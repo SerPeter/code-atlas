@@ -14,6 +14,8 @@ An ADR is a document that captures an important architectural decision made alon
 | [0001](./0001-memgraph-as-database.md) | Use Memgraph as the Graph Database | Accepted | 2025-02-07 |
 | [0002](./0002-build-from-scratch.md) | Build From Scratch Rather Than Fork | Accepted | 2025-02-07 |
 | [0003](./0003-python-rust-hybrid.md) | Python/Rust Hybrid Architecture | Accepted | 2025-02-07 |
+| [0004](./0004-event-driven-tiered-pipeline.md) | Event-Driven Tiered Pipeline | Accepted | 2026-02-07 |
+| [0005](./0005-deployment-process-model.md) | Deployment & Process Model | Accepted | 2026-02-07 |
 
 ## Creating a New ADR
 

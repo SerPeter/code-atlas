@@ -37,7 +37,7 @@ cargo test --manifest-path crates/Cargo.toml
 cargo clippy --manifest-path crates/Cargo.toml --all-targets -- -D warnings
 
 # Infrastructure
-docker compose up -d             # Start Memgraph + TEI
+docker compose up -d             # Start Memgraph + TEI + Valkey
 docker compose down              # Stop services
 
 # CLI
@@ -45,24 +45,29 @@ atlas index /path/to/project     # Index a codebase
 atlas search "query"             # Hybrid search
 atlas status                     # Check index status
 atlas mcp                        # Start MCP server
+atlas daemon start               # Start indexing daemon (watcher + pipeline)
 ```
 
 ## Architecture
 
 ```
 src/code_atlas/
-├── cli.py          # Typer CLI entrypoint (index, search, status, mcp commands)
+├── cli.py          # Typer CLI entrypoint (index, search, status, mcp, daemon commands)
+├── events.py       # Event types (FileChanged, ASTDirty, EmbedDirty) + Redis Streams EventBus
+├── pipeline.py     # TierConsumer base + Tier1/2/3 consumers with batch-pull pattern
 └── settings.py     # Pydantic configuration (atlas.toml + env vars)
 
 crates/
 └── atlas-parser/   # Rust AST parser using tree-sitter (outputs JSON)
 ```
 
-**Indexing Pipeline:** File Scanner → AST Parser (Rust) → Delta Diff → Pattern Detectors → Embeddings (TEI) → Graph Writer → Memgraph
+**Event Pipeline:** File Watcher → Valkey Streams → Tier 1 (graph metadata) → Tier 2 (AST diff + gate) → Tier 3 (embeddings) → Memgraph
 
 **Query Pipeline:** MCP Server → Query Router → [Graph Search | Vector Search | BM25 Search] → RRF Fusion → Results
 
-**Infrastructure:** Memgraph (graph DB with vector + BM25 support, port 7687), TEI (embeddings, port 8080)
+**Deployment:** Daemon (`atlas daemon start`) for indexing + MCP (`atlas mcp`) per agent session, decoupled via Valkey + Memgraph
+
+**Infrastructure:** Memgraph (graph DB, port 7687), TEI (embeddings, port 8080), Valkey (event bus, port 6379)
 
 ## Code Style
 

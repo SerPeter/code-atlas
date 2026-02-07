@@ -10,7 +10,7 @@ Code Atlas combines three search paradigms in a unified system:
 - **Semantic search** — find code by meaning via embeddings
 - **BM25 keyword search** — exact matches for identifiers and strings
 
-All powered by Memgraph as a single backend, exposed through an MCP server.
+All powered by Memgraph as a single backend, exposed through an MCP server. An event-driven pipeline with Valkey (Redis-compatible) Streams keeps the index fresh as code changes.
 
 ```mermaid
 graph TB
@@ -21,7 +21,14 @@ graph TB
         API[API Clients]
     end
 
-    subgraph "Code Atlas"
+    subgraph "Code Atlas — Daemon"
+        FW[File Watcher]
+        T1[Tier 1: Graph Metadata]
+        T2[Tier 2: AST Diff]
+        T3[Tier 3: Embeddings]
+    end
+
+    subgraph "Code Atlas — MCP"
         MCP[MCP Server]
         QR[Query Router]
 
@@ -33,17 +40,10 @@ graph TB
 
         RRF[RRF Fusion]
         CE[Context Expander]
-
-        subgraph Indexing
-            FS[File Scanner]
-            RP[Rust Parser]
-            PD[Pattern Detectors]
-            EM[Embedder]
-            GW[Graph Writer]
-        end
     end
 
     subgraph Infrastructure
+        VK[(Valkey)]
         MG[(Memgraph)]
         TEI[TEI Embeddings]
     end
@@ -69,208 +69,106 @@ graph TB
     VS --> MG
     BS --> MG
 
-    FS --> RP
-    RP --> PD
-    PD --> EM
-    EM --> GW
-    GW --> MG
-    EM --> TEI
+    FW --> VK
+    VK --> T1
+    T1 --> VK
+    VK --> T2
+    T2 --> VK
+    VK --> T3
+    T1 --> MG
+    T2 --> MG
+    T3 --> MG
+    T3 --> TEI
 ```
 
 ## Component Architecture
 
 ### MCP Server
 
-The MCP server is the primary interface for AI agents. It exposes tools for querying the code graph and managing the index.
+The MCP server is the primary interface for AI agents. Every capability is MCP-first; the CLI calls the same code paths. Spawned per agent session via `atlas mcp`, it reads Memgraph directly with no dependency on the daemon.
+
+**Query tools:**
+- `cypher_query` — Execute raw Cypher queries against Memgraph
+- `text_search` — BM25 keyword search via Memgraph's Tantivy
+- `vector_search` — Semantic search via Memgraph's vector index
+- `hybrid_search` — All three search types with RRF fusion
+- `get_node` — Retrieve a node by qualified name (supports suffix matching)
+- `get_context` — Get a node with surrounding context (class, module, callers)
+
+**Index tools:**
+- `index` — Trigger indexing of a project
+- `status` — Check index health and staleness
+
+**Admin tools:**
+- `health` — Infrastructure health check
+- `schema_info` — Describe available node types and relationships
+
+### Event-Driven Pipeline
+
+The indexing pipeline is event-driven, with three tiers of increasing cost connected via Valkey (Redis) Streams. Each tier pulls at its own pace, deduplicates within its batch window, and gates downstream work based on significance.
 
 ```mermaid
 graph LR
-    subgraph "MCP Server"
-        direction TB
-        QT[Query Tools]
-        IT[Index Tools]
-        AT[Admin Tools]
-    end
-
-    subgraph "Query Tools"
-        CS[cypher_query]
-        TS[text_search]
-        VS[vector_search]
-        HS[hybrid_search]
-        GN[get_node]
-        GC[get_context]
-    end
-
-    subgraph "Index Tools"
-        IX[index]
-        ST[status]
-    end
-
-    subgraph "Admin Tools"
-        HE[health]
-        SC[schema_info]
-    end
+    FW[File Watcher] -->|FileChanged| S1[atlas:file-changed]
+    S1 -->|XREADGROUP| T1[Tier 1: Graph Metadata<br/>0.5s batch, dedup by path]
+    T1 -->|ASTDirty| S2[atlas:ast-dirty]
+    S2 -->|XREADGROUP| T2[Tier 2: AST Diff<br/>3s batch, significance gate]
+    T2 -->|EmbedDirty| S3[atlas:embed-dirty]
+    S3 -->|XREADGROUP| T3[Tier 3: Embeddings<br/>15s batch, dedup by entity]
+    T1 -->|write| MG[(Memgraph)]
+    T2 -->|write| MG
+    T3 -->|write| MG
+    T3 -->|embed| TEI[TEI]
 ```
+
+**Tier 1 — Graph Metadata** (cheap, ~0.5s batch): Updates file node timestamps and staleness flags. Always publishes `ASTDirty` downstream.
+
+**Tier 2 — AST Diff** (medium, ~3s batch): Re-parses AST via Rust parser, diffs entities, updates graph nodes/edges. Evaluates a significance gate — trivial changes (whitespace, formatting) stop here; semantic changes (signature, body, docstring) publish `EmbedDirty` to Tier 3.
+
+**Tier 3 — Embeddings** (expensive, ~15s batch): Re-embeds affected entities via TEI, writes vectors to Memgraph. Deduplicates by entity qualified name across all events in the batch.
+
+**Significance Gate (Tier 2 → 3):**
+- Whitespace/formatting only → stop
+- Non-docstring comment → stop
+- Docstring changed → gate through
+- Body changed beyond threshold → gate through
+- Signature changed → always gate through
+- Entity added/deleted → always gate through
+
+**Error handling:** Failed batches are not acknowledged — Redis re-delivers via the pending entries list (PEL).
+
+See [ADR-0004](adr/0004-event-driven-tiered-pipeline.md) for full rationale.
 
 ### Indexing Pipeline
 
-The indexing pipeline transforms source code into a searchable graph.
+The indexing pipeline transforms source code into a searchable graph. Each stage feeds into the next:
 
-```mermaid
-flowchart LR
-    subgraph Input
-        SRC[Source Files]
-        DOC[Documentation]
-        CFG[Config Files]
-    end
-
-    subgraph "File Scanner"
-        GI[.gitignore]
-        AI[.atlasignore]
-        AT[atlas.toml]
-    end
-
-    subgraph "Rust Parser"
-        TS[Tree-sitter]
-        AST[AST Extraction]
-        ENT[Entity Detection]
-    end
-
-    subgraph "Pattern Detectors"
-        DR[Decorator Routing]
-        EH[Event Handlers]
-        TM[Test Mapping]
-        CO[Class Overrides]
-    end
-
-    subgraph "Embedder"
-        BC[Batch Collector]
-        TE[TEI Client]
-        EC[Embedding Cache]
-    end
-
-    subgraph "Graph Writer"
-        NW[Node Writer]
-        EW[Edge Writer]
-        IU[Index Updater]
-    end
-
-    SRC --> GI
-    DOC --> GI
-    GI --> AI
-    AI --> AT
-    AT --> TS
-
-    TS --> AST
-    AST --> ENT
-    ENT --> DR
-    DR --> EH
-    EH --> TM
-    TM --> CO
-
-    CO --> BC
-    BC --> TE
-    TE --> EC
-    EC --> NW
-    NW --> EW
-    EW --> IU
-    IU --> MG[(Memgraph)]
-```
+1. **File Scanner** — Walks the project tree, applying exclusion rules (`.gitignore`, `.atlasignore`, `atlas.toml` scope). Outputs a list of files to process.
+2. **Rust Parser** — Parses each file's AST via tree-sitter, extracts entities (classes, functions, methods, imports) and their relationships. Outputs structured JSON.
+3. **Pattern Detectors** — Pluggable detectors that identify implicit patterns: decorator-based routing, event handlers, test-to-code mapping, method overrides.
+4. **Embedder** — Batches entities for embedding via TEI. Uses a content-hash cache to skip unchanged code. Operates on logical chunks (functions, classes, doc sections).
+5. **Graph Writer** — Batch-writes nodes and edges to Memgraph. Updates vector and BM25 indices.
 
 ### Query Pipeline
 
-The query pipeline handles search requests and assembles context.
+When an agent issues a query:
 
-```mermaid
-flowchart TB
-    Q[Query] --> QA[Query Analyzer]
-    QA --> |structural| GS[Graph Search]
-    QA --> |semantic| VS[Vector Search]
-    QA --> |keyword| BS[BM25 Search]
-    QA --> |hybrid| ALL[All Three]
-
-    GS --> RRF[RRF Fusion]
-    VS --> RRF
-    BS --> RRF
-    ALL --> RRF
-
-    RRF --> CE[Context Expander]
-
-    CE --> |hierarchy| HW[Walk UP]
-    CE --> |calls| CW[Walk CALLS]
-    CE --> |docs| DW[Walk DOCUMENTS]
-
-    HW --> TA[Token Assembler]
-    CW --> TA
-    DW --> TA
-
-    TA --> |budget| TB[Token Budget]
-    TB --> R[Response]
-```
+1. **Query Router** analyzes the query and dispatches to one or more search backends (graph, vector, BM25) in parallel.
+2. **RRF Fusion** merges results from all backends using Reciprocal Rank Fusion scoring.
+3. **Context Expander** walks the graph around top results — up the hierarchy (class → module → package), along call chains, and into documentation links.
+4. **Token Assembler** packs expanded results into a response within the configured token budget, prioritizing by relevance.
 
 ## Graph Schema
 
 ### Node Types
 
-```mermaid
-graph TB
-    subgraph "Code Nodes"
-        P[Project]
-        PK[Package]
-        M[Module]
-        C[Class]
-        F[Function]
-        MT[Method]
-    end
+**Code nodes:** Project, Package, Module, Class, Function, Method — forming a containment hierarchy (Project → Package → Module → Class/Function, Class → Method).
 
-    subgraph "Documentation Nodes"
-        DF[DocFile]
-        DS[DocSection]
-        ADR[ADR]
-    end
+**Documentation nodes:** DocFile, DocSection, ADR — linked to code via DOCUMENTS and AFFECTS edges.
 
-    subgraph "Dependency Nodes"
-        EP[ExternalPackage]
-        ES[ExternalSymbol]
-    end
-
-    P --> PK
-    PK --> M
-    M --> C
-    M --> F
-    C --> MT
-```
+**Dependency nodes:** ExternalPackage, ExternalSymbol — representing imported libraries and their symbols.
 
 ### Relationships
-
-```mermaid
-graph LR
-    subgraph Structural
-        CONTAINS[CONTAINS]
-        DEFINES[DEFINES]
-        INHERITS[INHERITS]
-    end
-
-    subgraph "Call/Data"
-        CALLS[CALLS]
-        IMPORTS[IMPORTS]
-        USES_TYPE[USES_TYPE]
-    end
-
-    subgraph Documentation
-        DOCUMENTS[DOCUMENTS]
-        MOTIVATED_BY[MOTIVATED_BY]
-    end
-
-    subgraph Patterns
-        HANDLES_ROUTE[HANDLES_ROUTE]
-        HANDLES_EVENT[HANDLES_EVENT]
-        TESTS[TESTS]
-        OVERRIDES[OVERRIDES]
-    end
-```
-
-### Full Schema Diagram
 
 ```mermaid
 erDiagram
@@ -298,121 +196,30 @@ erDiagram
     Method ||--o{ Method : OVERRIDES
 ```
 
-## Data Flow
+**Structural:** CONTAINS, DEFINES, DEFINES_METHOD, INHERITS — the containment and type hierarchy.
 
-### Indexing Flow
+**Call/Data:** CALLS, IMPORTS, USES_TYPE — runtime and compile-time dependencies.
 
-```mermaid
-sequenceDiagram
-    participant CLI
-    participant Scanner
-    participant Parser
-    participant Detector
-    participant Embedder
-    participant Writer
-    participant Memgraph
+**Documentation:** DOCUMENTS, AFFECTS — links between docs/ADRs and code entities.
 
-    CLI->>Scanner: index /path/to/project
-    Scanner->>Scanner: Apply ignore rules
-    Scanner->>Parser: Batch of files
+**Patterns:** HANDLES_ROUTE, HANDLES_EVENT, TESTS, OVERRIDES — implicit relationships made explicit by pattern detectors.
 
-    loop For each file
-        Parser->>Parser: Parse AST
-        Parser->>Detector: Extracted entities
-        Detector->>Detector: Detect patterns
-        Detector->>Embedder: Entities + patterns
-    end
+## Deployment
 
-    Embedder->>Embedder: Batch embeddings
-    Embedder->>Writer: Entities + embeddings
+Code Atlas uses a **hybrid deployment model**: a long-running daemon handles continuous indexing, while a lightweight MCP server is spawned per agent session.
 
-    Writer->>Memgraph: Batch write nodes
-    Writer->>Memgraph: Batch write edges
-    Writer->>Memgraph: Update indices
+```bash
+docker compose up -d           # Memgraph (7687) + TEI (8080) + Valkey (6379)
+atlas daemon start             # File watcher + tier consumers (long-running)
+atlas mcp                      # MCP server — stdio (Claude Code)
+atlas mcp --transport sse      # MCP server — SSE (Cursor, Windsurf)
 ```
 
-### Query Flow
+The daemon publishes file change events to Valkey Streams, where tier consumers process them and write to Memgraph. The MCP server reads Memgraph directly — no dependency on the daemon for queries, so agents can query immediately even with a stale index.
 
-```mermaid
-sequenceDiagram
-    participant Agent
-    participant MCP
-    participant Router
-    participant Graph
-    participant Vector
-    participant BM25
-    participant Fusion
-    participant Expander
+On startup, the daemon runs a reconciliation pass: compares filesystem state against the index and enqueues stale files through the pipeline progressively (Tier 1 first, then 2, then 3).
 
-    Agent->>MCP: hybrid_search("auth middleware")
-
-    MCP->>Router: Analyze query
-
-    par Parallel Search
-        Router->>Graph: Cypher query
-        Router->>Vector: Embed + search
-        Router->>BM25: Text search
-    end
-
-    Graph-->>Fusion: Graph results
-    Vector-->>Fusion: Vector results
-    BM25-->>Fusion: BM25 results
-
-    Fusion->>Fusion: RRF merge
-    Fusion->>Expander: Top results
-
-    Expander->>Expander: Walk hierarchy
-    Expander->>Expander: Walk calls
-    Expander->>Expander: Assemble context
-
-    Expander-->>MCP: Expanded results
-    MCP-->>Agent: Response with context
-```
-
-## Deployment Architecture
-
-### Local Development
-
-```mermaid
-graph TB
-    subgraph "Developer Machine"
-        CLI[atlas CLI]
-        MCP[MCP Server]
-
-        subgraph Docker
-            MG[(Memgraph)]
-            TEI[TEI]
-        end
-    end
-
-    subgraph "AI Client"
-        CC[Claude Code]
-    end
-
-    CLI --> MG
-    MCP --> MG
-    MCP --> TEI
-    CC --> MCP
-```
-
-### Docker Compose Setup
-
-```mermaid
-graph TB
-    subgraph "docker-compose"
-        MG[memgraph:7687]
-        TEI[tei:8080]
-    end
-
-    subgraph "Host"
-        ATLAS[atlas CLI/MCP]
-        VOL[./data volume]
-    end
-
-    ATLAS --> MG
-    ATLAS --> TEI
-    MG --> VOL
-```
+See [ADR-0005](adr/0005-deployment-process-model.md) for full rationale.
 
 ## Technology Stack
 
@@ -423,11 +230,12 @@ graph TB
 | Config | Pydantic | Configuration management |
 | Parsing | Tree-sitter (Rust) | Fast AST parsing |
 | Graph DB | Memgraph | Graph storage + vector + BM25 |
+| Event Bus | Valkey (Redis) | Pipeline streams + embedding cache |
 | Embeddings | TEI / LiteLLM | Code embeddings |
 | HTTP | httpx | Async HTTP client |
 | Tokens | tiktoken | Token counting |
 
-## Security Considerations
+## Security
 
 - **Local-first**: All data stays on the developer's machine
 - **No external calls by default**: TEI runs locally in Docker
@@ -435,7 +243,7 @@ graph TB
 - **No telemetry**: No usage data sent anywhere
 - **Git-aware**: Respects .gitignore, never indexes secrets
 
-## Performance Characteristics
+## Performance Targets
 
 | Operation | Target | Notes |
 |-----------|--------|-------|
@@ -444,6 +252,11 @@ graph TB
 | Simple query (p95) | < 100ms | Single search type |
 | Hybrid query (p95) | < 300ms | Three search types + fusion |
 | Memory (100K nodes) | < 2GB | Memgraph in-memory |
+
+## Accepted Architectural Decisions
+
+- **[ADR-0004](adr/0004-event-driven-tiered-pipeline.md)**: Event-driven tiered pipeline with Redis Streams, significance gating, per-consumer batch policies
+- **[ADR-0005](adr/0005-deployment-process-model.md)**: Hybrid deployment — daemon + agent-spawned MCP, stdio/SSE transport
 
 ## Future Considerations
 
