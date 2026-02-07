@@ -75,6 +75,16 @@ class DetectorSettings(BaseSettings):
     )
 
 
+class RedisSettings(BaseSettings):
+    """Redis/Valkey connection settings for event bus."""
+
+    host: str = Field(default="localhost", description="Redis/Valkey host.")
+    port: int = Field(default=6379, description="Redis/Valkey port.")
+    db: int = Field(default=0, description="Redis database number.")
+    password: str = Field(default="", description="Redis/Valkey password.")
+    stream_prefix: str = Field(default="atlas", description="Prefix for Redis Stream keys.")
+
+
 class AtlasSettings(BaseSettings):
     """Root configuration for Code Atlas."""
 
@@ -90,5 +100,6 @@ class AtlasSettings(BaseSettings):
     monorepo: MonorepoSettings = Field(default_factory=MonorepoSettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     memgraph: MemgraphSettings = Field(default_factory=MemgraphSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)

@@ -29,6 +29,12 @@ base_url = "http://localhost:8080"
 host = "localhost"
 port = 7687
 
+[redis]
+host = "localhost"
+port = 6379
+db = 0
+stream_prefix = "atlas"
+
 [search]
 default_token_budget = 8000
 # Exclude test files from search results by default

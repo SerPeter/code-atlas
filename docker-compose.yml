@@ -23,6 +23,27 @@ services:
       retries: 5
 
   # ---------------------------------------------------------------------------
+  # Valkey — event bus (Redis-compatible) for pipeline streams
+  # ---------------------------------------------------------------------------
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+    command: >
+      valkey-server
+      --appendonly no
+      --save ""
+      --maxmemory 64mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
   # TEI — text embeddings inference (self-hosted embeddings)
   # ---------------------------------------------------------------------------
   tei:
@@ -42,4 +63,5 @@ services:
 
 volumes:
   memgraph-data:
+  valkey-data:
   tei-models:

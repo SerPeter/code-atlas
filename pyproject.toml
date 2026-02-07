@@ -48,6 +48,7 @@ dependencies = [
     "httpx>=0.28",           # async HTTP for TEI/API calls
     "tiktoken>=0.8",         # token counting for budget assembly
     "numpy>=2.0",            # vector operations
+    "redis[hiredis]>=5.0",   # async Redis/Valkey client for event bus
 ]
 
 [project.optional-dependencies]
