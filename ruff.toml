@@ -1,0 +1,66 @@
+# https://docs.astral.sh/ruff/configuration/
+
+target-version = "py314"
+line-length = 120
+src = ["src", "tests"]
+
+[format]
+docstring-code-format = true
+quote-style = "double"
+
+[lint]
+select = [
+    "F",      # pyflakes
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "COM",    # flake8-commas
+    "C4",     # flake8-comprehensions
+    "DTZ",    # flake8-datetimez
+    "T10",    # flake8-debugger
+    "ISC",    # flake8-implicit-str-concat
+    "ICN",    # flake8-import-conventions
+    "PIE",    # flake8-pie
+    "PT",     # flake8-pytest-style
+    "Q",      # flake8-quotes
+    "RSE",    # flake8-raise
+    "RET",    # flake8-return
+    "SLF",    # flake8-self
+    "SIM",    # flake8-simplify
+    "TID",    # flake8-tidy-imports
+    "TCH",    # flake8-type-checking
+    "ARG",    # flake8-unused-arguments
+    "PTH",    # flake8-use-pathlib
+    "ERA",    # eradicate (commented-out code)
+    "PL",     # pylint
+    "TRY",    # tryceratops
+    "FLY",    # flynt
+    "PERF",   # perflint
+    "FURB",   # refurb
+    "LOG",    # flake8-logging
+    "RUF",    # ruff-specific rules
+]
+ignore = [
+    "COM812",   # trailing comma — conflicts with formatter
+    "ISC001",   # single-line implicit string concat — conflicts with formatter
+    "PLR0913",  # too many arguments — common in config-heavy code
+    "PLR2004",  # magic value comparison — too noisy
+    "TRY003",   # long exception messages — we prefer descriptive errors
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = [
+    "ARG",      # unused arguments are common in fixtures
+    "SLF001",   # private member access is fine in tests
+    "PLR2004",  # magic values are fine in tests
+]
+
+[lint.isort]
+known-first-party = ["code_atlas"]
+
+[lint.pylint]
+max-args = 8

@@ -1,0 +1,3 @@
+[workspace]
+members = ["atlas-parser"]
+resolver = "2"

@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "code-atlas"
+version = "0.0.1"
+description = "A code intelligence graph that gives AI coding agents deep, token-efficient understanding of your codebase."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.14"
+authors = [
+    { name = "Peter" },
+]
+keywords = [
+    "code-intelligence",
+    "graph-database",
+    "mcp",
+    "rag",
+    "code-search",
+    "ai-agents",
+    "memgraph",
+    "ast",
+    "code-graph",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
+dependencies = [
+    "typer>=0.15",
+    "loguru>=0.7",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "mcp>=1.0",
+    "neo4j>=5.0",           # Bolt protocol driver (works with Memgraph)
+    "litellm>=1.50",
+    "tree-sitter>=0.24",
+    "tomli>=2.0; python_version < '3.11'",
+    "pathspec>=0.12",        # gitignore-compatible pattern matching
+    "httpx>=0.28",           # async HTTP for TEI/API calls
+    "tiktoken>=0.8",         # token counting for budget assembly
+    "numpy>=2.0",            # vector operations
+]
+
+[project.optional-dependencies]
+subagent = [
+    # Extra MCP tools for subagent mode (no API key needed)
+]
+
+[project.scripts]
+atlas = "code_atlas.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/your-username/code-atlas"
+Documentation = "https://github.com/your-username/code-atlas/tree/main/docs"
+Repository = "https://github.com/your-username/code-atlas"
+Issues = "https://github.com/your-username/code-atlas/issues"
+
+# --------------------------------------------------------------------------- #
+# Dev dependencies
+# --------------------------------------------------------------------------- #
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pytest-xdist>=3.5",
+    "pre-commit>=4.0",
+    "ruff>=0.9",
+    "ty>=0.0.1a6",
+    "mypy>=1.14",
+]
+
+# --------------------------------------------------------------------------- #
+# Hatch
+# --------------------------------------------------------------------------- #
+[tool.hatch.build.targets.wheel]
+packages = ["src/code_atlas"]
+
+[tool.hatch.envs.default]
+installer = "uv"
+
+# --------------------------------------------------------------------------- #
+# Pytest
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "-q",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: requires running Memgraph instance",
+]
+
+# --------------------------------------------------------------------------- #
+# ty (type checker)
+# --------------------------------------------------------------------------- #
+[tool.ty]
+python-version = "3.14"

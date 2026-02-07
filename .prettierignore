@@ -1,0 +1,5 @@
+CHANGELOG.md
+target/
+dist/
+*.min.js
+.venv/

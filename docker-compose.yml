@@ -1,0 +1,45 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Memgraph — graph database with BM25 + vector search
+  # ---------------------------------------------------------------------------
+  memgraph:
+    image: memgraph/memgraph:3.6
+    ports:
+      - "7687:7687"   # Bolt protocol
+      - "7444:7444"   # Monitoring
+    volumes:
+      - memgraph-data:/var/lib/memgraph
+    environment:
+      MEMGRAPH_ENTERPRISE_LICENSE: ""  # Community edition
+    command: >
+      --log-level=WARNING
+      --memory-limit=1024
+      --storage-wal-enabled=true
+      --storage-snapshot-interval-sec=300
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # TEI — text embeddings inference (self-hosted embeddings)
+  # ---------------------------------------------------------------------------
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    ports:
+      - "8080:80"
+    volumes:
+      - tei-models:/data
+    environment:
+      MODEL_ID: nomic-ai/nomic-embed-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  memgraph-data:
+  tei-models:

@@ -1,0 +1,11 @@
+proseWrap: always
+printWidth: 120
+tabWidth: 2
+overrides:
+  - files: "*.md"
+    options:
+      parser: markdown
+      proseWrap: preserve
+  - files: "*.yaml"
+    options:
+      singleQuote: false

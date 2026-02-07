@@ -1,0 +1,76 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  # --------------------------------------------------------------------------
+  # General
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+        exclude: '\.vscode/'
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-case-conflict
+
+  # --------------------------------------------------------------------------
+  # Python — Ruff
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # --------------------------------------------------------------------------
+  # Python — ty (type checking)
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ty
+    rev: 0.0.1-alpha.6
+    hooks:
+      - id: ty
+
+  # --------------------------------------------------------------------------
+  # Markdown & Docs — Prettier
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types_or: [markdown, yaml]
+        exclude: 'CHANGELOG\.md'
+
+  # --------------------------------------------------------------------------
+  # Rust
+  # --------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --manifest-path crates/Cargo.toml --
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        language: system
+        entry: cargo clippy --manifest-path crates/Cargo.toml --all-targets -- -D warnings
+        types: [rust]
+        pass_filenames: false
+
+  # --------------------------------------------------------------------------
+  # Commit messages
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.0.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert]

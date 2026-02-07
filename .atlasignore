@@ -1,0 +1,19 @@
+# Code Atlas ignore file — same syntax as .gitignore
+# For files tracked by git that should NOT be indexed
+
+# Generated code
+*_pb2.py
+*_pb2_grpc.py
+*.generated.ts
+*.generated.go
+
+# Vendored dependencies
+vendor/
+
+# Migration history
+migrations/
+
+# Large data / fixtures
+testdata/
+fixtures/
+*.sql

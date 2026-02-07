@@ -1,0 +1,48 @@
+# Code Atlas configuration
+# See: https://github.com/your-username/code-atlas
+
+[scope]
+# Whitelist paths to index (leave empty to index everything)
+include_paths = []
+# Additional exclude patterns beyond .gitignore and .atlasignore
+exclude_patterns = []
+
+[libraries]
+# Fully index these libraries (parse source, embed, full graph)
+full_index = []
+# Index at type-stub level only (public API signatures)
+stub_index = []
+
+[monorepo]
+# Auto-detect sub-projects by project markers (pyproject.toml, Cargo.toml, etc.)
+auto_detect = true
+# Always include these paths when scoping queries (shared libs)
+always_include = []
+
+[embeddings]
+# Provider: "tei", "litellm", "ollama"
+provider = "tei"
+model = "nomic-ai/nomic-embed-code"
+base_url = "http://localhost:8080"
+
+[memgraph]
+host = "localhost"
+port = 7687
+
+[search]
+default_token_budget = 8000
+# Exclude test files from search results by default
+test_filter = true
+# Max hop depth for caller/callee expansion
+max_caller_depth = 1
+
+[detectors]
+# Enabled pattern detectors
+enabled = [
+    "decorator_routing",
+    "event_handlers",
+    "test_mapping",
+    "class_overrides",
+    "di_injection",
+    "cli_commands",
+]

@@ -1,0 +1,94 @@
+"""Configuration management for Code Atlas."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ScopeSettings(BaseSettings):
+    """File scope and ignore settings."""
+
+    include_paths: list[str] = Field(default_factory=list, description="Whitelist of paths to index (monorepo roots).")
+    exclude_patterns: list[str] = Field(
+        default_factory=list, description="Additional glob patterns to exclude beyond .gitignore."
+    )
+
+
+class LibrarySettings(BaseSettings):
+    """Library and dependency indexing settings."""
+
+    full_index: list[str] = Field(default_factory=list, description="Libraries to fully parse and index.")
+    stub_index: list[str] = Field(default_factory=list, description="Libraries to index at type-stub level only.")
+
+
+class MonorepoSettings(BaseSettings):
+    """Monorepo detection and scoping settings."""
+
+    auto_detect: bool = Field(default=True, description="Auto-detect sub-projects by project markers.")
+    always_include: list[str] = Field(
+        default_factory=list, description="Paths always included when scoping queries (e.g., shared libs)."
+    )
+
+
+class EmbeddingSettings(BaseSettings):
+    """Embedding provider settings."""
+
+    provider: str = Field(default="tei", description="Embedding provider: tei, litellm, ollama.")
+    model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")
+    base_url: str = Field(default="http://localhost:8080", description="Embedding service URL.")
+
+
+class MemgraphSettings(BaseSettings):
+    """Memgraph connection settings."""
+
+    host: str = Field(default="localhost", description="Memgraph host.")
+    port: int = Field(default=7687, description="Memgraph Bolt port.")
+    username: str = Field(default="", description="Memgraph username.")
+    password: str = Field(default="", description="Memgraph password.")
+
+
+class SearchSettings(BaseSettings):
+    """Search and retrieval settings."""
+
+    default_token_budget: int = Field(default=8000, description="Default token budget for context assembly.")
+    test_filter: bool = Field(default=True, description="Exclude test files from results by default.")
+    max_caller_depth: int = Field(default=1, description="Default hop depth for caller/callee expansion.")
+    max_callers: int = Field(default=10, description="Max callers to return before ranking/filtering.")
+
+
+class DetectorSettings(BaseSettings):
+    """Pattern detector settings."""
+
+    enabled: list[str] = Field(
+        default_factory=lambda: [
+            "decorator_routing",
+            "event_handlers",
+            "test_mapping",
+            "class_overrides",
+            "di_injection",
+            "cli_commands",
+        ],
+        description="Enabled pattern detectors.",
+    )
+
+
+class AtlasSettings(BaseSettings):
+    """Root configuration for Code Atlas."""
+
+    model_config = SettingsConfigDict(
+        toml_file="atlas.toml",
+        env_prefix="ATLAS_",
+        env_nested_delimiter="__",
+    )
+
+    project_root: Path = Field(default_factory=lambda: Path.cwd(), description="Project root path.")
+    scope: ScopeSettings = Field(default_factory=ScopeSettings)
+    libraries: LibrarySettings = Field(default_factory=LibrarySettings)
+    monorepo: MonorepoSettings = Field(default_factory=MonorepoSettings)
+    embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    memgraph: MemgraphSettings = Field(default_factory=MemgraphSettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
+    detectors: DetectorSettings = Field(default_factory=DetectorSettings)
