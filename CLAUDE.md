@@ -116,6 +116,14 @@ crates/
 
 **Version bumping (semantic versioning)**
 
+## Task Tracking
+
+- `.tasks/.roadmap.md` - Master roadmap with all epics and task status tables
+- `.tasks/<epic>-<task>.md` - Individual task specs (e.g., `01-foundation-01-memgraph-schema.md`)
+- `.tasks/research/` - Research notes and spike findings
+- `.tasks/archive/` - Completed tasks moved here on completion
+- Read `.tasks/.roadmap.md` before starting work to understand current priorities and status
+
 ## Configuration
 
 - `atlas.toml` - Project configuration (scope, embeddings, search settings, detectors)
