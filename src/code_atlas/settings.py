@@ -39,6 +39,7 @@ class EmbeddingSettings(BaseSettings):
     provider: str = Field(default="tei", description="Embedding provider: tei, litellm, ollama.")
     model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")
     base_url: str = Field(default="http://localhost:8080", description="Embedding service URL.")
+    dimension: int = Field(default=768, description="Embedding vector dimension.")
 
 
 class MemgraphSettings(BaseSettings):

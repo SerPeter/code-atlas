@@ -24,6 +24,7 @@ always_include = []
 provider = "tei"
 model = "nomic-ai/nomic-embed-code"
 base_url = "http://localhost:8080"
+dimension = 768
 
 [memgraph]
 host = "localhost"

@@ -62,6 +62,7 @@ def mcp() -> None:
 async def _run_daemon() -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
     from code_atlas.events import EventBus
+    from code_atlas.graph import GraphClient
     from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
     from code_atlas.settings import AtlasSettings
 
@@ -77,6 +78,18 @@ async def _run_daemon() -> None:
 
     logger.info("Connected to Redis/Valkey at {}:{}", settings.redis.host, settings.redis.port)
 
+    # Verify Memgraph is reachable and apply schema
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        await bus.close()
+        raise typer.Exit(code=1) from exc
+
+    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+    await graph.ensure_schema()
+
     consumers = [
         Tier1GraphConsumer(bus),
         Tier2ASTConsumer(bus),
@@ -90,6 +103,7 @@ async def _run_daemon() -> None:
     finally:
         for c in consumers:
             c.stop()
+        await graph.close()
         await bus.close()
         logger.info("Daemon stopped")
 

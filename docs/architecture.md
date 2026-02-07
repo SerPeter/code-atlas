@@ -180,49 +180,76 @@ When an agent issues a query:
 
 ### Node Types
 
-**Code nodes:** Project, Package, Module, Class, Function, Method — forming a containment hierarchy (Project → Package →
-Module → Class/Function, Class → Method).
+**Code nodes (6):** Project, Package, Module — structural containers. TypeDef, Callable, Value — code entities
+discriminated by a `kind` property instead of language-specific labels (e.g., `TypeDef {kind: "class"}`,
+`Callable {kind: "method"}`). This is language-agnostic and paradigm-agnostic (OOP, FP, procedural).
 
-**Documentation nodes:** DocFile, DocSection, ADR — linked to code via DOCUMENTS and AFFECTS edges.
+**Documentation nodes (3):** DocFile, DocSection, ADR — linked to code via DOCUMENTS and MOTIVATED_BY edges.
 
-**Dependency nodes:** ExternalPackage, ExternalSymbol — representing imported libraries and their symbols.
+**Dependency nodes (2):** ExternalPackage, ExternalSymbol — representing imported libraries and their symbols.
+
+**Meta node (1):** SchemaVersion — singleton tracking the schema version for startup migration.
+
+### Kind Discriminators
+
+| Label    | Kind values                                                                                                  |
+| -------- | ------------------------------------------------------------------------------------------------------------ |
+| TypeDef  | class, struct, interface, trait, enum, union, type_alias, protocol, record, data_type, typeclass, annotation |
+| Callable | function, method, constructor, destructor, static_method, class_method, property, closure                    |
+| Value    | variable, constant, field, enum_member                                                                       |
+
+### Common Properties
+
+All entity nodes carry: `uid` (`{project_name}:{qualified_name}`), `project_name`, `name`, `qualified_name`,
+`file_path`, `line_start`, `line_end`, `content_hash`, `kind`.
+
+Code entities may also have: `visibility` (public/private/protected/internal), `tags` (extensible list replacing boolean
+flags like `is_async`, `is_abstract`), `signature`, `docstring`, `code_snippet`, `embedding`, `complexity`.
 
 ### Relationships
 
 ```mermaid
 erDiagram
     Project ||--o{ Package : CONTAINS
+    Project ||--o{ Project : CONTAINS
     Package ||--o{ Module : CONTAINS
-    Module ||--o{ Class : DEFINES
-    Module ||--o{ Function : DEFINES
-    Class ||--o{ Method : DEFINES_METHOD
-    Class ||--o{ Class : INHERITS
+    Module ||--o{ TypeDef : DEFINES
+    Module ||--o{ Callable : DEFINES
+    Module ||--o{ Value : DEFINES
+    TypeDef ||--o{ Callable : DEFINES
+    TypeDef ||--o{ Value : DEFINES
+    TypeDef ||--o{ TypeDef : INHERITS
 
-    Function ||--o{ Function : CALLS
-    Method ||--o{ Function : CALLS
-    Method ||--o{ Method : CALLS
-
+    Callable ||--o{ Callable : CALLS
+    Callable ||--o{ Callable : OVERRIDES
     Module ||--o{ ExternalPackage : IMPORTS
-    Function ||--o{ ExternalSymbol : USES_TYPE
+    Callable ||--o{ ExternalSymbol : USES_TYPE
 
-    DocSection ||--o{ Function : DOCUMENTS
-    DocSection ||--o{ Class : DOCUMENTS
-    ADR ||--o{ Module : AFFECTS
+    DocSection ||--o{ Callable : DOCUMENTS
+    DocSection ||--o{ TypeDef : DOCUMENTS
+    ADR ||--o{ Module : MOTIVATED_BY
 
-    Function ||--o{ Route : HANDLES_ROUTE
-    Function ||--o{ Event : HANDLES_EVENT
-    Function ||--o{ Class : TESTS
-    Method ||--o{ Method : OVERRIDES
+    Callable ||--o{ Callable : HANDLES_ROUTE
+    Callable ||--o{ Callable : HANDLES_EVENT
+    Callable ||--o{ TypeDef : TESTS
 ```
 
-**Structural:** CONTAINS, DEFINES, DEFINES_METHOD, INHERITS — the containment and type hierarchy.
+**Structural (2):** CONTAINS, DEFINES — hierarchical containment and definition. Node labels provide discrimination (no
+separate DEFINES_METHOD or CONTAINS_PROJECT needed). Monorepo roots are `Project` nodes that `CONTAINS` other `Project`
+nodes.
 
-**Call/Data:** CALLS, IMPORTS, USES_TYPE — runtime and compile-time dependencies.
+**Type hierarchy (2):** INHERITS, IMPLEMENTS — class inheritance and interface/trait implementation.
 
-**Documentation:** DOCUMENTS, AFFECTS — links between docs/ADRs and code entities.
+**Call/Data (4):** CALLS, IMPORTS, USES_TYPE, OVERRIDES — runtime and compile-time dependencies.
 
-**Patterns:** HANDLES_ROUTE, HANDLES_EVENT, TESTS, OVERRIDES — implicit relationships made explicit by pattern
-detectors.
+**Dependencies (1):** DEPENDS_ON — package-level dependency edges.
+
+**Documentation (2):** DOCUMENTS, MOTIVATED_BY — links between docs/ADRs and code entities.
+
+**Similarity (1):** SIMILAR_TO — computed via embedding cosine similarity (weighted edge).
+
+**Pattern-detected (6):** HANDLES_ROUTE, HANDLES_EVENT, REGISTERED_BY, INJECTED_INTO, TESTS, HANDLES_COMMAND — implicit
+relationships made explicit by pattern detectors.
 
 ## Deployment
 
