@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import typer
 from loguru import logger
 
@@ -10,6 +12,9 @@ app = typer.Typer(
     help="Code Atlas — map your codebase, search it three ways, feed it to agents.",
     no_args_is_help=True,
 )
+
+daemon_app = typer.Typer(name="daemon", help="Manage the Code Atlas indexing daemon.")
+app.add_typer(daemon_app)
 
 
 @app.command()
@@ -47,6 +52,62 @@ def mcp() -> None:
     """Start the MCP server."""
     logger.info("Starting MCP server")
     raise typer.Exit(code=0)
+
+
+# ---------------------------------------------------------------------------
+# Daemon subcommands
+# ---------------------------------------------------------------------------
+
+
+async def _run_daemon() -> None:
+    """Start the EventBus and all tier consumers, run until interrupted."""
+    from code_atlas.events import EventBus
+    from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+    from code_atlas.settings import AtlasSettings
+
+    settings = AtlasSettings()
+    bus = EventBus(settings.redis)
+
+    # Verify Redis is reachable
+    try:
+        await bus.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Redis/Valkey at {}:{} — {}", settings.redis.host, settings.redis.port, exc)
+        raise typer.Exit(code=1) from exc
+
+    logger.info("Connected to Redis/Valkey at {}:{}", settings.redis.host, settings.redis.port)
+
+    consumers = [
+        Tier1GraphConsumer(bus),
+        Tier2ASTConsumer(bus),
+        Tier3EmbedConsumer(bus),
+    ]
+
+    try:
+        await asyncio.gather(*(c.run() for c in consumers))
+    except asyncio.CancelledError:
+        pass
+    finally:
+        for c in consumers:
+            c.stop()
+        await bus.close()
+        logger.info("Daemon stopped")
+
+
+@daemon_app.command("start")
+def daemon_start(
+    foreground: bool = typer.Option(True, "--foreground/--background", help="Run in foreground (Ctrl+C to stop)."),
+) -> None:
+    """Start the indexing daemon (file watcher + tier consumers)."""
+    if not foreground:
+        logger.error("Background mode not yet implemented — use --foreground")
+        raise typer.Exit(code=1)
+
+    logger.info("Starting Code Atlas daemon (foreground)")
+    try:
+        asyncio.run(_run_daemon())
+    except KeyboardInterrupt:
+        logger.info("Interrupted — shutting down")
 
 
 if __name__ == "__main__":

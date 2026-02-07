@@ -53,6 +53,11 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
+"src/code_atlas/cli.py" = [
+    "ARG001",   # unused arguments — stub commands with typed params
+    "B008",     # function call in defaults — standard Typer pattern
+    "PLC0415",  # non-top-level imports — intentional lazy loading
+]
 "tests/**/*.py" = [
     "ARG",      # unused arguments are common in fixtures
     "SLF001",   # private member access is fine in tests
