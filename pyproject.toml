@@ -35,20 +35,19 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "typer>=0.15",
-    "loguru>=0.7",
-    "pydantic>=2.10",
-    "pydantic-settings>=2.7",
-    "mcp>=1.0",
-    "neo4j>=5.0",           # Bolt protocol driver (works with Memgraph)
-    "litellm>=1.50",
-    "tree-sitter>=0.24",
-    "tomli>=2.0; python_version < '3.11'",
-    "pathspec>=0.12",        # gitignore-compatible pattern matching
-    "httpx>=0.28",           # async HTTP for TEI/API calls
-    "tiktoken>=0.8",         # token counting for budget assembly
-    "numpy>=2.0",            # vector operations
-    "redis[hiredis]>=5.0",   # async Redis/Valkey client for event bus
+    "typer~=0.21",
+    "loguru~=0.7",
+    "pydantic~=2.12",
+    "pydantic-settings~=2.12",
+    "mcp~=1.26",
+    "neo4j~=6.1",            # Bolt protocol driver (works with Memgraph)
+    "litellm~=1.81",
+    "tree-sitter~=0.25",
+    "pathspec~=1.0",          # gitignore-compatible pattern matching
+    "httpx~=0.28",            # async HTTP for TEI/API calls
+    "tiktoken~=0.12",         # token counting for budget assembly
+    "numpy~=2.4",             # vector operations
+    "redis[hiredis]~=7.1",    # async Redis/Valkey client for event bus
 ]
 
 [project.optional-dependencies]
@@ -70,14 +69,14 @@ Issues = "https://github.com/your-username/code-atlas/issues"
 # --------------------------------------------------------------------------- #
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
-    "pytest-cov>=6.0",
-    "pytest-xdist>=3.5",
-    "pre-commit>=4.0",
-    "ruff>=0.9",
-    "ty>=0.0.1a6",
-    "mypy>=1.14",
+    "pytest~=9.0",
+    "pytest-asyncio~=1.1",
+    "pytest-cov~=7.0",
+    "pytest-xdist~=3.8",
+    "pre-commit~=4.5",
+    "ruff~=0.15",
+    "ty~=0.0.15",
+    "mypy~=1.19",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -109,5 +108,5 @@ markers = [
 # --------------------------------------------------------------------------- #
 # ty (type checker)
 # --------------------------------------------------------------------------- #
-[tool.ty]
+[tool.ty.environment]
 python-version = "3.14"

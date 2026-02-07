@@ -5,7 +5,7 @@ repos:
   # General
   # --------------------------------------------------------------------------
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -14,7 +14,7 @@ repos:
       - id: check-json
         exclude: '\.vscode/'
       - id: check-added-large-files
-        args: ['--maxkb=500']
+        args: ["--maxkb=500"]
       - id: check-merge-conflict
       - id: detect-private-key
       - id: check-case-conflict
@@ -23,19 +23,11 @@ repos:
   # Python — Ruff
   # --------------------------------------------------------------------------
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.6
+    rev: v0.15.0
     hooks:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
-
-  # --------------------------------------------------------------------------
-  # Python — ty (type checking)
-  # --------------------------------------------------------------------------
-  - repo: https://github.com/astral-sh/ty
-    rev: 0.0.1-alpha.6
-    hooks:
-      - id: ty
 
   # --------------------------------------------------------------------------
   # Markdown & Docs — Prettier
@@ -46,6 +38,18 @@ repos:
       - id: prettier
         types_or: [markdown, yaml]
         exclude: 'CHANGELOG\.md'
+
+  # --------------------------------------------------------------------------
+  # Python — ty (type checking, local — no official pre-commit hook yet)
+  # --------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: ty check
+        language: system
+        entry: uv run ty check
+        types: [python]
+        pass_filenames: false
 
   # --------------------------------------------------------------------------
   # Rust
@@ -69,7 +73,7 @@ repos:
   # Commit messages
   # --------------------------------------------------------------------------
   - repo: https://github.com/compilerla/conventional-pre-commit
-    rev: v4.0.0
+    rev: v4.3.0
     hooks:
       - id: conventional-pre-commit
         stages: [commit-msg]

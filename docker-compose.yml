@@ -3,19 +3,16 @@ services:
   # Memgraph — graph database with BM25 + vector search
   # ---------------------------------------------------------------------------
   memgraph:
-    image: memgraph/memgraph:3.6
+    image: memgraph/memgraph:3.7.2
     ports:
-      - "7687:7687"   # Bolt protocol
-      - "7444:7444"   # Monitoring
+      - "7687:7687" # Bolt protocol
+      - "7444:7444" # Monitoring
     volumes:
       - memgraph-data:/var/lib/memgraph
     environment:
-      MEMGRAPH_ENTERPRISE_LICENSE: ""  # Community edition
+      MEMGRAPH_ENTERPRISE_LICENSE: "" # Community edition
     command: >
-      --log-level=WARNING
-      --memory-limit=1024
-      --storage-wal-enabled=true
-      --storage-snapshot-interval-sec=300
+      --log-level=WARNING --memory-limit=1024 --storage-wal-enabled=true --storage-snapshot-interval-sec=300
     healthcheck:
       test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
       interval: 10s
@@ -32,11 +29,7 @@ services:
     volumes:
       - valkey-data:/data
     command: >
-      valkey-server
-      --appendonly no
-      --save ""
-      --maxmemory 64mb
-      --maxmemory-policy noeviction
+      valkey-server --appendonly no --save "" --maxmemory 64mb --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
@@ -47,7 +40,7 @@ services:
   # TEI — text embeddings inference (self-hosted embeddings)
   # ---------------------------------------------------------------------------
   tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     ports:
       - "8080:80"
     volumes:

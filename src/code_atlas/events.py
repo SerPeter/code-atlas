@@ -84,8 +84,8 @@ _TOPIC_EVENT_MAP: dict[Topic, type[Event]] = {
 # ---------------------------------------------------------------------------
 
 
-def encode_event(event: Event) -> dict[str, bytes]:
-    """Serialize an event for XADD. Returns ``{"data": <json_bytes>}``."""
+def encode_event(event: Event) -> dict[bytes, bytes]:
+    """Serialize an event for XADD. Returns ``{b"data": <json_bytes>}``."""
     return {b"data": json.dumps(asdict(event)).encode()}
 
 

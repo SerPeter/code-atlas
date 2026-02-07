@@ -94,7 +94,7 @@ class AtlasSettings(BaseSettings):
         env_nested_delimiter="__",
     )
 
-    project_root: Path = Field(default_factory=lambda: Path.cwd(), description="Project root path.")
+    project_root: Path = Field(default_factory=Path.cwd, description="Project root path.")
     scope: ScopeSettings = Field(default_factory=ScopeSettings)
     libraries: LibrarySettings = Field(default_factory=LibrarySettings)
     monorepo: MonorepoSettings = Field(default_factory=MonorepoSettings)
