@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from code_atlas.embeddings import build_embed_text
 from code_atlas.events import (
     ASTDirty,
     EmbedDirty,
@@ -33,6 +34,7 @@ from code_atlas.events import (
 from code_atlas.parser import parse_file
 
 if TYPE_CHECKING:
+    from code_atlas.embeddings import EmbedClient
     from code_atlas.graph import GraphClient
     from code_atlas.settings import AtlasSettings
 
@@ -278,7 +280,7 @@ class Tier2ASTConsumer(TierConsumer):
 class Tier3EmbedConsumer(TierConsumer):
     """Tier 3: Re-embed entities via TEI. Deduplicates by qualified name."""
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(self, bus: EventBus, graph: GraphClient, embed: EmbedClient) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
@@ -286,6 +288,8 @@ class Tier3EmbedConsumer(TierConsumer):
             consumer_name="tier3-embed-0",
             policy=BatchPolicy(time_window_s=15.0, max_batch_size=100),
         )
+        self.graph = graph
+        self.embed = embed
 
     def dedup_key(self, event: Event) -> str:
         # For EmbedDirty we can't dedup at the event level easily —
@@ -303,4 +307,34 @@ class Tier3EmbedConsumer(TierConsumer):
         entities = list(seen.values())
         logger.info("Tier3 batch {}: {} unique entity(ies)", batch_id, len(entities))
 
-        # TODO: Call TEI for embeddings, write vectors to Memgraph
+        if not entities:
+            return
+
+        t0 = asyncio.get_event_loop().time()
+
+        # 1. Read entity properties from graph
+        qns = [e.qualified_name for e in entities]
+        entity_props = await self.graph.read_entity_texts(qns)
+
+        # 2. Build embed texts
+        texts: list[str] = []
+        valid_qns: list[str] = []
+        for props in entity_props:
+            text = build_embed_text(props)
+            if text:
+                texts.append(text)
+                valid_qns.append(props["qualified_name"])
+
+        if not texts:
+            logger.debug("Tier3 batch {}: no embeddable texts", batch_id)
+            return
+
+        # 3. Embed
+        vectors = await self.embed.embed_batch(texts)
+
+        # 4. Write vectors to graph
+        items = list(zip(valid_qns, vectors, strict=True))
+        await self.graph.write_embeddings(items)
+
+        elapsed = asyncio.get_event_loop().time() - t0
+        logger.info("Tier3 batch {}: embedded {} entities in {:.1f}s", batch_id, len(items), elapsed)

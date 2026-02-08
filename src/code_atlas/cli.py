@@ -163,6 +163,7 @@ async def _run_status() -> None:
 
 async def _run_daemon() -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
+    from code_atlas.embeddings import EmbedClient
     from code_atlas.events import EventBus
     from code_atlas.graph import GraphClient
     from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
@@ -192,10 +193,11 @@ async def _run_daemon() -> None:
     logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
     await graph.ensure_schema()
 
+    embed = EmbedClient(settings.embeddings)
     consumers = [
         Tier1GraphConsumer(bus, graph, settings),
         Tier2ASTConsumer(bus, graph, settings),
-        Tier3EmbedConsumer(bus),
+        Tier3EmbedConsumer(bus, graph, embed),
     ]
 
     try:

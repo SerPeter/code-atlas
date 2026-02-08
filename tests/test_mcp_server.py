@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-import httpx
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+from code_atlas.embeddings import EmbedClient
 from code_atlas.graph import GraphClient
 from code_atlas.mcp_server import (
     AppContext,
@@ -216,8 +216,8 @@ class TestSchemaInfo:
 @pytest.fixture
 async def app_ctx(graph_client, settings):
     """Create an AppContext for testing tools directly."""
-    async with httpx.AsyncClient() as http:
-        yield AppContext(graph=graph_client, settings=settings, http=http)
+    embed = EmbedClient(settings.embeddings)
+    return AppContext(graph=graph_client, settings=settings, embed=embed)
 
 
 @pytest.fixture
@@ -433,29 +433,25 @@ class TestVectorSearchMock:
     async def test_vector_search_embed_error(self, settings):
         """Vector search returns EMBED_ERROR when TEI is unavailable."""
         graph = GraphClient(settings)
-        async with httpx.AsyncClient() as http:
-            app_ctx = AppContext(graph=graph, settings=settings, http=http)
+        embed = EmbedClient(settings.embeddings)
+        app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
+
+        with patch("code_atlas.embeddings.litellm.aembedding", new_callable=AsyncMock, side_effect=Exception("down")):
             result = await _invoke_tool(app_ctx, "vector_search", query="test query")
         await graph.close()
         assert result["code"] == "EMBED_ERROR"
 
     async def test_vector_search_mock_tei(self, settings):
-        """Vector search with mocked TEI embedding service."""
+        """Vector search with mocked embedding client."""
         mock_vector = [0.1] * settings.embeddings.dimension
         graph = GraphClient(settings)
-        async with httpx.AsyncClient() as http:
-            app_ctx = AppContext(graph=graph, settings=settings, http=http)
+        embed = EmbedClient(settings.embeddings)
+        app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
 
-            with patch.object(http, "post", new_callable=AsyncMock) as mock_post:
-                mock_response = MagicMock()
-                mock_response.status_code = 200
-                mock_response.raise_for_status = MagicMock()
-                mock_response.json.return_value = [mock_vector]
-                mock_post.return_value = mock_response
-
-                result = await _invoke_tool(app_ctx, "vector_search", query="test query")
-                # Structure is correct even if vector index search fails on Memgraph
-                assert "results" in result or "code" in result
-                mock_post.assert_called_once()
+        with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=mock_vector) as mock_embed:
+            result = await _invoke_tool(app_ctx, "vector_search", query="test query")
+            # Structure is correct even if vector index search fails on Memgraph
+            assert "results" in result or "code" in result
+            mock_embed.assert_called_once_with("test query")
 
         await graph.close()

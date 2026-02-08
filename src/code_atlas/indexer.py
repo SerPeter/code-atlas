@@ -14,9 +14,10 @@ from typing import TYPE_CHECKING
 import pathspec
 from loguru import logger
 
+from code_atlas.embeddings import EmbedClient
 from code_atlas.events import EventBus, FileChanged, Topic
 from code_atlas.parser import get_language_for_file
-from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer
+from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
 
 if TYPE_CHECKING:
     from code_atlas.graph import GraphClient
@@ -114,10 +115,19 @@ class FileScope:
                         self._nested_specs[rel_dir] = pathspec.PathSpec.from_lines("gitignore", patterns)
                         logger.debug("Loaded {} patterns from {}", len(patterns), nested_gi)
 
-            # Prune excluded directories (modify dirnames in-place)
-            dirnames[:] = [d for d in dirnames if not self._is_dir_excluded(f"{rel_dir}/{d}" if rel_dir else d)]
+            # Prune excluded and symlinked directories (modify dirnames in-place)
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not self._is_dir_excluded(f"{rel_dir}/{d}" if rel_dir else d) and not Path(dirpath, d).is_symlink()
+            ]
 
             for fname in filenames:
+                # Skip broken symlinks
+                fpath = Path(dirpath, fname)
+                if fpath.is_symlink() and not fpath.exists():
+                    logger.debug("Skipping broken symlink: {}", f"{rel_dir}/{fname}" if rel_dir else fname)
+                    continue
                 rel_path = f"{rel_dir}/{fname}" if rel_dir else fname
                 if not self.is_included(rel_path):
                     continue
@@ -226,7 +236,7 @@ def scan_files(
 def _read_ignore_file(path: Path) -> list[str]:
     """Read a .gitignore-style file, stripping comments and blank lines."""
     lines: list[str] = []
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         stripped = raw.strip()
         if stripped and not stripped.startswith("#"):
             lines.append(stripped)
@@ -250,7 +260,9 @@ def _detect_packages(project_root: Path) -> list[tuple[str, str]]:
     """
     root = project_root.resolve()
     packages: list[tuple[str, str]] = []
-    for dirpath, _dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune symlinked directories
+        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink()]
         if "__init__.py" in filenames:
             rel = Path(dirpath).relative_to(root).as_posix()
             if rel == ".":
@@ -283,6 +295,36 @@ def _get_git_hash(project_root: Path) -> str | None:
     except FileNotFoundError, subprocess.TimeoutExpired:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Embedding model lock
+# ---------------------------------------------------------------------------
+
+
+async def _check_model_lock(graph: GraphClient, model: str, dimension: int, *, reindex: bool) -> None:
+    """Enforce embedding model lock on the SchemaVersion node.
+
+    - First run (no stored model): write current config.
+    - Reindex: clear embeddings, write new config.
+    - Mismatch: raise RuntimeError with clear guidance.
+    """
+    if reindex:
+        await graph.clear_all_embeddings()
+        await graph.set_embedding_config(model, dimension)
+        return
+
+    stored = await graph.get_embedding_config()
+    if stored is not None:
+        stored_model, _stored_dim = stored
+        if stored_model != model:
+            msg = (
+                f"Embedding model changed from '{stored_model}' to '{model}'. "
+                f"Run `atlas index --reindex` to rebuild all embeddings."
+            )
+            raise RuntimeError(msg)
+    else:
+        await graph.set_embedding_config(model, dimension)
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +361,14 @@ async def index_project(
     if not files:
         return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=time.monotonic() - start)
 
-    # 2. Full reindex — wipe project data
+    # 2. Model lock check + full reindex
+    embed = EmbedClient(settings.embeddings)
+
     if full_reindex:
         logger.info("Full reindex: deleting existing data for '{}'", project_name)
         await graph.delete_project_data(project_name)
+
+    await _check_model_lock(graph, settings.embeddings.model, settings.embeddings.dimension, reindex=full_reindex)
 
     # 3. Create Project + Package hierarchy
     await graph.merge_project_node(project_name)
@@ -346,23 +392,28 @@ async def index_project(
     # 5. Start inline consumers and wait for drain
     await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
     await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
+    await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
 
     tier1 = Tier1GraphConsumer(bus, graph, settings)
     tier2 = Tier2ASTConsumer(bus, graph, settings)
+    tier3 = Tier3EmbedConsumer(bus, graph, embed)
 
     task1 = asyncio.create_task(tier1.run())
     task2 = asyncio.create_task(tier2.run())
+    task3 = asyncio.create_task(tier3.run())
 
     try:
         await _wait_for_drain(bus, drain_timeout_s)
     finally:
         tier1.stop()
         tier2.stop()
+        tier3.stop()
         # Give consumers time to finish their current iteration
         await asyncio.sleep(0.5)
         task1.cancel()
         task2.cancel()
-        for t in (task1, task2):
+        task3.cancel()
+        for t in (task1, task2, task3):
             with contextlib.suppress(asyncio.CancelledError):
                 await t
 
@@ -389,18 +440,20 @@ async def index_project(
 
 
 async def _wait_for_drain(bus: EventBus, timeout_s: float) -> None:
-    """Poll stream groups until both Tier 1 and Tier 2 are drained."""
+    """Poll stream groups until Tier 1, Tier 2, and Tier 3 are drained."""
     deadline = time.monotonic() + timeout_s
     settled_since: float | None = None
 
     while time.monotonic() < deadline:
         t1_info = await bus.stream_group_info(Topic.FILE_CHANGED, "tier1-graph")
         t2_info = await bus.stream_group_info(Topic.AST_DIRTY, "tier2-ast")
+        t3_info = await bus.stream_group_info(Topic.EMBED_DIRTY, "tier3-embed")
 
         t1_remaining = t1_info["pending"] + t1_info["lag"]
         t2_remaining = t2_info["pending"] + t2_info["lag"]
+        t3_remaining = t3_info["pending"] + t3_info["lag"]
 
-        if t1_remaining == 0 and t2_remaining == 0:
+        if t1_remaining == 0 and t2_remaining == 0 and t3_remaining == 0:
             if settled_since is None:
                 settled_since = time.monotonic()
             elif time.monotonic() - settled_since >= 1.0:

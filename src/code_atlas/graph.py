@@ -257,6 +257,56 @@ class GraphClient:
         )
         return records[0]["cnt"] if records else 0
 
+    # -- Embedding helpers -----------------------------------------------------
+
+    async def get_embedding_config(self) -> tuple[str, int] | None:
+        """Read embedding model and dimension from the SchemaVersion node.
+
+        Returns ``(model, dimension)`` or ``None`` if not yet configured.
+        """
+        records = await self.execute(
+            f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) RETURN sv.embedding_model AS model, sv.embedding_dimension AS dim"
+        )
+        if not records or records[0]["model"] is None:
+            return None
+        return (records[0]["model"], records[0]["dim"])
+
+    async def set_embedding_config(self, model: str, dimension: int) -> None:
+        """Write embedding model and dimension to the SchemaVersion node."""
+        await self.execute_write(
+            f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.embedding_model = $model, sv.embedding_dimension = $dim",
+            {"model": model, "dim": dimension},
+        )
+
+    async def read_entity_texts(self, qualified_names: list[str]) -> list[dict[str, Any]]:
+        """Batch-read entity properties needed for embedding.
+
+        Returns list of dicts with keys: ``qualified_name``, ``name``,
+        ``signature``, ``docstring``, ``kind``, ``_label``.
+        """
+        return await self.execute(
+            "UNWIND $qns AS qn "
+            "MATCH (n {qualified_name: qn}) "
+            "RETURN n.qualified_name AS qualified_name, n.name AS name, "
+            "n.signature AS signature, n.docstring AS docstring, "
+            "n.kind AS kind, labels(n)[0] AS _label",
+            {"qns": qualified_names},
+        )
+
+    async def write_embeddings(self, items: list[tuple[str, list[float]]]) -> None:
+        """Batch-write embedding vectors to nodes by qualified_name."""
+        if not items:
+            return
+        params = [{"qn": qn, "vector": vec} for qn, vec in items]
+        await self.execute_write(
+            "UNWIND $items AS item MATCH (n {qualified_name: item.qn}) SET n.embedding = item.vector",
+            {"items": params},
+        )
+
+    async def clear_all_embeddings(self) -> None:
+        """Remove embedding vectors from all nodes."""
+        await self.execute_write("MATCH (n) WHERE n.embedding IS NOT NULL REMOVE n.embedding")
+
     async def close(self) -> None:
         """Close the driver and release connections."""
         await self._driver.close()

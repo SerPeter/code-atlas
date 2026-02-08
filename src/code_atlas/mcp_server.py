@@ -12,10 +12,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import httpx
 from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 
+from code_atlas.embeddings import EmbedClient, EmbeddingError
 from code_atlas.graph import GraphClient
 from code_atlas.schema import (
     _CODE_LABELS,
@@ -57,7 +57,7 @@ _DOCSTRING_TRUNCATE = 200
 class AppContext:
     graph: GraphClient
     settings: AtlasSettings
-    http: httpx.AsyncClient
+    embed: EmbedClient
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +184,11 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
             raise
 
         logger.info("MCP connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
-        http = httpx.AsyncClient()
-        app_ctx = AppContext(graph=graph, settings=settings, http=http)
+        embed = EmbedClient(settings.embeddings)
+        app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
         try:
             yield app_ctx
         finally:
-            await http.aclose()
             await graph.close()
             logger.info("MCP server shut down")
 
@@ -464,15 +463,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
 
         # Embed the query
         try:
-            resp = await app.http.post(
-                f"{app.settings.embeddings.base_url}/embed",
-                json={"inputs": query},
-            )
-            resp.raise_for_status()
-            embeddings = resp.json()
-            # TEI returns list of embeddings; take the first
-            vector = embeddings[0] if isinstance(embeddings, list) and embeddings else embeddings
-        except Exception as exc:
+            vector = await app.embed.embed_one(query)
+        except EmbeddingError as exc:
             return _error(f"Embedding service unavailable: {exc}", code="EMBED_ERROR")
 
         indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]

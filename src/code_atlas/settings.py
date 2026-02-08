@@ -34,12 +34,13 @@ class MonorepoSettings(BaseSettings):
 
 
 class EmbeddingSettings(BaseSettings):
-    """Embedding provider settings."""
+    """Embedding settings — routes through litellm for any provider."""
 
-    provider: str = Field(default="tei", description="Embedding provider: tei, litellm, ollama.")
     model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")
-    base_url: str = Field(default="http://localhost:8080", description="Embedding service URL.")
+    base_url: str = Field(default="http://localhost:8080", description="OpenAI-compatible embedding endpoint URL.")
     dimension: int = Field(default=768, description="Embedding vector dimension.")
+    batch_size: int = Field(default=32, description="Max texts per embedding API call.")
+    timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
 
 
 class MemgraphSettings(BaseSettings):
