@@ -6,7 +6,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from code_atlas.search import SearchResult, SearchType, analyze_query, hybrid_search, rrf_fuse
+from code_atlas.search import (
+    CompactNode,
+    ExpandedContext,
+    SearchResult,
+    SearchType,
+    _prioritize_callers,
+    analyze_query,
+    hybrid_search,
+    rrf_fuse,
+)
 
 # ---------------------------------------------------------------------------
 # SearchType enum
@@ -124,6 +133,123 @@ class TestSearchResult:
         assert r.sources == {"graph": 1, "bm25": 2}
         with pytest.raises(AttributeError):
             r.name = "Bar"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# CompactNode dataclass
+# ---------------------------------------------------------------------------
+
+
+class TestCompactNode:
+    def test_frozen(self):
+        n = CompactNode(uid="p:m.Foo", name="Foo", qualified_name="m.Foo", kind="class", file_path="m.py")
+        assert n.uid == "p:m.Foo"
+        with pytest.raises(AttributeError):
+            n.name = "Bar"  # type: ignore[misc]
+
+    def test_defaults(self):
+        n = CompactNode(uid="p:x", name="x", qualified_name="x", kind="function", file_path="x.py")
+        assert n.line_start is None
+        assert n.line_end is None
+        assert n.signature == ""
+        assert n.docstring == ""
+        assert n.labels == []
+
+    def test_all_fields(self):
+        n = CompactNode(
+            uid="p:m.f",
+            name="f",
+            qualified_name="m.f",
+            kind="function",
+            file_path="m.py",
+            line_start=10,
+            line_end=20,
+            signature="def f():",
+            docstring="A function.",
+            labels=["Callable"],
+        )
+        assert n.line_start == 10
+        assert n.labels == ["Callable"]
+
+
+# ---------------------------------------------------------------------------
+# ExpandedContext dataclass
+# ---------------------------------------------------------------------------
+
+
+class TestExpandedContext:
+    def test_frozen(self):
+        target = CompactNode(uid="p:x", name="x", qualified_name="x", kind="function", file_path="x.py")
+        ec = ExpandedContext(target=target)
+        assert ec.target is target
+        with pytest.raises(AttributeError):
+            ec.target = target  # type: ignore[misc]
+
+    def test_defaults(self):
+        target = CompactNode(uid="p:x", name="x", qualified_name="x", kind="function", file_path="x.py")
+        ec = ExpandedContext(target=target)
+        assert ec.parent is None
+        assert ec.siblings == []
+        assert ec.callees == []
+        assert ec.callers == []
+        assert ec.docs == []
+        assert ec.package_context == ""
+
+
+# ---------------------------------------------------------------------------
+# _prioritize_callers
+# ---------------------------------------------------------------------------
+
+
+class TestPrioritizeCallers:
+    def _make(self, qn: str, file_path: str = "src/mod.py") -> CompactNode:
+        name = qn.rsplit(".", 1)[-1]
+        return CompactNode(uid=f"p:{qn}", name=name, qualified_name=qn, kind="function", file_path=file_path)
+
+    def test_same_package_first(self):
+        target_qn = "pkg.mod.target_func"
+        callers = [
+            self._make("other.lib.caller_a"),
+            self._make("pkg.mod.caller_b"),
+        ]
+        ranked = _prioritize_callers(callers, target_qn)
+        assert ranked[0].qualified_name == "pkg.mod.caller_b"
+        assert ranked[1].qualified_name == "other.lib.caller_a"
+
+    def test_non_test_first(self):
+        target_qn = "pkg.mod.func"
+        callers = [
+            self._make("tests.test_mod.test_func", file_path="tests/test_mod.py"),
+            self._make("pkg.other.caller", file_path="pkg/other.py"),
+        ]
+        ranked = _prioritize_callers(callers, target_qn)
+        assert ranked[0].qualified_name == "pkg.other.caller"
+        assert ranked[1].qualified_name == "tests.test_mod.test_func"
+
+    def test_combined_ranking(self):
+        """Same-package + non-test > different-package + non-test > test."""
+        target_qn = "pkg.mod.func"
+        callers = [
+            self._make("tests.test_mod.test_func", file_path="tests/test_mod.py"),
+            self._make("other.lib.helper", file_path="other/lib.py"),
+            self._make("pkg.mod.nearby", file_path="pkg/mod.py"),
+        ]
+        ranked = _prioritize_callers(callers, target_qn)
+        assert ranked[0].qualified_name == "pkg.mod.nearby"
+        assert ranked[1].qualified_name == "other.lib.helper"
+        assert ranked[2].qualified_name == "tests.test_mod.test_func"
+
+    def test_shorter_qn_tiebreak(self):
+        target_qn = "pkg.mod.func"
+        callers = [
+            self._make("pkg.mod.very_long_name_caller"),
+            self._make("pkg.mod.short"),
+        ]
+        ranked = _prioritize_callers(callers, target_qn)
+        assert ranked[0].qualified_name == "pkg.mod.short"
+
+    def test_empty_list(self):
+        assert _prioritize_callers([], "pkg.mod.func") == []
 
 
 # ---------------------------------------------------------------------------

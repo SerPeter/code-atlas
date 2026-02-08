@@ -32,7 +32,7 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
-from code_atlas.search import SearchType
+from code_atlas.search import CompactNode, SearchType, expand_context
 from code_atlas.search import hybrid_search as _hybrid_search
 
 if TYPE_CHECKING:
@@ -122,6 +122,30 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
             compact[score_key] = record[score_key]
 
     return compact
+
+
+def _compact_node_to_dict(node: CompactNode) -> dict[str, Any]:
+    """Serialize a CompactNode dataclass to a plain dict for JSON output."""
+    out: dict[str, Any] = {
+        "uid": node.uid,
+        "name": node.name,
+        "qualified_name": node.qualified_name,
+        "kind": node.kind,
+        "file_path": node.file_path,
+    }
+    if node.line_start is not None:
+        out["line_start"] = node.line_start
+    if node.line_end is not None:
+        out["line_end"] = node.line_end
+    if node.signature:
+        out["signature"] = node.signature
+    if node.docstring:
+        out["docstring"] = node.docstring[:_DOCSTRING_TRUNCATE] + (
+            "..." if len(node.docstring) > _DOCSTRING_TRUNCATE else ""
+        )
+    if node.labels:
+        out["_labels"] = node.labels
+    return out
 
 
 def _result(records: list[dict[str, Any]], *, limit: int, query_ms: float, total: int | None = None) -> dict[str, Any]:
@@ -329,83 +353,47 @@ def _register_query_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "Expand a node into its neighborhood: parent, children, callers, callees, bases, subclasses. "
-            "Pass the uid from a get_node result. "
-            "Set include_source=true to include source code (file_path + line range). "
-            "depth controls relationship traversal (default 1, max 3)."
+            "Expand a node into its neighborhood: parent, siblings, callers, callees, docs. "
+            "Pass the uid from a get_node or hybrid_search result. "
+            "Toggle sections with include_hierarchy, include_calls, include_docs. "
+            "call_depth controls CALLS traversal hops (default 1, max 3)."
         ),
     )
     async def get_context(
         uid: str,
-        depth: int = 1,
-        include_source: bool = False,
+        include_hierarchy: bool = True,
+        include_calls: bool = True,
+        call_depth: int = 1,
+        include_docs: bool = True,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = _get_app_ctx(ctx)
-        depth = max(1, min(depth, 3))
-        sub_limit = 20
-
         t0 = time.monotonic()
 
-        # Fetch target node
-        records = await app.graph.execute("MATCH (n {uid: $uid}) RETURN n", {"uid": uid})
-        if not records:
+        expanded = await expand_context(
+            app.graph,
+            uid,
+            include_hierarchy=include_hierarchy,
+            include_calls=include_calls,
+            call_depth=call_depth,
+            include_docs=include_docs,
+            max_siblings=app.settings.search.max_siblings,
+            max_callers=app.settings.search.max_callers,
+        )
+
+        if expanded is None:
             return _error(f"Node not found: {uid}", code="NOT_FOUND")
-
-        target = _compact_node(records[0])
-
-        if include_source:
-            node = records[0].get("n")
-            if node and hasattr(node, "items"):
-                props = dict(node.items())
-                target["source_code"] = props.get("source_code")
-
-        # Parent (who DEFINES this node)
-        parent_records = await app.graph.execute(
-            f"MATCH (p)-[:{RelType.DEFINES}]->(n {{uid: $uid}}) RETURN p AS n LIMIT {sub_limit}",
-            {"uid": uid},
-        )
-
-        # Children (this node DEFINES)
-        children_records = await app.graph.execute(
-            f"MATCH (n {{uid: $uid}})-[:{RelType.DEFINES}]->(c) RETURN c AS n LIMIT {sub_limit}",
-            {"uid": uid},
-        )
-
-        # Callers (who CALLS this node)
-        caller_records = await app.graph.execute(
-            f"MATCH (caller)-[:{RelType.CALLS}]->(n {{uid: $uid}}) RETURN caller AS n LIMIT {sub_limit}",
-            {"uid": uid},
-        )
-
-        # Callees (this node CALLS)
-        callee_records = await app.graph.execute(
-            f"MATCH (n {{uid: $uid}})-[:{RelType.CALLS}]->(callee) RETURN callee AS n LIMIT {sub_limit}",
-            {"uid": uid},
-        )
-
-        # Bases (this node INHERITS from)
-        base_records = await app.graph.execute(
-            f"MATCH (n {{uid: $uid}})-[:{RelType.INHERITS}]->(base) RETURN base AS n LIMIT {sub_limit}",
-            {"uid": uid},
-        )
-
-        # Subclasses (who INHERITS from this node)
-        subclass_records = await app.graph.execute(
-            f"MATCH (sub)-[:{RelType.INHERITS}]->(n {{uid: $uid}}) RETURN sub AS n LIMIT {sub_limit}",
-            {"uid": uid},
-        )
 
         elapsed = (time.monotonic() - t0) * 1000
 
         return {
-            "node": target,
-            "parent": [_compact_node(r) for r in parent_records],
-            "children": [_compact_node(r) for r in children_records],
-            "callers": [_compact_node(r) for r in caller_records],
-            "callees": [_compact_node(r) for r in callee_records],
-            "bases": [_compact_node(r) for r in base_records],
-            "subclasses": [_compact_node(r) for r in subclass_records],
+            "node": _compact_node_to_dict(expanded.target),
+            "parent": _compact_node_to_dict(expanded.parent) if expanded.parent else None,
+            "siblings": [_compact_node_to_dict(s) for s in expanded.siblings],
+            "callers": [_compact_node_to_dict(c) for c in expanded.callers],
+            "callees": [_compact_node_to_dict(c) for c in expanded.callees],
+            "docs": [_compact_node_to_dict(d) for d in expanded.docs],
+            "package_context": expanded.package_context,
             "query_ms": round(elapsed, 1),
         }
 

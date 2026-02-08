@@ -381,13 +381,13 @@ class TestGetContext:
         assert "node" in result
         assert result["node"]["name"] == "MyClass"
 
-        # Parent should be the module
-        assert len(result["parent"]) >= 1
-        assert any(p.get("name") == "mymodule" for p in result["parent"])
+        # Parent should be the module (now a dict, not a list)
+        assert result["parent"] is not None
+        assert result["parent"]["name"] == "mymodule"
 
-        # Children should include my_method
-        assert len(result["children"]) >= 1
-        assert any(c.get("name") == "my_method" for c in result["children"])
+        # Siblings should include my_function (both defined by mymodule)
+        assert len(result["siblings"]) >= 1
+        assert any(s.get("name") == "my_function" for s in result["siblings"])
 
     async def test_get_context_callers_callees(self, app_ctx, seeded_graph):
         result = await _invoke_tool(app_ctx, "get_context", uid="test-project:mypackage.mymodule.MyClass.my_method")
@@ -398,6 +398,38 @@ class TestGetContext:
     async def test_get_context_not_found(self, app_ctx, seeded_graph):
         result = await _invoke_tool(app_ctx, "get_context", uid="nonexistent:uid")
         assert result["code"] == "NOT_FOUND"
+
+    async def test_get_context_siblings(self, app_ctx, seeded_graph):
+        """my_function and MyClass are siblings under mymodule."""
+        result = await _invoke_tool(app_ctx, "get_context", uid="test-project:mypackage.mymodule.my_function")
+        assert any(s.get("name") == "MyClass" for s in result["siblings"])
+
+    async def test_get_context_hierarchy_off(self, app_ctx, seeded_graph):
+        """include_hierarchy=False returns None parent, empty siblings."""
+        result = await _invoke_tool(
+            app_ctx, "get_context", uid="test-project:mypackage.mymodule.MyClass", include_hierarchy=False
+        )
+        assert result["parent"] is None
+        assert result["siblings"] == []
+        # Callers/callees should still be present
+        assert "callers" in result
+        assert "callees" in result
+
+    async def test_get_context_calls_off(self, app_ctx, seeded_graph):
+        """include_calls=False returns empty callers/callees."""
+        result = await _invoke_tool(
+            app_ctx, "get_context", uid="test-project:mypackage.mymodule.MyClass.my_method", include_calls=False
+        )
+        assert result["callers"] == []
+        assert result["callees"] == []
+        # Parent should still be present
+        assert result["parent"] is not None
+
+    async def test_get_context_response_shape(self, app_ctx, seeded_graph):
+        """Verify all expected top-level keys are present."""
+        result = await _invoke_tool(app_ctx, "get_context", uid="test-project:mypackage.mymodule.MyClass")
+        expected_keys = {"node", "parent", "siblings", "callers", "callees", "docs", "package_context", "query_ms"}
+        assert expected_keys == set(result.keys())
 
 
 @pytest.mark.integration
