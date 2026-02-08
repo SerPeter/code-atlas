@@ -32,6 +32,7 @@ from code_atlas.schema import (
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
 
+    from code_atlas.detectors import PropertyEnrichment
     from code_atlas.parser import ParsedEntity, ParsedRelationship
     from code_atlas.settings import AtlasSettings
 
@@ -333,6 +334,22 @@ class GraphClient:
             {"project_name": project_name},
         )
         return records[0]["cnt"] if records else 0
+
+    # -- Detector enrichment helpers -------------------------------------------
+
+    async def apply_property_enrichments(self, enrichments: list[PropertyEnrichment]) -> None:
+        """Apply property enrichments from detectors to existing entity nodes.
+
+        Each enrichment SETs additional properties on a node matched by uid.
+        Uses ``+=`` (map merge) so existing properties are preserved.
+        """
+        for enrichment in enrichments:
+            if not enrichment.properties:
+                continue
+            await self.execute_write(
+                "MATCH (n {uid: $uid}) SET n += $props",
+                {"uid": enrichment.qualified_name, "props": enrichment.properties},
+            )
 
     # -- Embedding helpers -----------------------------------------------------
 
@@ -690,16 +707,49 @@ class GraphClient:
         )
 
         # Recreate: uid-based rels (both ends known by uid)
-        uid_rel_types = {RelType.DEFINES, RelType.CONTAINS}
+        # Includes structural rels and detector-produced rels (both ends resolved to UIDs)
+        uid_rel_types = {
+            RelType.DEFINES,
+            RelType.CONTAINS,
+            RelType.OVERRIDES,
+            RelType.TESTS,
+            RelType.HANDLES_ROUTE,
+            RelType.HANDLES_EVENT,
+            RelType.HANDLES_COMMAND,
+            RelType.REGISTERED_BY,
+            RelType.INJECTED_INTO,
+        }
         uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
         other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
 
         for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
-            rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in group]
-            await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
-                {"rels": rel_params},
-            )
+            rels_list = list(group)
+            has_props = any(r.properties for r in rels_list)
+            if has_props:
+                rel_params = [
+                    {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties} for r in rels_list
+                ]
+                await self.execute_write(
+                    f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                    f"CREATE (a)-[:{rel_type}]->(b)",
+                    {"rels": rel_params},
+                )
+                # SET properties in a second pass (Memgraph doesn't support dynamic props in CREATE)
+                for param in rel_params:
+                    if param["props"]:
+                        set_clause = ", ".join(f"e.{k} = $prop_{k}" for k in param["props"])
+                        prop_params = {f"prop_{k}": v for k, v in param["props"].items()}
+                        await self.execute_write(
+                            f"MATCH (a {{uid: $from_uid}})-[e:{rel_type}]->(b {{uid: $to_uid}}) SET {set_clause}",
+                            {"from_uid": param["from_uid"], "to_uid": param["to_uid"], **prop_params},
+                        )
+            else:
+                rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in rels_list]
+                await self.execute_write(
+                    f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                    f"CREATE (a)-[:{rel_type}]->(b)",
+                    {"rels": rel_params},
+                )
 
         # Name-matched rels
         doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]

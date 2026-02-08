@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from code_atlas.detectors import get_enabled_detectors, run_detectors
 from code_atlas.embeddings import EmbedCache, build_embed_text
 from code_atlas.events import (
     ASTDirty,
@@ -227,6 +228,7 @@ class Tier2ASTConsumer(TierConsumer):
         self.graph = graph
         self.settings = settings
         self.stats = Tier2Stats()
+        self._detectors = get_enabled_detectors(settings.detectors.enabled)
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         all_paths: list[str] = []
@@ -265,13 +267,21 @@ class Tier2ASTConsumer(TierConsumer):
                 logger.debug("Tier2: unsupported language for {}", file_path)
                 continue
 
+            # Run detectors → get extra relationships + property enrichments
+            det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
+            all_rels = parsed.relationships + det_result.relationships
+
             # Write to graph (delta-aware)
             result = await self.graph.upsert_file_entities(
                 project_name=project_name,
                 file_path=file_path,
                 entities=parsed.entities,
-                relationships=parsed.relationships,
+                relationships=all_rels,
             )
+
+            # Apply property enrichments after entity upsert
+            if det_result.enrichments:
+                await self.graph.apply_property_enrichments(det_result.enrichments)
 
             # Accumulate stats
             self.stats.files_processed += 1
