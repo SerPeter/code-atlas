@@ -46,10 +46,17 @@ def status() -> None:
 
 
 @app.command()
-def mcp() -> None:
-    """Start the MCP server."""
-    logger.info("Starting MCP server")
-    raise typer.Exit(code=0)
+def mcp(
+    transport: str = typer.Option("stdio", "--transport", "-t", help="Transport: stdio, streamable-http"),
+) -> None:
+    """Start the MCP server for AI agent connections."""
+    from code_atlas.mcp_server import create_mcp_server
+    from code_atlas.settings import AtlasSettings
+
+    settings = AtlasSettings()
+    server = create_mcp_server(settings)
+    logger.info("Starting MCP server (transport={})", transport)
+    server.run(transport=transport)  # type: ignore[arg-type]  # typer gives str, FastMCP expects Literal
 
 
 # ---------------------------------------------------------------------------

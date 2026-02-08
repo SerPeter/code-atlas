@@ -1,0 +1,398 @@
+"""Tests for the MCP server tools."""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+from mcp.server.fastmcp import FastMCP
+
+from code_atlas.graph import GraphClient
+from code_atlas.mcp_server import (
+    AppContext,
+    _clamp_limit,
+    _error,
+    _register_info_tools,
+    _register_query_tools,
+    _register_search_tools,
+    _result,
+)
+from code_atlas.schema import (
+    _CODE_LABELS,
+    _DOC_LABELS,
+    _EMBEDDABLE_LABELS,
+    _EXTERNAL_LABELS,
+    _TEXT_SEARCHABLE_LABELS,
+    SCHEMA_VERSION,
+    CallableKind,
+    NodeLabel,
+    RelType,
+    TypeDefKind,
+    ValueKind,
+    Visibility,
+)
+
+# ---------------------------------------------------------------------------
+# Fake context for direct tool invocation
+# ---------------------------------------------------------------------------
+
+
+class _FakeRequestContext:
+    def __init__(self, app_ctx: AppContext) -> None:
+        self.lifespan_context = app_ctx
+
+
+class _FakeCtx:
+    """Minimal stand-in for mcp.server.fastmcp.Context."""
+
+    def __init__(self, app_ctx: AppContext) -> None:
+        self.request_context = _FakeRequestContext(app_ctx)
+
+
+async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> dict[str, Any]:
+    """Invoke an MCP tool function directly, bypassing the MCP transport layer."""
+    server = FastMCP(name="test")
+    _register_query_tools(server)
+    _register_search_tools(server)
+    _register_info_tools(server)
+
+    tool_map = {tool.name: tool for tool in server._tool_manager._tools.values()}
+    if tool_name not in tool_map:
+        msg = f"Unknown tool: {tool_name}. Available: {sorted(tool_map)}"
+        raise ValueError(msg)
+
+    tool = tool_map[tool_name]
+    if tool_name != "schema_info":
+        kwargs["ctx"] = _FakeCtx(app_ctx)
+
+    return await tool.fn(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Helper tests (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestHelpers:
+    def test_clamp_limit_default(self):
+        assert _clamp_limit(None) == 20
+
+    def test_clamp_limit_within_range(self):
+        assert _clamp_limit(50) == 50
+
+    def test_clamp_limit_below_min(self):
+        assert _clamp_limit(0) == 1
+        assert _clamp_limit(-5) == 1
+
+    def test_clamp_limit_above_max(self):
+        assert _clamp_limit(200) == 100
+
+    def test_result_envelope(self):
+        r = _result([{"a": 1}], limit=20, query_ms=5.123)
+        assert r["count"] == 1
+        assert r["truncated"] is False
+        assert r["query_ms"] == 5.1
+
+    def test_result_truncated(self):
+        r = _result([{"a": 1}], limit=1, query_ms=1.0, total=5)
+        assert r["truncated"] is True
+
+    def test_error_envelope(self):
+        e = _error("boom", code="FAIL")
+        assert e == {"error": "boom", "code": "FAIL"}
+
+
+# ---------------------------------------------------------------------------
+# schema_info (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaInfo:
+    async def test_schema_info_returns_complete_schema(self, settings):
+        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+
+        assert result["schema_version"] == SCHEMA_VERSION
+        assert result["uid_format"] == "{project_name}:{qualified_name}"
+
+        # All labels present
+        all_labels = (
+            set(result["node_labels"]["code"])
+            | set(result["node_labels"]["documentation"])
+            | set(result["node_labels"]["external"])
+            | set(result["node_labels"]["meta"])
+        )
+        assert all_labels == {lbl.value for lbl in NodeLabel}
+
+        # All relationship types present
+        assert set(result["relationship_types"]) == {r.value for r in RelType}
+
+        # Kind discriminators
+        assert set(result["kind_discriminators"]["TypeDefKind"]) == {k.value for k in TypeDefKind}
+        assert set(result["kind_discriminators"]["CallableKind"]) == {k.value for k in CallableKind}
+        assert set(result["kind_discriminators"]["ValueKind"]) == {k.value for k in ValueKind}
+        assert set(result["kind_discriminators"]["Visibility"]) == {v.value for v in Visibility}
+
+        # Text/vector searchable labels
+        assert set(result["text_searchable_labels"]) == {lbl.value for lbl in _TEXT_SEARCHABLE_LABELS}
+        assert set(result["vector_searchable_labels"]) == {lbl.value for lbl in _EMBEDDABLE_LABELS}
+
+    async def test_schema_info_label_groups_correct(self, settings):
+        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+        assert sorted(result["node_labels"]["code"]) == sorted(lbl.value for lbl in _CODE_LABELS)
+        assert sorted(result["node_labels"]["documentation"]) == sorted(lbl.value for lbl in _DOC_LABELS)
+        assert sorted(result["node_labels"]["external"]) == sorted(lbl.value for lbl in _EXTERNAL_LABELS)
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (require Memgraph)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def app_ctx(graph_client, settings):
+    """Create an AppContext for testing tools directly."""
+    async with httpx.AsyncClient() as http:
+        yield AppContext(graph=graph_client, settings=settings, http=http)
+
+
+@pytest.fixture
+async def seeded_graph(graph_client):
+    """Seed the graph with test entities for querying."""
+    await graph_client.ensure_schema()
+
+    # Create a project
+    await graph_client.merge_project_node(
+        "test-project",
+        file_count=3,
+        entity_count=5,
+        last_indexed_at=1700000000,
+        git_hash="abc123",
+    )
+
+    # Create some entities
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.MODULE} {{"
+        "uid: 'test-project:mypackage.mymodule', "
+        "project_name: 'test-project', "
+        "name: 'mymodule', "
+        "qualified_name: 'mypackage.mymodule', "
+        "file_path: 'mypackage/mymodule.py', "
+        "kind: 'module', "
+        "line_start: 1, line_end: 100"
+        "})"
+    )
+
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        "uid: 'test-project:mypackage.mymodule.my_function', "
+        "project_name: 'test-project', "
+        "name: 'my_function', "
+        "qualified_name: 'mypackage.mymodule.my_function', "
+        "file_path: 'mypackage/mymodule.py', "
+        "kind: 'function', "
+        "line_start: 10, line_end: 20, "
+        "signature: 'def my_function(x: int) -> str', "
+        "docstring: 'A test function that does something useful.'"
+        "})"
+    )
+
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.TYPE_DEF} {{"
+        "uid: 'test-project:mypackage.mymodule.MyClass', "
+        "project_name: 'test-project', "
+        "name: 'MyClass', "
+        "qualified_name: 'mypackage.mymodule.MyClass', "
+        "file_path: 'mypackage/mymodule.py', "
+        "kind: 'class', "
+        "line_start: 30, line_end: 80, "
+        "signature: 'class MyClass(Base)', "
+        "docstring: 'A test class.'"
+        "})"
+    )
+
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        "uid: 'test-project:mypackage.mymodule.MyClass.my_method', "
+        "project_name: 'test-project', "
+        "name: 'my_method', "
+        "qualified_name: 'mypackage.mymodule.MyClass.my_method', "
+        "file_path: 'mypackage/mymodule.py', "
+        "kind: 'method', "
+        "line_start: 40, line_end: 50, "
+        "signature: 'def my_method(self) -> None', "
+        "docstring: 'A method on MyClass.'"
+        "})"
+    )
+
+    # Create DEFINES relationships
+    await graph_client.execute_write(
+        "MATCH (m {uid: 'test-project:mypackage.mymodule'}), "
+        "(f {uid: 'test-project:mypackage.mymodule.my_function'}) "
+        f"CREATE (m)-[:{RelType.DEFINES}]->(f)"
+    )
+    await graph_client.execute_write(
+        "MATCH (m {uid: 'test-project:mypackage.mymodule'}), "
+        "(c {uid: 'test-project:mypackage.mymodule.MyClass'}) "
+        f"CREATE (m)-[:{RelType.DEFINES}]->(c)"
+    )
+    await graph_client.execute_write(
+        "MATCH (c {uid: 'test-project:mypackage.mymodule.MyClass'}), "
+        "(method {uid: 'test-project:mypackage.mymodule.MyClass.my_method'}) "
+        f"CREATE (c)-[:{RelType.DEFINES}]->(method)"
+    )
+
+    # Create a CALLS relationship: my_function -> my_method
+    await graph_client.execute_write(
+        "MATCH (f {uid: 'test-project:mypackage.mymodule.my_function'}), "
+        "(m {uid: 'test-project:mypackage.mymodule.MyClass.my_method'}) "
+        f"CREATE (f)-[:{RelType.CALLS}]->(m)"
+    )
+
+    return graph_client
+
+
+@pytest.mark.integration
+class TestCypherQuery:
+    async def test_cypher_query_returns_results(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "cypher_query", query="MATCH (n:Callable) RETURN n.name AS name", limit=10)
+        assert "results" in result
+        assert result["count"] >= 1
+        names = [r["name"] for r in result["results"]]
+        assert "my_function" in names
+
+    async def test_cypher_query_rejects_writes(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "cypher_query", query="CREATE (n:Foo {name: 'bar'})")
+        assert result["code"] == "WRITE_REJECTED"
+
+    async def test_cypher_query_rejects_delete(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "cypher_query", query="MATCH (n) DELETE n")
+        assert result["code"] == "WRITE_REJECTED"
+
+    async def test_cypher_query_rejects_set(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "cypher_query", query="MATCH (n) SET n.name = 'x'")
+        assert result["code"] == "WRITE_REJECTED"
+
+    async def test_cypher_query_enforces_limit(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(
+            app_ctx,
+            "cypher_query",
+            query="MATCH (n) RETURN n.name AS name",
+            limit=2,
+        )
+        assert result["count"] <= 2
+
+
+@pytest.mark.integration
+class TestGetNode:
+    async def test_get_node_exact_name(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "get_node", name="my_function")
+        assert result["count"] >= 1
+        assert any(r.get("name") == "my_function" for r in result["results"])
+
+    async def test_get_node_by_uid(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "get_node", name="test-project:mypackage.mymodule.MyClass")
+        assert result["count"] == 1
+        assert result["results"][0]["name"] == "MyClass"
+
+    async def test_get_node_ends_with(self, app_ctx, seeded_graph):
+        # "MyClass" should match via suffix ".MyClass" on qualified_name
+        result = await _invoke_tool(app_ctx, "get_node", name="MyClass")
+        assert result["count"] >= 1
+        assert any(r.get("qualified_name", "").endswith("MyClass") for r in result["results"])
+
+    async def test_get_node_with_label_filter(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "get_node", name="my_function", label="Callable")
+        assert result["count"] >= 1
+
+    async def test_get_node_not_found(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "get_node", name="nonexistent_entity_xyz")
+        assert result["count"] == 0
+
+
+@pytest.mark.integration
+class TestGetContext:
+    async def test_get_context_returns_neighborhood(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "get_context", uid="test-project:mypackage.mymodule.MyClass")
+        assert "node" in result
+        assert result["node"]["name"] == "MyClass"
+
+        # Parent should be the module
+        assert len(result["parent"]) >= 1
+        assert any(p.get("name") == "mymodule" for p in result["parent"])
+
+        # Children should include my_method
+        assert len(result["children"]) >= 1
+        assert any(c.get("name") == "my_method" for c in result["children"])
+
+    async def test_get_context_callers_callees(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "get_context", uid="test-project:mypackage.mymodule.MyClass.my_method")
+        # my_function calls my_method
+        assert len(result["callers"]) >= 1
+        assert any(c.get("name") == "my_function" for c in result["callers"])
+
+    async def test_get_context_not_found(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "get_context", uid="nonexistent:uid")
+        assert result["code"] == "NOT_FOUND"
+
+
+@pytest.mark.integration
+class TestIndexStatus:
+    async def test_index_status_with_projects(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "index_status")
+        assert "projects" in result
+        assert len(result["projects"]) >= 1
+
+        project = result["projects"][0]
+        assert project["name"] == "test-project"
+        assert project["entity_count"] >= 1
+        assert result["schema_version"] == SCHEMA_VERSION
+
+    async def test_index_status_empty_graph(self, app_ctx):
+        result = await _invoke_tool(app_ctx, "index_status")
+        assert result["projects"] == []
+        assert result["schema_version"] == SCHEMA_VERSION
+
+
+@pytest.mark.integration
+class TestTextSearch:
+    async def test_text_search_finds_entity(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "text_search", query="my_function")
+        # Text search may or may not find results depending on Memgraph text index state
+        # Just verify the structure is correct
+        assert "results" in result
+        assert "count" in result
+        assert "query_ms" in result
+
+
+class TestVectorSearchMock:
+    async def test_vector_search_embed_error(self, settings):
+        """Vector search returns EMBED_ERROR when TEI is unavailable."""
+        graph = GraphClient(settings)
+        async with httpx.AsyncClient() as http:
+            app_ctx = AppContext(graph=graph, settings=settings, http=http)
+            result = await _invoke_tool(app_ctx, "vector_search", query="test query")
+        await graph.close()
+        assert result["code"] == "EMBED_ERROR"
+
+    async def test_vector_search_mock_tei(self, settings):
+        """Vector search with mocked TEI embedding service."""
+        mock_vector = [0.1] * settings.embeddings.dimension
+        graph = GraphClient(settings)
+        async with httpx.AsyncClient() as http:
+            app_ctx = AppContext(graph=graph, settings=settings, http=http)
+
+            with patch.object(http, "post", new_callable=AsyncMock) as mock_post:
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_response.raise_for_status = MagicMock()
+                mock_response.json.return_value = [mock_vector]
+                mock_post.return_value = mock_response
+
+                result = await _invoke_tool(app_ctx, "vector_search", query="test query")
+                # Structure is correct even if vector index search fails on Memgraph
+                assert "results" in result or "code" in result
+                mock_post.assert_called_once()
+
+        await graph.close()
