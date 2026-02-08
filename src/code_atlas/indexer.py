@@ -44,6 +44,7 @@ _DEFAULT_EXCLUDES: list[str] = [
     ".eggs/",
     "*.pyc",
     ".env/",
+    ".atlas/",
 ]
 
 

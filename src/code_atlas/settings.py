@@ -97,6 +97,13 @@ class DetectorSettings(BaseSettings):
     )
 
 
+class WatcherSettings(BaseSettings):
+    """File watcher debounce settings."""
+
+    debounce_s: float = Field(default=5.0, description="Debounce timer in seconds (resets per change).")
+    max_wait_s: float = Field(default=30.0, description="Max-wait ceiling in seconds (per batch).")
+
+
 class RedisSettings(BaseSettings):
     """Redis/Valkey connection settings for event bus."""
 
@@ -123,5 +130,6 @@ class AtlasSettings(BaseSettings):
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     memgraph: MemgraphSettings = Field(default_factory=MemgraphSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    watcher: WatcherSettings = Field(default_factory=WatcherSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)

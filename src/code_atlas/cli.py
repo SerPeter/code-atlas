@@ -58,6 +58,19 @@ def status() -> None:
 
 
 @app.command()
+def watch(
+    path: str = typer.Argument(".", help="Path to the project root to watch."),
+    debounce: float | None = typer.Option(None, "--debounce", help="Debounce timer in seconds (default: 5)."),
+    max_wait: float | None = typer.Option(None, "--max-wait", help="Max-wait ceiling in seconds (default: 30)."),
+) -> None:
+    """Watch a project for file changes and auto-index."""
+    try:
+        asyncio.run(_run_watch(path, debounce=debounce, max_wait=max_wait))
+    except KeyboardInterrupt:
+        logger.info("Interrupted — shutting down")
+
+
+@app.command()
 def mcp(
     transport: str = typer.Option("stdio", "--transport", "-t", help="Transport: stdio, streamable-http"),
 ) -> None:
@@ -239,6 +252,93 @@ async def _run_status() -> None:
             )
     finally:
         await graph.close()
+
+
+# ---------------------------------------------------------------------------
+# Shared infrastructure connection
+# ---------------------------------------------------------------------------
+
+
+async def _connect_bus_and_graph(settings):
+    """Connect to Valkey and Memgraph, returning ``(bus, graph)``.
+
+    Exits with code 1 if either service is unreachable.
+    Accepts an :class:`~code_atlas.settings.AtlasSettings` instance.
+    """
+    from code_atlas.events import EventBus
+    from code_atlas.graph import GraphClient
+
+    bus = EventBus(settings.redis)
+    try:
+        await bus.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Valkey at {}:{} — {}", settings.redis.host, settings.redis.port, exc)
+        raise typer.Exit(code=1) from exc
+    logger.info("Connected to Valkey at {}:{}", settings.redis.host, settings.redis.port)
+
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        await bus.close()
+        raise typer.Exit(code=1) from exc
+    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+    await graph.ensure_schema()
+
+    return bus, graph
+
+
+# ---------------------------------------------------------------------------
+# Watch async helper
+# ---------------------------------------------------------------------------
+
+
+async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None) -> None:
+    """Async implementation of the ``atlas watch`` command."""
+    from pathlib import Path
+
+    from code_atlas.embeddings import EmbedCache, EmbedClient
+    from code_atlas.indexer import FileScope
+    from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+    from code_atlas.settings import AtlasSettings
+    from code_atlas.watcher import FileWatcher
+
+    project_root = Path(path).resolve()
+    settings = AtlasSettings(project_root=project_root)
+    if debounce is not None:
+        settings.watcher.debounce_s = debounce
+    if max_wait is not None:
+        settings.watcher.max_wait_s = max_wait
+
+    bus, graph = await _connect_bus_and_graph(settings)
+
+    embed = EmbedClient(settings.embeddings)
+    cache: EmbedCache | None = None
+    if settings.embeddings.cache_ttl_days > 0:
+        cache = EmbedCache(settings.redis, settings.embeddings)
+
+    scope = FileScope(project_root, settings)
+    watcher = FileWatcher(project_root, bus, scope, settings.watcher)
+    consumers = [
+        Tier1GraphConsumer(bus, graph, settings),
+        Tier2ASTConsumer(bus, graph, settings),
+        Tier3EmbedConsumer(bus, graph, embed, cache=cache),
+    ]
+
+    try:
+        await asyncio.gather(watcher.run(), *(c.run() for c in consumers))
+    except asyncio.CancelledError:
+        pass
+    finally:
+        watcher.stop()
+        for c in consumers:
+            c.stop()
+        if cache is not None:
+            await cache.close()
+        await graph.close()
+        await bus.close()
+        logger.info("Watch stopped")
 
 
 # ---------------------------------------------------------------------------

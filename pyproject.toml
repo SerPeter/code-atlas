@@ -49,6 +49,7 @@ dependencies = [
     "tiktoken~=0.12",         # token counting for budget assembly
     "numpy~=2.4",             # vector operations
     "redis[hiredis]~=7.1",    # async Redis/Valkey client for event bus
+    "watchfiles~=1.0",        # Rust-based filesystem watcher
 ]
 
 [project.optional-dependencies]
