@@ -43,6 +43,7 @@ dependencies = [
     "litellm~=1.81",
     "tree-sitter~=0.25",
     "tree-sitter-python~=0.23",
+    "tree-sitter-markdown~=0.5",
     "pathspec~=1.0",          # gitignore-compatible pattern matching
     "httpx~=0.28",            # async HTTP for TEI/API calls
     "tiktoken~=0.12",         # token counting for budget assembly

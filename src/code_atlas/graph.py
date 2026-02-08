@@ -172,6 +172,8 @@ class GraphClient:
                     "docstring": e.docstring,
                     "signature": e.signature,
                     "tags": e.tags,
+                    "header_path": e.header_path,
+                    "header_level": e.header_level,
                 }
                 for e in entity_list
             ]
@@ -182,23 +184,23 @@ class GraphClient:
                 f"qualified_name: e.qualified_name, file_path: e.file_path, "
                 f"kind: e.kind, line_start: e.line_start, line_end: e.line_end, "
                 f"visibility: e.visibility, docstring: e.docstring, "
-                f"signature: e.signature, tags: e.tags"
+                f"signature: e.signature, tags: e.tags, "
+                f"header_path: e.header_path, header_level: e.header_level"
                 f"}})"
             )
             await self.execute_write(query, {"entities": params})  # dynamic Cypher
 
         # 3. Create relationships
-        # Group by rel_type for batch creation
-        defines_rels = [r for r in relationships if r.rel_type == RelType.DEFINES]
-        other_rels = [r for r in relationships if r.rel_type != RelType.DEFINES]
+        # uid-based rels: both ends are in this file
+        uid_rel_types = {RelType.DEFINES, RelType.CONTAINS}
+        uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
+        other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
 
-        # DEFINES: both ends are in this file, match by uid
-        if defines_rels:
-            rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in defines_rels]
+        # Batch-create uid-based rels grouped by type
+        for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
+            rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in group]
             await self.execute_write(
-                "UNWIND $rels AS r "
-                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
-                f"CREATE (a)-[:{RelType.DEFINES}]->(b)",
+                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
                 {"rels": rel_params},
             )
 

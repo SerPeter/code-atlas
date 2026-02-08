@@ -58,14 +58,15 @@ class TestScanFiles:
         assert "app.py" in result
         assert "lib/utils.py" in result
 
-    def test_ignores_non_python_files(self, tmp_path):
-        _write(tmp_path, "readme.md", "# Hello")
+    def test_ignores_unsupported_files(self, tmp_path):
         _write(tmp_path, "data.json", "{}")
+        _write(tmp_path, "image.png", "")
         _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "readme.md", "# Hello")
 
         result = scan_files(tmp_path, _make_settings(tmp_path))
 
-        assert result == ["app.py"]
+        assert result == ["app.py", "readme.md"]
 
     def test_default_excludes(self, tmp_path):
         _write(tmp_path, "app.py", "x = 1")

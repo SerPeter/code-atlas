@@ -335,3 +335,199 @@ class Outer:
     )
     inner = _entity_by_name(parsed, "Inner")
     assert "Outer.Inner" in inner.qualified_name
+
+
+# ---------------------------------------------------------------------------
+# Markdown parser
+# ---------------------------------------------------------------------------
+
+
+def _parse_md(source: str, path: str = "docs/test.md") -> ParsedFile:
+    result = parse_file(path, source.encode("utf-8"), PROJECT)
+    assert result is not None
+    return result
+
+
+def _sections(parsed: ParsedFile) -> list:
+    return [e for e in parsed.entities if e.label == NodeLabel.DOC_SECTION]
+
+
+def test_markdown_basic_sections():
+    parsed = _parse_md(
+        """\
+# Introduction
+
+Intro text.
+
+## Details
+
+Detail text.
+"""
+    )
+    doc_file = [e for e in parsed.entities if e.label == NodeLabel.DOC_FILE]
+    assert len(doc_file) == 1
+    assert doc_file[0].name == "test.md"
+
+    sections = _sections(parsed)
+    assert len(sections) == 2
+
+    intro = _entity_by_name(parsed, "Introduction")
+    assert intro.label == NodeLabel.DOC_SECTION
+    assert intro.header_level == 1
+    assert intro.header_path == "Introduction"
+    assert intro.line_start == 1
+
+    details = _entity_by_name(parsed, "Details")
+    assert details.header_level == 2
+    assert details.header_path == "Introduction > Details"
+
+
+def test_markdown_nested_headers():
+    parsed = _parse_md(
+        """\
+# Top
+
+## Middle
+
+### Deep
+
+Deepest content.
+"""
+    )
+    sections = _sections(parsed)
+    assert len(sections) == 3
+
+    deep = _entity_by_name(parsed, "Deep")
+    assert deep.header_level == 3
+    assert deep.header_path == "Top > Middle > Deep"
+
+
+def test_markdown_header_path_disambiguation():
+    parsed = _parse_md(
+        """\
+# Parent A
+
+## Overview
+
+Content A.
+
+# Parent B
+
+## Overview
+
+Content B.
+"""
+    )
+    sections = _sections(parsed)
+    overview_sections = [s for s in sections if s.name == "Overview"]
+    assert len(overview_sections) == 2
+    qns = {s.qualified_name for s in overview_sections}
+    assert f"{PROJECT}:docs/test.md > Parent A > Overview" in qns
+    assert f"{PROJECT}:docs/test.md > Parent B > Overview" in qns
+
+
+def test_markdown_code_blocks():
+    parsed = _parse_md(
+        """\
+# Code Section
+
+```python
+print("hello")
+```
+
+```bash
+echo hi
+```
+"""
+    )
+    section = _entity_by_name(parsed, "Code Section")
+    assert "lang:python" in section.tags
+    assert "lang:bash" in section.tags
+
+
+def test_markdown_preamble():
+    parsed = _parse_md(
+        """\
+This is preamble text.
+
+More preamble.
+
+# First Heading
+
+Content.
+"""
+    )
+    sections = _sections(parsed)
+    preamble = [s for s in sections if s.header_level == 0]
+    assert len(preamble) == 1
+    assert preamble[0].name == "test.md"
+    assert preamble[0].docstring is not None
+    assert "preamble" in preamble[0].docstring.lower()
+
+
+def test_markdown_setext_headings():
+    parsed = _parse_md(
+        """\
+Title
+=====
+
+Some text.
+
+Subtitle
+--------
+
+More text.
+"""
+    )
+    title = _entity_by_name(parsed, "Title")
+    assert title.header_level == 1
+
+    subtitle = _entity_by_name(parsed, "Subtitle")
+    assert subtitle.header_level == 2
+    assert subtitle.header_path == "Title > Subtitle"
+
+
+def test_markdown_empty_file():
+    parsed = _parse_md("")
+    doc_files = [e for e in parsed.entities if e.label == NodeLabel.DOC_FILE]
+    assert len(doc_files) == 1
+    assert doc_files[0].name == "test.md"
+    assert _sections(parsed) == []
+
+
+def test_markdown_contains_relationships():
+    parsed = _parse_md(
+        """\
+# One
+
+## Two
+
+## Three
+"""
+    )
+    contains_rels = [r for r in parsed.relationships if r.rel_type == RelType.CONTAINS]
+    assert len(contains_rels) == 3
+    for rel in contains_rels:
+        assert rel.from_qualified_name == f"{PROJECT}:docs/test.md"
+
+
+def test_markdown_language_detection():
+    assert get_language_for_file("docs/readme.md") is not None
+    assert get_language_for_file("notes.txt") is None
+    assert get_language_for_file("readme.rst") is None
+
+
+def test_markdown_content_extraction():
+    parsed = _parse_md(
+        """\
+# Section
+
+The quick brown fox.
+
+Another paragraph.
+"""
+    )
+    section = _entity_by_name(parsed, "Section")
+    assert section.docstring is not None
+    assert "quick brown fox" in section.docstring
+    assert "Another paragraph" in section.docstring
