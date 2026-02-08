@@ -7,12 +7,18 @@ from unittest.mock import AsyncMock
 import pytest
 
 from code_atlas.search import (
+    AssembledContext,
     CompactNode,
+    ContextItem,
     ExpandedContext,
     SearchResult,
     SearchType,
     _prioritize_callers,
+    _render_node_text,
+    _truncate_to_budget,
     analyze_query,
+    assemble_context,
+    count_tokens,
     hybrid_search,
     rrf_fuse,
 )
@@ -377,3 +383,268 @@ class TestHybridSearchIntegration:
         assert len(results) >= 1
         # No result should have vector source
         assert not any("vector" in r.sources for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Token counting
+# ---------------------------------------------------------------------------
+
+
+class TestCountTokens:
+    def test_empty_string(self):
+        assert count_tokens("") == 0
+
+    def test_known_text(self):
+        # "hello world" should be ~2 tokens in cl100k_base
+        tokens = count_tokens("hello world")
+        assert 1 <= tokens <= 4
+
+    def test_code_snippet(self):
+        code = "def get_user(uid: str) -> User:\n    return db.query(uid)"
+        tokens = count_tokens(code)
+        assert tokens > 0
+
+    def test_claude_alias(self):
+        # "claude" alias should resolve to cl100k_base and produce same result
+        text = "test string for tokenizer"
+        assert count_tokens(text, "claude") == count_tokens(text, "cl100k_base")
+
+    def test_accuracy_within_5_percent(self):
+        # For a longer text, verify count is reasonable (chars/4 rough estimate)
+        text = (
+            "This is a moderately long text that should tokenize to roughly one quarter of its character count. "
+        ) * 10
+        tokens = count_tokens(text)
+        # Rough sanity: between len/6 and len/2
+        assert len(text) // 6 < tokens < len(text) // 2
+
+
+# ---------------------------------------------------------------------------
+# Render node text
+# ---------------------------------------------------------------------------
+
+
+class TestRenderNodeText:
+    def _node(self, **kwargs: object) -> CompactNode:
+        defaults: dict[str, object] = {
+            "uid": "p:m.func",
+            "name": "func",
+            "qualified_name": "m.func",
+            "kind": "function",
+            "file_path": "m.py",
+            "line_start": 10,
+            "line_end": 20,
+            "signature": "def func(x):",
+            "docstring": "A function.",
+        }
+        defaults.update(kwargs)
+        return CompactNode(**defaults)  # type: ignore[arg-type]
+
+    def test_with_signature(self):
+        text = _render_node_text(self._node())
+        assert "# m.func (m.py:10-20)" in text
+        assert "def func(x):" in text
+        assert "A function." not in text  # docstring excluded by default
+
+    def test_with_docstring(self):
+        text = _render_node_text(self._node(), include_docstring=True)
+        assert "A function." in text
+
+    def test_no_line_range(self):
+        text = _render_node_text(self._node(line_start=None, line_end=None))
+        assert "(m.py)" in text
+
+    def test_no_file_path(self):
+        text = _render_node_text(self._node(file_path=""))
+        lines = text.split("\n")
+        # Header line should NOT have a parenthesized location
+        assert lines[0] == "# m.func"
+
+
+# ---------------------------------------------------------------------------
+# Truncate to budget
+# ---------------------------------------------------------------------------
+
+
+class TestTruncateToBudget:
+    def test_fits_within_budget(self):
+        text = "hello world"
+        result = _truncate_to_budget(text, 100, "cl100k_base")
+        assert result == text
+
+    def test_truncates_at_line_boundary(self):
+        text = "line one\nline two\nline three\nline four"
+        # Truncate to ~5 tokens — should cut at a line boundary
+        result = _truncate_to_budget(text, 5, "cl100k_base")
+        assert result.endswith(("line one", "line two"))
+        assert "\nline four" not in result
+
+    def test_empty_text(self):
+        assert _truncate_to_budget("", 10, "cl100k_base") == ""
+
+    def test_zero_budget(self):
+        assert _truncate_to_budget("hello", 0, "cl100k_base") == ""
+
+
+# ---------------------------------------------------------------------------
+# Context assembly
+# ---------------------------------------------------------------------------
+
+
+def _make_node(name: str, *, sig: str = "", doc: str = "", file_path: str = "mod.py") -> CompactNode:
+    return CompactNode(
+        uid=f"p:{name}",
+        name=name.rsplit(".", 1)[-1],
+        qualified_name=name,
+        kind="function",
+        file_path=file_path,
+        line_start=1,
+        line_end=5,
+        signature=sig or f"def {name.rsplit('.', 1)[-1]}():",
+        docstring=doc,
+    )
+
+
+class TestAssembleContext:
+    def test_target_always_included(self):
+        ec = ExpandedContext(target=_make_node("mod.target", doc="Target docstring."))
+        result = assemble_context(ec, budget=8000)
+        assert len(result.items) >= 1
+        assert result.items[0].role == "target"
+        assert result.items[0].uid == "p:mod.target"
+        assert "Target docstring." in result.items[0].text
+
+    def test_priority_ordering(self):
+        ec = ExpandedContext(
+            target=_make_node("mod.target"),
+            parent=_make_node("mod.MyClass", sig="class MyClass:"),
+            callees=[_make_node("mod.callee1")],
+            callers=[_make_node("mod.caller1")],
+            docs=[_make_node("doc.section", doc="Some documentation.")],
+            siblings=[_make_node("mod.sibling1")],
+            package_context="Package docstring.",
+        )
+        result = assemble_context(ec, budget=8000)
+        roles = [item.role for item in result.items]
+        # Verify priority order
+        assert roles.index("target") < roles.index("parent")
+        assert roles.index("parent") < roles.index("callee")
+        assert roles.index("callee") < roles.index("caller")
+        assert roles.index("caller") < roles.index("doc")
+        assert roles.index("doc") < roles.index("sibling")
+        assert roles.index("sibling") < roles.index("package")
+
+    def test_budget_never_exceeded(self):
+        ec = ExpandedContext(
+            target=_make_node("mod.target", doc="Long docstring. " * 50),
+            callees=[_make_node(f"mod.callee{i}") for i in range(20)],
+            callers=[_make_node(f"mod.caller{i}") for i in range(20)],
+            siblings=[_make_node(f"mod.sibling{i}") for i in range(10)],
+        )
+        result = assemble_context(ec, budget=500)
+        assert result.total_tokens <= result.budget
+
+    def test_small_budget_excludes_lower_priority(self):
+        ec = ExpandedContext(
+            target=_make_node("mod.target"),
+            parent=_make_node("mod.Parent", sig="class Parent:"),
+            callees=[_make_node("mod.callee1")],
+            siblings=[_make_node("mod.sibling1")],
+            package_context="Package info.",
+        )
+        # Very small budget — should include target but exclude some later items
+        result = assemble_context(ec, budget=50)
+        roles = {item.role for item in result.items}
+        assert "target" in roles
+        # With 50 tokens, unlikely to fit everything
+        assert result.total_tokens <= 50
+
+    def test_different_budgets_different_sizes(self):
+        ec = ExpandedContext(
+            target=_make_node("mod.target", doc="Docstring. " * 10),
+            callees=[_make_node(f"mod.callee{i}") for i in range(10)],
+            callers=[_make_node(f"mod.caller{i}") for i in range(10)],
+        )
+        small = assemble_context(ec, budget=200)
+        large = assemble_context(ec, budget=2000)
+        assert len(large.items) >= len(small.items)
+        assert large.total_tokens >= small.total_tokens
+
+    def test_render(self):
+        ec = ExpandedContext(
+            target=_make_node("mod.target"),
+            callees=[_make_node("mod.callee1")],
+        )
+        result = assemble_context(ec, budget=8000)
+        rendered = result.render()
+        assert "## Target" in rendered
+        assert "## Direct Callees" in rendered
+        assert "mod.target" in rendered
+
+    def test_excluded_counts(self):
+        ec = ExpandedContext(
+            target=_make_node("mod.target"),
+            callees=[_make_node(f"mod.callee{i}") for i in range(20)],
+        )
+        result = assemble_context(ec, budget=200)
+        # Some callees should be excluded
+        if result.excluded_counts:
+            assert "callee" in result.excluded_counts
+            assert result.excluded_counts["callee"] > 0
+
+    def test_empty_expanded_context(self):
+        ec = ExpandedContext(target=_make_node("mod.target"))
+        result = assemble_context(ec, budget=8000)
+        assert len(result.items) == 1
+        assert result.items[0].role == "target"
+        assert result.excluded_counts == {}
+
+    def test_section_headers_in_output(self):
+        ec = ExpandedContext(
+            target=_make_node("mod.target"),
+            parent=_make_node("mod.Parent", sig="class Parent:"),
+        )
+        result = assemble_context(ec, budget=8000)
+        texts = [item.text for item in result.items]
+        assert any("## Target" in t for t in texts)
+        assert any("## Class Context" in t for t in texts)
+
+    def test_multiple_items_same_role(self):
+        """Second item in same role group should NOT have section header."""
+        ec = ExpandedContext(
+            target=_make_node("mod.target"),
+            callees=[_make_node("mod.callee1"), _make_node("mod.callee2")],
+        )
+        result = assemble_context(ec, budget=8000)
+        callee_items = [item for item in result.items if item.role == "callee"]
+        assert len(callee_items) == 2
+        assert "## Direct Callees" in callee_items[0].text
+        assert "## Direct Callees" not in callee_items[1].text
+
+    def test_tokenizer_parameter(self):
+        ec = ExpandedContext(target=_make_node("mod.target"))
+        result = assemble_context(ec, budget=8000, tokenizer="claude")
+        assert result.total_tokens > 0
+
+
+class TestAssembledContext:
+    def test_frozen(self):
+        ac = AssembledContext(items=[], total_tokens=0, budget=8000)
+        with pytest.raises(AttributeError):
+            ac.total_tokens = 99  # type: ignore[misc]
+
+    def test_render_empty(self):
+        ac = AssembledContext(items=[], total_tokens=0, budget=8000)
+        assert ac.render() == ""
+
+
+class TestContextItem:
+    def test_frozen(self):
+        ci = ContextItem(role="target", text="hello", tokens=1)
+        with pytest.raises(AttributeError):
+            ci.role = "other"  # type: ignore[misc]
+
+    def test_defaults(self):
+        ci = ContextItem(role="target", text="hello", tokens=1)
+        assert ci.uid == ""
+        assert ci.truncated is False

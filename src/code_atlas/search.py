@@ -9,8 +9,10 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+import tiktoken
 from loguru import logger
 
 from code_atlas.schema import RelType
@@ -76,6 +78,212 @@ class ExpandedContext:
     callers: list[CompactNode] = field(default_factory=list)
     docs: list[CompactNode] = field(default_factory=list)
     package_context: str = ""
+
+
+@dataclass(frozen=True)
+class ContextItem:
+    """A single piece of assembled context with its token cost."""
+
+    role: str  # target | parent | callee | caller | doc | sibling | package
+    text: str
+    tokens: int
+    uid: str = ""
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class AssembledContext:
+    """Budget-aware assembled context ready for LLM consumption."""
+
+    items: list[ContextItem]
+    total_tokens: int
+    budget: int
+    excluded_counts: dict[str, int] = field(default_factory=dict)
+
+    def render(self) -> str:
+        """Render all items as a single text block."""
+        return "\n\n".join(item.text for item in self.items)
+
+
+# ---------------------------------------------------------------------------
+# Token counting
+# ---------------------------------------------------------------------------
+
+_TOKENIZER_ALIASES: dict[str, str] = {
+    "claude": "cl100k_base",
+}
+
+
+@lru_cache(maxsize=4)
+def _get_encoding(name: str) -> tiktoken.Encoding:
+    """Get a cached tiktoken encoding by name."""
+    resolved = _TOKENIZER_ALIASES.get(name, name)
+    return tiktoken.get_encoding(resolved)
+
+
+def count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
+    """Count tokens in *text* using a tiktoken encoding."""
+    if not text:
+        return 0
+    return len(_get_encoding(encoding_name).encode(text))
+
+
+# ---------------------------------------------------------------------------
+# Context rendering helpers
+# ---------------------------------------------------------------------------
+
+_ROLE_HEADERS: dict[str, str] = {
+    "target": "## Target",
+    "parent": "## Class Context",
+    "callee": "## Direct Callees",
+    "caller": "## Direct Callers",
+    "doc": "## Documentation",
+    "sibling": "## Sibling Methods",
+    "package": "## Package Context",
+}
+
+_MIN_USEFUL_TOKENS = 20
+
+
+def _render_node_text(node: CompactNode, *, include_docstring: bool = False) -> str:
+    """Render a CompactNode as compact text for context assembly."""
+    parts: list[str] = []
+
+    qn = node.qualified_name or node.name
+    loc = node.file_path or ""
+    if loc and node.line_start is not None:
+        loc += f":{node.line_start}"
+        if node.line_end is not None:
+            loc += f"-{node.line_end}"
+
+    parts.append(f"# {qn}" + (f" ({loc})" if loc else ""))
+
+    if node.signature:
+        parts.append(node.signature)
+
+    if include_docstring and node.docstring:
+        parts.append(node.docstring)
+
+    return "\n".join(parts)
+
+
+def _truncate_to_budget(text: str, max_tokens: int, encoding_name: str) -> str:
+    """Truncate *text* to fit within *max_tokens*, cutting at line boundaries."""
+    if not text or max_tokens <= 0:
+        return ""
+    enc = _get_encoding(encoding_name)
+    tokens = enc.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    truncated = enc.decode(tokens[:max_tokens])
+    # Cut at last newline to avoid mid-line truncation
+    last_nl = truncated.rfind("\n")
+    if last_nl > 0:
+        return truncated[:last_nl]
+    return truncated
+
+
+# ---------------------------------------------------------------------------
+# Context assembly
+# ---------------------------------------------------------------------------
+
+
+def _make_target_item(expanded: ExpandedContext, budget: int, tokenizer: str) -> ContextItem:
+    """Build the always-included target ContextItem, truncating if needed."""
+    text = f"{_ROLE_HEADERS['target']}\n{_render_node_text(expanded.target, include_docstring=True)}"
+    tokens = count_tokens(text, tokenizer)
+    if tokens > budget > 0:
+        text = _truncate_to_budget(text, budget, tokenizer)
+        tokens = count_tokens(text, tokenizer)
+        return ContextItem(role="target", text=text, tokens=tokens, uid=expanded.target.uid, truncated=True)
+    return ContextItem(role="target", text=text, tokens=tokens, uid=expanded.target.uid)
+
+
+def assemble_context(
+    expanded: ExpandedContext,
+    budget: int = 8000,
+    tokenizer: str = "cl100k_base",
+) -> AssembledContext:
+    """Assemble context within token budget using priority ordering.
+
+    Priority:
+    1. Target code (always included)
+    2. Class context (parent)
+    3. Direct callees
+    4. Direct callers
+    5. Documentation
+    6. Sibling methods
+    7. Package context
+    """
+    items: list[ContextItem] = []
+    used = 0
+    excluded: dict[str, int] = {}
+    seen_roles: set[str] = set()
+
+    def _try_add(role: str, text: str, uid: str = "") -> bool:
+        nonlocal used
+        full_text = text
+        if role not in seen_roles:
+            full_text = f"{_ROLE_HEADERS.get(role, f'## {role.title()}')}\n{text}"
+
+        tokens = count_tokens(full_text, tokenizer)
+        if used + tokens <= budget:
+            items.append(ContextItem(role=role, text=full_text, tokens=tokens, uid=uid))
+            seen_roles.add(role)
+            used += tokens
+            return True
+
+        remaining = budget - used
+        if remaining >= _MIN_USEFUL_TOKENS:
+            trunc = _truncate_to_budget(full_text, remaining, tokenizer)
+            if trunc:
+                t_tokens = count_tokens(trunc, tokenizer)
+                items.append(ContextItem(role=role, text=trunc, tokens=t_tokens, uid=uid, truncated=True))
+                seen_roles.add(role)
+                used += t_tokens
+                return True
+        return False
+
+    def _add_nodes(role: str, nodes: list[CompactNode], *, include_docstring: bool = False) -> None:
+        for i, node in enumerate(nodes):
+            if budget - used < _MIN_USEFUL_TOKENS:
+                excluded[role] = excluded.get(role, 0) + (len(nodes) - i)
+                break
+            if not _try_add(role, _render_node_text(node, include_docstring=include_docstring), node.uid):
+                excluded[role] = excluded.get(role, 0) + 1
+
+    # Priority 1: Target (always included)
+    target_item = _make_target_item(expanded, budget, tokenizer)
+    items.append(target_item)
+    seen_roles.add("target")
+    used += target_item.tokens
+
+    # Priority 2: Class context
+    if (
+        expanded.parent
+        and budget - used >= _MIN_USEFUL_TOKENS
+        and not _try_add("parent", _render_node_text(expanded.parent), expanded.parent.uid)
+    ):
+        excluded["parent"] = 1
+
+    # Priority 3-6: callees, callers, docs, siblings
+    _add_nodes("callee", expanded.callees)
+    _add_nodes("caller", expanded.callers)
+    _add_nodes("doc", expanded.docs, include_docstring=True)
+    _add_nodes("sibling", expanded.siblings)
+
+    # Priority 7: Package context
+    if (
+        expanded.package_context
+        and budget - used >= _MIN_USEFUL_TOKENS
+        and not _try_add("package", expanded.package_context)
+    ):
+        excluded["package"] = 1
+
+    if excluded:
+        logger.debug("Context assembly excluded: {}", excluded)
+
+    return AssembledContext(items=items, total_tokens=used, budget=budget, excluded_counts=excluded)
 
 
 # ---------------------------------------------------------------------------

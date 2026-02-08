@@ -58,6 +58,8 @@ class SearchSettings(BaseSettings):
     """Search and retrieval settings."""
 
     default_token_budget: int = Field(default=8000, description="Default token budget for context assembly.")
+    max_token_budget: int = Field(default=32000, description="Maximum allowed token budget for context assembly.")
+    tokenizer: str = Field(default="cl100k_base", description="Tiktoken encoding name for token counting.")
     test_filter: bool = Field(default=True, description="Exclude test files from results by default.")
     max_caller_depth: int = Field(default=1, description="Default hop depth for caller/callee expansion.")
     max_callers: int = Field(default=10, description="Max callers to return before ranking/filtering.")
