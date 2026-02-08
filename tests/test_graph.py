@@ -867,3 +867,41 @@ async def test_upsert_delta_preserves_embeddings_unchanged(graph_client: GraphCl
     assert len(records) == 1
     assert records[0]["hash"] == "embed_abc"
     assert records[0]["vec"] == embedding
+
+
+async def test_upsert_updates_positions_on_shift(graph_client: GraphClient):
+    """Adding an entity above existing ones updates their line_start/line_end."""
+    await graph_client.ensure_schema()
+
+    project = "delta_pos"
+    fp = "src/mod.py"
+
+    # Initial: func_b at lines 1-5
+    entity_b = _make_entity(project, "func_b", fp, line_start=1, line_end=5, content_hash="bbb")
+    await graph_client.upsert_file_entities(project, fp, [entity_b], [])
+
+    # Set embed data on func_b — should be preserved after position update
+    dim = graph_client._dimension
+    await graph_client.execute_write(
+        "MATCH (n {uid: $uid}) SET n.embed_hash = $hash, n.embedding = $vec",
+        {"uid": f"{project}:src.mod.func_b", "hash": "emb_b", "vec": [0.5] * dim},
+    )
+
+    # Now add func_a above it — func_b shifts to lines 6-10
+    entity_a = _make_entity(project, "func_a", fp, line_start=1, line_end=4, content_hash="aaa")
+    entity_b_shifted = _make_entity(project, "func_b", fp, line_start=6, line_end=10, content_hash="bbb")
+
+    result = await graph_client.upsert_file_entities(project, fp, [entity_a, entity_b_shifted], [])
+    assert "src.mod.func_a" in result.added
+    assert "src.mod.func_b" in result.unchanged
+
+    # Verify func_b's position was updated
+    records = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN n.line_start AS ls, n.line_end AS le, n.embed_hash AS hash",
+        {"uid": f"{project}:src.mod.func_b"},
+    )
+    assert len(records) == 1
+    assert records[0]["ls"] == 6
+    assert records[0]["le"] == 10
+    # Embed data preserved — no re-embedding needed
+    assert records[0]["hash"] == "emb_b"

@@ -129,15 +129,15 @@ class GraphClient:
             )
             raise RuntimeError(msg)
 
-    async def get_file_content_hashes(self, project_name: str, file_path: str) -> dict[str, str]:
-        """Return ``{uid: content_hash}`` for all non-structural nodes in a file."""
+    async def get_file_content_hashes(self, project_name: str, file_path: str) -> dict[str, tuple[str, int, int]]:
+        """Return ``{uid: (content_hash, line_start, line_end)}`` for all non-structural nodes in a file."""
         records = await self.execute(
             f"MATCH (n {{project_name: $p, file_path: $f}}) "
             f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            "RETURN n.uid AS uid, n.content_hash AS hash",
+            "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le",
             {"p": project_name, "f": file_path},
         )
-        return {r["uid"]: r["hash"] or "" for r in records}
+        return {r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0) for r in records}
 
     async def upsert_file_entities(
         self,
@@ -152,22 +152,26 @@ class GraphClient:
         classify each as added/modified/deleted/unchanged.  Unchanged entities
         are skipped entirely — their embed data is never touched.
 
+        When entities are added or deleted, unchanged entities may have shifted
+        line positions.  Their ``line_start``/``line_end`` are updated without
+        invalidating embeddings.
+
         Returns an ``UpsertResult`` describing what changed.
         """
-        # 1. Read old content hashes
-        old_hashes = await self.get_file_content_hashes(project_name, file_path)
+        # 1. Read old content hashes + positions
+        old_data = await self.get_file_content_hashes(project_name, file_path)
 
         # 2. Build new hash map keyed on uid (= qualified_name including project prefix)
         new_hashes: dict[str, str] = {e.qualified_name: e.content_hash for e in entities}
         new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
 
-        old_uids = set(old_hashes)
+        old_uids = set(old_data)
         new_uids = set(new_hashes)
 
         added_uids = new_uids - old_uids
         deleted_uids = old_uids - new_uids
         common_uids = old_uids & new_uids
-        modified_uids = {uid for uid in common_uids if old_hashes[uid] != new_hashes[uid]}
+        modified_uids = {uid for uid in common_uids if old_data[uid][0] != new_hashes[uid]}
         unchanged_uids = common_uids - modified_uids
 
         # 3. Fast path: nothing changed → skip graph writes entirely
@@ -192,7 +196,19 @@ class GraphClient:
             modified_entities = [new_entity_map[uid] for uid in modified_uids]
             await self._batch_update_entities(modified_entities)
 
-        # 4d. Recreate ALL relationships for the file (delete old, create new).
+        # 4d. Update positions of unchanged entities that shifted
+        #     (only when entity count changed — adds or deletes cause shifts)
+        if unchanged_uids and (added_uids or deleted_uids):
+            shifted = [
+                new_entity_map[uid]
+                for uid in unchanged_uids
+                if (new_entity_map[uid].line_start, new_entity_map[uid].line_end)
+                != (old_data[uid][1], old_data[uid][2])
+            ]
+            if shifted:
+                await self._batch_update_positions(shifted)
+
+        # 4e. Recreate ALL relationships for the file (delete old, create new).
         #     Relationships are cheap and context-dependent — simpler to rebuild.
         await self._recreate_file_relationships(project_name, file_path, relationships)
 
@@ -221,10 +237,10 @@ class GraphClient:
 
     async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
         """Delete all non-structural entity nodes for a file. Returns deleted uids."""
-        old_hashes = await self.get_file_content_hashes(project_name, file_path)
-        if old_hashes:
-            await self._batch_delete_entities(list(old_hashes.keys()))
-        return [self._strip_uid(uid) for uid in old_hashes]
+        old_data = await self.get_file_content_hashes(project_name, file_path)
+        if old_data:
+            await self._batch_delete_entities(list(old_data.keys()))
+        return [self._strip_uid(uid) for uid in old_data]
 
     async def merge_project_node(self, project_name: str, **metadata: Any) -> None:
         """Create or update a Project node by uid."""
@@ -285,6 +301,27 @@ class GraphClient:
                 {"uid": project_name},
             )
         return await self.execute(f"MATCH (n:{NodeLabel.PROJECT}) RETURN n")
+
+    async def get_project_git_hash(self, project_name: str) -> str | None:
+        """Read stored git_hash from the Project node."""
+        records = await self.execute(
+            f"MATCH (n:{NodeLabel.PROJECT} {{uid: $uid}}) RETURN n.git_hash AS git_hash",
+            {"uid": project_name},
+        )
+        if not records or records[0]["git_hash"] is None:
+            return None
+        return records[0]["git_hash"]
+
+    async def get_project_file_paths(self, project_name: str) -> set[str]:
+        """Return all distinct file_paths indexed for a project (non-structural nodes)."""
+        records = await self.execute(
+            f"MATCH (n {{project_name: $p}}) "
+            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+            f"AND NOT n:{NodeLabel.SCHEMA_VERSION} "
+            "RETURN DISTINCT n.file_path AS fp",
+            {"p": project_name},
+        )
+        return {r["fp"] for r in records if r["fp"]}
 
     async def count_entities(self, project_name: str) -> int:
         """Count all entity nodes (Module, TypeDef, Callable, Value, Package) for a project."""
@@ -619,6 +656,14 @@ class GraphClient:
             "n.signature = e.signature, n.tags = e.tags, "
             "n.header_path = e.header_path, n.header_level = e.header_level, "
             "n.content_hash = e.content_hash",
+            {"entities": params},
+        )
+
+    async def _batch_update_positions(self, entities: list[ParsedEntity]) -> None:
+        """Update only line_start/line_end for entities whose content didn't change."""
+        params = [{"uid": e.qualified_name, "ls": e.line_start, "le": e.line_end} for e in entities]
+        await self.execute_write(
+            "UNWIND $entities AS e MATCH (n {uid: e.uid}) SET n.line_start = e.ls, n.line_end = e.le",
             {"entities": params},
         )
 

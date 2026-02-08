@@ -97,6 +97,14 @@ class DetectorSettings(BaseSettings):
     )
 
 
+class IndexSettings(BaseSettings):
+    """Indexing delta settings."""
+
+    delta_threshold: float = Field(
+        default=0.3, description="If more than this fraction of files changed, fall back to full re-index."
+    )
+
+
 class WatcherSettings(BaseSettings):
     """File watcher debounce settings."""
 
@@ -130,6 +138,7 @@ class AtlasSettings(BaseSettings):
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     memgraph: MemgraphSettings = Field(default_factory=MemgraphSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    index: IndexSettings = Field(default_factory=IndexSettings)
     watcher: WatcherSettings = Field(default_factory=WatcherSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)

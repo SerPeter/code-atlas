@@ -200,6 +200,19 @@ class Tier1GraphConsumer(TierConsumer):
 # | Entity added/deleted             | HIGH     | Always gate   |
 
 
+@dataclass
+class Tier2Stats:
+    """Accumulated delta statistics for Tier 2 processing."""
+
+    files_processed: int = 0
+    files_skipped: int = 0
+    files_deleted: int = 0
+    entities_added: int = 0
+    entities_modified: int = 0
+    entities_deleted: int = 0
+    entities_unchanged: int = 0
+
+
 class Tier2ASTConsumer(TierConsumer):
     """Tier 2: Parse AST via tree-sitter, write entities to graph, publish EmbedDirty."""
 
@@ -213,6 +226,7 @@ class Tier2ASTConsumer(TierConsumer):
         )
         self.graph = graph
         self.settings = settings
+        self.stats = Tier2Stats()
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         all_paths: list[str] = []
@@ -234,7 +248,9 @@ class Tier2ASTConsumer(TierConsumer):
             full_path = Path(self.settings.project_root) / file_path
             if not full_path.is_file():
                 logger.debug("Tier2: file deleted, removing entities for {}", file_path)
-                await self.graph.delete_file_entities(project_name, file_path)
+                deleted = await self.graph.delete_file_entities(project_name, file_path)
+                self.stats.files_deleted += 1
+                self.stats.entities_deleted += len(deleted)
                 continue
 
             try:
@@ -257,10 +273,18 @@ class Tier2ASTConsumer(TierConsumer):
                 relationships=parsed.relationships,
             )
 
+            # Accumulate stats
+            self.stats.files_processed += 1
+            self.stats.entities_added += len(result.added)
+            self.stats.entities_modified += len(result.modified)
+            self.stats.entities_deleted += len(result.deleted)
+            self.stats.entities_unchanged += len(result.unchanged)
+
             # Only collect refs for added + modified entities (not unchanged)
             changed_qns = set(result.added) | set(result.modified)
             if not changed_qns:
                 files_skipped += 1
+                self.stats.files_skipped += 1
                 continue
 
             total_changed += len(changed_qns)

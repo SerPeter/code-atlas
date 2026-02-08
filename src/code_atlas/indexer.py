@@ -9,7 +9,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pathspec
 from loguru import logger
@@ -49,6 +49,19 @@ _DEFAULT_EXCLUDES: list[str] = [
 
 
 @dataclass(frozen=True)
+class DeltaStats:
+    """File- and entity-level delta statistics for an indexing run."""
+
+    files_added: int = 0
+    files_modified: int = 0
+    files_deleted: int = 0
+    entities_added: int = 0
+    entities_modified: int = 0
+    entities_deleted: int = 0
+    entities_unchanged: int = 0
+
+
+@dataclass(frozen=True)
 class IndexResult:
     """Summary of an indexing run."""
 
@@ -56,6 +69,8 @@ class IndexResult:
     files_published: int
     entities_total: int
     duration_s: float
+    mode: str = "full"  # "full" | "delta"
+    delta_stats: DeltaStats | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +296,10 @@ def _detect_packages(project_root: Path) -> list[tuple[str, str]]:
 
 
 def _get_git_hash(project_root: Path) -> str | None:
-    """Get the current git HEAD short hash, or None if not a git repo."""
+    """Get the current git HEAD full hash, or None if not a git repo."""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=project_root,
             capture_output=True,
             text=True,
@@ -296,6 +311,43 @@ def _get_git_hash(project_root: Path) -> str | None:
     except FileNotFoundError, subprocess.TimeoutExpired:
         pass
     return None
+
+
+_GIT_STATUS_MAP = {"A": "created", "M": "modified", "D": "deleted"}
+
+
+def _git_changed_files(project_root: Path, from_hash: str) -> list[tuple[str, str]] | None:
+    """Return files changed between *from_hash* and HEAD as ``[(path, change_type), ...]``.
+
+    Uses ``git diff --name-status --no-renames`` so renames appear as delete+add.
+    Returns ``None`` if git fails (invalid hash, not a repo, etc.) — caller
+    falls back to full mode.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-status", "--no-renames", from_hash, "--", "."],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning("git diff failed (rc={}): {}", result.returncode, result.stderr.strip())
+            return None
+    except FileNotFoundError, subprocess.TimeoutExpired:
+        return None
+
+    changes: list[tuple[str, str]] = []
+    for line in result.stdout.strip().splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        status_code, file_path = parts
+        change_type = _GIT_STATUS_MAP.get(status_code, "modified")
+        # Normalise to forward slashes
+        changes.append((file_path.replace("\\", "/"), change_type))
+    return changes
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +405,11 @@ async def _run_pipeline(
     embed: EmbedClient,
     cache: EmbedCache | None,
     drain_timeout_s: float,
-) -> None:
-    """Start inline tier consumers and wait for the pipeline to drain."""
+) -> Tier2ASTConsumer:
+    """Start inline tier consumers and wait for the pipeline to drain.
+
+    Returns the Tier2 consumer so callers can read accumulated stats.
+    """
     await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
     await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
     await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
@@ -383,6 +438,93 @@ async def _run_pipeline(
         if cache is not None:
             await cache.close()
 
+    return tier2
+
+
+@dataclass
+class _DeltaDecision:
+    """Result of the delta vs. full mode decision."""
+
+    mode: str  # "full" | "delta"
+    files_added: set[str]
+    files_modified: set[str]
+    files_deleted: set[str]
+
+
+async def _decide_delta_mode(
+    settings: AtlasSettings,
+    graph: GraphClient,
+    project_name: str,
+    project_root: Path,
+    current_file_set: set[str],
+) -> _DeltaDecision:
+    """Determine whether to use delta or full mode based on git diff and threshold."""
+    stored_hash = await graph.get_project_git_hash(project_name)
+    if stored_hash is None:
+        return _DeltaDecision("full", set(), set(), set())
+
+    git_changes = _git_changed_files(project_root, stored_hash)
+    if git_changes is None:
+        return _DeltaDecision("full", set(), set(), set())
+
+    old_file_paths = await graph.get_project_file_paths(project_name)
+    git_changed_paths = {path for path, _ in git_changes}
+    files_deleted = old_file_paths - current_file_set
+    files_added = current_file_set - old_file_paths
+    files_modified = (git_changed_paths & current_file_set) - files_added
+
+    all_affected = files_added | files_modified | files_deleted
+    ratio = len(all_affected) / len(current_file_set) if current_file_set else 1.0
+
+    if ratio > settings.index.delta_threshold:
+        logger.info(
+            "Delta ratio {:.0%} exceeds threshold {:.0%} — falling back to full mode",
+            ratio,
+            settings.index.delta_threshold,
+        )
+        return _DeltaDecision("full", set(), set(), set())
+
+    if all_affected:
+        logger.info(
+            "Delta mode: {} added, {} modified, {} deleted ({:.0%} of {} files)",
+            len(files_added),
+            len(files_modified),
+            len(files_deleted),
+            ratio,
+            len(current_file_set),
+        )
+    else:
+        logger.info("Delta mode: no changes detected")
+
+    return _DeltaDecision("delta", files_added, files_modified, files_deleted)
+
+
+async def _publish_events(
+    bus: EventBus,
+    mode: str,
+    files: list[str],
+    decision: _DeltaDecision,
+) -> int:
+    """Publish FileChanged events and return the count published."""
+    if mode == "delta":
+        published = 0
+        for fp in decision.files_added:
+            await bus.publish(Topic.FILE_CHANGED, FileChanged(path=fp, change_type="created"))
+            published += 1
+        for fp in decision.files_modified:
+            await bus.publish(Topic.FILE_CHANGED, FileChanged(path=fp, change_type="modified"))
+            published += 1
+        for fp in decision.files_deleted:
+            await bus.publish(Topic.FILE_CHANGED, FileChanged(path=fp, change_type="deleted"))
+            published += 1
+        logger.info("Published {} FileChanged events (delta)", published)
+        return published
+
+    for file_path in files:
+        await bus.publish(Topic.FILE_CHANGED, FileChanged(path=file_path, change_type="created"))
+    logger.info("Published {} FileChanged events (full)", len(files))
+    return len(files)
+
 
 async def index_project(
     settings: AtlasSettings,
@@ -393,14 +535,15 @@ async def index_project(
     full_reindex: bool = False,
     drain_timeout_s: float = 120.0,
 ) -> IndexResult:
-    """Run a full index of the project through the event pipeline.
+    """Run a full or delta index of the project through the event pipeline.
 
     1. Scan files
     2. Optionally wipe old data (full reindex)
-    3. Create Project + Package hierarchy in the graph
-    4. Publish FileChanged events to Valkey
-    5. Run inline Tier 1 + Tier 2 consumers until the pipeline drains
-    6. Update Project metadata (counts, git hash)
+    3. Decide full vs. delta mode (git diff, threshold check)
+    4. Create Project + Package hierarchy in the graph
+    5. Publish FileChanged events to Valkey (all or delta-only)
+    6. Run inline Tier 1 + Tier 2 consumers until the pipeline drains
+    7. Update Project metadata (counts, git hash, delta stats)
     """
     start = time.monotonic()
     project_name = settings.project_root.name
@@ -427,37 +570,74 @@ async def index_project(
 
     await _check_model_lock(graph, settings.embeddings.model, settings.embeddings.dimension, reindex=full_reindex)
 
-    # 3. Create Project + Package hierarchy
+    # 3. Decide full vs. delta mode
+    if full_reindex:
+        decision = _DeltaDecision("full", set(), set(), set())
+    else:
+        decision = await _decide_delta_mode(settings, graph, project_name, project_root, set(files))
+
+    # 4. Create Project + Package hierarchy
     pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
     logger.info("Created {} package node(s)", pkg_count)
 
-    # 4. Publish FileChanged events
-    for file_path in files:
-        await bus.publish(Topic.FILE_CHANGED, FileChanged(path=file_path, change_type="created"))
-    logger.info("Published {} FileChanged events", len(files))
+    # 5. Publish FileChanged events
+    published = await _publish_events(bus, decision.mode, files, decision)
 
-    # 5. Start inline consumers and wait for drain
-    await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s)
+    # 6. Start inline consumers and wait for drain
+    t2stats = None
+    if published > 0:
+        tier2 = await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s)
+        t2stats = tier2.stats
 
-    # 6. Update Project metadata
+    # 7. Update Project metadata
     entity_count = await graph.count_entities(project_name)
     git_hash = _get_git_hash(project_root)
-    await graph.update_project_metadata(
-        project_name,
-        last_indexed_at=time.time(),
-        file_count=len(files),
-        entity_count=entity_count,
-        **({"git_hash": git_hash} if git_hash else {}),
-    )
+    metadata: dict[str, Any] = {
+        "last_indexed_at": time.time(),
+        "file_count": len(files),
+        "entity_count": entity_count,
+        "index_mode": decision.mode,
+    }
+    if git_hash:
+        metadata["git_hash"] = git_hash
+    if decision.mode == "delta":
+        metadata["delta_files_added"] = len(decision.files_added)
+        metadata["delta_files_modified"] = len(decision.files_modified)
+        metadata["delta_files_deleted"] = len(decision.files_deleted)
+    await graph.update_project_metadata(project_name, **metadata)
 
     duration = time.monotonic() - start
-    logger.info("Indexing complete: {} files, {} entities, {:.1f}s", len(files), entity_count, duration)
+    delta_stats = _build_delta_stats(decision, t2stats) if decision.mode == "delta" else None
+
+    logger.info(
+        "Indexing complete ({}): {} files scanned, {} published, {} entities, {:.1f}s",
+        decision.mode,
+        len(files),
+        published,
+        entity_count,
+        duration,
+    )
 
     return IndexResult(
         files_scanned=len(files),
-        files_published=len(files),
+        files_published=published,
         entities_total=entity_count,
         duration_s=duration,
+        mode=decision.mode,
+        delta_stats=delta_stats,
+    )
+
+
+def _build_delta_stats(decision: _DeltaDecision, t2stats: Any) -> DeltaStats:
+    """Build DeltaStats from the decision and Tier2 stats."""
+    return DeltaStats(
+        files_added=len(decision.files_added),
+        files_modified=len(decision.files_modified),
+        files_deleted=len(decision.files_deleted),
+        entities_added=t2stats.entities_added if t2stats else 0,
+        entities_modified=t2stats.entities_modified if t2stats else 0,
+        entities_deleted=t2stats.entities_deleted if t2stats else 0,
+        entities_unchanged=t2stats.entities_unchanged if t2stats else 0,
     )
 
 

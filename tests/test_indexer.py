@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
 
 from code_atlas.events import EventBus
-from code_atlas.indexer import FileScope, index_project, scan_files
+from code_atlas.indexer import FileScope, _git_changed_files, index_project, scan_files
 from code_atlas.schema import NodeLabel
-from code_atlas.settings import AtlasSettings, ScopeSettings
+from code_atlas.settings import AtlasSettings, IndexSettings, ScopeSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -340,3 +341,281 @@ class TestIndexProjectIntegration:
         # Should still complete and index the good file
         assert result.files_scanned >= 2
         assert result.entities_total > 0
+
+
+# ---------------------------------------------------------------------------
+# _git_changed_files — unit tests (requires git CLI, no infrastructure)
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd, *args):
+    """Run a git command in cwd."""
+    subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+
+def _init_git_repo(tmp_path):
+    """Initialise a git repo with an initial commit."""
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@test.com")
+    _git(tmp_path, "config", "user.name", "Test")
+
+
+def _get_head(tmp_path):
+    """Return the full HEAD hash."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+class TestGitChangedFiles:
+    def test_added_file(self, tmp_path):
+        """New files since the base commit are detected as 'created'."""
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "app.py", "x = 1")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        base_hash = _get_head(tmp_path)
+
+        _write(tmp_path, "new.py", "y = 2")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "add new")
+
+        changes = _git_changed_files(tmp_path, base_hash)
+
+        assert changes is not None
+        paths = {p for p, _ in changes}
+        types = dict(changes)
+        assert "new.py" in paths
+        assert types["new.py"] == "created"
+
+    def test_modified_file(self, tmp_path):
+        """Modified files are detected as 'modified'."""
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "app.py", "x = 1")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        base_hash = _get_head(tmp_path)
+
+        _write(tmp_path, "app.py", "x = 2")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "modify")
+
+        changes = _git_changed_files(tmp_path, base_hash)
+
+        assert changes is not None
+        types = dict(changes)
+        assert types["app.py"] == "modified"
+
+    def test_deleted_file(self, tmp_path):
+        """Deleted files are detected as 'deleted'."""
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "old.py", "y = 2")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        base_hash = _get_head(tmp_path)
+
+        (tmp_path / "old.py").unlink()
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "delete")
+
+        changes = _git_changed_files(tmp_path, base_hash)
+
+        assert changes is not None
+        types = dict(changes)
+        assert types["old.py"] == "deleted"
+
+    def test_invalid_hash_returns_none(self, tmp_path):
+        """An invalid base hash returns None (fallback to full mode)."""
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "app.py", "x = 1")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+
+        result = _git_changed_files(tmp_path, "0000000000000000000000000000000000000000")
+
+        assert result is None
+
+    def test_no_changes(self, tmp_path):
+        """No changes returns empty list."""
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "app.py", "x = 1")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        base_hash = _get_head(tmp_path)
+
+        changes = _git_changed_files(tmp_path, base_hash)
+
+        assert changes is not None
+        assert changes == []
+
+
+# ---------------------------------------------------------------------------
+# Delta threshold — unit test
+# ---------------------------------------------------------------------------
+
+
+class TestDeltaThreshold:
+    def test_threshold_setting_default(self):
+        """Default delta threshold is 0.3."""
+        settings = IndexSettings()
+        assert settings.delta_threshold == 0.3
+
+    def test_threshold_setting_custom(self):
+        """Custom delta threshold is respected."""
+        settings = IndexSettings(delta_threshold=0.5)
+        assert settings.delta_threshold == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Delta indexing — integration tests (require Memgraph + Valkey + git)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestDeltaIndexIntegration:
+    @pytest.fixture
+    def git_project(self, tmp_path):
+        """Create a git-tracked Python project with initial commit."""
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "src/__init__.py", "")
+        _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
+        _write(tmp_path, "src/utils.py", "MAGIC = 42\n\ndef add(a, b):\n    return a + b\n")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        return tmp_path
+
+    @pytest.fixture
+    async def bus(self, settings):
+        """EventBus fixture — skips if Valkey is unreachable."""
+        bus = EventBus(settings.redis)
+        try:
+            await bus.ping()
+        except Exception:
+            pytest.skip("Valkey not available")
+        yield bus
+        await bus.close()
+
+    async def test_delta_index_mode(self, git_project, graph_client, bus):
+        """Re-indexing without changes uses delta mode."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+
+        # First index — full mode
+        r1 = await index_project(settings, graph_client, bus)
+        assert r1.mode == "full"
+        assert r1.entities_total > 0
+
+        # Re-index without changes — delta mode, 0 published
+        r2 = await index_project(settings, graph_client, bus)
+        assert r2.mode == "delta"
+        assert r2.files_published == 0
+        assert r2.entities_total == r1.entities_total
+
+    async def test_delta_index_publishes_only_changed(self, git_project, graph_client, bus):
+        """Modifying one file only publishes that file in delta mode."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+
+        # First index
+        r1 = await index_project(settings, graph_client, bus)
+        assert r1.mode == "full"
+
+        # Modify one file and commit
+        _write(git_project, "src/app.py", 'def hello():\n    """Say hello!""""\n    return "hello world"\n')
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "modify app")
+
+        # Delta re-index
+        r2 = await index_project(settings, graph_client, bus)
+        assert r2.mode == "delta"
+        assert r2.delta_stats is not None
+        assert r2.delta_stats.files_modified >= 1
+        assert r2.files_published >= 1
+
+    async def test_delta_index_detects_new_files(self, git_project, graph_client, bus):
+        """New files are picked up in delta mode."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+
+        # First index
+        await index_project(settings, graph_client, bus)
+
+        # Add new file and commit
+        _write(git_project, "src/new_module.py", "NEW_CONST = 99\n")
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "add new module")
+
+        # Delta re-index
+        r2 = await index_project(settings, graph_client, bus)
+        assert r2.mode == "delta"
+        assert r2.delta_stats is not None
+        assert r2.delta_stats.files_added >= 1
+
+    async def test_delta_index_handles_deletion(self, git_project, graph_client, bus):
+        """Deleted files' entities are removed from the graph."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+
+        # First index
+        r1 = await index_project(settings, graph_client, bus)
+        e1 = r1.entities_total
+
+        # Delete a file and commit
+        (git_project / "src" / "utils.py").unlink()
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "remove utils")
+
+        # Delta re-index
+        r2 = await index_project(settings, graph_client, bus)
+        assert r2.mode == "delta"
+        assert r2.delta_stats is not None
+        assert r2.delta_stats.files_deleted >= 1
+        # Entity count should have dropped
+        assert r2.entities_total < e1
+
+    async def test_delta_index_full_fallback_on_threshold(self, git_project, graph_client, bus):
+        """Exceeding the threshold triggers full mode."""
+        # Set a very low threshold so any change exceeds it
+        settings = AtlasSettings(project_root=git_project, index=IndexSettings(delta_threshold=0.0))
+        await graph_client.ensure_schema()
+
+        # First index
+        await index_project(settings, graph_client, bus)
+
+        # Modify a file and commit
+        _write(git_project, "src/app.py", 'def hello():\n    return "changed"\n')
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "change")
+
+        # Re-index with threshold=0.0 — should fall back to full
+        r2 = await index_project(settings, graph_client, bus)
+        assert r2.mode == "full"
+
+    async def test_delta_index_preserves_unchanged(self, git_project, graph_client, bus):
+        """Unchanged entities keep their entity count after delta re-index."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+
+        # First index
+        r1 = await index_project(settings, graph_client, bus)
+
+        # Re-index without changes
+        r2 = await index_project(settings, graph_client, bus)
+        assert r2.mode == "delta"
+        assert r2.entities_total == r1.entities_total
+
+    async def test_full_reindex_flag_overrides_delta(self, git_project, graph_client, bus):
+        """--full flag forces full mode even when delta is available."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+
+        await index_project(settings, graph_client, bus)
+
+        r2 = await index_project(settings, graph_client, bus, full_reindex=True)
+        assert r2.mode == "full"

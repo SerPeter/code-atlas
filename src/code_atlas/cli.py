@@ -131,11 +131,25 @@ async def _run_index(path: str, scope: list[str] | None, full_reindex: bool) -> 
             full_reindex=full_reindex,
         )
         logger.info(
-            "Done — {} files scanned, {} entities indexed in {:.1f}s",
+            "Done ({}) — {} files scanned, {} published, {} entities in {:.1f}s",
+            result.mode,
             result.files_scanned,
+            result.files_published,
             result.entities_total,
             result.duration_s,
         )
+        if result.delta_stats is not None:
+            ds = result.delta_stats
+            logger.info(
+                "Delta: files +{} ~{} -{} | entities +{} ~{} -{} ={} unchanged",
+                ds.files_added,
+                ds.files_modified,
+                ds.files_deleted,
+                ds.entities_added,
+                ds.entities_modified,
+                ds.entities_deleted,
+                ds.entities_unchanged,
+            )
     finally:
         await graph.close()
         await bus.close()
