@@ -40,6 +40,10 @@ stream_prefix = "atlas"
 default_token_budget = 8000
 # Exclude test files from search results by default
 test_filter = true
+stub_filter = true
+generated_filter = true
+test_patterns = ["test_*", "*_test.py", "tests/", "__tests__/"]
+generated_patterns = ["*_pb2.py", "*_pb2_grpc.py", "*.generated.*"]
 # Max hop depth for caller/callee expansion
 max_caller_depth = 1
 

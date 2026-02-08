@@ -476,6 +476,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "semantic search via Reciprocal Rank Fusion (RRF). "
             "Automatically adjusts channel weights based on query shape: identifier-like queries "
             "boost graph+BM25, natural language boosts vector. "
+            "By default, test entities, .pyi stubs, and generated code are excluded. "
+            "Set exclude_tests/exclude_stubs/exclude_generated to false to include them "
+            "(e.g. to find tests for a function). "
             "Optional: search_types (comma-separated: graph,vector,bm25), "
             'scope (project name filter), weights (JSON: {"graph": 2.0}). '
             "Returns results ranked by fused score with provenance (which channels found each result)."
@@ -487,6 +490,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         search_types: str = "",
         scope: str = "",
         weights: str = "",
+        exclude_tests: bool | None = None,
+        exclude_stubs: bool | None = None,
+        exclude_generated: bool | None = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = _get_app_ctx(ctx)
@@ -515,6 +521,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             limit=clamped,
             scope=scope,
             weights=weight_dict,
+            exclude_tests=exclude_tests,
+            exclude_stubs=exclude_stubs,
+            exclude_generated=exclude_generated,
         )
         elapsed = (time.monotonic() - t0) * 1000
 

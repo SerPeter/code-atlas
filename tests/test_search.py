@@ -13,6 +13,10 @@ from code_atlas.search import (
     ExpandedContext,
     SearchResult,
     SearchType,
+    _apply_filters,
+    _is_generated_result,
+    _is_stub_result,
+    _is_test_result,
     _prioritize_callers,
     _render_node_text,
     _truncate_to_budget,
@@ -22,6 +26,7 @@ from code_atlas.search import (
     hybrid_search,
     rrf_fuse,
 )
+from code_atlas.settings import SearchSettings
 
 # ---------------------------------------------------------------------------
 # SearchType enum
@@ -259,6 +264,184 @@ class TestPrioritizeCallers:
 
 
 # ---------------------------------------------------------------------------
+# Result filtering predicates
+# ---------------------------------------------------------------------------
+
+
+def _result(
+    *,
+    name: str = "func",
+    file_path: str = "src/mod.py",
+    labels: list[str] | None = None,
+) -> SearchResult:
+    """Minimal SearchResult factory for filter tests."""
+    return SearchResult(
+        uid=f"p:{name}",
+        name=name,
+        qualified_name=f"mod.{name}",
+        kind="function",
+        file_path=file_path,
+        line_start=1,
+        line_end=5,
+        signature=f"def {name}():",
+        docstring="",
+        labels=labels or ["Callable"],
+        rrf_score=0.01,
+    )
+
+
+_TEST_PATTERNS = ["test_*", "*_test.py", "tests/", "__tests__/"]
+
+
+class TestIsTestResult:
+    def test_test_prefix_file(self):
+        assert _is_test_result(_result(file_path="test_utils.py"), _TEST_PATTERNS)
+
+    def test_test_suffix_file(self):
+        assert _is_test_result(_result(file_path="utils_test.py"), _TEST_PATTERNS)
+
+    def test_tests_directory(self):
+        assert _is_test_result(_result(file_path="tests/test_mod.py"), _TEST_PATTERNS)
+
+    def test_dunder_tests_directory(self):
+        assert _is_test_result(_result(file_path="src/__tests__/mod.spec.py"), _TEST_PATTERNS)
+
+    def test_entity_name_test_prefix(self):
+        assert _is_test_result(_result(name="test_get_user", file_path="src/mod.py"), _TEST_PATTERNS)
+
+    def test_entity_name_test_suffix(self):
+        assert _is_test_result(_result(name="get_user_test", file_path="src/mod.py"), _TEST_PATTERNS)
+
+    def test_non_test_file(self):
+        assert not _is_test_result(_result(file_path="src/utils.py"), _TEST_PATTERNS)
+
+    def test_non_test_entity(self):
+        assert not _is_test_result(_result(name="get_user", file_path="src/mod.py"), _TEST_PATTERNS)
+
+    def test_case_insensitive(self):
+        assert _is_test_result(_result(file_path="Tests/Test_Mod.py"), _TEST_PATTERNS)
+
+    def test_backslash_paths(self):
+        assert _is_test_result(_result(file_path="tests\\test_mod.py"), _TEST_PATTERNS)
+
+
+class TestIsStubResult:
+    def test_pyi_file(self):
+        assert _is_stub_result(_result(file_path="src/mod.pyi"))
+
+    def test_non_stub_file(self):
+        assert not _is_stub_result(_result(file_path="src/mod.py"))
+
+    def test_case_insensitive(self):
+        assert _is_stub_result(_result(file_path="src/Mod.PYI"))
+
+
+_GENERATED_PATTERNS = ["*_pb2.py", "*_pb2_grpc.py", "*.generated.*"]
+
+
+class TestIsGeneratedResult:
+    def test_protobuf_file(self):
+        assert _is_generated_result(_result(file_path="src/user_pb2.py"), _GENERATED_PATTERNS)
+
+    def test_grpc_file(self):
+        assert _is_generated_result(_result(file_path="src/user_pb2_grpc.py"), _GENERATED_PATTERNS)
+
+    def test_generated_pattern(self):
+        assert _is_generated_result(_result(file_path="src/schema.generated.ts"), _GENERATED_PATTERNS)
+
+    def test_normal_file(self):
+        assert not _is_generated_result(_result(file_path="src/user.py"), _GENERATED_PATTERNS)
+
+
+class TestApplyFilters:
+    def _settings(self, **overrides: object) -> SearchSettings:
+        defaults: dict[str, object] = {
+            "test_filter": True,
+            "stub_filter": True,
+            "generated_filter": True,
+            "test_patterns": ["test_*", "*_test.py", "tests/", "__tests__/"],
+            "generated_patterns": ["*_pb2.py", "*_pb2_grpc.py", "*.generated.*"],
+        }
+        defaults.update(overrides)
+        return SearchSettings(**defaults)  # type: ignore[arg-type]
+
+    def test_default_excludes_tests(self):
+        results = [
+            _result(name="get_user", file_path="src/mod.py"),
+            _result(name="test_get_user", file_path="tests/test_mod.py"),
+        ]
+        filtered = _apply_filters(results, self._settings())
+        assert len(filtered) == 1
+        assert filtered[0].name == "get_user"
+
+    def test_override_includes_tests(self):
+        results = [
+            _result(name="get_user", file_path="src/mod.py"),
+            _result(name="test_get_user", file_path="tests/test_mod.py"),
+        ]
+        filtered = _apply_filters(results, self._settings(), exclude_tests=False)
+        assert len(filtered) == 2
+
+    def test_default_excludes_stubs(self):
+        results = [
+            _result(file_path="src/mod.py"),
+            _result(file_path="src/mod.pyi"),
+        ]
+        filtered = _apply_filters(results, self._settings())
+        assert len(filtered) == 1
+        assert filtered[0].file_path == "src/mod.py"
+
+    def test_default_excludes_generated(self):
+        results = [
+            _result(file_path="src/user.py"),
+            _result(file_path="src/user_pb2.py"),
+        ]
+        filtered = _apply_filters(results, self._settings())
+        assert len(filtered) == 1
+        assert filtered[0].file_path == "src/user.py"
+
+    def test_custom_exclude_patterns(self):
+        results = [
+            _result(file_path="src/mod.py"),
+            _result(file_path="src/conftest.py"),
+        ]
+        filtered = _apply_filters(results, self._settings(), exclude_patterns=["conftest.py"])
+        assert len(filtered) == 1
+        assert filtered[0].file_path == "src/mod.py"
+
+    def test_include_patterns_whitelist(self):
+        results = [
+            _result(file_path="src/user.py"),
+            _result(file_path="src/auth.py"),
+            _result(file_path="src/utils.py"),
+        ]
+        filtered = _apply_filters(
+            results,
+            self._settings(test_filter=False),
+            include_patterns=["user.py"],
+        )
+        assert len(filtered) == 1
+        assert filtered[0].file_path == "src/user.py"
+
+    def test_all_filters_disabled(self):
+        results = [
+            _result(file_path="src/mod.py"),
+            _result(file_path="tests/test_mod.py"),
+            _result(file_path="src/mod.pyi"),
+            _result(file_path="src/user_pb2.py"),
+        ]
+        filtered = _apply_filters(
+            results,
+            self._settings(test_filter=False, stub_filter=False, generated_filter=False),
+        )
+        assert len(filtered) == 4
+
+    def test_empty_results(self):
+        filtered = _apply_filters([], self._settings())
+        assert filtered == []
+
+
+# ---------------------------------------------------------------------------
 # Integration tests — hybrid_search
 # ---------------------------------------------------------------------------
 
@@ -383,6 +566,46 @@ class TestHybridSearchIntegration:
         assert len(results) >= 1
         # No result should have vector source
         assert not any("vector" in r.sources for r in results)
+
+    async def test_filter_excludes_test_entity(self, seeded_graph, settings):
+        """Test entities are excluded by default filters."""
+        dim = seeded_graph._dimension
+        dummy_vec = [0.1] * dim
+
+        # Seed a test entity
+        await seeded_graph.execute_write(
+            "CREATE (n:Callable {uid: 'proj:tests.test_mod.test_get_user', project_name: 'proj', "
+            "name: 'test_get_user', qualified_name: 'tests.test_mod.test_get_user', "
+            "file_path: 'tests/test_mod.py', kind: 'function', line_start: 1, line_end: 5, "
+            "visibility: 'public', docstring: 'Test get_user', signature: 'def test_get_user():', "
+            "tags: [], embedding: $vec})",
+            {"vec": dummy_vec},
+        )
+
+        # Default: test entity excluded
+        results = await hybrid_search(
+            graph=seeded_graph,
+            embed=None,
+            settings=settings.search,
+            query="test_get_user",
+            search_types=[SearchType.GRAPH],
+            limit=10,
+        )
+        uids = [r.uid for r in results]
+        assert "proj:tests.test_mod.test_get_user" not in uids
+
+        # Override: include tests
+        results_with_tests = await hybrid_search(
+            graph=seeded_graph,
+            embed=None,
+            settings=settings.search,
+            query="test_get_user",
+            search_types=[SearchType.GRAPH],
+            limit=10,
+            exclude_tests=False,
+        )
+        uids_with_tests = [r.uid for r in results_with_tests]
+        assert "proj:tests.test_mod.test_get_user" in uids_with_tests
 
 
 # ---------------------------------------------------------------------------

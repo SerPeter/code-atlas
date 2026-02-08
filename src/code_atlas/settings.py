@@ -61,6 +61,16 @@ class SearchSettings(BaseSettings):
     max_token_budget: int = Field(default=32000, description="Maximum allowed token budget for context assembly.")
     tokenizer: str = Field(default="cl100k_base", description="Tiktoken encoding name for token counting.")
     test_filter: bool = Field(default=True, description="Exclude test files from results by default.")
+    stub_filter: bool = Field(default=True, description="Exclude .pyi type stubs from results by default.")
+    generated_filter: bool = Field(default=True, description="Exclude generated code patterns from results by default.")
+    test_patterns: list[str] = Field(
+        default_factory=lambda: ["test_*", "*_test.py", "tests/", "__tests__/"],
+        description="Glob patterns matching test file paths.",
+    )
+    generated_patterns: list[str] = Field(
+        default_factory=lambda: ["*_pb2.py", "*_pb2_grpc.py", "*.generated.*"],
+        description="Glob patterns matching generated code file paths.",
+    )
     max_caller_depth: int = Field(default=1, description="Default hop depth for caller/callee expansion.")
     max_callers: int = Field(default=10, description="Max callers to return before ranking/filtering.")
     max_siblings: int = Field(default=5, description="Max sibling entities in context expansion.")

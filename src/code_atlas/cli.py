@@ -33,9 +33,22 @@ def search(
     type_: str = typer.Option("hybrid", "--type", "-t", help="Search type: hybrid, graph, vector, bm25."),
     scope: str | None = typer.Option(None, help="Scope search to a project name."),
     limit: int = typer.Option(10, "--limit", "-n", help="Max results to return."),
+    include_tests: bool = typer.Option(False, "--include-tests", help="Include test entities in results."),
+    include_stubs: bool = typer.Option(False, "--include-stubs", help="Include .pyi type stubs in results."),
+    include_generated: bool = typer.Option(False, "--include-generated", help="Include generated code in results."),
 ) -> None:
     """Search the code graph."""
-    asyncio.run(_run_search(query, type_, scope, limit))
+    asyncio.run(
+        _run_search(
+            query,
+            type_,
+            scope,
+            limit,
+            exclude_tests=False if include_tests else None,
+            exclude_stubs=False if include_stubs else None,
+            exclude_generated=False if include_generated else None,
+        )
+    )
 
 
 @app.command()
@@ -115,7 +128,16 @@ async def _run_index(path: str, scope: list[str] | None, full_reindex: bool) -> 
         await bus.close()
 
 
-async def _run_search(query: str, type_: str, scope: str | None, limit: int) -> None:
+async def _run_search(
+    query: str,
+    type_: str,
+    scope: str | None,
+    limit: int,
+    *,
+    exclude_tests: bool | None = None,
+    exclude_stubs: bool | None = None,
+    exclude_generated: bool | None = None,
+) -> None:
     """Async implementation of the ``atlas search`` command."""
     from code_atlas.embeddings import EmbedClient
     from code_atlas.graph import GraphClient
@@ -156,6 +178,9 @@ async def _run_search(query: str, type_: str, scope: str | None, limit: int) -> 
             search_types=search_types,
             limit=limit,
             scope=scope or "",
+            exclude_tests=exclude_tests,
+            exclude_stubs=exclude_stubs,
+            exclude_generated=exclude_generated,
         )
         if not results:
             logger.info("No results found for '{}'", query)

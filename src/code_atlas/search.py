@@ -6,6 +6,7 @@ Consumed by both the MCP server and the CLI ``atlas search`` command.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -432,6 +433,94 @@ def _build_provenance(ranked_lists: dict[str, list[str]]) -> dict[str, dict[str,
     return uid_ranks
 
 
+def _normalize_path(path: str) -> str:
+    """Normalize a file path to forward slashes and lowercase for cross-platform matching."""
+    return path.replace("\\", "/").lower()
+
+
+def _is_test_result(result: SearchResult, patterns: list[str]) -> bool:
+    """Return True if *result* matches test file/entity patterns."""
+    fp = _normalize_path(result.file_path)
+    basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+
+    for pat in patterns:
+        pat_lower = pat.lower()
+        if pat_lower.endswith("/"):
+            # Directory pattern — check if any path segment matches
+            if f"/{pat_lower}" in f"/{fp}/" or fp.startswith(pat_lower):
+                return True
+        elif fnmatch.fnmatch(basename, pat_lower):
+            return True
+
+    # Also check entity name for test_* / *_test patterns
+    name = result.name.lower()
+    return name.startswith("test_") or name.endswith("_test")
+
+
+def _is_stub_result(result: SearchResult) -> bool:
+    """Return True if *result* comes from a .pyi type-stub file."""
+    return _normalize_path(result.file_path).endswith(".pyi")
+
+
+def _is_generated_result(result: SearchResult, patterns: list[str]) -> bool:
+    """Return True if *result* matches generated-code patterns."""
+    fp = _normalize_path(result.file_path)
+    basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+    return any(fnmatch.fnmatch(basename, pat.lower()) for pat in patterns)
+
+
+def _apply_filters(
+    results: list[SearchResult],
+    settings: SearchSettings,
+    *,
+    exclude_tests: bool | None = None,
+    exclude_stubs: bool | None = None,
+    exclude_generated: bool | None = None,
+    include_patterns: list[str] | None = None,
+    exclude_patterns: list[str] | None = None,
+) -> list[SearchResult]:
+    """Apply post-fusion filters to search results.
+
+    ``None`` values fall back to settings defaults.  Exclude filters run first,
+    then include-pattern whitelisting narrows further.
+    """
+    do_tests = settings.test_filter if exclude_tests is None else exclude_tests
+    do_stubs = settings.stub_filter if exclude_stubs is None else exclude_stubs
+    do_generated = settings.generated_filter if exclude_generated is None else exclude_generated
+
+    filtered: list[SearchResult] = []
+    excluded = 0
+    for result in results:
+        fp = _normalize_path(result.file_path)
+        basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+
+        # Exclude filters
+        if do_tests and _is_test_result(result, settings.test_patterns):
+            excluded += 1
+            continue
+        if do_stubs and _is_stub_result(result):
+            excluded += 1
+            continue
+        if do_generated and _is_generated_result(result, settings.generated_patterns):
+            excluded += 1
+            continue
+        if exclude_patterns and any(fnmatch.fnmatch(basename, p.lower()) for p in exclude_patterns):
+            excluded += 1
+            continue
+
+        # Include-pattern whitelist (if specified, only matching results pass)
+        if include_patterns and not any(fnmatch.fnmatch(basename, p.lower()) for p in include_patterns):
+            excluded += 1
+            continue
+
+        filtered.append(result)
+
+    if excluded:
+        logger.debug("Result filtering excluded {} of {} results", excluded, len(results))
+
+    return filtered
+
+
 async def hybrid_search(
     graph: GraphClient,
     embed: EmbedClient | None,
@@ -442,6 +531,11 @@ async def hybrid_search(
     limit: int = 20,
     scope: str = "",
     weights: dict[str, float] | None = None,
+    exclude_tests: bool | None = None,
+    exclude_stubs: bool | None = None,
+    exclude_generated: bool | None = None,
+    include_patterns: list[str] | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search across selected channels and fuse with RRF.
 
@@ -463,6 +557,16 @@ async def hybrid_search(
         Optional project name filter.
     weights:
         Explicit per-channel weight overrides (merged with auto-weights).
+    exclude_tests:
+        Exclude test entities (None = use settings.test_filter).
+    exclude_stubs:
+        Exclude .pyi stubs (None = use settings.stub_filter).
+    exclude_generated:
+        Exclude generated code (None = use settings.generated_filter).
+    include_patterns:
+        Only include results whose basename matches one of these globs.
+    exclude_patterns:
+        Exclude results whose basename matches any of these globs.
     """
     if search_types is None:
         search_types = list(SearchType)
@@ -502,8 +606,8 @@ async def hybrid_search(
     fused_scores = rrf_fuse(ranked_lists, k=settings.rrf_k, weights=effective_weights)
     uid_ranks = _build_provenance(ranked_lists)
 
-    # Build SearchResult objects
-    return [
+    # Build all SearchResult objects, apply filters, then slice to limit
+    all_results = [
         SearchResult(
             uid=uid,
             name=props_by_uid.get(uid, {}).get("name", ""),
@@ -518,8 +622,19 @@ async def hybrid_search(
             rrf_score=rrf_score,
             sources=uid_ranks.get(uid, {}),
         )
-        for uid, rrf_score in list(fused_scores.items())[:limit]
+        for uid, rrf_score in fused_scores.items()
     ]
+
+    filtered = _apply_filters(
+        all_results,
+        settings,
+        exclude_tests=exclude_tests,
+        exclude_stubs=exclude_stubs,
+        exclude_generated=exclude_generated,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+    )
+    return filtered[:limit]
 
 
 # ---------------------------------------------------------------------------
