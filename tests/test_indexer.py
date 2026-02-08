@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from typing import TYPE_CHECKING
 
 import pytest
 
 from code_atlas.events import EventBus
-from code_atlas.indexer import FileScope, _git_changed_files, index_project, scan_files
+from code_atlas.indexer import (
+    FileScope,
+    StalenessChecker,
+    _git_changed_files,
+    _read_git_head,
+    index_project,
+    scan_files,
+)
 from code_atlas.schema import NodeLabel
 from code_atlas.settings import AtlasSettings, IndexSettings, ScopeSettings
 
@@ -619,3 +627,194 @@ class TestDeltaIndexIntegration:
 
         r2 = await index_project(settings, graph_client, bus, full_reindex=True)
         assert r2.mode == "full"
+
+
+# ---------------------------------------------------------------------------
+# _read_git_head — unit tests (no infrastructure)
+# ---------------------------------------------------------------------------
+
+
+class TestReadGitHead:
+    def test_reads_ref_head(self, tmp_path):
+        """Reads HEAD via ref: pointer to a loose ref file."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        refs_dir = git_dir / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        fake_hash = "a" * 40
+        (refs_dir / "main").write_text(fake_hash + "\n", encoding="utf-8")
+
+        assert _read_git_head(tmp_path) == fake_hash
+
+    def test_reads_detached_head(self, tmp_path):
+        """Detached HEAD with a raw 40-char hex hash."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        fake_hash = "b" * 40
+        (git_dir / "HEAD").write_text(fake_hash + "\n", encoding="utf-8")
+
+        assert _read_git_head(tmp_path) == fake_hash
+
+    def test_reads_packed_ref(self, tmp_path):
+        """Falls back to packed-refs when the loose ref file is missing."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        fake_hash = "c" * 40
+        (git_dir / "packed-refs").write_text(
+            f"# pack-refs with: peeled fully-peeled sorted\n{fake_hash} refs/heads/main\n",
+            encoding="utf-8",
+        )
+
+        assert _read_git_head(tmp_path) == fake_hash
+
+    def test_returns_none_no_git(self, tmp_path):
+        """Returns None for directories without .git."""
+        assert _read_git_head(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# StalenessChecker — unit tests (no infrastructure)
+# ---------------------------------------------------------------------------
+
+
+class TestStalenessChecker:
+    def test_current_head_caches_by_mtime(self, tmp_path):
+        """Same mtime returns cached value without re-reading the file."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        refs_dir = git_dir / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        fake_hash = "d" * 40
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (refs_dir / "main").write_text(fake_hash + "\n", encoding="utf-8")
+
+        checker = StalenessChecker(tmp_path)
+        h1 = checker.current_head()
+        assert h1 == fake_hash
+
+        # Overwrite file content but keep the same text — mtime hasn't changed (fast enough)
+        # The cache should still return the same hash
+        h2 = checker.current_head()
+        assert h2 == fake_hash
+
+    def test_current_head_invalidates_on_mtime_change(self, tmp_path):
+        """New ref content with changed mtime triggers re-read."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        refs_dir = git_dir / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        hash1 = "d" * 40
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        ref_file = refs_dir / "main"
+        ref_file.write_text(hash1 + "\n", encoding="utf-8")
+
+        checker = StalenessChecker(tmp_path)
+        assert checker.current_head() == hash1
+
+        # Write a new hash and force mtime change
+        time.sleep(0.05)
+        hash2 = "e" * 40
+        ref_file.write_text(hash2 + "\n", encoding="utf-8")
+
+        assert checker.current_head() == hash2
+
+    def test_current_head_non_git_dir(self, tmp_path):
+        """Non-git directory returns None."""
+        checker = StalenessChecker(tmp_path)
+        assert checker.current_head() is None
+
+    def test_project_name(self, tmp_path):
+        """project_name is derived from project_root.name."""
+        checker = StalenessChecker(tmp_path)
+        assert checker.project_name == tmp_path.resolve().name
+
+
+# ---------------------------------------------------------------------------
+# stale_mode setting — unit test
+# ---------------------------------------------------------------------------
+
+
+class TestStaleMode:
+    def test_stale_mode_default(self):
+        """Default stale_mode is 'warn'."""
+        settings = IndexSettings()
+        assert settings.stale_mode == "warn"
+
+
+# ---------------------------------------------------------------------------
+# Staleness check — integration tests (require Memgraph + Valkey + git)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestStalenessCheckIntegration:
+    @pytest.fixture
+    def git_project(self, tmp_path):
+        """Create a git-tracked Python project with initial commit."""
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "src/__init__.py", "")
+        _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        return tmp_path
+
+    @pytest.fixture
+    async def bus(self, settings):
+        """EventBus fixture — skips if Valkey is unreachable."""
+        bus = EventBus(settings.redis)
+        try:
+            await bus.ping()
+        except Exception:
+            pytest.skip("Valkey not available")
+        yield bus
+        await bus.close()
+
+    async def test_not_stale_when_hashes_match(self, git_project, graph_client, bus):
+        """After indexing, the checker reports not stale."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+        await index_project(settings, graph_client, bus)
+
+        checker = StalenessChecker(git_project)
+        info = await checker.check(graph_client)
+
+        assert info.stale is False
+        assert info.current_commit is not None
+        assert info.last_indexed_commit is not None
+
+    async def test_stale_when_new_commit(self, git_project, graph_client, bus):
+        """A new commit after indexing makes the checker report stale."""
+        settings = AtlasSettings(project_root=git_project)
+        await graph_client.ensure_schema()
+        await index_project(settings, graph_client, bus)
+
+        # Make a new commit
+        _write(git_project, "src/new.py", "x = 1\n")
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "new file")
+
+        checker = StalenessChecker(git_project)
+        info = await checker.check(graph_client)
+
+        assert info.stale is True
+        assert info.changed_files  # should list at least src/new.py
+
+    async def test_not_stale_non_git_dir(self, tmp_path, graph_client):
+        """Non-git directory is never stale."""
+        checker = StalenessChecker(tmp_path)
+        info = await checker.check(graph_client)
+
+        assert info.stale is False
+
+    async def test_stale_never_indexed(self, git_project, graph_client):
+        """Git project with no stored hash is stale."""
+        await graph_client.ensure_schema()
+
+        checker = StalenessChecker(git_project)
+        info = await checker.check(graph_client)
+
+        assert info.stale is True
+        assert info.last_indexed_commit is None
+        assert info.current_commit is not None

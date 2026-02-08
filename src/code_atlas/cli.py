@@ -168,6 +168,7 @@ async def _run_search(
     """Async implementation of the ``atlas search`` command."""
     from code_atlas.embeddings import EmbedClient
     from code_atlas.graph import GraphClient
+    from code_atlas.indexer import StalenessChecker
     from code_atlas.search import SearchType, hybrid_search
     from code_atlas.settings import AtlasSettings
 
@@ -224,6 +225,15 @@ async def _run_search(
                 sources,
                 loc,
             )
+
+        # Staleness check
+        checker = StalenessChecker(settings.project_root)
+        info = await checker.check(graph, include_changed=True)
+        if info.stale:
+            commit_str = info.last_indexed_commit[:8] if info.last_indexed_commit else "never"
+            logger.warning("Index is stale (last indexed: {})", commit_str)
+            if info.changed_files:
+                logger.warning("  {} file(s) changed since last index", len(info.changed_files))
     finally:
         await graph.close()
 

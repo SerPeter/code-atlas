@@ -103,6 +103,10 @@ class IndexSettings(BaseSettings):
     delta_threshold: float = Field(
         default=0.3, description="If more than this fraction of files changed, fall back to full re-index."
     )
+    stale_mode: str = Field(
+        default="warn",
+        description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
+    )
 
 
 class WatcherSettings(BaseSettings):

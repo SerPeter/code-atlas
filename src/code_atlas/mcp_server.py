@@ -18,6 +18,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from code_atlas.embeddings import EmbedClient, EmbeddingError
 from code_atlas.graph import GraphClient
+from code_atlas.indexer import StalenessChecker
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
@@ -61,6 +62,7 @@ class AppContext:
     graph: GraphClient
     settings: AtlasSettings
     embed: EmbedClient
+    staleness: StalenessChecker | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +172,40 @@ def _clamp_limit(limit: int | None) -> int:
     return max(1, min(limit, _MAX_LIMIT))
 
 
+async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str = "") -> dict[str, Any]:
+    """Annotate a query result envelope with staleness info.
+
+    - ``stale_mode == "ignore"``: return result unchanged.
+    - ``stale_mode == "lock"`` and stale: return an error envelope.
+    - ``stale_mode == "warn"``: add ``stale``, ``stale_since``, ``changed_files`` keys.
+    """
+    stale_mode = app.settings.index.stale_mode
+    if stale_mode == "ignore" or app.staleness is None:
+        return result
+
+    checker = app.staleness
+    # Only check matching project or empty scope
+    if scope and scope != checker.project_name:
+        return result
+
+    info = await checker.check(app.graph, include_changed=(stale_mode == "warn"))
+
+    if stale_mode == "lock" and info.stale:
+        msg = "Index is stale"
+        if info.last_indexed_commit:
+            msg += f" (last indexed: {info.last_indexed_commit[:8]})"
+        msg += ". Re-index before querying."
+        return _error(msg, code="STALE_INDEX")
+
+    # warn mode (default)
+    result["stale"] = info.stale
+    if info.stale:
+        result["stale_since"] = info.last_indexed_commit
+        if info.changed_files:
+            result["changed_files"] = info.changed_files
+    return result
+
+
 # Visibility ranking: lower = more relevant (public entities preferred)
 _VISIBILITY_RANK: dict[str, int] = {"public": 0, "protected": 1, "internal": 2, "private": 3}
 
@@ -212,7 +248,8 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
 
         logger.info("MCP connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
         embed = EmbedClient(settings.embeddings)
-        app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
+        staleness = StalenessChecker(settings.project_root)
+        app_ctx = AppContext(graph=graph, settings=settings, embed=embed, staleness=staleness)
         try:
             yield app_ctx
         finally:
@@ -262,6 +299,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
 
         label_filter = f":{label}" if label else ""
         t0 = time.monotonic()
+        found: list[dict[str, Any]] | None = None
 
         # Stage 1: Exact uid match (if name contains ':')
         if ":" in name:
@@ -270,51 +308,48 @@ def _register_node_tools(mcp: FastMCP) -> None:
                 {"name": name},
             )
             if records:
-                elapsed = (time.monotonic() - t0) * 1000
-                ranked = _rank_results([_compact_node(r) for r in records])
-                return _result(ranked, limit=clamped, query_ms=elapsed)
+                found = records
 
         # Stage 2: Exact name match
-        records = await app.graph.execute(
-            f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
-            {"name": name},
-        )
-        if records:
-            elapsed = (time.monotonic() - t0) * 1000
-            ranked = _rank_results([_compact_node(r) for r in records])
-            return _result(ranked, limit=clamped, query_ms=elapsed)
+        if found is None:
+            records = await app.graph.execute(
+                f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
+                {"name": name},
+            )
+            if records:
+                found = records
 
         # Stage 3: ENDS WITH suffix match
-        suffix = f".{name}"
-        records = await app.graph.execute(
-            f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {clamped}",
-            {"suffix": suffix},
-        )
-        if records:
-            elapsed = (time.monotonic() - t0) * 1000
-            ranked = _rank_results([_compact_node(r) for r in records])
-            return _result(ranked, limit=clamped, query_ms=elapsed)
+        if found is None:
+            suffix = f".{name}"
+            records = await app.graph.execute(
+                f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {clamped}",
+                {"suffix": suffix},
+            )
+            if records:
+                found = records
 
         # Stage 4: STARTS WITH prefix match
-        prefix = f"{name}."
-        records = await app.graph.execute(
-            f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix RETURN n LIMIT {clamped}",
-            {"prefix": prefix},
-        )
-        if records:
-            elapsed = (time.monotonic() - t0) * 1000
-            ranked = _rank_results([_compact_node(r) for r in records])
-            return _result(ranked, limit=clamped, query_ms=elapsed)
+        if found is None:
+            prefix = f"{name}."
+            records = await app.graph.execute(
+                f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix RETURN n LIMIT {clamped}",
+                {"prefix": prefix},
+            )
+            if records:
+                found = records
 
         # Stage 5: CONTAINS match (qualified_name or name)
-        records = await app.graph.execute(
-            f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
-            f"RETURN n LIMIT {clamped}",
-            {"name": name},
-        )
+        if found is None:
+            found = await app.graph.execute(
+                f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
+                f"RETURN n LIMIT {clamped}",
+                {"name": name},
+            )
+
         elapsed = (time.monotonic() - t0) * 1000
-        ranked = _rank_results([_compact_node(r) for r in records])
-        return _result(ranked, limit=clamped, query_ms=elapsed)
+        ranked = _rank_results([_compact_node(r) for r in found])
+        return await _with_staleness(app, _result(ranked, limit=clamped, query_ms=elapsed))
 
 
 def _register_query_tools(mcp: FastMCP) -> None:
@@ -347,7 +382,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
         elapsed = (time.monotonic() - t0) * 1000
 
         serialized = [_serialize_node(r) for r in records]
-        return _result(serialized, limit=clamped, query_ms=elapsed)
+        return await _with_staleness(app, _result(serialized, limit=clamped, query_ms=elapsed))
 
     _register_node_tools(mcp)
 
@@ -386,7 +421,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
 
         elapsed = (time.monotonic() - t0) * 1000
 
-        return {
+        result = {
             "node": _compact_node_to_dict(expanded.target),
             "parent": _compact_node_to_dict(expanded.parent) if expanded.parent else None,
             "siblings": [_compact_node_to_dict(s) for s in expanded.siblings],
@@ -396,6 +431,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
             "package_context": expanded.package_context,
             "query_ms": round(elapsed, 1),
         }
+        return await _with_staleness(app, result)
 
 
 def _register_search_tools(mcp: FastMCP) -> None:
@@ -428,7 +464,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
-        return _result(compacted, limit=clamped, query_ms=elapsed)
+        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=project)
 
     @mcp.tool(
         description=(
@@ -464,7 +500,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
-        return _result(compacted, limit=clamped, query_ms=elapsed)
+        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=project)
 
 
 def _register_hybrid_tool(mcp: FastMCP) -> None:
@@ -548,7 +584,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             }
             for r in results
         ]
-        return _result(serialized, limit=clamped, query_ms=elapsed)
+        return await _with_staleness(app, _result(serialized, limit=clamped, query_ms=elapsed), scope=scope)
 
 
 def _register_info_tools(mcp: FastMCP) -> None:

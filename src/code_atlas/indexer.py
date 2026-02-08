@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -313,6 +314,8 @@ def _get_git_hash(project_root: Path) -> str | None:
     return None
 
 
+_GIT_HEX_RE = re.compile(r"^[0-9a-f]{40}$")
+
 _GIT_STATUS_MAP = {"A": "created", "M": "modified", "D": "deleted"}
 
 
@@ -348,6 +351,169 @@ def _git_changed_files(project_root: Path, from_hash: str) -> list[tuple[str, st
         # Normalise to forward slashes
         changes.append((file_path.replace("\\", "/"), change_type))
     return changes
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python HEAD reader (no subprocess)
+# ---------------------------------------------------------------------------
+
+
+def _read_git_head(project_root: Path) -> str | None:
+    """Read the current git HEAD hash without spawning a subprocess.
+
+    - If ``.git/HEAD`` contains ``ref: refs/heads/...``, read the ref file.
+    - If the ref file is missing, fall back to ``.git/packed-refs``.
+    - If HEAD is a detached 40-char hex hash, return directly.
+    - Returns ``None`` for non-git directories or on any read error.
+    """
+    git_dir = project_root / ".git"
+    head_file = git_dir / "HEAD"
+    try:
+        head_content = head_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    # Detached HEAD — raw 40-char hex
+    if _GIT_HEX_RE.match(head_content):
+        return head_content
+
+    # Symbolic ref: "ref: refs/heads/main"
+    if not head_content.startswith("ref: "):
+        return None
+
+    ref_path = head_content[5:].strip()
+    ref_file = git_dir / ref_path.replace("/", os.sep)
+
+    # Try loose ref file first
+    try:
+        return ref_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+
+    # Fall back to packed-refs
+    packed_refs = git_dir / "packed-refs"
+    try:
+        for raw_line in packed_refs.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith(("#", "^")):
+                continue
+            parts = stripped.split(" ", 1)
+            if len(parts) == 2 and parts[1] == ref_path:
+                return parts[0]
+    except OSError:
+        pass
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Staleness detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StalenessInfo:
+    """Result of a staleness check."""
+
+    stale: bool
+    last_indexed_commit: str | None = None
+    current_commit: str | None = None
+    changed_files: list[str] = field(default_factory=list)
+
+
+class StalenessChecker:
+    """Mtime-cached staleness checker for a git project.
+
+    ``current_head()`` reads ``.git/HEAD`` via :func:`_read_git_head`,
+    caching the result until the HEAD or ref file mtime changes.
+    ``check()`` compares the current HEAD against the stored ``git_hash``
+    on the Project node and optionally lists changed files.
+    """
+
+    def __init__(self, project_root: Path) -> None:
+        self._root = project_root.resolve()
+        self._cached_hash: str | None = None
+        self._cached_head_mtime: float | None = None
+        self._cached_ref_mtime: float | None = None
+        self._cached_ref_path: Path | None = None
+
+    @property
+    def project_name(self) -> str:
+        return self._root.name
+
+    def current_head(self) -> str | None:
+        """Return the current HEAD hash, cached by file mtime."""
+        git_dir = self._root / ".git"
+        head_file = git_dir / "HEAD"
+
+        try:
+            head_mtime = head_file.stat().st_mtime
+        except OSError:
+            self._cached_hash = None
+            return None
+
+        # Determine ref file path for mtime tracking
+        ref_path: Path | None = None
+        try:
+            head_content = head_file.read_text(encoding="utf-8").strip()
+            if head_content.startswith("ref: "):
+                ref_rel = head_content[5:].strip()
+                ref_path = git_dir / ref_rel.replace("/", os.sep)
+        except OSError:
+            pass
+
+        ref_mtime: float | None = None
+        if ref_path is not None:
+            with contextlib.suppress(OSError):
+                ref_mtime = ref_path.stat().st_mtime
+
+        # Check cache validity
+        if (
+            self._cached_hash is not None
+            and head_mtime == self._cached_head_mtime
+            and ref_path == self._cached_ref_path
+            and ref_mtime == self._cached_ref_mtime
+        ):
+            return self._cached_hash
+
+        # Cache miss — re-read
+        result = _read_git_head(self._root)
+        self._cached_hash = result
+        self._cached_head_mtime = head_mtime
+        self._cached_ref_path = ref_path
+        self._cached_ref_mtime = ref_mtime
+        return result
+
+    async def check(self, graph: GraphClient, *, include_changed: bool = True) -> StalenessInfo:
+        """Compare current HEAD against the stored git_hash on the Project node."""
+        current = self.current_head()
+        stored = await graph.get_project_git_hash(self.project_name)
+
+        # Non-git directory — not stale by definition
+        if current is None:
+            return StalenessInfo(stale=False)
+
+        # Never indexed — stale
+        if stored is None:
+            return StalenessInfo(stale=True, current_commit=current)
+
+        # Hashes match — not stale
+        if current == stored:
+            return StalenessInfo(stale=False, last_indexed_commit=stored, current_commit=current)
+
+        # Stale — optionally list changed files
+        changed: list[str] = []
+        if include_changed:
+            raw = _git_changed_files(self._root, stored)
+            if raw is not None:
+                changed = [path for path, _ in raw]
+
+        return StalenessInfo(
+            stale=True,
+            last_indexed_commit=stored,
+            current_commit=current,
+            changed_files=changed,
+        )
 
 
 # ---------------------------------------------------------------------------
