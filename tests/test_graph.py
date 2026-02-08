@@ -501,9 +501,10 @@ async def test_upsert_preserves_embed_data(graph_client: GraphClient):
     # First upsert — creates the node
     await graph_client.upsert_file_entities(project, fp, entities, [])
 
-    # Manually set embed_hash + embedding on the node
+    # Manually set embed_hash + embedding on the node (must match vector index dimension)
     embed_hash = "abc123"
-    embedding = [0.1, 0.2, 0.3]
+    dim = graph_client._dimension
+    embedding = [0.1] * dim
     await graph_client.execute_write(
         "MATCH (n {qualified_name: 'mod.my_func', project_name: $p}) SET n.embed_hash = $hash, n.embedding = $vec",
         {"p": project, "hash": embed_hash, "vec": embedding},
@@ -553,12 +554,12 @@ async def test_upsert_drops_embed_for_removed_entity(graph_client: GraphClient):
 
     await graph_client.upsert_file_entities(project, fp, entities, [])
 
-    # Set embed data on both
+    # Set embed data on both (must match vector index dimension)
+    dim = graph_client._dimension
     for qn in ("mod2.func_a", "mod2.func_b"):
         await graph_client.execute_write(
-            "MATCH (n {qualified_name: $qn, project_name: $p}) "
-            "SET n.embed_hash = 'hash_' + $qn, n.embedding = [1.0, 2.0]",
-            {"qn": qn, "p": project},
+            "MATCH (n {qualified_name: $qn, project_name: $p}) SET n.embed_hash = 'hash_' + $qn, n.embedding = $vec",
+            {"qn": qn, "p": project, "vec": [1.0] * dim},
         )
 
     # Re-upsert with only func_a (func_b was deleted from the file)
@@ -601,15 +602,18 @@ async def test_read_entity_texts_includes_embed_fields(graph_client: GraphClient
     """read_entity_texts returns embed_hash and embedding fields."""
     await graph_client.ensure_schema()
 
+    dim = graph_client._dimension
+    embedding = [0.1] * dim
     await graph_client.execute_write(
         f"CREATE (:{NodeLabel.CALLABLE} {{"
         "  uid: 'ret:proj.func', project_name: 'ret', name: 'func',"
         "  qualified_name: 'proj.func', kind: 'function', file_path: 'f.py',"
-        "  embed_hash: 'abc', embedding: [0.1, 0.2]"
-        "})"
+        "  embed_hash: 'abc', embedding: $emb, content_hash: 'ch'"
+        "})",
+        {"emb": embedding},
     )
 
     results = await graph_client.read_entity_texts(["proj.func"])
     assert len(results) == 1
     assert results[0]["embed_hash"] == "abc"
-    assert results[0]["embedding"] == [0.1, 0.2]
+    assert results[0]["embedding"] == embedding

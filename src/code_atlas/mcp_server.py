@@ -420,39 +420,28 @@ def _register_search_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "BM25 keyword search across code entities. "
+            "BM25 keyword search across code entities using Tantivy. "
             "Searches all text indices by default, or a single label if specified. "
             "Valid labels: Callable, Module, TypeDef, Value, DocSection. "
+            "Optional: project (filter by project_name). "
+            'Query syntax: quoted phrases ("exact phrase"), '
+            "field-specific (name:UserService, docstring:authentication), "
+            "wildcards (get*User), boolean (foo AND bar, foo OR bar). "
             "Returns compact metadata with relevance score."
         ),
     )
-    async def text_search(query: str, label: str = "", limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def text_search(
+        query: str,
+        label: str = "",
+        limit: int = 20,
+        project: str = "",
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
         app = _get_app_ctx(ctx)
         clamped = _clamp_limit(limit)
 
-        indices = (
-            [f"text_{label.lower()}"] if label else [f"text_{lbl.value.lower()}" for lbl in _TEXT_SEARCHABLE_LABELS]
-        )
-
         t0 = time.monotonic()
-        all_results: list[dict[str, Any]] = []
-
-        for index_name in indices:
-            cypher = (
-                f"CALL text_search.search('{index_name}', $query, {clamped}) "
-                "YIELD node, score "
-                "RETURN node, score "
-                f"ORDER BY score DESC LIMIT {clamped}"
-            )
-            try:
-                records = await app.graph.execute(cypher, {"query": query})
-                all_results.extend(records)
-            except Exception as exc:
-                logger.warning("Text search on {} failed: {}", index_name, exc)
-
-        # Sort by score descending and take top results
-        all_results.sort(key=lambda rec: rec.get("score", 0), reverse=True)
-        all_results = all_results[:clamped]
+        all_results = await app.graph.text_search(query, label=label, limit=clamped, project=project)
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
@@ -560,8 +549,9 @@ def _register_info_tools(mcp: FastMCP) -> None:
         )
         label_counts = {r["label"]: r["count"] for r in label_counts_raw}
 
-        # Vector index info
+        # Vector and text index info
         vec_index_info = await app.graph.get_vector_index_info()
+        text_index_info = await app.graph.get_text_index_info()
 
         elapsed = (time.monotonic() - t0) * 1000
 
@@ -569,6 +559,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
             "projects": projects,
             "label_counts": label_counts,
             "vector_indices": vec_index_info,
+            "text_indices": text_index_info,
             "schema_version": SCHEMA_VERSION,
             "query_ms": round(elapsed, 1),
         }

@@ -49,7 +49,10 @@ async def bus(redis_settings: RedisSettings):
 
 @pytest.fixture
 async def _clean_streams(bus: EventBus):
-    """Delete test streams after each test to avoid state leakage."""
+    """Delete test streams before and after each test to avoid state leakage."""
+    for topic in Topic:
+        key = f"{bus._prefix}:{topic.value}"
+        await bus._redis.delete(key)
     yield
     for topic in Topic:
         key = f"{bus._prefix}:{topic.value}"

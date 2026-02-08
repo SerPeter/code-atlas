@@ -18,6 +18,7 @@ from code_atlas.schema import (
     TEXT_INDICES,
     UNIQUE_CONSTRAINTS,
     NodeLabel,
+    generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
     generate_index_ddl,
@@ -117,7 +118,8 @@ class TestDDLGeneration:
         stmts = generate_text_index_ddl()
         assert len(stmts) == len(TEXT_INDICES)
         for stmt in stmts:
-            assert "text_search.create_index" in stmt
+            assert stmt.startswith("CREATE TEXT INDEX")
+            assert "ON :" in stmt
             assert stmt.endswith(";")
 
     def test_text_index_ddl_covers_searchable_labels(self):
@@ -125,6 +127,14 @@ class TestDDLGeneration:
         all_text = " ".join(stmts)
         for lbl in _TEXT_SEARCHABLE_LABELS:
             assert lbl.value in all_text, f"Missing text index for label: {lbl.value}"
+
+    def test_drop_text_index_ddl_syntax(self):
+        stmts = generate_drop_text_index_ddl()
+        assert len(stmts) == len(TEXT_INDICES)
+        for stmt in stmts:
+            assert stmt.startswith("DROP TEXT INDEX")
+            assert stmt.endswith(";")
+            assert "CALL" not in stmt
 
 
 class TestSchemaVersion:

@@ -307,8 +307,8 @@ def generate_vector_index_ddl(dimension: int, capacity: int = 50_000) -> list[st
 
 
 def generate_text_index_ddl() -> list[str]:
-    """Generate CREATE TEXT INDEX statements for BM25 searchable labels."""
-    return [f"CALL text_search.create_index('{spec.name}', '{spec.label.value}');" for spec in TEXT_INDICES]
+    """Generate CREATE TEXT INDEX statements for BM25 searchable labels (Memgraph 3.7+ DDL)."""
+    return [f"CREATE TEXT INDEX {spec.name} ON :{spec.label.value};" for spec in TEXT_INDICES]
 
 
 def generate_drop_vector_index_ddl() -> list[str]:
@@ -320,8 +320,8 @@ def generate_drop_vector_index_ddl() -> list[str]:
 
 
 def generate_drop_text_index_ddl() -> list[str]:
-    """Generate DROP statements for all text indices."""
-    return [f"CALL text_search.drop_index('{spec.name}');" for spec in TEXT_INDICES]
+    """Generate DROP statements for all text indices (Memgraph 3.7+ DDL)."""
+    return [f"DROP TEXT INDEX {spec.name};" for spec in TEXT_INDICES]
 
 
 # ---------------------------------------------------------------------------

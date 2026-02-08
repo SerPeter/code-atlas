@@ -411,11 +411,14 @@ class TestIndexStatus:
         assert project["name"] == "test-project"
         assert project["entity_count"] >= 1
         assert result["schema_version"] == SCHEMA_VERSION
+        assert "text_indices" in result
+        assert isinstance(result["text_indices"], list)
 
     async def test_index_status_empty_graph(self, app_ctx):
         result = await _invoke_tool(app_ctx, "index_status")
         assert result["projects"] == []
         assert result["schema_version"] == SCHEMA_VERSION
+        assert "text_indices" in result
 
 
 @pytest.mark.integration
@@ -427,6 +430,25 @@ class TestTextSearch:
         assert "results" in result
         assert "count" in result
         assert "query_ms" in result
+
+    async def test_text_search_with_label_filter(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "text_search", query="my_function", label="Callable")
+        assert "results" in result
+        assert "count" in result
+        assert "query_ms" in result
+        assert isinstance(result["results"], list)
+
+    async def test_text_search_with_project_filter(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "text_search", query="my_function", project="test-project")
+        assert "results" in result
+        assert "count" in result
+        assert "query_ms" in result
+        assert isinstance(result["results"], list)
+
+    async def test_text_search_empty_query(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "text_search", query="")
+        assert "results" in result
+        assert "count" in result
 
 
 class TestVectorSearchMock:

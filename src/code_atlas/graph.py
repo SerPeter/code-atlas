@@ -69,9 +69,14 @@ class GraphClient:
             return [dict(record) async for record in result]
 
     async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
-        """Execute a write query."""
+        """Execute a write query.
+
+        Consumes the result to ensure server-side errors (e.g. constraint
+        violations) are raised instead of being silently dropped.
+        """
         async with self._driver.session() as session:
-            await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+            result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+            await result.consume()
 
     async def get_schema_version(self) -> int | None:
         """Read the current schema version from the SchemaVersion node."""
@@ -136,9 +141,13 @@ class GraphClient:
         )
         embed_lookup: dict[str, tuple[str, list[float] | None]] = {r["qn"]: (r["hash"], r["vec"]) for r in old_embeds}
 
-        # 1. Delete existing nodes for this (project_name, file_path)
+        # 1. Delete existing entity nodes for this (project_name, file_path).
+        #    Exclude structural nodes (Package, Project) — they share the same
+        #    file_path as __init__.py modules but are managed by the hierarchy step.
         await self.execute_write(
-            "MATCH (n {project_name: $project_name, file_path: $file_path}) DETACH DELETE n",
+            f"MATCH (n {{project_name: $project_name, file_path: $file_path}}) "
+            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+            "DETACH DELETE n",
             {"project_name": project_name, "file_path": file_path},
         )
 
@@ -414,12 +423,24 @@ class GraphClient:
         return all_results[:limit]
 
     async def get_text_index_info(self) -> list[dict[str, Any]]:
-        """Query Memgraph for text index metadata.
+        """Query Memgraph for text index metadata via SHOW INDEX INFO (Memgraph 3.7+ DDL).
 
-        Returns a list of dicts with text index information.
+        Filters the generic index listing to text indices (type starts with 'label_text').
+        Returns a list of dicts with index_type, label, and name keys.
         """
         try:
-            return await self.execute("CALL text_search.show_index_info() YIELD * RETURN *")
+            rows = await self.execute(
+                "SHOW INDEX INFO"  # type: ignore[arg-type]
+            )
+            return [
+                {
+                    "index_type": r["index type"],
+                    "label": r["label"],
+                    "name": r["index type"].split("name: ")[-1].rstrip(")") if "name:" in r["index type"] else "",
+                }
+                for r in rows
+                if str(r.get("index type", "")).startswith("label_text")
+            ]
         except Exception as exc:
             logger.debug("Could not fetch text index info: {}", exc)
             return []
