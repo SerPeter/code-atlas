@@ -669,3 +669,65 @@ Just run the installer.
     rels = _doc_rels(parsed)
     explicit_rels = [r for r in rels if r.properties.get("link_type") == "explicit"]
     assert len(explicit_rels) == 0
+
+
+# ---------------------------------------------------------------------------
+# Content hash
+# ---------------------------------------------------------------------------
+
+
+def test_content_hash_populated():
+    """Every entity produced by parse_file has a non-empty content_hash."""
+    parsed = _parse(
+        """\
+class Foo:
+    def bar(self):
+        pass
+"""
+    )
+    for entity in parsed.entities:
+        assert entity.content_hash, f"Entity {entity.name!r} has empty content_hash"
+
+
+def test_content_hash_deterministic():
+    """Parsing the same source twice produces identical content_hashes."""
+    source = """\
+def greet(name):
+    \"\"\"Say hello.\"\"\"
+    print(f"Hello {name}")
+"""
+    parsed1 = _parse(source)
+    parsed2 = _parse(source)
+    for e1, e2 in zip(parsed1.entities, parsed2.entities, strict=True):
+        assert e1.content_hash == e2.content_hash
+
+
+def test_content_hash_ignores_line_shift():
+    """Inserting blank lines above an entity doesn't change its content_hash."""
+    source_v1 = "def greet():\n    pass\n"
+    source_v2 = "\n\n\ndef greet():\n    pass\n"
+    parsed1 = _parse(source_v1)
+    parsed2 = _parse(source_v2)
+    func1 = _entity_by_name(parsed1, "greet")
+    func2 = _entity_by_name(parsed2, "greet")
+    assert func1.content_hash == func2.content_hash
+    # But line_start differs
+    assert func1.line_start != func2.line_start
+
+
+def test_content_hash_changes_on_signature():
+    """Different function parameters produce different content_hashes."""
+    parsed1 = _parse("def work(x):\n    pass\n")
+    parsed2 = _parse("def work(x, y):\n    pass\n")
+    func1 = _entity_by_name(parsed1, "work")
+    func2 = _entity_by_name(parsed2, "work")
+    assert func1.content_hash != func2.content_hash
+
+
+def test_content_hash_changes_on_docstring():
+    """Different docstrings produce different content_hashes."""
+    parsed1 = _parse('def work():\n    """Version 1."""\n    pass\n')
+    parsed2 = _parse('def work():\n    """Version 2."""\n    pass\n')
+    func1 = _entity_by_name(parsed1, "work")
+    func2 = _entity_by_name(parsed2, "work")
+    assert func1.content_hash != func2.content_hash

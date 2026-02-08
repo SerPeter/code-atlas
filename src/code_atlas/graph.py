@@ -6,6 +6,7 @@ Uses the neo4j async driver (Bolt protocol) which is compatible with Memgraph.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,16 @@ if TYPE_CHECKING:
 
     from code_atlas.parser import ParsedEntity, ParsedRelationship
     from code_atlas.settings import AtlasSettings
+
+
+@dataclass(frozen=True)
+class UpsertResult:
+    """Result of a delta-aware upsert for a single file."""
+
+    added: list[str] = field(default_factory=list)  # qualified_names of new entities
+    modified: list[str] = field(default_factory=list)  # qualified_names with changed content_hash
+    deleted: list[str] = field(default_factory=list)  # qualified_names removed from file
+    unchanged: list[str] = field(default_factory=list)  # qualified_names with matching content_hash
 
 
 def _node_project_name(record: dict[str, Any]) -> str:
@@ -118,130 +129,102 @@ class GraphClient:
             )
             raise RuntimeError(msg)
 
+    async def get_file_content_hashes(self, project_name: str, file_path: str) -> dict[str, str]:
+        """Return ``{uid: content_hash}`` for all non-structural nodes in a file."""
+        records = await self.execute(
+            f"MATCH (n {{project_name: $p, file_path: $f}}) "
+            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+            "RETURN n.uid AS uid, n.content_hash AS hash",
+            {"p": project_name, "f": file_path},
+        )
+        return {r["uid"]: r["hash"] or "" for r in records}
+
     async def upsert_file_entities(
         self,
         project_name: str,
         file_path: str,
         entities: list[ParsedEntity],
         relationships: list[ParsedRelationship],
-    ) -> None:
-        """Replace all entities for a file and re-create relationships.
+    ) -> UpsertResult:
+        """Delta-aware upsert: only write changed entities to the graph.
 
-        Strategy: delete-and-recreate per file (simple v1 — delta indexing
-        comes in epic 05-delta).
+        Compares ``content_hash`` of new entities against stored values to
+        classify each as added/modified/deleted/unchanged.  Unchanged entities
+        are skipped entirely — their embed data is never touched.
 
-        Preserves ``embed_hash`` and ``embedding`` for entities whose
-        ``qualified_name`` survives the upsert cycle.
+        Returns an ``UpsertResult`` describing what changed.
         """
-        # 0. Save embed data from existing nodes (before delete)
-        old_embeds = await self.execute(
-            "MATCH (n {project_name: $p, file_path: $f}) "
-            "WHERE n.embed_hash IS NOT NULL "
-            "RETURN n.qualified_name AS qn, n.embed_hash AS hash, n.embedding AS vec",
-            {"p": project_name, "f": file_path},
+        # 1. Read old content hashes
+        old_hashes = await self.get_file_content_hashes(project_name, file_path)
+
+        # 2. Build new hash map keyed on uid (= qualified_name including project prefix)
+        new_hashes: dict[str, str] = {e.qualified_name: e.content_hash for e in entities}
+        new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
+
+        old_uids = set(old_hashes)
+        new_uids = set(new_hashes)
+
+        added_uids = new_uids - old_uids
+        deleted_uids = old_uids - new_uids
+        common_uids = old_uids & new_uids
+        modified_uids = {uid for uid in common_uids if old_hashes[uid] != new_hashes[uid]}
+        unchanged_uids = common_uids - modified_uids
+
+        # 3. Fast path: nothing changed → skip graph writes entirely
+        if not added_uids and not deleted_uids and not modified_uids:
+            logger.debug("Delta skip (no changes) for {}", file_path)
+            return UpsertResult(
+                unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
+            )
+
+        # 4. Apply delta
+        # 4a. Delete removed entity nodes
+        if deleted_uids:
+            await self._batch_delete_entities(list(deleted_uids))
+
+        # 4b. Create new entity nodes
+        if added_uids:
+            added_entities = [new_entity_map[uid] for uid in added_uids]
+            await self._batch_create_entities(project_name, added_entities)
+
+        # 4c. Update modified entity nodes
+        if modified_uids:
+            modified_entities = [new_entity_map[uid] for uid in modified_uids]
+            await self._batch_update_entities(modified_entities)
+
+        # 4d. Recreate ALL relationships for the file (delete old, create new).
+        #     Relationships are cheap and context-dependent — simpler to rebuild.
+        await self._recreate_file_relationships(project_name, file_path, relationships)
+
+        result = UpsertResult(
+            added=[self._strip_uid(uid) for uid in added_uids],
+            modified=[self._strip_uid(uid) for uid in modified_uids],
+            deleted=[self._strip_uid(uid) for uid in deleted_uids],
+            unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
         )
-        embed_lookup: dict[str, tuple[str, list[float] | None]] = {r["qn"]: (r["hash"], r["vec"]) for r in old_embeds}
-
-        # 1. Delete existing entity nodes for this (project_name, file_path).
-        #    Exclude structural nodes (Package, Project) — they share the same
-        #    file_path as __init__.py modules but are managed by the hierarchy step.
-        await self.execute_write(
-            f"MATCH (n {{project_name: $project_name, file_path: $file_path}}) "
-            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            "DETACH DELETE n",
-            {"project_name": project_name, "file_path": file_path},
-        )
-
-        # 2. Batch-create nodes grouped by label
-        sorted_entities = sorted(entities, key=attrgetter("label"))
-        for label, group in groupby(sorted_entities, key=attrgetter("label")):
-            entity_list = list(group)
-            params = [
-                {
-                    "uid": e.qualified_name,
-                    "project_name": project_name,
-                    "name": e.name,
-                    "qualified_name": (
-                        e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name
-                    ),
-                    "file_path": e.file_path,
-                    "kind": e.kind,
-                    "line_start": e.line_start,
-                    "line_end": e.line_end,
-                    "visibility": e.visibility,
-                    "docstring": e.docstring,
-                    "signature": e.signature,
-                    "tags": e.tags,
-                    "header_path": e.header_path,
-                    "header_level": e.header_level,
-                }
-                for e in entity_list
-            ]
-            query = (
-                f"UNWIND $entities AS e "
-                f"CREATE (n:{label.value} {{"
-                f"uid: e.uid, project_name: e.project_name, name: e.name, "
-                f"qualified_name: e.qualified_name, file_path: e.file_path, "
-                f"kind: e.kind, line_start: e.line_start, line_end: e.line_end, "
-                f"visibility: e.visibility, docstring: e.docstring, "
-                f"signature: e.signature, tags: e.tags, "
-                f"header_path: e.header_path, header_level: e.header_level"
-                f"}})"
-            )
-            await self.execute_write(query, {"entities": params})  # dynamic Cypher
-
-        # 3. Create relationships
-        # uid-based rels: both ends are in this file
-        uid_rel_types = {RelType.DEFINES, RelType.CONTAINS}
-        uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
-        other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
-
-        # Batch-create uid-based rels grouped by type
-        for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
-            rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in group]
-            await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
-                {"rels": rel_params},
-            )
-
-        # Other relationships: best-effort name matching within the project
-        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
-        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
-
-        for rel in inherits_rels:
-            await self.execute_write(
-                f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
-                f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
-                {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
-            )
-
-        if doc_rels:
-            await self._create_doc_links(project_name, doc_rels)
-
-        # 4. Restore embed data for entities whose qualified_name survived
-        if embed_lookup:
-            new_qns = {
-                e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name for e in entities
-            }
-            restore = [
-                {"qn": qn, "hash": h, "vec": v}
-                for qn, (h, v) in embed_lookup.items()
-                if qn in new_qns and v is not None
-            ]
-            if restore:
-                await self.execute_write(
-                    "UNWIND $items AS item "
-                    "MATCH (n {qualified_name: item.qn, project_name: $p, file_path: $f}) "
-                    "SET n.embed_hash = item.hash, n.embedding = item.vec",
-                    {"items": restore, "p": project_name, "f": file_path},
-                )
 
         logger.debug(
-            "Upserted {} entities and {} relationships for {}",
+            "Upserted {} (added={}, modified={}, deleted={}, unchanged={}) for {}",
             len(entities),
-            len(relationships),
+            len(result.added),
+            len(result.modified),
+            len(result.deleted),
+            len(result.unchanged),
             file_path,
         )
+        return result
+
+    @staticmethod
+    def _strip_uid(uid: str) -> str:
+        """Strip project prefix from uid to get qualified_name."""
+        return uid.split(":", 1)[1] if ":" in uid else uid
+
+    async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
+        """Delete all non-structural entity nodes for a file. Returns deleted uids."""
+        old_hashes = await self.get_file_content_hashes(project_name, file_path)
+        if old_hashes:
+            await self._batch_delete_entities(list(old_hashes.keys()))
+        return [self._strip_uid(uid) for uid in old_hashes]
 
     async def merge_project_node(self, project_name: str, **metadata: Any) -> None:
         """Create or update a Project node by uid."""
@@ -566,6 +549,126 @@ class GraphClient:
         await self._driver.close()
 
     # -- Private helpers -----------------------------------------------------
+
+    async def _batch_create_entities(self, project_name: str, entities: list[ParsedEntity]) -> None:
+        """Batch-create entity nodes grouped by label."""
+        sorted_entities = sorted(entities, key=attrgetter("label"))
+        for label, group in groupby(sorted_entities, key=attrgetter("label")):
+            entity_list = list(group)
+            params = [
+                {
+                    "uid": e.qualified_name,
+                    "project_name": project_name,
+                    "name": e.name,
+                    "qualified_name": (
+                        e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name
+                    ),
+                    "file_path": e.file_path,
+                    "kind": e.kind,
+                    "line_start": e.line_start,
+                    "line_end": e.line_end,
+                    "visibility": e.visibility,
+                    "docstring": e.docstring,
+                    "signature": e.signature,
+                    "tags": e.tags,
+                    "header_path": e.header_path,
+                    "header_level": e.header_level,
+                    "content_hash": e.content_hash,
+                }
+                for e in entity_list
+            ]
+            query = (
+                f"UNWIND $entities AS e "
+                f"CREATE (n:{label.value} {{"
+                f"uid: e.uid, project_name: e.project_name, name: e.name, "
+                f"qualified_name: e.qualified_name, file_path: e.file_path, "
+                f"kind: e.kind, line_start: e.line_start, line_end: e.line_end, "
+                f"visibility: e.visibility, docstring: e.docstring, "
+                f"signature: e.signature, tags: e.tags, "
+                f"header_path: e.header_path, header_level: e.header_level, "
+                f"content_hash: e.content_hash"
+                f"}})"
+            )
+            await self.execute_write(query, {"entities": params})
+
+    async def _batch_update_entities(self, entities: list[ParsedEntity]) -> None:
+        """Batch-update modified entity nodes by uid."""
+        params = [
+            {
+                "uid": e.qualified_name,
+                "name": e.name,
+                "kind": e.kind,
+                "line_start": e.line_start,
+                "line_end": e.line_end,
+                "visibility": e.visibility,
+                "docstring": e.docstring,
+                "signature": e.signature,
+                "tags": e.tags,
+                "header_path": e.header_path,
+                "header_level": e.header_level,
+                "content_hash": e.content_hash,
+            }
+            for e in entities
+        ]
+        await self.execute_write(
+            "UNWIND $entities AS e "
+            "MATCH (n {uid: e.uid}) "
+            "SET n.name = e.name, n.kind = e.kind, "
+            "n.line_start = e.line_start, n.line_end = e.line_end, "
+            "n.visibility = e.visibility, n.docstring = e.docstring, "
+            "n.signature = e.signature, n.tags = e.tags, "
+            "n.header_path = e.header_path, n.header_level = e.header_level, "
+            "n.content_hash = e.content_hash",
+            {"entities": params},
+        )
+
+    async def _batch_delete_entities(self, uids: list[str]) -> None:
+        """Delete entity nodes by uid."""
+        await self.execute_write(
+            "UNWIND $uids AS uid MATCH (n {uid: uid}) DETACH DELETE n",
+            {"uids": uids},
+        )
+
+    async def _recreate_file_relationships(
+        self,
+        project_name: str,
+        file_path: str,
+        relationships: list[ParsedRelationship],
+    ) -> None:
+        """Delete all relationships originating from this file's entities, then recreate them."""
+        # Delete existing relationships from file entities (excluding Package/Project)
+        await self.execute_write(
+            f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->() "
+            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+            "DELETE r",
+            {"p": project_name, "f": file_path},
+        )
+
+        # Recreate: uid-based rels (both ends known by uid)
+        uid_rel_types = {RelType.DEFINES, RelType.CONTAINS}
+        uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
+        other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
+
+        for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
+            rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in group]
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
+                {"rels": rel_params},
+            )
+
+        # Name-matched rels
+        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
+        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
+
+        for rel in inherits_rels:
+            await self.execute_write(
+                f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
+                f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
+                {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
+            )
+
+        if doc_rels:
+            await self._create_doc_links(project_name, doc_rels)
 
     async def _create_doc_links(self, project_name: str, doc_rels: list[ParsedRelationship]) -> None:
         """Create DOCUMENTS edges via batched name/path matching.

@@ -9,8 +9,9 @@ Phase 1: Python only. Other languages follow via register_language().
 
 from __future__ import annotations
 
+import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +46,7 @@ class ParsedEntity:
     tags: list[str] = field(default_factory=list)
     header_path: str | None = None
     header_level: int | None = None
+    content_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,30 @@ register_language(
         query=_MD_QUERY,
     )
 )
+
+
+# ---------------------------------------------------------------------------
+# Content hashing
+# ---------------------------------------------------------------------------
+
+
+def _compute_content_hash(entity: ParsedEntity) -> str:
+    """Compute a deterministic hash of an entity's semantic fields.
+
+    Hashes name, kind, visibility, signature, docstring, and sorted tags.
+    Excludes positional fields (line_start/line_end, file_path) so that
+    moving code without changing it produces the same hash.
+    """
+    parts = [
+        entity.name,
+        entity.kind,
+        entity.visibility,
+        entity.signature or "",
+        entity.docstring or "",
+        ",".join(sorted(entity.tags)),
+    ]
+    data = "\0".join(parts).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -375,12 +401,19 @@ def parse_file(path: str, source: bytes, project_name: str) -> ParsedFile | None
     tree = parser.parse(source)
 
     if lang_config.name == "python":
-        return _parse_python(path, source, tree.root_node, project_name)
+        result = _parse_python(path, source, tree.root_node, project_name)
+    elif lang_config.name == "markdown":
+        result = _parse_markdown(path, source, tree.root_node, project_name)
+    else:
+        return None
 
-    if lang_config.name == "markdown":
-        return _parse_markdown(path, source, tree.root_node, project_name)
-
-    return None
+    # Post-parse pass: compute content hashes for all entities
+    return ParsedFile(
+        file_path=result.file_path,
+        language=result.language,
+        entities=[replace(e, content_hash=_compute_content_hash(e)) for e in result.entities],
+        relationships=result.relationships,
+    )
 
 
 # ---------------------------------------------------------------------------

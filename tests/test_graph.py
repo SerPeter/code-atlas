@@ -695,3 +695,175 @@ async def test_upsert_with_documents_rels(graph_client: GraphClient):
     assert records[0]["code_name"] == "validate_token"
     assert records[0]["link_type"] == "explicit"
     assert records[0]["confidence"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Delta upsert
+# ---------------------------------------------------------------------------
+
+
+def _make_entity(
+    project: str,
+    name: str,
+    fp: str,
+    *,
+    label: NodeLabel = NodeLabel.CALLABLE,
+    kind: str = "function",
+    line_start: int = 1,
+    line_end: int = 5,
+    docstring: str | None = None,
+    signature: str | None = None,
+    content_hash: str = "",
+) -> ParsedEntity:
+    """Helper to build a ParsedEntity with content_hash."""
+    module = fp.replace("/", ".").removesuffix(".py")
+    return ParsedEntity(
+        name=name,
+        qualified_name=f"{project}:{module}.{name}",
+        label=label,
+        kind=kind,
+        line_start=line_start,
+        line_end=line_end,
+        file_path=fp,
+        docstring=docstring,
+        signature=signature,
+        content_hash=content_hash,
+    )
+
+
+async def test_upsert_delta_no_changes(graph_client: GraphClient):
+    """Upserting the same entities twice returns all unchanged, no graph writes."""
+    await graph_client.ensure_schema()
+
+    project = "delta1"
+    fp = "src/mod.py"
+    entities = [
+        _make_entity(project, "func_a", fp, content_hash="aaa111"),
+        _make_entity(project, "func_b", fp, line_start=6, line_end=10, content_hash="bbb222"),
+    ]
+
+    result1 = await graph_client.upsert_file_entities(project, fp, entities, [])
+    assert len(result1.added) == 2
+    assert len(result1.unchanged) == 0
+
+    result2 = await graph_client.upsert_file_entities(project, fp, entities, [])
+    assert len(result2.unchanged) == 2
+    assert result2.added == []
+    assert result2.modified == []
+    assert result2.deleted == []
+
+
+async def test_upsert_delta_added_entity(graph_client: GraphClient):
+    """Adding a new entity to a file is classified as 'added'."""
+    await graph_client.ensure_schema()
+
+    project = "delta2"
+    fp = "src/mod.py"
+    entity_a = _make_entity(project, "func_a", fp, content_hash="aaa111")
+
+    await graph_client.upsert_file_entities(project, fp, [entity_a], [])
+
+    entity_b = _make_entity(project, "func_b", fp, line_start=6, line_end=10, content_hash="bbb222")
+    result = await graph_client.upsert_file_entities(project, fp, [entity_a, entity_b], [])
+    assert "src.mod.func_b" in result.added
+    assert "src.mod.func_a" in result.unchanged
+    assert result.deleted == []
+    assert result.modified == []
+
+    # Verify both nodes exist in graph
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.CALLABLE} {{project_name: $p, file_path: $f}}) RETURN n.name AS name",
+        {"p": project, "f": fp},
+    )
+    names = {r["name"] for r in records}
+    assert names == {"func_a", "func_b"}
+
+
+async def test_upsert_delta_deleted_entity(graph_client: GraphClient):
+    """Removing an entity from a file is classified as 'deleted'."""
+    await graph_client.ensure_schema()
+
+    project = "delta3"
+    fp = "src/mod.py"
+    entities = [
+        _make_entity(project, "func_a", fp, content_hash="aaa111"),
+        _make_entity(project, "func_b", fp, line_start=6, line_end=10, content_hash="bbb222"),
+    ]
+
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    # Re-upsert with only func_a
+    result = await graph_client.upsert_file_entities(project, fp, [entities[0]], [])
+    assert "src.mod.func_b" in result.deleted
+    assert "src.mod.func_a" in result.unchanged
+    assert result.added == []
+    assert result.modified == []
+
+    # Verify func_b is gone
+    records = await graph_client.execute(
+        f"MATCH (n {{project_name: $p, file_path: $f}}) "
+        f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+        "RETURN n.name AS name",
+        {"p": project, "f": fp},
+    )
+    names = {r["name"] for r in records}
+    assert names == {"func_a"}
+
+
+async def test_upsert_delta_modified_entity(graph_client: GraphClient):
+    """Changing an entity's content_hash is classified as 'modified'."""
+    await graph_client.ensure_schema()
+
+    project = "delta4"
+    fp = "src/mod.py"
+    entity_v1 = _make_entity(project, "func_a", fp, docstring="Version 1", content_hash="hash_v1")
+
+    await graph_client.upsert_file_entities(project, fp, [entity_v1], [])
+
+    entity_v2 = _make_entity(project, "func_a", fp, docstring="Version 2", content_hash="hash_v2")
+    result = await graph_client.upsert_file_entities(project, fp, [entity_v2], [])
+    assert "src.mod.func_a" in result.modified
+    assert result.added == []
+    assert result.deleted == []
+    assert result.unchanged == []
+
+    # Verify the node was updated in graph
+    records = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN n.docstring AS doc, n.content_hash AS hash",
+        {"uid": f"{project}:src.mod.func_a"},
+    )
+    assert len(records) == 1
+    assert records[0]["doc"] == "Version 2"
+    assert records[0]["hash"] == "hash_v2"
+
+
+async def test_upsert_delta_preserves_embeddings_unchanged(graph_client: GraphClient):
+    """Unchanged entities keep their embed_hash and embedding without save/restore."""
+    await graph_client.ensure_schema()
+
+    project = "delta5"
+    fp = "src/mod.py"
+    entity = _make_entity(project, "func_a", fp, content_hash="stable_hash")
+
+    await graph_client.upsert_file_entities(project, fp, [entity], [])
+
+    # Set embed data
+    dim = graph_client._dimension
+    embedding = [0.5] * dim
+    await graph_client.execute_write(
+        "MATCH (n {uid: $uid}) SET n.embed_hash = $hash, n.embedding = $vec",
+        {"uid": f"{project}:src.mod.func_a", "hash": "embed_abc", "vec": embedding},
+    )
+
+    # Re-upsert with same content_hash — should be unchanged
+    result = await graph_client.upsert_file_entities(project, fp, [entity], [])
+    assert "src.mod.func_a" in result.unchanged
+
+    # Verify embed data is still there (never deleted because entity was unchanged)
+    records = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN n.embed_hash AS hash, n.embedding AS vec",
+        {"uid": f"{project}:src.mod.func_a"},
+    )
+    assert len(records) == 1
+    assert records[0]["hash"] == "embed_abc"
+    assert records[0]["vec"] == embedding

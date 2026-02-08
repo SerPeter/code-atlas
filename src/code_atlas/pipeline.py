@@ -225,13 +225,16 @@ class Tier2ASTConsumer(TierConsumer):
         logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
         project_name = self.settings.project_root.name
-        all_entity_refs: list[EntityRef] = []
+        changed_entity_refs: list[EntityRef] = []
+        files_skipped = 0
+        total_changed = 0
 
         for file_path in unique_paths:
-            # Read file from disk (skip if deleted/missing)
+            # Read file from disk — delete file's entities if it was removed
             full_path = Path(self.settings.project_root) / file_path
             if not full_path.is_file():
-                logger.debug("Tier2: skipping missing file {}", file_path)
+                logger.debug("Tier2: file deleted, removing entities for {}", file_path)
+                await self.graph.delete_file_entities(project_name, file_path)
                 continue
 
             try:
@@ -246,29 +249,48 @@ class Tier2ASTConsumer(TierConsumer):
                 logger.debug("Tier2: unsupported language for {}", file_path)
                 continue
 
-            # Write to graph
-            await self.graph.upsert_file_entities(
+            # Write to graph (delta-aware)
+            result = await self.graph.upsert_file_entities(
                 project_name=project_name,
                 file_path=file_path,
                 entities=parsed.entities,
                 relationships=parsed.relationships,
             )
 
-            # Collect entity refs for downstream
-            all_entity_refs.extend(
-                EntityRef(
-                    qualified_name=entity.qualified_name,
-                    node_type=entity.label.value,
-                    file_path=entity.file_path,
-                )
-                for entity in parsed.entities
-            )
+            # Only collect refs for added + modified entities (not unchanged)
+            changed_qns = set(result.added) | set(result.modified)
+            if not changed_qns:
+                files_skipped += 1
+                continue
 
-        # No significance gate yet (always pass through) — epic 05-delta
-        if all_entity_refs:
+            total_changed += len(changed_qns)
+            entity_map = {
+                (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
+                for e in parsed.entities
+            }
+            for qn in changed_qns:
+                entity = entity_map.get(qn)
+                if entity is not None:
+                    changed_entity_refs.append(
+                        EntityRef(
+                            qualified_name=entity.qualified_name,
+                            node_type=entity.label.value,
+                            file_path=entity.file_path,
+                        )
+                    )
+
+        logger.info(
+            "Tier2 batch {}: {} files, {} skipped, {} entities changed",
+            batch_id,
+            len(unique_paths),
+            files_skipped,
+            total_changed,
+        )
+
+        if changed_entity_refs:
             await self.bus.publish(
                 Topic.EMBED_DIRTY,
-                EmbedDirty(entities=all_entity_refs, significance="HIGH", batch_id=batch_id),
+                EmbedDirty(entities=changed_entity_refs, significance="HIGH", batch_id=batch_id),
             )
 
 

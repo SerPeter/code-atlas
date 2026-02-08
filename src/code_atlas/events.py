@@ -58,6 +58,16 @@ class EmbedDirty:
 # Type alias for any pipeline event
 Event = FileChanged | ASTDirty | EmbedDirty
 
+
+class Significance(StrEnum):
+    """How significant a change is for downstream re-embedding."""
+
+    NONE = "NONE"
+    TRIVIAL = "TRIVIAL"
+    MODERATE = "MODERATE"
+    HIGH = "HIGH"
+
+
 # ---------------------------------------------------------------------------
 # Topics
 # ---------------------------------------------------------------------------
