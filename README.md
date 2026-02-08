@@ -114,8 +114,8 @@ auto_detect = true
 always_include = ["libs/shared"]
 
 [embeddings]
-provider = "tei"  # or "litellm", "ollama"
 model = "nomic-ai/nomic-embed-code"
+base_url = "http://localhost:8080"  # self-hosted TEI; omit for cloud providers
 
 [search]
 default_token_budget = 8000
@@ -200,7 +200,7 @@ Several excellent tools exist in this space. Code Atlas builds on their ideas wh
 | **[Kit](https://github.com/cased/kit)**                                 | Clean DX, good semantic + text search          | No graph database — can't follow relationships (calls, inheritance)             |
 | **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)**       | 100% Rust, LSP-based type resolution           | SurrealDB's graph traversal unproven, non-standard query language for AI agents |
 
-Code Atlas combines the strengths: code-graph-rag's hierarchy and Memgraph foundation, Kit's search and context assembly, code-graph-mcp's tree-sitter parsing, and codegraph-rust's ambition for type-aware resolution — while adding documentation intelligence, monorepo support, pluggable pattern detection, and token-budget-aware context assembly.
+Code Atlas combines the strengths: code-graph-rag's hierarchy and Memgraph foundation, Kit's search and context assembly, and tree-sitter-based AST parsing — while adding documentation intelligence, monorepo support, pluggable pattern detection, and token-budget-aware context assembly.
 
 ## License
 

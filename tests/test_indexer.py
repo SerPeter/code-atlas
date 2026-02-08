@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -13,6 +14,12 @@ from code_atlas.settings import AtlasSettings, ScopeSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+# Skip decorator for tests that require symlink support (needs admin/dev mode on Windows)
+needs_symlinks = pytest.mark.skipif(
+    not os.environ.get("CI") and os.name == "nt",
+    reason="Symlinks require admin or Developer Mode on Windows",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +204,57 @@ class TestScanFiles:
         assert scope.is_included("app.py") is True
         assert scope.is_included("lib/utils.py") is True
         assert scope.is_included("ignored/secret.py") is False
+
+    def test_bom_in_gitignore(self, tmp_path):
+        """A .gitignore saved with UTF-8 BOM should still work."""
+        bom = b"\xef\xbb\xbf"
+        gi = tmp_path / ".gitignore"
+        gi.write_bytes(bom + b"secret/\n")
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "secret/key.py", "y = 2")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert result == ["app.py"]
+
+    @needs_symlinks
+    def test_symlinked_dir_not_followed(self, tmp_path):
+        """Symlinked directories are skipped (matches git default behavior)."""
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        _write(tmp_path, "real/module.py", "x = 1")
+        _write(tmp_path, "app.py", "y = 2")
+
+        link = tmp_path / "linked"
+        link.symlink_to(real_dir, target_is_directory=True)
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert "app.py" in result
+        assert "real/module.py" in result
+        # Symlinked directory content should NOT appear
+        assert "linked/module.py" not in result
+
+    @needs_symlinks
+    def test_broken_symlink_skipped(self, tmp_path):
+        """Broken file symlinks don't crash the scanner."""
+        _write(tmp_path, "app.py", "x = 1")
+        broken = tmp_path / "broken.py"
+        broken.symlink_to(tmp_path / "nonexistent.py")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert result == ["app.py"]
+
+    def test_non_ascii_paths(self, tmp_path):
+        """Non-ASCII characters in paths don't crash the scanner."""
+        _write(tmp_path, "über/app.py", "x = 1")
+        _write(tmp_path, "日本語/lib.py", "y = 2")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert "über/app.py" in result
+        assert "日本語/lib.py" in result
 
 
 # ---------------------------------------------------------------------------

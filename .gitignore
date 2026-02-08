@@ -52,6 +52,7 @@ docker-compose.override.yml
 # =============================================================================
 .claude/settings.local.json
 .tasks/
+CLAUDE.local.md
 
 # =============================================================================
 # Project-specific

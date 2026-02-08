@@ -182,8 +182,5 @@ Full-featured message broker for event routing.
 
 ## References
 
-- [Spike task: 01-foundation-08](../../.tasks/01-foundation-08-event-architecture.md)
-- [File watcher task: 05-delta-04](../../.tasks/05-delta-04-file-watcher.md)
 - [code-graph-rag PR #213 — Debounce implementation](https://github.com/vitali87/code-graph-rag/pull/213)
 - [code-graph-rag #286 — Infinite reindex loop](https://github.com/vitali87/code-graph-rag/issues/286)
-- [Competitor research](../../.tasks/research/2026-02-07_competitor_consolidated-insights.md)

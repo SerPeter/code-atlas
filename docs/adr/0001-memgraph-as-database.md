@@ -101,4 +101,3 @@ become a compelling single-binary alternative.
 - [Critical benchmark analysis](https://maxdemarzi.com/2023/01/11/bullshit-graph-database-performance-benchmarks/)
 - [Memgraph text search (Tantivy)](https://memgraph.com/blog/text-search-in-memgraph)
 - [SurrealDB stability discussions](https://github.com/surrealdb/surrealdb/issues/5175)
-- [Research document](../../.tasks/research/code-atlas.md)

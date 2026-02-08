@@ -326,13 +326,7 @@ Code Atlas runs as a container alongside Memgraph and TEI, watches mounted volum
 
 ## References
 
-- [Spike task: 01-foundation-09](../../.tasks/01-foundation-09-deployment-model.md)
-- [Research notes: deployment model](../../.tasks/research/2026-02-07_deployment-model.md)
-- [MCP server task: 01-foundation-04](../../.tasks/01-foundation-04-mcp-server.md)
-- [Event architecture spike: 01-foundation-08](../../.tasks/archive/01-foundation-08-event-architecture.md)
-- [File watcher task: 05-delta-04](../../.tasks/05-delta-04-file-watcher.md)
 - [MCP specification 2025-11-25 — transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
 - [gopls daemon mode](https://go.dev/gopls/daemon)
 - [How Cursor Indexes Codebases Fast](https://read.engineerscodex.com/p/how-cursor-indexes-codebases-fast)
 - [Ruff configuration discovery](https://docs.astral.sh/ruff/configuration/)
-- [Competitor research](../../.tasks/research/2026-02-07_competitor_consolidated-insights.md)

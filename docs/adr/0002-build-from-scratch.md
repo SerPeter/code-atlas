@@ -90,4 +90,3 @@ forking.
 - [code-graph-rag](https://github.com/vitali87/code-graph-rag)
 - [Kit](https://github.com/cased/kit)
 - [codegraph-rust](https://github.com/Jakedismo/codegraph-rust)
-- [Research document](../../.tasks/research/code-atlas.md)

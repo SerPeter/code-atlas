@@ -11,7 +11,7 @@ Accepted
 ## Context
 
 Qualified name resolution is the hardest recurring problem in code graph systems. It affects search, type inference,
-cross-file calls, and NL-to-Cypher translation. Competitor research shows this consistently:
+cross-file calls, and NL-to-Cypher translation. Prior art shows this consistently:
 
 - **code-graph-rag #278**: NL-to-Cypher generated `{name: 'VatManager'}` but data was stored as `qualified_name`
 - **code-graph-rag #275**: Java CamelCase conflicts across packages
@@ -189,4 +189,3 @@ qualified_name = auth.UserService.validate
 - [Schema implementation](../../src/code_atlas/schema.py) — property indices
 - [Parser implementation](../../src/code_atlas/parser.py) — `_module_qualified_name()` builds Python qualified names
 - [MCP Server](../../src/code_atlas/mcp_server.py) — `get_node` cascade and `_rank_results()`
-- [Task spec](../../.tasks/archive/01-foundation-07-qualified-names.md)
