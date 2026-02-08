@@ -205,14 +205,18 @@ class GraphClient:
             )
 
         # Other relationships: best-effort name matching within the project
-        for rel in other_rels:
-            if rel.rel_type == RelType.INHERITS:
-                # Try to match base class by name within the project
-                await self.execute_write(
-                    f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
-                    f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
-                    {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
-                )
+        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
+        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
+
+        for rel in inherits_rels:
+            await self.execute_write(
+                f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
+                f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
+                {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
+            )
+
+        if doc_rels:
+            await self._create_doc_links(project_name, doc_rels)
 
         # 4. Restore embed data for entities whose qualified_name survived
         if embed_lookup:
@@ -562,6 +566,58 @@ class GraphClient:
         await self._driver.close()
 
     # -- Private helpers -----------------------------------------------------
+
+    async def _create_doc_links(self, project_name: str, doc_rels: list[ParsedRelationship]) -> None:
+        """Create DOCUMENTS edges via batched name/path matching.
+
+        Two batched queries: one for symbol-based links (exact name match),
+        one for file-path-based links (suffix match on file_path).
+        """
+        symbol_params = []
+        file_params = []
+        for rel in doc_rels:
+            props = rel.properties
+            entry = {
+                "from_uid": rel.from_qualified_name,
+                "to_name": rel.to_name,
+                "link_type": props.get("link_type", ""),
+                "confidence": props.get("confidence", 0.0),
+            }
+            if props.get("is_file_ref"):
+                file_params.append(entry)
+            else:
+                symbol_params.append(entry)
+
+        created = 0
+        if symbol_params:
+            records = await self.execute(
+                f"UNWIND $rels AS r "
+                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: $project, name: r.to_name}}) "
+                f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
+                f"RETURN count(e) AS cnt",
+                {"rels": symbol_params, "project": project_name},
+            )
+            created += records[0]["cnt"] if records else 0
+
+        if file_params:
+            records = await self.execute(
+                f"UNWIND $rels AS r "
+                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: $project}}) "
+                f"WHERE b.file_path ENDS WITH r.to_name "
+                f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
+                f"RETURN count(e) AS cnt",
+                {"rels": file_params, "project": project_name},
+            )
+            created += records[0]["cnt"] if records else 0
+
+        attempted = len(doc_rels)
+        if created < attempted:
+            logger.debug(
+                "DOCUMENTS links: {}/{} resolved for project {}",
+                created,
+                attempted,
+                project_name,
+            )
 
     async def _apply_full_schema(self) -> None:
         """Apply all constraints, indices, vector indices, and text indices."""

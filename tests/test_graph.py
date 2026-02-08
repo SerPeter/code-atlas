@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from code_atlas.parser import ParsedEntity
+from code_atlas.parser import ParsedEntity, ParsedRelationship
 from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
 
 if TYPE_CHECKING:
@@ -617,3 +617,81 @@ async def test_read_entity_texts_includes_embed_fields(graph_client: GraphClient
     assert len(results) == 1
     assert results[0]["embed_hash"] == "abc"
     assert results[0]["embedding"] == embedding
+
+
+# ---------------------------------------------------------------------------
+# DOCUMENTS edge creation
+# ---------------------------------------------------------------------------
+
+
+async def test_upsert_with_documents_rels(graph_client: GraphClient):
+    """Full flow: pre-create a code entity, upsert markdown with DOCUMENTS rels, verify edges."""
+    await graph_client.ensure_schema()
+
+    project = "doclink"
+
+    # Pre-create a code entity (the target of the doc link)
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        "  uid: $uid, project_name: $project, name: $name,"
+        "  qualified_name: $qn, kind: 'function', file_path: 'src/auth.py'"
+        "})",
+        {
+            "uid": f"{project}:auth.validate_token",
+            "project": project,
+            "name": "validate_token",
+            "qn": "auth.validate_token",
+        },
+    )
+
+    # Now upsert a markdown file with a DOCUMENTS relationship targeting that entity
+    doc_fp = "docs/auth.md"
+    section_qn = f"{project}:{doc_fp} > Auth > validate_token"
+    entities = [
+        ParsedEntity(
+            name="auth.md",
+            qualified_name=f"{project}:{doc_fp}",
+            label=NodeLabel.DOC_FILE,
+            kind="doc_file",
+            line_start=1,
+            line_end=10,
+            file_path=doc_fp,
+        ),
+        ParsedEntity(
+            name="validate_token",
+            qualified_name=section_qn,
+            label=NodeLabel.DOC_SECTION,
+            kind="section",
+            line_start=3,
+            line_end=8,
+            file_path=doc_fp,
+            header_level=2,
+            header_path="Auth > validate_token",
+        ),
+    ]
+    relationships = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:{doc_fp}",
+            rel_type=RelType.CONTAINS,
+            to_name=section_qn,
+        ),
+        ParsedRelationship(
+            from_qualified_name=section_qn,
+            rel_type=RelType.DOCUMENTS,
+            to_name="validate_token",
+            properties={"link_type": "explicit", "confidence": 0.9, "is_file_ref": False},
+        ),
+    ]
+
+    await graph_client.upsert_file_entities(project, doc_fp, entities, relationships)
+
+    # Verify DOCUMENTS edge was created with correct properties
+    records = await graph_client.execute(
+        f"MATCH (d:{NodeLabel.DOC_SECTION})-[r:{RelType.DOCUMENTS}]->(c:{NodeLabel.CALLABLE}) "
+        "RETURN d.name AS doc_name, c.name AS code_name, r.link_type AS link_type, r.confidence AS confidence"
+    )
+    assert len(records) == 1
+    assert records[0]["doc_name"] == "validate_token"
+    assert records[0]["code_name"] == "validate_token"
+    assert records[0]["link_type"] == "explicit"
+    assert records[0]["confidence"] == 0.9

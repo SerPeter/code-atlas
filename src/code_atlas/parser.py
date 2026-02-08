@@ -9,6 +9,7 @@ Phase 1: Python only. Other languages follow via register_language().
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -53,6 +54,7 @@ class ParsedRelationship:
     from_qualified_name: str
     rel_type: RelType
     to_name: str
+    properties: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -484,6 +486,72 @@ def _collect_code_langs(nodes: list[Node], source: bytes) -> list[str]:
     return sorted(f"lang:{lang}" for lang in langs)
 
 
+# ---------------------------------------------------------------------------
+# Doc-code reference extraction
+# ---------------------------------------------------------------------------
+
+_MIN_REF_NAME_LEN = 3
+
+# Match `symbol_name` or `symbol_name()` or `module.Class.method` in backticks
+_BACKTICK_SYMBOL_RE = re.compile(r"`([A-Za-z_][\w.]*(?:\(\))?)`")
+
+# Match file paths like src/auth/service.py with at least one / and a known extension
+_FILE_REF_RE = re.compile(r"(?<!\w)([\w./\\-]+\.(?:py|pyi|js|ts|jsx|tsx|java|go|rs|rb|cpp|c|h|hpp|md))(?!\w)")
+
+# CamelCase or snake_case identifier (for headings)
+_HEADING_IDENT_RE = re.compile(r"^(?:[A-Z][a-zA-Z0-9]*(?:[A-Z][a-z0-9]+)+|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)$")
+
+
+@dataclass(frozen=True)
+class _DocRef:
+    """A reference from a doc section to a code entity."""
+
+    target_name: str
+    link_type: str
+    confidence: float
+    is_file_ref: bool = False
+
+
+def _extract_doc_references(title: str, content: str | None, level: int) -> list[_DocRef]:
+    """Extract code references from a doc section's title and content.
+
+    Returns a deduplicated list of _DocRef, keeping highest confidence per target_name.
+    """
+    refs: dict[str, _DocRef] = {}
+
+    def _add(ref: _DocRef) -> None:
+        existing = refs.get(ref.target_name)
+        if existing is None or ref.confidence > existing.confidence:
+            refs[ref.target_name] = ref
+
+    # 1. Header-as-symbol: only H2+ (H1 is doc title, not a code ref)
+    if level >= 2 and title and _HEADING_IDENT_RE.match(title) and len(title) >= _MIN_REF_NAME_LEN:
+        _add(_DocRef(target_name=title, link_type="explicit", confidence=0.9))
+
+    # 2. Backtick symbol mentions in content
+    if content:
+        for match in _BACKTICK_SYMBOL_RE.finditer(content):
+            symbol = match.group(1)
+            # Strip trailing ()
+            symbol = symbol.rstrip("()")
+            # Take last segment of dotted paths (auth.service.MyClass → MyClass)
+            if "." in symbol:
+                symbol = symbol.rsplit(".", 1)[1]
+            if len(symbol) >= _MIN_REF_NAME_LEN:
+                _add(_DocRef(target_name=symbol, link_type="symbol_mention", confidence=0.8))
+
+    # 3. File path references in content
+    if content:
+        for match in _FILE_REF_RE.finditer(content):
+            path_str = match.group(1)
+            # Normalize backslashes and require at least one /
+            normalized = path_str.replace("\\", "/")
+            if "/" in normalized and len(normalized) >= _MIN_REF_NAME_LEN:
+                _add(_DocRef(target_name=normalized, link_type="file_ref", confidence=0.85, is_file_ref=True))
+
+    return list(refs.values())
+
+
 def _emit_md_section(
     *,
     path: str,
@@ -553,6 +621,21 @@ def _emit_md_section(
             rel_type=RelType.CONTAINS,
             to_name=section_qn,
         )
+    )
+
+    # Extract doc-code references and emit DOCUMENTS relationships
+    relationships.extend(
+        ParsedRelationship(
+            from_qualified_name=section_qn,
+            rel_type=RelType.DOCUMENTS,
+            to_name=ref.target_name,
+            properties={
+                "link_type": ref.link_type,
+                "confidence": ref.confidence,
+                "is_file_ref": ref.is_file_ref,
+            },
+        )
+        for ref in _extract_doc_references(title, content_text, level)
     )
 
 

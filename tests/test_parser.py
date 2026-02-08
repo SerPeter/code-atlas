@@ -531,3 +531,141 @@ Another paragraph.
     assert section.docstring is not None
     assert "quick brown fox" in section.docstring
     assert "Another paragraph" in section.docstring
+
+
+# ---------------------------------------------------------------------------
+# Markdown doc-code linking
+# ---------------------------------------------------------------------------
+
+
+def _doc_rels(parsed: ParsedFile) -> list:
+    return [r for r in parsed.relationships if r.rel_type == RelType.DOCUMENTS]
+
+
+def test_md_header_as_symbol():
+    """CamelCase heading at H2+ emits an explicit doc-code link."""
+    parsed = _parse_md(
+        """\
+# Docs
+
+## UserService
+
+Describes the user service.
+"""
+    )
+    rels = _doc_rels(parsed)
+    assert len(rels) == 1
+    assert rels[0].to_name == "UserService"
+    assert rels[0].properties["link_type"] == "explicit"
+    assert rels[0].properties["confidence"] == 0.9
+
+
+def test_md_header_snake_case():
+    """snake_case heading at H2+ emits an explicit doc-code link."""
+    parsed = _parse_md(
+        """\
+# API
+
+## validate_token
+
+Validates the token.
+"""
+    )
+    rels = _doc_rels(parsed)
+    assert any(r.to_name == "validate_token" and r.properties["link_type"] == "explicit" for r in rels)
+
+
+def test_md_backtick_symbols():
+    """Backtick mentions in content emit symbol_mention links."""
+    parsed = _parse_md(
+        """\
+# Overview
+
+Use `validate_token()` and `UserService` for authentication.
+"""
+    )
+    rels = _doc_rels(parsed)
+    names = {r.to_name for r in rels}
+    assert "validate_token" in names
+    assert "UserService" in names
+    for rel in rels:
+        assert rel.properties["link_type"] == "symbol_mention"
+        assert rel.properties["confidence"] == 0.8
+
+
+def test_md_file_path_refs():
+    """File path patterns in content emit file_ref links."""
+    parsed = _parse_md(
+        """\
+# Architecture
+
+The auth module lives in `src/auth/service.py`.
+"""
+    )
+    rels = _doc_rels(parsed)
+    file_rels = [r for r in rels if r.properties.get("is_file_ref")]
+    assert len(file_rels) == 1
+    assert file_rels[0].to_name == "src/auth/service.py"
+    assert file_rels[0].properties["link_type"] == "file_ref"
+    assert file_rels[0].properties["confidence"] == 0.85
+
+
+def test_md_dedup_highest_confidence():
+    """Same symbol in heading and body keeps heading's higher confidence."""
+    parsed = _parse_md(
+        """\
+# Docs
+
+## UserService
+
+The `UserService` handles users.
+"""
+    )
+    rels = _doc_rels(parsed)
+    user_rels = [r for r in rels if r.to_name == "UserService"]
+    assert len(user_rels) == 1
+    assert user_rels[0].properties["confidence"] == 0.9
+    assert user_rels[0].properties["link_type"] == "explicit"
+
+
+def test_md_short_names_filtered():
+    """Names shorter than 3 chars are excluded."""
+    parsed = _parse_md(
+        """\
+# Notes
+
+Use `os` and `io` modules.
+"""
+    )
+    rels = _doc_rels(parsed)
+    assert len(rels) == 0
+
+
+def test_md_h1_not_explicit():
+    """H1 headings are doc titles, not code references even if CamelCase."""
+    parsed = _parse_md(
+        """\
+# UserService
+
+Some content.
+"""
+    )
+    rels = _doc_rels(parsed)
+    explicit_rels = [r for r in rels if r.properties.get("link_type") == "explicit"]
+    assert len(explicit_rels) == 0
+
+
+def test_md_no_refs_plain_heading():
+    """Multi-word headings don't match identifier pattern."""
+    parsed = _parse_md(
+        """\
+# Getting Started
+
+## How to install
+
+Just run the installer.
+"""
+    )
+    rels = _doc_rels(parsed)
+    explicit_rels = [r for r in rels if r.properties.get("link_type") == "explicit"]
+    assert len(explicit_rels) == 0
