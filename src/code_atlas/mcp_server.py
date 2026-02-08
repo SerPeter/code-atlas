@@ -121,6 +121,16 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _node_project_name(record: dict[str, Any]) -> str:
+    """Extract project_name from a record containing a neo4j Node."""
+    node = record.get("node") or record.get("n")
+    if node is None:
+        return ""
+    if hasattr(node, "get"):
+        return node.get("project_name", "")
+    return ""
+
+
 def _result(records: list[dict[str, Any]], *, limit: int, query_ms: float, total: int | None = None) -> dict[str, Any]:
     """Consistent result envelope."""
     return {
@@ -454,12 +464,22 @@ def _register_search_tools(mcp: FastMCP) -> None:
             "Embeds the query via TEI, then searches vector indices. "
             "Searches all embeddable labels by default, or a single label if specified. "
             "Valid labels: Callable, Module, TypeDef, Value, DocSection. "
+            "Optional: project (filter by project_name), threshold (min similarity 0-1). "
             "Returns compact metadata with similarity score."
         ),
     )
-    async def vector_search(query: str, label: str = "", limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def vector_search(
+        query: str,
+        label: str = "",
+        limit: int = 20,
+        project: str = "",
+        threshold: float = 0.0,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
         app = _get_app_ctx(ctx)
         clamped = _clamp_limit(limit)
+        filtering = bool(project) or threshold > 0.0
+        fetch_limit = clamped * 3 if filtering else clamped
 
         # Embed the query
         try:
@@ -474,16 +494,24 @@ def _register_search_tools(mcp: FastMCP) -> None:
 
         for index_name in indices:
             cypher = (
-                f"CALL vector_search.search('{index_name}', {clamped}, $vector) "
+                f"CALL vector_search.search('{index_name}', {fetch_limit}, $vector) "
                 "YIELD node, similarity "
                 "RETURN node, similarity "
-                f"ORDER BY similarity DESC LIMIT {clamped}"
+                f"ORDER BY similarity DESC LIMIT {fetch_limit}"
             )
             try:
                 records = await app.graph.execute(cypher, {"vector": vector})
                 all_results.extend(records)
             except Exception as exc:
                 logger.warning("Vector search on {} failed: {}", index_name, exc)
+
+        # Post-filter by threshold
+        if threshold > 0.0:
+            all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
+
+        # Post-filter by project scope
+        if project:
+            all_results = [r for r in all_results if _node_project_name(r) == project]
 
         # Sort by similarity descending and take top results
         all_results.sort(key=lambda rec: rec.get("similarity", 0), reverse=True)
@@ -532,11 +560,15 @@ def _register_info_tools(mcp: FastMCP) -> None:
         )
         label_counts = {r["label"]: r["count"] for r in label_counts_raw}
 
+        # Vector index info
+        vec_index_info = await app.graph.get_vector_index_info()
+
         elapsed = (time.monotonic() - t0) * 1000
 
         return {
             "projects": projects,
             "label_counts": label_counts,
+            "vector_indices": vec_index_info,
             "schema_version": SCHEMA_VERSION,
             "query_ms": round(elapsed, 1),
         }

@@ -307,6 +307,18 @@ class GraphClient:
         """Remove embedding vectors from all nodes."""
         await self.execute_write("MATCH (n) WHERE n.embedding IS NOT NULL REMOVE n.embedding")
 
+    async def get_vector_index_info(self) -> list[dict[str, Any]]:
+        """Query Memgraph for vector index metadata.
+
+        Returns a list of dicts with keys like ``index_name``, ``label``,
+        ``property``, ``dimension``, ``size``, etc.
+        """
+        try:
+            return await self.execute("CALL vector_search.show_index_info() YIELD * RETURN *")
+        except Exception as exc:
+            logger.debug("Could not fetch vector index info: {}", exc)
+            return []
+
     async def close(self) -> None:
         """Close the driver and release connections."""
         await self._driver.close()

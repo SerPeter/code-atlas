@@ -41,6 +41,7 @@ class EmbeddingSettings(BaseSettings):
     dimension: int = Field(default=768, description="Embedding vector dimension.")
     batch_size: int = Field(default=32, description="Max texts per embedding API call.")
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
+    query_cache_size: int = Field(default=128, description="Max cached query embeddings (LRU eviction).")
 
 
 class MemgraphSettings(BaseSettings):

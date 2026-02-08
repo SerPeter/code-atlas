@@ -295,3 +295,122 @@ async def test_tags_query(graph_client: GraphClient):
     )
     assert len(records) == 1
     assert records[0]["name"] == "async_func"
+
+
+# ---------------------------------------------------------------------------
+# Vector indices
+# ---------------------------------------------------------------------------
+
+
+async def test_vector_index_created(graph_client: GraphClient):
+    """After ensure_schema, vector indices should be visible."""
+    await graph_client.ensure_schema()
+
+    info = await graph_client.get_vector_index_info()
+    index_names = {r.get("index_name", r.get("name", "")) for r in info}
+    # At minimum, the Callable index should exist
+    assert "vec_callable" in index_names
+
+
+async def test_write_and_search_embeddings(graph_client: GraphClient):
+    """Write embedding vectors to nodes, then search via the vector index."""
+    await graph_client.ensure_schema()
+
+    # Create a Callable node
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        "  uid: 'vec:proj.my_func', project_name: 'vec', name: 'my_func',"
+        "  qualified_name: 'proj.my_func', kind: 'function', file_path: 'f.py',"
+        "  content_hash: 'v1'"
+        "})"
+    )
+
+    # Write a 768-dim embedding (simple pattern: 1.0 at index 0, rest 0)
+    dim = 768
+    vector = [1.0] + [0.0] * (dim - 1)
+    await graph_client.write_embeddings([("proj.my_func", vector)])
+
+    # Search with same vector — should find our node with high similarity
+    records = await graph_client.execute(
+        "CALL vector_search.search('vec_callable', 5, $vector) "
+        "YIELD node, similarity "
+        "RETURN node.uid AS uid, similarity",
+        {"vector": vector},
+    )
+    assert len(records) >= 1
+    assert records[0]["uid"] == "vec:proj.my_func"
+    assert records[0]["similarity"] > 0.9
+
+
+async def test_vector_search_scope_filter(graph_client: GraphClient):
+    """Two projects with embeddings — verify scope isolation via post-filter."""
+    await graph_client.ensure_schema()
+
+    dim = 768
+    vector_a = [1.0] + [0.0] * (dim - 1)
+    vector_b = [0.0, 1.0] + [0.0] * (dim - 2)
+
+    for project, vec, name in [("alpha", vector_a, "func_a"), ("beta", vector_b, "func_b")]:
+        await graph_client.execute_write(
+            f"CREATE (:{NodeLabel.CALLABLE} {{"
+            "  uid: $uid, project_name: $project, name: $name,"
+            "  qualified_name: $qn, kind: 'function', file_path: 'f.py',"
+            "  content_hash: $hash"
+            "})",
+            {
+                "uid": f"{project}:{name}",
+                "project": project,
+                "name": name,
+                "qn": name,
+                "hash": f"h_{project}",
+            },
+        )
+        await graph_client.write_embeddings([(name, vec)])
+
+    # Search both — should get two results
+    records = await graph_client.execute(
+        "CALL vector_search.search('vec_callable', 10, $vector) "
+        "YIELD node, similarity "
+        "RETURN node.uid AS uid, node.project_name AS project_name, similarity",
+        {"vector": vector_a},
+    )
+    assert len(records) == 2
+
+    # Python-side scope filter (mirrors what mcp_server.vector_search does)
+    alpha_only = [r for r in records if r["project_name"] == "alpha"]
+    assert len(alpha_only) == 1
+    assert alpha_only[0]["uid"] == "alpha:func_a"
+
+
+async def test_vector_search_threshold(graph_client: GraphClient):
+    """Threshold filter discards low-similarity results."""
+    await graph_client.ensure_schema()
+
+    dim = 768
+    vector_a = [1.0] + [0.0] * (dim - 1)
+    vector_b = [0.0, 1.0] + [0.0] * (dim - 2)
+
+    for name, vec in [("near", vector_a), ("far", vector_b)]:
+        await graph_client.execute_write(
+            f"CREATE (:{NodeLabel.CALLABLE} {{"
+            "  uid: $uid, project_name: 'thresh', name: $name,"
+            "  qualified_name: $qn, kind: 'function', file_path: 'f.py',"
+            "  content_hash: $hash"
+            "})",
+            {"uid": f"thresh:{name}", "name": name, "qn": name, "hash": f"h_{name}"},
+        )
+        await graph_client.write_embeddings([(name, vec)])
+
+    # Search with vector_a — both results returned
+    records = await graph_client.execute(
+        "CALL vector_search.search('vec_callable', 10, $vector) "
+        "YIELD node, similarity "
+        "RETURN node.uid AS uid, similarity",
+        {"vector": vector_a},
+    )
+    assert len(records) == 2
+
+    # Apply threshold — only high-similarity result survives
+    high_sim = [r for r in records if r["similarity"] >= 0.9]
+    assert len(high_sim) == 1
+    assert high_sim[0]["uid"] == "thresh:near"

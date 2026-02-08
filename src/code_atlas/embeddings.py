@@ -6,6 +6,7 @@ Uses litellm to route embedding requests to any OpenAI-compatible endpoint
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 import litellm
@@ -31,6 +32,8 @@ class EmbedClient:
         self._settings = settings
         self._batch_size = settings.batch_size
         self._timeout = settings.timeout_s
+        self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._query_cache_size = settings.query_cache_size
 
         # Compute the litellm model string
         if settings.base_url:
@@ -81,9 +84,19 @@ class EmbedClient:
         return all_vectors
 
     async def embed_one(self, text: str) -> list[float]:
-        """Embed a single text. Convenience wrapper around :meth:`embed_batch`."""
+        """Embed a single text with LRU caching for repeated queries."""
+        if text in self._query_cache:
+            self._query_cache.move_to_end(text)
+            return self._query_cache[text]
+
         result = await self.embed_batch([text])
-        return result[0]
+        vector = result[0]
+
+        self._query_cache[text] = vector
+        if len(self._query_cache) > self._query_cache_size:
+            self._query_cache.popitem(last=False)
+
+        return vector
 
     async def health_check(self) -> bool:
         """Check if the embedding service is reachable.

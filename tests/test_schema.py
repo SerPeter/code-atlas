@@ -8,6 +8,7 @@ from __future__ import annotations
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
+    _EMBEDDABLE_LABELS,
     _ENTITY_LABELS,
     _EXTERNAL_LABELS,
     _TEXT_SEARCHABLE_LABELS,
@@ -17,6 +18,7 @@ from code_atlas.schema import (
     TEXT_INDICES,
     UNIQUE_CONSTRAINTS,
     NodeLabel,
+    generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
     generate_index_ddl,
     generate_text_index_ddl,
@@ -86,14 +88,30 @@ class TestDDLGeneration:
         assert len(stmts_768) == len(_TEXT_SEARCHABLE_LABELS)  # same count as embeddable
         for stmt in stmts_768:
             assert "768" in stmt
-            assert "vector_index.create" in stmt
+            assert stmt.startswith("CREATE VECTOR INDEX")
         for stmt in stmts_384:
             assert "384" in stmt
 
-    def test_vector_index_ddl_includes_cosine_metric(self):
+    def test_vector_index_ddl_includes_cos_metric(self):
         stmts = generate_vector_index_ddl(768)
         for stmt in stmts:
-            assert "'cosine'" in stmt
+            assert '"cos"' in stmt
+
+    def test_vector_index_ddl_declarative_syntax(self):
+        stmts = generate_vector_index_ddl(768)
+        for stmt in stmts:
+            assert "ON :" in stmt
+            assert "WITH CONFIG" in stmt
+            assert "(embedding)" in stmt
+            assert stmt.endswith(";")
+
+    def test_drop_vector_index_ddl_syntax(self):
+        stmts = generate_drop_vector_index_ddl()
+        assert len(stmts) == len(_EMBEDDABLE_LABELS)
+        for stmt in stmts:
+            assert stmt.startswith("DROP VECTOR INDEX")
+            assert stmt.endswith(";")
+            assert "CALL" not in stmt
 
     def test_text_index_ddl_one_per_searchable_label(self):
         stmts = generate_text_index_ddl()

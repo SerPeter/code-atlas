@@ -199,7 +199,7 @@ class VectorIndexSpec:
     property: str
     dimension: int
     capacity: int
-    metric: str = "cosine"
+    metric: str = "cos"
 
 
 @dataclass(frozen=True)
@@ -295,12 +295,12 @@ def generate_index_ddl() -> list[str]:
 
 
 def generate_vector_index_ddl(dimension: int, capacity: int = 50_000) -> list[str]:
-    """Generate CREATE VECTOR INDEX statements for embeddable labels."""
+    """Generate CREATE VECTOR INDEX statements for embeddable labels (Memgraph 3.7+ DDL)."""
     specs = build_vector_index_specs(dimension, capacity)
     return [
         (
-            f"CALL vector_index.create('{spec.name}', '{spec.label.value}', {spec.dimension},"
-            f" '{spec.property}', '{spec.metric}', {spec.capacity});"
+            f"CREATE VECTOR INDEX {spec.name} ON :{spec.label.value}({spec.property})"
+            f' WITH CONFIG {{"dimension": {spec.dimension}, "capacity": {spec.capacity}, "metric": "{spec.metric}"}};'
         )
         for spec in specs
     ]
@@ -312,9 +312,9 @@ def generate_text_index_ddl() -> list[str]:
 
 
 def generate_drop_vector_index_ddl() -> list[str]:
-    """Generate DROP statements for all vector indices."""
+    """Generate DROP statements for all vector indices (Memgraph 3.7+ DDL)."""
     return [
-        f"CALL vector_index.drop('{spec.name}');"
+        f"DROP VECTOR INDEX {spec.name};"
         for spec in build_vector_index_specs(0)  # dimension irrelevant for drops
     ]
 
