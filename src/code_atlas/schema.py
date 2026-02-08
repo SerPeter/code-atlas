@@ -30,7 +30,6 @@ class NodeLabel(StrEnum):
     # Documentation
     DOC_FILE = "DocFile"
     DOC_SECTION = "DocSection"
-    ADR = "ADR"
     # External dependencies
     EXTERNAL_PACKAGE = "ExternalPackage"
     EXTERNAL_SYMBOL = "ExternalSymbol"
@@ -135,7 +134,6 @@ _DOC_LABELS: frozenset[NodeLabel] = frozenset(
     {
         NodeLabel.DOC_FILE,
         NodeLabel.DOC_SECTION,
-        NodeLabel.ADR,
     }
 )
 
