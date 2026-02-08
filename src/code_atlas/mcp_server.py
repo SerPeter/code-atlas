@@ -143,6 +143,29 @@ def _clamp_limit(limit: int | None) -> int:
     return max(1, min(limit, _MAX_LIMIT))
 
 
+# Visibility ranking: lower = more relevant (public entities preferred)
+_VISIBILITY_RANK: dict[str, int] = {"public": 0, "protected": 1, "internal": 2, "private": 3}
+
+
+def _rank_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank disambiguation results by relevance.
+
+    Sorting criteria (applied in order):
+    1. Source over test — entities whose file_path does NOT contain "test" first
+    2. Visibility — public > protected > internal > private
+    3. Shorter qualified_name — more canonical entities first
+    """
+
+    def _sort_key(node: dict[str, Any]) -> tuple[int, int, int]:
+        fp = (node.get("file_path") or "").lower()
+        is_test = 1 if ("test" in fp) else 0
+        vis = _VISIBILITY_RANK.get(node.get("visibility", "public"), 0)
+        qn_len = len(node.get("qualified_name", ""))
+        return (is_test, vis, qn_len)
+
+    return sorted(results, key=_sort_key)
+
+
 # ---------------------------------------------------------------------------
 # Server factory
 # ---------------------------------------------------------------------------
@@ -193,8 +216,81 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
 # ---------------------------------------------------------------------------
 
 
+def _register_node_tools(mcp: FastMCP) -> None:
+    """Register the get_node tool (separated for statement-count limits)."""
+
+    @mcp.tool(
+        description=(
+            "Find code entities by name. "
+            "Cascade: exact uid → exact name → suffix → prefix → contains. "
+            "First stage with results wins. Results ranked by relevance. "
+            "Returns compact metadata (name, kind, file, lines, signature). "
+            "Use get_context to expand a result."
+        ),
+    )
+    async def get_node(name: str, label: str = "", limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        app = _get_app_ctx(ctx)
+        clamped = _clamp_limit(limit)
+
+        label_filter = f":{label}" if label else ""
+        t0 = time.monotonic()
+
+        # Stage 1: Exact uid match (if name contains ':')
+        if ":" in name:
+            records = await app.graph.execute(
+                f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {clamped}",
+                {"name": name},
+            )
+            if records:
+                elapsed = (time.monotonic() - t0) * 1000
+                ranked = _rank_results([_compact_node(r) for r in records])
+                return _result(ranked, limit=clamped, query_ms=elapsed)
+
+        # Stage 2: Exact name match
+        records = await app.graph.execute(
+            f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
+            {"name": name},
+        )
+        if records:
+            elapsed = (time.monotonic() - t0) * 1000
+            ranked = _rank_results([_compact_node(r) for r in records])
+            return _result(ranked, limit=clamped, query_ms=elapsed)
+
+        # Stage 3: ENDS WITH suffix match
+        suffix = f".{name}"
+        records = await app.graph.execute(
+            f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {clamped}",
+            {"suffix": suffix},
+        )
+        if records:
+            elapsed = (time.monotonic() - t0) * 1000
+            ranked = _rank_results([_compact_node(r) for r in records])
+            return _result(ranked, limit=clamped, query_ms=elapsed)
+
+        # Stage 4: STARTS WITH prefix match
+        prefix = f"{name}."
+        records = await app.graph.execute(
+            f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix RETURN n LIMIT {clamped}",
+            {"prefix": prefix},
+        )
+        if records:
+            elapsed = (time.monotonic() - t0) * 1000
+            ranked = _rank_results([_compact_node(r) for r in records])
+            return _result(ranked, limit=clamped, query_ms=elapsed)
+
+        # Stage 5: CONTAINS match (qualified_name or name)
+        records = await app.graph.execute(
+            f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
+            f"RETURN n LIMIT {clamped}",
+            {"name": name},
+        )
+        elapsed = (time.monotonic() - t0) * 1000
+        ranked = _rank_results([_compact_node(r) for r in records])
+        return _result(ranked, limit=clamped, query_ms=elapsed)
+
+
 def _register_query_tools(mcp: FastMCP) -> None:
-    """Register cypher_query, get_node, and get_context tools."""
+    """Register cypher_query and get_context tools."""
 
     @mcp.tool(
         description=(
@@ -225,48 +321,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
         serialized = [_serialize_node(r) for r in records]
         return _result(serialized, limit=clamped, query_ms=elapsed)
 
-    @mcp.tool(
-        description=(
-            "Find code entities by name. "
-            "Supports exact name, qualified name (uid), or suffix matching. "
-            "Returns compact metadata (name, kind, file, lines, signature). "
-            "Use get_context to expand a result."
-        ),
-    )
-    async def get_node(name: str, label: str = "", limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = _get_app_ctx(ctx)
-        clamped = _clamp_limit(limit)
-
-        label_filter = f":{label}" if label else ""
-        t0 = time.monotonic()
-
-        # Stage 1: Exact uid match (if name contains ':')
-        if ":" in name:
-            records = await app.graph.execute(
-                f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {clamped}",
-                {"name": name},
-            )
-            if records:
-                elapsed = (time.monotonic() - t0) * 1000
-                return _result([_compact_node(r) for r in records], limit=clamped, query_ms=elapsed)
-
-        # Stage 2: Exact name match
-        records = await app.graph.execute(
-            f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
-            {"name": name},
-        )
-        if records:
-            elapsed = (time.monotonic() - t0) * 1000
-            return _result([_compact_node(r) for r in records], limit=clamped, query_ms=elapsed)
-
-        # Stage 3: ENDS WITH suffix match
-        suffix = f".{name}"
-        records = await app.graph.execute(
-            f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {clamped}",
-            {"suffix": suffix},
-        )
-        elapsed = (time.monotonic() - t0) * 1000
-        return _result([_compact_node(r) for r in records], limit=clamped, query_ms=elapsed)
+    _register_node_tools(mcp)
 
     @mcp.tool(
         description=(

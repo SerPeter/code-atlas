@@ -14,7 +14,9 @@ from code_atlas.mcp_server import (
     AppContext,
     _clamp_limit,
     _error,
+    _rank_results,
     _register_info_tools,
+    _register_node_tools,
     _register_query_tools,
     _register_search_tools,
     _result,
@@ -54,6 +56,7 @@ class _FakeCtx:
 async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> dict[str, Any]:
     """Invoke an MCP tool function directly, bypassing the MCP transport layer."""
     server = FastMCP(name="test")
+    _register_node_tools(server)
     _register_query_tools(server)
     _register_search_tools(server)
     _register_info_tools(server)
@@ -102,6 +105,66 @@ class TestHelpers:
     def test_error_envelope(self):
         e = _error("boom", code="FAIL")
         assert e == {"error": "boom", "code": "FAIL"}
+
+
+# ---------------------------------------------------------------------------
+# _rank_results (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestRankResults:
+    def test_source_before_test(self):
+        results = [
+            {"name": "Foo", "qualified_name": "tests.test_foo.Foo", "file_path": "tests/test_foo.py"},
+            {"name": "Foo", "qualified_name": "mypackage.foo.Foo", "file_path": "mypackage/foo.py"},
+        ]
+        ranked = _rank_results(results)
+        assert ranked[0]["file_path"] == "mypackage/foo.py"
+        assert ranked[1]["file_path"] == "tests/test_foo.py"
+
+    def test_public_before_private(self):
+        results = [
+            {"name": "foo", "qualified_name": "mod._foo", "visibility": "private"},
+            {"name": "foo", "qualified_name": "mod.foo", "visibility": "public"},
+        ]
+        ranked = _rank_results(results)
+        assert ranked[0]["visibility"] == "public"
+        assert ranked[1]["visibility"] == "private"
+
+    def test_shorter_qn_preferred(self):
+        results = [
+            {"name": "Svc", "qualified_name": "a.b.c.d.Svc"},
+            {"name": "Svc", "qualified_name": "a.Svc"},
+        ]
+        ranked = _rank_results(results)
+        assert ranked[0]["qualified_name"] == "a.Svc"
+        assert ranked[1]["qualified_name"] == "a.b.c.d.Svc"
+
+    def test_combined_ranking(self):
+        """Source + public beats test + public, which beats test + private."""
+        results = [
+            {"name": "X", "qualified_name": "tests.X", "file_path": "tests/test.py", "visibility": "private"},
+            {"name": "X", "qualified_name": "pkg.X", "file_path": "pkg/mod.py", "visibility": "public"},
+            {"name": "X", "qualified_name": "tests.X", "file_path": "tests/test.py", "visibility": "public"},
+        ]
+        ranked = _rank_results(results)
+        assert ranked[0]["file_path"] == "pkg/mod.py"
+        assert ranked[1]["visibility"] == "public"
+        assert ranked[1]["file_path"] == "tests/test.py"
+        assert ranked[2]["visibility"] == "private"
+
+    def test_empty_list(self):
+        assert _rank_results([]) == []
+
+    def test_missing_fields_uses_defaults(self):
+        """Nodes without visibility or file_path should not crash."""
+        results = [
+            {"name": "A", "qualified_name": "long.path.A"},
+            {"name": "B", "qualified_name": "B"},
+        ]
+        ranked = _rank_results(results)
+        assert ranked[0]["qualified_name"] == "B"
+        assert ranked[1]["qualified_name"] == "long.path.A"
 
 
 # ---------------------------------------------------------------------------
