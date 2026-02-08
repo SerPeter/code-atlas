@@ -169,6 +169,29 @@ class EventBus:
         """Acknowledge messages after successful processing."""
         return await self._redis.xack(self._stream_key(topic), group, *msg_ids)
 
+    async def stream_group_info(self, topic: Topic, group: str) -> dict[str, int]:
+        """Return pending + lag counts for a consumer group via XINFO GROUPS.
+
+        Returns ``{"pending": N, "lag": N}`` or ``{"pending": 0, "lag": 0}``
+        if the group does not exist yet.
+        """
+        try:
+            groups = await self._redis.xinfo_groups(self._stream_key(topic))
+        except aioredis.ResponseError:
+            return {"pending": 0, "lag": 0}
+
+        for g in groups:
+            # Redis returns dicts with byte or str keys depending on decode_responses
+            name = g.get(b"name", g.get("name", b""))
+            if isinstance(name, bytes):
+                name = name.decode()
+            if name == group:
+                pending = g.get(b"pending", g.get("pending", 0))
+                lag = g.get(b"lag", g.get("lag", 0))
+                return {"pending": int(pending), "lag": int(lag or 0)}
+
+        return {"pending": 0, "lag": 0}
+
     async def close(self) -> None:
         """Close the connection pool."""
         await self._redis.aclose()

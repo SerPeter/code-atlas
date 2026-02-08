@@ -24,8 +24,7 @@ def index(
     full_reindex: bool = typer.Option(False, "--full", help="Force full re-index, ignoring delta cache."),
 ) -> None:
     """Index a codebase into the graph."""
-    logger.info("Indexing {}", path)
-    raise typer.Exit(code=0)
+    asyncio.run(_run_index(path, scope, full_reindex))
 
 
 @app.command()
@@ -43,8 +42,7 @@ def search(
 @app.command()
 def status() -> None:
     """Show index status and health."""
-    logger.info("Status check")
-    raise typer.Exit(code=0)
+    asyncio.run(_run_status())
 
 
 @app.command()
@@ -52,6 +50,103 @@ def mcp() -> None:
     """Start the MCP server."""
     logger.info("Starting MCP server")
     raise typer.Exit(code=0)
+
+
+# ---------------------------------------------------------------------------
+# Index / Status async helpers
+# ---------------------------------------------------------------------------
+
+
+async def _run_index(path: str, scope: list[str] | None, full_reindex: bool) -> None:
+    """Async implementation of the ``atlas index`` command."""
+    from pathlib import Path
+
+    from code_atlas.events import EventBus
+    from code_atlas.graph import GraphClient
+    from code_atlas.indexer import index_project
+    from code_atlas.settings import AtlasSettings
+
+    project_root = Path(path).resolve()
+    settings = AtlasSettings(project_root=project_root)
+
+    # Connect to Valkey
+    bus = EventBus(settings.redis)
+    try:
+        await bus.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Valkey at {}:{} — {}", settings.redis.host, settings.redis.port, exc)
+        raise typer.Exit(code=1) from exc
+    logger.info("Connected to Valkey at {}:{}", settings.redis.host, settings.redis.port)
+
+    # Connect to Memgraph
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        await bus.close()
+        raise typer.Exit(code=1) from exc
+    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+
+    await graph.ensure_schema()
+
+    try:
+        result = await index_project(
+            settings,
+            graph,
+            bus,
+            scope_paths=scope or None,
+            full_reindex=full_reindex,
+        )
+        logger.info(
+            "Done — {} files scanned, {} entities indexed in {:.1f}s",
+            result.files_scanned,
+            result.entities_total,
+            result.duration_s,
+        )
+    finally:
+        await graph.close()
+        await bus.close()
+
+
+async def _run_status() -> None:
+    """Async implementation of the ``atlas status`` command."""
+    from code_atlas.graph import GraphClient
+    from code_atlas.settings import AtlasSettings
+
+    settings = AtlasSettings()
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        projects = await graph.get_project_status()
+        if not projects:
+            logger.info("No indexed projects found.")
+            return
+        for row in projects:
+            node = row["n"]
+            name = node.get("name", "?")
+            last = node.get("last_indexed_at")
+            files = node.get("file_count", "?")
+            entities = node.get("entity_count", "?")
+            git_hash = node.get("git_hash", "?")
+            import datetime
+
+            ts = datetime.datetime.fromtimestamp(last, tz=datetime.UTC).isoformat() if last else "never"
+            logger.info(
+                "Project: {} | indexed: {} | files: {} | entities: {} | git: {}",
+                name,
+                ts,
+                files,
+                entities,
+                git_hash,
+            )
+    finally:
+        await graph.close()
 
 
 # ---------------------------------------------------------------------------

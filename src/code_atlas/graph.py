@@ -186,6 +186,77 @@ class GraphClient:
             file_path,
         )
 
+    async def merge_project_node(self, project_name: str, **metadata: Any) -> None:
+        """Create or update a Project node by uid."""
+        uid = project_name
+        props = {"uid": uid, "project_name": project_name, "name": project_name, **metadata}
+        set_clause = ", ".join(f"n.{k} = ${k}" for k in props)
+        await self.execute_write(
+            f"MERGE (n:{NodeLabel.PROJECT} {{uid: $uid}}) SET {set_clause}",
+            props,
+        )
+
+    async def merge_package_node(self, project_name: str, qualified_name: str, name: str, file_path: str) -> None:
+        """Create or update a Package node by uid."""
+        uid = f"{project_name}:{qualified_name}"
+        await self.execute_write(
+            f"MERGE (n:{NodeLabel.PACKAGE} {{uid: $uid}}) "
+            f"SET n.project_name = $project_name, n.name = $name, "
+            f"n.qualified_name = $qualified_name, n.file_path = $file_path",
+            {
+                "uid": uid,
+                "project_name": project_name,
+                "name": name,
+                "qualified_name": qualified_name,
+                "file_path": file_path,
+            },
+        )
+
+    async def create_contains_edge(self, from_uid: str, to_uid: str) -> None:
+        """Create an idempotent CONTAINS relationship between two nodes."""
+        await self.execute_write(
+            f"MATCH (a {{uid: $from_uid}}), (b {{uid: $to_uid}}) MERGE (a)-[:{RelType.CONTAINS}]->(b)",
+            {"from_uid": from_uid, "to_uid": to_uid},
+        )
+
+    async def delete_project_data(self, project_name: str) -> None:
+        """Delete all nodes belonging to a project (for full reindex)."""
+        await self.execute_write(
+            "MATCH (n {project_name: $project_name}) DETACH DELETE n",
+            {"project_name": project_name},
+        )
+
+    async def update_project_metadata(self, project_name: str, **metadata: Any) -> None:
+        """Update properties on the Project node."""
+        uid = project_name
+        set_clause = ", ".join(f"n.{k} = ${k}" for k in metadata)
+        if not set_clause:
+            return
+        await self.execute_write(
+            f"MATCH (n:{NodeLabel.PROJECT} {{uid: $uid}}) SET {set_clause}",
+            {"uid": uid, **metadata},
+        )
+
+    async def get_project_status(self, project_name: str | None = None) -> list[dict[str, Any]]:
+        """Query Project nodes for status display."""
+        if project_name:
+            return await self.execute(
+                f"MATCH (n:{NodeLabel.PROJECT} {{uid: $uid}}) RETURN n",
+                {"uid": project_name},
+            )
+        return await self.execute(f"MATCH (n:{NodeLabel.PROJECT}) RETURN n")
+
+    async def count_entities(self, project_name: str) -> int:
+        """Count all entity nodes (Module, TypeDef, Callable, Value, Package) for a project."""
+        records = await self.execute(
+            "MATCH (n {project_name: $project_name}) "
+            f"WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.TYPE_DEF} OR n:{NodeLabel.CALLABLE} "
+            f"OR n:{NodeLabel.VALUE} OR n:{NodeLabel.PACKAGE} "
+            "RETURN count(n) AS cnt",
+            {"project_name": project_name},
+        )
+        return records[0]["cnt"] if records else 0
+
     async def close(self) -> None:
         """Close the driver and release connections."""
         await self._driver.close()
