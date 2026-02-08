@@ -6,6 +6,7 @@ Read-only query interface — connects directly to Memgraph, no daemon dependenc
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from contextlib import asynccontextmanager
@@ -31,6 +32,8 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
+from code_atlas.search import SearchType
+from code_atlas.search import hybrid_search as _hybrid_search
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -121,16 +124,6 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def _node_project_name(record: dict[str, Any]) -> str:
-    """Extract project_name from a record containing a neo4j Node."""
-    node = record.get("node") or record.get("n")
-    if node is None:
-        return ""
-    if hasattr(node, "get"):
-        return node.get("project_name", "")
-    return ""
-
-
 def _result(records: list[dict[str, Any]], *, limit: int, query_ms: float, total: int | None = None) -> dict[str, Any]:
     """Consistent result envelope."""
     return {
@@ -207,15 +200,17 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
         instructions=(
             "Code Atlas — graph-powered code intelligence. "
             "Start with schema_info and index_status. "
-            "Use get_node to find entities, get_context to expand. "
+            "Use hybrid_search as the primary search tool — it fuses graph, vector, and BM25 results via RRF. "
+            "Use get_node to find entities by name, get_context to expand neighborhoods. "
             "Use cypher_query for custom traversals. "
-            "Use text_search for keywords, vector_search for semantics."
+            "Individual text_search / vector_search tools are available for targeted queries."
         ),
         lifespan=app_lifespan,
     )
 
     _register_query_tools(mcp)
     _register_search_tools(mcp)
+    _register_hybrid_tool(mcp)
     _register_info_tools(mcp)
     return mcp
 
@@ -467,8 +462,6 @@ def _register_search_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         app = _get_app_ctx(ctx)
         clamped = _clamp_limit(limit)
-        filtering = bool(project) or threshold > 0.0
-        fetch_limit = clamped * 3 if filtering else clamped
 
         # Embed the query
         try:
@@ -476,39 +469,89 @@ def _register_search_tools(mcp: FastMCP) -> None:
         except EmbeddingError as exc:
             return _error(f"Embedding service unavailable: {exc}", code="EMBED_ERROR")
 
-        indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
-
         t0 = time.monotonic()
-        all_results: list[dict[str, Any]] = []
-
-        for index_name in indices:
-            cypher = (
-                f"CALL vector_search.search('{index_name}', {fetch_limit}, $vector) "
-                "YIELD node, similarity "
-                "RETURN node, similarity "
-                f"ORDER BY similarity DESC LIMIT {fetch_limit}"
-            )
-            try:
-                records = await app.graph.execute(cypher, {"vector": vector})
-                all_results.extend(records)
-            except Exception as exc:
-                logger.warning("Vector search on {} failed: {}", index_name, exc)
-
-        # Post-filter by threshold
-        if threshold > 0.0:
-            all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
-
-        # Post-filter by project scope
-        if project:
-            all_results = [r for r in all_results if _node_project_name(r) == project]
-
-        # Sort by similarity descending and take top results
-        all_results.sort(key=lambda rec: rec.get("similarity", 0), reverse=True)
-        all_results = all_results[:clamped]
+        all_results = await app.graph.vector_search(
+            vector, label=label, limit=clamped, project=project, threshold=threshold
+        )
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
         return _result(compacted, limit=clamped, query_ms=elapsed)
+
+
+def _register_hybrid_tool(mcp: FastMCP) -> None:
+    """Register the hybrid_search tool."""
+
+    @mcp.tool(
+        description=(
+            "Primary search tool — fuses graph name-matching, BM25 keyword search, and vector "
+            "semantic search via Reciprocal Rank Fusion (RRF). "
+            "Automatically adjusts channel weights based on query shape: identifier-like queries "
+            "boost graph+BM25, natural language boosts vector. "
+            "Optional: search_types (comma-separated: graph,vector,bm25), "
+            'scope (project name filter), weights (JSON: {"graph": 2.0}). '
+            "Returns results ranked by fused score with provenance (which channels found each result)."
+        ),
+    )
+    async def hybrid_search(
+        query: str,
+        limit: int = 20,
+        search_types: str = "",
+        scope: str = "",
+        weights: str = "",
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = _get_app_ctx(ctx)
+        clamped = _clamp_limit(limit)
+
+        # Parse search_types
+        types: list[SearchType] | None = None
+        if search_types:
+            types = [SearchType(s.strip()) for s in search_types.split(",") if s.strip()]
+
+        # Parse weights
+        weight_dict: dict[str, float] | None = None
+        if weights:
+            try:
+                weight_dict = json.loads(weights)
+            except json.JSONDecodeError:
+                return _error("Invalid weights JSON", code="INVALID_WEIGHTS")
+
+        t0 = time.monotonic()
+        results = await _hybrid_search(
+            graph=app.graph,
+            embed=app.embed,
+            settings=app.settings.search,
+            query=query,
+            search_types=types,
+            limit=clamped,
+            scope=scope,
+            weights=weight_dict,
+        )
+        elapsed = (time.monotonic() - t0) * 1000
+
+        serialized = [
+            {
+                "uid": r.uid,
+                "name": r.name,
+                "qualified_name": r.qualified_name,
+                "kind": r.kind,
+                "file_path": r.file_path,
+                "line_start": r.line_start,
+                "line_end": r.line_end,
+                "signature": r.signature,
+                "docstring": (
+                    r.docstring[:_DOCSTRING_TRUNCATE] + ("..." if len(r.docstring) > _DOCSTRING_TRUNCATE else "")
+                    if r.docstring
+                    else ""
+                ),
+                "_labels": r.labels,
+                "rrf_score": round(r.rrf_score, 6),
+                "sources": r.sources,
+            }
+            for r in results
+        ]
+        return _result(serialized, limit=clamped, query_ms=elapsed)
 
 
 def _register_info_tools(mcp: FastMCP) -> None:

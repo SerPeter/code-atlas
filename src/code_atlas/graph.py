@@ -14,6 +14,7 @@ from loguru import logger
 from neo4j import AsyncGraphDatabase
 
 from code_atlas.schema import (
+    _EMBEDDABLE_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     SCHEMA_VERSION,
     NodeLabel,
@@ -444,6 +445,115 @@ class GraphClient:
         except Exception as exc:
             logger.debug("Could not fetch text index info: {}", exc)
             return []
+
+    # -- Vector search helpers -------------------------------------------------
+
+    async def vector_search(
+        self,
+        vector: list[float],
+        label: str = "",
+        limit: int = 20,
+        project: str = "",
+        threshold: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Semantic similarity search using pre-computed vector.
+
+        Queries one or all vector indices, optionally post-filters by project
+        and similarity threshold, and returns results sorted by similarity
+        descending.  Returns ``[{"node": Node, "similarity": float}, ...]``.
+        """
+        indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
+        filtering = bool(project) or threshold > 0.0
+        fetch_limit = limit * 3 if filtering else limit
+
+        all_results: list[dict[str, Any]] = []
+        for index_name in indices:
+            cypher = (
+                f"CALL vector_search.search('{index_name}', {fetch_limit}, $vector) "
+                "YIELD node, similarity "
+                "RETURN node, similarity "
+                f"ORDER BY similarity DESC LIMIT {fetch_limit}"
+            )
+            try:
+                records = await self.execute(cypher, {"vector": vector})
+                all_results.extend(records)
+            except Exception as exc:
+                logger.warning("Vector search on {} failed: {}", index_name, exc)
+
+        if threshold > 0.0:
+            all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
+        if project:
+            all_results = [r for r in all_results if _node_project_name(r) == project]
+
+        all_results.sort(key=lambda rec: rec.get("similarity", 0), reverse=True)
+        return all_results[:limit]
+
+    # -- Graph (name-based) search helpers ------------------------------------
+
+    async def graph_search(
+        self,
+        query: str,
+        label: str = "",
+        limit: int = 20,
+        project: str = "",
+    ) -> list[dict[str, Any]]:
+        """Name-based graph search with scored matching.
+
+        Three-stage matching with decreasing scores:
+        - Exact name match: score 3.0
+        - Suffix match (qualified_name ends with .query): score 2.0
+        - Contains match (name or qualified_name contains query): score 1.0
+
+        Deduplicates by uid, keeping highest score.
+        Returns ``[{"node": Node, "score": float}, ...]``.
+        """
+        label_filter = f":{label}" if label else ""
+        project_clause = " AND n.project_name = $project" if project else ""
+        params: dict[str, Any] = {"query": query, "project": project}
+        fetch_limit = limit * 3
+
+        scored: dict[str, tuple[Any, float]] = {}
+
+        # Stage 1: Exact name match (score 3.0)
+        records = await self.execute(
+            f"MATCH (n{label_filter}) WHERE n.name = $query{project_clause} RETURN n LIMIT {fetch_limit}",
+            params,
+        )
+        for r in records:
+            node = r["n"]
+            uid = node.get("uid", "") if hasattr(node, "get") else ""
+            if uid and (uid not in scored or scored[uid][1] < 3.0):
+                scored[uid] = (node, 3.0)
+
+        # Stage 2: Suffix match (score 2.0)
+        suffix = f".{query}"
+        records = await self.execute(
+            f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix{project_clause} "
+            f"RETURN n LIMIT {fetch_limit}",
+            {**params, "suffix": suffix},
+        )
+        for r in records:
+            node = r["n"]
+            uid = node.get("uid", "") if hasattr(node, "get") else ""
+            if uid and (uid not in scored or scored[uid][1] < 2.0):
+                scored[uid] = (node, 2.0)
+
+        # Stage 3: Contains match (score 1.0)
+        records = await self.execute(
+            f"MATCH (n{label_filter}) WHERE (n.qualified_name CONTAINS $query OR n.name CONTAINS $query)"
+            f"{project_clause} RETURN n LIMIT {fetch_limit}",
+            params,
+        )
+        for r in records:
+            node = r["n"]
+            uid = node.get("uid", "") if hasattr(node, "get") else ""
+            if uid and uid not in scored:
+                scored[uid] = (node, 1.0)
+
+        # Build result list sorted by score descending
+        results = [{"node": node, "score": score} for node, score in scored.values()]
+        results.sort(key=lambda rec: rec["score"], reverse=True)
+        return results[:limit]
 
     async def close(self) -> None:
         """Close the driver and release connections."""

@@ -29,14 +29,13 @@ def index(
 
 @app.command()
 def search(
-    query: str = typer.Argument(..., help="Search query (natural language, keyword, or Cypher)."),
-    type_: str = typer.Option("hybrid", "--type", "-t", help="Search type: hybrid, graph, semantic, keyword."),
-    scope: str | None = typer.Option(None, help="Scope search to a sub-project path."),
-    budget: int = typer.Option(8000, "--budget", "-b", help="Token budget for context assembly."),
+    query: str = typer.Argument(..., help="Search query (natural language, keyword, or identifier)."),
+    type_: str = typer.Option("hybrid", "--type", "-t", help="Search type: hybrid, graph, vector, bm25."),
+    scope: str | None = typer.Option(None, help="Scope search to a project name."),
+    limit: int = typer.Option(10, "--limit", "-n", help="Max results to return."),
 ) -> None:
     """Search the code graph."""
-    logger.info("Searching for '{}' (type={})", query, type_)
-    raise typer.Exit(code=0)
+    asyncio.run(_run_search(query, type_, scope, limit))
 
 
 @app.command()
@@ -114,6 +113,67 @@ async def _run_index(path: str, scope: list[str] | None, full_reindex: bool) -> 
     finally:
         await graph.close()
         await bus.close()
+
+
+async def _run_search(query: str, type_: str, scope: str | None, limit: int) -> None:
+    """Async implementation of the ``atlas search`` command."""
+    from code_atlas.embeddings import EmbedClient
+    from code_atlas.graph import GraphClient
+    from code_atlas.search import SearchType, hybrid_search
+    from code_atlas.settings import AtlasSettings
+
+    settings = AtlasSettings()
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        raise typer.Exit(code=1) from exc
+
+    # Map CLI type names to SearchType lists
+    type_map: dict[str, list[SearchType] | None] = {
+        "hybrid": None,  # all channels
+        "graph": [SearchType.GRAPH],
+        "vector": [SearchType.VECTOR],
+        "bm25": [SearchType.BM25],
+    }
+    search_types = type_map.get(type_)
+    if type_ not in type_map:
+        logger.error("Unknown search type '{}' — use hybrid, graph, vector, or bm25", type_)
+        await graph.close()
+        raise typer.Exit(code=1)
+
+    embed: EmbedClient | None = None
+    if search_types is None or SearchType.VECTOR in search_types:
+        embed = EmbedClient(settings.embeddings)
+
+    try:
+        results = await hybrid_search(
+            graph=graph,
+            embed=embed,
+            settings=settings.search,
+            query=query,
+            search_types=search_types,
+            limit=limit,
+            scope=scope or "",
+        )
+        if not results:
+            logger.info("No results found for '{}'", query)
+            return
+        for i, r in enumerate(results, 1):
+            sources = ", ".join(f"{ch}#{rank}" for ch, rank in r.sources.items())
+            loc = f"{r.file_path}:{r.line_start}" if r.file_path and r.line_start else ""
+            logger.info(
+                "{}. {} ({}) — rrf={:.4f} [{}] {}",
+                i,
+                r.qualified_name or r.name,
+                r.kind or ", ".join(r.labels),
+                r.rrf_score,
+                sources,
+                loc,
+            )
+    finally:
+        await graph.close()
 
 
 async def _run_status() -> None:

@@ -61,6 +61,11 @@ class SearchSettings(BaseSettings):
     test_filter: bool = Field(default=True, description="Exclude test files from results by default.")
     max_caller_depth: int = Field(default=1, description="Default hop depth for caller/callee expansion.")
     max_callers: int = Field(default=10, description="Max callers to return before ranking/filtering.")
+    rrf_k: int = Field(default=60, description="RRF k parameter (higher = more weight to lower-ranked results).")
+    default_weights: dict[str, float] = Field(
+        default_factory=lambda: {"graph": 1.0, "vector": 1.0, "bm25": 1.0},
+        description="Default per-channel weights for hybrid search RRF fusion.",
+    )
 
 
 class DetectorSettings(BaseSettings):
