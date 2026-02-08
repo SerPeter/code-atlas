@@ -18,7 +18,7 @@ from code_atlas.events import (
     decode_event,
 )
 from code_atlas.pipeline import Tier1GraphConsumer
-from code_atlas.settings import RedisSettings
+from code_atlas.settings import AtlasSettings, RedisSettings
 
 # All tests in this module require a live Redis/Valkey
 pytestmark = pytest.mark.integration
@@ -132,7 +132,13 @@ async def test_tier1_publishes_downstream(bus: EventBus) -> None:
     )
 
     # Run Tier1 for a short period then stop
-    tier1 = Tier1GraphConsumer(bus)
+    # Tier1 needs graph + settings but we're only testing event flow here;
+    # it doesn't call graph in its current implementation.
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    mock_graph = AsyncMock()
+    test_settings = AtlasSettings()
+    tier1 = Tier1GraphConsumer(bus, mock_graph, test_settings)
 
     async def stop_after_delay() -> None:
         await asyncio.sleep(1.5)

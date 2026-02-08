@@ -2,7 +2,7 @@
 
 Three tiers form a linear pipeline, each pulling at its own pace:
 
-    FileChanged → Tier 1 (graph metadata) → ASTDirty → Tier 2 (AST diff)
+    FileChanged → Tier 1 (graph metadata) → ASTDirty → Tier 2 (AST parse)
                 → significance gate → EmbedDirty → Tier 3 (embeddings)
 
 Each tier uses batch-pull with configurable time/count policy and
@@ -15,6 +15,8 @@ import asyncio
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
@@ -28,6 +30,11 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
+from code_atlas.parser import parse_file
+
+if TYPE_CHECKING:
+    from code_atlas.graph import GraphClient
+    from code_atlas.settings import AtlasSettings
 
 # ---------------------------------------------------------------------------
 # Batch policy
@@ -148,7 +155,7 @@ class TierConsumer(ABC):
 class Tier1GraphConsumer(TierConsumer):
     """Tier 1: Update file-level graph metadata, always publish ASTDirty downstream."""
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(self, bus: EventBus, graph: GraphClient, settings: AtlasSettings) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.FILE_CHANGED,
@@ -156,6 +163,8 @@ class Tier1GraphConsumer(TierConsumer):
             consumer_name="tier1-graph-0",
             policy=BatchPolicy(time_window_s=0.5, max_batch_size=50),
         )
+        self.graph = graph
+        self.settings = settings
 
     def dedup_key(self, event: Event) -> str:
         if isinstance(event, FileChanged):
@@ -173,7 +182,7 @@ class Tier1GraphConsumer(TierConsumer):
 
 
 # ---------------------------------------------------------------------------
-# Tier 2: AST diff + significance gate (medium cost)
+# Tier 2: AST parse + graph write (medium cost)
 # ---------------------------------------------------------------------------
 
 # Significance levels for the Tier 2 → Tier 3 gate
@@ -190,9 +199,9 @@ class Tier1GraphConsumer(TierConsumer):
 
 
 class Tier2ASTConsumer(TierConsumer):
-    """Tier 2: Re-parse AST, diff entities, gate significant changes to Tier 3."""
+    """Tier 2: Parse AST via tree-sitter, write entities to graph, publish EmbedDirty."""
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(self, bus: EventBus, graph: GraphClient, settings: AtlasSettings) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.AST_DIRTY,
@@ -200,6 +209,8 @@ class Tier2ASTConsumer(TierConsumer):
             consumer_name="tier2-ast-0",
             policy=BatchPolicy(time_window_s=3.0, max_batch_size=20),
         )
+        self.graph = graph
+        self.settings = settings
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         all_paths: list[str] = []
@@ -211,15 +222,51 @@ class Tier2ASTConsumer(TierConsumer):
 
         logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
-        # TODO: Run Rust parser on each path, diff AST against stored version
-        # TODO: Evaluate significance gate per entity
+        project_name = self.settings.project_root.name
+        all_entity_refs: list[EntityRef] = []
 
-        # Prototype: always gate through with a stub entity per path
-        entities = [EntityRef(qualified_name=p, node_type="module", file_path=p) for p in unique_paths]
-        if entities:
+        for file_path in unique_paths:
+            # Read file from disk (skip if deleted/missing)
+            full_path = Path(self.settings.project_root) / file_path
+            if not full_path.is_file():
+                logger.debug("Tier2: skipping missing file {}", file_path)
+                continue
+
+            try:
+                source = full_path.read_bytes()
+            except OSError:
+                logger.warning("Tier2: cannot read {}", file_path)
+                continue
+
+            # Parse with tree-sitter
+            parsed = parse_file(file_path, source, project_name)
+            if parsed is None:
+                logger.debug("Tier2: unsupported language for {}", file_path)
+                continue
+
+            # Write to graph
+            await self.graph.upsert_file_entities(
+                project_name=project_name,
+                file_path=file_path,
+                entities=parsed.entities,
+                relationships=parsed.relationships,
+            )
+
+            # Collect entity refs for downstream
+            all_entity_refs.extend(
+                EntityRef(
+                    qualified_name=entity.qualified_name,
+                    node_type=entity.label.value,
+                    file_path=entity.file_path,
+                )
+                for entity in parsed.entities
+            )
+
+        # No significance gate yet (always pass through) — epic 05-delta
+        if all_entity_refs:
             await self.bus.publish(
                 Topic.EMBED_DIRTY,
-                EmbedDirty(entities=entities, significance="HIGH", batch_id=batch_id),
+                EmbedDirty(entities=all_entity_refs, significance="HIGH", batch_id=batch_id),
             )
 
 

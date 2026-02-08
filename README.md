@@ -6,7 +6,6 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io/)
 
@@ -164,7 +163,7 @@ migrations/
 
 ┌─────────────────────────────────────────────────┐
 │              Indexing Pipeline                    │
-│  File Scanner → AST Parser (Rust) → Delta Diff  │
+│  File Scanner → AST Parser (tree-sitter) → Diff │
 │  → Pattern Detectors → Embeddings (TEI)         │
 │  → Graph Writer → Memgraph                      │
 └─────────────────────────────────────────────────┘
@@ -194,14 +193,14 @@ uv run pre-commit install
 
 Several excellent tools exist in this space. Code Atlas builds on their ideas while addressing gaps that emerge when you need graph, semantic, and keyword search working together.
 
-| Tool | Strengths | Gaps |
-|---|---|---|
-| **[code-graph-mcp](https://github.com/entrepeneur4lyf/code-graph-mcp)** | Fast ast-grep parsing, broad language coverage | In-memory only (no persistence), no semantic or keyword search |
-| **[code-graph-rag](https://github.com/vitali87/code-graph-rag)** | Best hierarchy model, Memgraph-native | Every query requires an LLM call, no vector/BM25 search, no doc indexing |
-| **[Kit](https://github.com/cased/kit)** | Clean DX, good semantic + text search | No graph database — can't follow relationships (calls, inheritance) |
-| **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)** | 100% Rust, LSP-based type resolution | SurrealDB's graph traversal unproven, non-standard query language for AI agents |
+| Tool                                                                    | Strengths                                      | Gaps                                                                            |
+| ----------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------- |
+| **[code-graph-mcp](https://github.com/entrepeneur4lyf/code-graph-mcp)** | Fast ast-grep parsing, broad language coverage | In-memory only (no persistence), no semantic or keyword search                  |
+| **[code-graph-rag](https://github.com/vitali87/code-graph-rag)**        | Best hierarchy model, Memgraph-native          | Every query requires an LLM call, no vector/BM25 search, no doc indexing        |
+| **[Kit](https://github.com/cased/kit)**                                 | Clean DX, good semantic + text search          | No graph database — can't follow relationships (calls, inheritance)             |
+| **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)**       | 100% Rust, LSP-based type resolution           | SurrealDB's graph traversal unproven, non-standard query language for AI agents |
 
-Code Atlas combines the strengths: code-graph-rag's hierarchy and Memgraph foundation, Kit's search and context assembly, code-graph-mcp's parsing speed via Rust, and codegraph-rust's ambition for type-aware resolution — while adding documentation intelligence, monorepo support, pluggable pattern detection, and token-budget-aware context assembly.
+Code Atlas combines the strengths: code-graph-rag's hierarchy and Memgraph foundation, Kit's search and context assembly, code-graph-mcp's tree-sitter parsing, and codegraph-rust's ambition for type-aware resolution — while adding documentation intelligence, monorepo support, pluggable pattern detection, and token-budget-aware context assembly.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR-0006](./0006-pure-python-tree-sitter.md)
 
 ## Date
 
@@ -32,13 +32,16 @@ We will use a **Python/Rust hybrid architecture**:
 
 - **Best of both worlds**: Rust's performance for the hot path (parsing), Python's productivity for orchestration
 
-- **Tree-sitter native performance**: Tree-sitter is a C library with excellent Rust bindings. Rust parser can achieve 10,000+ files/second
+- **Tree-sitter native performance**: Tree-sitter is a C library with excellent Rust bindings. Rust parser can achieve
+  10,000+ files/second
 
-- **Rich Python ecosystem**: MCP SDK, LiteLLM, httpx, tiktoken, numpy — all Python-native. No FFI overhead for these integrations
+- **Rich Python ecosystem**: MCP SDK, LiteLLM, httpx, tiktoken, numpy — all Python-native. No FFI overhead for these
+  integrations
 
 - **Familiar development**: Most contributors will work in Python. Rust is isolated to a well-defined component
 
-- **Subprocess simplicity**: Parser as a CLI subprocess avoids PyO3/maturin complexity for v1. Can optimize to native bindings later if needed
+- **Subprocess simplicity**: Parser as a CLI subprocess avoids PyO3/maturin complexity for v1. Can optimize to native
+  bindings later if needed
 
 ### Negative
 
@@ -60,6 +63,7 @@ We will use a **Python/Rust hybrid architecture**:
 Use tree-sitter Python bindings (`py-tree-sitter`) for parsing.
 
 **Why rejected:**
+
 - Python GIL limits parallel parsing performance
 - tree-sitter Python bindings are less ergonomic than Rust
 - Would be 5-10x slower for large codebases
@@ -69,6 +73,7 @@ Use tree-sitter Python bindings (`py-tree-sitter`) for parsing.
 Rewrite everything in Rust for maximum performance.
 
 **Why rejected:**
+
 - MCP SDK is Python-first; Rust MCP support is nascent
 - LiteLLM, tiktoken, and other AI libraries are Python
 - Significantly more development effort
@@ -79,6 +84,7 @@ Rewrite everything in Rust for maximum performance.
 Use PyO3 to expose Rust parser as a native Python module.
 
 **Why rejected:**
+
 - Adds build complexity (maturin, cross-platform wheels)
 - Subprocess is sufficient for v1 performance targets
 - Can migrate to PyO3 later if profiling shows subprocess overhead

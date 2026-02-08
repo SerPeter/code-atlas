@@ -10,13 +10,15 @@ Accepted
 
 ## Context
 
-Code Atlas has two distinct event sources — file system changes (continuous) and MCP requests (on-demand) — that feed into an indexing pipeline where operations have vastly different costs:
+Code Atlas has two distinct event sources — file system changes (continuous) and MCP requests (on-demand) — that feed
+into an indexing pipeline where operations have vastly different costs:
 
 - **Cheap**: Graph node metadata updates (sub-millisecond Cypher writes)
-- **Medium**: AST re-parsing (Rust, fast) + entity diffing + graph edge updates
+- **Medium**: AST re-parsing (tree-sitter, fast) + entity diffing + graph edge updates
 - **Expensive**: Embedding generation via TEI (network call, batch processing)
 
 A flat debounce strategy (as attempted in code-graph-rag PR #213) treats all work equally. This leads to either:
+
 - Re-embedding on every minor change (wasteful — TEI calls are the bottleneck)
 - Delaying cheap updates unnecessarily (stale graph metadata while waiting for debounce)
 
@@ -24,7 +26,9 @@ We need an architecture that processes cheap work immediately and expensive work
 
 ## Decision
 
-We adopt an **event-driven tiered pipeline** using **Redis/Valkey Streams** as the event bus backbone, following a "dumb pipes, smart endpoints" principle: Redis routes messages between decoupled stages, and each consumer implements its own batching, dedup, and gating logic.
+We adopt an **event-driven tiered pipeline** using **Redis/Valkey Streams** as the event bus backbone, following a "dumb
+pipes, smart endpoints" principle: Redis routes messages between decoupled stages, and each consumer implements its own
+batching, dedup, and gating logic.
 
 ### Event Bus: Redis Streams
 
@@ -58,15 +62,16 @@ Typed frozen dataclasses with JSON serialization for Redis transport:
                                               └──────────────┘
 ```
 
-Each tier pulls at its own pace via `XREADGROUP`, deduplicates within its batch window, and publishes downstream only if warranted.
+Each tier pulls at its own pace via `XREADGROUP`, deduplicates within its batch window, and publishes downstream only if
+warranted.
 
 ### Per-Consumer Batch Policy
 
-| Tier | Window | Max Batch | Dedup Key |
-|------|--------|-----------|-----------|
-| Tier 1 (Graph) | 0.5s | 50 | File path |
-| Tier 2 (AST) | 3.0s | 20 | File path |
-| Tier 3 (Embed) | 15.0s | 100 | Entity qualified name |
+| Tier           | Window | Max Batch | Dedup Key             |
+| -------------- | ------ | --------- | --------------------- |
+| Tier 1 (Graph) | 0.5s   | 50        | File path             |
+| Tier 2 (AST)   | 3.0s   | 20        | File path             |
+| Tier 3 (Embed) | 15.0s  | 100       | Entity qualified name |
 
 Hybrid batching: flush when count OR time threshold hit, whichever first. Same file changed 5× in window = 1 work item.
 
@@ -88,19 +93,20 @@ FileChanged                ASTDirty                     EmbedDirty
 
 Tier 2 evaluates whether a change is semantically significant enough to warrant re-embedding:
 
-| Condition | Level | Action |
-|-----------|-------|--------|
-| Whitespace/formatting only | NONE | Stop |
-| Non-docstring comment | TRIVIAL | Stop |
-| Docstring changed | MODERATE | Gate through |
-| Body changed < 20% AST diff | MODERATE | Gate through |
-| Body changed >= 20% | HIGH | Gate through |
-| Signature changed | HIGH | Always gate through |
-| Entity added/deleted | HIGH | Always gate through |
+| Condition                   | Level    | Action              |
+| --------------------------- | -------- | ------------------- |
+| Whitespace/formatting only  | NONE     | Stop                |
+| Non-docstring comment       | TRIVIAL  | Stop                |
+| Docstring changed           | MODERATE | Gate through        |
+| Body changed < 20% AST diff | MODERATE | Gate through        |
+| Body changed >= 20%         | HIGH     | Gate through        |
+| Signature changed           | HIGH     | Always gate through |
+| Entity added/deleted        | HIGH     | Always gate through |
 
 ### Error Handling
 
-Failed batches are NOT acknowledged — Redis re-delivers via the pending entries list (PEL). Each consumer handles its own retries through this mechanism, avoiding the need for a separate dead-letter queue.
+Failed batches are NOT acknowledged — Redis re-delivers via the pending entries list (PEL). Each consumer handles its
+own retries through this mechanism, avoiding the need for a separate dead-letter queue.
 
 ## Consequences
 
@@ -117,15 +123,19 @@ Failed batches are NOT acknowledged — Redis re-delivers via the pending entrie
 ### Negative
 
 - More architectural complexity than a simple "reindex everything on change"
-- Significance threshold heuristics need tuning and may produce false negatives (skipping re-embeds that should have happened)
+- Significance threshold heuristics need tuning and may produce false negatives (skipping re-embeds that should have
+  happened)
 - Debugging event flow across tiers is harder than a linear pipeline
 - Additional infrastructure dependency (Valkey), though lightweight
 
 ### Risks
 
-- Threshold tuning: too aggressive = stale embeddings, too conservative = excessive TEI calls. Need observability on gate decisions.
-- Event ordering: if Tier 2 processes file A before file B, but B depends on A's entities, the diff may be incorrect. Batch boundaries must align with dependency boundaries.
-- Complexity creep: the event bus must stay simple. If we find ourselves adding routing rules, dead-letter queues, or retry logic, we've gone too far.
+- Threshold tuning: too aggressive = stale embeddings, too conservative = excessive TEI calls. Need observability on
+  gate decisions.
+- Event ordering: if Tier 2 processes file A before file B, but B depends on A's entities, the diff may be incorrect.
+  Batch boundaries must align with dependency boundaries.
+- Complexity creep: the event bus must stay simple. If we find ourselves adding routing rules, dead-letter queues, or
+  retry logic, we've gone too far.
 
 ## Alternatives Considered
 
@@ -134,7 +144,9 @@ Failed batches are NOT acknowledged — Redis re-delivers via the pending entrie
 Single debounce timer + max-wait ceiling. All work (graph updates, AST parsing, embedding) happens in one batch.
 
 **Why rejected:**
-- Treats all work equally — either everything is delayed (bad for cheap updates) or everything is eager (wasteful for expensive updates)
+
+- Treats all work equally — either everything is delayed (bad for cheap updates) or everything is eager (wasteful for
+  expensive updates)
 - No way to skip embedding for trivial changes
 - code-graph-rag's implementation had unresolved bugs around threading and timer cancellation
 
@@ -143,6 +155,7 @@ Single debounce timer + max-wait ceiling. All work (graph updates, AST parsing, 
 Pure asyncio queues per topic, task per subscriber. Zero external dependencies.
 
 **Why rejected:**
+
 - Locks to single-process — multi-process scaling requires a full rewrite
 - No consumer groups, no persistent pending entries, no batch-pull primitives
 - Simpler initially but creates technical debt when daemon + MCP need to communicate
@@ -152,6 +165,7 @@ Pure asyncio queues per topic, task per subscriber. Zero external dependencies.
 Use SQLite WAL as a durable work queue between tiers.
 
 **Why rejected:**
+
 - Persistence adds complexity without benefit (process re-evaluates on startup)
 - Polling-based consumption adds latency vs event-driven push
 - Doesn't naturally support the pub/sub pattern needed for tier fan-out
@@ -161,6 +175,7 @@ Use SQLite WAL as a durable work queue between tiers.
 Full-featured message broker for event routing.
 
 **Why rejected:**
+
 - Heavy infrastructure for a local developer tool (100MB+ Docker image)
 - Feature-rich but most features (persistence, routing rules, exchanges) are unnecessary
 - Valkey provides the needed subset at a fraction of the weight

@@ -52,24 +52,6 @@ repos:
         pass_filenames: false
 
   # --------------------------------------------------------------------------
-  # Rust
-  # --------------------------------------------------------------------------
-  - repo: local
-    hooks:
-      - id: cargo-fmt
-        name: cargo fmt
-        language: system
-        entry: cargo fmt --manifest-path crates/Cargo.toml --
-        types: [rust]
-        pass_filenames: false
-      - id: cargo-clippy
-        name: cargo clippy
-        language: system
-        entry: cargo clippy --manifest-path crates/Cargo.toml --all-targets -- -D warnings
-        types: [rust]
-        pass_filenames: false
-
-  # --------------------------------------------------------------------------
   # Commit messages
   # --------------------------------------------------------------------------
   - repo: https://github.com/compilerla/conventional-pre-commit

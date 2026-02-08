@@ -6,6 +6,8 @@ Uses the neo4j async driver (Bolt protocol) which is compatible with Memgraph.
 
 from __future__ import annotations
 
+from itertools import groupby
+from operator import attrgetter
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -14,6 +16,7 @@ from neo4j import AsyncGraphDatabase
 from code_atlas.schema import (
     SCHEMA_VERSION,
     NodeLabel,
+    RelType,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
@@ -26,6 +29,7 @@ from code_atlas.schema import (
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
 
+    from code_atlas.parser import ParsedEntity, ParsedRelationship
     from code_atlas.settings import AtlasSettings
 
 
@@ -96,6 +100,91 @@ class GraphClient:
                 f"Downgrade is not supported — update your Code Atlas installation."
             )
             raise RuntimeError(msg)
+
+    async def upsert_file_entities(
+        self,
+        project_name: str,
+        file_path: str,
+        entities: list[ParsedEntity],
+        relationships: list[ParsedRelationship],
+    ) -> None:
+        """Replace all entities for a file and re-create relationships.
+
+        Strategy: delete-and-recreate per file (simple v1 — delta indexing
+        comes in epic 05-delta).
+        """
+        # 1. Delete existing nodes for this (project_name, file_path)
+        await self.execute_write(
+            "MATCH (n {project_name: $project_name, file_path: $file_path}) DETACH DELETE n",
+            {"project_name": project_name, "file_path": file_path},
+        )
+
+        # 2. Batch-create nodes grouped by label
+        sorted_entities = sorted(entities, key=attrgetter("label"))
+        for label, group in groupby(sorted_entities, key=attrgetter("label")):
+            entity_list = list(group)
+            params = [
+                {
+                    "uid": e.qualified_name,
+                    "project_name": project_name,
+                    "name": e.name,
+                    "qualified_name": (
+                        e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name
+                    ),
+                    "file_path": e.file_path,
+                    "kind": e.kind,
+                    "line_start": e.line_start,
+                    "line_end": e.line_end,
+                    "visibility": e.visibility,
+                    "docstring": e.docstring,
+                    "signature": e.signature,
+                    "tags": e.tags,
+                }
+                for e in entity_list
+            ]
+            query = (
+                f"UNWIND $entities AS e "
+                f"CREATE (n:{label.value} {{"
+                f"uid: e.uid, project_name: e.project_name, name: e.name, "
+                f"qualified_name: e.qualified_name, file_path: e.file_path, "
+                f"kind: e.kind, line_start: e.line_start, line_end: e.line_end, "
+                f"visibility: e.visibility, docstring: e.docstring, "
+                f"signature: e.signature, tags: e.tags"
+                f"}})"
+            )
+            await self.execute_write(query, {"entities": params})  # dynamic Cypher
+
+        # 3. Create relationships
+        # Group by rel_type for batch creation
+        defines_rels = [r for r in relationships if r.rel_type == RelType.DEFINES]
+        other_rels = [r for r in relationships if r.rel_type != RelType.DEFINES]
+
+        # DEFINES: both ends are in this file, match by uid
+        if defines_rels:
+            rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in defines_rels]
+            await self.execute_write(
+                "UNWIND $rels AS r "
+                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
+                f"CREATE (a)-[:{RelType.DEFINES}]->(b)",
+                {"rels": rel_params},
+            )
+
+        # Other relationships: best-effort name matching within the project
+        for rel in other_rels:
+            if rel.rel_type == RelType.INHERITS:
+                # Try to match base class by name within the project
+                await self.execute_write(
+                    f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
+                    f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
+                    {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
+                )
+
+        logger.debug(
+            "Upserted {} entities and {} relationships for {}",
+            len(entities),
+            len(relationships),
+            file_path,
+        )
 
     async def close(self) -> None:
         """Close the driver and release connections."""

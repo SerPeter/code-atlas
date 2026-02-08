@@ -29,7 +29,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",
-    "Programming Language :: Rust",
     "Topic :: Software Development :: Libraries",
     "Topic :: Software Development :: Quality Assurance",
     "Typing :: Typed",
@@ -43,6 +42,7 @@ dependencies = [
     "neo4j~=6.1",            # Bolt protocol driver (works with Memgraph)
     "litellm~=1.81",
     "tree-sitter~=0.25",
+    "tree-sitter-python~=0.23",
     "pathspec~=1.0",          # gitignore-compatible pattern matching
     "httpx~=0.28",            # async HTTP for TEI/API calls
     "tiktoken~=0.12",         # token counting for budget assembly

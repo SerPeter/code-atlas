@@ -1,22 +1,5 @@
 # =============================================================================
-# Stage 1: Build Rust parser
-# =============================================================================
-FROM rust:1.84-slim AS rust-builder
-
-WORKDIR /build
-
-# Copy only Rust sources
-COPY crates/ crates/
-
-# Build release binary
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cd crates && \
-    cargo build --release && \
-    cp target/release/atlas-parser /build/atlas-parser || true
-
-# =============================================================================
-# Stage 2: Python application
+# Python application
 # =============================================================================
 FROM python:3.14-slim AS runtime
 
@@ -30,9 +13,6 @@ RUN apt-get update && \
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
-# Copy Rust binary from builder (if built)
-COPY --from=rust-builder /build/atlas-parser /usr/local/bin/atlas-parser
 
 # Install Python dependencies (cached layer)
 COPY pyproject.toml uv.lock* ./

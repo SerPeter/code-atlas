@@ -91,8 +91,8 @@ async def _run_daemon() -> None:
     await graph.ensure_schema()
 
     consumers = [
-        Tier1GraphConsumer(bus),
-        Tier2ASTConsumer(bus),
+        Tier1GraphConsumer(bus, graph, settings),
+        Tier2ASTConsumer(bus, graph, settings),
         Tier3EmbedConsumer(bus),
     ]
 

@@ -276,7 +276,7 @@ Queries:    Agent calls MCP tools ─────► Memgraph ◄──── Da
 
 - **Auto-start daemon from MCP**: gopls auto-starts its daemon from the forwarder process. We could do the same — if
   `atlas mcp` detects no running daemon, start one automatically. Deferred to post-v1.
-- **`atlas doctor` command**: Comprehensive diagnostics checking Python version, Rust parser binary, all services,
+- **`atlas doctor` command**: Comprehensive diagnostics checking Python version, tree-sitter grammars, all services,
   config validity, index state. High value for support/debugging.
 - **Background mode**: `atlas daemon start --background` using `subprocess.Popen` with platform-specific flags
   (`start_new_session=True` on Unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows). Not needed for v1 —

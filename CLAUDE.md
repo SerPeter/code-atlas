@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Code Atlas is a code intelligence graph system that indexes codebases and exposes them via MCP tools for AI coding agents. It combines graph traversal, semantic search, and BM25 keyword search using Memgraph as the unified backend.
 
-Python/Rust hybrid: Python for CLI, MCP server, and orchestration; Rust (`crates/atlas-parser`) for fast AST parsing via tree-sitter.
+Python with tree-sitter C extension for AST parsing, called in-process via py-tree-sitter.
 
 ## Commands
 
@@ -31,11 +31,6 @@ uv run ty check                  # Type check
 uv run pre-commit install        # Install hooks
 uv run pre-commit run --all-files  # Run all hooks manually
 
-# Rust (from repo root)
-cargo build --manifest-path crates/Cargo.toml
-cargo test --manifest-path crates/Cargo.toml
-cargo clippy --manifest-path crates/Cargo.toml --all-targets -- -D warnings
-
 # Infrastructure
 docker compose up -d             # Start Memgraph + TEI + Valkey
 docker compose down              # Stop services
@@ -54,11 +49,9 @@ atlas daemon start               # Start indexing daemon (watcher + pipeline)
 src/code_atlas/
 ├── cli.py          # Typer CLI entrypoint (index, search, status, mcp, daemon commands)
 ├── events.py       # Event types (FileChanged, ASTDirty, EmbedDirty) + Redis Streams EventBus
+├── parser.py       # Tree-sitter AST parser (py-tree-sitter, in-process)
 ├── pipeline.py     # TierConsumer base + Tier1/2/3 consumers with batch-pull pattern
 └── settings.py     # Pydantic configuration (atlas.toml + env vars)
-
-crates/
-└── atlas-parser/   # Rust AST parser using tree-sitter (outputs JSON)
 ```
 
 **Event Pipeline:** File Watcher → Valkey Streams → Tier 1 (graph metadata) → Tier 2 (AST diff + gate) → Tier 3 (embeddings) → Memgraph
@@ -75,7 +68,6 @@ crates/
 - Ruff for linting/formatting, ty for type checking
 - Known first-party import: `code_atlas`
 - Conventional commits: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
-- Rust: `cargo fmt` + `cargo clippy` with `-D warnings`
 
 ## Development Rules
 

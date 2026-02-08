@@ -131,7 +131,7 @@ graph LR
 **Tier 1 — Graph Metadata** (cheap, ~0.5s batch): Updates file node timestamps and staleness flags. Always publishes
 `ASTDirty` downstream.
 
-**Tier 2 — AST Diff** (medium, ~3s batch): Re-parses AST via Rust parser, diffs entities, updates graph nodes/edges.
+**Tier 2 — AST Diff** (medium, ~3s batch): Re-parses AST via tree-sitter, diffs entities, updates graph nodes/edges.
 Evaluates a significance gate — trivial changes (whitespace, formatting) stop here; semantic changes (signature, body,
 docstring) publish `EmbedDirty` to Tier 3.
 
@@ -157,8 +157,8 @@ The indexing pipeline transforms source code into a searchable graph. Each stage
 
 1. **File Scanner** — Walks the project tree, applying exclusion rules (`.gitignore`, `.atlasignore`, `atlas.toml`
    scope). Outputs a list of files to process.
-2. **Rust Parser** — Parses each file's AST via tree-sitter, extracts entities (classes, functions, methods, imports)
-   and their relationships. Outputs structured JSON.
+2. **AST Parser** — Parses each file's AST via tree-sitter (in-process via py-tree-sitter), extracts entities (classes,
+   functions, methods, imports) and their relationships.
 3. **Pattern Detectors** — Pluggable detectors that identify implicit patterns: decorator-based routing, event handlers,
    test-to-code mapping, method overrides.
 4. **Embedder** — Batches entities for embedding via TEI. Uses a content-hash cache to skip unchanged code. Operates on
@@ -274,17 +274,17 @@ See [ADR-0005](adr/0005-deployment-process-model.md) for full rationale.
 
 ## Technology Stack
 
-| Layer      | Technology         | Purpose                            |
-| ---------- | ------------------ | ---------------------------------- |
-| CLI        | Typer              | Command-line interface             |
-| MCP        | mcp-python         | Model Context Protocol server      |
-| Config     | Pydantic           | Configuration management           |
-| Parsing    | Tree-sitter (Rust) | Fast AST parsing                   |
-| Graph DB   | Memgraph           | Graph storage + vector + BM25      |
-| Event Bus  | Valkey (Redis)     | Pipeline streams + embedding cache |
-| Embeddings | TEI / LiteLLM      | Code embeddings                    |
-| HTTP       | httpx              | Async HTTP client                  |
-| Tokens     | tiktoken           | Token counting                     |
+| Layer      | Technology           | Purpose                            |
+| ---------- | -------------------- | ---------------------------------- |
+| CLI        | Typer                | Command-line interface             |
+| MCP        | mcp-python           | Model Context Protocol server      |
+| Config     | Pydantic             | Configuration management           |
+| Parsing    | Tree-sitter (Python) | Fast AST parsing                   |
+| Graph DB   | Memgraph             | Graph storage + vector + BM25      |
+| Event Bus  | Valkey (Redis)       | Pipeline streams + embedding cache |
+| Embeddings | TEI / LiteLLM        | Code embeddings                    |
+| HTTP       | httpx                | Async HTTP client                  |
+| Tokens     | tiktoken             | Token counting                     |
 
 ## Security
 
