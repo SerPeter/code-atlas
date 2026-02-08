@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from code_atlas.embeddings import build_embed_text
+from code_atlas.embeddings import EmbedCache, build_embed_text
 from code_atlas.events import (
     ASTDirty,
     EmbedDirty,
@@ -278,9 +278,17 @@ class Tier2ASTConsumer(TierConsumer):
 
 
 class Tier3EmbedConsumer(TierConsumer):
-    """Tier 3: Re-embed entities via TEI. Deduplicates by qualified name."""
+    """Tier 3: Re-embed entities via TEI. Deduplicates by qualified name.
 
-    def __init__(self, bus: EventBus, graph: GraphClient, embed: EmbedClient) -> None:
+    Implements a three-tier lookup to minimize expensive embedding API calls:
+      1. **Graph hit** — node already has ``embed_hash`` matching current text (free).
+      2. **Valkey cache hit** — vector stored in Redis from a previous run (1 round-trip).
+      3. **API call** — embed via TEI / cloud provider (expensive).
+    """
+
+    def __init__(
+        self, bus: EventBus, graph: GraphClient, embed: EmbedClient, *, cache: EmbedCache | None = None
+    ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
@@ -290,11 +298,42 @@ class Tier3EmbedConsumer(TierConsumer):
         )
         self.graph = graph
         self.embed = embed
+        self.cache = cache
 
     def dedup_key(self, event: Event) -> str:
         # For EmbedDirty we can't dedup at the event level easily —
         # dedup happens inside process_batch across all entities
         return str(id(event))
+
+    async def _resolve_cache(
+        self, to_process: list[tuple[str, str, str]]
+    ) -> tuple[list[tuple[str, list[float], str]], list[tuple[str, str, str]], int]:
+        """Resolve vectors from Valkey cache, returning (cache_resolved, need_embed, cache_hits)."""
+        if self.cache is not None and to_process:
+            remaining_hashes = [h for _, _, h in to_process]
+            cached = await self.cache.get_many(remaining_hashes)
+            cache_resolved: list[tuple[str, list[float], str]] = []
+            need_embed: list[tuple[str, str, str]] = []
+            hits = 0
+            for qn, text, text_hash in to_process:
+                if text_hash in cached:
+                    cache_resolved.append((qn, cached[text_hash], text_hash))
+                    hits += 1
+                else:
+                    need_embed.append((qn, text, text_hash))
+            return cache_resolved, need_embed, hits
+        return [], list(to_process), 0
+
+    async def _embed_and_store(self, need_embed: list[tuple[str, str, str]]) -> list[tuple[str, list[float], str]]:
+        """Embed texts via API and store results in cache. Returns (qn, vector, hash) tuples."""
+        if not need_embed:
+            return []
+        texts = [text for _, text, _ in need_embed]
+        vectors = await self.embed.embed_batch(texts)
+        result = [(qn, vec, th) for (qn, _t, th), vec in zip(need_embed, vectors, strict=True)]
+        if self.cache is not None:
+            await self.cache.put_many([(th, vec) for _, vec, th in result])
+        return result
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         # Collect and deduplicate entities across all events in the batch
@@ -312,29 +351,53 @@ class Tier3EmbedConsumer(TierConsumer):
 
         t0 = asyncio.get_event_loop().time()
 
-        # 1. Read entity properties from graph
+        # 1. Read entity properties from graph (includes embed_hash + embedding)
         qns = [e.qualified_name for e in entities]
         entity_props = await self.graph.read_entity_texts(qns)
 
-        # 2. Build embed texts
-        texts: list[str] = []
-        valid_qns: list[str] = []
+        # 2. Build embed texts — graph-check for unchanged content
+        to_process: list[tuple[str, str, str]] = []  # (qn, text, text_hash)
+        graph_hits = 0
         for props in entity_props:
             text = build_embed_text(props)
-            if text:
-                texts.append(text)
-                valid_qns.append(props["qualified_name"])
+            if not text:
+                continue
+            qn = props["qualified_name"]
+            text_hash = EmbedCache.hash_text(text)
+            if props.get("embed_hash") == text_hash and props.get("embedding") is not None:
+                graph_hits += 1
+            else:
+                to_process.append((qn, text, text_hash))
 
-        if not texts:
-            logger.debug("Tier3 batch {}: no embeddable texts", batch_id)
+        total = graph_hits + len(to_process)
+        if not to_process:
+            elapsed = asyncio.get_event_loop().time() - t0
+            logger.info(
+                "Tier3 batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
+                batch_id,
+                total,
+                graph_hits,
+                elapsed,
+            )
             return
 
-        # 3. Embed
-        vectors = await self.embed.embed_batch(texts)
+        # 3. Valkey cache check → 4. API call for misses
+        cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
+        api_vectors = await self._embed_and_store(need_embed)
 
-        # 4. Write vectors to graph
-        items = list(zip(valid_qns, vectors, strict=True))
-        await self.graph.write_embeddings(items)
+        # 5. Write all new/changed vectors + embed_hashes to graph
+        all_resolved = cache_resolved + api_vectors
+        if all_resolved:
+            await self.graph.write_embeddings([(qn, vec) for qn, vec, _ in all_resolved])
+            await self.graph.write_embed_hashes([(qn, th) for qn, _, th in all_resolved])
 
         elapsed = asyncio.get_event_loop().time() - t0
-        logger.info("Tier3 batch {}: embedded {} entities in {:.1f}s", batch_id, len(items), elapsed)
+        logger.info(
+            "Tier3 batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
+            batch_id,
+            total,
+            graph_hits,
+            cache_hits,
+            len(api_vectors),
+            elapsed,
+        )

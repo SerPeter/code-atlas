@@ -163,7 +163,7 @@ async def _run_status() -> None:
 
 async def _run_daemon() -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
-    from code_atlas.embeddings import EmbedClient
+    from code_atlas.embeddings import EmbedCache, EmbedClient
     from code_atlas.events import EventBus
     from code_atlas.graph import GraphClient
     from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
@@ -194,10 +194,14 @@ async def _run_daemon() -> None:
     await graph.ensure_schema()
 
     embed = EmbedClient(settings.embeddings)
+    cache: EmbedCache | None = None
+    if settings.embeddings.cache_ttl_days > 0:
+        cache = EmbedCache(settings.redis, settings.embeddings)
+
     consumers = [
         Tier1GraphConsumer(bus, graph, settings),
         Tier2ASTConsumer(bus, graph, settings),
-        Tier3EmbedConsumer(bus, graph, embed),
+        Tier3EmbedConsumer(bus, graph, embed, cache=cache),
     ]
 
     try:
@@ -207,6 +211,8 @@ async def _run_daemon() -> None:
     finally:
         for c in consumers:
             c.stop()
+        if cache is not None:
+            await cache.close()
         await graph.close()
         await bus.close()
         logger.info("Daemon stopped")

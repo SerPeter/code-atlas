@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import pathspec
 from loguru import logger
 
-from code_atlas.embeddings import EmbedClient
+from code_atlas.embeddings import EmbedCache, EmbedClient
 from code_atlas.events import EventBus, FileChanged, Topic
 from code_atlas.parser import get_language_for_file
 from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
@@ -332,6 +332,57 @@ async def _check_model_lock(graph: GraphClient, model: str, dimension: int, *, r
 # ---------------------------------------------------------------------------
 
 
+async def _create_package_hierarchy(graph: GraphClient, project_name: str, project_root: Path) -> int:
+    """Create Project + Package nodes and CONTAINS edges. Returns package count."""
+    await graph.merge_project_node(project_name)
+    packages = _detect_packages(project_root)
+    for qn, rel_path in packages:
+        pkg_name = qn.rsplit(".", 1)[-1]
+        await graph.merge_package_node(project_name, qn, pkg_name, f"{rel_path}/__init__.py")
+        parent_qn = qn.rsplit(".", 1)[0] if "." in qn else None
+        parent_uid = f"{project_name}:{parent_qn}" if parent_qn else project_name
+        await graph.create_contains_edge(parent_uid, f"{project_name}:{qn}")
+    return len(packages)
+
+
+async def _run_pipeline(
+    bus: EventBus,
+    graph: GraphClient,
+    settings: AtlasSettings,
+    embed: EmbedClient,
+    cache: EmbedCache | None,
+    drain_timeout_s: float,
+) -> None:
+    """Start inline tier consumers and wait for the pipeline to drain."""
+    await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
+    await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
+    await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
+
+    tier1 = Tier1GraphConsumer(bus, graph, settings)
+    tier2 = Tier2ASTConsumer(bus, graph, settings)
+    tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+
+    task1 = asyncio.create_task(tier1.run())
+    task2 = asyncio.create_task(tier2.run())
+    task3 = asyncio.create_task(tier3.run())
+
+    try:
+        await _wait_for_drain(bus, drain_timeout_s)
+    finally:
+        tier1.stop()
+        tier2.stop()
+        tier3.stop()
+        await asyncio.sleep(0.5)
+        task1.cancel()
+        task2.cancel()
+        task3.cancel()
+        for t in (task1, task2, task3):
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        if cache is not None:
+            await cache.close()
+
+
 async def index_project(
     settings: AtlasSettings,
     graph: GraphClient,
@@ -363,59 +414,29 @@ async def index_project(
 
     # 2. Model lock check + full reindex
     embed = EmbedClient(settings.embeddings)
+    cache: EmbedCache | None = None
+    if settings.embeddings.cache_ttl_days > 0:
+        cache = EmbedCache(settings.redis, settings.embeddings)
 
     if full_reindex:
         logger.info("Full reindex: deleting existing data for '{}'", project_name)
         await graph.delete_project_data(project_name)
+        if cache is not None:
+            await cache.clear()
 
     await _check_model_lock(graph, settings.embeddings.model, settings.embeddings.dimension, reindex=full_reindex)
 
     # 3. Create Project + Package hierarchy
-    await graph.merge_project_node(project_name)
-    packages = _detect_packages(project_root)
-    for qn, rel_path in packages:
-        pkg_name = qn.rsplit(".", 1)[-1]
-        await graph.merge_package_node(project_name, qn, pkg_name, f"{rel_path}/__init__.py")
-        # CONTAINS edge from parent
-        parent_qn = qn.rsplit(".", 1)[0] if "." in qn else None
-        parent_uid = f"{project_name}:{parent_qn}" if parent_qn else project_name
-        await graph.create_contains_edge(parent_uid, f"{project_name}:{qn}")
-
-    logger.info("Created {} package node(s)", len(packages))
+    pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
+    logger.info("Created {} package node(s)", pkg_count)
 
     # 4. Publish FileChanged events
     for file_path in files:
         await bus.publish(Topic.FILE_CHANGED, FileChanged(path=file_path, change_type="created"))
-
     logger.info("Published {} FileChanged events", len(files))
 
     # 5. Start inline consumers and wait for drain
-    await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
-    await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
-    await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-
-    tier1 = Tier1GraphConsumer(bus, graph, settings)
-    tier2 = Tier2ASTConsumer(bus, graph, settings)
-    tier3 = Tier3EmbedConsumer(bus, graph, embed)
-
-    task1 = asyncio.create_task(tier1.run())
-    task2 = asyncio.create_task(tier2.run())
-    task3 = asyncio.create_task(tier3.run())
-
-    try:
-        await _wait_for_drain(bus, drain_timeout_s)
-    finally:
-        tier1.stop()
-        tier2.stop()
-        tier3.stop()
-        # Give consumers time to finish their current iteration
-        await asyncio.sleep(0.5)
-        task1.cancel()
-        task2.cancel()
-        task3.cancel()
-        for t in (task1, task2, task3):
-            with contextlib.suppress(asyncio.CancelledError):
-                await t
+    await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s)
 
     # 6. Update Project metadata
     entity_count = await graph.count_entities(project_name)

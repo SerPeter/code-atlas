@@ -14,6 +14,7 @@ from loguru import logger
 from neo4j import AsyncGraphDatabase
 
 from code_atlas.schema import (
+    _TEXT_SEARCHABLE_LABELS,
     SCHEMA_VERSION,
     NodeLabel,
     RelType,
@@ -31,6 +32,16 @@ if TYPE_CHECKING:
 
     from code_atlas.parser import ParsedEntity, ParsedRelationship
     from code_atlas.settings import AtlasSettings
+
+
+def _node_project_name(record: dict[str, Any]) -> str:
+    """Extract project_name from a record containing a neo4j Node."""
+    node = record.get("node") or record.get("n")
+    if node is None:
+        return ""
+    if hasattr(node, "get"):
+        return node.get("project_name", "")
+    return ""
 
 
 class GraphClient:
@@ -112,7 +123,19 @@ class GraphClient:
 
         Strategy: delete-and-recreate per file (simple v1 — delta indexing
         comes in epic 05-delta).
+
+        Preserves ``embed_hash`` and ``embedding`` for entities whose
+        ``qualified_name`` survives the upsert cycle.
         """
+        # 0. Save embed data from existing nodes (before delete)
+        old_embeds = await self.execute(
+            "MATCH (n {project_name: $p, file_path: $f}) "
+            "WHERE n.embed_hash IS NOT NULL "
+            "RETURN n.qualified_name AS qn, n.embed_hash AS hash, n.embedding AS vec",
+            {"p": project_name, "f": file_path},
+        )
+        embed_lookup: dict[str, tuple[str, list[float] | None]] = {r["qn"]: (r["hash"], r["vec"]) for r in old_embeds}
+
         # 1. Delete existing nodes for this (project_name, file_path)
         await self.execute_write(
             "MATCH (n {project_name: $project_name, file_path: $file_path}) DETACH DELETE n",
@@ -177,6 +200,24 @@ class GraphClient:
                     f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
                     f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
                     {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
+                )
+
+        # 4. Restore embed data for entities whose qualified_name survived
+        if embed_lookup:
+            new_qns = {
+                e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name for e in entities
+            }
+            restore = [
+                {"qn": qn, "hash": h, "vec": v}
+                for qn, (h, v) in embed_lookup.items()
+                if qn in new_qns and v is not None
+            ]
+            if restore:
+                await self.execute_write(
+                    "UNWIND $items AS item "
+                    "MATCH (n {qualified_name: item.qn, project_name: $p, file_path: $f}) "
+                    "SET n.embed_hash = item.hash, n.embedding = item.vec",
+                    {"items": restore, "p": project_name, "f": file_path},
                 )
 
         logger.debug(
@@ -282,14 +323,16 @@ class GraphClient:
         """Batch-read entity properties needed for embedding.
 
         Returns list of dicts with keys: ``qualified_name``, ``name``,
-        ``signature``, ``docstring``, ``kind``, ``_label``.
+        ``signature``, ``docstring``, ``kind``, ``_label``,
+        ``embed_hash``, ``embedding``.
         """
         return await self.execute(
             "UNWIND $qns AS qn "
             "MATCH (n {qualified_name: qn}) "
             "RETURN n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
-            "n.kind AS kind, labels(n)[0] AS _label",
+            "n.kind AS kind, labels(n)[0] AS _label, "
+            "n.embed_hash AS embed_hash, n.embedding AS embedding",
             {"qns": qualified_names},
         )
 
@@ -300,6 +343,16 @@ class GraphClient:
         params = [{"qn": qn, "vector": vec} for qn, vec in items]
         await self.execute_write(
             "UNWIND $items AS item MATCH (n {qualified_name: item.qn}) SET n.embedding = item.vector",
+            {"items": params},
+        )
+
+    async def write_embed_hashes(self, items: list[tuple[str, str]]) -> None:
+        """Batch-write embed_hash values to nodes by qualified_name."""
+        if not items:
+            return
+        params = [{"qn": qn, "hash": h} for qn, h in items]
+        await self.execute_write(
+            "UNWIND $items AS item MATCH (n {qualified_name: item.qn}) SET n.embed_hash = item.hash",
             {"items": params},
         )
 
@@ -317,6 +370,58 @@ class GraphClient:
             return await self.execute("CALL vector_search.show_index_info() YIELD * RETURN *")
         except Exception as exc:
             logger.debug("Could not fetch vector index info: {}", exc)
+            return []
+
+    # -- Text (BM25) search helpers -------------------------------------------
+
+    async def text_search(
+        self,
+        query: str,
+        label: str = "",
+        limit: int = 20,
+        project: str = "",
+    ) -> list[dict[str, Any]]:
+        """BM25 text search across text indices.
+
+        Queries one or all text indices, optionally post-filters by project,
+        and returns results sorted by score descending.
+        """
+        indices = (
+            [f"text_{label.lower()}"] if label else [f"text_{lbl.value.lower()}" for lbl in _TEXT_SEARCHABLE_LABELS]
+        )
+        fetch_limit = limit * 3 if project else limit
+
+        all_results: list[dict[str, Any]] = []
+        for index_name in indices:
+            cypher = (
+                f"CALL text_search.search('{index_name}', $query, {fetch_limit}) "
+                "YIELD node, score "
+                "RETURN node, score "
+                f"ORDER BY score DESC LIMIT {fetch_limit}"
+            )
+            try:
+                records = await self.execute(cypher, {"query": query})
+                all_results.extend(records)
+            except Exception as exc:
+                logger.warning("Text search on {} failed: {}", index_name, exc)
+
+        # Post-filter by project scope
+        if project:
+            all_results = [r for r in all_results if _node_project_name(r) == project]
+
+        # Sort by score descending and truncate
+        all_results.sort(key=lambda rec: rec.get("score", 0), reverse=True)
+        return all_results[:limit]
+
+    async def get_text_index_info(self) -> list[dict[str, Any]]:
+        """Query Memgraph for text index metadata.
+
+        Returns a list of dicts with text index information.
+        """
+        try:
+            return await self.execute("CALL text_search.show_index_info() YIELD * RETURN *")
+        except Exception as exc:
+            logger.debug("Could not fetch text index info: {}", exc)
             return []
 
     async def close(self) -> None:

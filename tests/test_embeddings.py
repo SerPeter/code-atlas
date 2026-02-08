@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from code_atlas.embeddings import EmbedClient, EmbeddingError, build_embed_text
+from code_atlas.embeddings import EmbedCache, EmbedClient, EmbeddingError, build_embed_text
+from code_atlas.events import EmbedDirty, EntityRef
+from code_atlas.pipeline import Tier3EmbedConsumer
 from code_atlas.settings import EmbeddingSettings
 
 # ---------------------------------------------------------------------------
@@ -276,3 +279,175 @@ class TestModelLock:
         await graph_client.clear_all_embeddings()
         records = await graph_client.execute("MATCH (n {uid: 'test:mod'}) RETURN n.embedding AS emb")
         assert records[0]["emb"] is None
+
+
+# ---------------------------------------------------------------------------
+# EmbedCache unit tests (no Redis required)
+# ---------------------------------------------------------------------------
+
+
+class TestEmbedCacheHash:
+    def test_hash_text_deterministic(self):
+        """Same text always produces the same hash."""
+        h1 = EmbedCache.hash_text("hello world")
+        h2 = EmbedCache.hash_text("hello world")
+        assert h1 == h2
+        assert len(h1) == 64  # SHA-256 hex
+
+    def test_hash_text_different_content(self):
+        """Different texts produce different hashes."""
+        h1 = EmbedCache.hash_text("hello world")
+        h2 = EmbedCache.hash_text("goodbye world")
+        assert h1 != h2
+
+
+class TestVectorPackUnpack:
+    def test_roundtrip(self):
+        """struct pack/unpack preserves float32 values."""
+        vector = [0.1, -0.5, 3.14, 0.0, 1e-6]
+        packed = struct.pack(f"<{len(vector)}f", *vector)
+        unpacked = list(struct.unpack(f"<{len(packed) // 4}f", packed))
+        assert len(unpacked) == len(vector)
+        for orig, restored in zip(vector, unpacked, strict=True):
+            assert abs(orig - restored) < 1e-5
+
+    def test_768_dim(self):
+        """768-dim vector packs to exactly 3072 bytes."""
+        vector = [float(i) for i in range(768)]
+        packed = struct.pack(f"<{len(vector)}f", *vector)
+        assert len(packed) == 768 * 4
+
+
+# ---------------------------------------------------------------------------
+# Tier3 cache integration tests (mocked graph + embed + cache)
+# ---------------------------------------------------------------------------
+
+
+class TestTier3CacheLookup:
+    """Test the three-tier lookup logic in Tier3EmbedConsumer with mocks."""
+
+    @staticmethod
+    def _make_entity_ref(qn: str) -> EntityRef:
+        return EntityRef(qualified_name=qn, node_type="Callable", file_path="f.py")
+
+    @staticmethod
+    def _make_embed_dirty(entities: list[EntityRef]) -> EmbedDirty:
+        return EmbedDirty(entities=entities, significance="HIGH", batch_id="test01")
+
+    async def test_graph_hit_skips_all(self):
+        """When graph node has matching embed_hash+embedding, no cache or API call needed."""
+        bus = AsyncMock()
+        graph = AsyncMock()
+        embed = AsyncMock()
+        cache = AsyncMock()
+
+        text = "Module: foo\nFunction: bar"
+        text_hash = EmbedCache.hash_text(text)
+
+        graph.read_entity_texts = AsyncMock(
+            return_value=[
+                {
+                    "qualified_name": "foo.bar",
+                    "name": "bar",
+                    "signature": "",
+                    "docstring": "",
+                    "kind": "function",
+                    "_label": "Callable",
+                    "embed_hash": text_hash,
+                    "embedding": [0.1, 0.2, 0.3],
+                }
+            ]
+        )
+
+        consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        entity = self._make_entity_ref("foo.bar")
+        event = self._make_embed_dirty([entity])
+
+        await consumer.process_batch([event], "test01")
+
+        embed.embed_batch.assert_not_called()
+        cache.get_many.assert_not_called()
+        graph.write_embeddings.assert_not_called()
+
+    async def test_cache_hit_skips_embed(self):
+        """When Valkey cache has the vector, API call is skipped."""
+        bus = AsyncMock()
+        graph = AsyncMock()
+        embed = AsyncMock()
+        cache = AsyncMock()
+
+        text = "Module: foo\nFunction: bar"
+        text_hash = EmbedCache.hash_text(text)
+        cached_vec = [0.1, 0.2, 0.3]
+
+        graph.read_entity_texts = AsyncMock(
+            return_value=[
+                {
+                    "qualified_name": "foo.bar",
+                    "name": "bar",
+                    "signature": "",
+                    "docstring": "",
+                    "kind": "function",
+                    "_label": "Callable",
+                    "embed_hash": None,
+                    "embedding": None,
+                }
+            ]
+        )
+        cache.get_many = AsyncMock(return_value={text_hash: cached_vec})
+
+        consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        entity = self._make_entity_ref("foo.bar")
+        event = self._make_embed_dirty([entity])
+
+        await consumer.process_batch([event], "test02")
+
+        embed.embed_batch.assert_not_called()
+        cache.get_many.assert_called_once()
+        graph.write_embeddings.assert_called_once()
+        graph.write_embed_hashes.assert_called_once()
+
+        # Verify correct vector was written
+        write_args = graph.write_embeddings.call_args[0][0]
+        assert write_args[0] == ("foo.bar", cached_vec)
+
+    async def test_cache_miss_embeds_and_stores(self):
+        """When no hits anywhere, API is called and result stored in cache."""
+        bus = AsyncMock()
+        graph = AsyncMock()
+        embed = AsyncMock()
+        cache = AsyncMock()
+
+        api_vec = [0.5, 0.6, 0.7]
+
+        graph.read_entity_texts = AsyncMock(
+            return_value=[
+                {
+                    "qualified_name": "foo.bar",
+                    "name": "bar",
+                    "signature": "",
+                    "docstring": "",
+                    "kind": "function",
+                    "_label": "Callable",
+                    "embed_hash": None,
+                    "embedding": None,
+                }
+            ]
+        )
+        cache.get_many = AsyncMock(return_value={})  # no cache hit
+        embed.embed_batch = AsyncMock(return_value=[api_vec])
+
+        consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        entity = self._make_entity_ref("foo.bar")
+        event = self._make_embed_dirty([entity])
+
+        await consumer.process_batch([event], "test03")
+
+        embed.embed_batch.assert_called_once()
+        cache.put_many.assert_called_once()
+        graph.write_embeddings.assert_called_once()
+        graph.write_embed_hashes.assert_called_once()
+
+        # Verify the API vector was written to graph
+        write_args = graph.write_embeddings.call_args[0][0]
+        assert write_args[0] == ("foo.bar", api_vec)

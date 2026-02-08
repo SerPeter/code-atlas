@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from code_atlas.parser import ParsedEntity
 from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
 
 if TYPE_CHECKING:
@@ -414,3 +415,201 @@ async def test_vector_search_threshold(graph_client: GraphClient):
     high_sim = [r for r in records if r["similarity"] >= 0.9]
     assert len(high_sim) == 1
     assert high_sim[0]["uid"] == "thresh:near"
+
+
+# ---------------------------------------------------------------------------
+# Text (BM25) search
+# ---------------------------------------------------------------------------
+
+
+async def test_text_search_method(graph_client: GraphClient):
+    """GraphClient.text_search() returns a list of dicts."""
+    await graph_client.ensure_schema()
+
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        "  uid: 'txt:proj.search_func', project_name: 'txt', name: 'search_func',"
+        "  qualified_name: 'proj.search_func', kind: 'function', file_path: 'f.py',"
+        "  docstring: 'A function that searches things.'"
+        "})"
+    )
+
+    results = await graph_client.text_search("search_func")
+    assert isinstance(results, list)
+
+
+async def test_text_search_with_project_filter(graph_client: GraphClient):
+    """text_search with project filter returns only matching project."""
+    await graph_client.ensure_schema()
+
+    for project in ("alpha", "beta"):
+        await graph_client.execute_write(
+            f"CREATE (:{NodeLabel.CALLABLE} {{"
+            "  uid: $uid, project_name: $project, name: 'common_func',"
+            "  qualified_name: $qn, kind: 'function', file_path: 'f.py',"
+            "  docstring: 'A common function.'"
+            "})",
+            {
+                "uid": f"{project}:common_func",
+                "project": project,
+                "qn": f"{project}.common_func",
+            },
+        )
+
+    results = await graph_client.text_search("common_func", project="alpha")
+    assert isinstance(results, list)
+    # All returned results (if any) should belong to alpha
+    for r in results:
+        node = r.get("node") or r.get("n")
+        if node and hasattr(node, "get"):
+            assert node.get("project_name") == "alpha"
+
+
+async def test_get_text_index_info(graph_client: GraphClient):
+    """get_text_index_info() returns a list (may be empty without indices)."""
+    await graph_client.ensure_schema()
+    info = await graph_client.get_text_index_info()
+    assert isinstance(info, list)
+
+
+# ---------------------------------------------------------------------------
+# Embed data preservation across upsert
+# ---------------------------------------------------------------------------
+
+
+async def test_upsert_preserves_embed_data(graph_client: GraphClient):
+    """embed_hash+embedding survive a DELETE+CREATE upsert cycle when QN matches."""
+    await graph_client.ensure_schema()
+
+    project = "etest"
+    fp = "src/mod.py"
+
+    entities = [
+        ParsedEntity(
+            name="my_func",
+            qualified_name=f"{project}:mod.my_func",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=1,
+            line_end=5,
+            file_path=fp,
+            docstring="A test function.",
+            signature="my_func()",
+        ),
+    ]
+
+    # First upsert — creates the node
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    # Manually set embed_hash + embedding on the node
+    embed_hash = "abc123"
+    embedding = [0.1, 0.2, 0.3]
+    await graph_client.execute_write(
+        "MATCH (n {qualified_name: 'mod.my_func', project_name: $p}) SET n.embed_hash = $hash, n.embedding = $vec",
+        {"p": project, "hash": embed_hash, "vec": embedding},
+    )
+
+    # Second upsert — same entity (simulates re-parse with no rename)
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    # Verify embed data was preserved
+    records = await graph_client.execute(
+        "MATCH (n {qualified_name: 'mod.my_func', project_name: $p}) RETURN n.embed_hash AS hash, n.embedding AS vec",
+        {"p": project},
+    )
+    assert len(records) == 1
+    assert records[0]["hash"] == embed_hash
+    assert records[0]["vec"] == embedding
+
+
+async def test_upsert_drops_embed_for_removed_entity(graph_client: GraphClient):
+    """Embed data is NOT carried forward when an entity is removed from the file."""
+    await graph_client.ensure_schema()
+
+    project = "etest2"
+    fp = "src/mod2.py"
+
+    # Two entities initially
+    entities = [
+        ParsedEntity(
+            name="func_a",
+            qualified_name=f"{project}:mod2.func_a",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=1,
+            line_end=3,
+            file_path=fp,
+        ),
+        ParsedEntity(
+            name="func_b",
+            qualified_name=f"{project}:mod2.func_b",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=5,
+            line_end=8,
+            file_path=fp,
+        ),
+    ]
+
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    # Set embed data on both
+    for qn in ("mod2.func_a", "mod2.func_b"):
+        await graph_client.execute_write(
+            "MATCH (n {qualified_name: $qn, project_name: $p}) "
+            "SET n.embed_hash = 'hash_' + $qn, n.embedding = [1.0, 2.0]",
+            {"qn": qn, "p": project},
+        )
+
+    # Re-upsert with only func_a (func_b was deleted from the file)
+    await graph_client.upsert_file_entities(project, fp, [entities[0]], [])
+
+    # func_a should still have its embed data
+    records_a = await graph_client.execute(
+        "MATCH (n {qualified_name: 'mod2.func_a', project_name: $p}) RETURN n.embed_hash AS hash",
+        {"p": project},
+    )
+    assert len(records_a) == 1
+    assert records_a[0]["hash"] == "hash_mod2.func_a"
+
+    # func_b should no longer exist
+    records_b = await graph_client.execute(
+        "MATCH (n {qualified_name: 'mod2.func_b', project_name: $p}) RETURN n",
+        {"p": project},
+    )
+    assert len(records_b) == 0
+
+
+async def test_write_embed_hashes(graph_client: GraphClient):
+    """write_embed_hashes correctly sets embed_hash on nodes."""
+    await graph_client.ensure_schema()
+
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        "  uid: 'eh:proj.func', project_name: 'eh', name: 'func',"
+        "  qualified_name: 'proj.func', kind: 'function', file_path: 'f.py'"
+        "})"
+    )
+
+    await graph_client.write_embed_hashes([("proj.func", "deadbeef")])
+
+    records = await graph_client.execute("MATCH (n {qualified_name: 'proj.func'}) RETURN n.embed_hash AS hash")
+    assert records[0]["hash"] == "deadbeef"
+
+
+async def test_read_entity_texts_includes_embed_fields(graph_client: GraphClient):
+    """read_entity_texts returns embed_hash and embedding fields."""
+    await graph_client.ensure_schema()
+
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        "  uid: 'ret:proj.func', project_name: 'ret', name: 'func',"
+        "  qualified_name: 'proj.func', kind: 'function', file_path: 'f.py',"
+        "  embed_hash: 'abc', embedding: [0.1, 0.2]"
+        "})"
+    )
+
+    results = await graph_client.read_entity_texts(["proj.func"])
+    assert len(results) == 1
+    assert results[0]["embed_hash"] == "abc"
+    assert results[0]["embedding"] == [0.1, 0.2]
