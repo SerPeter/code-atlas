@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from code_atlas.events import EventBus
-from code_atlas.indexer import index_project, scan_files
+from code_atlas.indexer import FileScope, index_project, scan_files
 from code_atlas.schema import NodeLabel
 from code_atlas.settings import AtlasSettings, ScopeSettings
 
@@ -145,6 +145,58 @@ class TestScanFiles:
         result = scan_files(tmp_path, _make_settings(tmp_path))
 
         assert result == ["app.pyi"]
+
+    def test_nested_gitignore(self, tmp_path):
+        """A .gitignore in a subdirectory excludes files below it."""
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "lib/core.py", "y = 2")
+        _write(tmp_path, "lib/.gitignore", "generated/\n")
+        _write(tmp_path, "lib/generated/out.py", "z = 3")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert "app.py" in result
+        assert "lib/core.py" in result
+        assert "lib/generated/out.py" not in result
+
+    def test_nested_gitignore_does_not_leak_up(self, tmp_path):
+        """Patterns in a nested .gitignore don't affect sibling dirs."""
+        _write(tmp_path, "a/skip.py", "x = 1")
+        _write(tmp_path, "b/.gitignore", "skip.py\n")
+        _write(tmp_path, "b/skip.py", "y = 2")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert "a/skip.py" in result
+        assert "b/skip.py" not in result
+
+    def test_default_excludes_vendor_and_target(self, tmp_path):
+        """vendor/ and target/ are excluded by default."""
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "vendor/lib.py", "y = 2")
+        _write(tmp_path, "target/out.py", "z = 3")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert result == ["app.py"]
+
+    def test_file_scope_reuse(self, tmp_path):
+        """FileScope can be constructed once and queried multiple times."""
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "lib/utils.py", "y = 2")
+        _write(tmp_path, ".gitignore", "ignored/\n")
+        _write(tmp_path, "ignored/secret.py", "z = 3")
+
+        scope = FileScope(tmp_path, _make_settings(tmp_path))
+        # Must call scan() first to populate nested specs (and verify it works)
+        files = scope.scan()
+        assert "app.py" in files
+        assert "lib/utils.py" in files
+
+        # is_included() works without re-scanning
+        assert scope.is_included("app.py") is True
+        assert scope.is_included("lib/utils.py") is True
+        assert scope.is_included("ignored/secret.py") is False
 
 
 # ---------------------------------------------------------------------------

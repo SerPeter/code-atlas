@@ -32,8 +32,10 @@ _DEFAULT_EXCLUDES: list[str] = [
     "__pycache__/",
     ".venv/",
     "venv/",
+    "vendor/",
     "build/",
     "dist/",
+    "target/",
     ".tox/",
     ".mypy_cache/",
     ".ruff_cache/",
@@ -55,7 +57,156 @@ class IndexResult:
 
 
 # ---------------------------------------------------------------------------
-# File scanner (pure function, no I/O beyond filesystem)
+# File scope filter (cached, reusable)
+# ---------------------------------------------------------------------------
+
+
+class FileScope:
+    """Cached, reusable file scope filter.
+
+    Compiles ignore patterns once on construction and supports nested
+    ``.gitignore`` files discovered during :meth:`scan`.  The
+    :meth:`is_included` method can be called independently (e.g. by a
+    file watcher) without re-reading ignore files.
+
+    Exclusion order:
+      1. Default excludes (``.git/``, ``__pycache__/``, etc.)
+      2. Root ``.gitignore`` patterns
+      3. Root ``.atlasignore`` patterns
+      4. ``settings.scope.exclude_patterns``
+      5. Nested ``.gitignore`` files (discovered during :meth:`scan`)
+      6. Include-path prefix filter (if set)
+    """
+
+    def __init__(
+        self,
+        project_root: str | Path,
+        settings: AtlasSettings,
+        scope_paths: list[str] | None = None,
+    ) -> None:
+        self._root = Path(project_root).resolve()
+        self._global_spec = self._build_global_spec(settings)
+        self._include_prefixes = self._build_include_prefixes(scope_paths, settings)
+        # Nested gitignore specs populated during scan()
+        self._nested_specs: dict[str, pathspec.PathSpec] = {}
+
+    # -- public API ----------------------------------------------------------
+
+    def scan(self) -> list[str]:
+        """Walk the project tree and return sorted relative POSIX paths.
+
+        Files are filtered through the global ignore spec, nested
+        ``.gitignore`` files, include-path prefixes, and language support.
+        """
+        result: list[str] = []
+
+        for dirpath, dirnames, filenames in os.walk(self._root):
+            rel_dir = Path(dirpath).relative_to(self._root).as_posix()
+            if rel_dir == ".":
+                rel_dir = ""
+
+            # Discover nested .gitignore (non-root directories only)
+            if rel_dir:
+                nested_gi = Path(dirpath) / ".gitignore"
+                if nested_gi.is_file():
+                    patterns = _read_ignore_file(nested_gi)
+                    if patterns:
+                        self._nested_specs[rel_dir] = pathspec.PathSpec.from_lines("gitignore", patterns)
+                        logger.debug("Loaded {} patterns from {}", len(patterns), nested_gi)
+
+            # Prune excluded directories (modify dirnames in-place)
+            dirnames[:] = [d for d in dirnames if not self._is_dir_excluded(f"{rel_dir}/{d}" if rel_dir else d)]
+
+            for fname in filenames:
+                rel_path = f"{rel_dir}/{fname}" if rel_dir else fname
+                if not self.is_included(rel_path):
+                    continue
+                # Language support check (not in is_included — watcher may skip this)
+                if get_language_for_file(rel_path) is None:
+                    continue
+                result.append(rel_path)
+
+        result.sort()
+        return result
+
+    def is_included(self, rel_path: str) -> bool:
+        """Check whether *rel_path* passes all scope filters.
+
+        Does **not** check language support — callers handle that separately.
+        """
+        # 1. Global exclude
+        if self._global_spec.match_file(rel_path):
+            logger.trace("EXCLUDE {}: matched global pattern", rel_path)
+            return False
+
+        # 2. Nested gitignore exclude
+        parts = rel_path.split("/")
+        for depth in range(1, len(parts)):
+            ancestor = "/".join(parts[:depth])
+            spec = self._nested_specs.get(ancestor)
+            if spec is not None:
+                # Match relative to the ancestor directory
+                sub_path = "/".join(parts[depth:])
+                if spec.match_file(sub_path):
+                    logger.trace("EXCLUDE {}: matched nested .gitignore in {}/", rel_path, ancestor)
+                    return False
+
+        # 3. Include-path prefix filter
+        if self._include_prefixes and not _matches_any_prefix(rel_path, self._include_prefixes):
+            logger.trace("EXCLUDE {}: not under any include path", rel_path)
+            return False
+
+        logger.trace("INCLUDE {}", rel_path)
+        return True
+
+    # -- private helpers -----------------------------------------------------
+
+    def _build_global_spec(self, settings: AtlasSettings) -> pathspec.PathSpec:
+        """Compile the global ignore spec from defaults, root ignore files, and settings."""
+        patterns: list[str] = list(_DEFAULT_EXCLUDES)
+
+        gitignore = self._root / ".gitignore"
+        if gitignore.is_file():
+            gi_patterns = _read_ignore_file(gitignore)
+            patterns.extend(gi_patterns)
+            logger.debug("Loaded {} patterns from {}", len(gi_patterns), gitignore)
+
+        atlasignore = self._root / ".atlasignore"
+        if atlasignore.is_file():
+            ai_patterns = _read_ignore_file(atlasignore)
+            patterns.extend(ai_patterns)
+            logger.debug("Loaded {} patterns from {}", len(ai_patterns), atlasignore)
+
+        patterns.extend(settings.scope.exclude_patterns)
+
+        return pathspec.PathSpec.from_lines("gitignore", patterns)
+
+    def _build_include_prefixes(self, scope_paths: list[str] | None, settings: AtlasSettings) -> list[str]:
+        """Normalise include paths to POSIX form."""
+        include_paths = scope_paths or settings.scope.include_paths or []
+        return [p.replace("\\", "/").rstrip("/") for p in include_paths]
+
+    def _is_dir_excluded(self, rel_dir: str) -> bool:
+        """Check whether a directory should be pruned from the walk."""
+        dir_pattern = f"{rel_dir}/"
+        if self._global_spec.match_file(dir_pattern):
+            return True
+
+        # Check nested gitignore specs
+        parts = rel_dir.split("/")
+        for depth in range(1, len(parts)):
+            ancestor = "/".join(parts[:depth])
+            spec = self._nested_specs.get(ancestor)
+            if spec is not None:
+                sub_path = "/".join(parts[depth:]) + "/"
+                if spec.match_file(sub_path):
+                    return True
+
+        return False
+
+
+# ---------------------------------------------------------------------------
+# File scanner (thin wrapper for backward compatibility)
 # ---------------------------------------------------------------------------
 
 
@@ -67,62 +218,9 @@ def scan_files(
     """Discover indexable files under *project_root*.
 
     Returns a sorted list of **relative POSIX paths** (forward slashes,
-    relative to *project_root*).
-
-    Exclusion order (P0):
-      1. Default excludes (`.git/`, `__pycache__/`, etc.)
-      2. Root `.gitignore` patterns
-      3. Root `.atlasignore` patterns
-      4. ``settings.scope.exclude_patterns``
-      5. Filter to ``scope_paths`` / ``settings.scope.include_paths`` (if set)
-      6. Filter to files with registered language support
+    relative to *project_root*).  Delegates to :class:`FileScope`.
     """
-    root = Path(project_root).resolve()
-
-    # -- build combined ignore spec ------------------------------------------
-    patterns: list[str] = list(_DEFAULT_EXCLUDES)
-
-    gitignore = root / ".gitignore"
-    if gitignore.is_file():
-        patterns.extend(_read_ignore_file(gitignore))
-
-    atlasignore = root / ".atlasignore"
-    if atlasignore.is_file():
-        patterns.extend(_read_ignore_file(atlasignore))
-
-    patterns.extend(settings.scope.exclude_patterns)
-
-    spec = pathspec.PathSpec.from_lines("gitignore", patterns)
-
-    # -- walk and filter -----------------------------------------------------
-    include_paths = scope_paths or settings.scope.include_paths or []
-    # Normalise include paths to POSIX (forward-slash, no trailing slash)
-    include_prefixes = [p.replace("\\", "/").rstrip("/") for p in include_paths]
-
-    result: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = Path(dirpath).relative_to(root).as_posix()
-        if rel_dir == ".":
-            rel_dir = ""
-
-        # Prune excluded directories (modify dirnames in-place)
-        dirnames[:] = [d for d in dirnames if not spec.match_file(f"{rel_dir}/{d}/" if rel_dir else f"{d}/")]
-
-        for fname in filenames:
-            rel_path = f"{rel_dir}/{fname}" if rel_dir else fname
-            # 1. Exclude check
-            if spec.match_file(rel_path):
-                continue
-            # 2. Include check (if include_paths set)
-            if include_prefixes and not _matches_any_prefix(rel_path, include_prefixes):
-                continue
-            # 3. Language support check
-            if get_language_for_file(rel_path) is None:
-                continue
-            result.append(rel_path)
-
-    result.sort()
-    return result
+    return FileScope(project_root, settings, scope_paths).scan()
 
 
 def _read_ignore_file(path: Path) -> list[str]:
