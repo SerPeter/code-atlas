@@ -335,6 +335,140 @@ class GraphClient:
         )
         return records[0]["cnt"] if records else 0
 
+    # -- Import resolution helpers ---------------------------------------------
+
+    async def resolve_imports(
+        self,
+        project_name: str,
+        import_rels: list[ParsedRelationship],
+    ) -> None:
+        """Resolve IMPORTS relationships after all files in a batch have been upserted.
+
+        Classifies each import as internal (target exists in graph) or external
+        (no match → create ExternalPackage/ExternalSymbol stubs), then creates
+        IMPORTS edges for both.
+        """
+        if not import_rels:
+            return
+
+        # 1. Query all internal entity qualified_name → uid
+        records = await self.execute(
+            f"MATCH (n {{project_name: $p}}) "
+            f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
+            f"AND NOT n:{NodeLabel.SCHEMA_VERSION} AND NOT n:{NodeLabel.PROJECT} "
+            "RETURN n.qualified_name AS qn, n.uid AS uid",
+            {"p": project_name},
+        )
+        internal_map: dict[str, str] = {r["qn"]: r["uid"] for r in records}
+
+        # 2. Classify imports as internal or external
+        import_edges: list[dict[str, str]] = []  # [{from_uid, to_uid}]
+        ext_packages: dict[str, dict[str, str]] = {}  # top_level → {uid, name, qn, project_name}
+        ext_symbols: dict[str, dict[str, str]] = {}  # dotted_path → {uid, name, qn, package, project_name}
+
+        for rel in import_rels:
+            to_name = rel.to_name
+            from_uid = rel.from_qualified_name  # already project-prefixed uid
+
+            # Check internal match
+            if to_name in internal_map:
+                import_edges.append({"from_uid": from_uid, "to_uid": internal_map[to_name]})
+                continue
+
+            # External import — derive top-level package
+            top_level = to_name.split(".")[0]
+            pkg_uid = f"{project_name}:ext/{top_level}"
+
+            if top_level not in ext_packages:
+                ext_packages[top_level] = {
+                    "uid": pkg_uid,
+                    "project_name": project_name,
+                    "name": top_level,
+                    "qualified_name": f"ext/{top_level}",
+                }
+
+            if to_name == top_level:
+                # Bare package import (e.g. `import os`) → point to ExternalPackage
+                import_edges.append({"from_uid": from_uid, "to_uid": pkg_uid})
+            else:
+                # Symbol import (e.g. `from loguru import logger`) → ExternalSymbol
+                sym_uid = f"{project_name}:ext/{to_name}"
+                sym_name = to_name.rsplit(".", 1)[-1]
+                if to_name not in ext_symbols:
+                    ext_symbols[to_name] = {
+                        "uid": sym_uid,
+                        "project_name": project_name,
+                        "name": sym_name,
+                        "qualified_name": f"ext/{to_name}",
+                        "package": top_level,
+                    }
+                import_edges.append({"from_uid": from_uid, "to_uid": sym_uid})
+
+        # 3. MERGE ExternalPackage nodes
+        if ext_packages:
+            await self.execute_write(
+                f"UNWIND $packages AS pkg "
+                f"MERGE (n:{NodeLabel.EXTERNAL_PACKAGE} {{uid: pkg.uid}}) "
+                f"ON CREATE SET n.project_name = pkg.project_name, n.name = pkg.name, "
+                f"n.qualified_name = pkg.qualified_name",
+                {"packages": list(ext_packages.values())},
+            )
+
+        # 4. MERGE ExternalSymbol nodes
+        if ext_symbols:
+            await self.execute_write(
+                f"UNWIND $symbols AS sym "
+                f"MERGE (n:{NodeLabel.EXTERNAL_SYMBOL} {{uid: sym.uid}}) "
+                f"ON CREATE SET n.project_name = sym.project_name, n.name = sym.name, "
+                f"n.qualified_name = sym.qualified_name, n.package = sym.package",
+                {"symbols": list(ext_symbols.values())},
+            )
+
+        # 5. CONTAINS edges (ExternalPackage → ExternalSymbol)
+        contains_edges = [
+            {"pkg_uid": f"{project_name}:ext/{sym['package']}", "sym_uid": sym["uid"]} for sym in ext_symbols.values()
+        ]
+        if contains_edges:
+            await self.execute_write(
+                f"UNWIND $edges AS e "
+                f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{uid: e.pkg_uid}}), "
+                f"(s:{NodeLabel.EXTERNAL_SYMBOL} {{uid: e.sym_uid}}) "
+                f"MERGE (p)-[:{RelType.CONTAINS}]->(s)",
+                {"edges": contains_edges},
+            )
+
+        # 6. IMPORTS edges (both internal and external targets)
+        if import_edges:
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
+                f"CREATE (a)-[:{RelType.IMPORTS}]->(b)",
+                {"rels": import_edges},
+            )
+
+        logger.debug(
+            "Resolved {} imports ({} packages, {} symbols created)",
+            len(import_rels),
+            len(ext_packages),
+            len(ext_symbols),
+        )
+
+    async def update_external_package_versions(
+        self,
+        project_name: str,
+        versions: dict[str, str],
+    ) -> None:
+        """Set version properties on ExternalPackage nodes from dependency metadata."""
+        if not versions:
+            return
+        params = [{"uid": f"{project_name}:ext/{pkg}", "version": ver} for pkg, ver in versions.items()]
+        await self.execute_write(
+            f"UNWIND $items AS item "
+            f"MATCH (n:{NodeLabel.EXTERNAL_PACKAGE} {{uid: item.uid}}) "
+            "SET n.version = item.version",
+            {"items": params},
+        )
+
     # -- Detector enrichment helpers -------------------------------------------
 
     async def apply_property_enrichments(self, enrichments: list[PropertyEnrichment]) -> None:
@@ -751,7 +885,7 @@ class GraphClient:
                     {"rels": rel_params},
                 )
 
-        # Name-matched rels
+        # Name-matched rels (IMPORTS are intentionally excluded — resolved post-batch)
         doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
         inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
 

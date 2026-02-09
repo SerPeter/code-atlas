@@ -32,7 +32,8 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.parser import parse_file
+from code_atlas.parser import ParsedRelationship, parse_file
+from code_atlas.schema import RelType
 
 if TYPE_CHECKING:
     from code_atlas.embeddings import EmbedClient
@@ -230,94 +231,109 @@ class Tier2ASTConsumer(TierConsumer):
         self.stats = Tier2Stats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
 
+    async def _process_file(
+        self,
+        project_name: str,
+        file_path: str,
+        import_rels: list[ParsedRelationship],
+    ) -> tuple[set[str], list[EntityRef]]:
+        """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs).
+
+        Appends IMPORTS rels to *import_rels* for post-batch resolution.
+        """
+        full_path = Path(self.settings.project_root) / file_path
+        if not full_path.is_file():
+            logger.debug("Tier2: file deleted, removing entities for {}", file_path)
+            deleted = await self.graph.delete_file_entities(project_name, file_path)
+            self.stats.files_deleted += 1
+            self.stats.entities_deleted += len(deleted)
+            return set(), []
+
+        try:
+            source = full_path.read_bytes()
+        except OSError:
+            logger.warning("Tier2: cannot read {}", file_path)
+            return set(), []
+
+        parsed = parse_file(file_path, source, project_name)
+        if parsed is None:
+            logger.debug("Tier2: unsupported language for {}", file_path)
+            return set(), []
+
+        det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
+        all_rels = parsed.relationships + det_result.relationships
+
+        # Separate IMPORTS rels for post-batch resolution
+        non_import_rels = [r for r in all_rels if r.rel_type != RelType.IMPORTS]
+        import_rels.extend(r for r in all_rels if r.rel_type == RelType.IMPORTS)
+
+        result = await self.graph.upsert_file_entities(
+            project_name=project_name,
+            file_path=file_path,
+            entities=parsed.entities,
+            relationships=non_import_rels,
+        )
+
+        if det_result.enrichments:
+            await self.graph.apply_property_enrichments(det_result.enrichments)
+
+        self.stats.files_processed += 1
+        self.stats.entities_added += len(result.added)
+        self.stats.entities_modified += len(result.modified)
+        self.stats.entities_deleted += len(result.deleted)
+        self.stats.entities_unchanged += len(result.unchanged)
+
+        changed_qns = set(result.added) | set(result.modified)
+        if not changed_qns:
+            self.stats.files_skipped += 1
+            return set(), []
+
+        entity_map = {
+            (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
+            for e in parsed.entities
+        }
+        refs: list[EntityRef] = []
+        for qn in changed_qns:
+            entity = entity_map.get(qn)
+            if entity is not None:
+                refs.append(
+                    EntityRef(
+                        qualified_name=entity.qualified_name,
+                        node_type=entity.label.value,
+                        file_path=entity.file_path,
+                    )
+                )
+        return changed_qns, refs
+
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         all_paths: list[str] = []
         for e in events:
             if isinstance(e, ASTDirty):
                 all_paths.extend(e.paths)
-        # Deduplicate paths within this batch
         unique_paths = list(dict.fromkeys(all_paths))
 
         logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
         project_name = self.settings.project_root.name
         changed_entity_refs: list[EntityRef] = []
-        files_skipped = 0
+        all_import_rels: list[ParsedRelationship] = []
+        skipped_before = self.stats.files_skipped
         total_changed = 0
 
         for file_path in unique_paths:
-            # Read file from disk — delete file's entities if it was removed
-            full_path = Path(self.settings.project_root) / file_path
-            if not full_path.is_file():
-                logger.debug("Tier2: file deleted, removing entities for {}", file_path)
-                deleted = await self.graph.delete_file_entities(project_name, file_path)
-                self.stats.files_deleted += 1
-                self.stats.entities_deleted += len(deleted)
-                continue
-
-            try:
-                source = full_path.read_bytes()
-            except OSError:
-                logger.warning("Tier2: cannot read {}", file_path)
-                continue
-
-            # Parse with tree-sitter
-            parsed = parse_file(file_path, source, project_name)
-            if parsed is None:
-                logger.debug("Tier2: unsupported language for {}", file_path)
-                continue
-
-            # Run detectors → get extra relationships + property enrichments
-            det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
-            all_rels = parsed.relationships + det_result.relationships
-
-            # Write to graph (delta-aware)
-            result = await self.graph.upsert_file_entities(
-                project_name=project_name,
-                file_path=file_path,
-                entities=parsed.entities,
-                relationships=all_rels,
-            )
-
-            # Apply property enrichments after entity upsert
-            if det_result.enrichments:
-                await self.graph.apply_property_enrichments(det_result.enrichments)
-
-            # Accumulate stats
-            self.stats.files_processed += 1
-            self.stats.entities_added += len(result.added)
-            self.stats.entities_modified += len(result.modified)
-            self.stats.entities_deleted += len(result.deleted)
-            self.stats.entities_unchanged += len(result.unchanged)
-
-            # Only collect refs for added + modified entities (not unchanged)
-            changed_qns = set(result.added) | set(result.modified)
-            if not changed_qns:
-                files_skipped += 1
-                self.stats.files_skipped += 1
-                continue
-
+            changed_qns, refs = await self._process_file(project_name, file_path, all_import_rels)
             total_changed += len(changed_qns)
-            entity_map = {
-                (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
-                for e in parsed.entities
-            }
-            for qn in changed_qns:
-                entity = entity_map.get(qn)
-                if entity is not None:
-                    changed_entity_refs.append(
-                        EntityRef(
-                            qualified_name=entity.qualified_name,
-                            node_type=entity.label.value,
-                            file_path=entity.file_path,
-                        )
-                    )
+            changed_entity_refs.extend(refs)
+
+        # Post-batch import resolution
+        if all_import_rels:
+            await self.graph.resolve_imports(project_name, all_import_rels)
 
         logger.info(
             "Tier2 batch {}: {} files, {} skipped, {} entities changed",
             batch_id,
             len(unique_paths),
-            files_skipped,
+            self.stats.files_skipped - skipped_before,
             total_changed,
         )
 

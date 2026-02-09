@@ -905,3 +905,269 @@ async def test_upsert_updates_positions_on_shift(graph_client: GraphClient):
     assert records[0]["le"] == 10
     # Embed data preserved — no re-embedding needed
     assert records[0]["hash"] == "emb_b"
+
+
+# ---------------------------------------------------------------------------
+# Import resolution
+# ---------------------------------------------------------------------------
+
+
+def _setup_module_node(project: str, fp: str) -> tuple[list[ParsedEntity], str]:
+    """Helper: create a Module entity for import resolution tests.
+
+    Returns (entities, module_uid).
+    """
+    module_qn = fp.replace("/", ".").removesuffix(".py")
+    uid = f"{project}:{module_qn}"
+    entity = ParsedEntity(
+        name=fp.rsplit("/", 1)[-1].removesuffix(".py"),
+        qualified_name=uid,
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=1,
+        file_path=fp,
+        content_hash="mod_hash",
+    )
+    return [entity], uid
+
+
+async def test_resolve_imports_external(graph_client: GraphClient):
+    """Module with external-only imports creates ExternalPackage + ExternalSymbol nodes."""
+    await graph_client.ensure_schema()
+
+    project = "imp_ext"
+    fp = "src/app.py"
+    entities, mod_uid = _setup_module_node(project, fp)
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    import_rels = [
+        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="loguru.logger"),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    # ExternalPackage created
+    pkg_records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) RETURN n.uid AS uid, n.name AS name",
+        {"p": project},
+    )
+    assert len(pkg_records) == 1
+    assert pkg_records[0]["name"] == "loguru"
+
+    # ExternalSymbol created
+    sym_records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $p}}) "
+        "RETURN n.uid AS uid, n.name AS name, n.package AS pkg",
+        {"p": project},
+    )
+    assert len(sym_records) == 1
+    assert sym_records[0]["name"] == "logger"
+    assert sym_records[0]["pkg"] == "loguru"
+
+    # CONTAINS edge: ExternalPackage → ExternalSymbol
+    contains = await graph_client.execute(
+        f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE})-[:{RelType.CONTAINS}]->(s:{NodeLabel.EXTERNAL_SYMBOL}) "
+        "RETURN p.name AS pkg, s.name AS sym",
+    )
+    assert len(contains) == 1
+
+    # IMPORTS edge: Module → ExternalSymbol
+    imports = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE})-[:{RelType.IMPORTS}]->(s:{NodeLabel.EXTERNAL_SYMBOL}) "
+        "RETURN m.name AS mod, s.name AS sym",
+    )
+    assert len(imports) == 1
+    assert imports[0]["sym"] == "logger"
+
+
+async def test_resolve_imports_internal(graph_client: GraphClient):
+    """Module importing from another indexed module creates IMPORTS edge to internal entity."""
+    await graph_client.ensure_schema()
+
+    project = "imp_int"
+
+    # Create two modules: app.py imports utils.helper
+    fp_utils = "src/utils.py"
+    utils_entities = [
+        ParsedEntity(
+            name="utils",
+            qualified_name=f"{project}:src.utils",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=1,
+            file_path=fp_utils,
+            content_hash="utils_hash",
+        ),
+        ParsedEntity(
+            name="helper",
+            qualified_name=f"{project}:src.utils.helper",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=2,
+            line_end=5,
+            file_path=fp_utils,
+            content_hash="helper_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_utils, utils_entities, [])
+
+    fp_app = "src/app.py"
+    app_entities, app_uid = _setup_module_node(project, fp_app)
+    await graph_client.upsert_file_entities(project, fp_app, app_entities, [])
+
+    import_rels = [
+        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="src.utils.helper"),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    # IMPORTS edge to internal entity (no External* nodes created)
+    imports = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE} {{name: 'app'}})-[:{RelType.IMPORTS}]->(c:{NodeLabel.CALLABLE}) "
+        "RETURN c.name AS name",
+    )
+    assert len(imports) == 1
+    assert imports[0]["name"] == "helper"
+
+    # No external nodes
+    ext = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) RETURN n", {"p": project}
+    )
+    assert len(ext) == 0
+
+
+async def test_resolve_imports_mixed(graph_client: GraphClient):
+    """Both internal and external imports are correctly classified."""
+    await graph_client.ensure_schema()
+
+    project = "imp_mix"
+
+    # Internal target
+    fp_utils = "src/utils.py"
+    utils_entities = [
+        ParsedEntity(
+            name="utils",
+            qualified_name=f"{project}:src.utils",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=1,
+            file_path=fp_utils,
+            content_hash="u_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_utils, utils_entities, [])
+
+    fp_app = "src/app.py"
+    app_entities, app_uid = _setup_module_node(project, fp_app)
+    await graph_client.upsert_file_entities(project, fp_app, app_entities, [])
+
+    import_rels = [
+        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="src.utils"),
+        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="pydantic.BaseModel"),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    # Internal import
+    internal = await graph_client.execute(
+        f"MATCH (:{NodeLabel.MODULE} {{name: 'app'}})-[:{RelType.IMPORTS}]->(n:{NodeLabel.MODULE}) "
+        "RETURN n.name AS name",
+    )
+    assert len(internal) == 1
+    assert internal[0]["name"] == "utils"
+
+    # External import
+    external = await graph_client.execute(
+        f"MATCH (:{NodeLabel.MODULE} {{name: 'app'}})-[:{RelType.IMPORTS}]->(n:{NodeLabel.EXTERNAL_SYMBOL}) "
+        "RETURN n.name AS name",
+    )
+    assert len(external) == 1
+    assert external[0]["name"] == "BaseModel"
+
+
+async def test_resolve_imports_idempotent(graph_client: GraphClient):
+    """Re-running resolve_imports does not duplicate External* nodes (MERGE)."""
+    await graph_client.ensure_schema()
+
+    project = "imp_idem"
+    fp = "src/app.py"
+    entities, mod_uid = _setup_module_node(project, fp)
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    import_rels = [
+        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="requests.get"),
+    ]
+
+    # Run twice
+    await graph_client.resolve_imports(project, import_rels)
+    await graph_client.resolve_imports(project, import_rels)
+
+    # Should still be exactly one ExternalPackage and one ExternalSymbol
+    pkgs = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) RETURN n", {"p": project}
+    )
+    assert len(pkgs) == 1
+
+    syms = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $p}}) RETURN n", {"p": project}
+    )
+    assert len(syms) == 1
+
+
+async def test_resolve_imports_bare_package(graph_client: GraphClient):
+    """Bare package import (e.g. `import os`) creates IMPORTS edge to ExternalPackage directly."""
+    await graph_client.ensure_schema()
+
+    project = "imp_bare"
+    fp = "src/app.py"
+    entities, mod_uid = _setup_module_node(project, fp)
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    import_rels = [
+        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="os"),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    # IMPORTS edge points directly to ExternalPackage (no ExternalSymbol)
+    imports = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE})-[:{RelType.IMPORTS}]->(p:{NodeLabel.EXTERNAL_PACKAGE}) RETURN p.name AS name",
+    )
+    assert len(imports) == 1
+    assert imports[0]["name"] == "os"
+
+    # No ExternalSymbol for bare import
+    syms = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $p}}) RETURN n", {"p": project}
+    )
+    assert len(syms) == 0
+
+
+async def test_external_package_versions(graph_client: GraphClient):
+    """Version property is set on ExternalPackage nodes."""
+    await graph_client.ensure_schema()
+
+    project = "imp_ver"
+    fp = "src/app.py"
+    entities, mod_uid = _setup_module_node(project, fp)
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    import_rels = [
+        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="loguru.logger"),
+        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="pydantic.BaseModel"),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    # Set versions
+    versions = {"loguru": "~=0.7", "pydantic": ">=2.0,<3.0"}
+    await graph_client.update_external_package_versions(project, versions)
+
+    # Verify
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) "
+        "RETURN n.name AS name, n.version AS version ORDER BY n.name",
+        {"p": project},
+    )
+    assert len(records) == 2
+    version_map = {r["name"]: r["version"] for r in records}
+    assert version_map["loguru"] == "~=0.7"
+    assert version_map["pydantic"] == ">=2.0,<3.0"

@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -547,6 +548,34 @@ async def _check_model_lock(graph: GraphClient, model: str, dimension: int, *, r
 
 
 # ---------------------------------------------------------------------------
+# Dependency version extraction
+# ---------------------------------------------------------------------------
+
+_PEP508_RE = re.compile(r"^([A-Za-z0-9][\w.-]*)\s*(.*)")
+
+
+def _parse_dependency_versions(project_root: Path) -> dict[str, str]:
+    """Extract package name → version constraint from pyproject.toml dependencies."""
+    pyproject = project_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return {}
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    deps: list[str] = data.get("project", {}).get("dependencies", [])
+    versions: dict[str, str] = {}
+    for dep in deps:
+        match = _PEP508_RE.match(dep.strip())
+        if match:
+            pkg_name = match.group(1).lower().replace("-", "_")
+            constraint = match.group(2).strip().rstrip(";").strip()
+            if constraint:
+                versions[pkg_name] = constraint
+    return versions
+
+
+# ---------------------------------------------------------------------------
 # Main indexing orchestration
 # ---------------------------------------------------------------------------
 
@@ -755,7 +784,12 @@ async def index_project(
         tier2 = await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s)
         t2stats = tier2.stats
 
-    # 7. Update Project metadata
+    # 7. Set dependency versions on ExternalPackage nodes
+    dep_versions = _parse_dependency_versions(project_root)
+    if dep_versions:
+        await graph.update_external_package_versions(project_name, dep_versions)
+
+    # 8. Update Project metadata
     entity_count = await graph.count_entities(project_name)
     git_hash = _get_git_hash(project_root)
     metadata: dict[str, Any] = {
