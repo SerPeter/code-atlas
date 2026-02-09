@@ -320,6 +320,19 @@ class Foo:
     assert any("staticmethod" in t for t in bar.tags)
 
 
+def test_decorator_tags_with_args():
+    """Decorator with arguments preserves full text including args."""
+    parsed = _parse(
+        """\
+@app.get("/users/{id}")
+def get_user(id: int):
+    pass
+"""
+    )
+    get_user = _entity_by_name(parsed, "get_user")
+    assert 'decorator:app.get("/users/{id}")' in get_user.tags
+
+
 # ---------------------------------------------------------------------------
 # Qualified names
 # ---------------------------------------------------------------------------

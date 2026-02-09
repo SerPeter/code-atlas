@@ -366,17 +366,18 @@ def _callable_kind_for_method(name: str, node: Node) -> str:
 
 
 def _get_decorators(node: Node) -> list[str]:
-    """Extract decorator names from a decorated_definition parent."""
+    """Extract decorator names from a decorated_definition parent.
+
+    Preserves full decorator text including arguments so detectors can
+    inspect route paths, event names, etc.  Multi-line decorators are
+    collapsed to a single line with normalized whitespace.
+    """
     tags: list[str] = []
     parent = node.parent
     if parent is not None and parent.type == "decorated_definition":
         for child in parent.children:
             if child.type == "decorator":
-                dec_text = _node_text(child).strip().lstrip("@")
-                # Take just the name (before any parentheses)
-                paren = dec_text.find("(")
-                if paren >= 0:
-                    dec_text = dec_text[:paren]
+                dec_text = " ".join(_node_text(child).split()).lstrip("@").strip()
                 tags.append(f"decorator:{dec_text}")
     return tags
 
