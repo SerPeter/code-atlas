@@ -62,6 +62,7 @@ ignore = [
     "ARG",      # unused arguments are common in fixtures
     "SLF001",   # private member access is fine in tests
     "PLR2004",  # magic values are fine in tests
+    "PLC0415",  # non-top-level imports — common in integration test fixtures
 ]
 
 [lint.isort]

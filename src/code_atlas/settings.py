@@ -28,8 +28,24 @@ class MonorepoSettings(BaseSettings):
     """Monorepo detection and scoping settings."""
 
     auto_detect: bool = Field(default=True, description="Auto-detect sub-projects by project markers.")
+    projects: list[dict[str, str]] = Field(
+        default_factory=list,
+        description='Explicit sub-project definitions: [{"path": "services/auth", "name": "auth"}].',
+    )
     always_include: list[str] = Field(
-        default_factory=list, description="Paths always included when scoping queries (e.g., shared libs)."
+        default_factory=list, description="Project names always included when scoping queries (e.g., shared libs)."
+    )
+    markers: list[str] = Field(
+        default_factory=lambda: [
+            "pyproject.toml",
+            "setup.py",
+            "package.json",
+            "Cargo.toml",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+        ],
+        description="Files that indicate a directory is a sub-project root.",
     )
 
 

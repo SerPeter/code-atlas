@@ -137,7 +137,7 @@ async def test_tier1_publishes_downstream(bus: EventBus) -> None:
     # Run Tier1 for a short period then stop
     # Tier1 needs graph + settings but we're only testing event flow here;
     # it doesn't call graph in its current implementation.
-    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from unittest.mock import AsyncMock
 
     mock_graph = AsyncMock()
     test_settings = AtlasSettings()

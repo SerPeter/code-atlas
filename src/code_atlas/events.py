@@ -26,6 +26,7 @@ class FileChanged:
 
     path: str
     change_type: str  # "created" | "modified" | "deleted"
+    project_name: str = ""  # monorepo sub-project (empty = derive from settings)
     timestamp: float = field(default_factory=time.time)
 
 
@@ -43,6 +44,7 @@ class ASTDirty:
     """Files need AST re-parsing (published by Tier 1, consumed by Tier 2)."""
 
     paths: list[str]
+    project_name: str = ""  # monorepo sub-project (forwarded from FileChanged)
     batch_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 

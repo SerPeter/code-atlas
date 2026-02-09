@@ -288,6 +288,57 @@ def assemble_context(
 
 
 # ---------------------------------------------------------------------------
+# Scope expansion (monorepo support)
+# ---------------------------------------------------------------------------
+
+
+def expand_scope(
+    scope: str,
+    all_projects: list[str],
+    always_include: list[str] | None = None,
+) -> list[str] | None:
+    """Expand a scope string into a list of project names.
+
+    - Empty string → ``None`` (no filter — all projects).
+    - Single name → ``[name] + always_include``.
+    - Glob pattern (``services/*``) → matching projects + always_include.
+    - Comma-separated → split + always_include.
+
+    Returns ``None`` for no filtering, or a deduplicated list of project names.
+    """
+    if not scope:
+        return None
+
+    always = always_include or []
+
+    # Comma-separated list
+    parts = [s.strip() for s in scope.split(",") if s.strip()]
+
+    matched: list[str] = []
+    for part in parts:
+        if "*" in part or "?" in part or "[" in part:
+            # Glob pattern
+            matched.extend(p for p in all_projects if fnmatch.fnmatch(p, part))
+        else:
+            matched.append(part)
+
+    # Add always_include projects
+    for inc in always:
+        if inc not in matched:
+            matched.append(inc)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in matched:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+
+    return result or None
+
+
+# ---------------------------------------------------------------------------
 # RRF fusion (pure function)
 # ---------------------------------------------------------------------------
 
@@ -582,16 +633,24 @@ async def hybrid_search(
             logger.warning("Embedding failed, skipping vector channel: {}", exc)
             search_types = [st for st in search_types if st != SearchType.VECTOR]
 
+    # Resolve scope to projects list (monorepo-aware)
+    # Supports comma-separated project names (e.g., "auth,shared")
+    if scope:
+        parts = [s.strip() for s in scope.split(",") if s.strip()]
+        scope_projects: list[str] | None = parts
+    else:
+        scope_projects = None
+
     # Fire search channels in parallel
     tasks: dict[str, asyncio.Task[list[dict[str, Any]]]] = {}
     fetch_limit = limit * 3  # over-fetch for fusion quality
 
     if SearchType.GRAPH in search_types:
-        tasks["graph"] = asyncio.create_task(graph.graph_search(query, limit=fetch_limit, project=scope))
+        tasks["graph"] = asyncio.create_task(graph.graph_search(query, limit=fetch_limit, projects=scope_projects))
     if SearchType.VECTOR in search_types and vector is not None:
-        tasks["vector"] = asyncio.create_task(graph.vector_search(vector, limit=fetch_limit, project=scope))
+        tasks["vector"] = asyncio.create_task(graph.vector_search(vector, limit=fetch_limit, projects=scope_projects))
     if SearchType.BM25 in search_types:
-        tasks["bm25"] = asyncio.create_task(graph.text_search(query, limit=fetch_limit, project=scope))
+        tasks["bm25"] = asyncio.create_task(graph.text_search(query, limit=fetch_limit, projects=scope_projects))
 
     # Collect results
     channel_results: dict[str, list[dict[str, Any]]] = {}

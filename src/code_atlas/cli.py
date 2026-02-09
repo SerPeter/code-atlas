@@ -21,10 +21,13 @@ app.add_typer(daemon_app)
 def index(
     path: str = typer.Argument(".", help="Path to the project root to index."),
     scope: list[str] | None = typer.Option(None, help="Scope indexing to specific paths (repeatable)."),
+    project: list[str] | None = typer.Option(
+        None, "--project", "-p", help="Index specific sub-projects (repeatable, globs)."
+    ),
     full_reindex: bool = typer.Option(False, "--full", help="Force full re-index, ignoring delta cache."),
 ) -> None:
     """Index a codebase into the graph."""
-    asyncio.run(_run_index(path, scope, full_reindex))
+    asyncio.run(_run_index(path, scope, full_reindex, projects=project))
 
 
 @app.command()
@@ -89,13 +92,19 @@ def mcp(
 # ---------------------------------------------------------------------------
 
 
-async def _run_index(path: str, scope: list[str] | None, full_reindex: bool) -> None:
+async def _run_index(
+    path: str,
+    scope: list[str] | None,
+    full_reindex: bool,
+    *,
+    projects: list[str] | None = None,
+) -> None:
     """Async implementation of the ``atlas index`` command."""
     from pathlib import Path
 
     from code_atlas.events import EventBus
     from code_atlas.graph import GraphClient
-    from code_atlas.indexer import index_project
+    from code_atlas.indexer import detect_sub_projects, index_monorepo, index_project
     from code_atlas.settings import AtlasSettings
 
     project_root = Path(path).resolve()
@@ -123,33 +132,56 @@ async def _run_index(path: str, scope: list[str] | None, full_reindex: bool) -> 
     await graph.ensure_schema()
 
     try:
-        result = await index_project(
-            settings,
-            graph,
-            bus,
-            scope_paths=scope or None,
-            full_reindex=full_reindex,
-        )
-        logger.info(
-            "Done ({}) — {} files scanned, {} published, {} entities in {:.1f}s",
-            result.mode,
-            result.files_scanned,
-            result.files_published,
-            result.entities_total,
-            result.duration_s,
-        )
-        if result.delta_stats is not None:
-            ds = result.delta_stats
-            logger.info(
-                "Delta: files +{} ~{} -{} | entities +{} ~{} -{} ={} unchanged",
-                ds.files_added,
-                ds.files_modified,
-                ds.files_deleted,
-                ds.entities_added,
-                ds.entities_modified,
-                ds.entities_deleted,
-                ds.entities_unchanged,
+        # Auto-detect monorepo: if sub-projects detected or --project specified → monorepo mode
+        sub_projects = detect_sub_projects(project_root, settings.monorepo)
+        is_monorepo = bool(sub_projects) or bool(projects)
+
+        if is_monorepo:
+            results = await index_monorepo(
+                settings,
+                graph,
+                bus,
+                scope_projects=projects,
+                full_reindex=full_reindex,
             )
+            total_files = sum(r.files_scanned for r in results)
+            total_entities = sum(r.entities_total for r in results)
+            total_duration = sum(r.duration_s for r in results)
+            logger.info(
+                "Monorepo indexing complete — {} sub-project(s), {} files, {} entities, {:.1f}s total",
+                len(results),
+                total_files,
+                total_entities,
+                total_duration,
+            )
+        else:
+            result = await index_project(
+                settings,
+                graph,
+                bus,
+                scope_paths=scope or None,
+                full_reindex=full_reindex,
+            )
+            logger.info(
+                "Done ({}) — {} files scanned, {} published, {} entities in {:.1f}s",
+                result.mode,
+                result.files_scanned,
+                result.files_published,
+                result.entities_total,
+                result.duration_s,
+            )
+            if result.delta_stats is not None:
+                ds = result.delta_stats
+                logger.info(
+                    "Delta: files +{} ~{} -{} | entities +{} ~{} -{} ={} unchanged",
+                    ds.files_added,
+                    ds.files_modified,
+                    ds.files_deleted,
+                    ds.entities_added,
+                    ds.entities_modified,
+                    ds.entities_deleted,
+                    ds.entities_unchanged,
+                )
     finally:
         await graph.close()
         await bus.close()
@@ -256,6 +288,17 @@ async def _run_status() -> None:
         if not projects:
             logger.info("No indexed projects found.")
             return
+
+        import datetime
+
+        # Collect DEPENDS_ON relationships
+        depends_on = await graph.execute(
+            "MATCH (a:Project)-[:DEPENDS_ON]->(b:Project) RETURN a.name AS from_proj, b.name AS to_proj"
+        )
+        deps_by_project: dict[str, list[str]] = {}
+        for row in depends_on:
+            deps_by_project.setdefault(row["from_proj"], []).append(row["to_proj"])
+
         for row in projects:
             node = row["n"]
             name = node.get("name", "?")
@@ -263,16 +306,18 @@ async def _run_status() -> None:
             files = node.get("file_count", "?")
             entities = node.get("entity_count", "?")
             git_hash = node.get("git_hash", "?")
-            import datetime
 
             ts = datetime.datetime.fromtimestamp(last, tz=datetime.UTC).isoformat() if last else "never"
+            deps = deps_by_project.get(name, [])
+            deps_str = f" | depends_on: {', '.join(sorted(deps))}" if deps else ""
             logger.info(
-                "Project: {} | indexed: {} | files: {} | entities: {} | git: {}",
+                "Project: {} | indexed: {} | files: {} | entities: {} | git: {}{}",
                 name,
                 ts,
                 files,
                 entities,
                 git_hash,
+                deps_str,
             )
     finally:
         await graph.close()

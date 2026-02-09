@@ -33,7 +33,7 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
-from code_atlas.search import CompactNode, SearchType, expand_context
+from code_atlas.search import CompactNode, SearchType, expand_context, expand_scope
 from code_atlas.search import hybrid_search as _hybrid_search
 
 if TYPE_CHECKING:
@@ -547,6 +547,20 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             except json.JSONDecodeError:
                 return _error("Invalid weights JSON", code="INVALID_WEIGHTS")
 
+        # Resolve scope through expand_scope for monorepo glob/comma support
+        resolved_scope = scope
+        if scope and ("*" in scope or "," in scope):
+            project_rows = await app.graph.get_project_status()
+            all_project_names = []
+            for row in project_rows:
+                node = row.get("n")
+                if node:
+                    props = dict(node.items()) if hasattr(node, "items") else node
+                    all_project_names.append(props.get("name", ""))
+            expanded = expand_scope(scope, all_project_names, app.settings.monorepo.always_include)
+            # Pass expanded projects directly — use empty scope and set projects on search calls
+            resolved_scope = ",".join(expanded) if expanded else ""
+
         t0 = time.monotonic()
         results = await _hybrid_search(
             graph=app.graph,
@@ -555,7 +569,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             query=query,
             search_types=types,
             limit=clamped,
-            scope=scope,
+            scope=resolved_scope,
             weights=weight_dict,
             exclude_tests=exclude_tests,
             exclude_stubs=exclude_stubs,
@@ -639,6 +653,54 @@ def _register_info_tools(mcp: FastMCP) -> None:
             "schema_version": SCHEMA_VERSION,
             "query_ms": round(elapsed, 1),
         }
+
+    @mcp.tool(
+        description=(
+            "List all indexed projects with metadata and dependencies. "
+            "For monorepos, shows sub-projects with DEPENDS_ON relationships. "
+            "Returns name, file_count, entity_count, depends_on, depended_by for each project."
+        ),
+    )
+    async def list_projects(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        app = _get_app_ctx(ctx)
+        t0 = time.monotonic()
+
+        projects_raw = await app.graph.get_project_status()
+        if not projects_raw:
+            return _result([], limit=0, query_ms=0)
+
+        # Collect DEPENDS_ON relationships
+        depends_records = await app.graph.execute(
+            "MATCH (a:Project)-[:DEPENDS_ON]->(b:Project) RETURN a.name AS from_proj, b.name AS to_proj"
+        )
+        depends_on_map: dict[str, list[str]] = {}
+        depended_by_map: dict[str, list[str]] = {}
+        for r in depends_records:
+            depends_on_map.setdefault(r["from_proj"], []).append(r["to_proj"])
+            depended_by_map.setdefault(r["to_proj"], []).append(r["from_proj"])
+
+        result_list = []
+        for row in projects_raw:
+            node = row.get("n")
+            if node is None:
+                continue
+            props = dict(node.items()) if hasattr(node, "items") else node
+            name = props.get("name", "?")
+            entity_count = await app.graph.count_entities(name)
+            result_list.append(
+                {
+                    "name": name,
+                    "file_count": props.get("file_count"),
+                    "entity_count": entity_count,
+                    "last_indexed_at": props.get("last_indexed_at"),
+                    "git_hash": props.get("git_hash"),
+                    "depends_on": sorted(depends_on_map.get(name, [])),
+                    "depended_by": sorted(depended_by_map.get(name, [])),
+                }
+            )
+
+        elapsed = (time.monotonic() - t0) * 1000
+        return _result(result_list, limit=len(result_list), query_ms=elapsed)
 
     @mcp.tool(
         description=(

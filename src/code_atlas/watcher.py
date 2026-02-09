@@ -17,9 +17,10 @@ from loguru import logger
 from watchfiles import Change, awatch
 
 from code_atlas.events import EventBus, FileChanged, Topic
+from code_atlas.indexer import classify_file_project
 
 if TYPE_CHECKING:
-    from code_atlas.indexer import FileScope
+    from code_atlas.indexer import DetectedProject, FileScope
     from code_atlas.settings import WatcherSettings
 
 # Map watchfiles Change enum → FileChanged.change_type strings
@@ -55,15 +56,18 @@ class FileWatcher:
         bus: EventBus,
         scope: FileScope,
         settings: WatcherSettings,
+        *,
+        sub_projects: list[DetectedProject] | None = None,
     ) -> None:
         self._root = Path(project_root).resolve()
         self._bus = bus
         self._scope = scope
         self._debounce_s = settings.debounce_s
         self._max_wait_s = settings.max_wait_s
+        self._sub_projects = sub_projects or []
 
-        # Pending changes: {rel_path: change_type}  (latest type wins)
-        self._pending: dict[str, str] = {}
+        # Pending changes: {rel_path: (change_type, project_name)}  (latest wins)
+        self._pending: dict[str, tuple[str, str]] = {}
         self._flush_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
 
@@ -119,7 +123,12 @@ class FileWatcher:
             if change_type is None:
                 continue
 
-            self._pending[rel_path] = change_type
+            # Classify sub-project for monorepo mode
+            project_name = ""
+            if self._sub_projects:
+                project_name = classify_file_project(rel_path, self._sub_projects)
+
+            self._pending[rel_path] = (change_type, project_name)
             accepted += 1
 
         if accepted == 0:
@@ -178,6 +187,6 @@ class FileWatcher:
 
         # Publish outside the lock so new changes can accumulate
         logger.info("Flushing {} file change(s)", len(batch))
-        for rel_path, change_type in batch.items():
-            event = FileChanged(path=rel_path, change_type=change_type)
+        for rel_path, (change_type, project_name) in batch.items():
+            event = FileChanged(path=rel_path, change_type=change_type, project_name=project_name)
             await self._bus.publish(Topic.FILE_CHANGED, event)

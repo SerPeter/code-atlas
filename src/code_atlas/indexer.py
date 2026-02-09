@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import os
 import re
 import subprocess
@@ -23,11 +24,22 @@ from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3Embed
 
 if TYPE_CHECKING:
     from code_atlas.graph import GraphClient
-    from code_atlas.settings import AtlasSettings
+    from code_atlas.settings import AtlasSettings, MonorepoSettings
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DetectedProject:
+    """A detected sub-project within a monorepo."""
+
+    name: str  # project_name for the graph
+    path: str  # relative POSIX path from monorepo root
+    root: Path  # absolute path
+    marker: str  # which marker file (or "explicit")
+
 
 _DEFAULT_EXCLUDES: list[str] = [
     ".git/",
@@ -48,6 +60,116 @@ _DEFAULT_EXCLUDES: list[str] = [
     ".env/",
     ".atlas/",
 ]
+
+# Directories to always skip during sub-project detection walk
+_DETECT_PRUNE_DIRS = frozenset(d.rstrip("/") for d in _DEFAULT_EXCLUDES if d.endswith("/"))
+
+
+# ---------------------------------------------------------------------------
+# Monorepo sub-project detection
+# ---------------------------------------------------------------------------
+
+
+def _resolve_project_name(
+    proj: DetectedProject,
+    path: str,
+    name_counts: dict[str, list[str]],
+) -> DetectedProject:
+    """Resolve a DetectedProject's name, handling collisions."""
+    if proj.name:
+        return proj
+    base = path.rsplit("/", 1)[-1]
+    resolved = path.replace("/", "-") if len(name_counts.get(base, [])) > 1 else base
+    return DetectedProject(name=resolved, path=proj.path, root=proj.root, marker=proj.marker)
+
+
+def detect_sub_projects(
+    project_root: Path,
+    monorepo_settings: MonorepoSettings,
+) -> list[DetectedProject]:
+    """Detect sub-projects within a monorepo root.
+
+    1. Start with explicit ``monorepo_settings.projects`` entries.
+    2. If ``auto_detect`` is True, walk the tree looking for marker files.
+    3. Skip the root directory itself (root = the monorepo, not a sub-project).
+    4. Prune default-excluded directories during the walk.
+    5. Explicit entries override auto-detected at the same path.
+    6. Naming: basename of path. On collision, use ``path.replace("/", "-")``.
+    7. Sort by path depth (shallow first).
+    """
+    root = project_root.resolve()
+
+    # 1. Explicit projects
+    explicit_by_path: dict[str, DetectedProject] = {}
+    for entry in monorepo_settings.projects:
+        raw_path = entry.get("path", "").replace("\\", "/").strip("/")
+        if not raw_path:
+            continue
+        name = entry.get("name", "") or raw_path.replace("/", "-")
+        explicit_by_path[raw_path] = DetectedProject(
+            name=name,
+            path=raw_path,
+            root=root / raw_path.replace("/", os.sep),
+            marker="explicit",
+        )
+
+    # 2. Auto-detect
+    auto_by_path: dict[str, DetectedProject] = {}
+    if monorepo_settings.auto_detect:
+        markers = set(monorepo_settings.markers)
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = Path(dirpath).relative_to(root).as_posix()
+            if rel_dir == ".":
+                # Skip root — prune excluded dirs
+                dirnames[:] = [d for d in dirnames if d not in _DETECT_PRUNE_DIRS]
+                continue
+
+            # Prune excluded dirs
+            dirnames[:] = [d for d in dirnames if d not in _DETECT_PRUNE_DIRS]
+
+            # Check for marker files
+            matched_markers = markers & set(filenames)
+            if matched_markers:
+                marker = sorted(matched_markers)[0]  # deterministic
+                if rel_dir not in explicit_by_path:
+                    auto_by_path[rel_dir] = DetectedProject(
+                        name="",  # placeholder — resolved below
+                        path=rel_dir,
+                        root=root / rel_dir.replace("/", os.sep),
+                        marker=marker,
+                    )
+
+    # 3. Merge: explicit overrides auto-detected at same path
+    all_paths: dict[str, DetectedProject] = {**auto_by_path, **explicit_by_path}
+
+    # 4. Resolve names (basename, with collision fallback to full-path-dashed)
+    name_counts: dict[str, list[str]] = {}
+    for path, proj in all_paths.items():
+        base = proj.name or path.rsplit("/", 1)[-1]
+        name_counts.setdefault(base, []).append(path)
+
+    result: list[DetectedProject] = []
+    for path, proj in all_paths.items():
+        result.append(_resolve_project_name(proj, path, name_counts))
+
+    # 5. Sort by path depth (shallow first), then alphabetically
+    result.sort(key=lambda dp: (dp.path.count("/"), dp.path))
+    return result
+
+
+def classify_file_project(rel_path: str, sub_projects: list[DetectedProject]) -> str:
+    """Return the project_name for the most specific (longest prefix) matching sub-project.
+
+    Returns empty string if the file doesn't belong to any sub-project.
+    """
+    best_name = ""
+    best_len = -1
+    for proj in sub_projects:
+        prefix = proj.path
+        if (rel_path == prefix or rel_path.startswith(prefix + "/")) and len(prefix) > best_len:
+            best_len = len(prefix)
+            best_name = proj.name
+    return best_name
 
 
 @dataclass(frozen=True)
@@ -600,6 +722,8 @@ async def _run_pipeline(
     embed: EmbedClient,
     cache: EmbedCache | None,
     drain_timeout_s: float,
+    *,
+    project_root: Path | None = None,
 ) -> Tier2ASTConsumer:
     """Start inline tier consumers and wait for the pipeline to drain.
 
@@ -610,7 +734,7 @@ async def _run_pipeline(
     await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
 
     tier1 = Tier1GraphConsumer(bus, graph, settings)
-    tier2 = Tier2ASTConsumer(bus, graph, settings)
+    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root)
     tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
 
     task1 = asyncio.create_task(tier1.run())
@@ -699,24 +823,34 @@ async def _publish_events(
     mode: str,
     files: list[str],
     decision: _DeltaDecision,
+    *,
+    project_name: str = "",
 ) -> int:
     """Publish FileChanged events and return the count published."""
     if mode == "delta":
         published = 0
         for fp in decision.files_added:
-            await bus.publish(Topic.FILE_CHANGED, FileChanged(path=fp, change_type="created"))
+            await bus.publish(
+                Topic.FILE_CHANGED, FileChanged(path=fp, change_type="created", project_name=project_name)
+            )
             published += 1
         for fp in decision.files_modified:
-            await bus.publish(Topic.FILE_CHANGED, FileChanged(path=fp, change_type="modified"))
+            await bus.publish(
+                Topic.FILE_CHANGED, FileChanged(path=fp, change_type="modified", project_name=project_name)
+            )
             published += 1
         for fp in decision.files_deleted:
-            await bus.publish(Topic.FILE_CHANGED, FileChanged(path=fp, change_type="deleted"))
+            await bus.publish(
+                Topic.FILE_CHANGED, FileChanged(path=fp, change_type="deleted", project_name=project_name)
+            )
             published += 1
         logger.info("Published {} FileChanged events (delta)", published)
         return published
 
     for file_path in files:
-        await bus.publish(Topic.FILE_CHANGED, FileChanged(path=file_path, change_type="created"))
+        await bus.publish(
+            Topic.FILE_CHANGED, FileChanged(path=file_path, change_type="created", project_name=project_name)
+        )
     logger.info("Published {} FileChanged events (full)", len(files))
     return len(files)
 
@@ -729,6 +863,8 @@ async def index_project(
     scope_paths: list[str] | None = None,
     full_reindex: bool = False,
     drain_timeout_s: float = 120.0,
+    project_name: str | None = None,
+    project_root: Path | None = None,
 ) -> IndexResult:
     """Run a full or delta index of the project through the event pipeline.
 
@@ -739,10 +875,14 @@ async def index_project(
     5. Publish FileChanged events to Valkey (all or delta-only)
     6. Run inline Tier 1 + Tier 2 consumers until the pipeline drains
     7. Update Project metadata (counts, git hash, delta stats)
+
+    In monorepo mode, *project_name* and *project_root* override the
+    settings-derived defaults so that each sub-project can be indexed
+    with its own root while sharing infra config from the monorepo settings.
     """
     start = time.monotonic()
-    project_name = settings.project_root.name
-    project_root = Path(settings.project_root).resolve()
+    project_name = project_name or settings.project_root.name
+    project_root = (project_root or Path(settings.project_root)).resolve()
 
     # 1. Scan files
     files = scan_files(project_root, settings, scope_paths=scope_paths)
@@ -776,12 +916,12 @@ async def index_project(
     logger.info("Created {} package node(s)", pkg_count)
 
     # 5. Publish FileChanged events
-    published = await _publish_events(bus, decision.mode, files, decision)
+    published = await _publish_events(bus, decision.mode, files, decision, project_name=project_name)
 
     # 6. Start inline consumers and wait for drain
     t2stats = None
     if published > 0:
-        tier2 = await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s)
+        tier2 = await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s, project_root=project_root)
         t2stats = tier2.stats
 
     # 7. Set dependency versions on ExternalPackage nodes
@@ -825,6 +965,171 @@ async def index_project(
         duration_s=duration,
         mode=decision.mode,
         delta_stats=delta_stats,
+    )
+
+
+async def index_monorepo(
+    settings: AtlasSettings,
+    graph: GraphClient,
+    bus: EventBus,
+    *,
+    scope_projects: list[str] | None = None,
+    full_reindex: bool = False,
+    drain_timeout_s: float = 120.0,
+) -> list[IndexResult]:
+    """Index a monorepo: detect sub-projects, index each, resolve cross-project imports.
+
+    Flow:
+    1. Detect sub-projects via markers and explicit config.
+    2. Filter by *scope_projects* if specified (supports exact match + glob).
+    3. Index each sub-project via ``index_project()`` with overridden root + name.
+    4. Index root project (files not inside any sub-project).
+    5. Resolve cross-project imports and create DEPENDS_ON edges.
+    """
+    project_root = Path(settings.project_root).resolve()
+    sub_projects = detect_sub_projects(project_root, settings.monorepo)
+
+    if not sub_projects:
+        logger.info("No sub-projects detected — falling back to single-project index")
+        result = await index_project(settings, graph, bus, full_reindex=full_reindex, drain_timeout_s=drain_timeout_s)
+        return [result]
+
+    logger.info("Detected {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
+
+    # Filter by scope_projects if specified
+    if scope_projects:
+        filtered: list[DetectedProject] = []
+        for sp in sub_projects:
+            for pattern in scope_projects:
+                if sp.name == pattern or fnmatch.fnmatch(sp.name, pattern):
+                    filtered.append(sp)
+                    break
+        sub_projects = filtered
+        logger.info("Scoped to {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
+
+    results: list[IndexResult] = []
+
+    # Index each sub-project
+    for sub in sub_projects:
+        logger.info("Indexing sub-project '{}' at {}", sub.name, sub.path)
+        result = await index_project(
+            settings,
+            graph,
+            bus,
+            project_name=sub.name,
+            project_root=sub.root,
+            full_reindex=full_reindex,
+            drain_timeout_s=drain_timeout_s,
+        )
+        results.append(result)
+
+    # Index root project (files not inside any sub-project)
+    root_name = project_root.name
+    sub_paths = [sp.path for sp in sub_projects]
+
+    # Scan root, then filter out files belonging to sub-projects
+    root_scope = FileScope(project_root, settings)
+    root_files = root_scope.scan()
+    root_only_files = [f for f in root_files if not any(f == sp or f.startswith(sp + "/") for sp in sub_paths)]
+
+    if root_only_files:
+        logger.info("Indexing root project '{}' ({} file(s) outside sub-projects)", root_name, len(root_only_files))
+        # For root files, we publish them under the root project name
+        # but index_project expects to scan files itself. We use scope_paths
+        # exclusion approach: index with the full root but exclude sub-project paths.
+        # Actually simpler: just call index_project with the root but scope to exclude sub-project dirs.
+        # But the cleanest approach is to scan ourselves and publish directly.
+        # Let's use index_project with scope_paths set to root-level dirs only.
+        # Actually, the simplest is to just call index_project for the root project,
+        # and it naturally indexes everything. Then we'd double-index sub-project files.
+        # Instead, let's manually handle it:
+        result = await _index_root_project(
+            settings,
+            graph,
+            bus,
+            root_name,
+            project_root,
+            root_only_files,
+            full_reindex=full_reindex,
+            drain_timeout_s=drain_timeout_s,
+        )
+        results.append(result)
+
+    # Cross-project import resolution
+    all_project_names = [sp.name for sp in sub_projects]
+    if root_only_files:
+        all_project_names.append(root_name)
+
+    if len(all_project_names) > 1:
+        rewired = await graph.resolve_cross_project_imports(all_project_names)
+        logger.info("Cross-project import resolution: {} imports rewired", rewired)
+        depends_count = await graph.create_depends_on_edges(all_project_names)
+        logger.info("Created {} DEPENDS_ON edge(s)", depends_count)
+
+    return results
+
+
+async def _index_root_project(
+    settings: AtlasSettings,
+    graph: GraphClient,
+    bus: EventBus,
+    project_name: str,
+    project_root: Path,
+    files: list[str],
+    *,
+    full_reindex: bool = False,
+    drain_timeout_s: float = 120.0,
+) -> IndexResult:
+    """Index root-level files (outside any sub-project) as the root project."""
+    start = time.monotonic()
+
+    if not files:
+        return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=time.monotonic() - start)
+
+    embed = EmbedClient(settings.embeddings)
+    cache: EmbedCache | None = None
+    if settings.embeddings.cache_ttl_days > 0:
+        cache = EmbedCache(settings.redis, settings.embeddings)
+
+    if full_reindex:
+        await graph.delete_project_data(project_name)
+
+    await _check_model_lock(graph, settings.embeddings.model, settings.embeddings.dimension, reindex=full_reindex)
+
+    # Always full mode for root project (simpler — root files are typically few)
+    decision = _DeltaDecision("full", set(), set(), set())
+
+    pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
+    logger.info("Root project: created {} package node(s)", pkg_count)
+
+    published = await _publish_events(bus, decision.mode, files, decision, project_name=project_name)
+
+    if published > 0:
+        await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s, project_root=project_root)
+
+    dep_versions = _parse_dependency_versions(project_root)
+    if dep_versions:
+        await graph.update_external_package_versions(project_name, dep_versions)
+
+    entity_count = await graph.count_entities(project_name)
+    git_hash = _get_git_hash(project_root)
+    metadata: dict[str, Any] = {
+        "last_indexed_at": time.time(),
+        "file_count": len(files),
+        "entity_count": entity_count,
+        "index_mode": decision.mode,
+    }
+    if git_hash:
+        metadata["git_hash"] = git_hash
+    await graph.update_project_metadata(project_name, **metadata)
+
+    duration = time.monotonic() - start
+    return IndexResult(
+        files_scanned=len(files),
+        files_published=published,
+        entities_total=entity_count,
+        duration_s=duration,
+        mode="full",
     )
 
 

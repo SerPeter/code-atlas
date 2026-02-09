@@ -73,19 +73,19 @@ class TestChangeTypeMapping:
         bus = RecordingBus()
         watcher = _make_watcher(tmp_path, bus)
         watcher._on_change({(Change.added, str(tmp_path / "new.py"))})
-        assert watcher._pending == {"new.py": "created"}
+        assert watcher._pending == {"new.py": ("created", "")}
 
     async def test_modified_maps_to_modified(self, tmp_path: Path) -> None:
         bus = RecordingBus()
         watcher = _make_watcher(tmp_path, bus)
         watcher._on_change({(Change.modified, str(tmp_path / "edit.py"))})
-        assert watcher._pending == {"edit.py": "modified"}
+        assert watcher._pending == {"edit.py": ("modified", "")}
 
     async def test_deleted_maps_to_deleted(self, tmp_path: Path) -> None:
         bus = RecordingBus()
         watcher = _make_watcher(tmp_path, bus)
         watcher._on_change({(Change.deleted, str(tmp_path / "gone.py"))})
-        assert watcher._pending == {"gone.py": "deleted"}
+        assert watcher._pending == {"gone.py": ("deleted", "")}
 
 
 class TestExclusionFiltering:
@@ -219,7 +219,7 @@ class TestGracefulShutdown:
         watcher = _make_watcher(tmp_path, bus, debounce_s=10.0, max_wait_s=30.0)
 
         # Manually add pending changes (simulating what _on_change does)
-        watcher._pending["drain_me.py"] = "modified"
+        watcher._pending["drain_me.py"] = ("modified", "")
 
         # Flush should publish the pending change
         await watcher._flush()

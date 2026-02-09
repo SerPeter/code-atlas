@@ -469,6 +469,164 @@ class GraphClient:
             {"items": params},
         )
 
+    # -- Cross-project import resolution helpers --------------------------------
+
+    async def resolve_cross_project_imports(self, project_names: list[str]) -> int:
+        """Rewire ExternalPackage/ExternalSymbol stubs that match real entities in sibling projects.
+
+        For each project, finds ExternalPackage stubs whose name matches a Package
+        in a sibling project, then rewires IMPORTS edges from ExternalSymbol stubs
+        to the real entity. Orphaned stubs (no remaining inbound edges) are deleted.
+
+        Returns the total number of imports rewired.
+        """
+        if len(project_names) < 2:
+            return 0
+
+        # 1. Build map: package_name → project_name for all projects
+        records = await self.execute(
+            f"MATCH (pkg:{NodeLabel.PACKAGE}) "
+            "WHERE pkg.project_name IN $projects "
+            "RETURN pkg.name AS name, pkg.project_name AS project, pkg.qualified_name AS qn",
+            {"projects": project_names},
+        )
+        # Map top-level package name → project_name
+        pkg_to_project: dict[str, str] = {}
+        for r in records:
+            top_name = r["qn"].split(".")[0] if r["qn"] else r["name"]
+            if top_name not in pkg_to_project:
+                pkg_to_project[top_name] = r["project"]
+
+        if not pkg_to_project:
+            return 0
+
+        rewired = 0
+
+        for proj_name in project_names:
+            # 2. Find ExternalPackage stubs in this project whose name matches a sibling package
+            ext_pkgs = await self.execute(
+                f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $proj}}) "
+                "RETURN ep.name AS name, ep.uid AS uid",
+                {"proj": proj_name},
+            )
+
+            for ep in ext_pkgs:
+                ext_pkg_name = ep["name"]
+                target_project = pkg_to_project.get(ext_pkg_name)
+                if target_project is None or target_project == proj_name:
+                    continue
+
+                # 3. Find ExternalSymbol stubs under this ExternalPackage
+                ext_syms = await self.execute(
+                    f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $proj, package: $pkg}}) "
+                    "RETURN es.name AS name, es.uid AS uid, es.qualified_name AS qn",
+                    {"proj": proj_name, "pkg": ext_pkg_name},
+                )
+
+                for es in ext_syms:
+                    sym_name = es["name"]
+                    # 4. Find the real entity in the target project
+                    real_entities = await self.execute(
+                        "MATCH (n {project_name: $target_proj, name: $name}) "
+                        f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
+                        f"AND NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
+                        "RETURN n.uid AS uid LIMIT 1",
+                        {"target_proj": target_project, "name": sym_name},
+                    )
+
+                    if not real_entities:
+                        continue
+
+                    real_uid = real_entities[0]["uid"]
+
+                    # 5. Rewire: move IMPORTS edges from ExternalSymbol → real entity
+                    await self.execute_write(
+                        f"MATCH (src)-[r:{RelType.IMPORTS}]->(es {{uid: $es_uid}}) "
+                        f"MATCH (real {{uid: $real_uid}}) "
+                        f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
+                        "DELETE r",
+                        {"es_uid": es["uid"], "real_uid": real_uid},
+                    )
+                    rewired += 1
+
+                # 6. Also rewire bare package imports (IMPORTS → ExternalPackage)
+                real_pkg = await self.execute(
+                    f"MATCH (pkg:{NodeLabel.PACKAGE} {{project_name: $target_proj, name: $name}}) "
+                    "RETURN pkg.uid AS uid LIMIT 1",
+                    {"target_proj": target_project, "name": ext_pkg_name},
+                )
+                if real_pkg:
+                    await self.execute_write(
+                        f"MATCH (src)-[r:{RelType.IMPORTS}]->(ep {{uid: $ep_uid}}) "
+                        f"MATCH (real {{uid: $real_uid}}) "
+                        f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
+                        "DELETE r",
+                        {"ep_uid": ep["uid"], "real_uid": real_pkg[0]["uid"]},
+                    )
+
+                # 7. Delete orphaned stubs (no remaining inbound edges)
+                await self.execute_write(
+                    f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $proj, package: $pkg}}) "
+                    f"WHERE NOT ()-[:{RelType.IMPORTS}]->(es) "
+                    "DETACH DELETE es",
+                    {"proj": proj_name, "pkg": ext_pkg_name},
+                )
+                await self.execute_write(
+                    f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $uid}}) "
+                    f"WHERE NOT ()-[:{RelType.IMPORTS}]->(ep) AND NOT (ep)-[:{RelType.CONTAINS}]->() "
+                    "DETACH DELETE ep",
+                    {"uid": ep["uid"]},
+                )
+
+        logger.debug(
+            "Cross-project import resolution: {} imports rewired across {} projects", rewired, len(project_names)
+        )
+        return rewired
+
+    async def create_depends_on_edges(self, project_names: list[str]) -> int:
+        """Create DEPENDS_ON edges between Project nodes based on cross-project IMPORTS.
+
+        Queries all IMPORTS edges where source and target have different project_names,
+        then creates DEPENDS_ON between the corresponding Project nodes.
+
+        Returns the count of DEPENDS_ON edges created.
+        """
+        if len(project_names) < 2:
+            return 0
+
+        # Delete existing DEPENDS_ON edges between these projects
+        await self.execute_write(
+            f"MATCH (a:{NodeLabel.PROJECT})-[r:{RelType.DEPENDS_ON}]->(b:{NodeLabel.PROJECT}) "
+            "WHERE a.name IN $projects AND b.name IN $projects "
+            "DELETE r",
+            {"projects": project_names},
+        )
+
+        # Find all cross-project import pairs
+        records = await self.execute(
+            f"MATCH (src)-[:{RelType.IMPORTS}]->(tgt) "
+            "WHERE src.project_name IN $projects AND tgt.project_name IN $projects "
+            "AND src.project_name <> tgt.project_name "
+            "RETURN DISTINCT src.project_name AS from_proj, tgt.project_name AS to_proj",
+            {"projects": project_names},
+        )
+
+        if not records:
+            return 0
+
+        # Create DEPENDS_ON edges
+        edges = [{"from_proj": r["from_proj"], "to_proj": r["to_proj"]} for r in records]
+        await self.execute_write(
+            f"UNWIND $edges AS e "
+            f"MATCH (a:{NodeLabel.PROJECT} {{name: e.from_proj}}), "
+            f"(b:{NodeLabel.PROJECT} {{name: e.to_proj}}) "
+            f"CREATE (a)-[:{RelType.DEPENDS_ON}]->(b)",
+            {"edges": edges},
+        )
+
+        logger.debug("Created {} DEPENDS_ON edge(s) between projects", len(edges))
+        return len(edges)
+
     # -- Detector enrichment helpers -------------------------------------------
 
     async def apply_property_enrichments(self, enrichments: list[PropertyEnrichment]) -> None:
@@ -567,16 +725,20 @@ class GraphClient:
         label: str = "",
         limit: int = 20,
         project: str = "",
+        projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """BM25 text search across text indices.
 
-        Queries one or all text indices, optionally post-filters by project,
+        Queries one or all text indices, optionally post-filters by project(s),
         and returns results sorted by score descending.
         """
+        # Backward compat: single project → projects list
+        filter_projects = projects if projects is not None else ([project] if project else None)
+
         indices = (
             [f"text_{label.lower()}"] if label else [f"text_{lbl.value.lower()}" for lbl in _TEXT_SEARCHABLE_LABELS]
         )
-        fetch_limit = limit * 3 if project else limit
+        fetch_limit = limit * 3 if filter_projects else limit
 
         all_results: list[dict[str, Any]] = []
         for index_name in indices:
@@ -593,8 +755,9 @@ class GraphClient:
                 logger.warning("Text search on {} failed: {}", index_name, exc)
 
         # Post-filter by project scope
-        if project:
-            all_results = [r for r in all_results if _node_project_name(r) == project]
+        if filter_projects:
+            project_set = set(filter_projects)
+            all_results = [r for r in all_results if _node_project_name(r) in project_set]
 
         # Sort by score descending and truncate
         all_results.sort(key=lambda rec: rec.get("score", 0), reverse=True)
@@ -607,9 +770,7 @@ class GraphClient:
         Returns a list of dicts with index_type, label, and name keys.
         """
         try:
-            rows = await self.execute(
-                "SHOW INDEX INFO"  # type: ignore[arg-type]
-            )
+            rows = await self.execute("SHOW INDEX INFO")
             return [
                 {
                     "index_type": r["index type"],
@@ -632,15 +793,18 @@ class GraphClient:
         limit: int = 20,
         project: str = "",
         threshold: float = 0.0,
+        projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Semantic similarity search using pre-computed vector.
 
-        Queries one or all vector indices, optionally post-filters by project
+        Queries one or all vector indices, optionally post-filters by project(s)
         and similarity threshold, and returns results sorted by similarity
         descending.  Returns ``[{"node": Node, "similarity": float}, ...]``.
         """
+        filter_projects = projects if projects is not None else ([project] if project else None)
+
         indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
-        filtering = bool(project) or threshold > 0.0
+        filtering = bool(filter_projects) or threshold > 0.0
         fetch_limit = limit * 3 if filtering else limit
 
         all_results: list[dict[str, Any]] = []
@@ -659,8 +823,9 @@ class GraphClient:
 
         if threshold > 0.0:
             all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
-        if project:
-            all_results = [r for r in all_results if _node_project_name(r) == project]
+        if filter_projects:
+            project_set = set(filter_projects)
+            all_results = [r for r in all_results if _node_project_name(r) in project_set]
 
         all_results.sort(key=lambda rec: rec.get("similarity", 0), reverse=True)
         return all_results[:limit]
@@ -673,6 +838,7 @@ class GraphClient:
         label: str = "",
         limit: int = 20,
         project: str = "",
+        projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Name-based graph search with scored matching.
 
@@ -684,9 +850,11 @@ class GraphClient:
         Deduplicates by uid, keeping highest score.
         Returns ``[{"node": Node, "score": float}, ...]``.
         """
+        filter_projects = projects if projects is not None else ([project] if project else None)
+
         label_filter = f":{label}" if label else ""
-        project_clause = " AND n.project_name = $project" if project else ""
-        params: dict[str, Any] = {"query": query, "project": project}
+        project_clause = " AND n.project_name IN $projects" if filter_projects else ""
+        params: dict[str, Any] = {"query": query, "projects": filter_projects or []}
         fetch_limit = limit * 3
 
         scored: dict[str, tuple[Any, float]] = {}

@@ -177,12 +177,18 @@ class Tier1GraphConsumer(TierConsumer):
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         paths = [e.path for e in events if isinstance(e, FileChanged)]
+        # Forward project_name from FileChanged events (monorepo support)
+        project_name = ""
+        for e in events:
+            if isinstance(e, FileChanged) and e.project_name:
+                project_name = e.project_name
+                break
         logger.info("Tier1 batch {}: {} file(s)", batch_id, len(paths))
 
         # TODO: Update Memgraph file nodes (timestamps, staleness flags)
 
         # Always publish downstream — Tier 2 decides significance
-        await self.bus.publish(Topic.AST_DIRTY, ASTDirty(paths=paths, batch_id=batch_id))
+        await self.bus.publish(Topic.AST_DIRTY, ASTDirty(paths=paths, project_name=project_name, batch_id=batch_id))
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +224,14 @@ class Tier2Stats:
 class Tier2ASTConsumer(TierConsumer):
     """Tier 2: Parse AST via tree-sitter, write entities to graph, publish EmbedDirty."""
 
-    def __init__(self, bus: EventBus, graph: GraphClient, settings: AtlasSettings) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        graph: GraphClient,
+        settings: AtlasSettings,
+        *,
+        project_root: Path | None = None,
+    ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.AST_DIRTY,
@@ -228,6 +241,7 @@ class Tier2ASTConsumer(TierConsumer):
         )
         self.graph = graph
         self.settings = settings
+        self._project_root = project_root or Path(settings.project_root)
         self.stats = Tier2Stats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
 
@@ -241,7 +255,7 @@ class Tier2ASTConsumer(TierConsumer):
 
         Appends IMPORTS rels to *import_rels* for post-batch resolution.
         """
-        full_path = Path(self.settings.project_root) / file_path
+        full_path = self._project_root / file_path
         if not full_path.is_file():
             logger.debug("Tier2: file deleted, removing entities for {}", file_path)
             deleted = await self.graph.delete_file_entities(project_name, file_path)
@@ -307,14 +321,18 @@ class Tier2ASTConsumer(TierConsumer):
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         all_paths: list[str] = []
+        # Collect project_name from ASTDirty events (forwarded from FileChanged)
+        event_project_name = ""
         for e in events:
             if isinstance(e, ASTDirty):
                 all_paths.extend(e.paths)
+                if e.project_name:
+                    event_project_name = e.project_name
         unique_paths = list(dict.fromkeys(all_paths))
 
         logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
-        project_name = self.settings.project_root.name
+        project_name = event_project_name or self.settings.project_root.name
         changed_entity_refs: list[EntityRef] = []
         all_import_rels: list[ParsedRelationship] = []
         skipped_before = self.stats.files_skipped
