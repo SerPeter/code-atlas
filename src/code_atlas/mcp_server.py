@@ -35,6 +35,14 @@ from code_atlas.schema import (
 )
 from code_atlas.search import CompactNode, SearchType, expand_context, expand_scope
 from code_atlas.search import hybrid_search as _hybrid_search
+from code_atlas.subagent import (
+    _RELATIONSHIP_SUMMARY,
+    CYPHER_EXAMPLES,
+    get_guide,
+    plan_strategy,
+    validate_cypher_explain,
+    validate_cypher_static,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -260,11 +268,10 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
         name="code-atlas",
         instructions=(
             "Code Atlas — graph-powered code intelligence. "
-            "Start with schema_info and index_status. "
-            "Use hybrid_search as the primary search tool — it fuses graph, vector, and BM25 results via RRF. "
+            "Start with get_usage_guide for workflow guidance. "
+            "Use hybrid_search as the primary search tool. "
             "Use get_node to find entities by name, get_context to expand neighborhoods. "
-            "Use cypher_query for custom traversals. "
-            "Individual text_search / vector_search tools are available for targeted queries."
+            "Use schema_info for Cypher examples, validate_cypher to check queries before running them."
         ),
         lifespan=app_lifespan,
     )
@@ -273,6 +280,7 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
     _register_search_tools(mcp)
     _register_hybrid_tool(mcp)
     _register_info_tools(mcp)
+    _register_subagent_tools(mcp)
     return mcp
 
 
@@ -704,8 +712,8 @@ def _register_info_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "Graph schema reference: node labels, relationship types, kind discriminators, properties. "
-            "Call this first to understand what you can query. No database call needed."
+            "Graph schema reference: node labels, relationship types, kind discriminators, "
+            "properties, Cypher examples. Call this first to understand what you can query."
         ),
     )
     async def schema_info() -> dict[str, Any]:
@@ -717,6 +725,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
                 "meta": [NodeLabel.SCHEMA_VERSION.value],
             },
             "relationship_types": sorted(r.value for r in RelType),
+            "relationship_summary": dict(_RELATIONSHIP_SUMMARY),
             "kind_discriminators": {
                 "TypeDefKind": sorted(k.value for k in TypeDefKind),
                 "CallableKind": sorted(k.value for k in CallableKind),
@@ -739,6 +748,52 @@ def _register_info_tools(mcp: FastMCP) -> None:
             ],
             "text_searchable_labels": sorted(lbl.value for lbl in _TEXT_SEARCHABLE_LABELS),
             "vector_searchable_labels": sorted(lbl.value for lbl in _EMBEDDABLE_LABELS),
+            "cypher_examples": list(CYPHER_EXAMPLES),
             "uid_format": "{project_name}:{qualified_name}",
             "schema_version": SCHEMA_VERSION,
         }
+
+
+def _register_subagent_tools(mcp: FastMCP) -> None:
+    """Register subagent guidance tools: validate_cypher, get_usage_guide, plan_search_strategy."""
+
+    @mcp.tool(
+        description=(
+            "Check Cypher for errors before running it. "
+            "Catches write ops, invalid labels/relationships, missing RETURN/LIMIT, unbalanced syntax. "
+            "Returns issues list (empty = valid)."
+        ),
+    )
+    async def validate_cypher(query: str, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        issues = validate_cypher_static(query)
+
+        # Try EXPLAIN against live DB if available
+        try:
+            app = _get_app_ctx(ctx)
+            explain_issue = await validate_cypher_explain(app.graph, query)
+            if explain_issue is not None:
+                issues.append(explain_issue)
+        except Exception:
+            pass  # No DB context — static checks only
+
+        has_errors = any(i.level == "error" for i in issues)
+        return {
+            "valid": not has_errors,
+            "issues": [{"level": i.level, "message": i.message} for i in issues],
+        }
+
+    @mcp.tool(
+        description=(
+            "How to use Code Atlas tools. "
+            "Call with no args for a quick-start guide, or pass a topic: "
+            "'searching', 'cypher', 'navigation', 'patterns'."
+        ),
+    )
+    async def get_usage_guide(topic: str = "") -> dict[str, Any]:
+        return get_guide(topic)
+
+    @mcp.tool(
+        description="Analyze a question and recommend which search tool to use with suggested parameters.",
+    )
+    async def plan_search_strategy(question: str) -> dict[str, Any]:
+        return plan_strategy(question)

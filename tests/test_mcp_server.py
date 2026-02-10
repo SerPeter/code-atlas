@@ -19,6 +19,7 @@ from code_atlas.mcp_server import (
     _register_node_tools,
     _register_query_tools,
     _register_search_tools,
+    _register_subagent_tools,
     _result,
 )
 from code_atlas.schema import (
@@ -53,6 +54,9 @@ class _FakeCtx:
         self.request_context = _FakeRequestContext(app_ctx)
 
 
+_NO_CTX_TOOLS = frozenset({"schema_info", "get_usage_guide", "plan_search_strategy"})
+
+
 async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> dict[str, Any]:
     """Invoke an MCP tool function directly, bypassing the MCP transport layer."""
     server = FastMCP(name="test")
@@ -60,6 +64,7 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
     _register_query_tools(server)
     _register_search_tools(server)
     _register_info_tools(server)
+    _register_subagent_tools(server)
 
     tool_map = {tool.name: tool for tool in server._tool_manager._tools.values()}
     if tool_name not in tool_map:
@@ -67,7 +72,7 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
         raise ValueError(msg)
 
     tool = tool_map[tool_name]
-    if tool_name != "schema_info":
+    if tool_name not in _NO_CTX_TOOLS:
         kwargs["ctx"] = _FakeCtx(app_ctx)
 
     return await tool.fn(**kwargs)
@@ -509,3 +514,110 @@ class TestVectorSearchMock:
             mock_embed.assert_called_once_with("test query")
 
         await graph.close()
+
+
+# ---------------------------------------------------------------------------
+# Enhanced schema_info (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaInfoEnhanced:
+    async def test_schema_info_has_cypher_examples(self, settings):
+        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+        assert "cypher_examples" in result
+        assert isinstance(result["cypher_examples"], list)
+        assert len(result["cypher_examples"]) >= 5
+        for ex in result["cypher_examples"]:
+            assert "description" in ex
+            assert "query" in ex
+
+    async def test_schema_info_has_relationship_summary(self, settings):
+        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+        assert "relationship_summary" in result
+        summary = result["relationship_summary"]
+        assert isinstance(summary, dict)
+        # Every RelType should be described
+        for r in RelType:
+            assert r.value in summary, f"Missing relationship summary for {r.value}"
+
+
+# ---------------------------------------------------------------------------
+# Subagent tools (no DB needed for most)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateCypher:
+    async def test_valid_query(self, settings):
+        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")  # type: ignore[arg-type]
+        assert result["valid"] is True
+        errors = [i for i in result["issues"] if i["level"] == "error"]
+        assert errors == []
+
+    async def test_invalid_write_query(self, settings):
+        result = await _invoke_tool(None, "validate_cypher", query="CREATE (n:Foo {name: 'bar'})")  # type: ignore[arg-type]
+        assert result["valid"] is False
+        assert any("write" in i["message"].lower() for i in result["issues"])
+
+    async def test_invalid_label(self, settings):
+        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Function) RETURN n LIMIT 10")  # type: ignore[arg-type]
+        assert result["valid"] is False
+        assert any("unknown label" in i["message"].lower() for i in result["issues"])
+
+    async def test_missing_return(self, settings):
+        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Callable)")  # type: ignore[arg-type]
+        warnings = [i for i in result["issues"] if i["level"] == "warning"]
+        assert any("return" in i["message"].lower() for i in warnings)
+
+
+class TestGetUsageGuide:
+    async def test_default_guide(self, settings):
+        result = await _invoke_tool(None, "get_usage_guide")  # type: ignore[arg-type]
+        assert result["topic"] == "quickstart"
+        assert len(result["guide"]) > 50
+
+    async def test_specific_topic(self, settings):
+        result = await _invoke_tool(None, "get_usage_guide", topic="cypher")  # type: ignore[arg-type]
+        assert result["topic"] == "cypher"
+        assert "cypher" in result["guide"].lower()
+
+    async def test_unknown_topic(self, settings):
+        result = await _invoke_tool(None, "get_usage_guide", topic="nonexistent")  # type: ignore[arg-type]
+        assert "unknown topic" in result["guide"].lower()
+
+    async def test_available_topics(self, settings):
+        result = await _invoke_tool(None, "get_usage_guide")  # type: ignore[arg-type]
+        assert "available_topics" in result
+        assert "searching" in result["available_topics"]
+
+
+class TestPlanSearchStrategy:
+    async def test_identifier_query(self, settings):
+        result = await _invoke_tool(None, "plan_search_strategy", question="MyClass")  # type: ignore[arg-type]
+        assert result["recommended_tool"] == "get_node"
+        assert "alternatives" in result
+
+    async def test_natural_language_query(self, settings):
+        result = await _invoke_tool(None, "plan_search_strategy", question="how does authentication handle tokens")  # type: ignore[arg-type]
+        assert result["recommended_tool"] in ("hybrid_search", "cypher_query")
+        assert "explanation" in result
+
+    async def test_structural_query(self, settings):
+        result = await _invoke_tool(None, "plan_search_strategy", question="what calls the process function")  # type: ignore[arg-type]
+        assert result["recommended_tool"] == "cypher_query"
+
+
+# ---------------------------------------------------------------------------
+# Integration: validate_cypher with EXPLAIN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestValidateCypherExplain:
+    async def test_valid_query_with_explain(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")
+        assert result["valid"] is True
+
+    async def test_invalid_syntax_with_explain(self, app_ctx, seeded_graph):
+        result = await _invoke_tool(app_ctx, "validate_cypher", query="MATCHX (n) RETURN n LIMIT 10")
+        assert result["valid"] is False
+        assert any("explain" in i["message"].lower() for i in result["issues"] if i["level"] == "error")
