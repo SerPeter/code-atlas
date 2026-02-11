@@ -159,10 +159,16 @@ class TestEmbedClient:
         client = EmbedClient(_make_settings(model="openai/my-model"))
         assert client._model == "openai/my-model"
 
-    def test_model_string_no_base_url(self):
-        client = EmbedClient(_make_settings(base_url=""))
+    def test_model_string_cloud_provider(self):
+        client = EmbedClient(_make_settings(provider="litellm", base_url=""))
         assert client._model == "nomic-ai/nomic-embed-code"
         assert client._api_base is None
+        assert client._api_key is None
+
+    def test_model_string_ollama_provider(self):
+        client = EmbedClient(_make_settings(provider="ollama", base_url="http://localhost:11434"))
+        assert client._model == "nomic-ai/nomic-embed-code"
+        assert client._api_base == "http://localhost:11434"
         assert client._api_key is None
 
     async def test_embed_one(self):

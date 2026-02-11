@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from code_atlas.graph import GraphClient
+from code_atlas.schema import generate_drop_text_index_ddl, generate_drop_vector_index_ddl
 from code_atlas.settings import AtlasSettings
 
 
@@ -18,7 +21,9 @@ def settings(tmp_path):
 async def graph_client(settings):
     """Async GraphClient fixture — skips if Memgraph is unreachable.
 
-    Wipes all data after each test for isolation.
+    Wipes all data and search indices before each test for isolation.
+    Vector/text indices are dropped so ensure_schema can recreate them
+    at the dimension specified by the test settings.
     """
     client = GraphClient(settings)
     try:
@@ -26,8 +31,14 @@ async def graph_client(settings):
     except Exception:
         pytest.skip("Memgraph not available")
 
-    # Clean slate before test
+    # Clean slate: wipe nodes and drop search indices (dimension may differ)
     await client.execute_write("MATCH (n) DETACH DELETE n")
+    for stmt in generate_drop_vector_index_ddl():
+        with contextlib.suppress(Exception):
+            await client.execute_write(stmt)
+    for stmt in generate_drop_text_index_ddl():
+        with contextlib.suppress(Exception):
+            await client.execute_write(stmt)
 
     yield client
 

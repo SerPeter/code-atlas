@@ -489,11 +489,17 @@ class TestDeltaThreshold:
 class TestDeltaIndexIntegration:
     @pytest.fixture
     def git_project(self, tmp_path):
-        """Create a git-tracked Python project with initial commit."""
+        """Create a git-tracked Python project with initial commit.
+
+        Uses 5 files so that modifying 1 file stays under the 30% delta
+        threshold (1/5 = 20%).
+        """
         _init_git_repo(tmp_path)
         _write(tmp_path, "src/__init__.py", "")
         _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
         _write(tmp_path, "src/utils.py", "MAGIC = 42\n\ndef add(a, b):\n    return a + b\n")
+        _write(tmp_path, "src/config.py", "DEBUG = False\n\ndef get_config():\n    return {}\n")
+        _write(tmp_path, "src/models.py", "class User:\n    name: str\n    email: str\n")
         _git(tmp_path, "add", ".")
         _git(tmp_path, "commit", "-m", "initial")
         return tmp_path

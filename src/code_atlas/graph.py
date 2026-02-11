@@ -314,11 +314,14 @@ class GraphClient:
         return records[0]["git_hash"]
 
     async def get_project_file_paths(self, project_name: str) -> set[str]:
-        """Return all distinct file_paths indexed for a project (non-structural nodes)."""
+        """Return all distinct file_paths indexed for a project.
+
+        Includes Package nodes (from ``__init__.py``) so delta detection
+        doesn't treat them as newly added on every re-index.
+        """
         records = await self.execute(
             f"MATCH (n {{project_name: $p}}) "
-            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            f"AND NOT n:{NodeLabel.SCHEMA_VERSION} "
+            f"WHERE NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
             "RETURN DISTINCT n.file_path AS fp",
             {"p": project_name},
         )
@@ -667,13 +670,17 @@ class GraphClient:
     async def read_entity_texts(self, qualified_names: list[str]) -> list[dict[str, Any]]:
         """Batch-read entity properties needed for embedding.
 
+        ``qualified_names`` may be either bare qualified names or full uids
+        (``project:qualified_name``).  The query matches on ``uid`` first,
+        falling back to ``qualified_name`` for backwards compatibility.
+
         Returns list of dicts with keys: ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``kind``, ``_label``,
         ``embed_hash``, ``embedding``.
         """
         return await self.execute(
             "UNWIND $qns AS qn "
-            "MATCH (n {qualified_name: qn}) "
+            "MATCH (n) WHERE n.uid = qn OR n.qualified_name = qn "
             "RETURN n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
             "n.kind AS kind, labels(n)[0] AS _label, "
@@ -681,23 +688,27 @@ class GraphClient:
             {"qns": qualified_names},
         )
 
-    async def write_embeddings(self, items: list[tuple[str, list[float]]]) -> None:
-        """Batch-write embedding vectors to nodes by qualified_name."""
+    async def write_embeddings(self, items: list[tuple[str, list[float]]], chunk_size: int = 50) -> None:
+        """Batch-write embedding vectors to nodes by uid or qualified_name."""
         if not items:
             return
-        params = [{"qn": qn, "vector": vec} for qn, vec in items]
-        await self.execute_write(
-            "UNWIND $items AS item MATCH (n {qualified_name: item.qn}) SET n.embedding = item.vector",
-            {"items": params},
-        )
+        for i in range(0, len(items), chunk_size):
+            chunk = items[i : i + chunk_size]
+            params = [{"qn": qn, "vector": vec} for qn, vec in chunk]
+            await self.execute_write(
+                "UNWIND $items AS item MATCH (n) WHERE n.uid = item.qn OR n.qualified_name = item.qn "
+                "SET n.embedding = item.vector",
+                {"items": params},
+            )
 
     async def write_embed_hashes(self, items: list[tuple[str, str]]) -> None:
-        """Batch-write embed_hash values to nodes by qualified_name."""
+        """Batch-write embed_hash values to nodes by uid or qualified_name."""
         if not items:
             return
         params = [{"qn": qn, "hash": h} for qn, h in items]
         await self.execute_write(
-            "UNWIND $items AS item MATCH (n {qualified_name: item.qn}) SET n.embed_hash = item.hash",
+            "UNWIND $items AS item MATCH (n) WHERE n.uid = item.qn OR n.qualified_name = item.qn "
+            "SET n.embed_hash = item.hash",
             {"items": params},
         )
 
@@ -935,15 +946,23 @@ class GraphClient:
             ]
             query = (
                 f"UNWIND $entities AS e "
-                f"CREATE (n:{label.value} {{"
-                f"uid: e.uid, project_name: e.project_name, name: e.name, "
-                f"qualified_name: e.qualified_name, file_path: e.file_path, "
-                f"kind: e.kind, line_start: e.line_start, line_end: e.line_end, "
-                f"visibility: e.visibility, docstring: e.docstring, "
-                f"signature: e.signature, tags: e.tags, "
-                f"header_path: e.header_path, header_level: e.header_level, "
-                f"content_hash: e.content_hash"
-                f"}})"
+                f"MERGE (n:{label.value} {{uid: e.uid}}) "
+                f"ON CREATE SET "
+                f"n.project_name = e.project_name, n.name = e.name, "
+                f"n.qualified_name = e.qualified_name, n.file_path = e.file_path, "
+                f"n.kind = e.kind, n.line_start = e.line_start, n.line_end = e.line_end, "
+                f"n.visibility = e.visibility, n.docstring = e.docstring, "
+                f"n.signature = e.signature, n.tags = e.tags, "
+                f"n.header_path = e.header_path, n.header_level = e.header_level, "
+                f"n.content_hash = e.content_hash "
+                f"ON MATCH SET "
+                f"n.project_name = e.project_name, n.name = e.name, "
+                f"n.qualified_name = e.qualified_name, n.file_path = e.file_path, "
+                f"n.kind = e.kind, n.line_start = e.line_start, n.line_end = e.line_end, "
+                f"n.visibility = e.visibility, n.docstring = e.docstring, "
+                f"n.signature = e.signature, n.tags = e.tags, "
+                f"n.header_path = e.header_path, n.header_level = e.header_level, "
+                f"n.content_hash = e.content_hash"
             )
             await self.execute_write(query, {"entities": params})
 

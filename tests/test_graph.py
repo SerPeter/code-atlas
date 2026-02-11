@@ -326,8 +326,8 @@ async def test_write_and_search_embeddings(graph_client: GraphClient):
         "})"
     )
 
-    # Write a 768-dim embedding (simple pattern: 1.0 at index 0, rest 0)
-    dim = 768
+    # Write embedding (dimension must match vector index)
+    dim = graph_client._dimension
     vector = [1.0] + [0.0] * (dim - 1)
     await graph_client.write_embeddings([("proj.my_func", vector)])
 
@@ -347,7 +347,7 @@ async def test_vector_search_scope_filter(graph_client: GraphClient):
     """Two projects with embeddings — verify scope isolation via post-filter."""
     await graph_client.ensure_schema()
 
-    dim = 768
+    dim = graph_client._dimension
     vector_a = [1.0] + [0.0] * (dim - 1)
     vector_b = [0.0, 1.0] + [0.0] * (dim - 2)
 
@@ -387,7 +387,7 @@ async def test_vector_search_threshold(graph_client: GraphClient):
     """Threshold filter discards low-similarity results."""
     await graph_client.ensure_schema()
 
-    dim = 768
+    dim = graph_client._dimension
     vector_a = [1.0] + [0.0] * (dim - 1)
     vector_b = [0.0, 1.0] + [0.0] * (dim - 2)
 

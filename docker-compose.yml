@@ -12,7 +12,7 @@ services:
     environment:
       MEMGRAPH_ENTERPRISE_LICENSE: "" # Community edition
     command: >
-      --log-level=WARNING --memory-limit=1024 --storage-wal-enabled=true --storage-snapshot-interval-sec=300
+      --log-level=WARNING --memory-limit=4096 --storage-wal-enabled=true --storage-snapshot-interval-sec=300
     healthcheck:
       test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
       interval: 10s

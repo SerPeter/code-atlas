@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 
 import typer
+from dotenv import load_dotenv
 from loguru import logger
+
+load_dotenv()  # Load .env into os.environ (ATLAS_* + provider API keys)
 
 app = typer.Typer(
     name="atlas",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict, TomlConfigSettingsSource
 
 
 class ScopeSettings(BaseSettings):
@@ -52,6 +52,7 @@ class MonorepoSettings(BaseSettings):
 class EmbeddingSettings(BaseSettings):
     """Embedding settings — routes through litellm for any provider."""
 
+    provider: str = Field(default="tei", description="Embedding provider: 'tei', 'litellm', or 'ollama'.")
     model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")
     base_url: str = Field(default="http://localhost:8080", description="OpenAI-compatible embedding endpoint URL.")
     dimension: int = Field(default=768, description="Embedding vector dimension.")
@@ -150,6 +151,22 @@ class AtlasSettings(BaseSettings):
         env_prefix="ATLAS_",
         env_nested_delimiter="__",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            env_settings,
+            TomlConfigSettingsSource(settings_cls),
+            file_secret_settings,
+        )
 
     project_root: Path = Field(default_factory=Path.cwd, description="Project root path.")
     scope: ScopeSettings = Field(default_factory=ScopeSettings)

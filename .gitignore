@@ -65,3 +65,8 @@ data/tei/
 
 # Local config overrides
 atlas.local.toml
+
+# Environment files (secrets) — .env.dist is tracked
+.env
+.env.*
+!.env.dist

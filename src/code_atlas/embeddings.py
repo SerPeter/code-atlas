@@ -38,17 +38,22 @@ class EmbedClient:
         self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._query_cache_size = settings.query_cache_size
 
-        # Compute the litellm model string
-        if settings.base_url:
-            # Self-hosted endpoint — prefix with openai/ unless already prefixed
+        # Compute the litellm model string based on provider
+        if settings.provider == "tei":
+            # Self-hosted TEI endpoint — prefix with openai/ for litellm compat
             model = settings.model
             if not model.startswith("openai/"):
                 model = f"openai/{model}"
             self._model = model
             self._api_base = settings.base_url
             self._api_key = "unused"  # TEI ignores key, but OpenAI SDK requires one
+        elif settings.provider == "ollama":
+            # Local Ollama — use base_url but let litellm handle routing
+            self._model = settings.model
+            self._api_base = settings.base_url
+            self._api_key = None
         else:
-            # Cloud provider — litellm routes by prefix (e.g. "text-embedding-3-small")
+            # Cloud provider via litellm (openai/, gemini/, voyage/, cohere/, etc.)
             self._model = settings.model
             self._api_base = None
             self._api_key = None
@@ -77,7 +82,7 @@ class EmbedClient:
                     kwargs["api_key"] = self._api_key
 
                 response = await litellm.aembedding(**kwargs)
-                vectors = [item.embedding for item in response.data]
+                vectors = [item["embedding"] if isinstance(item, dict) else item.embedding for item in response.data]
                 all_vectors.extend(vectors)
             except Exception as exc:
                 msg = f"Embedding failed for batch [{i}:{i + len(chunk)}]: {exc}"
