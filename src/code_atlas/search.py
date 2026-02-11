@@ -394,7 +394,13 @@ def analyze_query(query: str) -> dict[str, float]:
     words = stripped.split()
 
     # Identifier-like patterns
-    if _IDENTIFIER_RE.match(stripped) or _SNAKE_RE.match(stripped) or _DOTTED_RE.search(stripped) or len(words) <= 2:
+    is_identifier = (
+        _IDENTIFIER_RE.match(stripped)
+        or _SNAKE_RE.match(stripped)
+        or _DOTTED_RE.search(stripped)
+        or (len(words) <= 2 and any(_IDENTIFIER_RE.match(w) or ("_" in w and _SNAKE_RE.match(w)) for w in words))
+    )
+    if is_identifier:
         return {"graph": 2.0, "vector": 0.5, "bm25": 1.5}
 
     # Natural language (3+ words, no structural indicators)

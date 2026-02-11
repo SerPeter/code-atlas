@@ -754,7 +754,7 @@ class GraphClient:
         all_results: list[dict[str, Any]] = []
         for index_name in indices:
             cypher = (
-                f"CALL text_search.search('{index_name}', $query, {fetch_limit}) "
+                f"CALL text_search.search_all('{index_name}', $query, {fetch_limit}) "
                 "YIELD node, score "
                 "RETURN node, score "
                 f"ORDER BY score DESC LIMIT {fetch_limit}"
@@ -1139,7 +1139,18 @@ class GraphClient:
             )
 
     async def _apply_full_schema(self) -> None:
-        """Apply all constraints, indices, vector indices, and text indices."""
+        """Apply all constraints, indices, vector indices, and text indices.
+
+        On a fresh database (no SchemaVersion node), vector/text indices from
+        a previous session may still exist with stale internal state.  Drop
+        them first so they are cleanly recreated at the current dimension.
+        """
+        # Drop stale search indices left over from a wiped database
+        for stmt in generate_drop_vector_index_ddl():
+            await self._exec_ddl(stmt)
+        for stmt in generate_drop_text_index_ddl():
+            await self._exec_ddl(stmt)
+
         stmts: list[str] = []
         stmts.extend(generate_unique_constraint_ddl())
         stmts.extend(generate_existence_constraint_ddl())

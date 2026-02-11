@@ -397,12 +397,13 @@ def _detect_packages(project_root: Path) -> list[tuple[str, str]]:
     """Find Python packages (dirs with __init__.py).
 
     Returns list of ``(qualified_name, relative_posix_path)`` sorted by depth.
+    Prunes directories in ``_DETECT_PRUNE_DIRS`` (e.g. .venv, node_modules).
     """
     root = project_root.resolve()
     packages: list[tuple[str, str]] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune symlinked directories
-        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink()]
+        # Prune symlinked and excluded directories
+        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink() and d not in _DETECT_PRUNE_DIRS]
         if "__init__.py" in filenames:
             rel = Path(dirpath).relative_to(root).as_posix()
             if rel == ".":
@@ -862,7 +863,7 @@ async def index_project(
     *,
     scope_paths: list[str] | None = None,
     full_reindex: bool = False,
-    drain_timeout_s: float = 120.0,
+    drain_timeout_s: float = 600.0,
     project_name: str | None = None,
     project_root: Path | None = None,
 ) -> IndexResult:
@@ -975,7 +976,7 @@ async def index_monorepo(
     *,
     scope_projects: list[str] | None = None,
     full_reindex: bool = False,
-    drain_timeout_s: float = 120.0,
+    drain_timeout_s: float = 600.0,
 ) -> list[IndexResult]:
     """Index a monorepo: detect sub-projects, index each, resolve cross-project imports.
 
@@ -1078,7 +1079,7 @@ async def _index_root_project(
     files: list[str],
     *,
     full_reindex: bool = False,
-    drain_timeout_s: float = 120.0,
+    drain_timeout_s: float = 600.0,
 ) -> IndexResult:
     """Index root-level files (outside any sub-project) as the root project."""
     start = time.monotonic()

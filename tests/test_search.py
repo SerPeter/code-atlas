@@ -109,13 +109,19 @@ class TestAnalyzeQuery:
         assert weights["vector"] > weights["graph"]
 
     def test_short_generic(self):
-        # Short queries (≤2 words) bias toward identifier matching
+        # Single lowercase word matches snake_case pattern → identifier-like
         weights = analyze_query("search")
         assert weights["graph"] >= weights["vector"]
 
-    def test_two_words(self):
-        weights = analyze_query("user login")
+    def test_two_words_identifier(self):
+        # Two words with PascalCase or snake_case → identifier-like
+        weights = analyze_query("UserService login")
         assert weights["graph"] > weights["vector"]
+
+    def test_two_words_generic(self):
+        # Two generic lowercase words → balanced (not identifier-like)
+        weights = analyze_query("user login")
+        assert weights["graph"] == weights["vector"]
 
 
 # ---------------------------------------------------------------------------
