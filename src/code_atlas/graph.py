@@ -105,11 +105,12 @@ def _resolve_one_call(project_name: str, rel: ParsedRelationship, lk: _CallLooku
             if fp == caller_fp and uid != caller_uid:
                 return uid
 
-    # Strategy 4: Project-wide match (prefer public via sort key)
+    # Strategy 4: Project-wide unique match — only when exactly 1 candidate exists.
+    # Ambiguous names (run, close, get) are left unresolved to avoid false positives
+    # from external attribute calls like asyncio.run(), session.run(), etc.
     candidates = lk.name_to_callables.get(bare_name, [])
-    non_self = [(uid, vis) for uid, _fp, vis in candidates if uid != caller_uid]
-    non_self.sort(key=lambda uv: 0 if uv[1] == "public" else 1)
-    return non_self[0][0] if non_self else None
+    non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
+    return non_self[0] if len(non_self) == 1 else None
 
 
 class GraphClient:
