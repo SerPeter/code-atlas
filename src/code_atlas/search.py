@@ -50,6 +50,7 @@ class SearchResult:
     labels: list[str]
     rrf_score: float
     sources: dict[str, int] = field(default_factory=dict)  # channel → rank
+    visibility: str = "public"
 
 
 @dataclass(frozen=True)
@@ -578,6 +579,18 @@ def _apply_filters(
     return filtered
 
 
+_VIS_BOOST: dict[str, float] = {"public": 1.0, "protected": 0.97, "internal": 0.94, "private": 0.88}
+
+
+def _boost_results(results: list[SearchResult]) -> list[SearchResult]:
+    """Re-rank by RRF score * visibility boost. Preserves relative order for equal boosts."""
+    return sorted(
+        results,
+        key=lambda r: r.rrf_score * _VIS_BOOST.get(r.visibility, 1.0),
+        reverse=True,
+    )
+
+
 async def hybrid_search(
     graph: GraphClient,
     embed: EmbedClient | None,
@@ -686,6 +699,7 @@ async def hybrid_search(
             labels=props_by_uid.get(uid, {}).get("_labels", []),
             rrf_score=rrf_score,
             sources=uid_ranks.get(uid, {}),
+            visibility=props_by_uid.get(uid, {}).get("visibility", "public"),
         )
         for uid, rrf_score in fused_scores.items()
     ]
@@ -699,7 +713,7 @@ async def hybrid_search(
         include_patterns=include_patterns,
         exclude_patterns=exclude_patterns,
     )
-    return filtered[:limit]
+    return _boost_results(filtered)[:limit]
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ from code_atlas.mcp_server import (
     _register_search_tools,
     _register_subagent_tools,
     _result,
+    _with_staleness,
 )
 from code_atlas.schema import (
     _CODE_LABELS,
@@ -170,6 +171,48 @@ class TestRankResults:
         ranked = _rank_results(results)
         assert ranked[0]["qualified_name"] == "B"
         assert ranked[1]["qualified_name"] == "long.path.A"
+
+    def test_internal_before_external(self):
+        """Internal entities rank above ExternalSymbol stubs."""
+        results = [
+            {
+                "name": "Logger",
+                "qualified_name": "ext/logging.Logger",
+                "_labels": ["ExternalSymbol"],
+                "file_path": "",
+            },
+            {
+                "name": "Logger",
+                "qualified_name": "mypackage.logging.Logger",
+                "_labels": ["TypeDef"],
+                "file_path": "mypackage/logging.py",
+                "visibility": "public",
+            },
+        ]
+        ranked = _rank_results(results)
+        assert ranked[0]["qualified_name"] == "mypackage.logging.Logger"
+        assert ranked[1]["qualified_name"] == "ext/logging.Logger"
+
+    def test_external_package_ranked_last(self):
+        """ExternalPackage stubs rank below internal entities."""
+        results = [
+            {
+                "name": "os",
+                "qualified_name": "ext/os",
+                "_labels": ["ExternalPackage"],
+                "file_path": "",
+            },
+            {
+                "name": "os",
+                "qualified_name": "mypackage.os",
+                "_labels": ["Module"],
+                "file_path": "mypackage/os.py",
+                "visibility": "public",
+            },
+        ]
+        ranked = _rank_results(results)
+        assert ranked[0]["qualified_name"] == "mypackage.os"
+        assert ranked[1]["qualified_name"] == "ext/os"
 
 
 # ---------------------------------------------------------------------------
@@ -621,3 +664,64 @@ class TestValidateCypherExplain:
         result = await _invoke_tool(app_ctx, "validate_cypher", query="MATCHX (n) RETURN n LIMIT 10")
         assert result["valid"] is False
         assert any("explain" in i["message"].lower() for i in result["issues"] if i["level"] == "error")
+
+
+# ---------------------------------------------------------------------------
+# Staleness flag tests (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestWithStaleness:
+    async def test_scope_matching_comma_separated(self, settings):
+        """Comma-separated scope with matching project triggers staleness check."""
+        from code_atlas.indexer import StalenessChecker, StalenessInfo
+
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        # Mock the check method to return not stale
+        mock_graph = AsyncMock()
+        mock_graph.get_project_git_hash = AsyncMock(return_value="abc123")
+
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+
+        # Patch checker.check to return a known StalenessInfo
+        with patch.object(
+            checker, "check", new_callable=AsyncMock, return_value=StalenessInfo(stale=False, current_commit="abc123")
+        ):
+            result = {"results": []}
+            annotated = await _with_staleness(app, result, scope="myproject,other")
+            assert annotated["stale"] is False
+
+    async def test_scope_mismatch_skips_check(self, settings):
+        """Scope that doesn't include checker's project returns result unchanged."""
+        from code_atlas.indexer import StalenessChecker
+
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+
+        result = {"results": []}
+        annotated = await _with_staleness(app, result, scope="other_project")
+        # Should skip check entirely — no "stale" key added
+        assert "stale" not in annotated
+
+    async def test_indeterminate_state_returns_none(self, settings):
+        """Never-indexed project returns stale=None (indeterminate)."""
+        from code_atlas.indexer import StalenessChecker, StalenessInfo
+
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+
+        # Simulate never-indexed: stale=True but no last_indexed_commit
+        with patch.object(
+            checker,
+            "check",
+            new_callable=AsyncMock,
+            return_value=StalenessInfo(stale=True, current_commit="abc123", last_indexed_commit=None),
+        ):
+            result = {"results": []}
+            annotated = await _with_staleness(app, result, scope="myproject")
+            assert annotated["stale"] is None

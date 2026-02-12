@@ -1171,3 +1171,295 @@ async def test_external_package_versions(graph_client: GraphClient):
     version_map = {r["name"]: r["version"] for r in records}
     assert version_map["loguru"] == "~=0.7"
     assert version_map["pydantic"] == ">=2.0,<3.0"
+
+
+# ---------------------------------------------------------------------------
+# CALLS resolution
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_calls_via_import(graph_client: GraphClient):
+    """Module imports a function, calls it → CALLS edge created to imported target."""
+    await graph_client.ensure_schema()
+
+    project = "call_imp"
+
+    # Module A defines helper
+    fp_utils = "src/utils.py"
+    utils_entities = [
+        ParsedEntity(
+            name="utils",
+            qualified_name=f"{project}:src.utils",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp_utils,
+            content_hash="u_hash",
+        ),
+        ParsedEntity(
+            name="helper",
+            qualified_name=f"{project}:src.utils.helper",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=2,
+            line_end=5,
+            file_path=fp_utils,
+            content_hash="h_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_utils, utils_entities, [])
+
+    # Module B imports helper and has a function that calls it
+    fp_app = "src/app.py"
+    app_entities = [
+        ParsedEntity(
+            name="app",
+            qualified_name=f"{project}:src.app",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp_app,
+            content_hash="a_hash",
+        ),
+        ParsedEntity(
+            name="main",
+            qualified_name=f"{project}:src.app.main",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=3,
+            line_end=8,
+            file_path=fp_app,
+            content_hash="m_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_app, app_entities, [])
+
+    # Create IMPORTS edge: app module → helper
+    import_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.app",
+            rel_type=RelType.IMPORTS,
+            to_name="src.utils.helper",
+        ),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    # Now resolve calls: main() calls helper()
+    call_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.app.main",
+            rel_type=RelType.CALLS,
+            to_name="helper",
+        ),
+    ]
+    await graph_client.resolve_calls(project, call_rels)
+
+    # Verify CALLS edge: main → helper
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE})-[:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
+        "RETURN a.name AS caller, b.name AS callee",
+    )
+    assert len(records) == 1
+    assert records[0]["caller"] == "main"
+    assert records[0]["callee"] == "helper"
+
+
+async def test_resolve_calls_same_class(graph_client: GraphClient):
+    """Method calls sibling method → resolves to sibling."""
+    await graph_client.ensure_schema()
+
+    project = "call_sib"
+    fp = "src/mod.py"
+
+    entities = [
+        ParsedEntity(
+            name="mod",
+            qualified_name=f"{project}:src.mod",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=20,
+            file_path=fp,
+            content_hash="mod_hash",
+        ),
+        ParsedEntity(
+            name="MyClass",
+            qualified_name=f"{project}:src.mod.MyClass",
+            label=NodeLabel.TYPE_DEF,
+            kind="class",
+            line_start=2,
+            line_end=18,
+            file_path=fp,
+            content_hash="cls_hash",
+        ),
+        ParsedEntity(
+            name="process",
+            qualified_name=f"{project}:src.mod.MyClass.process",
+            label=NodeLabel.CALLABLE,
+            kind="method",
+            line_start=3,
+            line_end=8,
+            file_path=fp,
+            content_hash="proc_hash",
+        ),
+        ParsedEntity(
+            name="validate",
+            qualified_name=f"{project}:src.mod.MyClass.validate",
+            label=NodeLabel.CALLABLE,
+            kind="method",
+            line_start=10,
+            line_end=15,
+            file_path=fp,
+            content_hash="val_hash",
+        ),
+    ]
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.mod.MyClass",
+        ),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.MyClass",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.mod.MyClass.process",
+        ),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.MyClass",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.mod.MyClass.validate",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities, rels)
+
+    # process() calls validate()
+    call_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.MyClass.process",
+            rel_type=RelType.CALLS,
+            to_name="validate",
+        ),
+    ]
+    await graph_client.resolve_calls(project, call_rels)
+
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE})-[:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
+        "RETURN a.name AS caller, b.name AS callee",
+    )
+    assert len(records) == 1
+    assert records[0]["caller"] == "process"
+    assert records[0]["callee"] == "validate"
+
+
+async def test_resolve_calls_unresolved_skipped(graph_client: GraphClient):
+    """Call to builtin (e.g. 'print') → no edge created, no crash."""
+    await graph_client.ensure_schema()
+
+    project = "call_unres"
+    fp = "src/mod.py"
+
+    entities = [
+        ParsedEntity(
+            name="mod",
+            qualified_name=f"{project}:src.mod",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp,
+            content_hash="mod_hash",
+        ),
+        ParsedEntity(
+            name="func",
+            qualified_name=f"{project}:src.mod.func",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=2,
+            line_end=5,
+            file_path=fp,
+            content_hash="f_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    call_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.func",
+            rel_type=RelType.CALLS,
+            to_name="print",
+        ),
+    ]
+    await graph_client.resolve_calls(project, call_rels)
+
+    # No CALLS edges should exist
+    records = await graph_client.execute(
+        f"MATCH ()-[r:{RelType.CALLS}]->() RETURN count(r) AS cnt",
+    )
+    assert records[0]["cnt"] == 0
+
+
+async def test_resolve_calls_deduplication(graph_client: GraphClient):
+    """Same call from same caller twice → single CALLS edge."""
+    await graph_client.ensure_schema()
+
+    project = "call_dedup"
+    fp = "src/mod.py"
+
+    entities = [
+        ParsedEntity(
+            name="mod",
+            qualified_name=f"{project}:src.mod",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp,
+            content_hash="mod_hash",
+        ),
+        ParsedEntity(
+            name="caller_func",
+            qualified_name=f"{project}:src.mod.caller_func",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=2,
+            line_end=5,
+            file_path=fp,
+            content_hash="cf_hash",
+        ),
+        ParsedEntity(
+            name="target_func",
+            qualified_name=f"{project}:src.mod.target_func",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=7,
+            line_end=10,
+            file_path=fp,
+            content_hash="tf_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    # Two CALLS rels pointing to the same target from same caller
+    call_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.caller_func",
+            rel_type=RelType.CALLS,
+            to_name="target_func",
+        ),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.caller_func",
+            rel_type=RelType.CALLS,
+            to_name="target_func",
+        ),
+    ]
+    await graph_client.resolve_calls(project, call_rels)
+
+    # Only one CALLS edge
+    records = await graph_client.execute(
+        f"MATCH (a)-[r:{RelType.CALLS}]->(b) RETURN a.name AS caller, b.name AS callee",
+    )
+    assert len(records) == 1
+    assert records[0]["caller"] == "caller_func"
+    assert records[0]["callee"] == "target_func"

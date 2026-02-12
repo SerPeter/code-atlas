@@ -14,6 +14,7 @@ from code_atlas.search import (
     SearchResult,
     SearchType,
     _apply_filters,
+    _boost_results,
     _is_generated_result,
     _is_stub_result,
     _is_test_result,
@@ -445,6 +446,81 @@ class TestApplyFilters:
     def test_empty_results(self):
         filtered = _apply_filters([], self._settings())
         assert filtered == []
+
+
+# ---------------------------------------------------------------------------
+# Visibility boost
+# ---------------------------------------------------------------------------
+
+
+class TestBoostResults:
+    def test_boost_prefers_public_over_private(self):
+        """Two results with equal RRF score — public should rank first."""
+        public = SearchResult(
+            uid="p:mod.public_func",
+            name="public_func",
+            qualified_name="mod.public_func",
+            kind="function",
+            file_path="src/mod.py",
+            line_start=1,
+            line_end=5,
+            signature="def public_func():",
+            docstring="",
+            labels=["Callable"],
+            rrf_score=0.05,
+            visibility="public",
+        )
+        private = SearchResult(
+            uid="p:mod._private_func",
+            name="_private_func",
+            qualified_name="mod._private_func",
+            kind="function",
+            file_path="src/mod.py",
+            line_start=10,
+            line_end=15,
+            signature="def _private_func():",
+            docstring="",
+            labels=["Callable"],
+            rrf_score=0.05,
+            visibility="private",
+        )
+        # Private first in input — boost should reorder
+        boosted = _boost_results([private, public])
+        assert boosted[0].uid == "p:mod.public_func"
+        assert boosted[1].uid == "p:mod._private_func"
+
+    def test_boost_preserves_large_score_gap(self):
+        """A high-scoring private result still beats a low-scoring public one."""
+        public_low = SearchResult(
+            uid="p:mod.pub",
+            name="pub",
+            qualified_name="mod.pub",
+            kind="function",
+            file_path="src/mod.py",
+            line_start=1,
+            line_end=5,
+            signature="def pub():",
+            docstring="",
+            labels=["Callable"],
+            rrf_score=0.01,
+            visibility="public",
+        )
+        private_high = SearchResult(
+            uid="p:mod._priv",
+            name="_priv",
+            qualified_name="mod._priv",
+            kind="function",
+            file_path="src/mod.py",
+            line_start=10,
+            line_end=15,
+            signature="def _priv():",
+            docstring="",
+            labels=["Callable"],
+            rrf_score=0.10,
+            visibility="private",
+        )
+        boosted = _boost_results([public_low, private_high])
+        assert boosted[0].uid == "p:mod._priv"
 
 
 # ---------------------------------------------------------------------------

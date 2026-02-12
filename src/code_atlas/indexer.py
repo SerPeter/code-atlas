@@ -554,8 +554,9 @@ class StalenessChecker:
     on the Project node and optionally lists changed files.
     """
 
-    def __init__(self, project_root: Path) -> None:
+    def __init__(self, project_root: Path, *, project_name: str | None = None) -> None:
         self._root = project_root.resolve()
+        self._project_name = project_name or self._root.name
         self._cached_hash: str | None = None
         self._cached_head_mtime: float | None = None
         self._cached_ref_mtime: float | None = None
@@ -563,7 +564,7 @@ class StalenessChecker:
 
     @property
     def project_name(self) -> str:
-        return self._root.name
+        return self._project_name
 
     def current_head(self) -> str | None:
         """Return the current HEAD hash, cached by file mtime."""

@@ -57,6 +57,61 @@ def _node_project_name(record: dict[str, Any]) -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class _CallLookup:
+    """Pre-built lookup tables for CALLS resolution."""
+
+    name_to_callables: dict[str, list[tuple[str, str, str]]]  # name → [(uid, file_path, vis)]
+    import_map: dict[str, dict[str, str]]  # module_uid → {imported_name: target_uid}
+    caller_to_parent: dict[str, str]  # callable_uid → parent TypeDef uid
+    parent_children: dict[str, list[str]]  # parent_uid → [child_uids]
+    uid_to_info: dict[str, tuple[str, str]]  # uid → (name, file_path)
+
+
+def _resolve_one_call(project_name: str, rel: ParsedRelationship, lk: _CallLookup) -> str | None:
+    """Resolve a single CALLS relationship to a target uid (or ``None``)."""
+    caller_uid = rel.from_qualified_name
+    bare_name = rel.to_name
+
+    # Derive caller's module uid — find the longest module prefix in import_map
+    caller_qn = caller_uid.split(":", 1)[1] if ":" in caller_uid else caller_uid
+    parts = caller_qn.split(".")
+    module_uid: str | None = None
+    for i in range(len(parts) - 1, 0, -1):
+        candidate = f"{project_name}:{'.'.join(parts[:i])}"
+        if candidate in lk.import_map:
+            module_uid = candidate
+            break
+
+    # Strategy 1: Import match
+    if module_uid and bare_name in lk.import_map.get(module_uid, {}):
+        return lk.import_map[module_uid][bare_name]
+
+    # Strategy 2: Same-class sibling
+    if caller_uid in lk.caller_to_parent:
+        parent_uid = lk.caller_to_parent[caller_uid]
+        for sibling_uid in lk.parent_children.get(parent_uid, []):
+            if sibling_uid == caller_uid:
+                continue
+            sib_info = lk.uid_to_info.get(sibling_uid)
+            if sib_info and sib_info[0] == bare_name:
+                return sibling_uid
+
+    # Strategy 3: Same-file match
+    caller_info = lk.uid_to_info.get(caller_uid)
+    caller_fp = caller_info[1] if caller_info else ""
+    if caller_fp:
+        for uid, fp, _vis in lk.name_to_callables.get(bare_name, []):
+            if fp == caller_fp and uid != caller_uid:
+                return uid
+
+    # Strategy 4: Project-wide match (prefer public via sort key)
+    candidates = lk.name_to_callables.get(bare_name, [])
+    non_self = [(uid, vis) for uid, _fp, vis in candidates if uid != caller_uid]
+    non_self.sort(key=lambda uv: 0 if uv[1] == "public" else 1)
+    return non_self[0][0] if non_self else None
+
+
 class GraphClient:
     """Async Memgraph client wrapping the neo4j Bolt driver.
 
@@ -454,6 +509,92 @@ class GraphClient:
             len(import_rels),
             len(ext_packages),
             len(ext_symbols),
+        )
+
+    async def resolve_calls(
+        self,
+        project_name: str,
+        call_rels: list[ParsedRelationship],
+    ) -> None:
+        """Resolve CALLS relationships after all files in a batch have been upserted.
+
+        Each call rel has a bare name (e.g. ``"some_func"``) as ``to_name``.
+        Resolution strategy (in priority order):
+        1. **Import match** — caller's module imports something with that name.
+        2. **Same-class sibling** — if caller is a method, check siblings in same TypeDef.
+        3. **Same-file match** — any Callable with that name in the same file.
+        4. **Project-wide match** — any Callable with that name (prefer public).
+        5. **Unresolved** — skip silently (builtins, dynamic calls).
+        """
+        if not call_rels:
+            return
+
+        lookup = await self._build_call_lookup(project_name)
+
+        # Resolve each call
+        edges: set[tuple[str, str]] = set()
+        resolved = 0
+        unresolved = 0
+        for rel in call_rels:
+            target_uid = _resolve_one_call(project_name, rel, lookup)
+            if target_uid is not None:
+                edges.add((rel.from_qualified_name, target_uid))
+                resolved += 1
+            else:
+                unresolved += 1
+
+        # Batch-create CALLS edges
+        if edges:
+            edge_params = [{"f": f, "t": t} for f, t in edges]
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) CREATE (a)-[:{RelType.CALLS}]->(b)",
+                {"rels": edge_params},
+            )
+
+        logger.debug("Resolved {} CALLS edges ({} unresolved)", resolved, unresolved)
+
+    async def _build_call_lookup(self, project_name: str) -> _CallLookup:
+        """Build lookup tables needed for CALLS resolution."""
+        # name → [(uid, file_path, visibility)]
+        name_records = await self.execute(
+            f"MATCH (n:{NodeLabel.CALLABLE} {{project_name: $p}}) "
+            "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp, n.visibility AS vis",
+            {"p": project_name},
+        )
+        name_to_callables: dict[str, list[tuple[str, str, str]]] = {}
+        uid_to_info: dict[str, tuple[str, str]] = {}
+        for r in name_records:
+            name_to_callables.setdefault(r["name"], []).append((r["uid"], r["fp"] or "", r["vis"] or "public"))
+            uid_to_info[r["uid"]] = (r["name"], r["fp"] or "")
+
+        # module_uid → {imported_name: target_uid}
+        import_records = await self.execute(
+            f"MATCH (m:{NodeLabel.MODULE} {{project_name: $p}})-[:{RelType.IMPORTS}]->(t) "
+            "RETURN m.uid AS mod_uid, t.name AS name, t.uid AS uid",
+            {"p": project_name},
+        )
+        import_map: dict[str, dict[str, str]] = {}
+        for r in import_records:
+            import_map.setdefault(r["mod_uid"], {})[r["name"]] = r["uid"]
+
+        # caller_uid → parent TypeDef uid, parent → children
+        parent_records = await self.execute(
+            f"MATCH (td:{NodeLabel.TYPE_DEF} {{project_name: $p}})-[:{RelType.DEFINES}]->(c:{NodeLabel.CALLABLE}) "
+            "RETURN td.uid AS td_uid, c.uid AS c_uid",
+            {"p": project_name},
+        )
+        caller_to_parent: dict[str, str] = {}
+        parent_children: dict[str, list[str]] = {}
+        for r in parent_records:
+            caller_to_parent[r["c_uid"]] = r["td_uid"]
+            parent_children.setdefault(r["td_uid"], []).append(r["c_uid"])
+
+        return _CallLookup(
+            name_to_callables=name_to_callables,
+            import_map=import_map,
+            caller_to_parent=caller_to_parent,
+            parent_children=parent_children,
+            uid_to_info=uid_to_info,
         )
 
     async def update_external_package_versions(

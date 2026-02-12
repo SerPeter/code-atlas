@@ -115,6 +115,7 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
         "line_start",
         "line_end",
         "signature",
+        "visibility",
     ):
         if field in props:
             compact[field] = props[field]
@@ -186,15 +187,20 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
     - ``stale_mode == "ignore"``: return result unchanged.
     - ``stale_mode == "lock"`` and stale: return an error envelope.
     - ``stale_mode == "warn"``: add ``stale``, ``stale_since``, ``changed_files`` keys.
+
+    When staleness is indeterminate (project never indexed or index in progress),
+    ``stale`` is set to ``None`` rather than ``True``.
     """
     stale_mode = app.settings.index.stale_mode
     if stale_mode == "ignore" or app.staleness is None:
         return result
 
     checker = app.staleness
-    # Only check matching project or empty scope
-    if scope and scope != checker.project_name:
-        return result
+    # Only check matching project — scope may be comma-separated
+    if scope:
+        scope_names = {s.strip() for s in scope.split(",") if s.strip()}
+        if checker.project_name not in scope_names:
+            return result
 
     info = await checker.check(app.graph, include_changed=(stale_mode == "warn"))
 
@@ -206,7 +212,11 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
         return _error(msg, code="STALE_INDEX")
 
     # warn mode (default)
-    result["stale"] = info.stale
+    # Indeterminate: stale=True but never indexed (no stored commit)
+    if info.stale and info.last_indexed_commit is None:
+        result["stale"] = None  # indeterminate — never indexed or index in progress
+    else:
+        result["stale"] = info.stale
     if info.stale:
         result["stale_since"] = info.last_indexed_commit
         if info.changed_files:
@@ -222,17 +232,20 @@ def _rank_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Rank disambiguation results by relevance.
 
     Sorting criteria (applied in order):
+    0. Internal over external — ExternalSymbol/ExternalPackage stubs last
     1. Source over test — entities whose file_path does NOT contain "test" first
     2. Visibility — public > protected > internal > private
     3. Shorter qualified_name — more canonical entities first
     """
 
-    def _sort_key(node: dict[str, Any]) -> tuple[int, int, int]:
+    def _sort_key(node: dict[str, Any]) -> tuple[int, int, int, int]:
+        labels = node.get("_labels") or []
+        is_external = 1 if any(lbl in ("ExternalSymbol", "ExternalPackage") for lbl in labels) else 0
         fp = (node.get("file_path") or "").lower()
         is_test = 1 if ("test" in fp) else 0
         vis = _VISIBILITY_RANK.get(node.get("visibility", "public"), 0)
         qn_len = len(node.get("qualified_name", ""))
-        return (is_test, vis, qn_len)
+        return (is_external, is_test, vis, qn_len)
 
     return sorted(results, key=_sort_key)
 
@@ -256,7 +269,7 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
 
         logger.info("MCP connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
         embed = EmbedClient(settings.embeddings)
-        staleness = StalenessChecker(settings.project_root)
+        staleness = StalenessChecker(settings.project_root, project_name=settings.project_root.name)
         app_ctx = AppContext(graph=graph, settings=settings, embed=embed, staleness=staleness)
         try:
             yield app_ctx
@@ -600,6 +613,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                     if r.docstring
                     else ""
                 ),
+                "visibility": r.visibility,
                 "_labels": r.labels,
                 "rrf_score": round(r.rrf_score, 6),
                 "sources": r.sources,

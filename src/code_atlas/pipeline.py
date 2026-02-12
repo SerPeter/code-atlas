@@ -250,10 +250,12 @@ class Tier2ASTConsumer(TierConsumer):
         project_name: str,
         file_path: str,
         import_rels: list[ParsedRelationship],
+        call_rels: list[ParsedRelationship],
     ) -> tuple[set[str], list[EntityRef]]:
         """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs).
 
-        Appends IMPORTS rels to *import_rels* for post-batch resolution.
+        Appends IMPORTS rels to *import_rels* and CALLS rels to *call_rels*
+        for post-batch resolution.
         """
         full_path = self._project_root / file_path
         if not full_path.is_file():
@@ -277,9 +279,10 @@ class Tier2ASTConsumer(TierConsumer):
         det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
         all_rels = parsed.relationships + det_result.relationships
 
-        # Separate IMPORTS rels for post-batch resolution
-        non_import_rels = [r for r in all_rels if r.rel_type != RelType.IMPORTS]
+        # Separate IMPORTS and CALLS rels for post-batch resolution
+        non_import_rels = [r for r in all_rels if r.rel_type not in {RelType.IMPORTS, RelType.CALLS}]
         import_rels.extend(r for r in all_rels if r.rel_type == RelType.IMPORTS)
+        call_rels.extend(r for r in all_rels if r.rel_type == RelType.CALLS)
 
         result = await self.graph.upsert_file_entities(
             project_name=project_name,
@@ -335,17 +338,22 @@ class Tier2ASTConsumer(TierConsumer):
         project_name = event_project_name or self.settings.project_root.name
         changed_entity_refs: list[EntityRef] = []
         all_import_rels: list[ParsedRelationship] = []
+        all_call_rels: list[ParsedRelationship] = []
         skipped_before = self.stats.files_skipped
         total_changed = 0
 
         for file_path in unique_paths:
-            changed_qns, refs = await self._process_file(project_name, file_path, all_import_rels)
+            changed_qns, refs = await self._process_file(project_name, file_path, all_import_rels, all_call_rels)
             total_changed += len(changed_qns)
             changed_entity_refs.extend(refs)
 
         # Post-batch import resolution
         if all_import_rels:
             await self.graph.resolve_imports(project_name, all_import_rels)
+
+        # Post-batch call resolution (after imports so import map is available)
+        if all_call_rels:
+            await self.graph.resolve_calls(project_name, all_call_rels)
 
         logger.info(
             "Tier2 batch {}: {} files, {} skipped, {} entities changed",
