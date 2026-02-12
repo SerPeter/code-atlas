@@ -15,8 +15,12 @@ import litellm
 import redis.asyncio as aioredis
 from loguru import logger
 
+from code_atlas.telemetry import get_tracer
+
 if TYPE_CHECKING:
     from code_atlas.settings import EmbeddingSettings, RedisSettings
+
+_tracer = get_tracer(__name__)
 
 
 class EmbeddingError(Exception):
@@ -67,44 +71,52 @@ class EmbedClient:
         if not texts:
             return []
 
-        all_vectors: list[list[float]] = []
-        for i in range(0, len(texts), self._batch_size):
-            chunk = texts[i : i + self._batch_size]
-            try:
-                kwargs: dict[str, Any] = {
-                    "model": self._model,
-                    "input": chunk,
-                    "timeout": self._timeout,
-                }
-                if self._api_base:
-                    kwargs["api_base"] = self._api_base
-                if self._api_key:
-                    kwargs["api_key"] = self._api_key
+        with _tracer.start_as_current_span(
+            "embed.embed_batch", attributes={"batch_size": len(texts), "model": self._model}
+        ):
+            all_vectors: list[list[float]] = []
+            for i in range(0, len(texts), self._batch_size):
+                chunk = texts[i : i + self._batch_size]
+                try:
+                    kwargs: dict[str, Any] = {
+                        "model": self._model,
+                        "input": chunk,
+                        "timeout": self._timeout,
+                    }
+                    if self._api_base:
+                        kwargs["api_base"] = self._api_base
+                    if self._api_key:
+                        kwargs["api_key"] = self._api_key
 
-                response = await litellm.aembedding(**kwargs)
-                vectors = [item["embedding"] if isinstance(item, dict) else item.embedding for item in response.data]
-                all_vectors.extend(vectors)
-            except Exception as exc:
-                msg = f"Embedding failed for batch [{i}:{i + len(chunk)}]: {exc}"
-                logger.error(msg)
-                raise EmbeddingError(msg) from exc
+                    response = await litellm.aembedding(**kwargs)
+                    vectors = [
+                        item["embedding"] if isinstance(item, dict) else item.embedding for item in response.data
+                    ]
+                    all_vectors.extend(vectors)
+                except Exception as exc:
+                    msg = f"Embedding failed for batch [{i}:{i + len(chunk)}]: {exc}"
+                    logger.error(msg)
+                    raise EmbeddingError(msg) from exc
 
-        return all_vectors
+            return all_vectors
 
     async def embed_one(self, text: str) -> list[float]:
         """Embed a single text with LRU caching for repeated queries."""
-        if text in self._query_cache:
-            self._query_cache.move_to_end(text)
-            return self._query_cache[text]
+        with _tracer.start_as_current_span("embed.embed_one") as span:
+            if text in self._query_cache:
+                self._query_cache.move_to_end(text)
+                span.set_attribute("cache_hit", True)
+                return self._query_cache[text]
 
-        result = await self.embed_batch([text])
-        vector = result[0]
+            span.set_attribute("cache_hit", False)
+            result = await self.embed_batch([text])
+            vector = result[0]
 
-        self._query_cache[text] = vector
-        if len(self._query_cache) > self._query_cache_size:
-            self._query_cache.popitem(last=False)
+            self._query_cache[text] = vector
+            if len(self._query_cache) > self._query_cache_size:
+                self._query_cache.popitem(last=False)
 
-        return vector
+            return vector
 
     async def health_check(self) -> bool:
         """Check if the embedding service is reachable.
@@ -176,37 +188,39 @@ class EmbedCache:
         """Batch-get cached vectors by text hash. Returns {hash: vector} for hits."""
         if not hashes:
             return {}
-        try:
-            keys = [self._key(h) for h in hashes]
-            pipe = self._redis.pipeline(transaction=False)
-            for k in keys:
-                pipe.get(k)
-            values = await pipe.execute()
-        except Exception:
-            logger.warning("EmbedCache.get_many failed, treating as cache miss")
-            self._misses += len(hashes)
-            return {}
+        with _tracer.start_as_current_span("embed_cache.get_many", attributes={"count": len(hashes)}):
+            try:
+                keys = [self._key(h) for h in hashes]
+                pipe = self._redis.pipeline(transaction=False)
+                for k in keys:
+                    pipe.get(k)
+                values = await pipe.execute()
+            except Exception:
+                logger.warning("EmbedCache.get_many failed, treating as cache miss")
+                self._misses += len(hashes)
+                return {}
 
-        result: dict[str, list[float]] = {}
-        for h, val in zip(hashes, values, strict=True):
-            if val is not None:
-                result[h] = self._unpack_vector(val)
-                self._hits += 1
-            else:
-                self._misses += 1
-        return result
+            result: dict[str, list[float]] = {}
+            for h, val in zip(hashes, values, strict=True):
+                if val is not None:
+                    result[h] = self._unpack_vector(val)
+                    self._hits += 1
+                else:
+                    self._misses += 1
+            return result
 
     async def put_many(self, items: list[tuple[str, list[float]]]) -> None:
         """Batch-store vectors by text hash with TTL."""
         if not items or self._ttl_s <= 0:
             return
-        try:
-            pipe = self._redis.pipeline(transaction=False)
-            for text_hash, vector in items:
-                pipe.setex(self._key(text_hash), self._ttl_s, self._pack_vector(vector))
-            await pipe.execute()
-        except Exception:
-            logger.warning("EmbedCache.put_many failed, vectors not cached")
+        with _tracer.start_as_current_span("embed_cache.put_many", attributes={"count": len(items)}):
+            try:
+                pipe = self._redis.pipeline(transaction=False)
+                for text_hash, vector in items:
+                    pipe.setex(self._key(text_hash), self._ttl_s, self._pack_vector(vector))
+                await pipe.execute()
+            except Exception:
+                logger.warning("EmbedCache.put_many failed, vectors not cached")
 
     async def clear(self) -> None:
         """Delete all cached embeddings for the current model."""

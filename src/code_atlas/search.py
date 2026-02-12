@@ -17,11 +17,15 @@ import tiktoken
 from loguru import logger
 
 from code_atlas.schema import RelType
+from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 
 if TYPE_CHECKING:
     from code_atlas.embeddings import EmbedClient
     from code_atlas.graph import GraphClient
     from code_atlas.settings import SearchSettings
+
+_tracer = get_tracer(__name__)
+_meter = get_meter(__name__)
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -638,82 +642,96 @@ async def hybrid_search(
     exclude_patterns:
         Exclude results whose basename matches any of these globs.
     """
-    if search_types is None:
-        search_types = list(SearchType)
+    with _tracer.start_as_current_span(
+        "hybrid_search", attributes={"query": query, "limit": limit, "scope": scope}
+    ) as span:
+        if search_types is None:
+            search_types = list(SearchType)
 
-    effective_weights = _compute_weights(settings, query, weights)
+        span.set_attribute("search_types", ",".join(st.value for st in search_types))
+        effective_weights = _compute_weights(settings, query, weights)
 
-    # Pre-compute embedding if vector channel is requested
-    vector: list[float] | None = None
-    if SearchType.VECTOR in search_types and embed is not None:
-        try:
-            vector = await embed.embed_one(query)
-        except Exception as exc:
-            logger.warning("Embedding failed, skipping vector channel: {}", exc)
-            search_types = [st for st in search_types if st != SearchType.VECTOR]
+        # Pre-compute embedding if vector channel is requested
+        vector: list[float] | None = None
+        if SearchType.VECTOR in search_types and embed is not None:
+            with _tracer.start_as_current_span("embed_query"):
+                try:
+                    vector = await embed.embed_one(query)
+                except Exception as exc:
+                    logger.warning("Embedding failed, skipping vector channel: {}", exc)
+                    search_types = [st for st in search_types if st != SearchType.VECTOR]
 
-    # Resolve scope to projects list (monorepo-aware)
-    # Supports comma-separated project names (e.g., "auth,shared")
-    if scope:
-        parts = [s.strip() for s in scope.split(",") if s.strip()]
-        scope_projects: list[str] | None = parts
-    else:
-        scope_projects = None
+        # Resolve scope to projects list (monorepo-aware)
+        if scope:
+            parts = [s.strip() for s in scope.split(",") if s.strip()]
+            scope_projects: list[str] | None = parts
+        else:
+            scope_projects = None
 
-    # Fire search channels in parallel
-    tasks: dict[str, asyncio.Task[list[dict[str, Any]]]] = {}
-    fetch_limit = limit * 3  # over-fetch for fusion quality
+        # Fire search channels in parallel
+        tasks: dict[str, asyncio.Task[list[dict[str, Any]]]] = {}
+        fetch_limit = limit * 3  # over-fetch for fusion quality
 
-    if SearchType.GRAPH in search_types:
-        tasks["graph"] = asyncio.create_task(graph.graph_search(query, limit=fetch_limit, projects=scope_projects))
-    if SearchType.VECTOR in search_types and vector is not None:
-        tasks["vector"] = asyncio.create_task(graph.vector_search(vector, limit=fetch_limit, projects=scope_projects))
-    if SearchType.BM25 in search_types:
-        tasks["bm25"] = asyncio.create_task(graph.text_search(query, limit=fetch_limit, projects=scope_projects))
+        if SearchType.GRAPH in search_types:
+            tasks["graph"] = asyncio.create_task(graph.graph_search(query, limit=fetch_limit, projects=scope_projects))
+        if SearchType.VECTOR in search_types and vector is not None:
+            tasks["vector"] = asyncio.create_task(
+                graph.vector_search(vector, limit=fetch_limit, projects=scope_projects)
+            )
+        if SearchType.BM25 in search_types:
+            tasks["bm25"] = asyncio.create_task(graph.text_search(query, limit=fetch_limit, projects=scope_projects))
 
-    # Collect results
-    channel_results: dict[str, list[dict[str, Any]]] = {}
-    for channel, task in tasks.items():
-        try:
-            channel_results[channel] = await task
-        except Exception as exc:
-            logger.warning("Search channel {} failed: {}", channel, exc)
-            channel_results[channel] = []
+        # Collect results
+        channel_results: dict[str, list[dict[str, Any]]] = {}
+        for channel, task in tasks.items():
+            try:
+                channel_results[channel] = await task
+            except Exception as exc:
+                logger.warning("Search channel {} failed: {}", channel, exc)
+                channel_results[channel] = []
 
-    ranked_lists, props_by_uid = _build_ranked_lists(channel_results)
-    fused_scores = rrf_fuse(ranked_lists, k=settings.rrf_k, weights=effective_weights)
-    uid_ranks = _build_provenance(ranked_lists)
+        with _tracer.start_as_current_span("rrf_fuse"):
+            ranked_lists, props_by_uid = _build_ranked_lists(channel_results)
+            fused_scores = rrf_fuse(ranked_lists, k=settings.rrf_k, weights=effective_weights)
+            uid_ranks = _build_provenance(ranked_lists)
 
-    # Build all SearchResult objects, apply filters, then slice to limit
-    all_results = [
-        SearchResult(
-            uid=uid,
-            name=props_by_uid.get(uid, {}).get("name", ""),
-            qualified_name=props_by_uid.get(uid, {}).get("qualified_name", ""),
-            kind=props_by_uid.get(uid, {}).get("kind", ""),
-            file_path=props_by_uid.get(uid, {}).get("file_path", ""),
-            line_start=props_by_uid.get(uid, {}).get("line_start"),
-            line_end=props_by_uid.get(uid, {}).get("line_end"),
-            signature=props_by_uid.get(uid, {}).get("signature", ""),
-            docstring=props_by_uid.get(uid, {}).get("docstring", ""),
-            labels=props_by_uid.get(uid, {}).get("_labels", []),
-            rrf_score=rrf_score,
-            sources=uid_ranks.get(uid, {}),
-            visibility=props_by_uid.get(uid, {}).get("visibility", "public"),
-        )
-        for uid, rrf_score in fused_scores.items()
-    ]
+        # Build all SearchResult objects, apply filters, then slice to limit
+        all_results = [
+            SearchResult(
+                uid=uid,
+                name=props_by_uid.get(uid, {}).get("name", ""),
+                qualified_name=props_by_uid.get(uid, {}).get("qualified_name", ""),
+                kind=props_by_uid.get(uid, {}).get("kind", ""),
+                file_path=props_by_uid.get(uid, {}).get("file_path", ""),
+                line_start=props_by_uid.get(uid, {}).get("line_start"),
+                line_end=props_by_uid.get(uid, {}).get("line_end"),
+                signature=props_by_uid.get(uid, {}).get("signature", ""),
+                docstring=props_by_uid.get(uid, {}).get("docstring", ""),
+                labels=props_by_uid.get(uid, {}).get("_labels", []),
+                rrf_score=rrf_score,
+                sources=uid_ranks.get(uid, {}),
+                visibility=props_by_uid.get(uid, {}).get("visibility", "public"),
+            )
+            for uid, rrf_score in fused_scores.items()
+        ]
 
-    filtered = _apply_filters(
-        all_results,
-        settings,
-        exclude_tests=exclude_tests,
-        exclude_stubs=exclude_stubs,
-        exclude_generated=exclude_generated,
-        include_patterns=include_patterns,
-        exclude_patterns=exclude_patterns,
-    )
-    return _boost_results(filtered)[:limit]
+        with _tracer.start_as_current_span("filter_and_boost"):
+            filtered = _apply_filters(
+                all_results,
+                settings,
+                exclude_tests=exclude_tests,
+                exclude_stubs=exclude_stubs,
+                exclude_generated=exclude_generated,
+                include_patterns=include_patterns,
+                exclude_patterns=exclude_patterns,
+            )
+            results = _boost_results(filtered)[:limit]
+
+        span.set_attribute("results_count", len(results))
+        m = get_metrics()
+        m.query_count.add(1, {"type": "hybrid"})
+        m.search_results_count.record(len(results))
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +841,33 @@ async def expand_context(
     max_callers:
         Max callers to return (over-fetched then prioritized).
     """
+    with _tracer.start_as_current_span("expand_context", attributes={"uid": uid}) as span:
+        return await _expand_context_inner(
+            graph,
+            uid,
+            span=span,
+            include_hierarchy=include_hierarchy,
+            include_calls=include_calls,
+            call_depth=call_depth,
+            include_docs=include_docs,
+            max_siblings=max_siblings,
+            max_callers=max_callers,
+        )
+
+
+async def _expand_context_inner(
+    graph: GraphClient,
+    uid: str,
+    *,
+    span: Any,
+    include_hierarchy: bool,
+    include_calls: bool,
+    call_depth: int,
+    include_docs: bool,
+    max_siblings: int,
+    max_callers: int,
+) -> ExpandedContext | None:
+    """Inner implementation of expand_context (separated to keep span wrapper clean)."""
     call_depth = max(1, min(call_depth, 3))
 
     # Always fetch the target node
@@ -897,6 +942,9 @@ async def expand_context(
     package_context = ""
     if pkg_records:
         package_context = pkg_records[0].get("docstring", "") or ""
+
+    span.set_attribute("callers_count", len(callers))
+    span.set_attribute("callees_count", len(callees))
 
     return ExpandedContext(
         target=target,

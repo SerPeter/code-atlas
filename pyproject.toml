@@ -56,6 +56,12 @@ dependencies = [
 subagent = [
     # Extra MCP tools for subagent mode (no API key needed)
 ]
+otel = [
+    "opentelemetry-api~=1.33",
+    "opentelemetry-sdk~=1.33",
+    "opentelemetry-exporter-otlp-proto-grpc~=1.33",
+    "opentelemetry-exporter-otlp-proto-http~=1.33",
+]
 
 [project.scripts]
 atlas = "code_atlas.cli:app"
@@ -112,3 +118,14 @@ markers = [
 # --------------------------------------------------------------------------- #
 [tool.ty.environment]
 python-version = "3.14"
+
+[tool.ty.analysis]
+# OTel packages are optional (`[otel]` extra) — not present in the base venv.
+allowed-unresolved-imports = [
+    "opentelemetry",
+    "opentelemetry.*",
+    "opentelemetry.*.*",
+    "opentelemetry.*.*.*",
+    "opentelemetry.*.*.*.*",
+    "opentelemetry.*.*.*.*.*",
+]

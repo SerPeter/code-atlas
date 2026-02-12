@@ -126,6 +126,16 @@ class IndexSettings(BaseSettings):
     )
 
 
+class ObservabilitySettings(BaseSettings):
+    """OpenTelemetry observability settings (requires ``[otel]`` extra)."""
+
+    enabled: bool = Field(default=False, description="Enable OpenTelemetry tracing and metrics.")
+    exporter: str = Field(default="otlp", description="Exporter type: 'otlp', 'console', or 'none'.")
+    endpoint: str = Field(default="http://localhost:4317", description="OTLP collector endpoint.")
+    service_name: str = Field(default="code-atlas", description="OTel service.name resource attribute.")
+    sample_rate: float = Field(default=1.0, description="Trace sample rate (1.0 = all, 0.1 = 10%).")
+
+
 class WatcherSettings(BaseSettings):
     """File watcher debounce settings."""
 
@@ -179,3 +189,4 @@ class AtlasSettings(BaseSettings):
     watcher: WatcherSettings = Field(default_factory=WatcherSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)

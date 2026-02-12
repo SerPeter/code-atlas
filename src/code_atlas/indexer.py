@@ -21,10 +21,13 @@ from code_atlas.embeddings import EmbedCache, EmbedClient
 from code_atlas.events import EventBus, FileChanged, Topic
 from code_atlas.parser import get_language_for_file
 from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
     from code_atlas.graph import GraphClient
     from code_atlas.settings import AtlasSettings, MonorepoSettings
+
+_tracer = get_tracer(__name__)
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -857,6 +860,18 @@ async def _publish_events(
     return len(files)
 
 
+def _record_index_metrics(span: Any, mode: str, files: int, entities: int, duration: float) -> None:
+    """Record OTel span attributes and metrics for an indexing run."""
+    if span is not None:
+        span.set_attribute("mode", mode)
+        span.set_attribute("files_scanned", files)
+        span.set_attribute("entities_total", entities)
+    m = get_metrics()
+    m.index_files_total.add(files)
+    m.index_entities_total.add(entities)
+    m.index_duration.record(duration)
+
+
 async def index_project(
     settings: AtlasSettings,
     graph: GraphClient,
@@ -882,8 +897,35 @@ async def index_project(
     settings-derived defaults so that each sub-project can be indexed
     with its own root while sharing infra config from the monorepo settings.
     """
-    start = time.monotonic()
     project_name = project_name or settings.project_root.name
+    with _tracer.start_as_current_span("index_project", attributes={"project_name": project_name}) as idx_span:
+        return await _index_project_inner(
+            settings,
+            graph,
+            bus,
+            scope_paths=scope_paths,
+            full_reindex=full_reindex,
+            drain_timeout_s=drain_timeout_s,
+            project_name=project_name,
+            project_root=project_root,
+            span=idx_span,
+        )
+
+
+async def _index_project_inner(
+    settings: AtlasSettings,
+    graph: GraphClient,
+    bus: EventBus,
+    *,
+    scope_paths: list[str] | None = None,
+    full_reindex: bool = False,
+    drain_timeout_s: float = 600.0,
+    project_name: str,
+    project_root: Path | None = None,
+    span: Any = None,
+) -> IndexResult:
+    """Inner implementation of index_project with active span."""
+    start = time.monotonic()
     project_root = (project_root or Path(settings.project_root)).resolve()
 
     # 1. Scan files
@@ -960,6 +1002,8 @@ async def index_project(
         duration,
     )
 
+    _record_index_metrics(span, decision.mode, len(files), entity_count, duration)
+
     return IndexResult(
         files_scanned=len(files),
         files_published=published,
@@ -988,6 +1032,27 @@ async def index_monorepo(
     4. Index root project (files not inside any sub-project).
     5. Resolve cross-project imports and create DEPENDS_ON edges.
     """
+    with _tracer.start_as_current_span("index_monorepo"):
+        return await _index_monorepo_inner(
+            settings,
+            graph,
+            bus,
+            scope_projects=scope_projects,
+            full_reindex=full_reindex,
+            drain_timeout_s=drain_timeout_s,
+        )
+
+
+async def _index_monorepo_inner(
+    settings: AtlasSettings,
+    graph: GraphClient,
+    bus: EventBus,
+    *,
+    scope_projects: list[str] | None = None,
+    full_reindex: bool = False,
+    drain_timeout_s: float = 600.0,
+) -> list[IndexResult]:
+    """Inner implementation of index_monorepo."""
     project_root = Path(settings.project_root).resolve()
     sub_projects = detect_sub_projects(project_root, settings.monorepo)
 

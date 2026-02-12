@@ -11,8 +11,12 @@ from typing import TYPE_CHECKING, Any
 
 import redis.asyncio as aioredis
 
+from code_atlas.telemetry import get_tracer
+
 if TYPE_CHECKING:
     from code_atlas.settings import RedisSettings
+
+_tracer = get_tracer(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +153,8 @@ class EventBus:
 
     async def publish(self, topic: Topic, event: Event, *, maxlen: int = 10_000) -> bytes:
         """Publish an event to a stream. Returns the message ID."""
-        return await self._redis.xadd(self._stream_key(topic), encode_event(event), maxlen=maxlen, approximate=True)
+        with _tracer.start_as_current_span("eventbus.publish", attributes={"topic": topic.value}):
+            return await self._redis.xadd(self._stream_key(topic), encode_event(event), maxlen=maxlen, approximate=True)
 
     async def read_batch(
         self,
@@ -165,17 +170,20 @@ class EventBus:
         Returns list of ``(message_id, field_dict)`` tuples, or empty list
         if the block timeout expires with no messages.
         """
-        result: Any = await self._redis.xreadgroup(
-            group,
-            consumer,
-            {self._stream_key(topic): ">"},
-            count=count,
-            block=block_ms,
-        )
-        if not result:
-            return []
-        # result shape: [[stream_key, [(msg_id, fields), ...]]]
-        return result[0][1]
+        with _tracer.start_as_current_span(
+            "eventbus.read_batch", attributes={"topic": topic.value, "group": group, "consumer": consumer}
+        ):
+            result: Any = await self._redis.xreadgroup(
+                group,
+                consumer,
+                {self._stream_key(topic): ">"},
+                count=count,
+                block=block_ms,
+            )
+            if not result:
+                return []
+            # result shape: [[stream_key, [(msg_id, fields), ...]]]
+            return result[0][1]
 
     async def ack(self, topic: Topic, group: str, *msg_ids: bytes) -> int:
         """Acknowledge messages after successful processing."""

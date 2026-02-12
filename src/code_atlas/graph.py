@@ -28,6 +28,7 @@ from code_atlas.schema import (
     generate_unique_constraint_ddl,
     generate_vector_index_ddl,
 )
+from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
     from code_atlas.detectors import PropertyEnrichment
     from code_atlas.parser import ParsedEntity, ParsedRelationship
     from code_atlas.settings import AtlasSettings
+
+_tracer = get_tracer(__name__)
 
 
 @dataclass(frozen=True)
@@ -133,9 +136,10 @@ class GraphClient:
 
     async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute a read query and return results as a list of dicts."""
-        async with self._driver.session() as session:
-            result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
-            return [dict(record) async for record in result]
+        with _tracer.start_as_current_span("graph.execute", attributes={"db.statement": query[:200]}):
+            async with self._driver.session() as session:
+                result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+                return [dict(record) async for record in result]
 
     async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
         """Execute a write query.
@@ -143,9 +147,10 @@ class GraphClient:
         Consumes the result to ensure server-side errors (e.g. constraint
         violations) are raised instead of being silently dropped.
         """
-        async with self._driver.session() as session:
-            result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
-            await result.consume()
+        with _tracer.start_as_current_span("graph.execute_write", attributes={"db.statement": query[:200]}):
+            async with self._driver.session() as session:
+                result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+                await result.consume()
 
     async def get_schema_version(self) -> int | None:
         """Read the current schema version from the SchemaVersion node."""
@@ -885,36 +890,37 @@ class GraphClient:
         Queries one or all text indices, optionally post-filters by project(s),
         and returns results sorted by score descending.
         """
-        # Backward compat: single project → projects list
-        filter_projects = projects if projects is not None else ([project] if project else None)
+        with _tracer.start_as_current_span("graph.text_search", attributes={"query": query[:100], "limit": limit}):
+            # Backward compat: single project → projects list
+            filter_projects = projects if projects is not None else ([project] if project else None)
 
-        indices = (
-            [f"text_{label.lower()}"] if label else [f"text_{lbl.value.lower()}" for lbl in _TEXT_SEARCHABLE_LABELS]
-        )
-        fetch_limit = limit * 3 if filter_projects else limit
-
-        all_results: list[dict[str, Any]] = []
-        for index_name in indices:
-            cypher = (
-                f"CALL text_search.search_all('{index_name}', $query, {fetch_limit}) "
-                "YIELD node, score "
-                "RETURN node, score "
-                f"ORDER BY score DESC LIMIT {fetch_limit}"
+            indices = (
+                [f"text_{label.lower()}"] if label else [f"text_{lbl.value.lower()}" for lbl in _TEXT_SEARCHABLE_LABELS]
             )
-            try:
-                records = await self.execute(cypher, {"query": query})
-                all_results.extend(records)
-            except Exception as exc:
-                logger.warning("Text search on {} failed: {}", index_name, exc)
+            fetch_limit = limit * 3 if filter_projects else limit
 
-        # Post-filter by project scope
-        if filter_projects:
-            project_set = set(filter_projects)
-            all_results = [r for r in all_results if _node_project_name(r) in project_set]
+            all_results: list[dict[str, Any]] = []
+            for index_name in indices:
+                cypher = (
+                    f"CALL text_search.search_all('{index_name}', $query, {fetch_limit}) "
+                    "YIELD node, score "
+                    "RETURN node, score "
+                    f"ORDER BY score DESC LIMIT {fetch_limit}"
+                )
+                try:
+                    records = await self.execute(cypher, {"query": query})
+                    all_results.extend(records)
+                except Exception as exc:
+                    logger.warning("Text search on {} failed: {}", index_name, exc)
 
-        # Sort by score descending and truncate
-        all_results.sort(key=lambda rec: rec.get("score", 0), reverse=True)
-        return all_results[:limit]
+            # Post-filter by project scope
+            if filter_projects:
+                project_set = set(filter_projects)
+                all_results = [r for r in all_results if _node_project_name(r) in project_set]
+
+            # Sort by score descending and truncate
+            all_results.sort(key=lambda rec: rec.get("score", 0), reverse=True)
+            return all_results[:limit]
 
     async def get_text_index_info(self) -> list[dict[str, Any]]:
         """Query Memgraph for text index metadata via SHOW INDEX INFO (Memgraph 3.7+ DDL).
@@ -954,34 +960,35 @@ class GraphClient:
         and similarity threshold, and returns results sorted by similarity
         descending.  Returns ``[{"node": Node, "similarity": float}, ...]``.
         """
-        filter_projects = projects if projects is not None else ([project] if project else None)
+        with _tracer.start_as_current_span("graph.vector_search", attributes={"limit": limit}):
+            filter_projects = projects if projects is not None else ([project] if project else None)
 
-        indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
-        filtering = bool(filter_projects) or threshold > 0.0
-        fetch_limit = limit * 3 if filtering else limit
+            indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
+            filtering = bool(filter_projects) or threshold > 0.0
+            fetch_limit = limit * 3 if filtering else limit
 
-        all_results: list[dict[str, Any]] = []
-        for index_name in indices:
-            cypher = (
-                f"CALL vector_search.search('{index_name}', {fetch_limit}, $vector) "
-                "YIELD node, similarity "
-                "RETURN node, similarity "
-                f"ORDER BY similarity DESC LIMIT {fetch_limit}"
-            )
-            try:
-                records = await self.execute(cypher, {"vector": vector})
-                all_results.extend(records)
-            except Exception as exc:
-                logger.warning("Vector search on {} failed: {}", index_name, exc)
+            all_results: list[dict[str, Any]] = []
+            for index_name in indices:
+                cypher = (
+                    f"CALL vector_search.search('{index_name}', {fetch_limit}, $vector) "
+                    "YIELD node, similarity "
+                    "RETURN node, similarity "
+                    f"ORDER BY similarity DESC LIMIT {fetch_limit}"
+                )
+                try:
+                    records = await self.execute(cypher, {"vector": vector})
+                    all_results.extend(records)
+                except Exception as exc:
+                    logger.warning("Vector search on {} failed: {}", index_name, exc)
 
-        if threshold > 0.0:
-            all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
-        if filter_projects:
-            project_set = set(filter_projects)
-            all_results = [r for r in all_results if _node_project_name(r) in project_set]
+            if threshold > 0.0:
+                all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
+            if filter_projects:
+                project_set = set(filter_projects)
+                all_results = [r for r in all_results if _node_project_name(r) in project_set]
 
-        all_results.sort(key=lambda rec: rec.get("similarity", 0), reverse=True)
-        return all_results[:limit]
+            all_results.sort(key=lambda rec: rec.get("similarity", 0), reverse=True)
+            return all_results[:limit]
 
     # -- Graph (name-based) search helpers ------------------------------------
 
@@ -1003,6 +1010,18 @@ class GraphClient:
         Deduplicates by uid, keeping highest score.
         Returns ``[{"node": Node, "score": float}, ...]``.
         """
+        with _tracer.start_as_current_span("graph.graph_search", attributes={"query": query[:100], "limit": limit}):
+            return await self._graph_search_inner(query, label=label, limit=limit, project=project, projects=projects)
+
+    async def _graph_search_inner(
+        self,
+        query: str,
+        label: str = "",
+        limit: int = 20,
+        project: str = "",
+        projects: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Inner implementation of graph_search."""
         filter_projects = projects if projects is not None else ([project] if project else None)
 
         label_filter = f":{label}" if label else ""

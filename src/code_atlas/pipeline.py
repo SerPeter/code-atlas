@@ -34,11 +34,14 @@ from code_atlas.events import (
 )
 from code_atlas.parser import ParsedRelationship, parse_file
 from code_atlas.schema import RelType
+from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
     from code_atlas.embeddings import EmbedClient
     from code_atlas.graph import GraphClient
     from code_atlas.settings import AtlasSettings
+
+_tracer = get_tracer(__name__)
 
 # ---------------------------------------------------------------------------
 # Batch policy
@@ -176,19 +179,20 @@ class Tier1GraphConsumer(TierConsumer):
         return super().dedup_key(event)
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
-        paths = [e.path for e in events if isinstance(e, FileChanged)]
-        # Forward project_name from FileChanged events (monorepo support)
-        project_name = ""
-        for e in events:
-            if isinstance(e, FileChanged) and e.project_name:
-                project_name = e.project_name
-                break
-        logger.info("Tier1 batch {}: {} file(s)", batch_id, len(paths))
+        with _tracer.start_as_current_span("tier1.process_batch", attributes={"batch_id": batch_id}):
+            paths = [e.path for e in events if isinstance(e, FileChanged)]
+            # Forward project_name from FileChanged events (monorepo support)
+            project_name = ""
+            for e in events:
+                if isinstance(e, FileChanged) and e.project_name:
+                    project_name = e.project_name
+                    break
+            logger.info("Tier1 batch {}: {} file(s)", batch_id, len(paths))
 
-        # TODO: Update Memgraph file nodes (timestamps, staleness flags)
+            # TODO: Update Memgraph file nodes (timestamps, staleness flags)
 
-        # Always publish downstream — Tier 2 decides significance
-        await self.bus.publish(Topic.AST_DIRTY, ASTDirty(paths=paths, project_name=project_name, batch_id=batch_id))
+            # Always publish downstream — Tier 2 decides significance
+            await self.bus.publish(Topic.AST_DIRTY, ASTDirty(paths=paths, project_name=project_name, batch_id=batch_id))
 
 
 # ---------------------------------------------------------------------------
@@ -323,51 +327,55 @@ class Tier2ASTConsumer(TierConsumer):
         return changed_qns, refs
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
-        all_paths: list[str] = []
-        # Collect project_name from ASTDirty events (forwarded from FileChanged)
-        event_project_name = ""
-        for e in events:
-            if isinstance(e, ASTDirty):
-                all_paths.extend(e.paths)
-                if e.project_name:
-                    event_project_name = e.project_name
-        unique_paths = list(dict.fromkeys(all_paths))
+        with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
+            all_paths: list[str] = []
+            # Collect project_name from ASTDirty events (forwarded from FileChanged)
+            event_project_name = ""
+            for e in events:
+                if isinstance(e, ASTDirty):
+                    all_paths.extend(e.paths)
+                    if e.project_name:
+                        event_project_name = e.project_name
+            unique_paths = list(dict.fromkeys(all_paths))
 
-        logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
+            logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
-        project_name = event_project_name or self.settings.project_root.name
-        changed_entity_refs: list[EntityRef] = []
-        all_import_rels: list[ParsedRelationship] = []
-        all_call_rels: list[ParsedRelationship] = []
-        skipped_before = self.stats.files_skipped
-        total_changed = 0
+            project_name = event_project_name or self.settings.project_root.name
+            changed_entity_refs: list[EntityRef] = []
+            all_import_rels: list[ParsedRelationship] = []
+            all_call_rels: list[ParsedRelationship] = []
+            skipped_before = self.stats.files_skipped
+            total_changed = 0
 
-        for file_path in unique_paths:
-            changed_qns, refs = await self._process_file(project_name, file_path, all_import_rels, all_call_rels)
-            total_changed += len(changed_qns)
-            changed_entity_refs.extend(refs)
+            for file_path in unique_paths:
+                changed_qns, refs = await self._process_file(project_name, file_path, all_import_rels, all_call_rels)
+                total_changed += len(changed_qns)
+                changed_entity_refs.extend(refs)
 
-        # Post-batch import resolution
-        if all_import_rels:
-            await self.graph.resolve_imports(project_name, all_import_rels)
+            # Post-batch import resolution
+            if all_import_rels:
+                await self.graph.resolve_imports(project_name, all_import_rels)
 
-        # Post-batch call resolution (after imports so import map is available)
-        if all_call_rels:
-            await self.graph.resolve_calls(project_name, all_call_rels)
+            # Post-batch call resolution (after imports so import map is available)
+            if all_call_rels:
+                await self.graph.resolve_calls(project_name, all_call_rels)
 
-        logger.info(
-            "Tier2 batch {}: {} files, {} skipped, {} entities changed",
-            batch_id,
-            len(unique_paths),
-            self.stats.files_skipped - skipped_before,
-            total_changed,
-        )
+            span.set_attribute("files_count", len(unique_paths))
+            span.set_attribute("entities_changed", total_changed)
 
-        if changed_entity_refs:
-            await self.bus.publish(
-                Topic.EMBED_DIRTY,
-                EmbedDirty(entities=changed_entity_refs, significance="HIGH", batch_id=batch_id),
+            logger.info(
+                "Tier2 batch {}: {} files, {} skipped, {} entities changed",
+                batch_id,
+                len(unique_paths),
+                self.stats.files_skipped - skipped_before,
+                total_changed,
             )
+
+            if changed_entity_refs:
+                await self.bus.publish(
+                    Topic.EMBED_DIRTY,
+                    EmbedDirty(entities=changed_entity_refs, significance="HIGH", batch_id=batch_id),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -434,68 +442,76 @@ class Tier3EmbedConsumer(TierConsumer):
         return result
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
-        # Collect and deduplicate entities across all events in the batch
-        seen: dict[str, EntityRef] = {}
-        for e in events:
-            if isinstance(e, EmbedDirty):
-                for entity in e.entities:
-                    seen[entity.qualified_name] = entity
+        with _tracer.start_as_current_span("tier3.process_batch", attributes={"batch_id": batch_id}) as span:
+            # Collect and deduplicate entities across all events in the batch
+            seen: dict[str, EntityRef] = {}
+            for e in events:
+                if isinstance(e, EmbedDirty):
+                    for entity in e.entities:
+                        seen[entity.qualified_name] = entity
 
-        entities = list(seen.values())
-        logger.info("Tier3 batch {}: {} unique entity(ies)", batch_id, len(entities))
+            entities = list(seen.values())
+            logger.info("Tier3 batch {}: {} unique entity(ies)", batch_id, len(entities))
 
-        if not entities:
-            return
+            if not entities:
+                return
 
-        t0 = asyncio.get_event_loop().time()
+            t0 = asyncio.get_event_loop().time()
 
-        # 1. Read entity properties from graph (includes embed_hash + embedding)
-        qns = [e.qualified_name for e in entities]
-        entity_props = await self.graph.read_entity_texts(qns)
+            # 1. Read entity properties from graph (includes embed_hash + embedding)
+            qns = [e.qualified_name for e in entities]
+            entity_props = await self.graph.read_entity_texts(qns)
 
-        # 2. Build embed texts — graph-check for unchanged content
-        to_process: list[tuple[str, str, str]] = []  # (qn, text, text_hash)
-        graph_hits = 0
-        for props in entity_props:
-            text = build_embed_text(props)
-            if not text:
-                continue
-            qn = props["qualified_name"]
-            text_hash = EmbedCache.hash_text(text)
-            if props.get("embed_hash") == text_hash and props.get("embedding") is not None:
-                graph_hits += 1
-            else:
-                to_process.append((qn, text, text_hash))
+            # 2. Build embed texts — graph-check for unchanged content
+            to_process: list[tuple[str, str, str]] = []  # (qn, text, text_hash)
+            graph_hits = 0
+            for props in entity_props:
+                text = build_embed_text(props)
+                if not text:
+                    continue
+                qn = props["qualified_name"]
+                text_hash = EmbedCache.hash_text(text)
+                if props.get("embed_hash") == text_hash and props.get("embedding") is not None:
+                    graph_hits += 1
+                else:
+                    to_process.append((qn, text, text_hash))
 
-        total = graph_hits + len(to_process)
-        if not to_process:
+            total = graph_hits + len(to_process)
+            if not to_process:
+                elapsed = asyncio.get_event_loop().time() - t0
+                logger.info(
+                    "Tier3 batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
+                    batch_id,
+                    total,
+                    graph_hits,
+                    elapsed,
+                )
+                return
+
+            # 3. Valkey cache check → 4. API call for misses
+            cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
+            api_vectors = await self._embed_and_store(need_embed)
+
+            # 5. Write all new/changed vectors + embed_hashes to graph
+            all_resolved = cache_resolved + api_vectors
+            if all_resolved:
+                await self.graph.write_embeddings([(qn, vec) for qn, vec, _ in all_resolved])
+                await self.graph.write_embed_hashes([(qn, th) for qn, _, th in all_resolved])
+
             elapsed = asyncio.get_event_loop().time() - t0
+            span.set_attribute("entities_count", total)
+            span.set_attribute("graph_hits", graph_hits)
+            span.set_attribute("cache_hits", cache_hits)
+            span.set_attribute("api_embedded", len(api_vectors))
+
+            get_metrics().embedding_latency.record(elapsed)
+
             logger.info(
-                "Tier3 batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
+                "Tier3 batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
                 batch_id,
                 total,
                 graph_hits,
+                cache_hits,
+                len(api_vectors),
                 elapsed,
             )
-            return
-
-        # 3. Valkey cache check → 4. API call for misses
-        cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
-        api_vectors = await self._embed_and_store(need_embed)
-
-        # 5. Write all new/changed vectors + embed_hashes to graph
-        all_resolved = cache_resolved + api_vectors
-        if all_resolved:
-            await self.graph.write_embeddings([(qn, vec) for qn, vec, _ in all_resolved])
-            await self.graph.write_embed_hashes([(qn, th) for qn, _, th in all_resolved])
-
-        elapsed = asyncio.get_event_loop().time() - t0
-        logger.info(
-            "Tier3 batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
-            batch_id,
-            total,
-            graph_hits,
-            cache_hits,
-            len(api_vectors),
-            elapsed,
-        )

@@ -43,11 +43,14 @@ from code_atlas.subagent import (
     validate_cypher_explain,
     validate_cypher_static,
 )
+from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from code_atlas.settings import AtlasSettings
+
+_tracer = get_tracer(__name__)
 
 # ---------------------------------------------------------------------------
 # Application context
@@ -260,6 +263,8 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
 
     @asynccontextmanager
     async def app_lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:
+        init_telemetry(settings.observability)
+
         graph = GraphClient(settings)
         try:
             await graph.ping()
@@ -275,6 +280,7 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
             yield app_ctx
         finally:
             await graph.close()
+            shutdown_telemetry()
             logger.info("MCP server shut down")
 
     mcp = FastMCP(

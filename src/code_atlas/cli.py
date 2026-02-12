@@ -83,11 +83,16 @@ def mcp(
     """Start the MCP server for AI agent connections."""
     from code_atlas.mcp_server import create_mcp_server
     from code_atlas.settings import AtlasSettings
+    from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = AtlasSettings()
-    server = create_mcp_server(settings)
-    logger.info("Starting MCP server (transport={})", transport)
-    server.run(transport=transport)  # type: ignore[arg-type]  # typer gives str, FastMCP expects Literal
+    init_telemetry(settings.observability)
+    try:
+        server = create_mcp_server(settings)
+        logger.info("Starting MCP server (transport={})", transport)
+        server.run(transport=transport)  # type: ignore[arg-type]  # typer gives str, FastMCP expects Literal
+    finally:
+        shutdown_telemetry()
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +114,11 @@ async def _run_index(
     from code_atlas.graph import GraphClient
     from code_atlas.indexer import detect_sub_projects, index_monorepo, index_project
     from code_atlas.settings import AtlasSettings
+    from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     project_root = Path(path).resolve()
     settings = AtlasSettings(project_root=project_root)
+    init_telemetry(settings.observability)
 
     # Connect to Valkey
     bus = EventBus(settings.redis)
@@ -188,6 +195,7 @@ async def _run_index(
     finally:
         await graph.close()
         await bus.close()
+        shutdown_telemetry()
 
 
 async def _run_search(
@@ -206,8 +214,10 @@ async def _run_search(
     from code_atlas.indexer import StalenessChecker
     from code_atlas.search import SearchType, hybrid_search
     from code_atlas.settings import AtlasSettings
+    from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = AtlasSettings()
+    init_telemetry(settings.observability)
     graph = GraphClient(settings)
     try:
         await graph.ping()
@@ -271,6 +281,7 @@ async def _run_search(
                 logger.warning("  {} file(s) changed since last index", len(info.changed_files))
     finally:
         await graph.close()
+        shutdown_telemetry()
 
 
 async def _run_status() -> None:
@@ -374,10 +385,12 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     from code_atlas.indexer import FileScope
     from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
     from code_atlas.settings import AtlasSettings
+    from code_atlas.telemetry import init_telemetry, shutdown_telemetry
     from code_atlas.watcher import FileWatcher
 
     project_root = Path(path).resolve()
     settings = AtlasSettings(project_root=project_root)
+    init_telemetry(settings.observability)
     if debounce is not None:
         settings.watcher.debounce_s = debounce
     if max_wait is not None:
@@ -410,6 +423,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
             await cache.close()
         await graph.close()
         await bus.close()
+        shutdown_telemetry()
         logger.info("Watch stopped")
 
 
@@ -425,8 +439,10 @@ async def _run_daemon() -> None:
     from code_atlas.graph import GraphClient
     from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
     from code_atlas.settings import AtlasSettings
+    from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = AtlasSettings()
+    init_telemetry(settings.observability)
     bus = EventBus(settings.redis)
 
     # Verify Redis is reachable
@@ -472,6 +488,7 @@ async def _run_daemon() -> None:
             await cache.close()
         await graph.close()
         await bus.close()
+        shutdown_telemetry()
         logger.info("Daemon stopped")
 
 
