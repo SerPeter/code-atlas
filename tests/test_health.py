@@ -267,14 +267,16 @@ async def test_skips_db_checks_when_memgraph_down(tmp_path):
 
         report = await run_health_checks(settings, graph=graph, embed=embed)
 
-    # Should have 6 checks total
-    assert len(report.checks) == 6
+    # Should have 7 checks total (config, memgraph, embeddings, valkey, schema, embedding_model, index)
+    assert len(report.checks) == 7
     assert report.ok is False
 
-    # Schema and index should be marked as FAIL/skipped
+    # Schema, embedding_model, and index should be marked as FAIL/skipped
     by_name = {c.name: c for c in report.checks}
     assert by_name["schema"].status == CheckStatus.FAIL
     assert "Skipped" in by_name["schema"].message
+    assert by_name["embedding_model"].status == CheckStatus.FAIL
+    assert "Skipped" in by_name["embedding_model"].message
     assert by_name["index"].status == CheckStatus.FAIL
     assert "Skipped" in by_name["index"].message
 
@@ -297,6 +299,7 @@ async def test_all_pass_when_healthy(tmp_path):
     graph.get_schema_version = AsyncMock(return_value=SCHEMA_VERSION)
     graph.get_project_status = AsyncMock(return_value=[{"n": node}])
     graph.get_project_git_hash = AsyncMock(return_value=None)
+    graph.get_embedding_config = AsyncMock(return_value=None)
 
     # Mock embed
     embed = AsyncMock()
@@ -318,6 +321,6 @@ async def test_all_pass_when_healthy(tmp_path):
         report = await run_health_checks(settings, graph=graph, embed=embed)
 
     assert report.ok is True
-    assert len(report.checks) == 6
+    assert len(report.checks) == 7
     for c in report.checks:
         assert c.status in (CheckStatus.OK, CheckStatus.WARN), f"{c.name} unexpectedly {c.status}: {c.message}"

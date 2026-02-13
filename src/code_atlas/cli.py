@@ -153,6 +153,7 @@ def watch(
 @app.command()
 def mcp(
     transport: str = typer.Option("stdio", "--transport", "-t", help="Transport: stdio, streamable-http"),
+    strict: bool = typer.Option(False, "--strict", help="Refuse to start if embedding model mismatch."),
 ) -> None:
     """Start the MCP server for AI agent connections."""
     from code_atlas.mcp_server import create_mcp_server
@@ -162,7 +163,7 @@ def mcp(
     settings = AtlasSettings()
     init_telemetry(settings.observability)
     try:
-        server = create_mcp_server(settings)
+        server = create_mcp_server(settings, strict=strict)
         logger.info("Starting MCP server (transport={})", transport)
         server.run(transport=transport)  # type: ignore[arg-type]  # typer gives str, FastMCP expects Literal
     finally:
@@ -202,6 +203,21 @@ async def _run_index(  # noqa: PLR0915
         logger.error("Cannot reach Valkey at {}:{} — {}", settings.redis.host, settings.redis.port, exc)
         raise typer.Exit(code=1) from exc
     logger.info("Connected to Valkey at {}:{}", settings.redis.host, settings.redis.port)
+
+    # Resolve embedding dimension before graph construction (vector indices need it)
+    if settings.embeddings.dimension is None:
+        from code_atlas.embeddings import EmbedClient as _EmbedClient
+
+        _probe = _EmbedClient(settings.embeddings)
+        try:
+            resolved_dim = await _probe.detect_dimension()
+        except Exception as exc:
+            logger.error("Cannot auto-detect embedding dimension: {}", exc)
+            logger.error("Set 'dimension' in atlas.toml [embeddings] or start the embedding service.")
+            await bus.close()
+            raise typer.Exit(code=1) from exc
+        settings.embeddings.dimension = resolved_dim
+        logger.info("Auto-detected embedding dimension: {}", resolved_dim)
 
     # Connect to Memgraph
     graph = GraphClient(settings)
@@ -285,7 +301,7 @@ async def _run_index(  # noqa: PLR0915
         shutdown_telemetry()
 
 
-async def _run_search(
+async def _run_search(  # noqa: PLR0915
     query: str,
     type_: str,
     scope: str | None,
@@ -325,8 +341,27 @@ async def _run_search(
         await graph.close()
         raise typer.Exit(code=1)
 
+    # Check model lock — warn and disable vector if mismatch
     embed: EmbedClient | None = None
-    if search_types is None or SearchType.VECTOR in search_types:
+    stored_config = await graph.get_embedding_config()
+    model_mismatch = stored_config is not None and stored_config[0] != settings.embeddings.model
+    if model_mismatch:
+        stored_model = stored_config[0]  # type: ignore[index]
+        if search_types and SearchType.VECTOR in search_types:
+            logger.error(
+                "Cannot use vector search: model mismatch (stored='{}', current='{}'). Run 'atlas index --full'.",
+                stored_model,
+                settings.embeddings.model,
+            )
+            await graph.close()
+            raise typer.Exit(code=1)
+        logger.warning(
+            "Embedding model mismatch (stored='{}', current='{}') — vector search disabled",
+            stored_model,
+            settings.embeddings.model,
+        )
+
+    if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
         embed = EmbedClient(settings.embeddings)
 
     try:

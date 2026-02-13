@@ -118,6 +118,11 @@ class EmbedClient:
 
             return vector
 
+    async def detect_dimension(self) -> int:
+        """Probe the embedding service and return the vector dimension."""
+        vectors = await self.embed_batch(["dimension probe"])
+        return len(vectors[0])
+
     async def health_check(self) -> bool:
         """Check if the embedding service is reachable.
 
@@ -235,6 +240,20 @@ class EmbedCache:
                     break
         except Exception:
             logger.warning("EmbedCache.clear failed")
+
+    async def clear_all_models(self) -> None:
+        """Delete ALL cached embeddings across all models."""
+        try:
+            pattern = f"{self._prefix}:emb:*"
+            cursor: int | bytes = 0
+            while True:
+                cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=500)
+                if keys:
+                    await self._redis.delete(*keys)
+                if cursor == 0:
+                    break
+        except Exception:
+            logger.warning("EmbedCache.clear_all_models failed")
 
     async def close(self) -> None:
         """Close the Redis connection."""

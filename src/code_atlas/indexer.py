@@ -649,15 +649,26 @@ class StalenessChecker:
 # ---------------------------------------------------------------------------
 
 
-async def _check_model_lock(graph: GraphClient, model: str, dimension: int, *, reindex: bool) -> None:
+async def _check_model_lock(
+    graph: GraphClient,
+    model: str,
+    dimension: int,
+    *,
+    reindex: bool,
+    cache: EmbedCache | None = None,
+) -> None:
     """Enforce embedding model lock on the SchemaVersion node.
 
     - First run (no stored model): write current config.
-    - Reindex: clear embeddings, write new config.
+    - Reindex: clear embeddings + embed_hash, rebuild vector indices,
+      flush all model keys from Valkey cache, write new config.
     - Mismatch: raise RuntimeError with clear guidance.
     """
     if reindex:
         await graph.clear_all_embeddings()
+        await graph.rebuild_vector_indices(dimension)
+        if cache is not None:
+            await cache.clear_all_models()
         await graph.set_embedding_config(model, dimension)
         return
 
@@ -667,7 +678,7 @@ async def _check_model_lock(graph: GraphClient, model: str, dimension: int, *, r
         if stored_model != model:
             msg = (
                 f"Embedding model changed from '{stored_model}' to '{model}'. "
-                f"Run `atlas index --reindex` to rebuild all embeddings."
+                "Run 'atlas index --full' to rebuild all embeddings."
             )
             raise RuntimeError(msg)
     else:
@@ -947,7 +958,8 @@ async def _index_project_inner(
         if cache is not None:
             await cache.clear()
 
-    await _check_model_lock(graph, settings.embeddings.model, settings.embeddings.dimension, reindex=full_reindex)
+    dimension = settings.embeddings.dimension or 768
+    await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
 
     # 3. Decide full vs. delta mode
     if full_reindex:
@@ -1101,15 +1113,6 @@ async def _index_monorepo_inner(
 
     if root_only_files:
         logger.info("Indexing root project '{}' ({} file(s) outside sub-projects)", root_name, len(root_only_files))
-        # For root files, we publish them under the root project name
-        # but index_project expects to scan files itself. We use scope_paths
-        # exclusion approach: index with the full root but exclude sub-project paths.
-        # Actually simpler: just call index_project with the root but scope to exclude sub-project dirs.
-        # But the cleanest approach is to scan ourselves and publish directly.
-        # Let's use index_project with scope_paths set to root-level dirs only.
-        # Actually, the simplest is to just call index_project for the root project,
-        # and it naturally indexes everything. Then we'd double-index sub-project files.
-        # Instead, let's manually handle it:
         result = await _index_root_project(
             settings,
             graph,
@@ -1161,7 +1164,8 @@ async def _index_root_project(
     if full_reindex:
         await graph.delete_project_data(project_name)
 
-    await _check_model_lock(graph, settings.embeddings.model, settings.embeddings.dimension, reindex=full_reindex)
+    dimension = settings.embeddings.dimension or 768
+    await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
 
     # Always full mode for root project (simpler — root files are typically few)
     decision = _DeltaDecision("full", set(), set(), set())

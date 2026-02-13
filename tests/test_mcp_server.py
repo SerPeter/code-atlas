@@ -862,6 +862,7 @@ class TestMaybeUpdateRoot:
 
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
+        mock_graph.get_embedding_config = AsyncMock(return_value=None)
         old_daemon = AsyncMock()
         old_daemon.stop = AsyncMock()
         app = AppContext(

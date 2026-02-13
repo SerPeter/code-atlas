@@ -202,6 +202,28 @@ async def check_config(settings: AtlasSettings) -> CheckResult:
     return CheckResult(name, CheckStatus.OK, f"Valid root: {root}")
 
 
+async def check_embedding_model(graph: GraphClient, embed_settings: EmbeddingSettings) -> CheckResult:
+    """Check whether the stored embedding model matches the configured model."""
+    name = "embedding_model"
+    try:
+        stored = await asyncio.wait_for(graph.get_embedding_config(), timeout=_CHECK_TIMEOUT)
+    except Exception as exc:
+        return CheckResult(name, CheckStatus.WARN, "Cannot read embedding config", detail=str(exc))
+
+    if stored is None:
+        return CheckResult(name, CheckStatus.OK, "No model lock (fresh database)")
+    stored_model, stored_dim = stored
+    if stored_model == embed_settings.model:
+        return CheckResult(name, CheckStatus.OK, f"Model matches: {stored_model} ({stored_dim}d)")
+    return CheckResult(
+        name,
+        CheckStatus.WARN,
+        f"Mismatch: stored='{stored_model}', configured='{embed_settings.model}'",
+        detail=f"Stored dimension: {stored_dim}. Vector search disabled until re-indexed.",
+        suggestion="Run 'atlas index --full' to re-embed with the new model.",
+    )
+
+
 async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResult:
     """Check indexed project status."""
     name = "index"
@@ -291,14 +313,17 @@ async def run_health_checks(
         # Phase 2: Memgraph-dependent checks
         if mg_res.status == CheckStatus.FAIL:
             results.append(CheckResult("schema", CheckStatus.FAIL, _SKIPPED_DETAIL))
+            results.append(CheckResult("embedding_model", CheckStatus.FAIL, _SKIPPED_DETAIL))
             results.append(CheckResult("index", CheckStatus.FAIL, _SKIPPED_DETAIL))
         else:
             assert graph is not None
-            schema_res, index_res = await asyncio.gather(
+            schema_res, model_res, index_res = await asyncio.gather(
                 check_schema(graph),
+                check_embedding_model(graph, settings.embeddings),
                 check_index(graph, settings),
             )
             results.append(schema_res)
+            results.append(model_res)
             results.append(index_res)
     finally:
         if own_graph:

@@ -128,7 +128,7 @@ class GraphClient:
         self._uri = f"bolt://{mg.host}:{mg.port}"
         auth = (mg.username, mg.password) if mg.username else None
         self._driver: AsyncDriver = AsyncGraphDatabase.driver(self._uri, auth=auth)
-        self._dimension = settings.embeddings.dimension
+        self._dimension = settings.embeddings.dimension or 768
 
     async def ping(self) -> bool:
         """Health check — returns True if Memgraph is reachable."""
@@ -921,8 +921,18 @@ class GraphClient:
         )
 
     async def clear_all_embeddings(self) -> None:
-        """Remove embedding vectors from all nodes."""
-        await self.execute_write("MATCH (n) WHERE n.embedding IS NOT NULL REMOVE n.embedding")
+        """Remove embedding vectors and content hashes from all nodes."""
+        await self.execute_write(
+            "MATCH (n) WHERE n.embedding IS NOT NULL OR n.embed_hash IS NOT NULL REMOVE n.embedding, n.embed_hash"
+        )
+
+    async def rebuild_vector_indices(self, dimension: int) -> None:
+        """Drop and recreate vector indices at the specified dimension."""
+        for stmt in generate_drop_vector_index_ddl():
+            await self._exec_ddl(stmt)
+        for stmt in generate_vector_index_ddl(dimension):
+            await self._exec_ddl(stmt)
+        self._dimension = dimension
 
     async def get_vector_index_info(self) -> list[dict[str, Any]]:
         """Query Memgraph for vector index metadata.

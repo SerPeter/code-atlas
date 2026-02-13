@@ -84,6 +84,7 @@ class AppContext:
     daemon: DaemonManager = field(default_factory=DaemonManager)
     resolved_root: Path | None = field(default=None, repr=False)
     roots_checked: bool = field(default=False, repr=False)
+    vector_enabled: bool = field(default=True, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,19 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
     app.embed = EmbedClient(app.settings.embeddings)
     app.resolved_root = new_root
     app.staleness = StalenessChecker(new_root, project_name=new_root.name)
+
+    # Re-check embedding model match for new root
+    app.vector_enabled = True
+    stored_config = await app.graph.get_embedding_config()
+    if stored_config is not None:
+        stored_model, _stored_dim = stored_config
+        if stored_model != app.settings.embeddings.model:
+            logger.warning(
+                "Embedding model mismatch after root switch (stored='{}', current='{}'). Vector search disabled.",
+                stored_model,
+                app.settings.embeddings.model,
+            )
+            app.vector_enabled = False
 
     started = await app.daemon.start(app.settings, app.graph)
     if started:
@@ -357,7 +371,7 @@ def _rank_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def create_mcp_server(settings: AtlasSettings) -> FastMCP:
+def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastMCP:  # noqa: PLR0915
     """Create and configure the Code Atlas MCP server."""
 
     @asynccontextmanager
@@ -372,6 +386,28 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
             raise
 
         logger.info("MCP connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+
+        # Check embedding model lock
+        vector_enabled = True
+        stored_config = await graph.get_embedding_config()
+        if stored_config is not None:
+            stored_model, _stored_dim = stored_config
+            if stored_model != settings.embeddings.model:
+                if strict:
+                    await graph.close()
+                    msg = (
+                        f"Embedding model mismatch: stored='{stored_model}', "
+                        f"configured='{settings.embeddings.model}'. "
+                        "Refusing to start in strict mode. Run 'atlas index --full' to re-embed."
+                    )
+                    raise RuntimeError(msg)
+                logger.warning(
+                    "Embedding model mismatch (stored='{}', current='{}'). Vector search disabled.",
+                    stored_model,
+                    settings.embeddings.model,
+                )
+                vector_enabled = False
+
         embed = EmbedClient(settings.embeddings)
         staleness = StalenessChecker(settings.project_root, project_name=settings.project_root.name)
         daemon = DaemonManager()
@@ -382,6 +418,7 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
             staleness=staleness,
             daemon=daemon,
             resolved_root=settings.project_root,
+            vector_enabled=vector_enabled,
         )
 
         # Register handler for roots/list_changed notification so we re-probe
@@ -642,6 +679,11 @@ def _register_search_tools(mcp: FastMCP) -> None:
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
+        if not app.vector_enabled:
+            return _error(
+                "Vector search disabled: embedding model mismatch. Run 'atlas index --full' to re-embed.",
+                code="MODEL_MISMATCH",
+            )
         clamped = _clamp_limit(limit)
 
         # Embed the query
@@ -721,7 +763,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         results = await _hybrid_search(
             graph=app.graph,
-            embed=app.embed,
+            embed=app.embed if app.vector_enabled else None,
             settings=app.settings.search,
             query=query,
             search_types=types,

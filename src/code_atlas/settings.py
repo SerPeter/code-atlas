@@ -92,7 +92,7 @@ class EmbeddingSettings(BaseSettings):
     provider: str = Field(default="tei", description="Embedding provider: 'tei', 'litellm', or 'ollama'.")
     model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")
     base_url: str = Field(default="http://localhost:8080", description="OpenAI-compatible embedding endpoint URL.")
-    dimension: int = Field(default=768, description="Embedding vector dimension.")
+    dimension: int | None = Field(default=None, description="Embedding vector dimension. Auto-detected when None.")
     batch_size: int = Field(default=32, description="Max texts per embedding API call.")
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
     query_cache_size: int = Field(default=128, description="Max cached query embeddings (LRU eviction).")
