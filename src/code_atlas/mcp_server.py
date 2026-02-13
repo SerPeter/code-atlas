@@ -1,21 +1,28 @@
 """MCP server for Code Atlas.
 
 Exposes the Memgraph graph database to AI coding agents via MCP tools.
-Read-only query interface — connects directly to Memgraph, no daemon dependency.
+Auto-starts file watcher + pipeline when Valkey is reachable; falls back
+to query-only mode otherwise.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
+import tomllib
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 
+from code_atlas.daemon import DaemonManager
 from code_atlas.embeddings import EmbedClient, EmbeddingError
 from code_atlas.graph import GraphClient
 from code_atlas.indexer import StalenessChecker
@@ -35,6 +42,7 @@ from code_atlas.schema import (
 )
 from code_atlas.search import CompactNode, SearchType, expand_context, expand_scope
 from code_atlas.search import hybrid_search as _hybrid_search
+from code_atlas.settings import AtlasSettings
 from code_atlas.subagent import (
     _RELATIONSHIP_SUMMARY,
     CYPHER_EXAMPLES,
@@ -47,8 +55,6 @@ from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-
-    from code_atlas.settings import AtlasSettings
 
 _tracer = get_tracer(__name__)
 
@@ -74,6 +80,91 @@ class AppContext:
     settings: AtlasSettings
     embed: EmbedClient
     staleness: StalenessChecker | None = None
+    daemon: DaemonManager = field(default_factory=DaemonManager)
+    resolved_root: Path | None = field(default=None, repr=False)
+    roots_checked: bool = field(default=False, repr=False)
+
+
+# ---------------------------------------------------------------------------
+# MCP Roots helpers
+# ---------------------------------------------------------------------------
+
+_ROOTS_TIMEOUT = 2.0  # seconds — fast fail for broken/missing clients
+
+
+def _file_uri_to_path(uri: str) -> Path:
+    """Convert a ``file://`` URI to a local :class:`Path` (cross-platform)."""
+    parsed = urllib.parse.urlparse(uri)
+    return Path(urllib.request.url2pathname(parsed.path))
+
+
+async def _try_list_roots(ctx: Context) -> Path | None:
+    """Attempt to get the first root from the MCP client, with timeout.
+
+    Returns ``None`` on any failure (timeout, no roots, no session).
+    """
+    try:
+        session = ctx.session
+        result = await asyncio.wait_for(session.list_roots(), timeout=_ROOTS_TIMEOUT)
+        roots = result.roots if hasattr(result, "roots") else result
+        if roots:
+            uri = str(roots[0].uri)
+            if uri.startswith("file://"):
+                return _file_uri_to_path(uri)
+    except Exception:
+        pass
+    return None
+
+
+async def _switch_root(app: AppContext, new_root: Path) -> None:
+    """Stop daemon, re-create settings from *new_root*, restart daemon."""
+    await app.daemon.stop()
+    app.daemon = DaemonManager()
+
+    # Re-read atlas.toml from new root and re-create settings.
+    # Init kwargs have highest Pydantic precedence (init > env > toml > default)
+    # so env vars still apply for fields not in the toml.
+    overrides: dict[str, Any] = {"project_root": new_root}
+    toml_path = new_root / "atlas.toml"
+    if toml_path.is_file():
+        with toml_path.open("rb") as fh:
+            overrides.update(tomllib.load(fh))
+        overrides["project_root"] = new_root  # ensure root wins over toml
+
+    app.settings = AtlasSettings(**overrides)
+    app.embed = EmbedClient(app.settings.embeddings)
+    app.resolved_root = new_root
+    app.staleness = StalenessChecker(new_root, project_name=new_root.name)
+
+    started = await app.daemon.start(app.settings, app.graph)
+    if started:
+        logger.info("Daemon restarted for new root: {}", new_root)
+    else:
+        logger.info("Query-only mode for new root: {} (no Valkey)", new_root)
+
+
+async def _maybe_update_root(app: AppContext, ctx: Context) -> None:
+    """On first tool call, try MCP roots.  Restart daemon if root changed.
+
+    Short-circuits immediately after first check via ``roots_checked`` flag.
+    """
+    if app.roots_checked:
+        return
+    app.roots_checked = True
+
+    root = await _try_list_roots(ctx)
+    if root is None:
+        logger.debug("MCP roots unavailable — keeping current root: {}", app.settings.project_root)
+        return
+
+    root = root.resolve()
+    current = app.settings.project_root.resolve()
+    if root == current:
+        logger.debug("MCP root matches current root: {}", current)
+        return
+
+    logger.info("MCP root differs from current root ({} → {}), switching…", current, root)
+    await _switch_root(app, root)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +175,13 @@ class AppContext:
 def _get_app_ctx(ctx: Context) -> AppContext:
     """Extract AppContext from the MCP request context."""
     return ctx.request_context.lifespan_context
+
+
+async def _ensure_root(ctx: Context) -> AppContext:
+    """Extract AppContext and ensure MCP roots have been checked."""
+    app: AppContext = ctx.request_context.lifespan_context
+    await _maybe_update_root(app, ctx)
+    return app
 
 
 def _serialize_node(record: dict[str, Any]) -> dict[str, Any]:
@@ -109,7 +207,7 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
     props = dict(node.items()) if hasattr(node, "items") else (node if isinstance(node, dict) else {})
 
     compact: dict[str, Any] = {}
-    for field in (
+    for key in (
         "uid",
         "name",
         "qualified_name",
@@ -120,8 +218,8 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
         "signature",
         "visibility",
     ):
-        if field in props:
-            compact[field] = props[field]
+        if key in props:
+            compact[key] = props[key]
 
     docstring = props.get("docstring")
     if docstring:
@@ -275,10 +373,41 @@ def create_mcp_server(settings: AtlasSettings) -> FastMCP:
         logger.info("MCP connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
         embed = EmbedClient(settings.embeddings)
         staleness = StalenessChecker(settings.project_root, project_name=settings.project_root.name)
-        app_ctx = AppContext(graph=graph, settings=settings, embed=embed, staleness=staleness)
+        daemon = DaemonManager()
+        app_ctx = AppContext(
+            graph=graph,
+            settings=settings,
+            embed=embed,
+            staleness=staleness,
+            daemon=daemon,
+            resolved_root=settings.project_root,
+        )
+
+        # Register handler for roots/list_changed notification so we re-probe
+        # on next tool call.  _mcp_server.notification_handlers is private API
+        # in FastMCP — the only way to register notification handlers today.
+        try:
+            raw = _server._mcp_server  # noqa: SLF001
+
+            async def _on_roots_changed(*_args: object, **_kwargs: object) -> None:
+                app_ctx.roots_checked = False
+                logger.debug("Received roots/list_changed — will re-probe on next tool call")
+
+            raw.notification_handlers["notifications/roots/list_changed"] = _on_roots_changed  # type: ignore[index]
+        except Exception:
+            logger.debug("Could not register roots/list_changed handler — root updates via notification disabled")
+
+        # Auto-start watcher + pipeline if Valkey is reachable
+        daemon_running = await daemon.start(settings, graph)
+        if daemon_running:
+            logger.info("Auto-indexing active (watching {})", settings.project_root)
+        else:
+            logger.info("Query-only mode (no Valkey)")
+
         try:
             yield app_ctx
         finally:
+            await app_ctx.daemon.stop()
             await graph.close()
             shutdown_telemetry()
             logger.info("MCP server shut down")
@@ -321,7 +450,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
         ),
     )
     async def get_node(name: str, label: str = "", limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
         label_filter = f":{label}" if label else ""
@@ -391,7 +520,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
         ),
     )
     async def cypher_query(query: str, limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
         if _WRITE_KEYWORDS.search(query):
@@ -429,7 +558,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
         include_docs: bool = True,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         t0 = time.monotonic()
 
         expanded = await expand_context(
@@ -483,7 +612,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
         project: str = "",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
         t0 = time.monotonic()
@@ -511,7 +640,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
         threshold: float = 0.0,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
         # Embed the query
@@ -558,7 +687,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         exclude_generated: bool | None = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
         # Parse search_types
@@ -639,7 +768,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
         ),
     )
     async def index_status(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         t0 = time.monotonic()
 
         projects_raw = await app.graph.get_project_status()
@@ -690,7 +819,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
         ),
     )
     async def list_projects(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = _get_app_ctx(ctx)
+        app = await _ensure_root(ctx)
         t0 = time.monotonic()
 
         projects_raw = await app.graph.get_project_status()
@@ -789,7 +918,7 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
 
         # Try EXPLAIN against live DB if available
         try:
-            app = _get_app_ctx(ctx)
+            app = await _ensure_root(ctx)
             explain_issue = await validate_cypher_explain(app.graph, query)
             if explain_issue is not None:
                 issues.append(explain_issue)

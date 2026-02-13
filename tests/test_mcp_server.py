@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp.server.fastmcp import FastMCP
@@ -14,6 +16,8 @@ from code_atlas.mcp_server import (
     AppContext,
     _clamp_limit,
     _error,
+    _file_uri_to_path,
+    _maybe_update_root,
     _rank_results,
     _register_info_tools,
     _register_node_tools,
@@ -37,6 +41,7 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
+from code_atlas.settings import find_git_root
 
 # ---------------------------------------------------------------------------
 # Fake context for direct tool invocation
@@ -725,3 +730,106 @@ class TestWithStaleness:
             result = {"results": []}
             annotated = await _with_staleness(app, result, scope="myproject")
             assert annotated["stale"] is None
+
+
+# ---------------------------------------------------------------------------
+# find_git_root (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestFindGitRoot:
+    def test_found(self, tmp_path):
+        """Subdirectory resolves to parent containing .git/."""
+        (tmp_path / ".git").mkdir()
+        sub = tmp_path / "a" / "b"
+        sub.mkdir(parents=True)
+        assert find_git_root(sub) == tmp_path
+
+    def test_not_found(self, tmp_path):
+        """No .git in tree → returns None."""
+        sub = tmp_path / "a" / "b"
+        sub.mkdir(parents=True)
+        assert find_git_root(sub) is None
+
+
+# ---------------------------------------------------------------------------
+# _file_uri_to_path (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestFileUriToPath:
+    def test_posix_uri(self):
+        p = _file_uri_to_path("file:///home/user/project")
+        assert str(p).replace("\\", "/").endswith("/home/user/project")
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific path handling")
+    def test_windows_uri(self):
+        p = _file_uri_to_path("file:///D:/dev/project")
+        assert p == Path("D:/dev/project")
+
+
+# ---------------------------------------------------------------------------
+# _maybe_update_root (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeUpdateRoot:
+    async def test_skips_when_checked(self, settings):
+        """roots_checked=True → no-op, no session access."""
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=settings, embed=embed, roots_checked=True)
+        ctx = MagicMock()
+        await _maybe_update_root(app, ctx)
+        # Should not have touched session at all
+        ctx.session.list_roots.assert_not_called() if hasattr(ctx.session, "list_roots") else None
+        assert app.roots_checked is True
+
+    async def test_handles_timeout(self, settings):
+        """list_roots() times out → keeps current root."""
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=settings, embed=embed)
+        ctx = MagicMock()
+        # Simulate a timeout on list_roots
+        ctx.session.list_roots = AsyncMock(side_effect=TimeoutError)
+        await _maybe_update_root(app, ctx)
+        assert app.roots_checked is True
+        assert app.settings.project_root == settings.project_root
+
+    async def test_restarts_daemon_on_new_root(self, tmp_path, settings):
+        """list_roots() returns different root → daemon stop+start called."""
+        new_root = tmp_path / "other_project"
+        new_root.mkdir()
+
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        old_daemon = AsyncMock()
+        old_daemon.stop = AsyncMock()
+        app = AppContext(
+            graph=mock_graph,
+            settings=settings,
+            embed=embed,
+            daemon=old_daemon,
+            resolved_root=settings.project_root,
+        )
+
+        # Mock list_roots to return a different root
+        mock_root = MagicMock()
+        mock_root.uri = new_root.as_uri()
+        mock_result = MagicMock()
+        mock_result.roots = [mock_root]
+
+        ctx = MagicMock()
+        ctx.session.list_roots = AsyncMock(return_value=mock_result)
+
+        # Mock the new DaemonManager that _switch_root creates
+        mock_new_daemon = AsyncMock()
+        mock_new_daemon.start = AsyncMock(return_value=False)
+        with patch("code_atlas.mcp_server.DaemonManager", return_value=mock_new_daemon):
+            await _maybe_update_root(app, ctx)
+
+        assert app.roots_checked is True
+        old_daemon.stop.assert_awaited_once()
+        assert app.settings.project_root == new_root
+        assert app.resolved_root == new_root

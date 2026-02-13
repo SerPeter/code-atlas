@@ -7,6 +7,43 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict, TomlConfigSettingsSource
 
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+
+def find_git_root(start: Path | None = None) -> Path | None:
+    """Walk up from *start* (default: cwd) looking for a ``.git`` directory.
+
+    Returns the containing directory or ``None`` if no ``.git`` is found.
+    """
+    current = (start or Path.cwd()).resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _default_project_root() -> Path:
+    """Git root if found, otherwise cwd."""
+    return find_git_root() or Path.cwd()
+
+
+def _find_atlas_toml() -> Path | None:
+    """Walk up from cwd looking for ``atlas.toml``."""
+    current = Path.cwd().resolve()
+    while True:
+        candidate = current / "atlas.toml"
+        if candidate.is_file():
+            return candidate
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
 
 class ScopeSettings(BaseSettings):
     """File scope and ignore settings."""
@@ -171,14 +208,14 @@ class AtlasSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        return (
-            init_settings,
-            env_settings,
-            TomlConfigSettingsSource(settings_cls),
-            file_secret_settings,
-        )
+        toml_path = _find_atlas_toml()
+        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
+        if toml_path:
+            sources.append(TomlConfigSettingsSource(settings_cls, toml_file=toml_path))
+        sources.append(file_secret_settings)
+        return tuple(sources)
 
-    project_root: Path = Field(default_factory=Path.cwd, description="Project root path.")
+    project_root: Path = Field(default_factory=_default_project_root, description="Project root path.")
     scope: ScopeSettings = Field(default_factory=ScopeSettings)
     libraries: LibrarySettings = Field(default_factory=LibrarySettings)
     monorepo: MonorepoSettings = Field(default_factory=MonorepoSettings)
