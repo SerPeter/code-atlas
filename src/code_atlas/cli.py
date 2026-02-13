@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from dataclasses import asdict, dataclass
+from typing import Any
 
 import typer
 from dotenv import load_dotenv
@@ -12,9 +15,68 @@ load_dotenv()  # Load .env into os.environ (ATLAS_* + provider API keys)
 
 app = typer.Typer(
     name="atlas",
-    help="Code Atlas — map your codebase, search it three ways, feed it to agents.",
     no_args_is_help=True,
 )
+
+
+# ---------------------------------------------------------------------------
+# Output mode (global flags)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OutputMode:
+    quiet: bool = False
+    json: bool = False
+    verbose: int = 0  # 0=normal, 1=debug, 2=trace
+    no_color: bool = False
+
+
+_output = OutputMode()
+
+
+def _configure_logger() -> None:
+    """Reconfigure loguru based on global output flags."""
+    logger.remove()
+
+    if _output.json:
+        # JSON mode: only errors on stderr, no formatting noise
+        logger.add(sys.stderr, level="ERROR", colorize=False, format="{message}")
+        return
+
+    if _output.quiet:
+        level = "WARNING"
+    elif _output.verbose >= 2:
+        level = "TRACE"
+    elif _output.verbose >= 1:
+        level = "DEBUG"
+    else:
+        level = "INFO"
+
+    logger.add(sys.stderr, level=level, colorize=False if _output.no_color else None)
+
+
+def _json_output(payload: dict[str, Any]) -> None:
+    """Write a JSON object to stdout."""
+    import json as _json
+
+    print(_json.dumps(payload, indent=2, default=str))
+
+
+@app.callback()
+def main(
+    quiet: bool = typer.Option(False, "--quiet", "-q", envvar="ATLAS_QUIET", help="Suppress info output (CI mode)."),
+    json_flag: bool = typer.Option(False, "--json", envvar="ATLAS_JSON", help="Machine-readable JSON output."),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity (-v debug, -vv trace)."),
+    no_color: bool = typer.Option(False, "--no-color", envvar="NO_COLOR", help="Disable colored output."),
+) -> None:
+    """Code Atlas — map your codebase, search it three ways, feed it to agents."""
+    _output.quiet = quiet
+    _output.json = json_flag
+    _output.verbose = verbose
+    _output.no_color = no_color
+    _configure_logger()
+
 
 daemon_app = typer.Typer(name="daemon", help="Manage the Code Atlas indexing daemon.")
 app.add_typer(daemon_app)
@@ -64,19 +126,15 @@ def status() -> None:
 
 
 @app.command()
-def health(
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
-) -> None:
+def health() -> None:
     """Quick infrastructure health check (exit 0 = ok, 1 = any failed)."""
-    asyncio.run(_run_health(json_output=json_output))
+    asyncio.run(_run_health())
 
 
 @app.command()
-def doctor(
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
-) -> None:
+def doctor() -> None:
     """Detailed diagnostic report with fix suggestions."""
-    asyncio.run(_run_doctor(json_output=json_output))
+    asyncio.run(_run_doctor())
 
 
 @app.command()
@@ -116,7 +174,7 @@ def mcp(
 # ---------------------------------------------------------------------------
 
 
-async def _run_index(
+async def _run_index(  # noqa: PLR0915
     path: str,
     scope: list[str] | None,
     full_reindex: bool,
@@ -173,13 +231,23 @@ async def _run_index(
             total_files = sum(r.files_scanned for r in results)
             total_entities = sum(r.entities_total for r in results)
             total_duration = sum(r.duration_s for r in results)
-            logger.info(
-                "Monorepo indexing complete — {} sub-project(s), {} files, {} entities, {:.1f}s total",
-                len(results),
-                total_files,
-                total_entities,
-                total_duration,
-            )
+            if _output.json:
+                _json_output(
+                    {
+                        "projects": [asdict(r) for r in results],
+                        "total_files": total_files,
+                        "total_entities": total_entities,
+                        "total_duration_s": round(total_duration, 1),
+                    }
+                )
+            else:
+                logger.info(
+                    "Monorepo indexing complete — {} sub-project(s), {} files, {} entities, {:.1f}s total",
+                    len(results),
+                    total_files,
+                    total_entities,
+                    total_duration,
+                )
         else:
             result = await index_project(
                 settings,
@@ -188,26 +256,29 @@ async def _run_index(
                 scope_paths=scope or None,
                 full_reindex=full_reindex,
             )
-            logger.info(
-                "Done ({}) — {} files scanned, {} published, {} entities in {:.1f}s",
-                result.mode,
-                result.files_scanned,
-                result.files_published,
-                result.entities_total,
-                result.duration_s,
-            )
-            if result.delta_stats is not None:
-                ds = result.delta_stats
+            if _output.json:
+                _json_output(asdict(result))
+            else:
                 logger.info(
-                    "Delta: files +{} ~{} -{} | entities +{} ~{} -{} ={} unchanged",
-                    ds.files_added,
-                    ds.files_modified,
-                    ds.files_deleted,
-                    ds.entities_added,
-                    ds.entities_modified,
-                    ds.entities_deleted,
-                    ds.entities_unchanged,
+                    "Done ({}) — {} files scanned, {} published, {} entities in {:.1f}s",
+                    result.mode,
+                    result.files_scanned,
+                    result.files_published,
+                    result.entities_total,
+                    result.duration_s,
                 )
+                if result.delta_stats is not None:
+                    ds = result.delta_stats
+                    logger.info(
+                        "Delta: files +{} ~{} -{} | entities +{} ~{} -{} ={} unchanged",
+                        ds.files_added,
+                        ds.files_modified,
+                        ds.files_deleted,
+                        ds.entities_added,
+                        ds.entities_modified,
+                        ds.entities_deleted,
+                        ds.entities_unchanged,
+                    )
     finally:
         await graph.close()
         await bus.close()
@@ -271,6 +342,22 @@ async def _run_search(
             exclude_stubs=exclude_stubs,
             exclude_generated=exclude_generated,
         )
+
+        # Staleness check (before output so JSON can include it)
+        checker = StalenessChecker(settings.project_root)
+        info = await checker.check(graph, include_changed=True)
+
+        if _output.json:
+            _json_output(
+                {
+                    "query": query,
+                    "type": type_,
+                    "results": [asdict(r) for r in results],
+                    "stale": info.stale if info else None,
+                }
+            )
+            return
+
         if not results:
             logger.info("No results found for '{}'", query)
             return
@@ -287,9 +374,6 @@ async def _run_search(
                 loc,
             )
 
-        # Staleness check
-        checker = StalenessChecker(settings.project_root)
-        info = await checker.check(graph, include_changed=True)
         if info.stale:
             commit_str = info.last_indexed_commit[:8] if info.last_indexed_commit else "never"
             logger.warning("Index is stale (last indexed: {})", commit_str)
@@ -315,9 +399,6 @@ async def _run_status() -> None:
 
     try:
         projects = await graph.get_project_status()
-        if not projects:
-            logger.info("No indexed projects found.")
-            return
 
         import datetime
 
@@ -328,6 +409,34 @@ async def _run_status() -> None:
         deps_by_project: dict[str, list[str]] = {}
         for row in depends_on:
             deps_by_project.setdefault(row["from_proj"], []).append(row["to_proj"])
+
+        if _output.json:
+            _json_output(
+                {
+                    "projects": [
+                        {
+                            "name": row["n"].get("name"),
+                            "last_indexed_at": (
+                                datetime.datetime.fromtimestamp(
+                                    row["n"]["last_indexed_at"], tz=datetime.UTC
+                                ).isoformat()
+                                if row["n"].get("last_indexed_at")
+                                else None
+                            ),
+                            "file_count": row["n"].get("file_count"),
+                            "entity_count": row["n"].get("entity_count"),
+                            "git_hash": row["n"].get("git_hash"),
+                            "depends_on": sorted(deps_by_project.get(row["n"].get("name", ""), [])),
+                        }
+                        for row in projects
+                    ],
+                }
+            )
+            return
+
+        if not projects:
+            logger.info("No indexed projects found.")
+            return
 
         for row in projects:
             node = row["n"]
@@ -358,49 +467,48 @@ async def _run_status() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_health(*, json_output: bool) -> None:
+async def _run_health() -> None:
     from code_atlas.health import run_health_checks
     from code_atlas.settings import AtlasSettings
 
     settings = AtlasSettings()
     report = await run_health_checks(settings)
-    _print_report(report, detailed=False, json_output=json_output)
+    _print_report(report, detailed=False)
     raise typer.Exit(code=0 if report.ok else 1)
 
 
-async def _run_doctor(*, json_output: bool) -> None:
+async def _run_doctor() -> None:
     from code_atlas.health import run_health_checks
     from code_atlas.settings import AtlasSettings
 
     settings = AtlasSettings()
     report = await run_health_checks(settings)
-    _print_report(report, detailed=True, json_output=json_output)
+    _print_report(report, detailed=True)
     raise typer.Exit(code=0 if report.ok else 1)
 
 
-def _print_report(report: object, *, detailed: bool, json_output: bool) -> None:
-    import json
-
+def _print_report(report: object, *, detailed: bool) -> None:
     from code_atlas.health import CheckStatus, HealthReport
 
     rpt: HealthReport = report  # type: ignore[assignment]
 
-    if json_output:
-        payload = {
-            "ok": rpt.ok,
-            "checks": [
-                {
-                    "name": c.name,
-                    "status": c.status.value,
-                    "message": c.message,
-                    "detail": c.detail,
-                    "suggestion": c.suggestion,
-                }
-                for c in rpt.checks
-            ],
-            "elapsed_ms": round(rpt.elapsed_ms, 1),
-        }
-        logger.opt(raw=True).info(json.dumps(payload, indent=2) + "\n")
+    if _output.json:
+        _json_output(
+            {
+                "ok": rpt.ok,
+                "checks": [
+                    {
+                        "name": c.name,
+                        "status": c.status.value,
+                        "message": c.message,
+                        "detail": c.detail,
+                        "suggestion": c.suggestion,
+                    }
+                    for c in rpt.checks
+                ],
+                "elapsed_ms": round(rpt.elapsed_ms, 1),
+            }
+        )
         return
 
     status_icon = {
