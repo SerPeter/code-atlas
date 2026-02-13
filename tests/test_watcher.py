@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+import pytest
 from watchfiles import Change
 
 from code_atlas.settings import WatcherSettings
@@ -195,6 +196,43 @@ class TestFlushSerialization:
 
         assert len(bus.published) == 2
         assert bus.published[1][1].path == "second.py"
+
+
+class TestEndToEnd:
+    """Integration test: real filesystem watcher detects actual file changes."""
+
+    @pytest.mark.integration
+    async def test_end_to_end_watcher_detects_file_change(self, tmp_path: Path) -> None:
+        """Start watcher, modify a file on disk, assert FileChanged event arrives."""
+        # Create initial file
+        py_file = tmp_path / "hello.py"
+        py_file.write_text("x = 1\n", encoding="utf-8")
+
+        bus = RecordingBus()
+        watcher = _make_watcher(tmp_path, bus, debounce_s=0.2, max_wait_s=2.0)
+
+        # Run watcher in background
+        task = asyncio.create_task(watcher.run())
+
+        # Allow watcher to warm up
+        await asyncio.sleep(0.5)
+
+        # Modify file on disk
+        py_file.write_text("x = 2\n", encoding="utf-8")
+
+        # Wait for debounce + flush
+        await asyncio.sleep(1.5)
+
+        # Stop watcher gracefully
+        watcher.stop()
+        await asyncio.wait_for(task, timeout=3.0)
+
+        # Assert we got the change event
+        assert len(bus.published) >= 1
+        paths = {ev.path for _, ev in bus.published}
+        assert "hello.py" in paths
+        change_types = {ev.change_type for _, ev in bus.published if ev.path == "hello.py"}
+        assert "modified" in change_types
 
 
 class TestGracefulShutdown:
