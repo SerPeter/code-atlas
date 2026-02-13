@@ -48,6 +48,7 @@ class UpsertResult:
     modified: list[str] = field(default_factory=list)  # qualified_names with changed content_hash
     deleted: list[str] = field(default_factory=list)  # qualified_names removed from file
     unchanged: list[str] = field(default_factory=list)  # qualified_names with matching content_hash
+    modified_significance: dict[str, str] = field(default_factory=dict)  # qualified_name → Significance value
 
 
 def _node_project_name(record: dict[str, Any]) -> str:
@@ -191,15 +192,18 @@ class GraphClient:
             )
             raise RuntimeError(msg)
 
-    async def get_file_content_hashes(self, project_name: str, file_path: str) -> dict[str, tuple[str, int, int]]:
-        """Return ``{uid: (content_hash, line_start, line_end)}`` for all non-structural nodes in a file."""
+    async def get_file_content_hashes(
+        self, project_name: str, file_path: str
+    ) -> dict[str, tuple[str, int, int, str | None, str | None]]:
+        """Return ``{uid: (content_hash, line_start, line_end, signature, docstring)}`` for all non-structural nodes."""
         records = await self.execute(
             f"MATCH (n {{project_name: $p, file_path: $f}}) "
             f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le",
+            "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le, "
+            "n.signature AS sig, n.docstring AS doc",
             {"p": project_name, "f": file_path},
         )
-        return {r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0) for r in records}
+        return {r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"]) for r in records}
 
     async def upsert_file_entities(
         self,
@@ -253,10 +257,23 @@ class GraphClient:
             added_entities = [new_entity_map[uid] for uid in added_uids]
             await self._batch_create_entities(project_name, added_entities)
 
-        # 4c. Update modified entity nodes
+        # 4c. Update modified entity nodes + compute per-entity significance
+        mod_significance: dict[str, str] = {}
         if modified_uids:
             modified_entities = [new_entity_map[uid] for uid in modified_uids]
             await self._batch_update_entities(modified_entities)
+
+            for uid in modified_uids:
+                old_sig, old_doc = old_data[uid][3], old_data[uid][4]
+                new_entity = new_entity_map[uid]
+                qn = self._strip_uid(uid)
+                if (new_entity.signature or "") != (old_sig or ""):
+                    mod_significance[qn] = "HIGH"
+                elif (new_entity.docstring or "") != (old_doc or ""):
+                    mod_significance[qn] = "MODERATE"
+                else:
+                    # Other semantic field change (name/kind/visibility/tags)
+                    mod_significance[qn] = "HIGH"
 
         # 4d. Update positions of unchanged entities that shifted
         #     (only when entity count changed — adds or deletes cause shifts)
@@ -279,6 +296,7 @@ class GraphClient:
             modified=[self._strip_uid(uid) for uid in modified_uids],
             deleted=[self._strip_uid(uid) for uid in deleted_uids],
             unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
+            modified_significance=mod_significance,
         )
 
         logger.debug(
@@ -621,6 +639,85 @@ class GraphClient:
 
     # -- Cross-project import resolution helpers --------------------------------
 
+    async def _resolve_cross_project_read_phase(
+        self,
+        project_names: list[str],
+        pkg_to_project: dict[str, str],
+    ) -> tuple[list[dict[str, str]], dict[str, str], dict[str, str]]:
+        """Batch-read stubs and resolve real entities for cross-project imports.
+
+        Returns ``(matched_eps, sym_to_real, ep_to_real_pkg)`` where
+        *matched_eps* are the ExternalPackage stubs that matched a sibling
+        package, *sym_to_real* maps ExternalSymbol uid → real entity uid, and
+        *ep_to_real_pkg* maps ExternalPackage uid → real Package uid.
+        """
+        # Fetch ALL ExternalPackage stubs across all projects in one query
+        all_ext_pkgs = await self.execute(
+            f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE}) "
+            "WHERE ep.project_name IN $projects "
+            "RETURN ep.name AS name, ep.uid AS uid, ep.project_name AS proj",
+            {"projects": project_names},
+        )
+
+        # Filter to those matching a sibling package (not self)
+        matched_eps: list[dict[str, str]] = [
+            {"name": ep["name"], "uid": ep["uid"], "proj": ep["proj"], "target": target}
+            for ep in all_ext_pkgs
+            if (target := pkg_to_project.get(ep["name"])) is not None and target != ep["proj"]
+        ]
+        if not matched_eps:
+            return [], {}, {}
+
+        # Build fast lookup: (proj, pkg_name) → target_project
+        ep_target_map: dict[tuple[str, str], str] = {(ep["proj"], ep["name"]): ep["target"] for ep in matched_eps}
+
+        # Fetch ALL ExternalSymbol stubs for matched packages in one query
+        ep_keys = [{"proj": ep["proj"], "pkg": ep["name"]} for ep in matched_eps]
+        all_ext_syms = await self.execute(
+            f"UNWIND $keys AS k "
+            f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: k.proj, package: k.pkg}}) "
+            "RETURN es.name AS name, es.uid AS uid, "
+            "es.project_name AS proj, es.package AS pkg",
+            {"keys": ep_keys},
+        )
+
+        # Build lookup pairs for bulk entity resolution
+        lookup_pairs = [
+            {"name": es["name"], "target_project": target, "es_uid": es["uid"]}
+            for es in all_ext_syms
+            if (target := ep_target_map.get((es["proj"], es["pkg"])))
+        ]
+
+        pkg_rewire = [
+            {"ep_uid": ep["uid"], "pkg_name": ep["name"], "target_project": ep["target"]} for ep in matched_eps
+        ]
+
+        # Bulk-resolve real entities for ExternalSymbols
+        sym_to_real: dict[str, str] = {}
+        if lookup_pairs:
+            real_matches = await self.execute(
+                "UNWIND $pairs AS p "
+                "MATCH (n {project_name: p.target_project, name: p.name}) "
+                f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
+                f"AND NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
+                "RETURN p.es_uid AS es_uid, n.uid AS real_uid LIMIT 1",
+                {"pairs": lookup_pairs},
+            )
+            sym_to_real = {m["es_uid"]: m["real_uid"] for m in real_matches}
+
+        # Bulk-resolve real Package nodes for bare package imports
+        ep_to_real_pkg: dict[str, str] = {}
+        if pkg_rewire:
+            real_pkgs = await self.execute(
+                "UNWIND $pairs AS p "
+                f"MATCH (pkg:{NodeLabel.PACKAGE} {{project_name: p.target_project, name: p.pkg_name}}) "
+                "RETURN p.ep_uid AS ep_uid, pkg.uid AS real_uid LIMIT 1",
+                {"pairs": pkg_rewire},
+            )
+            ep_to_real_pkg = {m["ep_uid"]: m["real_uid"] for m in real_pkgs}
+
+        return matched_eps, sym_to_real, ep_to_real_pkg
+
     async def resolve_cross_project_imports(self, project_names: list[str]) -> int:
         """Rewire ExternalPackage/ExternalSymbol stubs that match real entities in sibling projects.
 
@@ -633,14 +730,13 @@ class GraphClient:
         if len(project_names) < 2:
             return 0
 
-        # 1. Build map: package_name → project_name for all projects
+        # Build map: package_name → project_name for all projects
         records = await self.execute(
             f"MATCH (pkg:{NodeLabel.PACKAGE}) "
             "WHERE pkg.project_name IN $projects "
             "RETURN pkg.name AS name, pkg.project_name AS project, pkg.qualified_name AS qn",
             {"projects": project_names},
         )
-        # Map top-level package name → project_name
         pkg_to_project: dict[str, str] = {}
         for r in records:
             top_name = r["qn"].split(".")[0] if r["qn"] else r["name"]
@@ -650,83 +746,48 @@ class GraphClient:
         if not pkg_to_project:
             return 0
 
-        rewired = 0
+        # Batch-read stubs and resolve real entities
+        matched_eps, sym_to_real, ep_to_real_pkg = await self._resolve_cross_project_read_phase(
+            project_names, pkg_to_project
+        )
+        if not matched_eps:
+            return 0
 
-        for proj_name in project_names:
-            # 2. Find ExternalPackage stubs in this project whose name matches a sibling package
-            ext_pkgs = await self.execute(
-                f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $proj}}) "
-                "RETURN ep.name AS name, ep.uid AS uid",
-                {"proj": proj_name},
+        # Writes — per-stub for correctness
+        rewired = 0
+        for es_uid, real_uid in sym_to_real.items():
+            await self.execute_write(
+                f"MATCH (src)-[r:{RelType.IMPORTS}]->(es {{uid: $es_uid}}) "
+                f"MATCH (real {{uid: $real_uid}}) "
+                f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
+                "DELETE r",
+                {"es_uid": es_uid, "real_uid": real_uid},
+            )
+            rewired += 1
+
+        for ep_uid, real_uid in ep_to_real_pkg.items():
+            await self.execute_write(
+                f"MATCH (src)-[r:{RelType.IMPORTS}]->(ep {{uid: $ep_uid}}) "
+                f"MATCH (real {{uid: $real_uid}}) "
+                f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
+                "DELETE r",
+                {"ep_uid": ep_uid, "real_uid": real_uid},
             )
 
-            for ep in ext_pkgs:
-                ext_pkg_name = ep["name"]
-                target_project = pkg_to_project.get(ext_pkg_name)
-                if target_project is None or target_project == proj_name:
-                    continue
-
-                # 3. Find ExternalSymbol stubs under this ExternalPackage
-                ext_syms = await self.execute(
-                    f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $proj, package: $pkg}}) "
-                    "RETURN es.name AS name, es.uid AS uid, es.qualified_name AS qn",
-                    {"proj": proj_name, "pkg": ext_pkg_name},
-                )
-
-                for es in ext_syms:
-                    sym_name = es["name"]
-                    # 4. Find the real entity in the target project
-                    real_entities = await self.execute(
-                        "MATCH (n {project_name: $target_proj, name: $name}) "
-                        f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
-                        f"AND NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
-                        "RETURN n.uid AS uid LIMIT 1",
-                        {"target_proj": target_project, "name": sym_name},
-                    )
-
-                    if not real_entities:
-                        continue
-
-                    real_uid = real_entities[0]["uid"]
-
-                    # 5. Rewire: move IMPORTS edges from ExternalSymbol → real entity
-                    await self.execute_write(
-                        f"MATCH (src)-[r:{RelType.IMPORTS}]->(es {{uid: $es_uid}}) "
-                        f"MATCH (real {{uid: $real_uid}}) "
-                        f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
-                        "DELETE r",
-                        {"es_uid": es["uid"], "real_uid": real_uid},
-                    )
-                    rewired += 1
-
-                # 6. Also rewire bare package imports (IMPORTS → ExternalPackage)
-                real_pkg = await self.execute(
-                    f"MATCH (pkg:{NodeLabel.PACKAGE} {{project_name: $target_proj, name: $name}}) "
-                    "RETURN pkg.uid AS uid LIMIT 1",
-                    {"target_proj": target_project, "name": ext_pkg_name},
-                )
-                if real_pkg:
-                    await self.execute_write(
-                        f"MATCH (src)-[r:{RelType.IMPORTS}]->(ep {{uid: $ep_uid}}) "
-                        f"MATCH (real {{uid: $real_uid}}) "
-                        f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
-                        "DELETE r",
-                        {"ep_uid": ep["uid"], "real_uid": real_pkg[0]["uid"]},
-                    )
-
-                # 7. Delete orphaned stubs (no remaining inbound edges)
-                await self.execute_write(
-                    f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $proj, package: $pkg}}) "
-                    f"WHERE NOT ()-[:{RelType.IMPORTS}]->(es) "
-                    "DETACH DELETE es",
-                    {"proj": proj_name, "pkg": ext_pkg_name},
-                )
-                await self.execute_write(
-                    f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $uid}}) "
-                    f"WHERE NOT ()-[:{RelType.IMPORTS}]->(ep) AND NOT (ep)-[:{RelType.CONTAINS}]->() "
-                    "DETACH DELETE ep",
-                    {"uid": ep["uid"]},
-                )
+        # Delete orphaned stubs
+        for ep in matched_eps:
+            await self.execute_write(
+                f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $proj, package: $pkg}}) "
+                f"WHERE NOT ()-[:{RelType.IMPORTS}]->(es) "
+                "DETACH DELETE es",
+                {"proj": ep["proj"], "pkg": ep["name"]},
+            )
+            await self.execute_write(
+                f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $uid}}) "
+                f"WHERE NOT ()-[:{RelType.IMPORTS}]->(ep) AND NOT (ep)-[:{RelType.CONTAINS}]->() "
+                "DETACH DELETE ep",
+                {"uid": ep["uid"]},
+            )
 
         logger.debug(
             "Cross-project import resolution: {} imports rewired across {} projects", rewired, len(project_names)

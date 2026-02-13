@@ -29,6 +29,7 @@ from code_atlas.events import (
     Event,
     EventBus,
     FileChanged,
+    Significance,
     Topic,
     decode_event,
 )
@@ -212,6 +213,14 @@ class Tier1GraphConsumer(TierConsumer):
 # | Entity added/deleted             | HIGH     | Always gate   |
 
 
+_SIG_ORDER: dict[Significance, int] = {
+    Significance.NONE: 0,
+    Significance.TRIVIAL: 1,
+    Significance.MODERATE: 2,
+    Significance.HIGH: 3,
+}
+
+
 @dataclass
 class Tier2Stats:
     """Accumulated delta statistics for Tier 2 processing."""
@@ -255,8 +264,8 @@ class Tier2ASTConsumer(TierConsumer):
         file_path: str,
         import_rels: list[ParsedRelationship],
         call_rels: list[ParsedRelationship],
-    ) -> tuple[set[str], list[EntityRef]]:
-        """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs).
+    ) -> tuple[set[str], list[EntityRef], Significance]:
+        """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs, max_significance).
 
         Appends IMPORTS rels to *import_rels* and CALLS rels to *call_rels*
         for post-batch resolution.
@@ -267,18 +276,18 @@ class Tier2ASTConsumer(TierConsumer):
             deleted = await self.graph.delete_file_entities(project_name, file_path)
             self.stats.files_deleted += 1
             self.stats.entities_deleted += len(deleted)
-            return set(), []
+            return set(), [], Significance.HIGH if deleted else Significance.NONE
 
         try:
             source = full_path.read_bytes()
         except OSError:
             logger.warning("Tier2: cannot read {}", file_path)
-            return set(), []
+            return set(), [], Significance.NONE
 
         parsed = parse_file(file_path, source, project_name)
         if parsed is None:
             logger.debug("Tier2: unsupported language for {}", file_path)
-            return set(), []
+            return set(), [], Significance.NONE
 
         det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
         all_rels = parsed.relationships + det_result.relationships
@@ -307,7 +316,18 @@ class Tier2ASTConsumer(TierConsumer):
         changed_qns = set(result.added) | set(result.modified)
         if not changed_qns:
             self.stats.files_skipped += 1
-            return set(), []
+            return set(), [], Significance.NONE
+
+        # Compute file-level significance from upsert result
+        if result.added or result.deleted:
+            file_sig = Significance.HIGH
+        elif result.modified_significance:
+            file_sig = max(
+                (Significance(v) for v in result.modified_significance.values()),
+                key=lambda s: _SIG_ORDER[s],
+            )
+        else:
+            file_sig = Significance.NONE
 
         entity_map = {
             (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
@@ -324,7 +344,7 @@ class Tier2ASTConsumer(TierConsumer):
                         file_path=entity.file_path,
                     )
                 )
-        return changed_qns, refs
+        return changed_qns, refs, file_sig
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
@@ -346,11 +366,16 @@ class Tier2ASTConsumer(TierConsumer):
             all_call_rels: list[ParsedRelationship] = []
             skipped_before = self.stats.files_skipped
             total_changed = 0
+            batch_max_sig = Significance.NONE
 
             for file_path in unique_paths:
-                changed_qns, refs = await self._process_file(project_name, file_path, all_import_rels, all_call_rels)
+                changed_qns, refs, file_sig = await self._process_file(
+                    project_name, file_path, all_import_rels, all_call_rels
+                )
                 total_changed += len(changed_qns)
                 changed_entity_refs.extend(refs)
+                if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
+                    batch_max_sig = file_sig
 
             # Post-batch import resolution
             if all_import_rels:
@@ -371,10 +396,10 @@ class Tier2ASTConsumer(TierConsumer):
                 total_changed,
             )
 
-            if changed_entity_refs:
+            if changed_entity_refs and _SIG_ORDER[batch_max_sig] >= _SIG_ORDER[Significance.MODERATE]:
                 await self.bus.publish(
                     Topic.EMBED_DIRTY,
-                    EmbedDirty(entities=changed_entity_refs, significance="HIGH", batch_id=batch_id),
+                    EmbedDirty(entities=changed_entity_refs, significance=batch_max_sig, batch_id=batch_id),
                 )
 
 
