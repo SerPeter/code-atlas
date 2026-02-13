@@ -24,7 +24,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from code_atlas.daemon import DaemonManager
 from code_atlas.embeddings import EmbedClient, EmbeddingError
-from code_atlas.graph import GraphClient
+from code_atlas.graph import GraphClient, QueryTimeoutError
 from code_atlas.health import run_health_checks
 from code_atlas.indexer import StalenessChecker
 from code_atlas.schema import (
@@ -495,51 +495,54 @@ def _register_node_tools(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         found: list[dict[str, Any]] | None = None
 
-        # Stage 1: Exact uid match (if name contains ':')
-        if ":" in name:
-            records = await app.graph.execute(
-                f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {clamped}",
-                {"name": name},
-            )
-            if records:
-                found = records
+        try:
+            # Stage 1: Exact uid match (if name contains ':')
+            if ":" in name:
+                records = await app.graph.execute(
+                    f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {clamped}",
+                    {"name": name},
+                )
+                if records:
+                    found = records
 
-        # Stage 2: Exact name match
-        if found is None:
-            records = await app.graph.execute(
-                f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
-                {"name": name},
-            )
-            if records:
-                found = records
+            # Stage 2: Exact name match
+            if found is None:
+                records = await app.graph.execute(
+                    f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
+                    {"name": name},
+                )
+                if records:
+                    found = records
 
-        # Stage 3: ENDS WITH suffix match
-        if found is None:
-            suffix = f".{name}"
-            records = await app.graph.execute(
-                f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {clamped}",
-                {"suffix": suffix},
-            )
-            if records:
-                found = records
+            # Stage 3: ENDS WITH suffix match
+            if found is None:
+                suffix = f".{name}"
+                records = await app.graph.execute(
+                    f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {clamped}",
+                    {"suffix": suffix},
+                )
+                if records:
+                    found = records
 
-        # Stage 4: STARTS WITH prefix match
-        if found is None:
-            prefix = f"{name}."
-            records = await app.graph.execute(
-                f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix RETURN n LIMIT {clamped}",
-                {"prefix": prefix},
-            )
-            if records:
-                found = records
+            # Stage 4: STARTS WITH prefix match
+            if found is None:
+                prefix = f"{name}."
+                records = await app.graph.execute(
+                    f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix RETURN n LIMIT {clamped}",
+                    {"prefix": prefix},
+                )
+                if records:
+                    found = records
 
-        # Stage 5: CONTAINS match (qualified_name or name)
-        if found is None:
-            found = await app.graph.execute(
-                f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
-                f"RETURN n LIMIT {clamped}",
-                {"name": name},
-            )
+            # Stage 5: CONTAINS match (qualified_name or name)
+            if found is None:
+                found = await app.graph.execute(
+                    f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
+                    f"RETURN n LIMIT {clamped}",
+                    {"name": name},
+                )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
 
         elapsed = (time.monotonic() - t0) * 1000
         ranked = _rank_results([_compact_node(r) for r in found])
@@ -571,6 +574,8 @@ def _register_query_tools(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         try:
             records = await app.graph.execute(query)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
         except Exception as exc:
             return _error(str(exc), code="QUERY_ERROR")
         elapsed = (time.monotonic() - t0) * 1000
@@ -599,16 +604,19 @@ def _register_query_tools(mcp: FastMCP) -> None:
         app = await _ensure_root(ctx)
         t0 = time.monotonic()
 
-        expanded = await expand_context(
-            app.graph,
-            uid,
-            include_hierarchy=include_hierarchy,
-            include_calls=include_calls,
-            call_depth=call_depth,
-            include_docs=include_docs,
-            max_siblings=app.settings.search.max_siblings,
-            max_callers=app.settings.search.max_callers,
-        )
+        try:
+            expanded = await expand_context(
+                app.graph,
+                uid,
+                include_hierarchy=include_hierarchy,
+                include_calls=include_calls,
+                call_depth=call_depth,
+                include_docs=include_docs,
+                max_siblings=app.settings.search.max_siblings,
+                max_callers=app.settings.search.max_callers,
+            )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
 
         if expanded is None:
             return _error(f"Node not found: {uid}", code="NOT_FOUND")
@@ -654,7 +662,10 @@ def _register_search_tools(mcp: FastMCP) -> None:
         clamped = _clamp_limit(limit)
 
         t0 = time.monotonic()
-        all_results = await app.graph.text_search(query, label=label, limit=clamped, project=project)
+        try:
+            all_results = await app.graph.text_search(query, label=label, limit=clamped, project=project)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
@@ -693,9 +704,12 @@ def _register_search_tools(mcp: FastMCP) -> None:
             return _error(f"Embedding service unavailable: {exc}", code="EMBED_ERROR")
 
         t0 = time.monotonic()
-        all_results = await app.graph.vector_search(
-            vector, label=label, limit=clamped, project=project, threshold=threshold
-        )
+        try:
+            all_results = await app.graph.vector_search(
+                vector, label=label, limit=clamped, project=project, threshold=threshold
+            )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
@@ -761,19 +775,22 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             resolved_scope = ",".join(expanded) if expanded else ""
 
         t0 = time.monotonic()
-        results = await _hybrid_search(
-            graph=app.graph,
-            embed=app.embed if app.vector_enabled else None,
-            settings=app.settings.search,
-            query=query,
-            search_types=types,
-            limit=clamped,
-            scope=resolved_scope,
-            weights=weight_dict,
-            exclude_tests=exclude_tests,
-            exclude_stubs=exclude_stubs,
-            exclude_generated=exclude_generated,
-        )
+        try:
+            results = await _hybrid_search(
+                graph=app.graph,
+                embed=app.embed if app.vector_enabled else None,
+                settings=app.settings.search,
+                query=query,
+                search_types=types,
+                limit=clamped,
+                scope=resolved_scope,
+                weights=weight_dict,
+                exclude_tests=exclude_tests,
+                exclude_stubs=exclude_stubs,
+                exclude_generated=exclude_generated,
+            )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
         serialized = [
@@ -814,34 +831,37 @@ def _register_info_tools(mcp: FastMCP) -> None:
         app = await _ensure_root(ctx)
         t0 = time.monotonic()
 
-        projects_raw = await app.graph.get_project_status()
-        projects = []
-        for row in projects_raw:
-            node = row.get("n")
-            if node is None:
-                continue
-            props = dict(node.items()) if hasattr(node, "items") else node
-            name = props.get("name", "?")
-            entity_count = await app.graph.count_entities(name)
-            projects.append(
-                {
-                    "name": name,
-                    "file_count": props.get("file_count"),
-                    "entity_count": entity_count,
-                    "last_indexed_at": props.get("last_indexed_at"),
-                    "git_hash": props.get("git_hash"),
-                }
+        try:
+            projects_raw = await app.graph.get_project_status()
+            projects = []
+            for row in projects_raw:
+                node = row.get("n")
+                if node is None:
+                    continue
+                props = dict(node.items()) if hasattr(node, "items") else node
+                name = props.get("name", "?")
+                entity_count = await app.graph.count_entities(name)
+                projects.append(
+                    {
+                        "name": name,
+                        "file_count": props.get("file_count"),
+                        "entity_count": entity_count,
+                        "last_indexed_at": props.get("last_indexed_at"),
+                        "git_hash": props.get("git_hash"),
+                    }
+                )
+
+            # Per-label counts
+            label_counts_raw = await app.graph.execute(
+                "MATCH (n) RETURN labels(n)[0] AS label, count(n) AS count ORDER BY count DESC"
             )
+            label_counts = {r["label"]: r["count"] for r in label_counts_raw}
 
-        # Per-label counts
-        label_counts_raw = await app.graph.execute(
-            "MATCH (n) RETURN labels(n)[0] AS label, count(n) AS count ORDER BY count DESC"
-        )
-        label_counts = {r["label"]: r["count"] for r in label_counts_raw}
-
-        # Vector and text index info
-        vec_index_info = await app.graph.get_vector_index_info()
-        text_index_info = await app.graph.get_text_index_info()
+            # Vector and text index info
+            vec_index_info = await app.graph.get_vector_index_info()
+            text_index_info = await app.graph.get_text_index_info()
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
 
         elapsed = (time.monotonic() - t0) * 1000
 
@@ -865,39 +885,42 @@ def _register_info_tools(mcp: FastMCP) -> None:
         app = await _ensure_root(ctx)
         t0 = time.monotonic()
 
-        projects_raw = await app.graph.get_project_status()
-        if not projects_raw:
-            return _result([], limit=0, query_ms=0)
+        try:
+            projects_raw = await app.graph.get_project_status()
+            if not projects_raw:
+                return _result([], limit=0, query_ms=0)
 
-        # Collect DEPENDS_ON relationships
-        depends_records = await app.graph.execute(
-            "MATCH (a:Project)-[:DEPENDS_ON]->(b:Project) RETURN a.name AS from_proj, b.name AS to_proj"
-        )
-        depends_on_map: dict[str, list[str]] = {}
-        depended_by_map: dict[str, list[str]] = {}
-        for r in depends_records:
-            depends_on_map.setdefault(r["from_proj"], []).append(r["to_proj"])
-            depended_by_map.setdefault(r["to_proj"], []).append(r["from_proj"])
-
-        result_list = []
-        for row in projects_raw:
-            node = row.get("n")
-            if node is None:
-                continue
-            props = dict(node.items()) if hasattr(node, "items") else node
-            name = props.get("name", "?")
-            entity_count = await app.graph.count_entities(name)
-            result_list.append(
-                {
-                    "name": name,
-                    "file_count": props.get("file_count"),
-                    "entity_count": entity_count,
-                    "last_indexed_at": props.get("last_indexed_at"),
-                    "git_hash": props.get("git_hash"),
-                    "depends_on": sorted(depends_on_map.get(name, [])),
-                    "depended_by": sorted(depended_by_map.get(name, [])),
-                }
+            # Collect DEPENDS_ON relationships
+            depends_records = await app.graph.execute(
+                "MATCH (a:Project)-[:DEPENDS_ON]->(b:Project) RETURN a.name AS from_proj, b.name AS to_proj"
             )
+            depends_on_map: dict[str, list[str]] = {}
+            depended_by_map: dict[str, list[str]] = {}
+            for r in depends_records:
+                depends_on_map.setdefault(r["from_proj"], []).append(r["to_proj"])
+                depended_by_map.setdefault(r["to_proj"], []).append(r["from_proj"])
+
+            result_list = []
+            for row in projects_raw:
+                node = row.get("n")
+                if node is None:
+                    continue
+                props = dict(node.items()) if hasattr(node, "items") else node
+                name = props.get("name", "?")
+                entity_count = await app.graph.count_entities(name)
+                result_list.append(
+                    {
+                        "name": name,
+                        "file_count": props.get("file_count"),
+                        "entity_count": entity_count,
+                        "last_indexed_at": props.get("last_indexed_at"),
+                        "git_hash": props.get("git_hash"),
+                        "depends_on": sorted(depends_on_map.get(name, [])),
+                        "depended_by": sorted(depended_by_map.get(name, [])),
+                    }
+                )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
 
         elapsed = (time.monotonic() - t0) * 1000
         return _result(result_list, limit=len(result_list), query_ms=elapsed)

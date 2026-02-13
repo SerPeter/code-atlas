@@ -6,6 +6,7 @@ Uses the neo4j async driver (Bolt protocol) which is compatible with Memgraph.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
@@ -38,6 +39,15 @@ if TYPE_CHECKING:
     from code_atlas.settings import AtlasSettings
 
 _tracer = get_tracer(__name__)
+
+
+class QueryTimeoutError(Exception):
+    """Raised when a read query exceeds the configured timeout."""
+
+    def __init__(self, timeout_s: float, query_prefix: str = "") -> None:
+        self.timeout_s = timeout_s
+        self.query_prefix = query_prefix
+        super().__init__(f"Query timed out after {timeout_s}s: {query_prefix}")
 
 
 @dataclass(frozen=True)
@@ -129,6 +139,7 @@ class GraphClient:
         auth = (mg.username, mg.password) if mg.username else None
         self._driver: AsyncDriver = AsyncGraphDatabase.driver(self._uri, auth=auth)
         self._dimension = settings.embeddings.dimension or 768
+        self._query_timeout_s = mg.query_timeout_s
 
     async def ping(self) -> bool:
         """Health check — returns True if Memgraph is reachable."""
@@ -138,9 +149,16 @@ class GraphClient:
     async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute a read query and return results as a list of dicts."""
         with _tracer.start_as_current_span("graph.execute", attributes={"db.statement": query[:200]}):
-            async with self._driver.session() as session:
-                result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
-                return [dict(record) async for record in result]
+            try:
+                return await asyncio.wait_for(self._execute_inner(query, params), timeout=self._query_timeout_s)
+            except TimeoutError:
+                raise QueryTimeoutError(self._query_timeout_s, query[:120]) from None
+
+    async def _execute_inner(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Inner execute without timeout — used by ``execute()``."""
+        async with self._driver.session() as session:
+            result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+            return [dict(record) async for record in result]
 
     async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
         """Execute a write query.

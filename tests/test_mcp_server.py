@@ -11,7 +11,7 @@ import pytest
 from mcp.server.fastmcp import FastMCP
 
 from code_atlas.embeddings import EmbedClient
-from code_atlas.graph import GraphClient
+from code_atlas.graph import GraphClient, QueryTimeoutError
 from code_atlas.mcp_server import (
     AppContext,
     _clamp_limit,
@@ -19,6 +19,7 @@ from code_atlas.mcp_server import (
     _file_uri_to_path,
     _maybe_update_root,
     _rank_results,
+    _register_hybrid_tool,
     _register_info_tools,
     _register_node_tools,
     _register_query_tools,
@@ -69,6 +70,7 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
     _register_node_tools(server)
     _register_query_tools(server)
     _register_search_tools(server)
+    _register_hybrid_tool(server)
     _register_info_tools(server)
     _register_subagent_tools(server)
 
@@ -892,3 +894,56 @@ class TestMaybeUpdateRoot:
         old_daemon.stop.assert_awaited_once()
         assert app.settings.project_root == new_root
         assert app.resolved_root == new_root
+
+
+# ---------------------------------------------------------------------------
+# QueryTimeoutError handling in MCP tools (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestQueryTimeout:
+    """Verify each tool returns QUERY_TIMEOUT error envelope on timeout."""
+
+    @pytest.fixture
+    def timeout_app(self, settings):
+        """AppContext with graph.execute mocked to raise QueryTimeoutError."""
+        mock_graph = AsyncMock(spec=GraphClient)
+        mock_graph.execute = AsyncMock(side_effect=QueryTimeoutError(10.0, "MATCH (n) RETURN n"))
+        mock_graph.text_search = AsyncMock(side_effect=QueryTimeoutError(10.0, "text_search"))
+        mock_graph.vector_search = AsyncMock(side_effect=QueryTimeoutError(10.0, "vector_search"))
+        mock_graph.graph_search = AsyncMock(side_effect=QueryTimeoutError(10.0, "graph_search"))
+        mock_graph.get_project_status = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_project_status"))
+        mock_graph.count_entities = AsyncMock(side_effect=QueryTimeoutError(10.0, "count_entities"))
+        embed = EmbedClient(settings.embeddings)
+        return AppContext(graph=mock_graph, settings=settings, embed=embed)
+
+    async def test_get_node_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "get_node", name="Foo")
+        assert result["code"] == "QUERY_TIMEOUT"
+        assert "error" in result
+
+    async def test_cypher_query_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "cypher_query", query="MATCH (n:Callable) RETURN n")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_get_context_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "get_context", uid="proj:mod.Foo")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_text_search_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "text_search", query="foo")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_vector_search_timeout(self, timeout_app):
+        """vector_search graph call timeout (after successful embedding)."""
+        with patch.object(timeout_app.embed, "embed_one", new_callable=AsyncMock, return_value=[0.1] * 768):
+            result = await _invoke_tool(timeout_app, "vector_search", query="foo")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_index_status_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "index_status")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_list_projects_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "list_projects")
+        assert result["code"] == "QUERY_TIMEOUT"

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from code_atlas.graph import QueryTimeoutError
 from code_atlas.parser import ParsedEntity, ParsedRelationship
 from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
 
@@ -1463,3 +1464,15 @@ async def test_resolve_calls_deduplication(graph_client: GraphClient):
     assert len(records) == 1
     assert records[0]["caller"] == "caller_func"
     assert records[0]["callee"] == "target_func"
+
+
+# ---------------------------------------------------------------------------
+# Query timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_raises_query_timeout(graph_client: GraphClient):
+    """Setting an impossibly short timeout triggers QueryTimeoutError."""
+    graph_client._query_timeout_s = 0.0001
+    with pytest.raises(QueryTimeoutError):
+        await graph_client.execute("RETURN 1 AS n")

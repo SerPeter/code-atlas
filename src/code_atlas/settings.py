@@ -106,6 +106,7 @@ class MemgraphSettings(BaseSettings):
     port: int = Field(default=7687, description="Memgraph Bolt port.")
     username: str = Field(default="", description="Memgraph username.")
     password: str = Field(default="", description="Memgraph password.")
+    query_timeout_s: float = Field(default=10.0, description="Timeout in seconds for read queries.")
 
 
 class SearchSettings(BaseSettings):
