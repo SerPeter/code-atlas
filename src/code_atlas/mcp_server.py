@@ -25,6 +25,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from code_atlas.daemon import DaemonManager
 from code_atlas.embeddings import EmbedClient, EmbeddingError
 from code_atlas.graph import GraphClient
+from code_atlas.health import run_health_checks
 from code_atlas.indexer import StalenessChecker
 from code_atlas.schema import (
     _CODE_LABELS,
@@ -900,6 +901,30 @@ def _register_info_tools(mcp: FastMCP) -> None:
             "cypher_examples": list(CYPHER_EXAMPLES),
             "uid_format": "{project_name}:{qualified_name}",
             "schema_version": SCHEMA_VERSION,
+        }
+
+    @mcp.tool(
+        description=(
+            "Check infrastructure health: Memgraph, TEI, Valkey, schema, config, index. "
+            "Returns ok (bool), per-check status with messages and suggestions, and elapsed_ms."
+        ),
+    )
+    async def health_check(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        app = await _ensure_root(ctx)
+        report = await run_health_checks(app.settings, graph=app.graph, embed=app.embed)
+        return {
+            "ok": report.ok,
+            "checks": [
+                {
+                    "name": c.name,
+                    "status": c.status.value,
+                    "message": c.message,
+                    "detail": c.detail,
+                    "suggestion": c.suggestion,
+                }
+                for c in report.checks
+            ],
+            "elapsed_ms": round(report.elapsed_ms, 1),
         }
 
 

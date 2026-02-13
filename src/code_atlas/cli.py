@@ -64,6 +64,22 @@ def status() -> None:
 
 
 @app.command()
+def health(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Quick infrastructure health check (exit 0 = ok, 1 = any failed)."""
+    asyncio.run(_run_health(json_output=json_output))
+
+
+@app.command()
+def doctor(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Detailed diagnostic report with fix suggestions."""
+    asyncio.run(_run_doctor(json_output=json_output))
+
+
+@app.command()
 def watch(
     path: str = typer.Argument(".", help="Path to the project root to watch."),
     debounce: float | None = typer.Option(None, "--debounce", help="Debounce timer in seconds (default: 5)."),
@@ -338,38 +354,71 @@ async def _run_status() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared infrastructure connection
+# Health / Doctor async helpers
 # ---------------------------------------------------------------------------
 
 
-async def _connect_bus_and_graph(settings):
-    """Connect to Valkey and Memgraph, returning ``(bus, graph)``.
+async def _run_health(*, json_output: bool) -> None:
+    from code_atlas.health import run_health_checks
+    from code_atlas.settings import AtlasSettings
 
-    Exits with code 1 if either service is unreachable.
-    Accepts an :class:`~code_atlas.settings.AtlasSettings` instance.
-    """
-    from code_atlas.events import EventBus
-    from code_atlas.graph import GraphClient
+    settings = AtlasSettings()
+    report = await run_health_checks(settings)
+    _print_report(report, detailed=False, json_output=json_output)
+    raise typer.Exit(code=0 if report.ok else 1)
 
-    bus = EventBus(settings.redis)
-    try:
-        await bus.ping()
-    except Exception as exc:
-        logger.error("Cannot reach Valkey at {}:{} — {}", settings.redis.host, settings.redis.port, exc)
-        raise typer.Exit(code=1) from exc
-    logger.info("Connected to Valkey at {}:{}", settings.redis.host, settings.redis.port)
 
-    graph = GraphClient(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
-        await bus.close()
-        raise typer.Exit(code=1) from exc
-    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
-    await graph.ensure_schema()
+async def _run_doctor(*, json_output: bool) -> None:
+    from code_atlas.health import run_health_checks
+    from code_atlas.settings import AtlasSettings
 
-    return bus, graph
+    settings = AtlasSettings()
+    report = await run_health_checks(settings)
+    _print_report(report, detailed=True, json_output=json_output)
+    raise typer.Exit(code=0 if report.ok else 1)
+
+
+def _print_report(report: object, *, detailed: bool, json_output: bool) -> None:
+    import json
+
+    from code_atlas.health import CheckStatus, HealthReport
+
+    rpt: HealthReport = report  # type: ignore[assignment]
+
+    if json_output:
+        payload = {
+            "ok": rpt.ok,
+            "checks": [
+                {
+                    "name": c.name,
+                    "status": c.status.value,
+                    "message": c.message,
+                    "detail": c.detail,
+                    "suggestion": c.suggestion,
+                }
+                for c in rpt.checks
+            ],
+            "elapsed_ms": round(rpt.elapsed_ms, 1),
+        }
+        logger.opt(raw=True).info(json.dumps(payload, indent=2) + "\n")
+        return
+
+    status_icon = {
+        CheckStatus.OK: "<green>\u2713</green>",
+        CheckStatus.WARN: "<yellow>!</yellow>",
+        CheckStatus.FAIL: "<red>\u2717</red>",
+    }
+
+    for c in rpt.checks:
+        icon = status_icon.get(c.status, "?")
+        logger.opt(colors=True).info("{} {:<20} {}", icon, c.name, c.message)
+        if detailed:
+            if c.detail:
+                logger.info("    {}", c.detail)
+            if c.suggestion:
+                logger.opt(colors=True).info("    <dim>Suggestion: {}</dim>", c.suggestion)
+
+    logger.info("Completed in {:.0f}ms", rpt.elapsed_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -381,12 +430,10 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     """Async implementation of the ``atlas watch`` command."""
     from pathlib import Path
 
-    from code_atlas.embeddings import EmbedCache, EmbedClient
-    from code_atlas.indexer import FileScope
-    from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+    from code_atlas.daemon import DaemonManager
+    from code_atlas.graph import GraphClient
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
-    from code_atlas.watcher import FileWatcher
 
     project_root = Path(path).resolve()
     settings = AtlasSettings(project_root=project_root)
@@ -396,33 +443,29 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     if max_wait is not None:
         settings.watcher.max_wait_s = max_wait
 
-    bus, graph = await _connect_bus_and_graph(settings)
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        raise typer.Exit(code=1) from exc
+    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+    await graph.ensure_schema()
 
-    embed = EmbedClient(settings.embeddings)
-    cache: EmbedCache | None = None
-    if settings.embeddings.cache_ttl_days > 0:
-        cache = EmbedCache(settings.redis, settings.embeddings)
-
-    scope = FileScope(project_root, settings)
-    watcher = FileWatcher(project_root, bus, scope, settings.watcher)
-    consumers = [
-        Tier1GraphConsumer(bus, graph, settings),
-        Tier2ASTConsumer(bus, graph, settings),
-        Tier3EmbedConsumer(bus, graph, embed, cache=cache),
-    ]
+    daemon = DaemonManager()
+    started = await daemon.start(settings, graph)
+    if not started:
+        logger.error("Valkey required for watch mode")
+        await graph.close()
+        raise typer.Exit(code=1)
 
     try:
-        await asyncio.gather(watcher.run(), *(c.run() for c in consumers))
+        await daemon.wait()
     except asyncio.CancelledError:
         pass
     finally:
-        watcher.stop()
-        for c in consumers:
-            c.stop()
-        if cache is not None:
-            await cache.close()
+        await daemon.stop()
         await graph.close()
-        await bus.close()
         shutdown_telemetry()
         logger.info("Watch stopped")
 
@@ -434,60 +477,37 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 
 async def _run_daemon() -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
-    from code_atlas.embeddings import EmbedCache, EmbedClient
-    from code_atlas.events import EventBus
+    from code_atlas.daemon import DaemonManager
     from code_atlas.graph import GraphClient
-    from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = AtlasSettings()
     init_telemetry(settings.observability)
-    bus = EventBus(settings.redis)
 
-    # Verify Redis is reachable
-    try:
-        await bus.ping()
-    except Exception as exc:
-        logger.error("Cannot reach Redis/Valkey at {}:{} — {}", settings.redis.host, settings.redis.port, exc)
-        raise typer.Exit(code=1) from exc
-
-    logger.info("Connected to Redis/Valkey at {}:{}", settings.redis.host, settings.redis.port)
-
-    # Verify Memgraph is reachable and apply schema
     graph = GraphClient(settings)
     try:
         await graph.ping()
     except Exception as exc:
         logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
-        await bus.close()
         raise typer.Exit(code=1) from exc
-
     logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
     await graph.ensure_schema()
 
-    embed = EmbedClient(settings.embeddings)
-    cache: EmbedCache | None = None
-    if settings.embeddings.cache_ttl_days > 0:
-        cache = EmbedCache(settings.redis, settings.embeddings)
-
-    consumers = [
-        Tier1GraphConsumer(bus, graph, settings),
-        Tier2ASTConsumer(bus, graph, settings),
-        Tier3EmbedConsumer(bus, graph, embed, cache=cache),
-    ]
+    daemon = DaemonManager()
+    started = await daemon.start(settings, graph, include_watcher=False)
+    if not started:
+        logger.error("Valkey required for daemon mode")
+        await graph.close()
+        raise typer.Exit(code=1)
 
     try:
-        await asyncio.gather(*(c.run() for c in consumers))
+        await daemon.wait()
     except asyncio.CancelledError:
         pass
     finally:
-        for c in consumers:
-            c.stop()
-        if cache is not None:
-            await cache.close()
+        await daemon.stop()
         await graph.close()
-        await bus.close()
         shutdown_telemetry()
         logger.info("Daemon stopped")
 
