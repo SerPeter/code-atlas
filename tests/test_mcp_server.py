@@ -41,7 +41,7 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
-from code_atlas.settings import find_git_root
+from code_atlas.settings import AtlasSettings, IndexSettings, find_git_root
 
 # ---------------------------------------------------------------------------
 # Fake context for direct tool invocation
@@ -730,6 +730,64 @@ class TestWithStaleness:
             result = {"results": []}
             annotated = await _with_staleness(app, result, scope="myproject")
             assert annotated["stale"] is None
+
+    async def test_lock_mode_stale_returns_error(self, settings):
+        """Lock mode with stale index returns STALE_INDEX error."""
+        from code_atlas.indexer import StalenessChecker, StalenessInfo
+
+        lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
+
+        with patch.object(
+            checker,
+            "check",
+            new_callable=AsyncMock,
+            return_value=StalenessInfo(stale=True, last_indexed_commit="abc123", current_commit="def456"),
+        ):
+            result = {"results": []}
+            annotated = await _with_staleness(app, result, scope="myproject")
+            assert annotated["code"] == "STALE_INDEX"
+            assert "error" in annotated
+
+    async def test_lock_mode_not_stale_passes_through(self, settings):
+        """Lock mode with fresh index passes result through unchanged."""
+        from code_atlas.indexer import StalenessChecker, StalenessInfo
+
+        lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
+
+        with patch.object(
+            checker,
+            "check",
+            new_callable=AsyncMock,
+            return_value=StalenessInfo(stale=False, current_commit="abc123"),
+        ):
+            result = {"results": []}
+            annotated = await _with_staleness(app, result, scope="myproject")
+            assert "error" not in annotated
+            assert annotated["stale"] is False
+
+    async def test_ignore_mode_skips_check(self, settings):
+        """Ignore mode skips staleness check entirely — result unchanged, check not called."""
+        from code_atlas.indexer import StalenessChecker
+
+        ignore_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="ignore"))
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=ignore_settings, embed=embed, staleness=checker)
+
+        with patch.object(checker, "check", new_callable=AsyncMock) as mock_check:
+            result = {"results": []}
+            annotated = await _with_staleness(app, result, scope="myproject")
+            assert "stale" not in annotated
+            mock_check.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
