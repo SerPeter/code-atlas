@@ -51,6 +51,8 @@ from code_atlas.search.guidance import (
     validate_cypher_explain,
     validate_cypher_static,
 )
+from code_atlas.server.analysis import analyze_repo as _analyze_repo
+from code_atlas.server.analysis import generate_diagram as _generate_diagram
 from code_atlas.server.health import run_health_checks
 from code_atlas.settings import AtlasSettings
 from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
@@ -494,6 +496,7 @@ def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastM
     _register_hybrid_tool(mcp)
     _register_info_tools(mcp)
     _register_subagent_tools(mcp)
+    _register_analysis_tools(mcp)
     return mcp
 
 
@@ -1068,3 +1071,57 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
     )
     async def plan_search_strategy(question: str) -> dict[str, Any]:
         return plan_strategy(question)
+
+
+def _register_analysis_tools(mcp: FastMCP) -> None:
+    """Register repository analysis and diagram generation tools."""
+
+    @mcp.tool(
+        description=(
+            "Analyze repository structure, centrality, dependencies, or patterns. "
+            "Select sub-analysis with the `analysis` parameter: "
+            "structure (entity counts, packages, largest modules, external deps), "
+            "centrality (hub entities, hub modules, leaf entities), "
+            "dependencies (internal imports, cross-package coupling, circular deps), "
+            "patterns (inheritance trees, enums, visibility distribution, docstring coverage)."
+        ),
+    )
+    async def analyze_repo(
+        analysis: str,
+        project: str = "",
+        path: str = "",
+        limit: int = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        project_name = project or app.settings.project_root.name
+        clamped = _clamp_limit(limit)
+        try:
+            return await _analyze_repo(app.graph, analysis, project_name, path=path, limit=clamped)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+    @mcp.tool(
+        description=(
+            "Generate Mermaid diagrams of the codebase. "
+            "Select diagram type: "
+            "packages (containment tree of packages and modules), "
+            "imports (module-level dependency graph), "
+            "inheritance (class hierarchy), "
+            "module_detail (single module's classes + methods — requires path)."
+        ),
+    )
+    async def generate_diagram(
+        type: str,  # noqa: A002
+        project: str = "",
+        path: str = "",
+        max_nodes: int = 30,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        project_name = project or app.settings.project_root.name
+        max_nodes = max(1, min(max_nodes, _MAX_LIMIT))
+        try:
+            return await _generate_diagram(app.graph, type, project_name, path=path, max_nodes=max_nodes)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")

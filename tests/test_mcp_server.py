@@ -33,6 +33,7 @@ from code_atlas.server.mcp import (
     _file_uri_to_path,
     _maybe_update_root,
     _rank_results,
+    _register_analysis_tools,
     _register_hybrid_tool,
     _register_info_tools,
     _register_node_tools,
@@ -73,6 +74,7 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
     _register_hybrid_tool(server)
     _register_info_tools(server)
     _register_subagent_tools(server)
+    _register_analysis_tools(server)
 
     tool_map = {tool.name: tool for tool in server._tool_manager._tools.values()}
     if tool_name not in tool_map:
@@ -969,3 +971,367 @@ class TestQueryTimeout:
     async def test_list_projects_timeout(self, timeout_app):
         result = await _invoke_tool(timeout_app, "list_projects")
         assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_analyze_repo_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "analyze_repo", analysis="structure", project="p")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_generate_diagram_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "generate_diagram", type="packages", project="p")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+
+# ---------------------------------------------------------------------------
+# Analysis tools fixtures
+# ---------------------------------------------------------------------------
+
+_PROJECT = "analysis-project"
+
+
+@pytest.fixture
+async def seeded_analysis_graph(graph_client):
+    """Seed graph with rich structure for analysis/diagram tests."""
+    await graph_client.ensure_schema()
+
+    # Project
+    await graph_client.merge_project_node(_PROJECT, file_count=3, entity_count=10)
+
+    # Packages
+    await graph_client.merge_package_node(_PROJECT, "mypkg", "mypkg", "mypkg/__init__.py")
+    await graph_client.merge_package_node(_PROJECT, "mypkg.sub", "sub", "mypkg/sub/__init__.py")
+
+    # Package containment
+    await graph_client.create_contains_edge(_PROJECT, f"{_PROJECT}:mypkg")
+    await graph_client.create_contains_edge(f"{_PROJECT}:mypkg", f"{_PROJECT}:mypkg.sub")
+
+    # --- Modules ---
+    for uid, name, qn, fp, le in [
+        (f"{_PROJECT}:mypkg.models", "models", "mypkg.models", "mypkg/models.py", 50),
+        (f"{_PROJECT}:mypkg.utils", "utils", "mypkg.utils", "mypkg/utils.py", 30),
+        (f"{_PROJECT}:mypkg.sub.api", "api", "mypkg.sub.api", "mypkg/sub/api.py", 40),
+    ]:
+        await graph_client.execute_write(
+            "CREATE (n:Module {uid: $uid, project_name: $p, name: $name, "
+            "qualified_name: $qn, file_path: $fp, kind: 'module', line_start: 1, line_end: $le})",
+            {"uid": uid, "p": _PROJECT, "name": name, "qn": qn, "fp": fp, "le": le},
+        )
+
+    # Package → Module containment
+    await graph_client.create_contains_edge(f"{_PROJECT}:mypkg", f"{_PROJECT}:mypkg.models")
+    await graph_client.create_contains_edge(f"{_PROJECT}:mypkg", f"{_PROJECT}:mypkg.utils")
+    await graph_client.create_contains_edge(f"{_PROJECT}:mypkg.sub", f"{_PROJECT}:mypkg.sub.api")
+
+    # --- TypeDefs ---
+    await graph_client.execute_write(
+        "CREATE (n:TypeDef {uid: $uid, project_name: $p, name: 'Base', "
+        "qualified_name: 'mypkg.models.Base', file_path: 'mypkg/models.py', "
+        "kind: 'class', line_start: 5, line_end: 20, visibility: 'public', "
+        "docstring: 'Base model class.'})",
+        {"uid": f"{_PROJECT}:mypkg.models.Base", "p": _PROJECT},
+    )
+    await graph_client.execute_write(
+        "CREATE (n:TypeDef {uid: $uid, project_name: $p, name: 'User', "
+        "qualified_name: 'mypkg.models.User', file_path: 'mypkg/models.py', "
+        "kind: 'class', line_start: 22, line_end: 45, visibility: 'public', "
+        "docstring: 'User model.', signature: 'class User(Base)'})",
+        {"uid": f"{_PROJECT}:mypkg.models.User", "p": _PROJECT},
+    )
+
+    # INHERITS: User → Base
+    await graph_client.execute_write(
+        "MATCH (child {uid: $c}), (parent {uid: $p}) CREATE (child)-[:INHERITS]->(parent)",
+        {"c": f"{_PROJECT}:mypkg.models.User", "p": f"{_PROJECT}:mypkg.models.Base"},
+    )
+
+    # --- Callables ---
+    for uid, name, qn, fp, kind, ls, le, vis, doc, sig in [
+        (
+            f"{_PROJECT}:mypkg.models.User.save",
+            "save",
+            "mypkg.models.User.save",
+            "mypkg/models.py",
+            "method",
+            30,
+            40,
+            "public",
+            "Save the user.",
+            "def save(self) -> None",
+        ),
+        (
+            f"{_PROJECT}:mypkg.utils.helper",
+            "helper",
+            "mypkg.utils.helper",
+            "mypkg/utils.py",
+            "function",
+            5,
+            15,
+            "public",
+            "A helper function.",
+            "def helper(x: int) -> str",
+        ),
+        (
+            f"{_PROJECT}:mypkg.sub.api.handle_request",
+            "handle_request",
+            "mypkg.sub.api.handle_request",
+            "mypkg/sub/api.py",
+            "function",
+            5,
+            30,
+            "public",
+            "Handle an API request.",
+            "def handle_request(req) -> Response",
+        ),
+    ]:
+        await graph_client.execute_write(
+            "CREATE (n:Callable {uid: $uid, project_name: $p, name: $name, "
+            "qualified_name: $qn, file_path: $fp, kind: $kind, "
+            "line_start: $ls, line_end: $le, visibility: $vis, "
+            "docstring: $doc, signature: $sig})",
+            {
+                "uid": uid,
+                "p": _PROJECT,
+                "name": name,
+                "qn": qn,
+                "fp": fp,
+                "kind": kind,
+                "ls": ls,
+                "le": le,
+                "vis": vis,
+                "doc": doc,
+                "sig": sig,
+            },
+        )
+
+    # --- Value (no docstring) ---
+    await graph_client.execute_write(
+        "CREATE (n:Value {uid: $uid, project_name: $p, name: 'MAX_SIZE', "
+        "qualified_name: 'mypkg.utils.MAX_SIZE', file_path: 'mypkg/utils.py', "
+        "kind: 'constant', line_start: 1, line_end: 1, visibility: 'public'})",
+        {"uid": f"{_PROJECT}:mypkg.utils.MAX_SIZE", "p": _PROJECT},
+    )
+
+    # --- DEFINES relationships ---
+    defines_pairs = [
+        (f"{_PROJECT}:mypkg.models", f"{_PROJECT}:mypkg.models.Base"),
+        (f"{_PROJECT}:mypkg.models", f"{_PROJECT}:mypkg.models.User"),
+        (f"{_PROJECT}:mypkg.models.User", f"{_PROJECT}:mypkg.models.User.save"),
+        (f"{_PROJECT}:mypkg.utils", f"{_PROJECT}:mypkg.utils.helper"),
+        (f"{_PROJECT}:mypkg.utils", f"{_PROJECT}:mypkg.utils.MAX_SIZE"),
+        (f"{_PROJECT}:mypkg.sub.api", f"{_PROJECT}:mypkg.sub.api.handle_request"),
+    ]
+    for from_uid, to_uid in defines_pairs:
+        await graph_client.execute_write(
+            "MATCH (a {uid: $f}), (b {uid: $t}) CREATE (a)-[:DEFINES]->(b)",
+            {"f": from_uid, "t": to_uid},
+        )
+
+    # --- IMPORTS relationships ---
+    imports_pairs = [
+        # api → User (indirect: api depends on models)
+        (f"{_PROJECT}:mypkg.sub.api", f"{_PROJECT}:mypkg.models.User"),
+        # api → helper (indirect: api depends on utils)
+        (f"{_PROJECT}:mypkg.sub.api", f"{_PROJECT}:mypkg.utils.helper"),
+        # models → helper (creates models→utils dependency)
+        (f"{_PROJECT}:mypkg.models", f"{_PROJECT}:mypkg.utils.helper"),
+        # utils → Base (creates utils→models dependency — circular with above!)
+        (f"{_PROJECT}:mypkg.utils", f"{_PROJECT}:mypkg.models.Base"),
+    ]
+    for from_uid, to_uid in imports_pairs:
+        await graph_client.execute_write(
+            "MATCH (a {uid: $f}), (b {uid: $t}) CREATE (a)-[:IMPORTS]->(b)",
+            {"f": from_uid, "t": to_uid},
+        )
+
+    # --- External dependency ---
+    await graph_client.execute_write(
+        "CREATE (ep:ExternalPackage {uid: $uid, project_name: $p, "
+        "name: 'dataclasses', qualified_name: 'ext/dataclasses'})",
+        {"uid": f"{_PROJECT}:ext/dataclasses", "p": _PROJECT},
+    )
+    await graph_client.execute_write(
+        "CREATE (es:ExternalSymbol {uid: $uid, project_name: $p, "
+        "name: 'dataclass', qualified_name: 'ext/dataclasses.dataclass', package: 'dataclasses'})",
+        {"uid": f"{_PROJECT}:ext/dataclasses.dataclass", "p": _PROJECT},
+    )
+    await graph_client.execute_write(
+        "MATCH (ep {uid: $ep}), (es {uid: $es}) CREATE (ep)-[:CONTAINS]->(es)",
+        {"ep": f"{_PROJECT}:ext/dataclasses", "es": f"{_PROJECT}:ext/dataclasses.dataclass"},
+    )
+    # models imports dataclass (external)
+    await graph_client.execute_write(
+        "MATCH (m {uid: $f}), (es {uid: $t}) CREATE (m)-[:IMPORTS]->(es)",
+        {"f": f"{_PROJECT}:mypkg.models", "t": f"{_PROJECT}:ext/dataclasses.dataclass"},
+    )
+
+    # --- CALLS: handle_request → helper ---
+    await graph_client.execute_write(
+        "MATCH (a {uid: $f}), (b {uid: $t}) CREATE (a)-[:CALLS]->(b)",
+        {"f": f"{_PROJECT}:mypkg.sub.api.handle_request", "t": f"{_PROJECT}:mypkg.utils.helper"},
+    )
+
+    return graph_client
+
+
+# ---------------------------------------------------------------------------
+# analyze_repo integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestAnalyzeRepo:
+    async def test_structure_counts(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="structure", project=_PROJECT)
+        assert result["analysis"] == "structure"
+        assert result["label_counts"]["Module"] == 3
+        assert result["label_counts"]["TypeDef"] == 2
+        assert result["label_counts"]["Callable"] == 3
+        assert result["label_counts"]["Value"] == 1
+        assert result["kind_breakdown"]["Callable"]["function"] == 2
+        assert result["kind_breakdown"]["Callable"]["method"] == 1
+
+    async def test_structure_packages(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="structure", project=_PROJECT)
+        pkg_names = [p["name"] for p in result["packages"]]
+        assert "mypkg" in pkg_names
+
+    async def test_structure_largest_modules(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="structure", project=_PROJECT)
+        # models defines Base + User = 2 entities; utils defines helper + MAX_SIZE = 2
+        assert len(result["largest_modules"]) >= 2
+
+    async def test_structure_external_deps(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="structure", project=_PROJECT)
+        ext_names = [d["package"] for d in result["external_dependencies"]]
+        assert "dataclasses" in ext_names
+
+    async def test_centrality_hubs(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="centrality", project=_PROJECT)
+        assert result["analysis"] == "centrality"
+        hub_names = [h["name"] for h in result["hub_entities"]]
+        # helper is imported by api + models, and called by handle_request
+        assert "helper" in hub_names
+
+    async def test_centrality_leaves(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="centrality", project=_PROJECT)
+        leaf_names = [lf["name"] for lf in result["leaf_entities"]]
+        # MAX_SIZE has no inbound IMPORTS/INHERITS/CALLS
+        assert "MAX_SIZE" in leaf_names
+
+    async def test_dependencies_internal(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="dependencies", project=_PROJECT)
+        assert result["analysis"] == "dependencies"
+        assert len(result["internal_imports"]) >= 2
+
+    async def test_dependencies_circular(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="dependencies", project=_PROJECT)
+        # models↔utils is a circular dependency
+        assert len(result["circular_dependencies"]) >= 1
+        cycle = result["circular_dependencies"][0]
+        pair = {cycle["module_a"], cycle["module_b"]}
+        assert pair == {"mypkg.models", "mypkg.utils"}
+
+    async def test_dependencies_external(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="dependencies", project=_PROJECT)
+        ext_pkgs = [e["package"] for e in result["external_imports"]]
+        assert "dataclasses" in ext_pkgs
+
+    async def test_patterns_inheritance(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="patterns", project=_PROJECT)
+        assert result["analysis"] == "patterns"
+        assert len(result["inheritance"]) >= 1
+        inh = result["inheritance"][0]
+        assert inh["child"] == "User"
+        assert inh["parent"] == "Base"
+
+    async def test_patterns_visibility(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="patterns", project=_PROJECT)
+        assert result["visibility_distribution"]["public"] >= 5
+
+    async def test_patterns_docstring_coverage(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="patterns", project=_PROJECT)
+        cov = result["docstring_coverage"]
+        assert cov["total"] >= 5
+        # MAX_SIZE has no docstring, so documented < total
+        assert cov["documented"] < cov["total"]
+        assert cov["percentage"] > 0
+
+    async def test_path_filter(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="structure", project=_PROJECT, path="mypkg/utils")
+        # Only entities under mypkg/utils.py
+        assert result["label_counts"].get("Module", 0) <= 1
+        assert "TypeDef" not in result["label_counts"]
+
+    async def test_invalid_analysis(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="nonexistent", project=_PROJECT)
+        assert result["code"] == "INVALID_ANALYSIS"
+
+
+# ---------------------------------------------------------------------------
+# generate_diagram integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestGenerateDiagram:
+    async def test_packages_diagram(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="packages", project=_PROJECT)
+        assert result["type"] == "packages"
+        assert "graph TD" in result["mermaid"]
+        assert result["node_count"] >= 2
+        assert "-->" in result["mermaid"]
+
+    async def test_imports_diagram(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="imports", project=_PROJECT)
+        assert result["type"] == "imports"
+        assert "graph LR" in result["mermaid"]
+        assert result["node_count"] >= 2
+        # Should show module dependency edges
+        assert "-->" in result["mermaid"]
+
+    async def test_inheritance_diagram(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="inheritance", project=_PROJECT)
+        assert result["type"] == "inheritance"
+        assert "classDiagram" in result["mermaid"]
+        assert "Base" in result["mermaid"]
+        assert "User" in result["mermaid"]
+        assert "<|--" in result["mermaid"]
+
+    async def test_module_detail_diagram(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(
+            app_ctx, "generate_diagram", type="module_detail", project=_PROJECT, path="mypkg/models"
+        )
+        assert result["type"] == "module_detail"
+        assert result["module"] == "mypkg.models"
+        assert "classDiagram" in result["mermaid"]
+        # Should include Base and User
+        assert "Base" in result["mermaid"]
+        assert "User" in result["mermaid"]
+        # User.save should appear as a method
+        assert "save()" in result["mermaid"]
+
+    async def test_module_detail_requires_path(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="module_detail", project=_PROJECT)
+        assert result["code"] == "PATH_REQUIRED"
+
+    async def test_module_detail_not_found(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(
+            app_ctx, "generate_diagram", type="module_detail", project=_PROJECT, path="nonexistent/path"
+        )
+        assert result["code"] == "NOT_FOUND"
+
+    async def test_max_nodes_caps_output(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="packages", project=_PROJECT, max_nodes=2)
+        assert result["node_count"] <= 4  # max_nodes limits edges, each edge adds up to 2 nodes
+
+    async def test_invalid_diagram_type(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="nonexistent", project=_PROJECT)
+        assert result["code"] == "INVALID_DIAGRAM_TYPE"
+
+    async def test_empty_project_diagrams(self, app_ctx):
+        """Diagrams for a non-existent project return empty/placeholder output."""
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="packages", project="nonexistent")
+        assert result["node_count"] == 0
+
+    async def test_imports_empty(self, app_ctx):
+        result = await _invoke_tool(app_ctx, "generate_diagram", type="imports", project="nonexistent")
+        assert result["node_count"] == 0
