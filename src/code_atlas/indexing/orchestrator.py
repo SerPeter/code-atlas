@@ -21,6 +21,7 @@ from code_atlas.events import EventBus, FileChanged, Topic
 from code_atlas.indexing.consumers import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
+from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
@@ -485,18 +486,22 @@ def _git_changed_files(project_root: Path, from_hash: str) -> list[tuple[str, st
 # ---------------------------------------------------------------------------
 
 
-def _read_git_head(project_root: Path) -> str | None:
+def _read_git_head(project_root: Path) -> str | None:  # noqa: PLR0911
     """Read the current git HEAD hash without spawning a subprocess.
 
     - If ``.git/HEAD`` contains ``ref: refs/heads/...``, read the ref file.
     - If the ref file is missing, fall back to ``.git/packed-refs``.
     - If HEAD is a detached 40-char hex hash, return directly.
     - Returns ``None`` for non-git directories or on any read error.
+
+    Supports linked worktrees (where ``.git`` is a file pointing to the
+    real git directory).
     """
-    git_dir = project_root / ".git"
-    head_file = git_dir / "HEAD"
+    git_dir = resolve_git_dir(project_root)
+    if git_dir is None:
+        return None
     try:
-        head_content = head_file.read_text(encoding="utf-8").strip()
+        head_content = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
     except OSError:
         return None
 
@@ -559,7 +564,7 @@ class StalenessChecker:
 
     def __init__(self, project_root: Path, *, project_name: str | None = None) -> None:
         self._root = project_root.resolve()
-        self._project_name = project_name or self._root.name
+        self._project_name = project_name or derive_project_name(self._root)
         self._cached_hash: str | None = None
         self._cached_head_mtime: float | None = None
         self._cached_ref_mtime: float | None = None
@@ -571,7 +576,10 @@ class StalenessChecker:
 
     def current_head(self) -> str | None:
         """Return the current HEAD hash, cached by file mtime."""
-        git_dir = self._root / ".git"
+        git_dir = resolve_git_dir(self._root)
+        if git_dir is None:
+            self._cached_hash = None
+            return None
         head_file = git_dir / "HEAD"
 
         try:
@@ -915,7 +923,7 @@ async def index_project(
     settings-derived defaults so that each sub-project can be indexed
     with its own root while sharing infra config from the monorepo settings.
     """
-    project_name = project_name or settings.project_root.name
+    project_name = project_name or derive_project_name(Path(settings.project_root))
     with _tracer.start_as_current_span("index_project", attributes={"project_name": project_name}) as idx_span:
         return await _index_project_inner(
             settings,
@@ -1085,7 +1093,7 @@ async def _index_monorepo_inner(
 
     logger.info("Detected {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
 
-    # Filter by scope_projects if specified
+    # Filter by scope_projects if specified (matches on bare DetectedProject.name)
     if scope_projects:
         filtered: list[DetectedProject] = []
         for sp in sub_projects:
@@ -1096,16 +1104,20 @@ async def _index_monorepo_inner(
         sub_projects = filtered
         logger.info("Scoped to {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
 
+    # Compute the root name once — sub-projects are prefixed with it
+    root_name = derive_project_name(project_root)
+
     results: list[IndexResult] = []
 
-    # Index each sub-project
+    # Index each sub-project with prefixed name
     for sub in sub_projects:
-        logger.info("Indexing sub-project '{}' at {}", sub.name, sub.path)
+        prefixed_name = f"{root_name}/{sub.name}"
+        logger.info("Indexing sub-project '{}' at {}", prefixed_name, sub.path)
         result = await index_project(
             settings,
             graph,
             bus,
-            project_name=sub.name,
+            project_name=prefixed_name,
             project_root=sub.root,
             full_reindex=full_reindex,
             drain_timeout_s=drain_timeout_s,
@@ -1113,7 +1125,6 @@ async def _index_monorepo_inner(
         results.append(result)
 
     # Index root project (files not inside any sub-project)
-    root_name = project_root.name
     sub_paths = [sp.path for sp in sub_projects]
 
     # Scan root, then filter out files belonging to sub-projects
@@ -1136,7 +1147,7 @@ async def _index_monorepo_inner(
         results.append(result)
 
     # Cross-project import resolution
-    all_project_names = [sp.name for sp in sub_projects]
+    all_project_names = [f"{root_name}/{sp.name}" for sp in sub_projects]
     if root_only_files:
         all_project_names.append(root_name)
 

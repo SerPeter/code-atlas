@@ -292,11 +292,12 @@ class TestIndexMonorepoIntegration:
         # Should have indexed at least the two sub-projects
         assert len(results) >= 2
 
-        # Check Project nodes exist
+        # Check Project nodes exist with prefixed names
+        root_name = monorepo_dir.resolve().name
         projects = await graph_client.execute(f"MATCH (p:{NodeLabel.PROJECT}) RETURN p.name AS name")
         project_names = {p["name"] for p in projects}
-        assert "auth" in project_names
-        assert "shared" in project_names
+        assert f"{root_name}/auth" in project_names
+        assert f"{root_name}/shared" in project_names
 
     async def test_scoped_monorepo_index(self, monorepo_dir, graph_client, event_bus):
         """Scoping to specific sub-projects only indexes those."""
@@ -311,7 +312,8 @@ class TestIndexMonorepoIntegration:
             settings, graph_client, event_bus, scope_projects=["auth"], drain_timeout_s=TEST_DRAIN_TIMEOUT_S
         )
 
-        # Should only have indexed auth + possibly root
+        # Should only have indexed auth (prefixed) + possibly root
+        root_name = monorepo_dir.resolve().name
         projects = await graph_client.execute(f"MATCH (p:{NodeLabel.PROJECT}) RETURN p.name AS name")
         project_names = {p["name"] for p in projects}
-        assert "auth" in project_names
+        assert f"{root_name}/auth" in project_names

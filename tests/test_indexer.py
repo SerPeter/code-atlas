@@ -18,7 +18,7 @@ from code_atlas.indexing.orchestrator import (
     scan_files,
 )
 from code_atlas.schema import NodeLabel
-from code_atlas.settings import AtlasSettings, IndexSettings, ScopeSettings
+from code_atlas.settings import AtlasSettings, IndexSettings, ScopeSettings, derive_project_name, resolve_git_dir
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
 if TYPE_CHECKING:
@@ -620,6 +620,89 @@ class TestDeltaIndexIntegration:
 
 
 # ---------------------------------------------------------------------------
+# resolve_git_dir — unit tests (no infrastructure)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveGitDir:
+    def test_normal_repo(self, tmp_path):
+        """Normal repo with .git directory returns it."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        assert resolve_git_dir(tmp_path) == git_dir
+
+    def test_worktree(self, tmp_path):
+        """.git file with gitdir: pointer follows to the real git dir."""
+        real_git_dir = tmp_path / "main-repo" / ".git" / "worktrees" / "feature"
+        real_git_dir.mkdir(parents=True)
+        worktree = tmp_path / "feature"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {real_git_dir}\n", encoding="utf-8")
+
+        result = resolve_git_dir(worktree)
+        assert result == real_git_dir
+
+    def test_relative_gitdir(self, tmp_path):
+        """Relative gitdir: path is resolved against project_root."""
+        real_git_dir = tmp_path / "main" / ".git" / "worktrees" / "wt"
+        real_git_dir.mkdir(parents=True)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # Write a relative path from worktree dir to real git dir
+        rel = os.path.relpath(real_git_dir, worktree).replace("\\", "/")
+        (worktree / ".git").write_text(f"gitdir: {rel}\n", encoding="utf-8")
+
+        result = resolve_git_dir(worktree)
+        assert result is not None
+        assert result.resolve() == real_git_dir.resolve()
+
+    def test_no_git(self, tmp_path):
+        """No .git file or directory returns None."""
+        assert resolve_git_dir(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# derive_project_name — unit tests (no infrastructure)
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveProjectName:
+    def test_normal_repo(self, tmp_path):
+        """Normal repo returns directory basename."""
+        (tmp_path / ".git").mkdir()
+        assert derive_project_name(tmp_path) == tmp_path.resolve().name
+
+    def test_worktree_with_branch(self, tmp_path):
+        """Worktree returns basename@branch."""
+        real_git_dir = tmp_path / "main-repo" / ".git" / "worktrees" / "feat-login"
+        real_git_dir.mkdir(parents=True)
+        (real_git_dir / "HEAD").write_text("ref: refs/heads/feat/login\n", encoding="utf-8")
+
+        worktree = tmp_path / "myapp"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {real_git_dir}\n", encoding="utf-8")
+
+        assert derive_project_name(worktree) == "myapp@feat/login"
+
+    def test_detached_worktree_fallback(self, tmp_path):
+        """Detached HEAD worktree uses git dir basename as fallback."""
+        real_git_dir = tmp_path / "main-repo" / ".git" / "worktrees" / "hotfix-42"
+        real_git_dir.mkdir(parents=True)
+        detached_hash = "a" * 40
+        (real_git_dir / "HEAD").write_text(detached_hash + "\n", encoding="utf-8")
+
+        worktree = tmp_path / "myapp"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {real_git_dir}\n", encoding="utf-8")
+
+        assert derive_project_name(worktree) == "myapp@hotfix-42"
+
+    def test_non_git_directory(self, tmp_path):
+        """Non-git directory returns plain basename."""
+        assert derive_project_name(tmp_path) == tmp_path.resolve().name
+
+
+# ---------------------------------------------------------------------------
 # _read_git_head — unit tests (no infrastructure)
 # ---------------------------------------------------------------------------
 
@@ -662,6 +745,19 @@ class TestReadGitHead:
     def test_returns_none_no_git(self, tmp_path):
         """Returns None for directories without .git."""
         assert _read_git_head(tmp_path) is None
+
+    def test_reads_head_in_worktree(self, tmp_path):
+        """_read_git_head follows .git file → real git dir."""
+        real_git_dir = tmp_path / "main-repo" / ".git" / "worktrees" / "wt"
+        real_git_dir.mkdir(parents=True)
+        fake_hash = "f" * 40
+        (real_git_dir / "HEAD").write_text(fake_hash + "\n", encoding="utf-8")
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {real_git_dir}\n", encoding="utf-8")
+
+        assert _read_git_head(worktree) == fake_hash
 
 
 # ---------------------------------------------------------------------------
@@ -716,9 +812,25 @@ class TestStalenessChecker:
         assert checker.current_head() is None
 
     def test_project_name(self, tmp_path):
-        """project_name is derived from project_root.name."""
+        """project_name is derived via derive_project_name()."""
         checker = StalenessChecker(tmp_path)
-        assert checker.project_name == tmp_path.resolve().name
+        assert checker.project_name == derive_project_name(tmp_path)
+
+    def test_project_name_worktree(self, tmp_path):
+        """project_name includes worktree branch suffix."""
+        real_git_dir = tmp_path / "main" / ".git" / "worktrees" / "dev"
+        real_git_dir.mkdir(parents=True)
+        (real_git_dir / "HEAD").write_text("ref: refs/heads/dev\n", encoding="utf-8")
+        refs_dir = real_git_dir / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        (refs_dir / "dev").write_text("a" * 40 + "\n", encoding="utf-8")
+
+        worktree = tmp_path / "myapp"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {real_git_dir}\n", encoding="utf-8")
+
+        checker = StalenessChecker(worktree)
+        assert checker.project_name == "myapp@dev"
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,7 @@ class FileWatcher:
         settings: WatcherSettings,
         *,
         sub_projects: list[DetectedProject] | None = None,
+        root_name: str = "",
     ) -> None:
         self._root = Path(project_root).resolve()
         self._bus = bus
@@ -65,6 +66,7 @@ class FileWatcher:
         self._debounce_s = settings.debounce_s
         self._max_wait_s = settings.max_wait_s
         self._sub_projects = sub_projects or []
+        self._root_name = root_name
 
         # Pending changes: {rel_path: (change_type, project_name)}  (latest wins)
         self._pending: dict[str, tuple[str, str]] = {}
@@ -127,6 +129,12 @@ class FileWatcher:
             project_name = ""
             if self._sub_projects:
                 project_name = classify_file_project(rel_path, self._sub_projects)
+
+            # Prefix with root_name for monorepo sub-project naming
+            if project_name and self._root_name:
+                project_name = f"{self._root_name}/{project_name}"
+            elif not project_name and self._root_name:
+                project_name = self._root_name
 
             self._pending[rel_path] = (change_type, project_name)
             accepted += 1

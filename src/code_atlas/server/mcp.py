@@ -54,7 +54,7 @@ from code_atlas.search.guidance import (
 from code_atlas.server.analysis import analyze_repo as _analyze_repo
 from code_atlas.server.analysis import generate_diagram as _generate_diagram
 from code_atlas.server.health import run_health_checks
-from code_atlas.settings import AtlasSettings
+from code_atlas.settings import AtlasSettings, derive_project_name
 from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
 
 if TYPE_CHECKING:
@@ -138,7 +138,7 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
 
     app.settings = AtlasSettings(**overrides)
     app.resolved_root = new_root
-    app.staleness = StalenessChecker(new_root, project_name=new_root.name)
+    app.staleness = StalenessChecker(new_root)
 
     # Re-check embedding model match for new root
     if not app.settings.embeddings.enabled:
@@ -438,7 +438,7 @@ def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastM
                 logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
                 embed = None
                 vector_enabled = False
-        staleness = StalenessChecker(settings.project_root, project_name=settings.project_root.name)
+        staleness = StalenessChecker(settings.project_root)
         daemon = DaemonManager()
         app_ctx = AppContext(
             graph=graph,
@@ -1097,7 +1097,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
-        project_name = project or app.settings.project_root.name
+        project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
         try:
             return await _analyze_repo(app.graph, analysis, project_name, path=path, limit=clamped)
@@ -1122,7 +1122,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
-        project_name = project or app.settings.project_root.name
+        project_name = project or derive_project_name(app.settings.project_root)
         max_nodes = max(1, min(max_nodes, _MAX_LIMIT))
         try:
             return await _generate_diagram(app.graph, type, project_name, path=path, max_nodes=max_nodes)

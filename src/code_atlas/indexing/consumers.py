@@ -35,6 +35,7 @@ from code_atlas.parsing.ast import ParsedRelationship, parse_file
 from code_atlas.parsing.detectors import get_enabled_detectors, run_detectors
 from code_atlas.schema import RelType
 from code_atlas.search.embeddings import EmbedCache, build_embed_text
+from code_atlas.settings import derive_project_name
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
@@ -360,7 +361,7 @@ class Tier2ASTConsumer(TierConsumer):
 
             logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
-            project_name = event_project_name or self.settings.project_root.name
+            project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
             changed_entity_refs: list[EntityRef] = []
             all_import_rels: list[ParsedRelationship] = []
             all_call_rels: list[ParsedRelationship] = []

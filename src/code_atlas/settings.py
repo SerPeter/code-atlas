@@ -27,6 +27,69 @@ def find_git_root(start: Path | None = None) -> Path | None:
         current = parent
 
 
+def resolve_git_dir(project_root: Path) -> Path | None:
+    """Resolve the actual git directory for *project_root*.
+
+    - If ``.git`` is a directory → return it (normal repo / main worktree).
+    - If ``.git`` is a file → parse ``gitdir: <path>``, resolve relative
+      paths against *project_root*, return the target directory.
+    - Otherwise → ``None``.
+    """
+    dot_git = project_root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    if dot_git.is_file():
+        try:
+            content = dot_git.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if content.startswith("gitdir:"):
+            raw = content[len("gitdir:") :].strip()
+            resolved = Path(raw) if Path(raw).is_absolute() else (project_root / raw).resolve()
+            return resolved if resolved.is_dir() else None
+    return None
+
+
+def get_worktree_branch(project_root: Path) -> str | None:
+    """Return the branch name if *project_root* is a linked git worktree.
+
+    Returns ``None`` for the main worktree or non-git directories.
+    """
+    dot_git = project_root / ".git"
+    if not dot_git.is_file():
+        return None  # main worktree or non-git
+
+    git_dir = resolve_git_dir(project_root)
+    if git_dir is None:
+        return None
+
+    head_file = git_dir / "HEAD"
+    try:
+        head_content = head_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    if head_content.startswith("ref: refs/heads/"):
+        return head_content[len("ref: refs/heads/") :]
+
+    # Detached HEAD fallback — use the worktree directory name
+    # (git stores linked worktrees under `.git/worktrees/<name>`)
+    return git_dir.name
+
+
+def derive_project_name(project_root: Path) -> str:
+    """Derive the canonical project name for *project_root*.
+
+    - Base name = resolved directory basename.
+    - If *project_root* is a linked worktree → ``base@branch``.
+    """
+    base = project_root.resolve().name
+    branch = get_worktree_branch(project_root)
+    if branch is not None:
+        return f"{base}@{branch}"
+    return base
+
+
 def _default_project_root() -> Path:
     """Git root if found, otherwise cwd."""
     return find_git_root() or Path.cwd()

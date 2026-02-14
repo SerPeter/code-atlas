@@ -15,9 +15,10 @@ from loguru import logger
 
 from code_atlas.events import EventBus
 from code_atlas.indexing.consumers import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
-from code_atlas.indexing.orchestrator import FileScope
+from code_atlas.indexing.orchestrator import FileScope, detect_sub_projects
 from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
+from code_atlas.settings import derive_project_name
 
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
@@ -88,7 +89,16 @@ class DaemonManager:
 
         if include_watcher:
             scope = FileScope(settings.project_root, settings)
-            self._watcher = FileWatcher(settings.project_root, bus, scope, settings.watcher)
+            subs = detect_sub_projects(settings.project_root, settings.monorepo)
+            root_name = derive_project_name(settings.project_root)
+            self._watcher = FileWatcher(
+                settings.project_root,
+                bus,
+                scope,
+                settings.watcher,
+                sub_projects=subs or None,
+                root_name=root_name,
+            )
 
         # Spawn background tasks
         if self._watcher is not None:
