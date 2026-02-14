@@ -168,6 +168,24 @@ _USAGE_GUIDE: dict[str, str] = {
         "Query these like any relationship: "
         "`MATCH (t)-[:TESTS]->(target {name: 'MyClass'}) RETURN t`"
     ),
+    "guidelines": (
+        "# Repository Guidelines\n"
+        "\n"
+        "For best results when your codebase is indexed by Code Atlas:\n"
+        "- **First-line doc comments** on public functions/classes — embedded for vector search\n"
+        "- **Type annotations** on signatures — create USES_TYPE edges, improve search quality\n"
+        "- **Named imports** (not wildcards) — each creates an IMPORTS edge for graph analysis\n"
+        "- **Focused modules** (one concept per file) — clean graph neighborhoods, efficient delta detection\n"
+        "- **Descriptive names** consistently — graph and BM25 search tokenize on name boundaries\n"
+        "- **Standard decorators** for routes, commands, tests — pattern detectors create typed edges\n"
+        "- **Explicit inheritance** (`class Foo(Bar)`) — parser extracts INHERITS edges\n"
+        "- **`.atlasignore`** to exclude generated/vendored code — reduces graph noise\n"
+        "- **File-level doc comments** at file top — embedded for module-level vector search\n"
+        "- **Small functions** — each is a separately searchable, delta-tracked entity\n"
+        "- **Test naming** mirrors source (`test_graph_search_*` → `graph_search`) — enables TESTS edges\n"
+        "\n"
+        "Full reference with code examples: docs/guides/repo-guidelines.md"
+    ),
 }
 
 # ---------------------------------------------------------------------------

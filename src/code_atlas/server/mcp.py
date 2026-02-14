@@ -486,7 +486,8 @@ def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastM
             "Start with get_usage_guide for workflow guidance. "
             "Use hybrid_search as the primary search tool. "
             "Use get_node to find entities by name, get_context to expand neighborhoods. "
-            "Use schema_info for Cypher examples, validate_cypher to check queries before running them."
+            "Use schema_info for Cypher examples, validate_cypher to check queries before running them. "
+            "Call get_usage_guide('guidelines') for tips on structuring code for better search results."
         ),
         lifespan=app_lifespan,
     )
@@ -765,7 +766,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "(e.g. to find tests for a function). "
             "Optional: search_types (comma-separated: graph,vector,bm25), "
             'scope (project name filter), weights (JSON: {"graph": 2.0}). '
-            "Returns results ranked by fused score with provenance (which channels found each result)."
+            "Returns results ranked by fused score with provenance (which channels found each result). "
+            "For best results, add doc comments and type annotations to your code — "
+            "they are embedded for semantic search."
         ),
     )
     async def hybrid_search(
@@ -1060,7 +1063,7 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
         description=(
             "How to use Code Atlas tools. "
             "Call with no args for a quick-start guide, or pass a topic: "
-            "'searching', 'cypher', 'navigation', 'patterns'."
+            "'searching', 'cypher', 'navigation', 'patterns', 'guidelines'."
         ),
     )
     async def get_usage_guide(topic: str = "") -> dict[str, Any]:

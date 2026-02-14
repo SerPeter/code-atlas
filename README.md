@@ -137,6 +137,11 @@ vendor/
 migrations/
 ```
 
+## For Best Results
+
+Code Atlas works with any codebase, but structured code produces a richer graph and better search results.
+See the [repository guidelines](docs/guides/repo-guidelines.md) for practices that improve both code quality and Code Atlas indexing.
+
 ## Architecture
 
 ```

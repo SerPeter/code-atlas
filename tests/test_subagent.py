@@ -212,5 +212,5 @@ class TestSchemaCompleteness:
 
     def test_usage_guide_has_all_topics(self):
         """All documented topics exist in _USAGE_GUIDE."""
-        expected = {"", "searching", "cypher", "navigation", "patterns"}
+        expected = {"", "searching", "cypher", "navigation", "patterns", "guidelines"}
         assert set(_USAGE_GUIDE.keys()) == expected
