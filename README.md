@@ -141,28 +141,28 @@ migrations/
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                 MCP Server (Python)              │
+│                 MCP Server (Python)             │
 │  ┌──────────┐ ┌──────────┐ ┌─────────────────┐  │
 │  │  Query   │ │  Index   │ │  Admin/Health   │  │
 │  │  Tools   │ │  Tools   │ │  Tools          │  │
 │  └────┬─────┘ └────┬─────┘ └─────────────────┘  │
-│       │             │                             │
-│  ┌────▼─────────────▼───────────────────────┐    │
-│  │       Query Router / Orchestrator        │    │
-│  └────┬─────────┬───────────┬───────────────┘    │
-│       │         │           │                     │
+│       │             │                           │
+│  ┌────▼─────────────▼───────────────────────┐   │
+│  │       Query Router / Orchestrator        │   │
+│  └────┬─────────┬───────────┬───────────────┘   │
+│       │         │           │                   │
 │  ┌────▼───┐ ┌───▼────┐ ┌───▼─────┐              │
 │  │ Graph  │ │ Vector │ │  BM25   │   → RRF →    │
 │  │ Search │ │ Search │ │ Search  │   Fusion     │
 │  └────┬───┘ └───┬────┘ └───┬─────┘              │
-│       └─────────┼──────────┘                     │
-│            ┌────▼────┐                            │
-│            │Memgraph │                            │
-│            └─────────┘                            │
+│       └─────────┼──────────┘                    │
+│            ┌────▼────┐                          │
+│            │Memgraph │                          │
+│            └─────────┘                          │
 └─────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────┐
-│              Indexing Pipeline                    │
+│              Indexing Pipeline                  │
 │  File Scanner → AST Parser (tree-sitter) → Diff │
 │  → Pattern Detectors → Embeddings (TEI)         │
 │  → Graph Writer → Memgraph                      │
@@ -189,12 +189,57 @@ uv run ty check
 uv run pre-commit install
 ```
 
+## Performance
+
+Benchmarked on a synthetic codebase with deterministic Python files (classes, methods, imports, docstrings).
+
+### Parsing
+
+| Codebase | Files | Entities | Time | Throughput | Peak Memory |
+|----------|-------|----------|------|------------|-------------|
+| Small    | 100   | 1,500    | 0.14s | **709 files/sec** | 1.4 MB |
+| Medium   | 1,000 | 15,000   | 1.6s  | **608 files/sec** | 15.8 MB |
+
+Memory scales linearly (~16 KB per entity) when accumulating all parse results. In production, entities are streamed to the graph and not held in memory simultaneously.
+
+### Query Latency (p50 / p95)
+
+| Search Type | p50 | p95 | p99 |
+|-------------|-----|-----|-----|
+| BM25 text search | 8 ms | 12 ms | 29 ms |
+| Vector search | 58 ms | 73 ms | 84 ms |
+| Graph search | 209 ms | 352 ms | 436 ms |
+
+Graph search is slower because it runs a 3-stage cascade (exact → suffix → contains) as sequential Cypher queries. BM25 and vector search use single Memgraph procedure calls.
+
+### Concurrent Queries
+
+| Concurrency | Total Queries | Wall Time | QPS | Errors |
+|-------------|---------------|-----------|-----|--------|
+| 10 | 50 | 1.9s | 26 | 0 |
+| 50 | 250 | 1.1s | **238** | 0 |
+
+Zero errors under load. QPS scales well with concurrency thanks to Memgraph's connection pooling.
+
+### Running Benchmarks
+
+```bash
+# Parser + memory (no infra needed)
+uv run pytest tests/bench/test_bench_parser.py tests/bench/test_bench_memory.py -m bench -s
+
+# Query + concurrent (requires Memgraph)
+uv run pytest tests/bench/ -m bench -s
+
+# Exclude benchmarks from regular test runs
+uv run pytest -m "not bench"
+```
+
 ## How Does This Compare?
 
 Several excellent tools exist in this space. Code Atlas builds on their ideas while addressing gaps that emerge when you need graph, semantic, and keyword search working together.
 
 | Tool                                                                    | Strengths                                      | Gaps                                                                            |
-| ----------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------- |
+|-------------------------------------------------------------------------|------------------------------------------------|---------------------------------------------------------------------------------|
 | **[code-graph-mcp](https://github.com/entrepeneur4lyf/code-graph-mcp)** | Fast ast-grep parsing, broad language coverage | In-memory only (no persistence), no semantic or keyword search                  |
 | **[code-graph-rag](https://github.com/vitali87/code-graph-rag)**        | Best hierarchy model, Memgraph-native          | Every query requires an LLM call, no vector/BM25 search, no doc indexing        |
 | **[Kit](https://github.com/cased/kit)**                                 | Clean DX, good semantic + text search          | No graph database — can't follow relationships (calls, inheritance)             |

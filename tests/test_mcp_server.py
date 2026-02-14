@@ -791,6 +791,27 @@ class TestWithStaleness:
             assert "stale" not in annotated
             mock_check.assert_not_called()
 
+    async def test_staleness_timeout_returns_original_result(self, settings):
+        """If staleness check times out, the original result is returned unmodified."""
+        import asyncio
+
+        from code_atlas.indexer import StalenessChecker
+
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+
+        async def _slow_check(*_args, **_kwargs):
+            await asyncio.sleep(60)
+
+        with patch.object(checker, "check", side_effect=_slow_check):
+            result = {"results": [{"uid": "test:foo"}]}
+            annotated = await _with_staleness(app, result, scope="myproject")
+            # Timeout fires (5s) — original result returned without stale keys
+            assert "stale" not in annotated
+            assert annotated["results"] == [{"uid": "test:foo"}]
+
 
 # ---------------------------------------------------------------------------
 # find_git_root (no DB needed)

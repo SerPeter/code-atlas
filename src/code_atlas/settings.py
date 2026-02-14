@@ -107,6 +107,7 @@ class MemgraphSettings(BaseSettings):
     username: str = Field(default="", description="Memgraph username.")
     password: str = Field(default="", description="Memgraph password.")
     query_timeout_s: float = Field(default=10.0, description="Timeout in seconds for read queries.")
+    write_timeout_s: float = Field(default=60.0, description="Timeout in seconds for write queries.")
 
 
 class SearchSettings(BaseSettings):

@@ -632,7 +632,7 @@ class StalenessChecker:
         # Stale — optionally list changed files
         changed: list[str] = []
         if include_changed:
-            raw = _git_changed_files(self._root, stored)
+            raw = await asyncio.to_thread(_git_changed_files, self._root, stored)
             if raw is not None:
                 changed = [path for path, _ in raw]
 
@@ -798,7 +798,7 @@ async def _decide_delta_mode(
     if stored_hash is None:
         return _DeltaDecision("full", set(), set(), set())
 
-    git_changes = _git_changed_files(project_root, stored_hash)
+    git_changes = await asyncio.to_thread(_git_changed_files, project_root, stored_hash)
     if git_changes is None:
         return _DeltaDecision("full", set(), set(), set())
 

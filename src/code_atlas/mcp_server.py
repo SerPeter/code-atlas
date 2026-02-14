@@ -318,7 +318,14 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
         if checker.project_name not in scope_names:
             return result
 
-    info = await checker.check(app.graph, include_changed=(stale_mode == "warn"))
+    try:
+        info = await asyncio.wait_for(
+            checker.check(app.graph, include_changed=(stale_mode == "warn")),
+            timeout=5.0,
+        )
+    except TimeoutError:
+        logger.warning("Staleness check timed out — skipping annotation")
+        return result
 
     if stale_mode == "lock" and info.stale:
         msg = "Index is stale"

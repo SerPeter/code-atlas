@@ -1476,3 +1476,14 @@ async def test_execute_raises_query_timeout(graph_client: GraphClient):
     graph_client._query_timeout_s = 0.0001
     with pytest.raises(QueryTimeoutError):
         await graph_client.execute("RETURN 1 AS n")
+
+
+async def test_execute_write_raises_query_timeout(graph_client: GraphClient):
+    """Setting an impossibly short write timeout triggers QueryTimeoutError."""
+    original = graph_client._write_timeout_s
+    graph_client._write_timeout_s = 0.0001
+    try:
+        with pytest.raises(QueryTimeoutError):
+            await graph_client.execute_write("CREATE (n:_Tmp {x: 1})")
+    finally:
+        graph_client._write_timeout_s = original

@@ -140,6 +140,7 @@ class GraphClient:
         self._driver: AsyncDriver = AsyncGraphDatabase.driver(self._uri, auth=auth)
         self._dimension = settings.embeddings.dimension or 768
         self._query_timeout_s = mg.query_timeout_s
+        self._write_timeout_s = mg.write_timeout_s
 
     async def ping(self) -> bool:
         """Health check — returns True if Memgraph is reachable."""
@@ -167,9 +168,16 @@ class GraphClient:
         violations) are raised instead of being silently dropped.
         """
         with _tracer.start_as_current_span("graph.execute_write", attributes={"db.statement": query[:200]}):
-            async with self._driver.session() as session:
-                result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
-                await result.consume()
+            try:
+                await asyncio.wait_for(self._execute_write_inner(query, params), timeout=self._write_timeout_s)
+            except TimeoutError:
+                raise QueryTimeoutError(self._write_timeout_s, query[:120]) from None
+
+    async def _execute_write_inner(self, query: str, params: dict[str, Any] | None = None) -> None:
+        """Inner execute_write without timeout."""
+        async with self._driver.session() as session:
+            result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+            await result.consume()
 
     async def get_schema_version(self) -> int | None:
         """Read the current schema version from the SchemaVersion node."""
