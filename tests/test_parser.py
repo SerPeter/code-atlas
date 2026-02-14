@@ -811,3 +811,125 @@ def test_source_not_in_content_hash():
     assert func1.content_hash == func2.content_hash
     # But source differs
     assert func1.source != func2.source
+
+
+# ---------------------------------------------------------------------------
+# Enum detection
+# ---------------------------------------------------------------------------
+
+
+def test_enum_class_kind():
+    """Enum subclass gets kind=enum instead of class."""
+    parsed = _parse(
+        """\
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+"""
+    )
+    cls = _entity_by_name(parsed, "Color")
+    assert cls.label == NodeLabel.TYPE_DEF
+    assert cls.kind == TypeDefKind.ENUM
+
+
+def test_enum_member_kind():
+    """Assignments inside an Enum class get kind=enum_member."""
+    parsed = _parse(
+        """\
+from enum import StrEnum
+
+class Status(StrEnum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+"""
+    )
+    active = _entity_by_name(parsed, "ACTIVE")
+    assert active.label == NodeLabel.VALUE
+    assert active.kind == ValueKind.ENUM_MEMBER
+
+    inactive = _entity_by_name(parsed, "INACTIVE")
+    assert inactive.kind == ValueKind.ENUM_MEMBER
+
+
+def test_non_enum_class_unchanged():
+    """Regular class fields still get kind=field."""
+    parsed = _parse(
+        """\
+class Config:
+    debug = True
+"""
+    )
+    cls = _entity_by_name(parsed, "Config")
+    assert cls.kind == TypeDefKind.CLASS
+
+    debug = _entity_by_name(parsed, "debug")
+    assert debug.kind == ValueKind.FIELD
+
+
+def test_int_flag_detected():
+    """IntFlag is recognized as an enum base."""
+    parsed = _parse(
+        """\
+from enum import IntFlag
+
+class Perms(IntFlag):
+    READ = 4
+    WRITE = 2
+"""
+    )
+    cls = _entity_by_name(parsed, "Perms")
+    assert cls.kind == TypeDefKind.ENUM
+
+    read = _entity_by_name(parsed, "READ")
+    assert read.kind == ValueKind.ENUM_MEMBER
+
+
+# ---------------------------------------------------------------------------
+# Conditional definitions
+# ---------------------------------------------------------------------------
+
+
+def test_conditional_definitions():
+    """Duplicate qualified_name entities get a 'conditional' tag."""
+    parsed = _parse(
+        """\
+import sys
+
+if sys.platform == "win32":
+    def get_path():
+        return "C:\\\\"
+
+if sys.platform == "linux":
+    def get_path():
+        return "/tmp"
+"""
+    )
+    # Both should exist
+    get_paths = [e for e in parsed.entities if e.name == "get_path"]
+    assert len(get_paths) == 2
+
+    # First occurrence: no conditional tag
+    assert "conditional" not in get_paths[0].tags
+
+    # Second occurrence: has conditional tag
+    assert "conditional" in get_paths[1].tags
+
+
+def test_no_conditional_tag_for_unique_defs():
+    """Unique definitions don't get a conditional tag."""
+    parsed = _parse(
+        """\
+def foo():
+    pass
+
+def bar():
+    pass
+"""
+    )
+    foo = _entity_by_name(parsed, "foo")
+    assert "conditional" not in foo.tags
+    bar = _entity_by_name(parsed, "bar")
+    assert "conditional" not in bar.tags

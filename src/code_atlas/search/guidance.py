@@ -48,6 +48,7 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.INJECTED_INTO: "Dependency -> class it is injected into (pattern-detected)",
     RelType.TESTS: "Test function -> entity it tests (pattern-detected)",
     RelType.HANDLES_COMMAND: "Callable -> CLI/bot command it handles (pattern-detected)",
+    RelType.EXPORTS: "Module -> entity listed in __all__ (pattern-detected)",
 }
 
 # ---------------------------------------------------------------------------

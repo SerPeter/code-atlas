@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -251,6 +252,25 @@ def _get_decorators(node: Node) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Post-processing helpers
+# ---------------------------------------------------------------------------
+
+
+def _tag_conditional_definitions(entities: list[ParsedEntity]) -> None:
+    """Tag duplicate qualified_name entries as conditional (e.g. platform guards).
+
+    The first occurrence is left unchanged; subsequent duplicates get a
+    ``"conditional"`` tag added.  Modifies the list in place.
+    """
+    seen_qns: set[str] = set()
+    for idx, entity in enumerate(entities):
+        if entity.qualified_name in seen_qns:
+            entities[idx] = replace(entity, tags=[*entity.tags, "conditional"])
+        else:
+            seen_qns.add(entity.qualified_name)
+
+
+# ---------------------------------------------------------------------------
 # Python parse entry point
 # ---------------------------------------------------------------------------
 
@@ -270,6 +290,8 @@ def _parse_python(
 
     # Track seen entities by (line_start, name) to dedup (competitor insight P1)
     seen: set[tuple[int, str]] = set()
+    # Track class names that are Enum subclasses (for enum_member detection)
+    enum_classes: set[str] = set()
 
     # Module/Package entity
     module_label = NodeLabel.PACKAGE if is_package else NodeLabel.MODULE
@@ -286,7 +308,10 @@ def _parse_python(
     )
 
     # Walk the tree for classes, functions, imports, assignments
-    _walk_python_node(root, path, source, project_name, module_qn, entities, relationships, seen)
+    _walk_python_node(root, path, source, project_name, module_qn, entities, relationships, seen, enum_classes)
+
+    # Post-processing: tag conditional (duplicate) definitions
+    _tag_conditional_definitions(entities)
 
     return ParsedFile(
         file_path=path,
@@ -305,6 +330,7 @@ def _walk_python_node(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    enum_classes: set[str],
 ) -> None:
     """Recursively walk the parse tree to extract entities."""
     for child in node.children:
@@ -312,11 +338,15 @@ def _walk_python_node(
         if child.type == "decorated_definition":
             for inner in child.children:
                 if inner.type in ("function_definition", "class_definition"):
-                    _process_definition(inner, path, source, project_name, module_qn, entities, relationships, seen)
+                    _process_definition(
+                        inner, path, source, project_name, module_qn, entities, relationships, seen, enum_classes
+                    )
             continue
 
         if child.type in ("function_definition", "class_definition"):
-            _process_definition(child, path, source, project_name, module_qn, entities, relationships, seen)
+            _process_definition(
+                child, path, source, project_name, module_qn, entities, relationships, seen, enum_classes
+            )
             continue
 
         if child.type in ("import_statement", "import_from_statement"):
@@ -324,12 +354,12 @@ def _walk_python_node(
             continue
 
         if child.type == "expression_statement":
-            _process_assignment(child, path, project_name, module_qn, node, entities, seen)
+            _process_assignment(child, path, project_name, module_qn, node, entities, seen, enum_classes)
             continue
 
         # Recurse into blocks (if, for, try, with, etc.) but not into functions/classes
         if child.type not in ("function_definition", "class_definition"):
-            _walk_python_node(child, path, source, project_name, module_qn, entities, relationships, seen)
+            _walk_python_node(child, path, source, project_name, module_qn, entities, relationships, seen, enum_classes)
 
 
 def _process_definition(
@@ -341,6 +371,7 @@ def _process_definition(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    enum_classes: set[str],
 ) -> None:
     """Process a class_definition or function_definition node."""
     name_node = node.child_by_field_name("name")
@@ -356,9 +387,12 @@ def _process_definition(
     seen.add(key)
 
     if node.type == "class_definition":
-        _process_class(node, path, source, project_name, module_qn, name, entities, relationships, seen)
+        _process_class(node, path, source, project_name, module_qn, name, entities, relationships, seen, enum_classes)
     elif node.type == "function_definition":
         _process_function(node, path, source, project_name, module_qn, name, entities, relationships)
+
+
+_ENUM_BASES: frozenset[str] = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"})
 
 
 def _process_class(
@@ -371,6 +405,7 @@ def _process_class(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    enum_classes: set[str],
 ) -> None:
     """Process a class_definition node."""
     class_name = _is_inside_class(node)
@@ -380,12 +415,26 @@ def _process_class(
     line_end = node.end_point[0] + 1
 
     qn = f"{module_qn}.{name}" if class_name is None else f"{module_qn}.{class_name}.{name}"
+
+    # Detect Enum subclasses from superclass list
+    is_enum = False
+    superclasses = node.child_by_field_name("superclasses")
+    if superclasses is not None:
+        for base in superclasses.children:
+            if base.type == "identifier" and node_text(base) in _ENUM_BASES:
+                is_enum = True
+                break
+
+    kind = TypeDefKind.ENUM if is_enum else TypeDefKind.CLASS
+    if is_enum:
+        enum_classes.add(name)
+
     entities.append(
         ParsedEntity(
             name=name,
             qualified_name=f"{project_name}:{qn}",
             label=NodeLabel.TYPE_DEF,
-            kind=TypeDefKind.CLASS,
+            kind=kind,
             line_start=line_start,
             line_end=line_end,
             file_path=path,
@@ -403,7 +452,6 @@ def _process_class(
         )
     )
     # Base classes -> INHERITS
-    superclasses = node.child_by_field_name("superclasses")
     if superclasses is not None:
         for base in superclasses.children:
             if base.type == "identifier":
@@ -418,7 +466,7 @@ def _process_class(
     # Recurse into class body for methods, nested classes, etc.
     body = node.child_by_field_name("body")
     if body is not None:
-        _walk_python_node(body, path, source, project_name, module_qn, entities, relationships, seen)
+        _walk_python_node(body, path, source, project_name, module_qn, entities, relationships, seen, enum_classes)
 
 
 def _process_function(
@@ -550,6 +598,7 @@ def _process_assignment(
     parent: Node,
     entities: list[ParsedEntity],
     seen: set[tuple[int, str]],
+    enum_classes: set[str],
 ) -> None:
     """Process module-level or class-level assignments as Value entities."""
     # Only process assignments at module or class body level
@@ -573,7 +622,7 @@ def _process_assignment(
         class_name = _is_inside_class(node)
         if class_name is not None:
             qn = f"{module_qn}.{class_name}.{name}"
-            kind = ValueKind.FIELD
+            kind = ValueKind.ENUM_MEMBER if class_name in enum_classes else ValueKind.FIELD
         else:
             qn = f"{module_qn}.{name}"
             kind = ValueKind.CONSTANT if name.isupper() else ValueKind.VARIABLE
@@ -871,18 +920,21 @@ class ClassOverridesDetector:
             bases = class_bases.get(class_qn, [])
             if not bases:
                 continue
-            # Query graph for parent method
+            # Query graph for parent method (include tags for abstractmethod detection)
             records = await graph.execute(
                 "MATCH (base:TypeDef)-[:DEFINES]->(m:Callable)"
                 " WHERE base.name IN $bases AND m.name = $method"
-                " RETURN m.uid AS uid LIMIT 1",
+                " RETURN m.uid AS uid, m.tags AS tags LIMIT 1",
                 {"bases": bases, "method": entity.name},
             )
             if records:
+                parent_tags = records[0].get("tags") or []
+                is_abstract = any(t == "decorator:abstractmethod" for t in parent_tags)
+                rel_type = RelType.IMPLEMENTS if is_abstract else RelType.OVERRIDES
                 relationships.append(
                     ParsedRelationship(
                         from_qualified_name=entity.qualified_name,
-                        rel_type=RelType.OVERRIDES,
+                        rel_type=rel_type,
                         to_name=records[0]["uid"],
                     )
                 )
@@ -973,6 +1025,134 @@ class CLICommandDetector:
         return DetectorResult(enrichments=enrichments)
 
 
+_DATACLASS_TAGS: dict[str, tuple[str, list[str]]] = {
+    "dataclass": ("dataclasses", ["__init__", "__repr__", "__eq__"]),
+    "dataclasses.dataclass": ("dataclasses", ["__init__", "__repr__", "__eq__"]),
+    "attr.s": ("attrs", ["__init__", "__repr__", "__eq__", "__hash__"]),
+    "attr.define": ("attrs", ["__init__", "__repr__", "__eq__"]),
+    "attr.attrs": ("attrs", ["__init__", "__repr__", "__eq__", "__hash__"]),
+}
+
+_PYDANTIC_BASES: frozenset[str] = frozenset({"BaseModel"})
+
+
+class DataclassSynthesisDetector:
+    """Detect synthesized methods from @dataclass / attrs / Pydantic classes."""
+
+    @property
+    def name(self) -> str:
+        return "dataclass_synthesis"
+
+    async def detect(
+        self,
+        parsed: ParsedFile,
+        project_name: str,  # noqa: ARG002
+        graph: GraphClient,  # noqa: ARG002
+    ) -> DetectorResult:
+        # Build class_qn -> set[base_names] for INHERITS relationships
+        class_bases: dict[str, set[str]] = {}
+        for rel in parsed.relationships:
+            if rel.rel_type == RelType.INHERITS:
+                class_bases.setdefault(rel.from_qualified_name, set()).add(rel.to_name)
+
+        enrichments: list[PropertyEnrichment] = []
+        for entity in parsed.entities:
+            if entity.label != NodeLabel.TYPE_DEF:
+                continue
+            # Check decorator tags
+            for tag in entity.tags:
+                dec_name, _ = _parse_decorator_tag(tag)
+                if dec_name in _DATACLASS_TAGS:
+                    framework, methods = _DATACLASS_TAGS[dec_name]
+                    enrichments.append(
+                        PropertyEnrichment(
+                            qualified_name=entity.qualified_name,
+                            properties={"synthesis_framework": framework, "synthesized_methods": methods},
+                        )
+                    )
+                    break
+            else:
+                # Check Pydantic via inheritance
+                bases = class_bases.get(entity.qualified_name, set())
+                if bases & _PYDANTIC_BASES:
+                    enrichments.append(
+                        PropertyEnrichment(
+                            qualified_name=entity.qualified_name,
+                            properties={
+                                "synthesis_framework": "pydantic",
+                                "synthesized_methods": ["__init__", "__repr__", "__eq__", "__hash__"],
+                            },
+                        )
+                    )
+        return DetectorResult(enrichments=enrichments)
+
+
+class ModuleExportsDetector:
+    """Detect ``__all__`` exports and emit EXPORTS relationships."""
+
+    _ALL_NAMES_RE = re.compile(r"""['"](\w+)['"]""")
+
+    @property
+    def name(self) -> str:
+        return "module_exports"
+
+    async def detect(
+        self,
+        parsed: ParsedFile,
+        project_name: str,  # noqa: ARG002
+        graph: GraphClient,  # noqa: ARG002
+    ) -> DetectorResult:
+        # Find __all__ Value entity
+        all_entity = None
+        for entity in parsed.entities:
+            if entity.label == NodeLabel.VALUE and entity.name == "__all__":
+                all_entity = entity
+                break
+        if all_entity is None or not all_entity.source:
+            return DetectorResult()
+
+        # Extract exported names
+        exported_names = self._ALL_NAMES_RE.findall(all_entity.source)
+        if not exported_names:
+            return DetectorResult()
+
+        # Find the module/package entity for this file
+        module_entity = None
+        for entity in parsed.entities:
+            if entity.label in (NodeLabel.MODULE, NodeLabel.PACKAGE):
+                module_entity = entity
+                break
+        if module_entity is None:
+            return DetectorResult()
+
+        # Build name -> qualified_name lookup for entities in this file
+        name_to_qn: dict[str, str] = {}
+        for entity in parsed.entities:
+            if entity.label not in (NodeLabel.MODULE, NodeLabel.PACKAGE, NodeLabel.VALUE) or entity.name != "__all__":
+                name_to_qn.setdefault(entity.name, entity.qualified_name)
+
+        enrichments = [
+            PropertyEnrichment(
+                qualified_name=module_entity.qualified_name,
+                properties={"public_api": exported_names},
+            )
+        ]
+
+        relationships: list[ParsedRelationship] = []
+        for exp_name in exported_names:
+            target_qn = name_to_qn.get(exp_name)
+            if target_qn:
+                relationships.append(
+                    ParsedRelationship(
+                        from_qualified_name=module_entity.qualified_name,
+                        rel_type=RelType.EXPORTS,
+                        to_name=target_qn,
+                    )
+                )
+
+        return DetectorResult(enrichments=enrichments, relationships=relationships)
+
+
 # ---------------------------------------------------------------------------
 # Auto-registration
 # ---------------------------------------------------------------------------
@@ -983,6 +1163,8 @@ register_detector(TestMappingDetector())
 register_detector(ClassOverridesDetector())
 register_detector(DIInjectionDetector())
 register_detector(CLICommandDetector())
+register_detector(DataclassSynthesisDetector())
+register_detector(ModuleExportsDetector())
 
 
 # ---------------------------------------------------------------------------

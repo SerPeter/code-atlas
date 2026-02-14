@@ -1296,6 +1296,8 @@ class GraphClient:
             RelType.DEFINES,
             RelType.CONTAINS,
             RelType.OVERRIDES,
+            RelType.IMPLEMENTS,
+            RelType.EXPORTS,
             RelType.TESTS,
             RelType.HANDLES_ROUTE,
             RelType.HANDLES_EVENT,

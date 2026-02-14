@@ -61,6 +61,7 @@ class RelType(StrEnum):
     MOTIVATED_BY = "MOTIVATED_BY"
     # Similarity
     SIMILAR_TO = "SIMILAR_TO"
+    EXPORTS = "EXPORTS"
     # Pattern-detected
     HANDLES_ROUTE = "HANDLES_ROUTE"
     HANDLES_EVENT = "HANDLES_EVENT"

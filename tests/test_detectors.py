@@ -17,9 +17,11 @@ from code_atlas.parsing.detectors import (
 from code_atlas.parsing.languages.python import (
     ClassOverridesDetector,
     CLICommandDetector,
+    DataclassSynthesisDetector,
     DecoratorRoutingDetector,
     DIInjectionDetector,
     EventHandlerDetector,
+    ModuleExportsDetector,
     TestMappingDetector,
     _extract_depends_names,
     _extract_first_string_arg,
@@ -517,3 +519,219 @@ async def test_di_injection_relationship():
     assert result.relationships[0].rel_type == RelType.INJECTED_INTO
     assert result.relationships[0].from_qualified_name == "proj:src.deps.get_db"
     assert result.relationships[0].to_name == "proj:src.app.handler"
+
+
+# ---------------------------------------------------------------------------
+# DataclassSynthesisDetector tests
+# ---------------------------------------------------------------------------
+
+
+async def test_dataclass_synthesis_decorator():
+    """@dataclass decorator → synthesis enrichment."""
+    entity = _make_entity(
+        name="Config",
+        qn="proj:src.app.Config",
+        label=NodeLabel.TYPE_DEF,
+        kind=TypeDefKind.CLASS,
+        tags=["decorator:dataclass"],
+    )
+    parsed = _make_parsed(entities=[entity])
+    det = DataclassSynthesisDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    assert len(result.enrichments) == 1
+    assert result.enrichments[0].properties["synthesis_framework"] == "dataclasses"
+    assert "__init__" in result.enrichments[0].properties["synthesized_methods"]
+    assert "__repr__" in result.enrichments[0].properties["synthesized_methods"]
+
+
+async def test_dataclass_synthesis_attrs():
+    """@attr.define decorator → attrs synthesis enrichment."""
+    entity = _make_entity(
+        name="Config",
+        qn="proj:src.app.Config",
+        label=NodeLabel.TYPE_DEF,
+        kind=TypeDefKind.CLASS,
+        tags=["decorator:attr.define"],
+    )
+    parsed = _make_parsed(entities=[entity])
+    det = DataclassSynthesisDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    assert len(result.enrichments) == 1
+    assert result.enrichments[0].properties["synthesis_framework"] == "attrs"
+
+
+async def test_dataclass_synthesis_pydantic():
+    """Class inheriting BaseModel → pydantic synthesis enrichment."""
+    entity = _make_entity(
+        name="UserModel",
+        qn="proj:src.app.UserModel",
+        label=NodeLabel.TYPE_DEF,
+        kind=TypeDefKind.CLASS,
+    )
+    inherits_rel = ParsedRelationship(
+        from_qualified_name="proj:src.app.UserModel",
+        rel_type=RelType.INHERITS,
+        to_name="BaseModel",
+    )
+    parsed = _make_parsed(entities=[entity], relationships=[inherits_rel])
+    det = DataclassSynthesisDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    assert len(result.enrichments) == 1
+    assert result.enrichments[0].properties["synthesis_framework"] == "pydantic"
+    assert "__init__" in result.enrichments[0].properties["synthesized_methods"]
+
+
+async def test_dataclass_synthesis_no_match():
+    """Plain class without decorators or Pydantic base → no enrichment."""
+    entity = _make_entity(
+        name="PlainClass",
+        qn="proj:src.app.PlainClass",
+        label=NodeLabel.TYPE_DEF,
+        kind=TypeDefKind.CLASS,
+    )
+    parsed = _make_parsed(entities=[entity])
+    det = DataclassSynthesisDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    assert result.enrichments == []
+
+
+# ---------------------------------------------------------------------------
+# ModuleExportsDetector tests
+# ---------------------------------------------------------------------------
+
+
+async def test_module_exports_basic():
+    """__all__ with exported names → public_api enrichment + EXPORTS relationships."""
+    module = _make_entity(
+        name="app",
+        qn="proj:src.app",
+        label=NodeLabel.MODULE,
+        kind="module",
+    )
+    func_a = _make_entity(
+        name="func_a",
+        qn="proj:src.app.func_a",
+        label=NodeLabel.CALLABLE,
+        kind=CallableKind.FUNCTION,
+    )
+    func_b = _make_entity(
+        name="func_b",
+        qn="proj:src.app.func_b",
+        label=NodeLabel.CALLABLE,
+        kind=CallableKind.FUNCTION,
+    )
+    all_val = ParsedEntity(
+        name="__all__",
+        qualified_name="proj:src.app.__all__",
+        label=NodeLabel.VALUE,
+        kind="variable",
+        line_start=1,
+        line_end=1,
+        file_path="src/app.py",
+        source="__all__ = ['func_a', 'func_b']",
+    )
+    parsed = _make_parsed(entities=[module, func_a, func_b, all_val])
+    det = ModuleExportsDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    assert len(result.enrichments) == 1
+    assert result.enrichments[0].properties["public_api"] == ["func_a", "func_b"]
+    assert len(result.relationships) == 2
+    assert all(r.rel_type == RelType.EXPORTS for r in result.relationships)
+    export_targets = {r.to_name for r in result.relationships}
+    assert "proj:src.app.func_a" in export_targets
+    assert "proj:src.app.func_b" in export_targets
+
+
+async def test_module_exports_no_all():
+    """No __all__ → empty result."""
+    module = _make_entity(
+        name="app",
+        qn="proj:src.app",
+        label=NodeLabel.MODULE,
+        kind="module",
+    )
+    parsed = _make_parsed(entities=[module])
+    det = ModuleExportsDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    assert result.enrichments == []
+    assert result.relationships == []
+
+
+async def test_module_exports_unresolved_name():
+    """Exported name not in file entities → no EXPORTS rel for that name."""
+    module = _make_entity(
+        name="app",
+        qn="proj:src.app",
+        label=NodeLabel.MODULE,
+        kind="module",
+    )
+    all_val = ParsedEntity(
+        name="__all__",
+        qualified_name="proj:src.app.__all__",
+        label=NodeLabel.VALUE,
+        kind="variable",
+        line_start=1,
+        line_end=1,
+        file_path="src/app.py",
+        source="__all__ = ['missing_func']",
+    )
+    parsed = _make_parsed(entities=[module, all_val])
+    det = ModuleExportsDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    assert len(result.enrichments) == 1
+    assert result.enrichments[0].properties["public_api"] == ["missing_func"]
+    assert result.relationships == []
+
+
+# ---------------------------------------------------------------------------
+# ClassOverridesDetector — abstractmethod → IMPLEMENTS
+# ---------------------------------------------------------------------------
+
+
+async def test_overrides_abstractmethod_becomes_implements():
+    """Parent method with @abstractmethod tag → IMPLEMENTS instead of OVERRIDES."""
+    method = _make_entity(
+        name="save",
+        qn="proj:src.app.Child.save",
+        label=NodeLabel.CALLABLE,
+        kind=CallableKind.METHOD,
+    )
+    inherits_rel = ParsedRelationship(
+        from_qualified_name="proj:src.app.Child",
+        rel_type=RelType.INHERITS,
+        to_name="Base",
+    )
+    parsed = _make_parsed(entities=[method], relationships=[inherits_rel])
+
+    graph = AsyncMock()
+    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.base.Base.save", "tags": ["decorator:abstractmethod"]}])
+
+    det = ClassOverridesDetector()
+    result = await det.detect(parsed, "proj", graph)
+    assert len(result.relationships) == 1
+    assert result.relationships[0].rel_type == RelType.IMPLEMENTS
+    assert result.relationships[0].to_name == "proj:src.base.Base.save"
+
+
+async def test_overrides_non_abstract_stays_overrides():
+    """Parent method without @abstractmethod → stays OVERRIDES."""
+    method = _make_entity(
+        name="save",
+        qn="proj:src.app.Child.save",
+        label=NodeLabel.CALLABLE,
+        kind=CallableKind.METHOD,
+    )
+    inherits_rel = ParsedRelationship(
+        from_qualified_name="proj:src.app.Child",
+        rel_type=RelType.INHERITS,
+        to_name="Base",
+    )
+    parsed = _make_parsed(entities=[method], relationships=[inherits_rel])
+
+    graph = AsyncMock()
+    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.base.Base.save", "tags": []}])
+
+    det = ClassOverridesDetector()
+    result = await det.detect(parsed, "proj", graph)
+    assert len(result.relationships) == 1
+    assert result.relationships[0].rel_type == RelType.OVERRIDES
