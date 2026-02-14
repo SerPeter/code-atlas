@@ -13,37 +13,25 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from code_atlas.events import EventBus
 from code_atlas.indexing.orchestrator import index_project
 from code_atlas.settings import AtlasSettings
+from tests.conftest import NO_EMBED
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from code_atlas.events import EventBus
     from code_atlas.graph.client import GraphClient
 
 pytestmark = [pytest.mark.bench, pytest.mark.integration]
 
 
-@pytest.fixture
-async def bench_bus():
-    """Create and connect an EventBus for benchmarking."""
-    settings = AtlasSettings()
-    bus = EventBus(settings.redis)
-    try:
-        await bus.ping()
-    except Exception:
-        pytest.skip("Valkey not available")
-    yield bus
-    await bus.close()
-
-
 async def test_full_index_throughput(
-    graph_client: GraphClient, bench_bus: EventBus, bench_small: tuple[Path, list[str]]
+    graph_client: GraphClient, event_bus: EventBus, bench_small: tuple[Path, list[str]]
 ):
     """Measure full indexing throughput (files/sec) with mock embeddings."""
     root, _rel_paths = bench_small
-    settings = AtlasSettings(project_root=root)
+    settings = AtlasSettings(project_root=root, embeddings=NO_EMBED)
 
     # Mock embedding client to return random vectors instantly
     dim = graph_client._dimension
@@ -56,7 +44,7 @@ async def test_full_index_throughput(
         patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         start = time.perf_counter()
-        result = await index_project(settings, graph_client, bench_bus, full_reindex=True, drain_timeout_s=120.0)
+        result = await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
         elapsed = time.perf_counter() - start
 
     fps = result.files_scanned / elapsed if elapsed > 0 else 0
@@ -72,11 +60,11 @@ async def test_full_index_throughput(
 
 
 async def test_delta_index_throughput(
-    graph_client: GraphClient, bench_bus: EventBus, bench_small: tuple[Path, list[str]]
+    graph_client: GraphClient, event_bus: EventBus, bench_small: tuple[Path, list[str]]
 ):
     """Measure delta indexing throughput after modifying 10% of files."""
     root, rel_paths = bench_small
-    settings = AtlasSettings(project_root=root)
+    settings = AtlasSettings(project_root=root, embeddings=NO_EMBED)
 
     dim = graph_client._dimension
     mock_embed = AsyncMock()
@@ -88,7 +76,7 @@ async def test_delta_index_throughput(
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
         patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
-        await index_project(settings, graph_client, bench_bus, full_reindex=True, drain_timeout_s=120.0)
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
 
     # Modify 10% of files
     py_paths = [p for p in rel_paths if p.endswith(".py") and "__init__" not in p]
@@ -104,7 +92,7 @@ async def test_delta_index_throughput(
         patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         start = time.perf_counter()
-        result = await index_project(settings, graph_client, bench_bus, drain_timeout_s=120.0)
+        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=120.0)
         elapsed = time.perf_counter() - start
 
     report = {

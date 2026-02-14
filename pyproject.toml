@@ -86,6 +86,7 @@ dev = [
     "ty~=0.0.15",
     "mypy~=1.19",
     "psutil>=7.2.2",
+    "testcontainers>=4.10",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +114,13 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: requires running Memgraph instance",
     "bench: performance benchmarks (deselect with '-m \"not bench\"')",
+    "tei: requires TEI embeddings service",
+]
+filterwarnings = [
+    # litellm uses deprecated asyncio.iscoroutinefunction (removed in 3.16)
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:litellm",
+    # aiohttp cleanup_closed deprecation on Python 3.14+
+    "ignore:enable_cleanup_closed ignored:DeprecationWarning:aiohttp",
 ]
 
 # --------------------------------------------------------------------------- #

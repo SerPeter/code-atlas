@@ -85,6 +85,8 @@ class EmbedClient:
                     }
                     if self._api_base:
                         kwargs["api_base"] = self._api_base
+                        # TEI rejects encoding_format=null; explicitly request floats
+                        kwargs["encoding_format"] = "float"
                     if self._api_key:
                         kwargs["api_key"] = self._api_key
 

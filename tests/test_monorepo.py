@@ -13,6 +13,7 @@ from code_atlas.indexing.orchestrator import (
 )
 from code_atlas.search.engine import expand_scope
 from code_atlas.settings import MonorepoSettings
+from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -277,29 +278,16 @@ class TestIndexMonorepoIntegration:
 
         return tmp_path
 
-    @pytest.fixture
-    async def bus(self, settings):
-        """EventBus fixture — skips if Valkey is unreachable."""
-        from code_atlas.events import EventBus
-
-        bus = EventBus(settings.redis)
-        try:
-            await bus.ping()
-        except Exception:
-            pytest.skip("Valkey not available")
-        yield bus
-        await bus.close()
-
-    async def test_detect_and_index_monorepo(self, monorepo_dir, graph_client, bus):
+    async def test_detect_and_index_monorepo(self, monorepo_dir, graph_client, event_bus):
         """Full monorepo index: detects sub-projects, creates Project nodes, indexes entities."""
         from code_atlas.indexing.orchestrator import index_monorepo
         from code_atlas.schema import NodeLabel
         from code_atlas.settings import AtlasSettings
 
-        settings = AtlasSettings(project_root=monorepo_dir)
+        settings = AtlasSettings(project_root=monorepo_dir, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        results = await index_monorepo(settings, graph_client, bus)
+        results = await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
 
         # Should have indexed at least the two sub-projects
         assert len(results) >= 2
@@ -310,16 +298,18 @@ class TestIndexMonorepoIntegration:
         assert "auth" in project_names
         assert "shared" in project_names
 
-    async def test_scoped_monorepo_index(self, monorepo_dir, graph_client, bus):
+    async def test_scoped_monorepo_index(self, monorepo_dir, graph_client, event_bus):
         """Scoping to specific sub-projects only indexes those."""
         from code_atlas.indexing.orchestrator import index_monorepo
         from code_atlas.schema import NodeLabel
         from code_atlas.settings import AtlasSettings
 
-        settings = AtlasSettings(project_root=monorepo_dir)
+        settings = AtlasSettings(project_root=monorepo_dir, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        await index_monorepo(settings, graph_client, bus, scope_projects=["auth"])
+        await index_monorepo(
+            settings, graph_client, event_bus, scope_projects=["auth"], drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+        )
 
         # Should only have indexed auth + possibly root
         projects = await graph_client.execute(f"MATCH (p:{NodeLabel.PROJECT}) RETURN p.name AS name")

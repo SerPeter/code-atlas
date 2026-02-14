@@ -7,6 +7,7 @@ Uses the neo4j async driver (Bolt protocol) which is compatible with Memgraph.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
@@ -1411,31 +1412,28 @@ class GraphClient:
         them first so they are cleanly recreated at the current dimension.
         """
         # Drop stale search indices left over from a wiped database
-        for stmt in generate_drop_vector_index_ddl():
-            await self._exec_ddl(stmt)
+        await self._drop_all_vector_indices()
         for stmt in generate_drop_text_index_ddl():
             await self._exec_ddl(stmt)
 
-        stmts: list[str] = []
-        stmts.extend(generate_unique_constraint_ddl())
-        stmts.extend(generate_existence_constraint_ddl())
-        stmts.extend(generate_index_ddl())
+        for stmt in generate_unique_constraint_ddl():
+            await self._exec_ddl(stmt)
+        for stmt in generate_existence_constraint_ddl():
+            await self._exec_ddl(stmt)
+        for stmt in generate_index_ddl():
+            await self._exec_ddl(stmt)
         if self._embeddings_enabled:
-            stmts.extend(generate_vector_index_ddl(self._dimension))
-        stmts.extend(generate_text_index_ddl())
-
-        for stmt in stmts:
+            await self._create_vector_indices()
+        for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
 
     async def _migrate_indices(self) -> None:
         """Drop and recreate vector/text indices (dimension may have changed)."""
-        for stmt in generate_drop_vector_index_ddl():
-            await self._exec_ddl(stmt)
+        await self._drop_all_vector_indices()
         for stmt in generate_drop_text_index_ddl():
             await self._exec_ddl(stmt)
         if self._embeddings_enabled:
-            for stmt in generate_vector_index_ddl(self._dimension):
-                await self._exec_ddl(stmt)
+            await self._create_vector_indices()
         for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
 
@@ -1464,3 +1462,82 @@ class GraphClient:
                 logger.debug("DDL skipped (idempotent): {}", stmt.rstrip(";"))
             else:
                 raise
+
+    async def _drop_all_vector_indices(self) -> None:
+        """Drop every vector index, waiting until Memgraph confirms removal.
+
+        Memgraph's ``DROP VECTOR INDEX`` returns success before internal
+        state is fully cleaned up.  A subsequent ``CREATE VECTOR INDEX`` at
+        a different dimension will fail unless we verify that the catalogue
+        is actually empty.  Poll with short delays to handle this.
+        """
+        for drop_stmt in generate_drop_vector_index_ddl():
+            try:
+                await self.execute_write(drop_stmt)
+                logger.debug("Dropped: {}", drop_stmt.rstrip(";"))
+            except Exception as exc:
+                logger.debug("Drop skipped ({}): {}", exc, drop_stmt.rstrip(";"))
+
+        # Poll the catalogue until all vector indices are gone
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            try:
+                rows = await self.execute("CALL vector_search.show_index_info() YIELD index_name RETURN index_name")
+            except Exception:
+                # If the procedure itself fails, assume no indices
+                break
+
+            if not rows:
+                break
+
+            names = [r["index_name"] for r in rows if r.get("index_name")]
+            logger.debug(
+                "Vector indices still in catalogue (attempt {}/{}): {}",
+                attempt + 1,
+                max_attempts,
+                names,
+            )
+
+            # Try dropping each remaining index
+            for name in names:
+                with contextlib.suppress(Exception):
+                    await self.execute_write(f"DROP VECTOR INDEX {name};")
+
+            await asyncio.sleep(0.3)
+
+    async def _create_vector_indices(self) -> None:
+        """Create all vector indices, retrying if Memgraph's async DROP hasn't settled.
+
+        Memgraph's ``DROP VECTOR INDEX`` returns success before internal state
+        is fully cleaned.  A ``CREATE`` at a different dimension will fail
+        with a 'dimensions' error.  This method retries the entire batch of
+        CREATE statements with backoff until Memgraph accepts them.
+        """
+        stmts = generate_vector_index_ddl(self._dimension)
+        max_retries = 10
+        for attempt in range(max_retries):
+            failed = False
+            for stmt in stmts:
+                try:
+                    await self.execute_write(stmt)
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if "already exists" in msg:
+                        continue
+                    if "dimensions" in msg:
+                        failed = True
+                        break
+                    raise
+            if not failed:
+                return
+            # Dimension mismatch — old internal state not yet cleared
+            logger.debug(
+                "Vector index CREATE blocked by stale dimension (attempt {}/{}), waiting…",
+                attempt + 1,
+                max_retries,
+            )
+            await self._drop_all_vector_indices()
+            await asyncio.sleep(0.5 * (attempt + 1))
+        # Final attempt — let exceptions propagate
+        for stmt in stmts:
+            await self._exec_ddl(stmt)

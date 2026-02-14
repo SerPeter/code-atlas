@@ -555,7 +555,7 @@ class TestVectorSearchMock:
 
     async def test_vector_search_mock_tei(self, settings):
         """Vector search with mocked embedding client."""
-        mock_vector = [0.1] * settings.embeddings.dimension
+        mock_vector = [0.1] * (settings.embeddings.dimension or 768)
         graph = GraphClient(settings)
         embed = EmbedClient(settings.embeddings)
         app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
