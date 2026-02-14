@@ -8,6 +8,7 @@ to query-only mode otherwise.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -79,7 +80,7 @@ _DOCSTRING_TRUNCATE = 200
 class AppContext:
     graph: GraphClient
     settings: AtlasSettings
-    embed: EmbedClient
+    embed: EmbedClient | None
     staleness: StalenessChecker | None = None
     daemon: DaemonManager = field(default_factory=DaemonManager)
     resolved_root: Path | None = field(default=None, repr=False)
@@ -134,22 +135,26 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
         overrides["project_root"] = new_root  # ensure root wins over toml
 
     app.settings = AtlasSettings(**overrides)
-    app.embed = EmbedClient(app.settings.embeddings)
     app.resolved_root = new_root
     app.staleness = StalenessChecker(new_root, project_name=new_root.name)
 
     # Re-check embedding model match for new root
-    app.vector_enabled = True
-    stored_config = await app.graph.get_embedding_config()
-    if stored_config is not None:
-        stored_model, _stored_dim = stored_config
-        if stored_model != app.settings.embeddings.model:
-            logger.warning(
-                "Embedding model mismatch after root switch (stored='{}', current='{}'). Vector search disabled.",
-                stored_model,
-                app.settings.embeddings.model,
-            )
-            app.vector_enabled = False
+    if not app.settings.embeddings.enabled:
+        app.embed = None
+        app.vector_enabled = False
+    else:
+        app.embed = EmbedClient(app.settings.embeddings)
+        app.vector_enabled = True
+        stored_config = await app.graph.get_embedding_config()
+        if stored_config is not None:
+            stored_model, _stored_dim = stored_config
+            if stored_model != app.settings.embeddings.model:
+                logger.warning(
+                    "Embedding model mismatch after root switch (stored='{}', current='{}'). Vector search disabled.",
+                    stored_model,
+                    app.settings.embeddings.model,
+                )
+                app.vector_enabled = False
 
     started = await app.daemon.start(app.settings, app.graph)
     if started:
@@ -384,7 +389,7 @@ def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastM
     """Create and configure the Code Atlas MCP server."""
 
     @asynccontextmanager
-    async def app_lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:
+    async def app_lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: PLR0915
         init_telemetry(settings.observability)
 
         graph = GraphClient(settings)
@@ -396,28 +401,41 @@ def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastM
 
         logger.info("MCP connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
 
-        # Check embedding model lock
+        # Embedding setup — skipped entirely in lightweight mode
         vector_enabled = True
-        stored_config = await graph.get_embedding_config()
-        if stored_config is not None:
-            stored_model, _stored_dim = stored_config
-            if stored_model != settings.embeddings.model:
-                if strict:
-                    await graph.close()
-                    msg = (
-                        f"Embedding model mismatch: stored='{stored_model}', "
-                        f"configured='{settings.embeddings.model}'. "
-                        "Refusing to start in strict mode. Run 'atlas index --full' to re-embed."
+        embed: EmbedClient | None = None
+        if not settings.embeddings.enabled:
+            vector_enabled = False
+            logger.info("Lightweight mode: embeddings disabled, vector search unavailable")
+        else:
+            stored_config = await graph.get_embedding_config()
+            if stored_config is not None:
+                stored_model, _stored_dim = stored_config
+                if stored_model != settings.embeddings.model:
+                    if strict:
+                        await graph.close()
+                        msg = (
+                            f"Embedding model mismatch: stored='{stored_model}', "
+                            f"configured='{settings.embeddings.model}'. "
+                            "Refusing to start in strict mode. Run 'atlas index --full' to re-embed."
+                        )
+                        raise RuntimeError(msg)
+                    logger.warning(
+                        "Embedding model mismatch (stored='{}', current='{}'). Vector search disabled.",
+                        stored_model,
+                        settings.embeddings.model,
                     )
-                    raise RuntimeError(msg)
-                logger.warning(
-                    "Embedding model mismatch (stored='{}', current='{}'). Vector search disabled.",
-                    stored_model,
-                    settings.embeddings.model,
-                )
-                vector_enabled = False
+                    vector_enabled = False
 
-        embed = EmbedClient(settings.embeddings)
+            embed = EmbedClient(settings.embeddings)
+            # Implicit degradation: probe TEI, fall back to lightweight if unreachable
+            tei_ok = False
+            with contextlib.suppress(Exception):
+                tei_ok = await embed.health_check()
+            if not tei_ok:
+                logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
+                embed = None
+                vector_enabled = False
         staleness = StalenessChecker(settings.project_root, project_name=settings.project_root.name)
         daemon = DaemonManager()
         app_ctx = AppContext(
@@ -700,6 +718,11 @@ def _register_search_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
         if not app.vector_enabled:
+            if not app.settings.embeddings.enabled:
+                return _error(
+                    "Vector search unavailable — embeddings are disabled.",
+                    code="EMBEDDINGS_DISABLED",
+                )
             return _error(
                 "Vector search disabled: embedding model mismatch. Run 'atlas index --full' to re-embed.",
                 code="MODEL_MISMATCH",

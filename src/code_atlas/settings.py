@@ -89,6 +89,9 @@ class MonorepoSettings(BaseSettings):
 class EmbeddingSettings(BaseSettings):
     """Embedding settings — routes through litellm for any provider."""
 
+    enabled: bool = Field(
+        default=True, description="Enable embedding pipeline and vector search. False for lightweight mode."
+    )
     provider: str = Field(default="tei", description="Embedding provider: 'tei', 'litellm', or 'ollama'.")
     model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")
     base_url: str = Field(default="http://localhost:8080", description="OpenAI-compatible embedding endpoint URL.")

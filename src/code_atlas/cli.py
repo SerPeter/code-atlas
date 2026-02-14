@@ -90,9 +90,10 @@ def index(
         None, "--project", "-p", help="Index specific sub-projects (repeatable, globs)."
     ),
     full_reindex: bool = typer.Option(False, "--full", help="Force full re-index, ignoring delta cache."),
+    no_embed: bool = typer.Option(False, "--no-embed", help="Disable embeddings (lightweight mode)."),
 ) -> None:
     """Index a codebase into the graph."""
-    asyncio.run(_run_index(path, scope, full_reindex, projects=project))
+    asyncio.run(_run_index(path, scope, full_reindex, projects=project, no_embed=no_embed))
 
 
 @app.command()
@@ -175,12 +176,13 @@ def mcp(
 # ---------------------------------------------------------------------------
 
 
-async def _run_index(  # noqa: PLR0915
+async def _run_index(  # noqa: PLR0912, PLR0915
     path: str,
     scope: list[str] | None,
     full_reindex: bool,
     *,
     projects: list[str] | None = None,
+    no_embed: bool = False,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
     from pathlib import Path
@@ -193,6 +195,8 @@ async def _run_index(  # noqa: PLR0915
 
     project_root = Path(path).resolve()
     settings = AtlasSettings(project_root=project_root)
+    if no_embed:
+        settings.embeddings.enabled = False
     init_telemetry(settings.observability)
 
     # Connect to Valkey
@@ -205,19 +209,22 @@ async def _run_index(  # noqa: PLR0915
     logger.info("Connected to Valkey at {}:{}", settings.redis.host, settings.redis.port)
 
     # Resolve embedding dimension before graph construction (vector indices need it)
-    if settings.embeddings.dimension is None:
+    if settings.embeddings.enabled and settings.embeddings.dimension is None:
         from code_atlas.search.embeddings import EmbedClient as _EmbedClient
 
         _probe = _EmbedClient(settings.embeddings)
         try:
             resolved_dim = await _probe.detect_dimension()
-        except Exception as exc:
-            logger.error("Cannot auto-detect embedding dimension: {}", exc)
-            logger.error("Set 'dimension' in atlas.toml [embeddings] or start the embedding service.")
-            await bus.close()
-            raise typer.Exit(code=1) from exc
-        settings.embeddings.dimension = resolved_dim
-        logger.info("Auto-detected embedding dimension: {}", resolved_dim)
+        except Exception:
+            logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
+            settings.embeddings.enabled = False
+            resolved_dim = None
+        if resolved_dim is not None:
+            settings.embeddings.dimension = resolved_dim
+            logger.info("Auto-detected embedding dimension: {}", resolved_dim)
+
+    if not settings.embeddings.enabled:
+        logger.info("Lightweight mode: embeddings disabled, using graph + BM25 only")
 
     # Connect to Memgraph
     graph = GraphClient(settings)
@@ -301,7 +308,7 @@ async def _run_index(  # noqa: PLR0915
         shutdown_telemetry()
 
 
-async def _run_search(  # noqa: PLR0915
+async def _run_search(  # noqa: PLR0912, PLR0915
     query: str,
     type_: str,
     scope: str | None,
@@ -341,28 +348,35 @@ async def _run_search(  # noqa: PLR0915
         await graph.close()
         raise typer.Exit(code=1)
 
+    # Check embeddings disabled — error on explicit vector search
+    if not settings.embeddings.enabled and search_types and SearchType.VECTOR in search_types:
+        logger.error("Vector search unavailable — embeddings are disabled")
+        await graph.close()
+        raise typer.Exit(code=1)
+
     # Check model lock — warn and disable vector if mismatch
     embed: EmbedClient | None = None
-    stored_config = await graph.get_embedding_config()
-    model_mismatch = stored_config is not None and stored_config[0] != settings.embeddings.model
-    if model_mismatch:
-        stored_model = stored_config[0]  # type: ignore[index]
-        if search_types and SearchType.VECTOR in search_types:
-            logger.error(
-                "Cannot use vector search: model mismatch (stored='{}', current='{}'). Run 'atlas index --full'.",
+    if settings.embeddings.enabled:
+        stored_config = await graph.get_embedding_config()
+        model_mismatch = stored_config is not None and stored_config[0] != settings.embeddings.model
+        if model_mismatch:
+            stored_model = stored_config[0]  # type: ignore[index]
+            if search_types and SearchType.VECTOR in search_types:
+                logger.error(
+                    "Cannot use vector search: model mismatch (stored='{}', current='{}'). Run 'atlas index --full'.",
+                    stored_model,
+                    settings.embeddings.model,
+                )
+                await graph.close()
+                raise typer.Exit(code=1)
+            logger.warning(
+                "Embedding model mismatch (stored='{}', current='{}') — vector search disabled",
                 stored_model,
                 settings.embeddings.model,
             )
-            await graph.close()
-            raise typer.Exit(code=1)
-        logger.warning(
-            "Embedding model mismatch (stored='{}', current='{}') — vector search disabled",
-            stored_model,
-            settings.embeddings.model,
-        )
 
-    if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
-        embed = EmbedClient(settings.embeddings)
+        if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
+            embed = EmbedClient(settings.embeddings)
 
     try:
         results = await hybrid_search(
@@ -618,7 +632,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 # ---------------------------------------------------------------------------
 
 
-async def _run_daemon() -> None:
+async def _run_daemon(*, no_embed: bool = False) -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.daemon import DaemonManager
@@ -626,6 +640,8 @@ async def _run_daemon() -> None:
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = AtlasSettings()
+    if no_embed:
+        settings.embeddings.enabled = False
     init_telemetry(settings.observability)
 
     graph = GraphClient(settings)
@@ -658,6 +674,7 @@ async def _run_daemon() -> None:
 @daemon_app.command("start")
 def daemon_start(
     foreground: bool = typer.Option(True, "--foreground/--background", help="Run in foreground (Ctrl+C to stop)."),
+    no_embed: bool = typer.Option(False, "--no-embed", help="Disable embeddings (lightweight mode)."),
 ) -> None:
     """Start the indexing daemon (file watcher + tier consumers)."""
     if not foreground:
@@ -666,7 +683,7 @@ def daemon_start(
 
     logger.info("Starting Code Atlas daemon (foreground)")
     try:
-        asyncio.run(_run_daemon())
+        asyncio.run(_run_daemon(no_embed=no_embed))
     except KeyboardInterrupt:
         logger.info("Interrupted — shutting down")
 

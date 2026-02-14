@@ -69,19 +69,22 @@ class DaemonManager:
 
         self._bus = bus
 
-        embed = EmbedClient(settings.embeddings)
-        self._embed = embed
-
+        embed: EmbedClient | None = None
         cache: EmbedCache | None = None
-        if settings.embeddings.cache_ttl_days > 0:
-            cache = EmbedCache(settings.redis, settings.embeddings)
-        self._cache = cache
+        if settings.embeddings.enabled:
+            embed = EmbedClient(settings.embeddings)
+            self._embed = embed
+            if settings.embeddings.cache_ttl_days > 0:
+                cache = EmbedCache(settings.redis, settings.embeddings)
+            self._cache = cache
 
-        self._consumers = [
+        consumers: list[Tier1GraphConsumer | Tier2ASTConsumer | Tier3EmbedConsumer] = [
             Tier1GraphConsumer(bus, graph, settings),
             Tier2ASTConsumer(bus, graph, settings),
-            Tier3EmbedConsumer(bus, graph, embed, cache=cache),
         ]
+        if embed is not None:
+            consumers.append(Tier3EmbedConsumer(bus, graph, embed, cache=cache))
+        self._consumers = consumers
 
         if include_watcher:
             scope = FileScope(settings.project_root, settings)

@@ -396,7 +396,11 @@ class Tier2ASTConsumer(TierConsumer):
                 total_changed,
             )
 
-            if changed_entity_refs and _SIG_ORDER[batch_max_sig] >= _SIG_ORDER[Significance.MODERATE]:
+            if (
+                self.settings.embeddings.enabled
+                and changed_entity_refs
+                and _SIG_ORDER[batch_max_sig] >= _SIG_ORDER[Significance.MODERATE]
+            ):
                 await self.bus.publish(
                     Topic.EMBED_DIRTY,
                     EmbedDirty(entities=changed_entity_refs, significance=batch_max_sig, batch_id=batch_id),

@@ -267,12 +267,13 @@ async def test_skips_db_checks_when_memgraph_down(tmp_path):
 
         report = await run_health_checks(settings, graph=graph, embed=embed)
 
-    # Should have 7 checks total (config, memgraph, embeddings, valkey, schema, embedding_model, index)
-    assert len(report.checks) == 7
+    # Should have 8 checks total (mode, config, memgraph, embeddings, valkey, schema, embedding_model, index)
+    assert len(report.checks) == 8
     assert report.ok is False
 
     # Schema, embedding_model, and index should be marked as FAIL/skipped
     by_name = {c.name: c for c in report.checks}
+    assert by_name["mode"].status == CheckStatus.OK
     assert by_name["schema"].status == CheckStatus.FAIL
     assert "Skipped" in by_name["schema"].message
     assert by_name["embedding_model"].status == CheckStatus.FAIL
@@ -321,6 +322,6 @@ async def test_all_pass_when_healthy(tmp_path):
         report = await run_health_checks(settings, graph=graph, embed=embed)
 
     assert report.ok is True
-    assert len(report.checks) == 7
+    assert len(report.checks) == 8
     for c in report.checks:
         assert c.status in (CheckStatus.OK, CheckStatus.WARN), f"{c.name} unexpectedly {c.status}: {c.message}"

@@ -130,6 +130,8 @@ async def check_embeddings(
 ) -> CheckResult:
     """Verify the embedding service is reachable."""
     name = "embeddings"
+    if not embed_settings.enabled:
+        return CheckResult(name, CheckStatus.OK, "Disabled (lightweight mode)")
     info = f"{embed_settings.provider} @ {embed_settings.base_url}"
     if embed is None:
         return CheckResult(name, CheckStatus.WARN, f"No client ({info})", suggestion="Check embedding settings.")
@@ -205,6 +207,8 @@ async def check_config(settings: AtlasSettings) -> CheckResult:
 async def check_embedding_model(graph: GraphClient, embed_settings: EmbeddingSettings) -> CheckResult:
     """Check whether the stored embedding model matches the configured model."""
     name = "embedding_model"
+    if not embed_settings.enabled:
+        return CheckResult(name, CheckStatus.OK, "Skipped (embeddings disabled)")
     try:
         stored = await asyncio.wait_for(graph.get_embedding_config(), timeout=_CHECK_TIMEOUT)
     except Exception as exc:
@@ -296,10 +300,14 @@ async def run_health_checks(
     own_graph = graph is None
     if own_graph:
         graph = GraphClient(settings)
-    if embed is None:
+    if embed is None and settings.embeddings.enabled:
         embed = EmbedClient(settings.embeddings)
 
     try:
+        # Mode indicator
+        mode_label = "full" if settings.embeddings.enabled else "lightweight (no embeddings)"
+        mode_res = CheckResult("mode", CheckStatus.OK, mode_label)
+
         # Phase 1: independent checks
         config_res, mg_res, embed_res, valkey_res = await asyncio.gather(
             check_config(settings),
@@ -308,7 +316,7 @@ async def run_health_checks(
             check_valkey(settings.redis),
         )
 
-        results = [config_res, mg_res, embed_res, valkey_res]
+        results = [mode_res, config_res, mg_res, embed_res, valkey_res]
 
         # Phase 2: Memgraph-dependent checks
         if mg_res.status == CheckStatus.FAIL:

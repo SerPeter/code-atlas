@@ -735,7 +735,7 @@ async def _run_pipeline(
     bus: EventBus,
     graph: GraphClient,
     settings: AtlasSettings,
-    embed: EmbedClient,
+    embed: EmbedClient | None,
     cache: EmbedCache | None,
     drain_timeout_s: float,
     *,
@@ -747,29 +747,36 @@ async def _run_pipeline(
     """
     await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
     await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
-    await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
 
     tier1 = Tier1GraphConsumer(bus, graph, settings)
     tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root)
-    tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
 
     task1 = asyncio.create_task(tier1.run())
     task2 = asyncio.create_task(tier2.run())
-    task3 = asyncio.create_task(tier3.run())
+
+    tier3: Tier3EmbedConsumer | None = None
+    task3: asyncio.Task[None] | None = None
+    if embed is not None:
+        await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
+        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        task3 = asyncio.create_task(tier3.run())
 
     try:
-        await _wait_for_drain(bus, drain_timeout_s)
+        await _wait_for_drain(bus, drain_timeout_s, embed_enabled=embed is not None)
     finally:
         tier1.stop()
         tier2.stop()
-        tier3.stop()
+        if tier3 is not None:
+            tier3.stop()
         await asyncio.sleep(0.5)
         task1.cancel()
         task2.cancel()
-        task3.cancel()
+        if task3 is not None:
+            task3.cancel()
         for t in (task1, task2, task3):
-            with contextlib.suppress(asyncio.CancelledError):
-                await t
+            if t is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
         if cache is not None:
             await cache.close()
 
@@ -946,11 +953,13 @@ async def _index_project_inner(
     if not files:
         return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=time.monotonic() - start)
 
-    # 2. Model lock check + full reindex
-    embed = EmbedClient(settings.embeddings)
+    # 2. Embedding setup + model lock check (skipped in lightweight mode)
+    embed: EmbedClient | None = None
     cache: EmbedCache | None = None
-    if settings.embeddings.cache_ttl_days > 0:
-        cache = EmbedCache(settings.redis, settings.embeddings)
+    if settings.embeddings.enabled:
+        embed = EmbedClient(settings.embeddings)
+        if settings.embeddings.cache_ttl_days > 0:
+            cache = EmbedCache(settings.redis, settings.embeddings)
 
     if full_reindex:
         logger.info("Full reindex: deleting existing data for '{}'", project_name)
@@ -958,8 +967,9 @@ async def _index_project_inner(
         if cache is not None:
             await cache.clear()
 
-    dimension = settings.embeddings.dimension or 768
-    await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
+    if settings.embeddings.enabled:
+        dimension = settings.embeddings.dimension or 768
+        await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
 
     # 3. Decide full vs. delta mode
     if full_reindex:
@@ -1156,16 +1166,19 @@ async def _index_root_project(
     if not files:
         return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=time.monotonic() - start)
 
-    embed = EmbedClient(settings.embeddings)
+    embed: EmbedClient | None = None
     cache: EmbedCache | None = None
-    if settings.embeddings.cache_ttl_days > 0:
-        cache = EmbedCache(settings.redis, settings.embeddings)
+    if settings.embeddings.enabled:
+        embed = EmbedClient(settings.embeddings)
+        if settings.embeddings.cache_ttl_days > 0:
+            cache = EmbedCache(settings.redis, settings.embeddings)
 
     if full_reindex:
         await graph.delete_project_data(project_name)
 
-    dimension = settings.embeddings.dimension or 768
-    await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
+    if settings.embeddings.enabled:
+        dimension = settings.embeddings.dimension or 768
+        await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
 
     # Always full mode for root project (simpler — root files are typically few)
     decision = _DeltaDecision("full", set(), set(), set())
@@ -1217,19 +1230,23 @@ def _build_delta_stats(decision: _DeltaDecision, t2stats: Any) -> DeltaStats:
     )
 
 
-async def _wait_for_drain(bus: EventBus, timeout_s: float) -> None:
-    """Poll stream groups until Tier 1, Tier 2, and Tier 3 are drained."""
+async def _wait_for_drain(bus: EventBus, timeout_s: float, *, embed_enabled: bool = True) -> None:
+    """Poll stream groups until Tier 1, Tier 2, and (optionally) Tier 3 are drained."""
     deadline = time.monotonic() + timeout_s
     settled_since: float | None = None
 
     while time.monotonic() < deadline:
         t1_info = await bus.stream_group_info(Topic.FILE_CHANGED, "tier1-graph")
         t2_info = await bus.stream_group_info(Topic.AST_DIRTY, "tier2-ast")
-        t3_info = await bus.stream_group_info(Topic.EMBED_DIRTY, "tier3-embed")
 
         t1_remaining = t1_info["pending"] + t1_info["lag"]
         t2_remaining = t2_info["pending"] + t2_info["lag"]
-        t3_remaining = t3_info["pending"] + t3_info["lag"]
+
+        if embed_enabled:
+            t3_info = await bus.stream_group_info(Topic.EMBED_DIRTY, "tier3-embed")
+            t3_remaining = t3_info["pending"] + t3_info["lag"]
+        else:
+            t3_remaining = 0
 
         if t1_remaining == 0 and t2_remaining == 0 and t3_remaining == 0:
             if settled_since is None:

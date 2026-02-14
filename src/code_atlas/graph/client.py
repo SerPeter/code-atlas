@@ -162,6 +162,7 @@ class GraphClient:
         auth = (mg.username, mg.password) if mg.username else None
         self._driver: AsyncDriver = AsyncGraphDatabase.driver(self._uri, auth=auth)
         self._dimension = settings.embeddings.dimension or 768
+        self._embeddings_enabled = settings.embeddings.enabled
         self._query_timeout_s = mg.query_timeout_s
         self._write_timeout_s = mg.write_timeout_s
 
@@ -980,8 +981,9 @@ class GraphClient:
         """Drop and recreate vector indices at the specified dimension."""
         for stmt in generate_drop_vector_index_ddl():
             await self._exec_ddl(stmt)
-        for stmt in generate_vector_index_ddl(dimension):
-            await self._exec_ddl(stmt)
+        if self._embeddings_enabled:
+            for stmt in generate_vector_index_ddl(dimension):
+                await self._exec_ddl(stmt)
         self._dimension = dimension
 
     async def get_vector_index_info(self) -> list[dict[str, Any]]:
@@ -1416,7 +1418,8 @@ class GraphClient:
         stmts.extend(generate_unique_constraint_ddl())
         stmts.extend(generate_existence_constraint_ddl())
         stmts.extend(generate_index_ddl())
-        stmts.extend(generate_vector_index_ddl(self._dimension))
+        if self._embeddings_enabled:
+            stmts.extend(generate_vector_index_ddl(self._dimension))
         stmts.extend(generate_text_index_ddl())
 
         for stmt in stmts:
@@ -1428,8 +1431,9 @@ class GraphClient:
             await self._exec_ddl(stmt)
         for stmt in generate_drop_text_index_ddl():
             await self._exec_ddl(stmt)
-        for stmt in generate_vector_index_ddl(self._dimension):
-            await self._exec_ddl(stmt)
+        if self._embeddings_enabled:
+            for stmt in generate_vector_index_ddl(self._dimension):
+                await self._exec_ddl(stmt)
         for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
 
