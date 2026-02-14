@@ -8,20 +8,22 @@ import pytest
 
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship
 from code_atlas.parsing.detectors import (
+    DetectorResult,
+    PropertyEnrichment,
+    get_enabled_detectors,
+    register_detector,
+    run_detectors,
+)
+from code_atlas.parsing.languages.python import (
     ClassOverridesDetector,
     CLICommandDetector,
     DecoratorRoutingDetector,
-    DetectorResult,
     DIInjectionDetector,
     EventHandlerDetector,
-    PropertyEnrichment,
     TestMappingDetector,
     _extract_depends_names,
     _extract_first_string_arg,
     _parse_decorator_tag,
-    get_enabled_detectors,
-    register_detector,
-    run_detectors,
 )
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind
 

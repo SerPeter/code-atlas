@@ -8,6 +8,7 @@ from code_atlas.parsing.ast import (
     ParsedFile,
     ParsedRelationship,
     get_language_for_file,
+    node_text,
     parse_file,
     register_language,
 )
@@ -19,6 +20,7 @@ from code_atlas.parsing.detectors import (
     register_detector,
     run_detectors,
 )
+from code_atlas.parsing.languages import discover_plugins
 
 __all__ = [
     "Detector",
@@ -28,8 +30,10 @@ __all__ = [
     "ParsedFile",
     "ParsedRelationship",
     "PropertyEnrichment",
+    "discover_plugins",
     "get_enabled_detectors",
     "get_language_for_file",
+    "node_text",
     "parse_file",
     "register_detector",
     "register_language",
