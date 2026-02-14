@@ -270,6 +270,8 @@ def _compact_node_to_dict(node: CompactNode) -> dict[str, Any]:
         out["docstring"] = node.docstring[:_DOCSTRING_TRUNCATE] + (
             "..." if len(node.docstring) > _DOCSTRING_TRUNCATE else ""
         )
+    if node.source:
+        out["source"] = node.source
     if node.labels:
         out["_labels"] = node.labels
     return out

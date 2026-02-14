@@ -163,6 +163,7 @@ class IndexSettings(BaseSettings):
         default="warn",
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
     )
+    max_source_chars: int = Field(default=2000, description="Max characters for entity source text (0 to disable).")
 
 
 class ObservabilitySettings(BaseSettings):

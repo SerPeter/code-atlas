@@ -70,6 +70,7 @@ class CompactNode:
     line_end: int | None = None
     signature: str = ""
     docstring: str = ""
+    source: str = ""
     labels: list[str] = field(default_factory=list)
 
 
@@ -760,6 +761,7 @@ def _node_to_compact(node: Any) -> CompactNode:
         line_end=props.get("line_end"),
         signature=props.get("signature", ""),
         docstring=props.get("docstring", ""),
+        source=props.get("source", "") or "",
         labels=labels,
     )
 

@@ -44,6 +44,7 @@ class ParsedEntity:
     signature: str | None = None
     visibility: str = Visibility.PUBLIC
     tags: list[str] = field(default_factory=list)
+    source: str | None = None
     header_path: str | None = None
     header_level: int | None = None
     content_hash: str = ""
@@ -155,12 +156,15 @@ def node_text(node: Node) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_file(path: str, source: bytes, project_name: str) -> ParsedFile | None:
+def parse_file(path: str, source: bytes, project_name: str, *, max_source_chars: int = 2000) -> ParsedFile | None:
     """Parse a source file and extract entities + relationships.
 
     Returns ParsedFile with entities mapped to schema labels/kinds,
     qualified names built from file path + nesting. Returns None if
     the language is not supported.
+
+    ``max_source_chars`` caps the ``source`` field on each entity.
+    Set to 0 to disable source extraction entirely.
     """
     lang_config = get_language_for_file(path)
     if lang_config is None:
@@ -171,10 +175,18 @@ def parse_file(path: str, source: bytes, project_name: str) -> ParsedFile | None
 
     result = lang_config.parse_func(path, source, tree.root_node, project_name)
 
-    # Post-parse pass: compute content hashes for all entities
+    # Post-parse pass: compute content hashes and truncate source
+    def _finalize(e: ParsedEntity) -> ParsedEntity:
+        updates: dict[str, Any] = {"content_hash": _compute_content_hash(e)}
+        if max_source_chars > 0 and e.source:
+            updates["source"] = e.source[:max_source_chars]
+        elif max_source_chars <= 0:
+            updates["source"] = None
+        return replace(e, **updates)
+
     return ParsedFile(
         file_path=result.file_path,
         language=result.language,
-        entities=[replace(e, content_hash=_compute_content_hash(e)) for e in result.entities],
+        entities=[_finalize(e) for e in result.entities],
         relationships=result.relationships,
     )

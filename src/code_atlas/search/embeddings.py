@@ -287,6 +287,7 @@ def build_embed_text(props: dict[str, Any]) -> str:
     kind = props.get("kind", "")
     signature = props.get("signature", "")
     docstring = props.get("docstring", "")
+    source = props.get("source", "")
 
     if not qualified_name:
         return ""
@@ -294,7 +295,7 @@ def build_embed_text(props: dict[str, Any]) -> str:
     if label == "DocSection":
         return _build_doc_section_text(qualified_name, docstring)
     if label in _CODE_ENTITY_LABELS:
-        return _build_code_entity_text(label, kind, qualified_name, signature, docstring)
+        return _build_code_entity_text(label, kind, qualified_name, signature, docstring, source)
 
     # Fallback for unknown labels: just use qualified_name + docstring
     parts = [qualified_name]
@@ -303,7 +304,9 @@ def build_embed_text(props: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _build_code_entity_text(label: str, kind: str, qualified_name: str, signature: str, docstring: str) -> str:
+def _build_code_entity_text(
+    label: str, kind: str, qualified_name: str, signature: str, docstring: str, source: str = ""
+) -> str:
     """Build embed text for code entities (Callable, TypeDef, Value, Module)."""
     parts = qualified_name.split(".")
     lines: list[str] = []
@@ -346,6 +349,10 @@ def _build_code_entity_text(label: str, kind: str, qualified_name: str, signatur
 
     if docstring:
         lines.append(f'"""{docstring}"""')
+
+    if source:
+        lines.append("")
+        lines.append(source)
 
     return "\n".join(lines)
 

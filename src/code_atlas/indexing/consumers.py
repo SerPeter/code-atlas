@@ -284,7 +284,7 @@ class Tier2ASTConsumer(TierConsumer):
             logger.warning("Tier2: cannot read {}", file_path)
             return set(), [], Significance.NONE
 
-        parsed = parse_file(file_path, source, project_name)
+        parsed = parse_file(file_path, source, project_name, max_source_chars=self.settings.index.max_source_chars)
         if parsed is None:
             logger.debug("Tier2: unsupported language for {}", file_path)
             return set(), [], Significance.NONE

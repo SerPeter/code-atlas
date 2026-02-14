@@ -940,6 +940,7 @@ class GraphClient:
             "MATCH (n) WHERE n.uid = qn OR n.qualified_name = qn "
             "RETURN n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
+            "n.source AS source, "
             "n.kind AS kind, labels(n)[0] AS _label, "
             "n.embed_hash AS embed_hash, n.embedding AS embedding",
             {"qns": qualified_names},
@@ -1195,6 +1196,7 @@ class GraphClient:
                     "visibility": e.visibility,
                     "docstring": e.docstring,
                     "signature": e.signature,
+                    "source": e.source,
                     "tags": e.tags,
                     "header_path": e.header_path,
                     "header_level": e.header_level,
@@ -1210,7 +1212,7 @@ class GraphClient:
                 f"n.qualified_name = e.qualified_name, n.file_path = e.file_path, "
                 f"n.kind = e.kind, n.line_start = e.line_start, n.line_end = e.line_end, "
                 f"n.visibility = e.visibility, n.docstring = e.docstring, "
-                f"n.signature = e.signature, n.tags = e.tags, "
+                f"n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
                 f"n.header_path = e.header_path, n.header_level = e.header_level, "
                 f"n.content_hash = e.content_hash "
                 f"ON MATCH SET "
@@ -1218,7 +1220,7 @@ class GraphClient:
                 f"n.qualified_name = e.qualified_name, n.file_path = e.file_path, "
                 f"n.kind = e.kind, n.line_start = e.line_start, n.line_end = e.line_end, "
                 f"n.visibility = e.visibility, n.docstring = e.docstring, "
-                f"n.signature = e.signature, n.tags = e.tags, "
+                f"n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
                 f"n.header_path = e.header_path, n.header_level = e.header_level, "
                 f"n.content_hash = e.content_hash"
             )
@@ -1236,6 +1238,7 @@ class GraphClient:
                 "visibility": e.visibility,
                 "docstring": e.docstring,
                 "signature": e.signature,
+                "source": e.source,
                 "tags": e.tags,
                 "header_path": e.header_path,
                 "header_level": e.header_level,
@@ -1249,7 +1252,7 @@ class GraphClient:
             "SET n.name = e.name, n.kind = e.kind, "
             "n.line_start = e.line_start, n.line_end = e.line_end, "
             "n.visibility = e.visibility, n.docstring = e.docstring, "
-            "n.signature = e.signature, n.tags = e.tags, "
+            "n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
             "n.header_path = e.header_path, n.header_level = e.header_level, "
             "n.content_hash = e.content_hash",
             {"entities": params},

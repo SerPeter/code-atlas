@@ -462,6 +462,7 @@ def _process_function(
             file_path=path,
             docstring=docstring,
             signature=signature,
+            source=node_text(node),
             visibility=_visibility_from_name(name),
             tags=tags,
         )
@@ -586,6 +587,7 @@ def _process_assignment(
                 line_start=line_start,
                 line_end=child.end_point[0] + 1,
                 file_path=path,
+                source=node_text(child),
                 visibility=_visibility_from_name(name),
             )
         )

@@ -744,3 +744,70 @@ def test_content_hash_changes_on_docstring():
     func1 = _entity_by_name(parsed1, "work")
     func2 = _entity_by_name(parsed2, "work")
     assert func1.content_hash != func2.content_hash
+
+
+# ---------------------------------------------------------------------------
+# Source extraction
+# ---------------------------------------------------------------------------
+
+
+def test_function_source_extracted():
+    """Function entities have source containing full function text."""
+    parsed = _parse("def greet(name):\n    return f'Hello {name}'\n")
+    func = _entity_by_name(parsed, "greet")
+    assert func.source is not None
+    assert "def greet(name):" in func.source
+    assert "return f'Hello {name}'" in func.source
+
+
+def test_assignment_source_extracted():
+    """Assignment entities have source containing the assignment text."""
+    parsed = _parse("MAX_SIZE = 100\n")
+    val = _entity_by_name(parsed, "MAX_SIZE")
+    assert val.source is not None
+    assert "MAX_SIZE = 100" in val.source
+
+
+def test_class_source_is_none():
+    """TypeDef (class) entities have source=None — children carry the source."""
+    parsed = _parse("class Foo:\n    pass\n")
+    cls = _entity_by_name(parsed, "Foo")
+    assert cls.source is None
+
+
+def test_module_source_is_none():
+    """Module entities have source=None — module source is the entire file."""
+    parsed = _parse("x = 1\n", path="src/mod.py")
+    mod = _entity_by_name(parsed, "mod")
+    assert mod.source is None
+
+
+def test_source_truncated():
+    """Source longer than 2000 chars is truncated by default."""
+    body = "    x = 1\n" * 300  # ~3000 chars
+    source_code = f"def big():\n{body}"
+    parsed = _parse(source_code)
+    func = _entity_by_name(parsed, "big")
+    assert func.source is not None
+    assert len(func.source) == 2000
+
+
+def test_source_truncated_custom():
+    """parse_file(max_source_chars=50) truncates at 50."""
+    source_code = "def big():\n" + "    x = 1\n" * 20
+    result = parse_file("src/example.py", source_code.encode("utf-8"), PROJECT, max_source_chars=50)
+    assert result is not None
+    func = _entity_by_name(result, "big")
+    assert func.source is not None
+    assert len(func.source) == 50
+
+
+def test_source_not_in_content_hash():
+    """Same signature/name but different bodies produce the same content_hash."""
+    parsed1 = _parse("def work():\n    return 1\n")
+    parsed2 = _parse("def work():\n    return 2\n")
+    func1 = _entity_by_name(parsed1, "work")
+    func2 = _entity_by_name(parsed2, "work")
+    assert func1.content_hash == func2.content_hash
+    # But source differs
+    assert func1.source != func2.source

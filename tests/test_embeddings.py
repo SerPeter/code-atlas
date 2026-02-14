@@ -120,6 +120,43 @@ class TestBuildEmbedText:
         text = build_embed_text(props)
         assert '"""' not in text
 
+    def test_source_in_embed_text(self):
+        """Source appears in embed text after docstring."""
+        source_code = (
+            "def retry(fn, max_attempts=3):\n"
+            "    for i in range(max_attempts):\n"
+            "        try:\n"
+            "            return fn()\n"
+            "        except Exception:\n"
+            "            time.sleep(2**i)"
+        )
+        props = {
+            "_label": "Callable",
+            "qualified_name": "myapp.utils.retry",
+            "kind": "function",
+            "signature": "retry(fn, max_attempts=3)",
+            "docstring": "Retry with backoff.",
+            "source": source_code,
+        }
+        text = build_embed_text(props)
+        assert '"""Retry with backoff."""' in text
+        assert "def retry(fn, max_attempts=3):" in text
+        assert "time.sleep(2**i)" in text
+
+    def test_source_without_docstring(self):
+        """Source still included when docstring is empty."""
+        props = {
+            "_label": "Callable",
+            "qualified_name": "foo.bar",
+            "kind": "function",
+            "signature": "bar(x)",
+            "docstring": "",
+            "source": "def bar(x):\n    return x + 1",
+        }
+        text = build_embed_text(props)
+        assert "def bar(x):" in text
+        assert "return x + 1" in text
+
 
 # ---------------------------------------------------------------------------
 # EmbedClient tests (mocked litellm)
