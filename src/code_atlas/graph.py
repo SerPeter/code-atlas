@@ -41,6 +41,29 @@ if TYPE_CHECKING:
 _tracer = get_tracer(__name__)
 
 
+def _build_graph_search_query(
+    label: str,
+    project_clause: str,
+    fetch_limit: int,
+) -> str:
+    """Build a UNION ALL Cypher query for the 3-stage graph search cascade.
+
+    Collapses exact / suffix / contains matching into a single round-trip.
+    """
+    label_filter = f":{label}" if label else ""
+
+    return (
+        f"MATCH (n{label_filter}) WHERE n.name = $query{project_clause} "
+        f"RETURN n AS node, 3.0 AS score LIMIT {fetch_limit} "
+        f"UNION ALL "
+        f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix{project_clause} "
+        f"RETURN n AS node, 2.0 AS score LIMIT {fetch_limit} "
+        f"UNION ALL "
+        f"MATCH (n{label_filter}) WHERE (n.qualified_name CONTAINS $query OR n.name CONTAINS $query)"
+        f"{project_clause} RETURN n AS node, 1.0 AS score LIMIT {fetch_limit}"
+    )
+
+
 class QueryTimeoutError(Exception):
     """Raised when a read query exceeds the configured timeout."""
 
@@ -1118,51 +1141,28 @@ class GraphClient:
         project: str = "",
         projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Inner implementation of graph_search."""
+        """Inner implementation of graph_search.
+
+        Uses a single UNION ALL query (one round-trip) instead of 3
+        sequential execute() calls.
+        """
         filter_projects = projects if projects is not None else ([project] if project else None)
 
-        label_filter = f":{label}" if label else ""
         project_clause = " AND n.project_name IN $projects" if filter_projects else ""
-        params: dict[str, Any] = {"query": query, "projects": filter_projects or []}
+        params: dict[str, Any] = {"query": query, "suffix": f".{query}", "projects": filter_projects or []}
         fetch_limit = limit * 3
 
+        query_str = _build_graph_search_query(label, project_clause, fetch_limit)
+        records = await self.execute(query_str, params)
+
+        # Deduplicate by uid, keeping highest score
         scored: dict[str, tuple[Any, float]] = {}
-
-        # Stage 1: Exact name match (score 3.0)
-        records = await self.execute(
-            f"MATCH (n{label_filter}) WHERE n.name = $query{project_clause} RETURN n LIMIT {fetch_limit}",
-            params,
-        )
         for r in records:
-            node = r["n"]
+            node = r["node"]
+            score: float = r["score"]
             uid = node.get("uid", "") if hasattr(node, "get") else ""
-            if uid and (uid not in scored or scored[uid][1] < 3.0):
-                scored[uid] = (node, 3.0)
-
-        # Stage 2: Suffix match (score 2.0)
-        suffix = f".{query}"
-        records = await self.execute(
-            f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix{project_clause} "
-            f"RETURN n LIMIT {fetch_limit}",
-            {**params, "suffix": suffix},
-        )
-        for r in records:
-            node = r["n"]
-            uid = node.get("uid", "") if hasattr(node, "get") else ""
-            if uid and (uid not in scored or scored[uid][1] < 2.0):
-                scored[uid] = (node, 2.0)
-
-        # Stage 3: Contains match (score 1.0)
-        records = await self.execute(
-            f"MATCH (n{label_filter}) WHERE (n.qualified_name CONTAINS $query OR n.name CONTAINS $query)"
-            f"{project_clause} RETURN n LIMIT {fetch_limit}",
-            params,
-        )
-        for r in records:
-            node = r["n"]
-            uid = node.get("uid", "") if hasattr(node, "get") else ""
-            if uid and uid not in scored:
-                scored[uid] = (node, 1.0)
+            if uid and (uid not in scored or scored[uid][1] < score):
+                scored[uid] = (node, score)
 
         # Build result list sorted by score descending
         results = [{"node": node, "score": score} for node, score in scored.values()]
