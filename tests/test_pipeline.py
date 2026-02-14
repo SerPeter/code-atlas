@@ -17,7 +17,7 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.pipeline import Tier1GraphConsumer
+from code_atlas.indexing.consumers import Tier1GraphConsumer
 from code_atlas.settings import AtlasSettings, RedisSettings
 
 # All tests in this module require a live Redis/Valkey

@@ -34,8 +34,8 @@ from code_atlas.telemetry import get_tracer
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
 
-    from code_atlas.detectors import PropertyEnrichment
-    from code_atlas.parser import ParsedEntity, ParsedRelationship
+    from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
+    from code_atlas.parsing.detectors import PropertyEnrichment
     from code_atlas.settings import AtlasSettings
 
 _tracer = get_tracer(__name__)

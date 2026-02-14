@@ -22,11 +22,9 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 
-from code_atlas.daemon import DaemonManager
-from code_atlas.embeddings import EmbedClient, EmbeddingError
-from code_atlas.graph import GraphClient, QueryTimeoutError
-from code_atlas.health import run_health_checks
-from code_atlas.indexer import StalenessChecker
+from code_atlas.graph.client import GraphClient, QueryTimeoutError
+from code_atlas.indexing.daemon import DaemonManager
+from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
@@ -41,10 +39,10 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
-from code_atlas.search import CompactNode, SearchType, expand_context, expand_scope
-from code_atlas.search import hybrid_search as _hybrid_search
-from code_atlas.settings import AtlasSettings
-from code_atlas.subagent import (
+from code_atlas.search.embeddings import EmbedClient, EmbeddingError
+from code_atlas.search.engine import CompactNode, SearchType, expand_context, expand_scope
+from code_atlas.search.engine import hybrid_search as _hybrid_search
+from code_atlas.search.guidance import (
     _RELATIONSHIP_SUMMARY,
     CYPHER_EXAMPLES,
     get_guide,
@@ -52,6 +50,8 @@ from code_atlas.subagent import (
     validate_cypher_explain,
     validate_cypher_static,
 )
+from code_atlas.server.health import run_health_checks
+from code_atlas.settings import AtlasSettings
 from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
 
 if TYPE_CHECKING:

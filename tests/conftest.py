@@ -6,7 +6,7 @@ import contextlib
 
 import pytest
 
-from code_atlas.graph import GraphClient
+from code_atlas.graph.client import GraphClient
 from code_atlas.schema import generate_drop_text_index_ddl, generate_drop_vector_index_ddl
 from code_atlas.settings import AtlasSettings
 

@@ -9,9 +9,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from code_atlas.embeddings import EmbedCache, EmbedClient, EmbeddingError, build_embed_text
 from code_atlas.events import EmbedDirty, EntityRef
-from code_atlas.pipeline import Tier3EmbedConsumer
+from code_atlas.indexing.consumers import Tier3EmbedConsumer
+from code_atlas.search.embeddings import EmbedCache, EmbedClient, EmbeddingError, build_embed_text
 from code_atlas.settings import EmbeddingSettings
 
 # ---------------------------------------------------------------------------
@@ -175,7 +175,8 @@ class TestEmbedClient:
         client = EmbedClient(_make_settings())
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1, 0.2, 0.3])])
 
-        with patch("code_atlas.embeddings.litellm.aembedding", new_callable=AsyncMock, return_value=fake_response):
+        patch_target = "code_atlas.search.embeddings.litellm.aembedding"
+        with patch(patch_target, new_callable=AsyncMock, return_value=fake_response):
             result = await client.embed_one("hello")
 
         assert result == [0.1, 0.2, 0.3]
@@ -186,7 +187,7 @@ class TestEmbedClient:
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[float(i)]) for i in range(3)])
 
         with patch(
-            "code_atlas.embeddings.litellm.aembedding", new_callable=AsyncMock, return_value=fake_response
+            "code_atlas.search.embeddings.litellm.aembedding", new_callable=AsyncMock, return_value=fake_response
         ) as mock_embed:
             result = await client.embed_batch(texts)
 
@@ -205,7 +206,7 @@ class TestEmbedClient:
             n = len(kwargs["input"])
             return FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[float(call_count)]) for _ in range(n)])
 
-        with patch("code_atlas.embeddings.litellm.aembedding", side_effect=fake_aembedding):
+        with patch("code_atlas.search.embeddings.litellm.aembedding", side_effect=fake_aembedding):
             result = await client.embed_batch(texts)
 
         assert len(result) == 10
@@ -222,7 +223,7 @@ class TestEmbedClient:
 
         with (
             patch(
-                "code_atlas.embeddings.litellm.aembedding",
+                "code_atlas.search.embeddings.litellm.aembedding",
                 new_callable=AsyncMock,
                 side_effect=Exception("Connection refused"),
             ),
@@ -234,14 +235,15 @@ class TestEmbedClient:
         client = EmbedClient(_make_settings())
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1])])
 
-        with patch("code_atlas.embeddings.litellm.aembedding", new_callable=AsyncMock, return_value=fake_response):
+        patch_target = "code_atlas.search.embeddings.litellm.aembedding"
+        with patch(patch_target, new_callable=AsyncMock, return_value=fake_response):
             assert await client.health_check() is True
 
     async def test_health_check_failure(self):
         client = EmbedClient(_make_settings())
 
         with patch(
-            "code_atlas.embeddings.litellm.aembedding",
+            "code_atlas.search.embeddings.litellm.aembedding",
             new_callable=AsyncMock,
             side_effect=Exception("down"),
         ):

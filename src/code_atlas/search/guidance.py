@@ -13,10 +13,10 @@ from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any
 
 from code_atlas.schema import NodeLabel, RelType
-from code_atlas.search import analyze_query
+from code_atlas.search.engine import analyze_query
 
 if TYPE_CHECKING:
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
 
 # ---------------------------------------------------------------------------
 # Schema-derived constants

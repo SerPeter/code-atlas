@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from code_atlas.graph import QueryTimeoutError
-from code_atlas.parser import ParsedEntity, ParsedRelationship
+from code_atlas.graph.client import QueryTimeoutError
+from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
 from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
 
 if TYPE_CHECKING:
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
 
 
 pytestmark = [pytest.mark.integration]

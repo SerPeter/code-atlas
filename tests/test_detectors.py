@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from code_atlas.detectors import (
+from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship
+from code_atlas.parsing.detectors import (
     ClassOverridesDetector,
     CLICommandDetector,
     DecoratorRoutingDetector,
@@ -22,7 +23,6 @@ from code_atlas.detectors import (
     register_detector,
     run_detectors,
 )
-from code_atlas.parser import ParsedEntity, ParsedFile, ParsedRelationship
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ def _make_parsed_file() -> ParsedFile:
 
 def test_register_and_get(monkeypatch):
     """register_detector adds to registry; get_enabled_detectors retrieves by name."""
-    monkeypatch.setattr("code_atlas.detectors._REGISTRY", {})
+    monkeypatch.setattr("code_atlas.parsing.detectors._REGISTRY", {})
 
     det_a = FakeDetector("alpha")
     det_b = FakeDetector("beta")
@@ -99,7 +99,7 @@ def test_register_and_get(monkeypatch):
 
 def test_register_duplicate_raises(monkeypatch):
     """Registering a detector with the same name raises ValueError."""
-    monkeypatch.setattr("code_atlas.detectors._REGISTRY", {})
+    monkeypatch.setattr("code_atlas.parsing.detectors._REGISTRY", {})
 
     register_detector(FakeDetector("dup"))
     with pytest.raises(ValueError, match="already registered"):
@@ -108,7 +108,7 @@ def test_register_duplicate_raises(monkeypatch):
 
 def test_get_enabled_skips_unknown(monkeypatch):
     """Unknown detector names are skipped, not errors."""
-    monkeypatch.setattr("code_atlas.detectors._REGISTRY", {})
+    monkeypatch.setattr("code_atlas.parsing.detectors._REGISTRY", {})
 
     det = FakeDetector("known")
     register_detector(det)
@@ -120,7 +120,7 @@ def test_get_enabled_skips_unknown(monkeypatch):
 
 def test_get_enabled_empty_registry(monkeypatch):
     """Empty enabled list returns empty list."""
-    monkeypatch.setattr("code_atlas.detectors._REGISTRY", {})
+    monkeypatch.setattr("code_atlas.parsing.detectors._REGISTRY", {})
     assert get_enabled_detectors([]) == []
 
 

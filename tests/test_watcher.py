@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 import pytest
 from watchfiles import Change
 
+from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.settings import WatcherSettings
-from code_atlas.watcher import FileWatcher
 
 if TYPE_CHECKING:
     from pathlib import Path

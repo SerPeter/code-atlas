@@ -17,14 +17,14 @@ from typing import TYPE_CHECKING, Any
 import pathspec
 from loguru import logger
 
-from code_atlas.embeddings import EmbedCache, EmbedClient
 from code_atlas.events import EventBus, FileChanged, Topic
-from code_atlas.parser import get_language_for_file
-from code_atlas.pipeline import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+from code_atlas.indexing.consumers import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+from code_atlas.parsing.ast import get_language_for_file
+from code_atlas.search.embeddings import EmbedCache, EmbedClient
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
     from code_atlas.settings import AtlasSettings, MonorepoSettings
 
 _tracer = get_tracer(__name__)

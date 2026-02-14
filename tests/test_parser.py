@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from code_atlas.parser import ParsedFile, get_language_for_file, parse_file
+from code_atlas.parsing.ast import ParsedFile, get_language_for_file, parse_file
 from code_atlas.schema import (
     CallableKind,
     NodeLabel,

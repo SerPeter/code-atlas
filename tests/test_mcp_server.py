@@ -10,9 +10,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp.server.fastmcp import FastMCP
 
-from code_atlas.embeddings import EmbedClient
-from code_atlas.graph import GraphClient, QueryTimeoutError
-from code_atlas.mcp_server import (
+from code_atlas.graph.client import GraphClient, QueryTimeoutError
+from code_atlas.schema import (
+    _CODE_LABELS,
+    _DOC_LABELS,
+    _EMBEDDABLE_LABELS,
+    _EXTERNAL_LABELS,
+    _TEXT_SEARCHABLE_LABELS,
+    SCHEMA_VERSION,
+    CallableKind,
+    NodeLabel,
+    RelType,
+    TypeDefKind,
+    ValueKind,
+    Visibility,
+)
+from code_atlas.search.embeddings import EmbedClient
+from code_atlas.server.mcp import (
     AppContext,
     _clamp_limit,
     _error,
@@ -27,20 +41,6 @@ from code_atlas.mcp_server import (
     _register_subagent_tools,
     _result,
     _with_staleness,
-)
-from code_atlas.schema import (
-    _CODE_LABELS,
-    _DOC_LABELS,
-    _EMBEDDABLE_LABELS,
-    _EXTERNAL_LABELS,
-    _TEXT_SEARCHABLE_LABELS,
-    SCHEMA_VERSION,
-    CallableKind,
-    NodeLabel,
-    RelType,
-    TypeDefKind,
-    ValueKind,
-    Visibility,
 )
 from code_atlas.settings import AtlasSettings, IndexSettings, find_git_root
 
@@ -545,7 +545,8 @@ class TestVectorSearchMock:
         embed = EmbedClient(settings.embeddings)
         app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
 
-        with patch("code_atlas.embeddings.litellm.aembedding", new_callable=AsyncMock, side_effect=Exception("down")):
+        patch_target = "code_atlas.search.embeddings.litellm.aembedding"
+        with patch(patch_target, new_callable=AsyncMock, side_effect=Exception("down")):
             result = await _invoke_tool(app_ctx, "vector_search", query="test query")
         await graph.close()
         assert result["code"] == "EMBED_ERROR"
@@ -681,7 +682,7 @@ class TestValidateCypherExplain:
 class TestWithStaleness:
     async def test_scope_matching_comma_separated(self, settings):
         """Comma-separated scope with matching project triggers staleness check."""
-        from code_atlas.indexer import StalenessChecker, StalenessInfo
+        from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         # Mock the check method to return not stale
@@ -701,7 +702,7 @@ class TestWithStaleness:
 
     async def test_scope_mismatch_skips_check(self, settings):
         """Scope that doesn't include checker's project returns result unchanged."""
-        from code_atlas.indexer import StalenessChecker
+        from code_atlas.indexing.orchestrator import StalenessChecker
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
@@ -715,7 +716,7 @@ class TestWithStaleness:
 
     async def test_indeterminate_state_returns_none(self, settings):
         """Never-indexed project returns stale=None (indeterminate)."""
-        from code_atlas.indexer import StalenessChecker, StalenessInfo
+        from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
@@ -735,7 +736,7 @@ class TestWithStaleness:
 
     async def test_lock_mode_stale_returns_error(self, settings):
         """Lock mode with stale index returns STALE_INDEX error."""
-        from code_atlas.indexer import StalenessChecker, StalenessInfo
+        from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
 
         lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
@@ -756,7 +757,7 @@ class TestWithStaleness:
 
     async def test_lock_mode_not_stale_passes_through(self, settings):
         """Lock mode with fresh index passes result through unchanged."""
-        from code_atlas.indexer import StalenessChecker, StalenessInfo
+        from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
 
         lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
@@ -777,7 +778,7 @@ class TestWithStaleness:
 
     async def test_ignore_mode_skips_check(self, settings):
         """Ignore mode skips staleness check entirely — result unchanged, check not called."""
-        from code_atlas.indexer import StalenessChecker
+        from code_atlas.indexing.orchestrator import StalenessChecker
 
         ignore_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="ignore"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
@@ -795,7 +796,7 @@ class TestWithStaleness:
         """If staleness check times out, the original result is returned unmodified."""
         import asyncio
 
-        from code_atlas.indexer import StalenessChecker
+        from code_atlas.indexing.orchestrator import StalenessChecker
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
@@ -908,7 +909,7 @@ class TestMaybeUpdateRoot:
         # Mock the new DaemonManager that _switch_root creates
         mock_new_daemon = AsyncMock()
         mock_new_daemon.start = AsyncMock(return_value=False)
-        with patch("code_atlas.mcp_server.DaemonManager", return_value=mock_new_daemon):
+        with patch("code_atlas.server.mcp.DaemonManager", return_value=mock_new_daemon):
             await _maybe_update_root(app, ctx)
 
         assert app.roots_checked is True

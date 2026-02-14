@@ -20,8 +20,8 @@ from code_atlas.schema import RelType
 from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from code_atlas.embeddings import EmbedClient
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.search.embeddings import EmbedClient
     from code_atlas.settings import SearchSettings
 
 _tracer = get_tracer(__name__)

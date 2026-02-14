@@ -27,7 +27,7 @@ def _reset_output() -> None:
 
 def _mock_health_report(*, ok: bool = True):
     """Return a mock HealthReport with one check."""
-    from code_atlas.health import CheckResult, CheckStatus, HealthReport
+    from code_atlas.server.health import CheckResult, CheckStatus, HealthReport
 
     return HealthReport(
         checks=[
@@ -43,13 +43,13 @@ def _mock_health_report(*, ok: bool = True):
 
 def _patch_health(report):
     """Patch run_health_checks where it's defined (code_atlas.health)."""
-    return patch("code_atlas.health.run_health_checks", new_callable=AsyncMock, return_value=report)
+    return patch("code_atlas.server.health.run_health_checks", new_callable=AsyncMock, return_value=report)
 
 
 def _patch_status(mock_graph):
     """Patch GraphClient and AtlasSettings at the modules where _run_status imports them."""
     return (
-        patch("code_atlas.graph.GraphClient", return_value=mock_graph),
+        patch("code_atlas.graph.client.GraphClient", return_value=mock_graph),
         patch("code_atlas.settings.AtlasSettings", return_value=AsyncMock()),
     )
 
@@ -120,7 +120,7 @@ class TestJsonStatus:
         mock_graph = self._make_mock_graph(mock_projects)
 
         with (
-            patch("code_atlas.graph.GraphClient", return_value=mock_graph),
+            patch("code_atlas.graph.client.GraphClient", return_value=mock_graph),
             patch("code_atlas.settings.AtlasSettings"),
         ):
             result = runner.invoke(app, ["--json", "status"])
@@ -136,7 +136,7 @@ class TestJsonStatus:
         mock_graph = self._make_mock_graph([])
 
         with (
-            patch("code_atlas.graph.GraphClient", return_value=mock_graph),
+            patch("code_atlas.graph.client.GraphClient", return_value=mock_graph),
             patch("code_atlas.settings.AtlasSettings"),
         ):
             result = runner.invoke(app, ["--json", "status"])

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from code_atlas.parser import ParsedFile, parse_file
+from code_atlas.parsing.ast import ParsedFile, parse_file
 
 if TYPE_CHECKING:
     from pathlib import Path

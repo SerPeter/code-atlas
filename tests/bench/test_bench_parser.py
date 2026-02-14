@@ -15,7 +15,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from code_atlas.parser import parse_file
+from code_atlas.parsing.ast import parse_file
 
 pytestmark = [pytest.mark.bench, pytest.mark.slow]
 

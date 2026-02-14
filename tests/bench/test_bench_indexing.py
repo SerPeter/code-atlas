@@ -14,13 +14,13 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from code_atlas.events import EventBus
-from code_atlas.indexer import index_project
+from code_atlas.indexing.orchestrator import index_project
 from code_atlas.settings import AtlasSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
 
 pytestmark = [pytest.mark.bench, pytest.mark.integration]
 
@@ -52,8 +52,8 @@ async def test_full_index_throughput(
     mock_embed.embed_one = AsyncMock(return_value=[0.1] * dim)
 
     with (
-        patch("code_atlas.indexer.EmbedClient", return_value=mock_embed),
-        patch("code_atlas.indexer.EmbedCache", return_value=None),
+        patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
+        patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         start = time.perf_counter()
         result = await index_project(settings, graph_client, bench_bus, full_reindex=True, drain_timeout_s=120.0)
@@ -85,8 +85,8 @@ async def test_delta_index_throughput(
 
     # First do a full index
     with (
-        patch("code_atlas.indexer.EmbedClient", return_value=mock_embed),
-        patch("code_atlas.indexer.EmbedCache", return_value=None),
+        patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
+        patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         await index_project(settings, graph_client, bench_bus, full_reindex=True, drain_timeout_s=120.0)
 
@@ -100,8 +100,8 @@ async def test_delta_index_throughput(
 
     # Delta index
     with (
-        patch("code_atlas.indexer.EmbedClient", return_value=mock_embed),
-        patch("code_atlas.indexer.EmbedCache", return_value=None),
+        patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
+        patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         start = time.perf_counter()
         result = await index_project(settings, graph_client, bench_bus, drain_timeout_s=120.0)

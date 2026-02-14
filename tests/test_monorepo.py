@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from code_atlas.indexer import (
+from code_atlas.indexing.orchestrator import (
     DetectedProject,
     classify_file_project,
     detect_sub_projects,
 )
-from code_atlas.search import expand_scope
+from code_atlas.search.engine import expand_scope
 from code_atlas.settings import MonorepoSettings
 
 # ---------------------------------------------------------------------------
@@ -292,7 +292,7 @@ class TestIndexMonorepoIntegration:
 
     async def test_detect_and_index_monorepo(self, monorepo_dir, graph_client, bus):
         """Full monorepo index: detects sub-projects, creates Project nodes, indexes entities."""
-        from code_atlas.indexer import index_monorepo
+        from code_atlas.indexing.orchestrator import index_monorepo
         from code_atlas.schema import NodeLabel
         from code_atlas.settings import AtlasSettings
 
@@ -312,7 +312,7 @@ class TestIndexMonorepoIntegration:
 
     async def test_scoped_monorepo_index(self, monorepo_dir, graph_client, bus):
         """Scoping to specific sub-projects only indexes those."""
-        from code_atlas.indexer import index_monorepo
+        from code_atlas.indexing.orchestrator import index_monorepo
         from code_atlas.schema import NodeLabel
         from code_atlas.settings import AtlasSettings
 

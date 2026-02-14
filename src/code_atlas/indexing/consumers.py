@@ -20,8 +20,6 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from code_atlas.detectors import get_enabled_detectors, run_detectors
-from code_atlas.embeddings import EmbedCache, build_embed_text
 from code_atlas.events import (
     ASTDirty,
     EmbedDirty,
@@ -33,13 +31,15 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.parser import ParsedRelationship, parse_file
+from code_atlas.parsing.ast import ParsedRelationship, parse_file
+from code_atlas.parsing.detectors import get_enabled_detectors, run_detectors
 from code_atlas.schema import RelType
+from code_atlas.search.embeddings import EmbedCache, build_embed_text
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from code_atlas.embeddings import EmbedClient
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.search.embeddings import EmbedClient
     from code_atlas.settings import AtlasSettings
 
 _tracer = get_tracer(__name__)

@@ -21,12 +21,12 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from loguru import logger
 
-from code_atlas.parser import ParsedRelationship
+from code_atlas.parsing.ast import ParsedRelationship
 from code_atlas.schema import CallableKind, NodeLabel, RelType
 
 if TYPE_CHECKING:
-    from code_atlas.graph import GraphClient
-    from code_atlas.parser import ParsedEntity, ParsedFile
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.parsing.ast import ParsedEntity, ParsedFile
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +450,11 @@ class CLICommandDetector:
         project_name: str,  # noqa: ARG002
         graph: GraphClient,  # noqa: ARG002
     ) -> DetectorResult:
+        # Check relationships for typer imports (e.g. `import typer`, `from typer import ...`)
+        has_typer_import = any(
+            rel.rel_type == RelType.IMPORTS and rel.to_name.startswith("typer") for rel in parsed.relationships
+        )
+
         enrichments: list[PropertyEnrichment] = []
         for entity in parsed.entities:
             for tag in entity.tags:
@@ -461,8 +466,7 @@ class CLICommandDetector:
                 command_name = _extract_first_string_arg(args_text) if args_text else None
                 if command_name is None:
                     command_name = entity.name
-                # Heuristic: typer uses app.command(), click uses cli.command() or @click.command()
-                framework = "typer" if "typer" in dec_name.lower() else "click"
+                framework = "typer" if has_typer_import or "typer" in dec_name.lower() else "click"
                 enrichments.append(
                     PropertyEnrichment(
                         qualified_name=entity.qualified_name,

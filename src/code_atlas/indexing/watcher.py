@@ -17,10 +17,10 @@ from loguru import logger
 from watchfiles import Change, awatch
 
 from code_atlas.events import EventBus, FileChanged, Topic
-from code_atlas.indexer import classify_file_project
+from code_atlas.indexing.orchestrator import classify_file_project
 
 if TYPE_CHECKING:
-    from code_atlas.indexer import DetectedProject, FileScope
+    from code_atlas.indexing.orchestrator import DetectedProject, FileScope
     from code_atlas.settings import WatcherSettings
 
 # Map watchfiles Change enum → FileChanged.change_type strings

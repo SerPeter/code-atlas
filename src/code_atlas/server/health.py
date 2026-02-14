@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from code_atlas.embeddings import EmbedClient
 from code_atlas.events import EventBus
-from code_atlas.graph import GraphClient
-from code_atlas.indexer import StalenessChecker
+from code_atlas.graph.client import GraphClient
+from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import SCHEMA_VERSION
+from code_atlas.search.embeddings import EmbedClient
 from code_atlas.settings import find_git_root
 
 if TYPE_CHECKING:

@@ -47,11 +47,34 @@ atlas daemon start               # Start indexing daemon (watcher + pipeline)
 
 ```
 src/code_atlas/
-├── cli.py          # Typer CLI entrypoint (index, search, status, mcp, daemon commands)
-├── events.py       # Event types (FileChanged, ASTDirty, EmbedDirty) + Redis Streams EventBus
-├── parser.py       # Tree-sitter AST parser (py-tree-sitter, in-process)
-├── pipeline.py     # TierConsumer base + Tier1/2/3 consumers with batch-pull pattern
-└── settings.py     # Pydantic configuration (atlas.toml + env vars)
+├── __init__.py          # __version__ only
+├── schema.py            # Graph schema (labels, relationships, DDL generators)
+├── settings.py          # Pydantic configuration (atlas.toml + env vars)
+├── events.py            # Event types (FileChanged, ASTDirty, EmbedDirty) + Valkey Streams EventBus
+├── telemetry.py         # OpenTelemetry integration
+├── cli.py               # Typer CLI entrypoint (index, search, status, mcp, daemon commands)
+│
+├── parsing/
+│   ├── ast.py           # Tree-sitter AST parser (py-tree-sitter, in-process)
+│   └── detectors.py     # Pluggable pattern detectors (routes, test mappings, overrides)
+│
+├── graph/
+│   └── client.py        # Async Memgraph client (schema, upsert, search)
+│
+├── search/
+│   ├── engine.py        # Hybrid search — RRF fusion across graph/vector/BM25
+│   ├── embeddings.py    # Embedding client (litellm) + Valkey cache
+│   └── guidance.py      # Cypher validation + search strategy for AI agents
+│
+├── indexing/
+│   ├── orchestrator.py  # Full-index, monorepo detection, staleness checking
+│   ├── consumers.py     # Tier 1/2/3 event consumers (batch-pull pattern)
+│   ├── watcher.py       # Filesystem watcher (watchfiles + hybrid debounce)
+│   └── daemon.py        # Daemon lifecycle manager (watcher + pipeline)
+│
+└── server/
+    ├── mcp.py           # FastMCP server (tools for AI coding agents)
+    └── health.py        # Infrastructure health checks + diagnostics
 ```
 
 **Event Pipeline:** File Watcher → Valkey Streams → Tier 1 (graph metadata) → Tier 2 (AST diff + gate) → Tier 3 (embeddings) → Memgraph

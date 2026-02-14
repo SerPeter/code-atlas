@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from code_atlas.search import (
+from code_atlas.search.engine import (
     AssembledContext,
     CompactNode,
     ContextItem,

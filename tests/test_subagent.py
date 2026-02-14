@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from code_atlas.schema import NodeLabel, RelType
-from code_atlas.subagent import (
+from code_atlas.search.guidance import (
     _LABEL_NAMES,
     _REL_NAMES,
     _RELATIONSHIP_SUMMARY,

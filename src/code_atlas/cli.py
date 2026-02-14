@@ -156,7 +156,7 @@ def mcp(
     strict: bool = typer.Option(False, "--strict", help="Refuse to start if embedding model mismatch."),
 ) -> None:
     """Start the MCP server for AI agent connections."""
-    from code_atlas.mcp_server import create_mcp_server
+    from code_atlas.server.mcp import create_mcp_server
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -186,8 +186,8 @@ async def _run_index(  # noqa: PLR0915
     from pathlib import Path
 
     from code_atlas.events import EventBus
-    from code_atlas.graph import GraphClient
-    from code_atlas.indexer import detect_sub_projects, index_monorepo, index_project
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.indexing.orchestrator import detect_sub_projects, index_monorepo, index_project
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -206,7 +206,7 @@ async def _run_index(  # noqa: PLR0915
 
     # Resolve embedding dimension before graph construction (vector indices need it)
     if settings.embeddings.dimension is None:
-        from code_atlas.embeddings import EmbedClient as _EmbedClient
+        from code_atlas.search.embeddings import EmbedClient as _EmbedClient
 
         _probe = _EmbedClient(settings.embeddings)
         try:
@@ -312,10 +312,10 @@ async def _run_search(  # noqa: PLR0915
     exclude_generated: bool | None = None,
 ) -> None:
     """Async implementation of the ``atlas search`` command."""
-    from code_atlas.embeddings import EmbedClient
-    from code_atlas.graph import GraphClient
-    from code_atlas.indexer import StalenessChecker
-    from code_atlas.search import SearchType, hybrid_search
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.indexing.orchestrator import StalenessChecker
+    from code_atlas.search.embeddings import EmbedClient
+    from code_atlas.search.engine import SearchType, hybrid_search
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -421,7 +421,7 @@ async def _run_search(  # noqa: PLR0915
 
 async def _run_status() -> None:
     """Async implementation of the ``atlas status`` command."""
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
     from code_atlas.settings import AtlasSettings
 
     settings = AtlasSettings()
@@ -503,7 +503,7 @@ async def _run_status() -> None:
 
 
 async def _run_health() -> None:
-    from code_atlas.health import run_health_checks
+    from code_atlas.server.health import run_health_checks
     from code_atlas.settings import AtlasSettings
 
     settings = AtlasSettings()
@@ -513,7 +513,7 @@ async def _run_health() -> None:
 
 
 async def _run_doctor() -> None:
-    from code_atlas.health import run_health_checks
+    from code_atlas.server.health import run_health_checks
     from code_atlas.settings import AtlasSettings
 
     settings = AtlasSettings()
@@ -523,7 +523,7 @@ async def _run_doctor() -> None:
 
 
 def _print_report(report: object, *, detailed: bool) -> None:
-    from code_atlas.health import CheckStatus, HealthReport
+    from code_atlas.server.health import CheckStatus, HealthReport
 
     rpt: HealthReport = report  # type: ignore[assignment]
 
@@ -573,8 +573,8 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     """Async implementation of the ``atlas watch`` command."""
     from pathlib import Path
 
-    from code_atlas.daemon import DaemonManager
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -620,8 +620,8 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 
 async def _run_daemon() -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
-    from code_atlas.daemon import DaemonManager
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 

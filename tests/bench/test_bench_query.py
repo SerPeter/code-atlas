@@ -14,12 +14,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from code_atlas.parser import parse_file
+from code_atlas.parsing.ast import parse_file
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from code_atlas.graph import GraphClient
+    from code_atlas.graph.client import GraphClient
 
 pytestmark = [pytest.mark.bench, pytest.mark.integration]
 

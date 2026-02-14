@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from code_atlas.health import (
+from code_atlas.server.health import (
     CheckResult,
     CheckStatus,
     HealthReport,
@@ -127,7 +127,7 @@ async def test_check_embeddings_none():
 
 async def test_check_valkey_success():
     redis_settings = RedisSettings()
-    with patch("code_atlas.health.EventBus") as mock_bus_cls:
+    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
         bus_instance = AsyncMock()
         bus_instance.ping = AsyncMock(return_value=True)
         bus_instance.close = AsyncMock()
@@ -141,7 +141,7 @@ async def test_check_valkey_success():
 
 async def test_check_valkey_failure():
     redis_settings = RedisSettings()
-    with patch("code_atlas.health.EventBus") as mock_bus_cls:
+    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
         bus_instance = AsyncMock()
         bus_instance.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
         bus_instance.close = AsyncMock()
@@ -231,8 +231,8 @@ async def test_check_index_stale(tmp_path):
     graph.get_project_git_hash = AsyncMock(return_value="aabbccdd")
     settings = AtlasSettings(project_root=tmp_path)
 
-    with patch("code_atlas.health.StalenessChecker") as mock_checker_cls:
-        from code_atlas.indexer import StalenessInfo
+    with patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls:
+        from code_atlas.indexing.orchestrator import StalenessInfo
 
         checker = MagicMock()
         checker.check = AsyncMock(return_value=StalenessInfo(stale=True, last_indexed_commit="aabbccdd"))
@@ -259,7 +259,7 @@ async def test_skips_db_checks_when_memgraph_down(tmp_path):
     embed = AsyncMock()
     embed.health_check = AsyncMock(return_value=True)
 
-    with patch("code_atlas.health.EventBus") as mock_bus_cls:
+    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
         bus_instance = AsyncMock()
         bus_instance.ping = AsyncMock(return_value=True)
         bus_instance.close = AsyncMock()
@@ -282,7 +282,7 @@ async def test_skips_db_checks_when_memgraph_down(tmp_path):
 
 
 async def test_all_pass_when_healthy(tmp_path):
-    from code_atlas.indexer import StalenessInfo
+    from code_atlas.indexing.orchestrator import StalenessInfo
     from code_atlas.schema import SCHEMA_VERSION
 
     (tmp_path / ".git").mkdir()
@@ -306,8 +306,8 @@ async def test_all_pass_when_healthy(tmp_path):
     embed.health_check = AsyncMock(return_value=True)
 
     with (
-        patch("code_atlas.health.EventBus") as mock_bus_cls,
-        patch("code_atlas.health.StalenessChecker") as mock_checker_cls,
+        patch("code_atlas.server.health.EventBus") as mock_bus_cls,
+        patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls,
     ):
         bus_instance = AsyncMock()
         bus_instance.ping = AsyncMock(return_value=True)

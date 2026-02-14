@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from code_atlas.events import EventBus
-from code_atlas.indexer import (
+from code_atlas.indexing.orchestrator import (
     FileScope,
     StalenessChecker,
     _git_changed_files,
