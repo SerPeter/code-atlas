@@ -55,6 +55,7 @@ class SearchResult:
     rrf_score: float
     sources: dict[str, int] = field(default_factory=dict)  # channel → rank
     visibility: str = "public"
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -713,6 +714,7 @@ async def hybrid_search(
                 rrf_score=rrf_score,
                 sources=uid_ranks.get(uid, {}),
                 visibility=props_by_uid.get(uid, {}).get("visibility", "public"),
+                source=props_by_uid.get(uid, {}).get("source", "") or "",
             )
             for uid, rrf_score in fused_scores.items()
         ]

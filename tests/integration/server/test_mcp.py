@@ -654,3 +654,95 @@ class TestGenerateDiagram:
     async def test_imports_empty(self, app_ctx):
         result = await _invoke_tool(app_ctx, "generate_diagram", type="imports", project="nonexistent")
         assert result["node_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Detail parameter integration tests
+# ---------------------------------------------------------------------------
+
+_DETAIL_PROJECT = "detail-project"
+
+
+@pytest.fixture
+async def seeded_detail_graph(graph_client):
+    """Seed the graph with entities that have source code for detail tests."""
+    await graph_client.ensure_schema()
+
+    await graph_client.merge_project_node(_DETAIL_PROJECT, file_count=1, entity_count=3)
+
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.MODULE} {{"
+        "uid: $uid, project_name: $p, name: 'mod', qualified_name: 'mod', "
+        "file_path: 'mod.py', kind: 'module', line_start: 1, line_end: 50"
+        "})",
+        {"uid": f"{_DETAIL_PROJECT}:mod", "p": _DETAIL_PROJECT},
+    )
+
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        "uid: $uid, project_name: $p, name: 'caller_fn', qualified_name: 'mod.caller_fn', "
+        "file_path: 'mod.py', kind: 'function', line_start: 5, line_end: 10, "
+        "signature: 'def caller_fn() -> None', docstring: 'Calls helper.', "
+        "source: 'def caller_fn() -> None:\\n    helper()'"
+        "})",
+        {"uid": f"{_DETAIL_PROJECT}:mod.caller_fn", "p": _DETAIL_PROJECT},
+    )
+
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        "uid: $uid, project_name: $p, name: 'helper', qualified_name: 'mod.helper', "
+        "file_path: 'mod.py', kind: 'function', line_start: 15, line_end: 20, "
+        "signature: 'def helper() -> str', docstring: 'A helper function.', "
+        "source: 'def helper() -> str:\\n    return \"hi\"'"
+        "})",
+        {"uid": f"{_DETAIL_PROJECT}:mod.helper", "p": _DETAIL_PROJECT},
+    )
+
+    # DEFINES edges
+    await graph_client.execute_write(
+        f"MATCH (m {{uid: $m}}), (f {{uid: $f}}) CREATE (m)-[:{RelType.DEFINES}]->(f)",
+        {"m": f"{_DETAIL_PROJECT}:mod", "f": f"{_DETAIL_PROJECT}:mod.caller_fn"},
+    )
+    await graph_client.execute_write(
+        f"MATCH (m {{uid: $m}}), (f {{uid: $f}}) CREATE (m)-[:{RelType.DEFINES}]->(f)",
+        {"m": f"{_DETAIL_PROJECT}:mod", "f": f"{_DETAIL_PROJECT}:mod.helper"},
+    )
+
+    # CALLS edge: caller_fn -> helper
+    await graph_client.execute_write(
+        f"MATCH (a {{uid: $a}}), (b {{uid: $b}}) CREATE (a)-[:{RelType.CALLS}]->(b)",
+        {"a": f"{_DETAIL_PROJECT}:mod.caller_fn", "b": f"{_DETAIL_PROJECT}:mod.helper"},
+    )
+
+    return graph_client
+
+
+class TestDetailParameter:
+    async def test_get_node_detail_full_includes_source(self, app_ctx, seeded_detail_graph):
+        result = await _invoke_tool(app_ctx, "get_node", name="helper", detail="full")
+        assert result["count"] >= 1
+        node = next(r for r in result["results"] if r["name"] == "helper")
+        assert "source" in node
+        assert "helper" in node["source"]
+
+    async def test_get_node_detail_summary_excludes_source(self, app_ctx, seeded_detail_graph):
+        result = await _invoke_tool(app_ctx, "get_node", name="helper", detail="summary")
+        assert result["count"] >= 1
+        node = next(r for r in result["results"] if r["name"] == "helper")
+        assert "source" not in node
+
+    async def test_get_node_full_has_call_info(self, app_ctx, seeded_detail_graph):
+        result = await _invoke_tool(app_ctx, "get_node", name="helper", detail="full")
+        node = next(r for r in result["results"] if r["name"] == "helper")
+        assert "caller_count" in node
+        assert node["caller_count"] >= 1
+        assert "callers" in node
+        assert "caller_fn" in node["callers"]
+
+    async def test_get_context_neighborhood_excludes_source(self, app_ctx, seeded_detail_graph):
+        result = await _invoke_tool(app_ctx, "get_context", uid=f"{_DETAIL_PROJECT}:mod.helper")
+        # Target node keeps source
+        assert "source" in result["node"] or result["node"].get("source") is not None
+        # Siblings should NOT have source
+        for sibling in result["siblings"]:
+            assert "source" not in sibling

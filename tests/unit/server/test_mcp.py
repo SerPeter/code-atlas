@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +28,7 @@ from code_atlas.schema import (
 from code_atlas.search.embeddings import EmbedClient
 from code_atlas.server.mcp import (
     AppContext,
+    _compact_node,
     _file_uri_to_path,
     _maybe_update_root,
     _rank_results,
@@ -655,3 +656,55 @@ class TestQueryTimeout:
     async def test_generate_diagram_timeout(self, timeout_app):
         result = await _invoke_tool(timeout_app, "generate_diagram", type="packages", project="p")
         assert result["code"] == "QUERY_TIMEOUT"
+
+
+# ---------------------------------------------------------------------------
+# _compact_node detail modes (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestCompactNodeDetail:
+    """Verify _compact_node respects the detail parameter."""
+
+    def _make_record(self) -> dict[str, Any]:
+        """Build a fake node record with source and a long docstring."""
+
+        class FakeNode(dict):
+            labels: ClassVar[list[str]] = ["Callable"]
+
+            def items(self):
+                return super().items()
+
+        node = FakeNode(
+            uid="proj:mod.func",
+            name="func",
+            qualified_name="mod.func",
+            kind="function",
+            file_path="mod.py",
+            line_start=1,
+            line_end=10,
+            signature="def func(x: int) -> str",
+            docstring="A" * 300,
+            visibility="public",
+            source="def func(x: int) -> str:\n    return str(x)",
+        )
+        return {"node": node, "score": 1.5}
+
+    def test_summary_truncates_docstring(self):
+        record = self._make_record()
+        result = _compact_node(record, detail="summary")
+        assert result["docstring"].endswith("...")
+        assert len(result["docstring"]) < 300
+        assert "source" not in result
+
+    def test_full_includes_source_and_full_docstring(self):
+        record = self._make_record()
+        result = _compact_node(record, detail="full")
+        assert result["docstring"] == "A" * 300
+        assert result["source"] == "def func(x: int) -> str:\n    return str(x)"
+
+    def test_default_is_summary(self):
+        record = self._make_record()
+        result = _compact_node(record)
+        assert "source" not in result
+        assert result["docstring"].endswith("...")

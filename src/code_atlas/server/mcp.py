@@ -221,8 +221,13 @@ def _serialize_node(record: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
-    """Extract compact metadata from a node record."""
+def _compact_node(record: dict[str, Any], *, detail: str = "summary") -> dict[str, Any]:
+    """Extract compact metadata from a node record.
+
+    *detail* controls output verbosity:
+    - ``"summary"`` (default): truncated docstring, no source code.
+    - ``"full"``: full docstring, includes source code.
+    """
     node = record.get("node") or record.get("n")
     if node is None:
         return _serialize_node(record)
@@ -246,7 +251,17 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
 
     docstring = props.get("docstring")
     if docstring:
-        compact["docstring"] = docstring[:_DOCSTRING_TRUNCATE] + ("..." if len(docstring) > _DOCSTRING_TRUNCATE else "")
+        if detail == "full":
+            compact["docstring"] = docstring
+        else:
+            compact["docstring"] = docstring[:_DOCSTRING_TRUNCATE] + (
+                "..." if len(docstring) > _DOCSTRING_TRUNCATE else ""
+            )
+
+    if detail == "full":
+        source = props.get("source")
+        if source:
+            compact["source"] = source
 
     if hasattr(node, "labels"):
         compact["_labels"] = sorted(node.labels)
@@ -259,8 +274,12 @@ def _compact_node(record: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def _compact_node_to_dict(node: CompactNode) -> dict[str, Any]:
-    """Serialize a CompactNode dataclass to a plain dict for JSON output."""
+def _compact_node_to_dict(node: CompactNode, *, include_source: bool = True) -> dict[str, Any]:
+    """Serialize a CompactNode dataclass to a plain dict for JSON output.
+
+    *include_source*: when ``False``, omits the ``source`` field (used for
+    neighborhood nodes in ``get_context`` to reduce payload).
+    """
     out: dict[str, Any] = {
         "uid": node.uid,
         "name": node.name,
@@ -278,7 +297,7 @@ def _compact_node_to_dict(node: CompactNode) -> dict[str, Any]:
         out["docstring"] = node.docstring[:_DOCSTRING_TRUNCATE] + (
             "..." if len(node.docstring) > _DOCSTRING_TRUNCATE else ""
         )
-    if node.source:
+    if include_source and node.source:
         out["source"] = node.source
     if node.labels:
         out["_labels"] = node.labels
@@ -381,6 +400,29 @@ def _rank_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return (is_external, is_test, vis, qn_len)
 
     return sorted(results, key=_sort_key)
+
+
+async def _enrich_with_calls(graph: GraphClient, results: list[dict[str, Any]], *, detail: str) -> None:
+    """Inject caller/callee stats into *results* dicts in-place.
+
+    In ``"full"`` mode, adds ``caller_count``, ``callee_count``, ``callers``
+    (top-5 names), and ``callees`` (top-5 names).  In ``"summary"`` mode this
+    is a no-op.
+    """
+    if detail != "full" or not results:
+        return
+    uids = [r["uid"] for r in results if "uid" in r]
+    if not uids:
+        return
+    stats = await graph.batch_call_stats(uids)
+    for r in results:
+        uid = r.get("uid", "")
+        st = stats.get(uid)
+        if st:
+            r["caller_count"] = st.caller_count
+            r["callee_count"] = st.callee_count
+            r["callers"] = st.caller_names
+            r["callees"] = st.callee_names
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +559,8 @@ def _register_node_tools(mcp: FastMCP) -> None:
             "First stage with results wins. Results ranked by relevance. "
             "Use get_context to expand a result. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
-            "line_start, line_end, signature, docstring}], count, truncated, query_ms}."
+            "line_start, line_end, signature, docstring}], count, truncated, query_ms}. "
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
         ),
     )
     async def get_node(
@@ -533,6 +576,13 @@ def _register_node_tools(mcp: FastMCP) -> None:
             ),
         ] = "",
         limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        detail: Annotated[
+            str,
+            Field(
+                "summary",
+                description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
+            ),
+        ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -592,7 +642,8 @@ def _register_node_tools(mcp: FastMCP) -> None:
             return _error(str(exc), code="QUERY_TIMEOUT")
 
         elapsed = (time.monotonic() - t0) * 1000
-        ranked = _rank_results([_compact_node(r) for r in found])
+        ranked = _rank_results([_compact_node(r, detail=detail) for r in found])
+        await _enrich_with_calls(app.graph, ranked, detail=detail)
         return await _with_staleness(app, _result(ranked, limit=clamped, query_ms=elapsed))
 
 
@@ -677,11 +728,11 @@ def _register_query_tools(mcp: FastMCP) -> None:
 
         result = {
             "node": _compact_node_to_dict(expanded.target),
-            "parent": _compact_node_to_dict(expanded.parent) if expanded.parent else None,
-            "siblings": [_compact_node_to_dict(s) for s in expanded.siblings],
-            "callers": [_compact_node_to_dict(c) for c in expanded.callers],
-            "callees": [_compact_node_to_dict(c) for c in expanded.callees],
-            "docs": [_compact_node_to_dict(d) for d in expanded.docs],
+            "parent": _compact_node_to_dict(expanded.parent, include_source=False) if expanded.parent else None,
+            "siblings": [_compact_node_to_dict(s, include_source=False) for s in expanded.siblings],
+            "callers": [_compact_node_to_dict(c, include_source=False) for c in expanded.callers],
+            "callees": [_compact_node_to_dict(c, include_source=False) for c in expanded.callees],
+            "docs": [_compact_node_to_dict(d, include_source=False) for d in expanded.docs],
             "package_context": expanded.package_context,
             "query_ms": round(elapsed, 1),
         }
@@ -697,7 +748,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
             "field-specific queries (name:X, docstring:Y), wildcards (get*User), "
             "and boolean operators (AND, OR). "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
-            "line_start, line_end, signature, docstring, score}], count, truncated, query_ms}."
+            "line_start, line_end, signature, docstring, score}], count, truncated, query_ms}. "
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
         ),
     )
     async def text_search(
@@ -710,6 +762,13 @@ def _register_search_tools(mcp: FastMCP) -> None:
         project: Annotated[
             str, Field("", description="Filter by project name. Empty = auto-detect from workspace.")
         ] = "",
+        detail: Annotated[
+            str,
+            Field(
+                "summary",
+                description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
+            ),
+        ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -723,7 +782,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
-        compacted = [_compact_node(r) for r in all_results]
+        compacted = [_compact_node(r, detail=detail) for r in all_results]
+        await _enrich_with_calls(app.graph, compacted, detail=detail)
         return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=resolved_project)
 
     @mcp.tool(
@@ -731,7 +791,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
             "Semantic similarity search using vector embeddings. "
             "Finds code by meaning, not just name. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
-            "line_start, line_end, signature, docstring, similarity}], count, truncated, query_ms}."
+            "line_start, line_end, signature, docstring, similarity}], count, truncated, query_ms}. "
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
         ),
     )
     async def vector_search(
@@ -747,6 +808,13 @@ def _register_search_tools(mcp: FastMCP) -> None:
         threshold: Annotated[
             float, Field(0.0, description="Minimum cosine similarity to include a result.", ge=0.0, le=1.0)
         ] = 0.0,
+        detail: Annotated[
+            str,
+            Field(
+                "summary",
+                description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
+            ),
+        ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -779,7 +847,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
-        compacted = [_compact_node(r) for r in all_results]
+        compacted = [_compact_node(r, detail=detail) for r in all_results]
+        await _enrich_with_calls(app.graph, compacted, detail=detail)
         return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=resolved_project)
 
 
@@ -793,7 +862,8 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "By default excludes test entities, .pyi stubs, and generated code. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, line_start, "
             "line_end, signature, docstring, visibility, _labels, rrf_score, sources}], "
-            "count, truncated, query_ms}."
+            "count, truncated, query_ms}. "
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
         ),
     )
     async def hybrid_search(
@@ -824,6 +894,13 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         exclude_generated: Annotated[
             bool | None, Field(None, description="Exclude generated code. Default true.")
         ] = None,
+        detail: Annotated[
+            str,
+            Field(
+                "summary",
+                description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
+            ),
+        ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -875,8 +952,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
-        serialized = [
-            {
+        serialized = []
+        for r in results:
+            entry: dict[str, Any] = {
                 "uid": r.uid,
                 "name": r.name,
                 "qualified_name": r.qualified_name,
@@ -885,18 +963,24 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 "line_start": r.line_start,
                 "line_end": r.line_end,
                 "signature": r.signature,
-                "docstring": (
-                    r.docstring[:_DOCSTRING_TRUNCATE] + ("..." if len(r.docstring) > _DOCSTRING_TRUNCATE else "")
-                    if r.docstring
-                    else ""
-                ),
                 "visibility": r.visibility,
                 "_labels": r.labels,
                 "rrf_score": round(r.rrf_score, 6),
                 "sources": r.sources,
             }
-            for r in results
-        ]
+            if detail == "full":
+                entry["docstring"] = r.docstring or ""
+                if r.source:
+                    entry["source"] = r.source
+            else:
+                entry["docstring"] = (
+                    r.docstring[:_DOCSTRING_TRUNCATE] + ("..." if len(r.docstring) > _DOCSTRING_TRUNCATE else "")
+                    if r.docstring
+                    else ""
+                )
+            serialized.append(entry)
+
+        await _enrich_with_calls(app.graph, serialized, detail=detail)
         return await _with_staleness(app, _result(serialized, limit=clamped, query_ms=elapsed), scope=scope)
 
 

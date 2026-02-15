@@ -151,6 +151,16 @@ def _resolve_one_call(project_name: str, rel: ParsedRelationship, lk: _CallLooku
     return non_self[0] if len(non_self) == 1 else None
 
 
+@dataclass(frozen=True)
+class CallStats:
+    """Caller/callee statistics for a single entity."""
+
+    caller_count: int = 0
+    callee_count: int = 0
+    caller_names: list[str] = field(default_factory=list)
+    callee_names: list[str] = field(default_factory=list)
+
+
 class GraphClient:
     """Async Memgraph client wrapping the neo4j Bolt driver.
 
@@ -1172,6 +1182,29 @@ class GraphClient:
         results = [{"node": node, "score": score} for node, score in scored.values()]
         results.sort(key=lambda rec: rec["score"], reverse=True)
         return results[:limit]
+
+    async def batch_call_stats(self, uids: list[str], *, top_n: int = 5) -> dict[str, CallStats]:
+        """Return caller/callee counts and top-N names per uid in a single round-trip."""
+        if not uids:
+            return {}
+        records = await self.execute(
+            "UNWIND $uids AS uid "
+            "MATCH (n {uid: uid}) "
+            f"OPTIONAL MATCH (caller)-[:{RelType.CALLS}]->(n) "
+            "WITH uid, n, count(DISTINCT caller) AS cc, collect(DISTINCT caller.name)[0..$top_n] AS cn "
+            f"OPTIONAL MATCH (n)-[:{RelType.CALLS}]->(callee) "
+            "RETURN uid, cc, cn, count(DISTINCT callee) AS ec, collect(DISTINCT callee.name)[0..$top_n] AS en",
+            {"uids": uids, "top_n": top_n},
+        )
+        return {
+            r["uid"]: CallStats(
+                caller_count=r["cc"],
+                callee_count=r["ec"],
+                caller_names=r["cn"] or [],
+                callee_names=r["en"] or [],
+            )
+            for r in records
+        }
 
     async def close(self) -> None:
         """Close the driver and release connections."""
