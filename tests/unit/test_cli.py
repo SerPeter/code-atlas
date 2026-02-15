@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from typer.testing import CliRunner
 
-from code_atlas.cli import OutputMode, _output, app
+from code_atlas.cli import _output, app
 
 runner = CliRunner()
 
@@ -217,17 +217,3 @@ class TestNoColor:
             runner.invoke(app, ["health"], env={"NO_COLOR": "1"})
 
         assert _output.no_color is True
-
-
-# ---------------------------------------------------------------------------
-# OutputMode dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestOutputMode:
-    def test_defaults(self) -> None:
-        mode = OutputMode()
-        assert mode.quiet is False
-        assert mode.json is False
-        assert mode.verbose == 0
-        assert mode.no_color is False

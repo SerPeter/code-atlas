@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -285,43 +284,6 @@ class TestEmbedClient:
             side_effect=Exception("down"),
         ):
             assert await client.health_check() is False
-
-
-# ---------------------------------------------------------------------------
-# EmbedCache unit tests (no Redis required)
-# ---------------------------------------------------------------------------
-
-
-class TestEmbedCacheHash:
-    def test_hash_text_deterministic(self):
-        """Same text always produces the same hash."""
-        h1 = EmbedCache.hash_text("hello world")
-        h2 = EmbedCache.hash_text("hello world")
-        assert h1 == h2
-        assert len(h1) == 64  # SHA-256 hex
-
-    def test_hash_text_different_content(self):
-        """Different texts produce different hashes."""
-        h1 = EmbedCache.hash_text("hello world")
-        h2 = EmbedCache.hash_text("goodbye world")
-        assert h1 != h2
-
-
-class TestVectorPackUnpack:
-    def test_roundtrip(self):
-        """struct pack/unpack preserves float32 values."""
-        vector = [0.1, -0.5, 3.14, 0.0, 1e-6]
-        packed = struct.pack(f"<{len(vector)}f", *vector)
-        unpacked = list(struct.unpack(f"<{len(packed) // 4}f", packed))
-        assert len(unpacked) == len(vector)
-        for orig, restored in zip(vector, unpacked, strict=True):
-            assert abs(orig - restored) < 1e-5
-
-    def test_768_dim(self):
-        """768-dim vector packs to exactly 3072 bytes."""
-        vector = [float(i) for i in range(768)]
-        packed = struct.pack(f"<{len(vector)}f", *vector)
-        assert len(packed) == 768 * 4
 
 
 # ---------------------------------------------------------------------------

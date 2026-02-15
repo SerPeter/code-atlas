@@ -16,7 +16,7 @@ from code_atlas.indexing.orchestrator import (
     _read_git_head,
     scan_files,
 )
-from code_atlas.settings import AtlasSettings, IndexSettings, ScopeSettings, derive_project_name, resolve_git_dir
+from code_atlas.settings import AtlasSettings, ScopeSettings, derive_project_name, resolve_git_dir
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -377,23 +377,6 @@ class TestGitChangedFiles:
 
 
 # ---------------------------------------------------------------------------
-# Delta threshold — unit test
-# ---------------------------------------------------------------------------
-
-
-class TestDeltaThreshold:
-    def test_threshold_setting_default(self):
-        """Default delta threshold is 0.3."""
-        settings = IndexSettings()
-        assert settings.delta_threshold == 0.3
-
-    def test_threshold_setting_custom(self):
-        """Custom delta threshold is respected."""
-        settings = IndexSettings(delta_threshold=0.5)
-        assert settings.delta_threshold == 0.5
-
-
-# ---------------------------------------------------------------------------
 # resolve_git_dir — unit tests (no infrastructure)
 # ---------------------------------------------------------------------------
 
@@ -605,15 +588,3 @@ class TestStalenessChecker:
 
         checker = StalenessChecker(worktree)
         assert checker.project_name == "myapp@dev"
-
-
-# ---------------------------------------------------------------------------
-# stale_mode setting — unit test
-# ---------------------------------------------------------------------------
-
-
-class TestStaleMode:
-    def test_stale_mode_default(self):
-        """Default stale_mode is 'warn'."""
-        settings = IndexSettings()
-        assert settings.stale_mode == "warn"

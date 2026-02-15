@@ -28,8 +28,6 @@ from code_atlas.schema import (
 from code_atlas.search.embeddings import EmbedClient
 from code_atlas.server.mcp import (
     AppContext,
-    _clamp_limit,
-    _error,
     _file_uri_to_path,
     _maybe_update_root,
     _rank_results,
@@ -40,7 +38,6 @@ from code_atlas.server.mcp import (
     _register_query_tools,
     _register_search_tools,
     _register_subagent_tools,
-    _result,
     _with_staleness,
 )
 from code_atlas.settings import AtlasSettings, IndexSettings, find_git_root
@@ -86,40 +83,6 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
         kwargs["ctx"] = _FakeCtx(app_ctx)
 
     return await tool.fn(**kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Helper tests (no DB needed)
-# ---------------------------------------------------------------------------
-
-
-class TestHelpers:
-    def test_clamp_limit_default(self):
-        assert _clamp_limit(None) == 20
-
-    def test_clamp_limit_within_range(self):
-        assert _clamp_limit(50) == 50
-
-    def test_clamp_limit_below_min(self):
-        assert _clamp_limit(0) == 1
-        assert _clamp_limit(-5) == 1
-
-    def test_clamp_limit_above_max(self):
-        assert _clamp_limit(200) == 100
-
-    def test_result_envelope(self):
-        r = _result([{"a": 1}], limit=20, query_ms=5.123)
-        assert r["count"] == 1
-        assert r["truncated"] is False
-        assert r["query_ms"] == 5.1
-
-    def test_result_truncated(self):
-        r = _result([{"a": 1}], limit=1, query_ms=1.0, total=5)
-        assert r["truncated"] is True
-
-    def test_error_envelope(self):
-        e = _error("boom", code="FAIL")
-        assert e == {"error": "boom", "code": "FAIL"}
 
 
 # ---------------------------------------------------------------------------

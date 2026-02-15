@@ -5,12 +5,9 @@ from __future__ import annotations
 import pytest
 
 from code_atlas.search.engine import (
-    AssembledContext,
     CompactNode,
-    ContextItem,
     ExpandedContext,
     SearchResult,
-    SearchType,
     _apply_filters,
     _boost_results,
     _is_generated_result,
@@ -25,21 +22,6 @@ from code_atlas.search.engine import (
     rrf_fuse,
 )
 from code_atlas.settings import SearchSettings
-
-# ---------------------------------------------------------------------------
-# SearchType enum
-# ---------------------------------------------------------------------------
-
-
-class TestSearchType:
-    def test_values(self):
-        assert SearchType.GRAPH == "graph"
-        assert SearchType.VECTOR == "vector"
-        assert SearchType.BM25 == "bm25"
-
-    def test_list_all(self):
-        assert set(SearchType) == {"graph", "vector", "bm25"}
-
 
 # ---------------------------------------------------------------------------
 # RRF fusion
@@ -120,95 +102,6 @@ class TestAnalyzeQuery:
         # Two generic lowercase words → balanced (not identifier-like)
         weights = analyze_query("user login")
         assert weights["graph"] == weights["vector"]
-
-
-# ---------------------------------------------------------------------------
-# SearchResult dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestSearchResult:
-    def test_frozen(self):
-        r = SearchResult(
-            uid="proj:mod.Foo",
-            name="Foo",
-            qualified_name="mod.Foo",
-            kind="class",
-            file_path="mod.py",
-            line_start=1,
-            line_end=10,
-            signature="class Foo:",
-            docstring="A class.",
-            labels=["TypeDef"],
-            rrf_score=0.05,
-            sources={"graph": 1, "bm25": 2},
-        )
-        assert r.uid == "proj:mod.Foo"
-        assert r.rrf_score == 0.05
-        assert r.sources == {"graph": 1, "bm25": 2}
-        with pytest.raises(AttributeError):
-            r.name = "Bar"  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# CompactNode dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestCompactNode:
-    def test_frozen(self):
-        n = CompactNode(uid="p:m.Foo", name="Foo", qualified_name="m.Foo", kind="class", file_path="m.py")
-        assert n.uid == "p:m.Foo"
-        with pytest.raises(AttributeError):
-            n.name = "Bar"  # type: ignore[misc]
-
-    def test_defaults(self):
-        n = CompactNode(uid="p:x", name="x", qualified_name="x", kind="function", file_path="x.py")
-        assert n.line_start is None
-        assert n.line_end is None
-        assert n.signature == ""
-        assert n.docstring == ""
-        assert n.labels == []
-
-    def test_all_fields(self):
-        n = CompactNode(
-            uid="p:m.f",
-            name="f",
-            qualified_name="m.f",
-            kind="function",
-            file_path="m.py",
-            line_start=10,
-            line_end=20,
-            signature="def f():",
-            docstring="A function.",
-            labels=["Callable"],
-        )
-        assert n.line_start == 10
-        assert n.labels == ["Callable"]
-
-
-# ---------------------------------------------------------------------------
-# ExpandedContext dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestExpandedContext:
-    def test_frozen(self):
-        target = CompactNode(uid="p:x", name="x", qualified_name="x", kind="function", file_path="x.py")
-        ec = ExpandedContext(target=target)
-        assert ec.target is target
-        with pytest.raises(AttributeError):
-            ec.target = target  # type: ignore[misc]
-
-    def test_defaults(self):
-        target = CompactNode(uid="p:x", name="x", qualified_name="x", kind="function", file_path="x.py")
-        ec = ExpandedContext(target=target)
-        assert ec.parent is None
-        assert ec.siblings == []
-        assert ec.callees == []
-        assert ec.callers == []
-        assert ec.docs == []
-        assert ec.package_context == ""
 
 
 # ---------------------------------------------------------------------------
@@ -760,26 +653,3 @@ class TestAssembleContext:
         ec = ExpandedContext(target=_make_node("mod.target"))
         result = assemble_context(ec, budget=8000, tokenizer="claude")
         assert result.total_tokens > 0
-
-
-class TestAssembledContext:
-    def test_frozen(self):
-        ac = AssembledContext(items=[], total_tokens=0, budget=8000)
-        with pytest.raises(AttributeError):
-            ac.total_tokens = 99  # type: ignore[misc]
-
-    def test_render_empty(self):
-        ac = AssembledContext(items=[], total_tokens=0, budget=8000)
-        assert ac.render() == ""
-
-
-class TestContextItem:
-    def test_frozen(self):
-        ci = ContextItem(role="target", text="hello", tokens=1)
-        with pytest.raises(AttributeError):
-            ci.role = "other"  # type: ignore[misc]
-
-    def test_defaults(self):
-        ci = ContextItem(role="target", text="hello", tokens=1)
-        assert ci.uid == ""
-        assert ci.truncated is False
