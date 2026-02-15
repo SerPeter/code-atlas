@@ -764,6 +764,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
         resolved_project = project or derive_project_name(app.settings.project_root)
 
         # Embed the query
+        assert app.embed is not None  # guaranteed by vector_enabled guard above
         try:
             vector = await app.embed.embed_one(query)
         except EmbeddingError as exc:

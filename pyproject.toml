@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.14"
 authors = [
-    { name = "Peter" },
+    { name = "SerPeter" },
 ]
 keywords = [
     "code-intelligence",
@@ -22,9 +22,13 @@ keywords = [
     "memgraph",
     "ast",
     "code-graph",
+    "tree-sitter",
+    "semantic-search",
+    "code-navigation",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
@@ -53,9 +57,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-subagent = [
-    # Extra MCP tools for subagent mode (no API key needed)
-]
 otel = [
     "opentelemetry-api~=1.33",
     "opentelemetry-sdk~=1.33",
@@ -70,7 +71,7 @@ csharp = ["tree-sitter-c-sharp~=0.23"]
 cpp = ["tree-sitter-c~=0.24", "tree-sitter-cpp~=0.23"]
 ruby = ["tree-sitter-ruby~=0.23"]
 php = ["tree-sitter-php~=0.24"]
-all-languages = ["code-atlas[typescript,go,rust,java,csharp,cpp,ruby,php]"]
+all-languages = ["code-atlas-mcp[typescript,go,rust,java,csharp,cpp,ruby,php]"]
 
 [project.scripts]
 atlas = "code_atlas.cli:app"
@@ -80,6 +81,7 @@ Homepage = "https://github.com/SerPeter/code-atlas"
 Documentation = "https://github.com/SerPeter/code-atlas/tree/main/docs"
 Repository = "https://github.com/SerPeter/code-atlas"
 Issues = "https://github.com/SerPeter/code-atlas/issues"
+Changelog = "https://github.com/SerPeter/code-atlas/releases"
 
 # --------------------------------------------------------------------------- #
 # Dev dependencies
@@ -93,8 +95,7 @@ dev = [
     "pre-commit~=4.5",
     "ruff~=0.15",
     "ty~=0.0.15",
-    "mypy~=1.19",
-    "psutil>=7.2.2",
+    "psutil~=7.2",
     "testcontainers>=4.10",
 ]
 
