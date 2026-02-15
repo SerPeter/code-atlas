@@ -5,18 +5,59 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14-dev"
+      - run: uv sync --group dev --all-extras
+      - run: uv run ruff check .
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14-dev"
+      - run: uv sync --group dev --all-extras
+      - run: uv run ruff format --check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14-dev"
+      - run: uv sync --group dev --all-extras
+      - run: uv run ty check
+
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v6
-
-      - uses: actions/setup-python@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14-dev"
-
-      - run: uv sync --group dev
-
-      - run: uv run pytest
+      - run: uv sync --group dev --all-extras
+      - run: uv run pytest -m "not integration and not bench and not tei"
