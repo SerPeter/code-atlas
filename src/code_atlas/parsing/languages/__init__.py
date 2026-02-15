@@ -31,9 +31,15 @@ def discover_plugins() -> None:
         return
     _discovered = True
 
-    # Built-in languages
+    import code_atlas.parsing.languages.cpp  # noqa: PLC0415
+    import code_atlas.parsing.languages.go  # noqa: PLC0415
+    import code_atlas.parsing.languages.jvm  # noqa: PLC0415
     import code_atlas.parsing.languages.markdown  # noqa: PLC0415
-    import code_atlas.parsing.languages.python  # noqa: PLC0415, F401
+    import code_atlas.parsing.languages.php  # noqa: PLC0415
+    import code_atlas.parsing.languages.python  # noqa: PLC0415
+    import code_atlas.parsing.languages.ruby  # noqa: PLC0415
+    import code_atlas.parsing.languages.rust  # noqa: PLC0415
+    import code_atlas.parsing.languages.typescript  # noqa: PLC0415, F401
 
     # External plugins via entry points
     for ep in importlib.metadata.entry_points(group="code_atlas.languages"):

@@ -521,8 +521,9 @@ def _is_test_result(result: SearchResult, patterns: list[str]) -> bool:
 
 
 def _is_stub_result(result: SearchResult) -> bool:
-    """Return True if *result* comes from a .pyi type-stub file."""
-    return _normalize_path(result.file_path).endswith(".pyi")
+    """Return True if *result* comes from a type-stub file (.pyi or .d.ts)."""
+    path = _normalize_path(result.file_path)
+    return path.endswith((".pyi", ".d.ts"))
 
 
 def _is_generated_result(result: SearchResult, patterns: list[str]) -> bool:

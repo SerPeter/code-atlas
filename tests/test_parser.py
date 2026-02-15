@@ -50,7 +50,6 @@ def test_language_detection_python():
 
 
 def test_language_detection_unsupported():
-    assert get_language_for_file("src/main.rs") is None
     assert get_language_for_file("data.csv") is None
 
 
@@ -292,7 +291,7 @@ def test_syntax_error_tolerant():
 
 
 def test_unsupported_extension():
-    result = parse_file("main.rs", b"fn main() {}", PROJECT)
+    result = parse_file("data.csv", b"a,b,c", PROJECT)
     assert result is None
 
 

@@ -62,6 +62,15 @@ otel = [
     "opentelemetry-exporter-otlp-proto-grpc~=1.33",
     "opentelemetry-exporter-otlp-proto-http~=1.33",
 ]
+typescript = ["tree-sitter-typescript~=0.23", "tree-sitter-javascript~=0.25"]
+go = ["tree-sitter-go~=0.25"]
+rust = ["tree-sitter-rust~=0.24"]
+java = ["tree-sitter-java~=0.23"]
+csharp = ["tree-sitter-c-sharp~=0.23"]
+cpp = ["tree-sitter-c~=0.24", "tree-sitter-cpp~=0.23"]
+ruby = ["tree-sitter-ruby~=0.23"]
+php = ["tree-sitter-php~=0.24"]
+all-languages = ["code-atlas[typescript,go,rust,java,csharp,cpp,ruby,php]"]
 
 [project.scripts]
 atlas = "code_atlas.cli:app"
