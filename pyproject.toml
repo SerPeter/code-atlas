@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "code-atlas"
+name = "code-atlas-mcp"
 version = "0.0.1"
 description = "A code intelligence graph that gives AI coding agents deep, token-efficient understanding of your codebase."
 readme = "README.md"
@@ -76,10 +76,10 @@ all-languages = ["code-atlas[typescript,go,rust,java,csharp,cpp,ruby,php]"]
 atlas = "code_atlas.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/your-username/code-atlas"
-Documentation = "https://github.com/your-username/code-atlas/tree/main/docs"
-Repository = "https://github.com/your-username/code-atlas"
-Issues = "https://github.com/your-username/code-atlas/issues"
+Homepage = "https://github.com/SerPeter/code-atlas"
+Documentation = "https://github.com/SerPeter/code-atlas/tree/main/docs"
+Repository = "https://github.com/SerPeter/code-atlas"
+Issues = "https://github.com/SerPeter/code-atlas/issues"
 
 # --------------------------------------------------------------------------- #
 # Dev dependencies

@@ -90,7 +90,7 @@ Token counts measured from MCP JSON tool definitions (tiktoken cl100k_base). **S
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/code-atlas.git
+git clone https://github.com/SerPeter/code-atlas.git
 cd code-atlas
 
 # Start infrastructure (Memgraph + Valkey)
