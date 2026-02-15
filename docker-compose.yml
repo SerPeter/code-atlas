@@ -38,15 +38,17 @@ services:
 
   # ---------------------------------------------------------------------------
   # TEI — text embeddings inference (self-hosted embeddings)
+  # Optional: docker compose --profile tei up -d
   # ---------------------------------------------------------------------------
   tei:
+    profiles: [tei]
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     ports:
       - "8080:80"
     volumes:
       - tei-models:/data
     environment:
-      MODEL_ID: nomic-ai/nomic-embed-code
+      MODEL_ID: ${TEI_MODEL:-Qwen/Qwen3-Embedding-0.6B}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/health"]
       interval: 10s

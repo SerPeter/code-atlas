@@ -257,7 +257,8 @@ Code Atlas uses a **hybrid deployment model**: a long-running daemon handles con
 MCP server is spawned per agent session.
 
 ```bash
-docker compose up -d           # Memgraph (7687) + TEI (8080) + Valkey (6379)
+docker compose up -d                  # Memgraph (7687) + Valkey (6379)
+docker compose --profile tei up -d   # Include TEI (8080) for local embeddings
 atlas daemon start             # File watcher + tier consumers (long-running)
 atlas mcp                      # MCP server — stdio (Claude Code, Cursor)
 atlas mcp --transport http     # MCP server — Streamable HTTP (VS Code, JetBrains)

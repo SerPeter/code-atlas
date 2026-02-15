@@ -1,4 +1,4 @@
-# 🗺️ Code Atlas
+# Code Atlas
 
 **A code intelligence graph that gives AI coding agents deep, token-efficient understanding of your codebase — structure, docs, and dependencies in one searchable graph.**
 
@@ -10,6 +10,14 @@
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io/)
 
 ---
+
+## The Problem
+
+Every time an AI agent touches your codebase, it burns tokens just figuring out where things are. Grep for a function name. Read five files to understand the call chain. Search docs for context. Repeat — across every task, every session. On a large project, agents can spend **30–50% of their context window** on orientation before they write a single line of code.
+
+Many tools solve one piece of this: semantic search, or graph traversal, or keyword lookup. But a developer doesn't understand a codebase through one lens — they build a **mental model** that connects structure, meaning, and names simultaneously. Agents need the same thing.
+
+Code Atlas is that mental model, externalized as a graph.
 
 ## What Is This?
 
@@ -31,9 +39,45 @@ All powered by [Memgraph](https://memgraph.com/) as a single backend.
 - **Pattern detection** — pluggable detectors for decorator routing, event handlers, DI, test→code mappings, and more
 - **Library awareness** — lightweight stubs for external dependencies, full indexing for internal libraries
 - **Self-hosted** — runs locally with Docker. No data leaves your machine
+- **No additional API costs** — agent-first design means all intelligence runs through your existing subscription; local embeddings via TEI, no extra API keys
 - **Token-efficient** — budget-aware context assembly that prioritizes what matters most
 - **Pluggable AI** — TEI for embeddings, LiteLLM for LLM calls, or bring your own
 - **MCP server** — works with Claude Code, Cursor, Windsurf, or any MCP-compatible client
+
+## How Does This Compare?
+
+Several excellent tools exist in this space — graph-based analyzers, semantic search engines, wiki generators, and IDE-integrated indexers. Code Atlas builds on their ideas while addressing a gap: no single tool combines graph traversal, semantic search, and BM25 keyword search with documentation intelligence and MCP exposure.
+
+For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code-graph-rag, codegraph-rust, and more, see [docs/landscape.md](docs/landscape.md).
+
+## MCP Tools
+
+15 tools exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), designed to minimize context window overhead.
+
+| Tool                   | What it does                                                                                 | Search | Full |
+| ---------------------- | -------------------------------------------------------------------------------------------- | -----: | ---: |
+| **Search**             |                                                                                              |        |      |
+| `hybrid_search`        | **Primary tool** — fuses graph + BM25 + vector via RRF. Auto-adjusts weights by query shape. |   ~117 | ~497 |
+| `text_search`          | BM25 keyword search. Quoted phrases, wildcards, field-specific queries.                      |    ~90 | ~275 |
+| `vector_search`        | Semantic similarity via embeddings. Finds code by meaning, not name.                         |    ~67 | ~297 |
+| `get_node`             | Find entities by name. Cascade: exact uid → name → suffix → prefix → contains.               |   ~100 | ~254 |
+| **Navigation**         |                                                                                              |        |      |
+| `get_context`          | Expand a node's neighborhood: parent, siblings, callers, callees, docs.                      |    ~64 | ~273 |
+| `cypher_query`         | Run read-only Cypher against the graph. Auto-limited, write-protected.                       |    ~59 | ~168 |
+| **Analysis**           |                                                                                              |        |      |
+| `analyze_repo`         | Structure, centrality, dependencies, or pattern analysis.                                    |    ~41 | ~266 |
+| `generate_diagram`     | Mermaid diagrams: packages, imports, inheritance, module detail.                             |    ~37 | ~254 |
+| **Guidance**           |                                                                                              |        |      |
+| `get_usage_guide`      | Quick-start or topic-specific guidance for the agent.                                        |    ~35 | ~106 |
+| `plan_search_strategy` | Recommends which search tool + params for a question.                                        |    ~40 |  ~97 |
+| `validate_cypher`      | Catches Cypher errors before execution.                                                      |    ~58 | ~116 |
+| `schema_info`          | Full graph schema: labels, relationships, Cypher examples.                                   |    ~75 |  ~96 |
+| **Status**             |                                                                                              |        |      |
+| `index_status`         | Projects, entity counts, schema version, index health.                                       |    ~72 |  ~93 |
+| `list_projects`        | Monorepo project list with dependency relationships.                                         |    ~56 |  ~77 |
+| `health_check`         | Infrastructure diagnostics: Memgraph, TEI, Valkey, schema.                                   |    ~55 |  ~76 |
+
+Token counts measured from MCP JSON tool definitions (tiktoken cl100k_base). **Search** = name + description (~966 total); **Full** = name + description + parameter schema with field descriptions, enums, and constraints (~2,945 total). All parameters are self-documented — agents can one-shot any tool without calling `get_usage_guide` first.
 
 ## Quick Start
 
@@ -49,8 +93,11 @@ All powered by [Memgraph](https://memgraph.com/) as a single backend.
 git clone https://github.com/your-username/code-atlas.git
 cd code-atlas
 
-# Start infrastructure (Memgraph + TEI)
+# Start infrastructure (Memgraph + Valkey)
 docker compose up -d
+
+# Optional: start with local embeddings (TEI)
+docker compose --profile tei up -d
 
 # Install code-atlas
 uv sync
@@ -77,180 +124,38 @@ Add to your Claude Code / Cursor MCP config:
 }
 ```
 
-## Usage
-
-```bash
-# Index a codebase
-atlas index .
-
-# Index specific paths (monorepo)
-atlas index . --scope services/auth --scope libs/shared
-
-# Search
-atlas search "authentication middleware"
-atlas search --type graph "MATCH (f:Function)-[:CALLS]->(g) WHERE g.name = 'validate_token' RETURN f"
-atlas search --type keyword "DATABASE_URL"
-
-# Status and health
-atlas status
-atlas health
-```
-
-## Configuration
-
-Create an `atlas.toml` in your project root:
-
-```toml
-[scope]
-include_paths = ["services/auth", "services/billing", "libs/shared"]
-exclude_patterns = ["*.generated.ts", "testdata/"]
-
-[libraries]
-full_index = ["my_company_shared_lib"]
-stub_index = ["fastapi", "sqlalchemy"]
-
-[monorepo]
-auto_detect = true
-always_include = ["libs/shared"]
-
-[embeddings]
-model = "nomic-ai/nomic-embed-code"
-base_url = "http://localhost:8080"  # self-hosted TEI; omit for cloud providers
-
-[search]
-default_token_budget = 8000
-test_filter = true  # exclude test files from results by default
-
-[detectors]
-enabled = ["decorator_routing", "event_handlers", "test_mapping", "class_overrides", "di_injection", "cli_commands"]
-```
-
-File exclusions use `.atlasignore` (same syntax as `.gitignore`):
-
-```
-# Generated code
-*_pb2.py
-*_pb2_grpc.py
-# Vendored deps
-vendor/
-# Migration history
-migrations/
-```
-
-## For Best Results
-
-Code Atlas works with any codebase, but structured code produces a richer graph and better search results.
-See the [repository guidelines](docs/guides/repo-guidelines.md) for practices that improve both code quality and Code Atlas indexing.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                 MCP Server (Python)             │
-│  ┌──────────┐ ┌──────────┐ ┌─────────────────┐  │
-│  │  Query   │ │  Index   │ │  Admin/Health   │  │
-│  │  Tools   │ │  Tools   │ │  Tools          │  │
-│  └────┬─────┘ └────┬─────┘ └─────────────────┘  │
-│       │             │                           │
-│  ┌────▼─────────────▼───────────────────────┐   │
-│  │       Query Router / Orchestrator        │   │
-│  └────┬─────────┬───────────┬───────────────┘   │
-│       │         │           │                   │
-│  ┌────▼───┐ ┌───▼────┐ ┌───▼─────┐              │
-│  │ Graph  │ │ Vector │ │  BM25   │   → RRF →    │
-│  │ Search │ │ Search │ │ Search  │   Fusion     │
-│  └────┬───┘ └───┬────┘ └───┬─────┘              │
-│       └─────────┼──────────┘                    │
-│            ┌────▼────┐                          │
-│            │Memgraph │                          │
-│            └─────────┘                          │
-└─────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────┐
-│              Indexing Pipeline                  │
-│  File Scanner → AST Parser (tree-sitter) → Diff │
-│  → Pattern Detectors → Embeddings (TEI)         │
-│  → Graph Writer → Memgraph                      │
-└─────────────────────────────────────────────────┘
-```
-
-## Development
-
-```bash
-# Install dev dependencies
-uv sync --group dev
-
-# Run tests
-uv run pytest
-
-# Lint & format
-uv run ruff check .
-uv run ruff format .
-
-# Type check
-uv run ty check
-
-# Pre-commit hooks
-uv run pre-commit install
-```
+See [CLI usage guide](docs/guides/usage.md) for more commands and options.
 
 ## Performance
 
-Benchmarked on a synthetic codebase with deterministic Python files (classes, methods, imports, docstrings).
+| Metric              | Value                 |
+| ------------------- | --------------------- |
+| Parse throughput    | **600–700 files/sec** |
+| Graph search (p50)  | 8 ms                  |
+| BM25 search (p50)   | 10 ms                 |
+| Vector search (p50) | 47 ms                 |
+| Concurrent QPS      | **238** (zero errors) |
 
-### Parsing
+Full benchmark tables and methodology: [docs/benchmarks.md](docs/benchmarks.md)
 
-| Codebase | Files | Entities | Time  | Throughput        | Peak Memory |
-| -------- | ----- | -------- | ----- | ----------------- | ----------- |
-| Small    | 100   | 1,500    | 0.14s | **709 files/sec** | 1.4 MB      |
-| Medium   | 1,000 | 15,000   | 1.6s  | **608 files/sec** | 15.8 MB     |
+## Documentation
 
-Memory scales linearly (~16 KB per entity) when accumulating all parse results. In production, entities are streamed to the graph and not held in memory simultaneously.
+- [Architecture](docs/architecture.md) — system design, pipelines, deployment model
+- [Landscape](docs/landscape.md) — code intelligence tools comparison and design rationale
+- [Configuration](docs/guides/configuration.md) — atlas.toml, .atlasignore, environment variables
+- [CLI Usage](docs/guides/usage.md) — indexing, searching, daemon mode
+- [Benchmarks](docs/benchmarks.md) — parsing, query latency, concurrency
+- [Repository Guidelines](docs/guides/repo-guidelines.md) — structure your code for better indexing
 
-### Query Latency (p50 / p95)
+## Supporting Code Atlas
 
-| Search Type      | p50   | p95   | p99    |
-| ---------------- | ----- | ----- | ------ |
-| Graph search     | 8 ms  | 63 ms | 66 ms  |
-| BM25 text search | 10 ms | 19 ms | 29 ms  |
-| Vector search    | 47 ms | 71 ms | 164 ms |
+I built Code Atlas because my AI agents kept burning half their context just figuring out where things are in larger
+codebases. Nothing combined the search types I needed in one place, so I built it and open-sourced it so you can
+benefit as well.
 
-All three search types use single-round-trip queries against Memgraph.
+If Code Atlas saves you time, tokens, or makes your agents noticeably better — consider [sponsoring the project](https://github.com/sponsors/SerPeter).
 
-### Concurrent Queries
-
-| Concurrency | Total Queries | Wall Time | QPS     | Errors |
-| ----------- | ------------- | --------- | ------- | ------ |
-| 10          | 50            | 1.9s      | 26      | 0      |
-| 50          | 250           | 1.1s      | **238** | 0      |
-
-Zero errors under load. QPS scales well with concurrency thanks to Memgraph's connection pooling.
-
-### Running Benchmarks
-
-```bash
-# Parser + memory (no infra needed)
-uv run pytest tests/bench/test_bench_parser.py tests/bench/test_bench_memory.py -m bench -s
-
-# Query + concurrent (requires Memgraph)
-uv run pytest tests/bench/ -m bench -s
-
-# Exclude benchmarks from regular test runs
-uv run pytest -m "not bench"
-```
-
-## How Does This Compare?
-
-Several excellent tools exist in this space. Code Atlas builds on their ideas while addressing gaps that emerge when you need graph, semantic, and keyword search working together.
-
-| Tool                                                                    | Strengths                                      | Gaps                                                                            |
-| ----------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------- |
-| **[code-graph-mcp](https://github.com/entrepeneur4lyf/code-graph-mcp)** | Fast ast-grep parsing, broad language coverage | In-memory only (no persistence), no semantic or keyword search                  |
-| **[code-graph-rag](https://github.com/vitali87/code-graph-rag)**        | Best hierarchy model, Memgraph-native          | Every query requires an LLM call, no vector/BM25 search, no doc indexing        |
-| **[Kit](https://github.com/cased/kit)**                                 | Clean DX, good semantic + text search          | No graph database — can't follow relationships (calls, inheritance)             |
-| **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)**       | 100% Rust, LSP-based type resolution           | SurrealDB's graph traversal unproven, non-standard query language for AI agents |
-
-Code Atlas combines the strengths: code-graph-rag's hierarchy and Memgraph foundation, Kit's search and context assembly, and tree-sitter-based AST parsing — while adding documentation intelligence, monorepo support, pluggable pattern detection, and token-budget-aware context assembly.
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github)](https://github.com/sponsors/SerPeter)
 
 ## License
 

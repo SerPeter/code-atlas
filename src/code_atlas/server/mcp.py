@@ -18,10 +18,11 @@ import urllib.request
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import Field
 
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
 from code_atlas.indexing.daemon import DaemonManager
@@ -514,11 +515,26 @@ def _register_node_tools(mcp: FastMCP) -> None:
             "Find code entities by name. "
             "Cascade: exact uid → exact name → suffix → prefix → contains. "
             "First stage with results wins. Results ranked by relevance. "
-            "Returns compact metadata (name, kind, file, lines, signature). "
-            "Use get_context to expand a result."
+            "Use get_context to expand a result. "
+            "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
+            "line_start, line_end, signature, docstring}], count, truncated, query_ms}."
         ),
     )
-    async def get_node(name: str, label: str = "", limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def get_node(
+        name: Annotated[str, Field(description="Entity name, qualified name, or uid to look up.")],
+        label: Annotated[
+            str,
+            Field(
+                "",
+                description=(
+                    "Restrict to a node label: Callable, Module, TypeDef, Value, Package, "
+                    "DocFile, DocSection, ExternalSymbol. Empty = all."
+                ),
+            ),
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
@@ -586,12 +602,16 @@ def _register_query_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Execute read-only Cypher against the graph. "
-            "LIMIT auto-applied (default 20, max 100). "
-            "Write operations rejected. "
-            "Call schema_info first to see available node types and relationships."
+            "LIMIT auto-applied; write operations rejected. "
+            "Call schema_info first for available labels and relationships. "
+            "Returns: {results: [record, ...], count, truncated, query_ms}."
         ),
     )
-    async def cypher_query(query: str, limit: int = 20, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def cypher_query(
+        query: Annotated[str, Field(description="Read-only Cypher query. LIMIT is auto-appended if missing.")],
+        limit: Annotated[int, Field(20, description="Max results (auto-appended as LIMIT clause).", ge=1, le=100)] = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
@@ -619,17 +639,18 @@ def _register_query_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Expand a node into its neighborhood: parent, siblings, callers, callees, docs. "
-            "Pass the uid from a get_node or hybrid_search result. "
-            "Toggle sections with include_hierarchy, include_calls, include_docs. "
-            "call_depth controls CALLS traversal hops (default 1, max 3)."
+            "Pass a uid from get_node or hybrid_search results. "
+            "Returns: {node, parent, siblings, callers, callees, docs, package_context, query_ms}."
         ),
     )
     async def get_context(
-        uid: str,
-        include_hierarchy: bool = True,
-        include_calls: bool = True,
-        call_depth: int = 1,
-        include_docs: bool = True,
+        uid: Annotated[str, Field(description="Unique identifier of the node to expand (from search results).")],
+        include_hierarchy: Annotated[bool, Field(True, description="Include parent and sibling entities.")] = True,
+        include_calls: Annotated[bool, Field(True, description="Include callers and callees.")] = True,
+        call_depth: Annotated[
+            int, Field(1, description="CALLS traversal hops (1 = direct callers/callees only).", ge=1, le=3)
+        ] = 1,
+        include_docs: Annotated[bool, Field(True, description="Include linked documentation sections.")] = True,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -672,52 +693,60 @@ def _register_search_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "BM25 keyword search across code entities using Tantivy. "
-            "Searches all text indices by default, or a single label if specified. "
-            "Valid labels: Callable, Module, TypeDef, Value, DocSection. "
-            "Optional: project (filter by project_name). "
-            'Query syntax: quoted phrases ("exact phrase"), '
-            "field-specific (name:UserService, docstring:authentication), "
-            "wildcards (get*User), boolean (foo AND bar, foo OR bar). "
-            "Returns compact metadata with relevance score."
+            "BM25 keyword search across code entities. Supports quoted phrases, "
+            "field-specific queries (name:X, docstring:Y), wildcards (get*User), "
+            "and boolean operators (AND, OR). "
+            "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
+            "line_start, line_end, signature, docstring, score}], count, truncated, query_ms}."
         ),
     )
     async def text_search(
-        query: str,
-        label: str = "",
-        limit: int = 20,
-        project: str = "",
+        query: Annotated[str, Field(description="BM25 query — supports phrases, wildcards, field:value, AND/OR.")],
+        label: Annotated[
+            str,
+            Field("", description="Restrict to one label: Callable, Module, TypeDef, Value, DocSection. Empty = all."),
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        project: Annotated[
+            str, Field("", description="Filter by project name. Empty = auto-detect from workspace.")
+        ] = "",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
+        resolved_project = project or derive_project_name(app.settings.project_root)
 
         t0 = time.monotonic()
         try:
-            all_results = await app.graph.text_search(query, label=label, limit=clamped, project=project)
+            all_results = await app.graph.text_search(query, label=label, limit=clamped, project=resolved_project)
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
-        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=project)
+        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=resolved_project)
 
     @mcp.tool(
         description=(
             "Semantic similarity search using vector embeddings. "
-            "Embeds the query via TEI, then searches vector indices. "
-            "Searches all embeddable labels by default, or a single label if specified. "
-            "Valid labels: Callable, Module, TypeDef, Value, DocSection. "
-            "Optional: project (filter by project_name), threshold (min similarity 0-1). "
-            "Returns compact metadata with similarity score."
+            "Finds code by meaning, not just name. "
+            "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
+            "line_start, line_end, signature, docstring, similarity}], count, truncated, query_ms}."
         ),
     )
     async def vector_search(
-        query: str,
-        label: str = "",
-        limit: int = 20,
-        project: str = "",
-        threshold: float = 0.0,
+        query: Annotated[str, Field(description="Natural language query — describes what the code does.")],
+        label: Annotated[
+            str,
+            Field("", description="Restrict to one label: Callable, Module, TypeDef, Value, DocSection. Empty = all."),
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        project: Annotated[
+            str, Field("", description="Filter by project name. Empty = auto-detect from workspace.")
+        ] = "",
+        threshold: Annotated[
+            float, Field(0.0, description="Minimum cosine similarity to include a result.", ge=0.0, le=1.0)
+        ] = 0.0,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -732,6 +761,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
                 code="MODEL_MISMATCH",
             )
         clamped = _clamp_limit(limit)
+        resolved_project = project or derive_project_name(app.settings.project_root)
 
         # Embed the query
         try:
@@ -742,14 +772,14 @@ def _register_search_tools(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         try:
             all_results = await app.graph.vector_search(
-                vector, label=label, limit=clamped, project=project, threshold=threshold
+                vector, label=label, limit=clamped, project=resolved_project, threshold=threshold
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
         compacted = [_compact_node(r) for r in all_results]
-        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=project)
+        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=resolved_project)
 
 
 def _register_hybrid_tool(mcp: FastMCP) -> None:
@@ -757,29 +787,42 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "Primary search tool — fuses graph name-matching, BM25 keyword search, and vector "
-            "semantic search via Reciprocal Rank Fusion (RRF). "
-            "Automatically adjusts channel weights based on query shape: identifier-like queries "
-            "boost graph+BM25, natural language boosts vector. "
-            "By default, test entities, .pyi stubs, and generated code are excluded. "
-            "Set exclude_tests/exclude_stubs/exclude_generated to false to include them "
-            "(e.g. to find tests for a function). "
-            "Optional: search_types (comma-separated: graph,vector,bm25), "
-            'scope (project name filter), weights (JSON: {"graph": 2.0}). '
-            "Returns results ranked by fused score with provenance (which channels found each result). "
-            "For best results, add doc comments and type annotations to your code — "
-            "they are embedded for semantic search."
+            "Primary search tool — fuses graph name-matching, BM25 keyword, and vector semantic "
+            "search via Reciprocal Rank Fusion (RRF). Auto-adjusts weights by query shape. "
+            "By default excludes test entities, .pyi stubs, and generated code. "
+            "Returns: {results: [{uid, name, qualified_name, kind, file_path, line_start, "
+            "line_end, signature, docstring, visibility, _labels, rrf_score, sources}], "
+            "count, truncated, query_ms}."
         ),
     )
     async def hybrid_search(
-        query: str,
-        limit: int = 20,
-        search_types: str = "",
-        scope: str = "",
-        weights: str = "",
-        exclude_tests: bool | None = None,
-        exclude_stubs: bool | None = None,
-        exclude_generated: bool | None = None,
+        query: Annotated[str, Field(description="Search query — identifier names, natural language, or mixed.")],
+        limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        search_types: Annotated[
+            str, Field("", description="Comma-separated channels to use: graph,vector,bm25. Empty = all.")
+        ] = "",
+        scope: Annotated[
+            str,
+            Field(
+                "",
+                description="Project name filter. Comma-separated names or globs for monorepos. "
+                "Empty = auto-detect from workspace.",
+            ),
+        ] = "",
+        weights: Annotated[
+            str,
+            Field(
+                "",
+                description='Channel weight overrides as JSON, e.g. {"graph": 2.0, "vector": 0.5}. Empty = auto.',
+            ),
+        ] = "",
+        exclude_tests: Annotated[
+            bool | None, Field(None, description="Exclude test files/entities. Default true for non-test queries.")
+        ] = None,
+        exclude_stubs: Annotated[bool | None, Field(None, description="Exclude .pyi stub files. Default true.")] = None,
+        exclude_generated: Annotated[
+            bool | None, Field(None, description="Exclude generated code. Default true.")
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -798,8 +841,8 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             except json.JSONDecodeError:
                 return _error("Invalid weights JSON", code="INVALID_WEIGHTS")
 
-        # Resolve scope through expand_scope for monorepo glob/comma support
-        resolved_scope = scope
+        # Resolve scope: default to current project, expand globs/commas for monorepos
+        resolved_scope = scope or derive_project_name(app.settings.project_root)
         if scope and ("*" in scope or "," in scope):
             project_rows = await app.graph.get_project_status()
             all_project_names = []
@@ -862,7 +905,9 @@ def _register_info_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Show indexed projects, entity counts, and schema version. "
-            "Use this to understand what data is available before querying."
+            "Use this to understand what data is available before querying. "
+            "Returns: {projects: [{name, file_count, entity_count, last_indexed_at, git_hash}], "
+            "label_counts, vector_indices, text_indices, schema_version, query_ms}."
         ),
     )
     async def index_status(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -914,9 +959,9 @@ def _register_info_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "List all indexed projects with metadata and dependencies. "
-            "For monorepos, shows sub-projects with DEPENDS_ON relationships. "
-            "Returns name, file_count, entity_count, depends_on, depended_by for each project."
+            "List all indexed projects with dependency relationships. "
+            "Returns: {results: [{name, file_count, entity_count, last_indexed_at, "
+            "git_hash, depends_on, depended_by}], count, truncated, query_ms}."
         ),
     )
     async def list_projects(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -966,7 +1011,10 @@ def _register_info_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Graph schema reference: node labels, relationship types, kind discriminators, "
-            "properties, Cypher examples. Call this first to understand what you can query."
+            "properties, and Cypher examples. "
+            "Returns: {node_labels, relationship_types, relationship_summary, "
+            "kind_discriminators, common_properties, text_searchable_labels, "
+            "vector_searchable_labels, cypher_examples, uid_format, schema_version}."
         ),
     )
     async def schema_info() -> dict[str, Any]:
@@ -1009,7 +1057,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Check infrastructure health: Memgraph, TEI, Valkey, schema, config, index. "
-            "Returns ok (bool), per-check status with messages and suggestions, and elapsed_ms."
+            "Returns: {ok: bool, checks: [{name, status, message, detail, suggestion}], elapsed_ms}."
         ),
     )
     async def health_check(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -1037,11 +1085,14 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Check Cypher for errors before running it. "
-            "Catches write ops, invalid labels/relationships, missing RETURN/LIMIT, unbalanced syntax. "
-            "Returns issues list (empty = valid)."
+            "Catches write ops, invalid labels/rels, missing RETURN/LIMIT, unbalanced syntax. "
+            "Returns: {valid: bool, issues: [{level, message}]}."
         ),
     )
-    async def validate_cypher(query: str, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def validate_cypher(
+        query: Annotated[str, Field(description="Cypher query to validate (not executed).")],
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
         issues = validate_cypher_static(query)
 
         # Try EXPLAIN against live DB if available
@@ -1061,18 +1112,31 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "How to use Code Atlas tools. "
-            "Call with no args for a quick-start guide, or pass a topic: "
-            "'searching', 'cypher', 'navigation', 'patterns', 'guidelines'."
+            "How to use Code Atlas tools effectively. Returns: {topic, guide (markdown text), related_topics}."
         ),
     )
-    async def get_usage_guide(topic: str = "") -> dict[str, Any]:
+    async def get_usage_guide(
+        topic: Annotated[
+            str,
+            Field(
+                "",
+                description=(
+                    "Guide topic: 'searching', 'cypher', 'navigation', 'patterns', 'guidelines'. Empty = quick-start."
+                ),
+            ),
+        ] = "",
+    ) -> dict[str, Any]:
         return get_guide(topic)
 
     @mcp.tool(
-        description="Analyze a question and recommend which search tool to use with suggested parameters.",
+        description=(
+            "Analyze a question and recommend which search tool + parameters to use. "
+            "Returns: {question, recommended_tool, params, reasoning}."
+        ),
     )
-    async def plan_search_strategy(question: str) -> dict[str, Any]:
+    async def plan_search_strategy(
+        question: Annotated[str, Field(description="The question or task you want to search for.")],
+    ) -> dict[str, Any]:
         return plan_strategy(question)
 
 
@@ -1082,18 +1146,26 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Analyze repository structure, centrality, dependencies, or patterns. "
-            "Select sub-analysis with the `analysis` parameter: "
-            "structure (entity counts, packages, largest modules, external deps), "
-            "centrality (hub entities, hub modules, leaf entities), "
-            "dependencies (internal imports, cross-package coupling, circular deps), "
-            "patterns (inheritance trees, enums, visibility distribution, docstring coverage)."
+            "Returns: {analysis, project, ...analysis-specific keys, query_ms}."
         ),
     )
     async def analyze_repo(
-        analysis: str,
-        project: str = "",
-        path: str = "",
-        limit: int = 20,
+        analysis: Annotated[
+            Literal["structure", "centrality", "dependencies", "patterns"],
+            Field(
+                description=(
+                    "Sub-analysis: structure (entity counts, packages, largest modules), "
+                    "centrality (hub entities/modules, leaves), "
+                    "dependencies (imports, cross-package coupling, circular deps), "
+                    "patterns (inheritance, enums, visibility, docstring coverage)."
+                ),
+            ),
+        ],
+        project: Annotated[str, Field("", description="Project name. Empty = auto-detect from workspace.")] = "",
+        path: Annotated[
+            str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max items per sub-section.", ge=1, le=100)] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
@@ -1105,20 +1177,24 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
             return _error(str(exc), code="QUERY_TIMEOUT")
 
     @mcp.tool(
-        description=(
-            "Generate Mermaid diagrams of the codebase. "
-            "Select diagram type: "
-            "packages (containment tree of packages and modules), "
-            "imports (module-level dependency graph), "
-            "inheritance (class hierarchy), "
-            "module_detail (single module's classes + methods — requires path)."
-        ),
+        description=("Generate Mermaid diagrams of the codebase. Returns: {type, mermaid, node_count, query_ms}."),
     )
     async def generate_diagram(
-        type: str,  # noqa: A002
-        project: str = "",
-        path: str = "",
-        max_nodes: int = 30,
+        type: Annotated[  # noqa: A002
+            Literal["packages", "imports", "inheritance", "module_detail"],
+            Field(
+                description=(
+                    "Diagram type: packages (containment tree), imports (module dependencies), "
+                    "inheritance (class hierarchy), module_detail (single module's classes + methods — requires path)."
+                ),
+            ),
+        ],
+        project: Annotated[str, Field("", description="Project name. Empty = auto-detect from workspace.")] = "",
+        path: Annotated[
+            str,
+            Field("", description="Scope to a file/package path. Required for module_detail, optional otherwise."),
+        ] = "",
+        max_nodes: Annotated[int, Field(30, description="Maximum nodes in the diagram.", ge=1, le=100)] = 30,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)

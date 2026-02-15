@@ -32,7 +32,8 @@ uv run pre-commit install        # Install hooks
 uv run pre-commit run --all-files  # Run all hooks manually
 
 # Infrastructure
-docker compose up -d             # Start Memgraph + TEI + Valkey
+docker compose up -d             # Start Memgraph + Valkey
+docker compose --profile tei up -d  # Include local embeddings (TEI)
 docker compose down              # Stop services
 
 # CLI

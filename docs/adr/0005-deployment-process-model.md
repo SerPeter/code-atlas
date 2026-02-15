@@ -212,7 +212,7 @@ Implementation note: pydantic-settings does not support walk-up discovery for cu
 Install:    uv tool install code-atlas     (or: pip install code-atlas)
                     │
                     ▼
-Infra:      docker compose up -d           (Memgraph + TEI + Valkey)
+Infra:      docker compose up -d           (Memgraph + Valkey; TEI optional via --profile tei)
                     │
                     ▼
 Config:     atlas.toml in project root     (optional — sensible defaults)
