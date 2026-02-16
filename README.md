@@ -86,45 +86,61 @@ Token counts measured from MCP JSON tool definitions (tiktoken cl100k_base). **S
 - [Docker](https://docs.docker.com/get-docker/) and Docker Compose
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
 
-### Installation
+### 1. Start infrastructure
+
+Download the compose file and start Memgraph + Valkey:
 
 ```bash
-# Clone the repository
-git clone https://github.com/SerPeter/code-atlas.git
-cd code-atlas
-
-# Start infrastructure (Memgraph + Valkey)
+curl -O https://raw.githubusercontent.com/SerPeter/code-atlas/main/docker-compose.yml
 docker compose up -d
-
-# Optional: start with local embeddings (TEI)
-docker compose --profile tei up -d
-
-# Install code-atlas
-uv sync
-
-# Index your project
-atlas index /path/to/your/project
-
-# Check status
-atlas status
 ```
 
-### MCP Integration
+Optional — add local embeddings (no API keys needed):
 
-Add to your Claude Code / Cursor MCP config:
+```bash
+docker compose --profile tei up -d
+```
+
+### 2. Index your project
+
+```bash
+uvx --from code-atlas-mcp atlas index /path/to/your/project
+uvx --from code-atlas-mcp atlas status
+```
+
+### 3. Connect to your AI agent
+
+**Claude Code:**
+
+```bash
+claude mcp add code-atlas -- uvx --from code-atlas-mcp atlas mcp
+```
+
+**Cursor / other MCP clients** — add to your MCP config:
 
 ```json
 {
   "mcpServers": {
     "code-atlas": {
-      "command": "atlas",
-      "args": ["mcp"]
+      "command": "uvx",
+      "args": ["--from", "code-atlas-mcp", "atlas", "mcp"]
     }
   }
 }
 ```
 
 See [CLI usage guide](docs/guides/usage.md) for more commands and options.
+
+### Development
+
+If you want to contribute or run from source:
+
+```bash
+git clone https://github.com/SerPeter/code-atlas.git
+cd code-atlas
+uv sync --group dev
+uv run pre-commit install
+```
 
 ## Performance
 
