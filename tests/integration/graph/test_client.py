@@ -330,7 +330,7 @@ async def test_write_and_search_embeddings(graph_client: GraphClient):
     # Write embedding (dimension must match vector index)
     dim = graph_client._dimension
     vector = [1.0] + [0.0] * (dim - 1)
-    await graph_client.write_embeddings([("proj.my_func", vector)])
+    await graph_client.write_embeddings([("vec:proj.my_func", vector)])
 
     # Search with same vector — should find our node with high similarity
     records = await graph_client.execute(
@@ -353,6 +353,7 @@ async def test_vector_search_scope_filter(graph_client: GraphClient):
     vector_b = [0.0, 1.0] + [0.0] * (dim - 2)
 
     for project, vec, name in [("alpha", vector_a, "func_a"), ("beta", vector_b, "func_b")]:
+        uid = f"{project}:{name}"
         await graph_client.execute_write(
             f"CREATE (:{NodeLabel.CALLABLE} {{"
             "  uid: $uid, project_name: $project, name: $name,"
@@ -360,14 +361,14 @@ async def test_vector_search_scope_filter(graph_client: GraphClient):
             "  content_hash: $hash"
             "})",
             {
-                "uid": f"{project}:{name}",
+                "uid": uid,
                 "project": project,
                 "name": name,
                 "qn": name,
                 "hash": f"h_{project}",
             },
         )
-        await graph_client.write_embeddings([(name, vec)])
+        await graph_client.write_embeddings([(uid, vec)])
 
     # Search both — should get two results
     records = await graph_client.execute(
@@ -393,15 +394,16 @@ async def test_vector_search_threshold(graph_client: GraphClient):
     vector_b = [0.0, 1.0] + [0.0] * (dim - 2)
 
     for name, vec in [("near", vector_a), ("far", vector_b)]:
+        uid = f"thresh:{name}"
         await graph_client.execute_write(
             f"CREATE (:{NodeLabel.CALLABLE} {{"
             "  uid: $uid, project_name: 'thresh', name: $name,"
             "  qualified_name: $qn, kind: 'function', file_path: 'f.py',"
             "  content_hash: $hash"
             "})",
-            {"uid": f"thresh:{name}", "name": name, "qn": name, "hash": f"h_{name}"},
+            {"uid": uid, "name": name, "qn": name, "hash": f"h_{name}"},
         )
-        await graph_client.write_embeddings([(name, vec)])
+        await graph_client.write_embeddings([(uid, vec)])
 
     # Search with vector_a — both results returned
     records = await graph_client.execute(
@@ -593,7 +595,7 @@ async def test_write_embed_hashes(graph_client: GraphClient):
         "})"
     )
 
-    await graph_client.write_embed_hashes([("proj.func", "deadbeef")])
+    await graph_client.write_embed_hashes([("eh:proj.func", "deadbeef")])
 
     records = await graph_client.execute("MATCH (n {qualified_name: 'proj.func'}) RETURN n.embed_hash AS hash")
     assert records[0]["hash"] == "deadbeef"
@@ -614,8 +616,9 @@ async def test_read_entity_texts_includes_embed_fields(graph_client: GraphClient
         {"emb": embedding},
     )
 
-    results = await graph_client.read_entity_texts(["proj.func"])
+    results = await graph_client.read_entity_texts(["ret:proj.func"])
     assert len(results) == 1
+    assert results[0]["uid"] == "ret:proj.func"
     assert results[0]["embed_hash"] == "abc"
     assert results[0]["embedding"] == embedding
 

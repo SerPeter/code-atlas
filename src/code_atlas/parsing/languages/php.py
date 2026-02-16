@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from tree_sitter import Node
 
 try:
-    import tree_sitter_php as ts_php
+    import tree_sitter_php as ts_php  # type: ignore[unresolved-import]
     from tree_sitter import Language, Query
 
     _PHP_LANGUAGE = Language(ts_php.language_php())

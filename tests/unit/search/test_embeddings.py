@@ -315,6 +315,7 @@ class TestTier3CacheLookup:
         graph.read_entity_texts = AsyncMock(
             return_value=[
                 {
+                    "uid": "foo.bar",
                     "qualified_name": "foo.bar",
                     "name": "bar",
                     "signature": "",
@@ -351,6 +352,7 @@ class TestTier3CacheLookup:
         graph.read_entity_texts = AsyncMock(
             return_value=[
                 {
+                    "uid": "foo.bar",
                     "qualified_name": "foo.bar",
                     "name": "bar",
                     "signature": "",
@@ -375,7 +377,7 @@ class TestTier3CacheLookup:
         graph.write_embeddings.assert_called_once()
         graph.write_embed_hashes.assert_called_once()
 
-        # Verify correct vector was written
+        # Verify correct vector was written (keyed by uid now)
         write_args = graph.write_embeddings.call_args[0][0]
         assert write_args[0] == ("foo.bar", cached_vec)
 
@@ -391,6 +393,7 @@ class TestTier3CacheLookup:
         graph.read_entity_texts = AsyncMock(
             return_value=[
                 {
+                    "uid": "foo.bar",
                     "qualified_name": "foo.bar",
                     "name": "bar",
                     "signature": "",
@@ -416,6 +419,6 @@ class TestTier3CacheLookup:
         graph.write_embeddings.assert_called_once()
         graph.write_embed_hashes.assert_called_once()
 
-        # Verify the API vector was written to graph
+        # Verify the API vector was written to graph (keyed by uid now)
         write_args = graph.write_embeddings.call_args[0][0]
         assert write_args[0] == ("foo.bar", api_vec)

@@ -493,18 +493,18 @@ class Tier3EmbedConsumer(TierConsumer):
             entity_props = await self.graph.read_entity_texts(qns)
 
             # 2. Build embed texts — graph-check for unchanged content
-            to_process: list[tuple[str, str, str]] = []  # (qn, text, text_hash)
+            to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
             graph_hits = 0
             for props in entity_props:
                 text = build_embed_text(props)
                 if not text:
                     continue
-                qn = props["qualified_name"]
+                uid = props["uid"]
                 text_hash = EmbedCache.hash_text(text)
                 if props.get("embed_hash") == text_hash and props.get("embedding") is not None:
                     graph_hits += 1
                 else:
-                    to_process.append((qn, text, text_hash))
+                    to_process.append((uid, text, text_hash))
 
             total = graph_hits + len(to_process)
             if not to_process:

@@ -26,7 +26,7 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 try:
-    import tree_sitter_rust as ts_rust
+    import tree_sitter_rust as ts_rust  # type: ignore[unresolved-import]
     from tree_sitter import Language, Query
 
     _RUST_LANGUAGE = Language(ts_rust.language())

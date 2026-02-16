@@ -936,49 +936,45 @@ class GraphClient:
             {"model": model, "dim": dimension},
         )
 
-    async def read_entity_texts(self, qualified_names: list[str]) -> list[dict[str, Any]]:
+    async def read_entity_texts(self, uids: list[str]) -> list[dict[str, Any]]:
         """Batch-read entity properties needed for embedding.
 
-        ``qualified_names`` may be either bare qualified names or full uids
-        (``project:qualified_name``).  The query matches on ``uid`` first,
-        falling back to ``qualified_name`` for backwards compatibility.
+        ``uids`` must be full uid strings (``project:qualified_name``).
 
-        Returns list of dicts with keys: ``qualified_name``, ``name``,
+        Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``kind``, ``_label``,
         ``embed_hash``, ``embedding``.
         """
         return await self.execute(
-            "UNWIND $qns AS qn "
-            "MATCH (n) WHERE n.uid = qn OR n.qualified_name = qn "
-            "RETURN n.qualified_name AS qualified_name, n.name AS name, "
+            "UNWIND $uids AS u "
+            "MATCH (n) WHERE n.uid = u "
+            "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
             "n.source AS source, "
             "n.kind AS kind, labels(n)[0] AS _label, "
             "n.embed_hash AS embed_hash, n.embedding AS embedding",
-            {"qns": qualified_names},
+            {"uids": uids},
         )
 
     async def write_embeddings(self, items: list[tuple[str, list[float]]], chunk_size: int = 50) -> None:
-        """Batch-write embedding vectors to nodes by uid or qualified_name."""
+        """Batch-write embedding vectors to nodes by uid."""
         if not items:
             return
         for i in range(0, len(items), chunk_size):
             chunk = items[i : i + chunk_size]
-            params = [{"qn": qn, "vector": vec} for qn, vec in chunk]
+            params = [{"uid": uid, "vector": vec} for uid, vec in chunk]
             await self.execute_write(
-                "UNWIND $items AS item MATCH (n) WHERE n.uid = item.qn OR n.qualified_name = item.qn "
-                "SET n.embedding = item.vector",
+                "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embedding = item.vector",
                 {"items": params},
             )
 
     async def write_embed_hashes(self, items: list[tuple[str, str]]) -> None:
-        """Batch-write embed_hash values to nodes by uid or qualified_name."""
+        """Batch-write embed_hash values to nodes by uid."""
         if not items:
             return
-        params = [{"qn": qn, "hash": h} for qn, h in items]
+        params = [{"uid": uid, "hash": h} for uid, h in items]
         await self.execute_write(
-            "UNWIND $items AS item MATCH (n) WHERE n.uid = item.qn OR n.qualified_name = item.qn "
-            "SET n.embed_hash = item.hash",
+            "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embed_hash = item.hash",
             {"items": params},
         )
 

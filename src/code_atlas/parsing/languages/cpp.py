@@ -29,7 +29,7 @@ _C_AVAILABLE = False
 _CPP_AVAILABLE = False
 
 try:
-    import tree_sitter_c as ts_c
+    import tree_sitter_c as ts_c  # type: ignore[unresolved-import]
     from tree_sitter import Language, Query
 
     _C_LANGUAGE = Language(ts_c.language())
@@ -39,7 +39,7 @@ except ImportError:
     _log.debug("tree-sitter-c not installed — C language support disabled")
 
 try:
-    import tree_sitter_cpp as ts_cpp
+    import tree_sitter_cpp as ts_cpp  # type: ignore[unresolved-import]
     from tree_sitter import Language, Query
 
     _CPP_LANGUAGE = Language(ts_cpp.language())
