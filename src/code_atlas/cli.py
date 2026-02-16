@@ -11,7 +11,8 @@ import typer
 from dotenv import find_dotenv, load_dotenv
 from loguru import logger
 
-load_dotenv(find_dotenv(usecwd=True))  # Load .env into os.environ (ATLAS_* + provider API keys)
+_dotenv_path = find_dotenv(usecwd=True)  # '' when not found
+load_dotenv(_dotenv_path)  # Load .env into os.environ (ATLAS_* + provider API keys)
 
 app = typer.Typer(
     name="atlas",
@@ -521,7 +522,7 @@ async def _run_health() -> None:
     from code_atlas.settings import AtlasSettings
 
     settings = AtlasSettings()
-    report = await run_health_checks(settings)
+    report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=False)
     raise typer.Exit(code=0 if report.ok else 1)
 
@@ -531,7 +532,7 @@ async def _run_doctor() -> None:
     from code_atlas.settings import AtlasSettings
 
     settings = AtlasSettings()
-    report = await run_health_checks(settings)
+    report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=True)
     raise typer.Exit(code=0 if report.ok else 1)
 

@@ -13,7 +13,7 @@ from code_atlas.graph.client import GraphClient
 from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import SCHEMA_VERSION
 from code_atlas.search.embeddings import EmbedClient
-from code_atlas.settings import find_git_root
+from code_atlas.settings import _find_atlas_toml, find_git_root
 
 if TYPE_CHECKING:
     from code_atlas.settings import AtlasSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
@@ -178,8 +178,8 @@ async def check_valkey(redis_settings: RedisSettings) -> CheckResult:
         await bus.close()
 
 
-async def check_config(settings: AtlasSettings) -> CheckResult:
-    """Verify project root and git repo."""
+async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> CheckResult:
+    """Verify project root, git repo, and loaded config files."""
     name = "config"
     root = settings.project_root
 
@@ -191,17 +191,24 @@ async def check_config(settings: AtlasSettings) -> CheckResult:
             suggestion="Set project_root in atlas.toml or pass a valid path.",
         )
 
+    # Build detail string showing which config files were loaded
+    toml_path = _find_atlas_toml()
+    detail_parts: list[str] = []
+    detail_parts.append(f"atlas.toml: {toml_path or 'not found'}")
+    detail_parts.append(f".env: {dotenv_path or 'not found'}")
+    detail = " | ".join(detail_parts)
+
     git_root = find_git_root(root)
     if git_root is None:
         return CheckResult(
             name,
             CheckStatus.WARN,
             f"No git repo at {root}",
-            detail="Staleness checks and delta indexing require git.",
+            detail=f"Staleness checks and delta indexing require git. {detail}",
             suggestion="Run 'git init' or check project_root setting.",
         )
 
-    return CheckResult(name, CheckStatus.OK, f"Valid root: {root}")
+    return CheckResult(name, CheckStatus.OK, f"Valid root: {root}", detail=detail)
 
 
 async def check_embedding_model(graph: GraphClient, embed_settings: EmbeddingSettings) -> CheckResult:
@@ -285,6 +292,7 @@ async def run_health_checks(
     *,
     graph: GraphClient | None = None,
     embed: EmbedClient | None = None,
+    dotenv_path: str = "",
 ) -> HealthReport:
     """Run all health checks and return an aggregated report.
 
@@ -310,7 +318,7 @@ async def run_health_checks(
 
         # Phase 1: independent checks
         config_res, mg_res, embed_res, valkey_res = await asyncio.gather(
-            check_config(settings),
+            check_config(settings, dotenv_path=dotenv_path),
             check_memgraph(graph, settings.memgraph),
             check_embeddings(embed, settings.embeddings),
             check_valkey(settings.redis),
