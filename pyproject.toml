@@ -54,6 +54,7 @@ dependencies = [
     "numpy~=2.4",             # vector operations
     "redis[hiredis]~=7.1",    # async Redis/Valkey client for event bus
     "watchfiles~=1.0",        # Rust-based filesystem watcher
+    "python-dotenv~=1.1",     # Load .env files (API keys, ATLAS_* overrides)
 ]
 
 [project.optional-dependencies]

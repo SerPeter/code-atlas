@@ -8,10 +8,10 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import typer
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from loguru import logger
 
-load_dotenv()  # Load .env into os.environ (ATLAS_* + provider API keys)
+load_dotenv(find_dotenv(usecwd=True))  # Load .env into os.environ (ATLAS_* + provider API keys)
 
 app = typer.Typer(
     name="atlas",

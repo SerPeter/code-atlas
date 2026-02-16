@@ -132,7 +132,18 @@ async def check_embeddings(
     name = "embeddings"
     if not embed_settings.enabled:
         return CheckResult(name, CheckStatus.OK, "Disabled (lightweight mode)")
-    info = f"{embed_settings.provider} @ {embed_settings.base_url}"
+
+    # Provider-aware display and suggestions
+    if embed_settings.provider == "tei":
+        info = f"tei @ {embed_settings.base_url}"
+        suggestion = "docker compose --profile tei up -d"
+    elif embed_settings.provider == "ollama":
+        info = f"ollama @ {embed_settings.base_url}"
+        suggestion = "Start Ollama and pull the model: ollama pull " + embed_settings.model
+    else:
+        info = f"{embed_settings.provider} ({embed_settings.model})"
+        suggestion = "Check your API key in .env (e.g. OPENAI_API_KEY) and network connectivity."
+
     if embed is None:
         return CheckResult(name, CheckStatus.WARN, f"No client ({info})", suggestion="Check embedding settings.")
 
@@ -140,20 +151,9 @@ async def check_embeddings(
         ok = await asyncio.wait_for(embed.health_check(), timeout=_CHECK_TIMEOUT)
         if ok:
             return CheckResult(name, CheckStatus.OK, f"Responding ({info})")
-        return CheckResult(
-            name,
-            CheckStatus.WARN,
-            f"Unreachable ({info})",
-            suggestion="docker compose up -d tei",
-        )
+        return CheckResult(name, CheckStatus.WARN, f"Unreachable ({info})", suggestion=suggestion)
     except Exception as exc:
-        return CheckResult(
-            name,
-            CheckStatus.WARN,
-            f"Unreachable ({info})",
-            detail=str(exc),
-            suggestion="docker compose up -d tei",
-        )
+        return CheckResult(name, CheckStatus.WARN, f"Unreachable ({info})", detail=str(exc), suggestion=suggestion)
 
 
 async def check_valkey(redis_settings: RedisSettings) -> CheckResult:
