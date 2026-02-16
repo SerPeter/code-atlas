@@ -25,6 +25,8 @@ from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from code_atlas.graph.client import GraphClient
     from code_atlas.settings import AtlasSettings, MonorepoSettings
 
@@ -827,7 +829,7 @@ async def _decide_delta_mode(
     ratio = len(all_affected) / len(current_file_set) if current_file_set else 1.0
 
     if ratio > settings.index.delta_threshold:
-        logger.info(
+        logger.debug(
             "Delta ratio {:.0%} exceeds threshold {:.0%} — falling back to full mode",
             ratio,
             settings.index.delta_threshold,
@@ -835,7 +837,7 @@ async def _decide_delta_mode(
         return _DeltaDecision("full", set(), set(), set())
 
     if all_affected:
-        logger.info(
+        logger.debug(
             "Delta mode: {} added, {} modified, {} deleted ({:.0%} of {} files)",
             len(files_added),
             len(files_modified),
@@ -844,7 +846,7 @@ async def _decide_delta_mode(
             len(current_file_set),
         )
     else:
-        logger.info("Delta mode: no changes detected")
+        logger.debug("Delta mode: no changes detected")
 
     return _DeltaDecision("delta", files_added, files_modified, files_deleted)
 
@@ -875,14 +877,14 @@ async def _publish_events(
                 Topic.FILE_CHANGED, FileChanged(path=fp, change_type="deleted", project_name=project_name)
             )
             published += 1
-        logger.info("Published {} FileChanged events (delta)", published)
+        logger.debug("Published {} FileChanged events (delta)", published)
         return published
 
     for file_path in files:
         await bus.publish(
             Topic.FILE_CHANGED, FileChanged(path=file_path, change_type="created", project_name=project_name)
         )
-    logger.info("Published {} FileChanged events (full)", len(files))
+    logger.debug("Published {} FileChanged events (full)", len(files))
     return len(files)
 
 
@@ -956,7 +958,7 @@ async def _index_project_inner(
 
     # 1. Scan files
     files = scan_files(project_root, settings, scope_paths=scope_paths)
-    logger.info("Scanned {} indexable files", len(files))
+    logger.debug("Scanned {} indexable files", len(files))
 
     if not files:
         return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=time.monotonic() - start)
@@ -970,7 +972,7 @@ async def _index_project_inner(
             cache = EmbedCache(settings.redis, settings.embeddings)
 
     if full_reindex:
-        logger.info("Full reindex: deleting existing data for '{}'", project_name)
+        logger.debug("Full reindex: deleting existing data for '{}'", project_name)
         await graph.delete_project_data(project_name)
         if cache is not None:
             await cache.clear()
@@ -987,7 +989,7 @@ async def _index_project_inner(
 
     # 4. Create Project + Package hierarchy
     pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
-    logger.info("Created {} package node(s)", pkg_count)
+    logger.debug("Created {} package node(s)", pkg_count)
 
     # 5. Publish FileChanged events
     published = await _publish_events(bus, decision.mode, files, decision, project_name=project_name)
@@ -1023,7 +1025,7 @@ async def _index_project_inner(
     duration = time.monotonic() - start
     delta_stats = _build_delta_stats(decision, t2stats) if decision.mode == "delta" else None
 
-    logger.info(
+    logger.debug(
         "Indexing complete ({}): {} files scanned, {} published, {} entities, {:.1f}s",
         decision.mode,
         len(files),
@@ -1052,6 +1054,7 @@ async def index_monorepo(
     scope_projects: list[str] | None = None,
     full_reindex: bool = False,
     drain_timeout_s: float = 600.0,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list[IndexResult]:
     """Index a monorepo: detect sub-projects, index each, resolve cross-project imports.
 
@@ -1061,6 +1064,9 @@ async def index_monorepo(
     3. Index each sub-project via ``index_project()`` with overridden root + name.
     4. Index root project (files not inside any sub-project).
     5. Resolve cross-project imports and create DEPENDS_ON edges.
+
+    If *on_progress* is provided, it is called after each sub-project finishes
+    with ``(project_name, current_1based, total)``.
     """
     with _tracer.start_as_current_span("index_monorepo"):
         return await _index_monorepo_inner(
@@ -1070,10 +1076,11 @@ async def index_monorepo(
             scope_projects=scope_projects,
             full_reindex=full_reindex,
             drain_timeout_s=drain_timeout_s,
+            on_progress=on_progress,
         )
 
 
-async def _index_monorepo_inner(
+async def _index_monorepo_inner(  # noqa: PLR0912
     settings: AtlasSettings,
     graph: GraphClient,
     bus: EventBus,
@@ -1081,6 +1088,7 @@ async def _index_monorepo_inner(
     scope_projects: list[str] | None = None,
     full_reindex: bool = False,
     drain_timeout_s: float = 600.0,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list[IndexResult]:
     """Inner implementation of index_monorepo."""
     project_root = Path(settings.project_root).resolve()
@@ -1107,12 +1115,22 @@ async def _index_monorepo_inner(
     # Compute the root name once — sub-projects are prefixed with it
     root_name = derive_project_name(project_root)
 
+    # Pre-scan root files to determine if there's a root project (needed for total count)
+    sub_paths = [sp.path for sp in sub_projects]
+    root_scope = FileScope(project_root, settings)
+    root_files = root_scope.scan()
+    root_only_files = [f for f in root_files if not any(f == sp or f.startswith(sp + "/") for sp in sub_paths)]
+    has_root = bool(root_only_files)
+    total = len(sub_projects) + (1 if has_root else 0)
+
     results: list[IndexResult] = []
 
     # Index each sub-project with prefixed name
-    for sub in sub_projects:
+    for i, sub in enumerate(sub_projects, 1):
         prefixed_name = f"{root_name}/{sub.name}"
-        logger.info("Indexing sub-project '{}' at {}", prefixed_name, sub.path)
+        logger.debug("Indexing sub-project '{}' at {}", prefixed_name, sub.path)
+        if on_progress is not None:
+            on_progress(prefixed_name, i - 1, total)
         result = await index_project(
             settings,
             graph,
@@ -1123,17 +1141,14 @@ async def _index_monorepo_inner(
             drain_timeout_s=drain_timeout_s,
         )
         results.append(result)
+        if on_progress is not None:
+            on_progress(prefixed_name, i, total)
 
     # Index root project (files not inside any sub-project)
-    sub_paths = [sp.path for sp in sub_projects]
-
-    # Scan root, then filter out files belonging to sub-projects
-    root_scope = FileScope(project_root, settings)
-    root_files = root_scope.scan()
-    root_only_files = [f for f in root_files if not any(f == sp or f.startswith(sp + "/") for sp in sub_paths)]
-
     if root_only_files:
-        logger.info("Indexing root project '{}' ({} file(s) outside sub-projects)", root_name, len(root_only_files))
+        logger.debug("Indexing root project '{}' ({} file(s) outside sub-projects)", root_name, len(root_only_files))
+        if on_progress is not None:
+            on_progress(root_name, total - 1, total)
         result = await _index_root_project(
             settings,
             graph,
@@ -1145,6 +1160,8 @@ async def _index_monorepo_inner(
             drain_timeout_s=drain_timeout_s,
         )
         results.append(result)
+        if on_progress is not None:
+            on_progress(root_name, total, total)
 
     # Cross-project import resolution
     all_project_names = [f"{root_name}/{sp.name}" for sp in sub_projects]
@@ -1195,7 +1212,7 @@ async def _index_root_project(
     decision = _DeltaDecision("full", set(), set(), set())
 
     pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
-    logger.info("Root project: created {} package node(s)", pkg_count)
+    logger.debug("Root project: created {} package node(s)", pkg_count)
 
     published = await _publish_events(bus, decision.mode, files, decision, project_name=project_name)
 

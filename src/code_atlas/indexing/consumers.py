@@ -103,7 +103,7 @@ class TierConsumer(ABC):
     async def run(self) -> None:
         """Main consumer loop — runs until ``stop()`` is called."""
         await self.bus.ensure_group(self.input_topic, self.group)
-        logger.info("{} started (group={}, topic={})", self.consumer_name, self.group, self.input_topic.value)
+        logger.debug("{} started (group={}, topic={})", self.consumer_name, self.group, self.input_topic.value)
 
         pending: dict[str, tuple[bytes, Event]] = {}  # dedup_key → (msg_id, event)
         window_start: float | None = None
@@ -153,7 +153,7 @@ class TierConsumer(ABC):
             pending.clear()
             window_start = None
 
-        logger.info("{} stopped", self.consumer_name)
+        logger.debug("{} stopped", self.consumer_name)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ class Tier1GraphConsumer(TierConsumer):
                 if isinstance(e, FileChanged) and e.project_name:
                     project_name = e.project_name
                     break
-            logger.info("Tier1 batch {}: {} file(s)", batch_id, len(paths))
+            logger.debug("Tier1 batch {}: {} file(s)", batch_id, len(paths))
 
             # TODO: Update Memgraph file nodes (timestamps, staleness flags)
 
@@ -359,7 +359,7 @@ class Tier2ASTConsumer(TierConsumer):
                         event_project_name = e.project_name
             unique_paths = list(dict.fromkeys(all_paths))
 
-            logger.info("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
+            logger.debug("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
             project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
             changed_entity_refs: list[EntityRef] = []
@@ -389,7 +389,7 @@ class Tier2ASTConsumer(TierConsumer):
             span.set_attribute("files_count", len(unique_paths))
             span.set_attribute("entities_changed", total_changed)
 
-            logger.info(
+            logger.debug(
                 "Tier2 batch {}: {} files, {} skipped, {} entities changed",
                 batch_id,
                 len(unique_paths),
@@ -481,7 +481,7 @@ class Tier3EmbedConsumer(TierConsumer):
                         seen[entity.qualified_name] = entity
 
             entities = list(seen.values())
-            logger.info("Tier3 batch {}: {} unique entity(ies)", batch_id, len(entities))
+            logger.debug("Tier3 batch {}: {} unique entity(ies)", batch_id, len(entities))
 
             if not entities:
                 return
@@ -509,7 +509,7 @@ class Tier3EmbedConsumer(TierConsumer):
             total = graph_hits + len(to_process)
             if not to_process:
                 elapsed = asyncio.get_event_loop().time() - t0
-                logger.info(
+                logger.debug(
                     "Tier3 batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
                     batch_id,
                     total,
@@ -536,7 +536,7 @@ class Tier3EmbedConsumer(TierConsumer):
 
             get_metrics().embedding_latency.record(elapsed)
 
-            logger.info(
+            logger.debug(
                 "Tier3 batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
                 batch_id,
                 total,

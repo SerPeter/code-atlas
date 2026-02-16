@@ -190,7 +190,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
 
     from code_atlas.events import EventBus
     from code_atlas.graph.client import GraphClient
-    from code_atlas.indexing.orchestrator import detect_sub_projects, index_monorepo, index_project
+    from code_atlas.indexing.orchestrator import detect_sub_projects
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -222,7 +222,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             resolved_dim = None
         if resolved_dim is not None:
             settings.embeddings.dimension = resolved_dim
-            logger.info("Auto-detected embedding dimension: {}", resolved_dim)
+            logger.debug("Auto-detected embedding dimension: {}", resolved_dim)
 
     if not settings.embeddings.enabled:
         logger.info("Lightweight mode: embeddings disabled, using graph + BM25 only")
@@ -245,12 +245,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         is_monorepo = bool(sub_projects) or bool(projects)
 
         if is_monorepo:
-            results = await index_monorepo(
-                settings,
-                graph,
-                bus,
-                scope_projects=projects,
-                full_reindex=full_reindex,
+            results = await _index_monorepo_with_progress(
+                settings, graph, bus, projects=projects, full_reindex=full_reindex
             )
             total_files = sum(r.files_scanned for r in results)
             total_entities = sum(r.entities_total for r in results)
@@ -266,28 +262,21 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                 )
             else:
                 logger.info(
-                    "Monorepo indexing complete — {} sub-project(s), {} files, {} entities, {:.1f}s total",
+                    "Done — {} projects, {} files, {} entities in {:.1f}s",
                     len(results),
                     total_files,
                     total_entities,
                     total_duration,
                 )
         else:
-            result = await index_project(
-                settings,
-                graph,
-                bus,
-                scope_paths=scope or None,
-                full_reindex=full_reindex,
-            )
+            result = await _index_single_with_spinner(settings, graph, bus, scope=scope, full_reindex=full_reindex)
             if _output.json:
                 _json_output(asdict(result))
             else:
                 logger.info(
-                    "Done ({}) — {} files scanned, {} published, {} entities in {:.1f}s",
+                    "Done ({}) — {} files, {} entities in {:.1f}s",
                     result.mode,
                     result.files_scanned,
-                    result.files_published,
                     result.entities_total,
                     result.duration_s,
                 )
@@ -307,6 +296,88 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         await graph.close()
         await bus.close()
         shutdown_telemetry()
+
+
+async def _index_monorepo_with_progress(
+    settings: Any,
+    graph: Any,
+    bus: Any,
+    *,
+    projects: list[str] | None,
+    full_reindex: bool,
+) -> list[Any]:
+    """Run monorepo indexing with a Rich progress bar (unless --json or --quiet)."""
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+    from code_atlas.indexing.orchestrator import IndexResult, index_monorepo
+
+    show_progress = not _output.json and not _output.quiet
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        disable=not show_progress,
+        console=_make_stderr_console(),
+    ) as progress:
+        task = progress.add_task("Indexing", total=None)
+
+        def on_progress(name: str, current: int, total: int) -> None:
+            progress.update(task, total=total, completed=current, description=name)
+
+        results: list[IndexResult] = await index_monorepo(
+            settings,
+            graph,
+            bus,
+            scope_projects=projects,
+            full_reindex=full_reindex,
+            on_progress=on_progress,
+        )
+
+    return results
+
+
+async def _index_single_with_spinner(
+    settings: Any,
+    graph: Any,
+    bus: Any,
+    *,
+    scope: list[str] | None,
+    full_reindex: bool,
+) -> Any:
+    """Run single-project indexing with a Rich spinner (unless --json or --quiet)."""
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+    from code_atlas.indexing.orchestrator import index_project
+
+    show_progress = not _output.json and not _output.quiet
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        TimeElapsedColumn(),
+        disable=not show_progress,
+        console=_make_stderr_console(),
+    ) as progress:
+        progress.add_task("Indexing...", total=None)
+        result = await index_project(
+            settings,
+            graph,
+            bus,
+            scope_paths=scope or None,
+            full_reindex=full_reindex,
+        )
+
+    return result  # noqa: RET504
+
+
+def _make_stderr_console() -> Any:
+    """Create a Rich Console that writes to stderr (so stdout stays clean for --json)."""
+    from rich.console import Console
+
+    return Console(stderr=True, no_color=_output.no_color)
 
 
 async def _run_search(  # noqa: PLR0912, PLR0915
