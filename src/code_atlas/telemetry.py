@@ -226,11 +226,11 @@ def shutdown_telemetry() -> None:
 
     tp = _otel_trace.get_tracer_provider()
     if hasattr(tp, "shutdown"):
-        tp.shutdown()  # runtime hasattr guard
+        tp.shutdown()  # type: ignore[call-non-callable]  # runtime hasattr guard
 
     mp = _otel_metrics.get_meter_provider()
     if hasattr(mp, "shutdown"):
-        mp.shutdown()  # runtime hasattr guard
+        mp.shutdown()  # type: ignore[call-non-callable]  # runtime hasattr guard
 
     _initialized = False
     _enabled = False

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from tree_sitter import Node
 
 try:
-    import tree_sitter_ruby as ts_ruby  # type: ignore[unresolved-import]
+    import tree_sitter_ruby as ts_ruby
     from tree_sitter import Language, Query
 
     _RUBY_LANGUAGE = Language(ts_ruby.language())

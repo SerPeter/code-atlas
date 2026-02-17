@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 try:
-    import tree_sitter_go as ts_go  # type: ignore[unresolved-import]
+    import tree_sitter_go as ts_go
     from tree_sitter import Language, Query
 
     _GO_LANGUAGE = Language(ts_go.language())

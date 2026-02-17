@@ -1092,7 +1092,7 @@ def _parse_typescript(
 # ---------------------------------------------------------------------------
 
 try:
-    import tree_sitter_typescript as _ts_ts  # type: ignore[unresolved-import]
+    import tree_sitter_typescript as _ts_ts
     from tree_sitter import Language, Query
 
     _TS_LANGUAGE = Language(_ts_ts.language_typescript())
@@ -1111,7 +1111,7 @@ except ImportError:
     pass
 
 try:
-    import tree_sitter_javascript as _ts_js  # type: ignore[unresolved-import]
+    import tree_sitter_javascript as _ts_js
     from tree_sitter import Language as _Language
     from tree_sitter import Query as _Query
 

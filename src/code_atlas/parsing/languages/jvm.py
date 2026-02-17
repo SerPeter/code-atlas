@@ -1331,7 +1331,7 @@ def _process_csharp_enum_member(
 # ---------------------------------------------------------------------------
 
 try:
-    import tree_sitter_java as ts_java  # type: ignore[unresolved-import]
+    import tree_sitter_java as ts_java
 
     _JAVA_LANGUAGE = Language(ts_java.language())
     _JAVA_QUERY = Query(_JAVA_LANGUAGE, _EMPTY_QUERY_SRC)
@@ -1349,7 +1349,7 @@ except ImportError:
     pass
 
 try:
-    import tree_sitter_c_sharp as ts_cs  # type: ignore[unresolved-import]
+    import tree_sitter_c_sharp as ts_cs
 
     _CS_LANGUAGE = Language(ts_cs.language())
     _CS_QUERY = Query(_CS_LANGUAGE, _EMPTY_CS_QUERY_SRC)
