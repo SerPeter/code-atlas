@@ -154,8 +154,10 @@ def watch(
 
 @app.command()
 def mcp(
-    transport: str = typer.Option("stdio", "--transport", "-t", help="Transport: stdio, streamable-http"),
-    strict: bool = typer.Option(False, "--strict", help="Refuse to start if embedding model mismatch."),
+    transport: str = typer.Option(None, "--transport", "-t", help="Transport: stdio, streamable-http."),
+    host: str = typer.Option(None, "--host", help="Bind address for HTTP transports (ignored for stdio)."),
+    port: int = typer.Option(None, "--port", "-p", help="Bind port for HTTP transports (ignored for stdio)."),
+    strict: bool = typer.Option(None, "--strict", help="Refuse to start if embedding model mismatch."),
 ) -> None:
     """Start the MCP server for AI agent connections."""
     from code_atlas.server.mcp import create_mcp_server
@@ -163,10 +165,17 @@ def mcp(
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = AtlasSettings()
+    # CLI args override settings (None = use settings default)
+    mcp_cfg = settings.mcp
+    transport = transport or mcp_cfg.transport
+    host = host or mcp_cfg.host
+    port = port or mcp_cfg.port
+    strict = strict if strict is not None else mcp_cfg.strict
+
     init_telemetry(settings.observability)
     try:
-        server = create_mcp_server(settings, strict=strict)
-        logger.info("Starting MCP server (transport={})", transport)
+        server = create_mcp_server(settings, strict=strict, host=host, port=port)
+        logger.info("Starting MCP server (transport={}, host={}, port={})", transport, host, port)
         server.run(transport=transport)  # type: ignore[arg-type]  # typer gives str, FastMCP expects Literal
     finally:
         shutdown_telemetry()

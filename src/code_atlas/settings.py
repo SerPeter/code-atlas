@@ -249,6 +249,15 @@ class WatcherSettings(BaseSettings):
     max_wait_s: float = Field(default=30.0, description="Max-wait ceiling in seconds (per batch).")
 
 
+class McpSettings(BaseSettings):
+    """MCP server settings."""
+
+    host: str = Field(default="127.0.0.1", description="Bind address for HTTP transports (ignored for stdio).")
+    port: int = Field(default=8000, description="Bind port for HTTP transports (ignored for stdio).")
+    transport: str = Field(default="stdio", description="Transport protocol: 'stdio' or 'streamable-http'.")
+    strict: bool = Field(default=False, description="Refuse to start if embedding model mismatch.")
+
+
 class RedisSettings(BaseSettings):
     """Redis/Valkey connection settings for event bus."""
 
@@ -295,4 +304,5 @@ class AtlasSettings(BaseSettings):
     watcher: WatcherSettings = Field(default_factory=WatcherSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)

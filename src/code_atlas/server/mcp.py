@@ -430,7 +430,13 @@ async def _enrich_with_calls(graph: GraphClient, results: list[dict[str, Any]], 
 # ---------------------------------------------------------------------------
 
 
-def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastMCP:  # noqa: PLR0915
+def create_mcp_server(  # noqa: PLR0915
+    settings: AtlasSettings,
+    *,
+    strict: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> FastMCP:
     """Create and configure the Code Atlas MCP server."""
 
     @asynccontextmanager
@@ -532,6 +538,8 @@ def create_mcp_server(settings: AtlasSettings, *, strict: bool = False) -> FastM
             "Use schema_info for Cypher examples, validate_cypher to check queries before running them. "
             "Call get_usage_guide('guidelines') for tips on structuring code for better search results."
         ),
+        host=host,
+        port=port,
         lifespan=app_lifespan,
     )
 

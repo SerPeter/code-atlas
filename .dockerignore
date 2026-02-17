@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.uv/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ty_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (pre-commit)
+node_modules/
+
+# Docker
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile
+.dockerignore
+
+# Git
+.git/
+.gitignore
+
+# Agent / local config
+.claude/
+.tasks/
+CLAUDE.md
+CLAUDE.local.md
+
+# Data / secrets
+data/
+.env
+.env.*
+atlas.local.toml
+
+# Tests (not needed in production image)
+tests/
