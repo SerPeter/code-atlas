@@ -10,6 +10,7 @@ from code_atlas.search.engine import (
     SearchResult,
     _apply_filters,
     _boost_results,
+    _is_doc_result,
     _is_generated_result,
     _is_stub_result,
     _is_test_result,
@@ -184,6 +185,30 @@ def _result(
         docstring="",
         labels=labels or ["Callable"],
         rrf_score=0.01,
+    )
+
+
+def _result_with_score(
+    *,
+    name: str = "func",
+    labels: list[str] | None = None,
+    rrf_score: float = 0.01,
+    visibility: str = "public",
+) -> SearchResult:
+    """SearchResult factory with explicit rrf_score for boost tests."""
+    return SearchResult(
+        uid=f"p:{name}",
+        name=name,
+        qualified_name=f"mod.{name}",
+        kind="function",
+        file_path="src/mod.py",
+        line_start=1,
+        line_end=5,
+        signature=f"def {name}():",
+        docstring="",
+        labels=labels or ["Callable"],
+        rrf_score=rrf_score,
+        visibility=visibility,
     )
 
 
@@ -411,6 +436,83 @@ class TestBoostResults:
         )
         boosted = _boost_results([public_low, private_high])
         assert boosted[0].uid == "p:mod._priv"
+
+    def test_label_boost_code_over_doc(self):
+        """At equal RRF score, a Callable should rank above a DocSection."""
+        code = _result_with_score(name="handler", labels=["Callable"], rrf_score=0.05)
+        doc = _result_with_score(name="readme_section", labels=["DocSection"], rrf_score=0.05)
+        boosted = _boost_results([doc, code])
+        assert boosted[0].uid == code.uid
+
+    def test_label_boost_high_scoring_doc_still_wins(self):
+        """A DocSection with much higher RRF score should still beat a low-scoring Callable."""
+        code = _result_with_score(name="minor", labels=["Callable"], rrf_score=0.01)
+        doc = _result_with_score(name="important_doc", labels=["DocSection"], rrf_score=0.10)
+        boosted = _boost_results([code, doc])
+        assert boosted[0].uid == doc.uid
+
+
+# ---------------------------------------------------------------------------
+# _is_doc_result predicate
+# ---------------------------------------------------------------------------
+
+
+class TestIsDocResult:
+    def test_doc_section(self):
+        assert _is_doc_result(_result(labels=["DocSection"]))
+
+    def test_doc_file(self):
+        assert _is_doc_result(_result(labels=["DocFile"]))
+
+    def test_callable_not_doc(self):
+        assert not _is_doc_result(_result(labels=["Callable"]))
+
+    def test_empty_labels(self):
+        assert not _is_doc_result(_result(labels=[]))
+
+
+# ---------------------------------------------------------------------------
+# code_only filter
+# ---------------------------------------------------------------------------
+
+
+class TestCodeOnlyFilter:
+    def _settings(self, **overrides: object) -> SearchSettings:
+        defaults: dict[str, object] = {
+            "test_filter": False,
+            "stub_filter": False,
+            "generated_filter": False,
+            "test_patterns": [],
+            "generated_patterns": [],
+        }
+        defaults.update(overrides)
+        return SearchSettings(**defaults)  # type: ignore[arg-type]
+
+    def test_code_only_excludes_doc_section(self):
+        results = [
+            _result(name="handler", labels=["Callable"]),
+            _result(name="readme", labels=["DocSection"]),
+        ]
+        filtered = _apply_filters(results, self._settings(), code_only=True)
+        assert len(filtered) == 1
+        assert filtered[0].name == "handler"
+
+    def test_code_only_excludes_doc_file(self):
+        results = [
+            _result(name="handler", labels=["Callable"]),
+            _result(name="changelog", labels=["DocFile"]),
+        ]
+        filtered = _apply_filters(results, self._settings(), code_only=True)
+        assert len(filtered) == 1
+        assert filtered[0].name == "handler"
+
+    def test_code_only_false_keeps_docs(self):
+        results = [
+            _result(name="handler", labels=["Callable"]),
+            _result(name="readme", labels=["DocSection"]),
+        ]
+        filtered = _apply_filters(results, self._settings(), code_only=False)
+        assert len(filtered) == 2
 
 
 # ---------------------------------------------------------------------------

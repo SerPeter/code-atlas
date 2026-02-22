@@ -868,6 +868,8 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "Primary search tool — fuses graph name-matching, BM25 keyword, and vector semantic "
             "search via Reciprocal Rank Fusion (RRF). Auto-adjusts weights by query shape. "
             "By default excludes test entities, .pyi stubs, and generated code. "
+            "Code entities (Callable, TypeDef, Module, Value) are boosted over documentation. "
+            "Set code_only=true to exclude DocSection/DocFile entirely. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, line_start, "
             "line_end, signature, docstring, visibility, _labels, rrf_score, sources}], "
             "count, truncated, query_ms}. "
@@ -902,6 +904,10 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         exclude_generated: Annotated[
             bool | None, Field(None, description="Exclude generated code. Default true.")
         ] = None,
+        code_only: Annotated[
+            bool,
+            Field(False, description="Exclude documentation entities (DocSection, DocFile). Return only code."),
+        ] = False,
         detail: Annotated[
             str,
             Field(
@@ -955,6 +961,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 exclude_tests=exclude_tests,
                 exclude_stubs=exclude_stubs,
                 exclude_generated=exclude_generated,
+                code_only=code_only,
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
