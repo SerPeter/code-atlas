@@ -54,7 +54,12 @@ def _configure_logger() -> None:
     else:
         level = "INFO"
 
-    logger.add(sys.stderr, level=level, colorize=False if _output.no_color else None)
+    if _output.verbose >= 1:
+        fmt = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}"
+    else:
+        fmt = "{time:HH:mm:ss.SSS} | {level:<8} | {message}"
+
+    logger.add(sys.stderr, level=level, colorize=False if _output.no_color else None, format=fmt)
 
 
 def _json_output(payload: dict[str, Any]) -> None:

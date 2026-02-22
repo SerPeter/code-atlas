@@ -31,6 +31,7 @@ class FileChanged:
     path: str
     change_type: str  # "created" | "modified" | "deleted"
     project_name: str = ""  # monorepo sub-project (empty = derive from settings)
+    project_root: str = ""  # absolute path to project root (monorepo sub-project roots differ)
     timestamp: float = field(default_factory=time.time)
 
 
@@ -49,6 +50,7 @@ class ASTDirty:
 
     paths: list[str]
     project_name: str = ""  # monorepo sub-project (forwarded from FileChanged)
+    project_root: str = ""  # absolute path to project root (forwarded from FileChanged)
     batch_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 

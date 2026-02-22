@@ -160,6 +160,7 @@ class EmbeddingSettings(BaseSettings):
     base_url: str = Field(default="http://localhost:8080", description="OpenAI-compatible embedding endpoint URL.")
     dimension: int | None = Field(default=None, description="Embedding vector dimension. Auto-detected when None.")
     batch_size: int = Field(default=32, description="Max texts per embedding API call.")
+    max_concurrency: int = Field(default=4, description="Max concurrent embedding API calls.")
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
     query_cache_size: int = Field(default=128, description="Max cached query embeddings (LRU eviction).")
     cache_ttl_days: int = Field(default=7, description="Embedding cache TTL in days. 0 disables Valkey caching.")

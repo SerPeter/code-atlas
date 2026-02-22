@@ -183,18 +183,24 @@ class Tier1GraphConsumer(TierConsumer):
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier1.process_batch", attributes={"batch_id": batch_id}):
             paths = [e.path for e in events if isinstance(e, FileChanged)]
-            # Forward project_name from FileChanged events (monorepo support)
+            # Forward project_name and project_root from FileChanged events (monorepo support)
             project_name = ""
+            project_root = ""
             for e in events:
-                if isinstance(e, FileChanged) and e.project_name:
-                    project_name = e.project_name
-                    break
+                if isinstance(e, FileChanged):
+                    if e.project_name and not project_name:
+                        project_name = e.project_name
+                    if e.project_root and not project_root:
+                        project_root = e.project_root
             logger.debug("Tier1 batch {}: {} file(s)", batch_id, len(paths))
 
             # TODO: Update Memgraph file nodes (timestamps, staleness flags)
 
             # Always publish downstream — Tier 2 decides significance
-            await self.bus.publish(Topic.AST_DIRTY, ASTDirty(paths=paths, project_name=project_name, batch_id=batch_id))
+            await self.bus.publish(
+                Topic.AST_DIRTY,
+                ASTDirty(paths=paths, project_name=project_name, project_root=project_root, batch_id=batch_id),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +271,16 @@ class Tier2ASTConsumer(TierConsumer):
         file_path: str,
         import_rels: list[ParsedRelationship],
         call_rels: list[ParsedRelationship],
+        *,
+        project_root: Path | None = None,
     ) -> tuple[set[str], list[EntityRef], Significance]:
         """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs, max_significance).
 
         Appends IMPORTS rels to *import_rels* and CALLS rels to *call_rels*
         for post-batch resolution.
         """
-        full_path = self._project_root / file_path
+        root = project_root if project_root is not None else self._project_root
+        full_path = root / file_path
         if not full_path.is_file():
             logger.debug("Tier2: file deleted, removing entities for {}", file_path)
             deleted = await self.graph.delete_file_entities(project_name, file_path)
@@ -350,18 +359,22 @@ class Tier2ASTConsumer(TierConsumer):
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
             all_paths: list[str] = []
-            # Collect project_name from ASTDirty events (forwarded from FileChanged)
+            # Collect project_name and project_root from ASTDirty events (forwarded from FileChanged)
             event_project_name = ""
+            event_project_root = ""
             for e in events:
                 if isinstance(e, ASTDirty):
                     all_paths.extend(e.paths)
-                    if e.project_name:
+                    if e.project_name and not event_project_name:
                         event_project_name = e.project_name
+                    if e.project_root and not event_project_root:
+                        event_project_root = e.project_root
             unique_paths = list(dict.fromkeys(all_paths))
 
             logger.debug("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
 
             project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
+            effective_root = Path(event_project_root) if event_project_root else None
             changed_entity_refs: list[EntityRef] = []
             all_import_rels: list[ParsedRelationship] = []
             all_call_rels: list[ParsedRelationship] = []
@@ -371,7 +384,7 @@ class Tier2ASTConsumer(TierConsumer):
 
             for file_path in unique_paths:
                 changed_qns, refs, file_sig = await self._process_file(
-                    project_name, file_path, all_import_rels, all_call_rels
+                    project_name, file_path, all_import_rels, all_call_rels, project_root=effective_root
                 )
                 total_changed += len(changed_qns)
                 changed_entity_refs.extend(refs)
