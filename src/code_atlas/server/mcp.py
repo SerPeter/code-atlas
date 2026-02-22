@@ -1245,19 +1245,20 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "Analyze repository structure, centrality, dependencies, or patterns. "
+            "Analyze repository structure, centrality, dependencies, patterns, or quality. "
             "Returns: {analysis, project, ...analysis-specific keys, query_ms}."
         ),
     )
     async def analyze_repo(
         analysis: Annotated[
-            Literal["structure", "centrality", "dependencies", "patterns"],
+            Literal["structure", "centrality", "dependencies", "patterns", "quality"],
             Field(
                 description=(
                     "Sub-analysis: structure (entity counts, packages, largest modules), "
                     "centrality (hub entities/modules, leaves), "
                     "dependencies (imports, cross-package coupling, circular deps), "
-                    "patterns (inheritance, enums, visibility, docstring coverage)."
+                    "patterns (inheritance, enums, visibility, docstring coverage), "
+                    "quality (health score, god modules, circular deps, tangled modules, coupling, instability)."
                 ),
             ),
         ],

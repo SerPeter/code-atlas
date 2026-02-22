@@ -575,6 +575,57 @@ class TestAnalyzeRepo:
         assert cov["documented"] < cov["total"]
         assert cov["percentage"] > 0
 
+    async def test_quality_health_score(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT)
+        assert result["analysis"] == "quality"
+        assert 0 <= result["health_score"] <= 100
+        assert "score_breakdown" in result
+        assert "query_ms" in result
+
+    async def test_quality_modularity(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT)
+        # models<->utils are intra-package (mypkg), api->models and api->utils are cross-package
+        assert 0 <= result["modularity_ratio"] <= 1.0
+
+    async def test_quality_circular_deps(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT)
+        assert result["circular_dependency_count"] >= 1
+        pair = {result["circular_dependencies"][0]["module_a"], result["circular_dependencies"][0]["module_b"]}
+        assert pair == {"mypkg.models", "mypkg.utils"}
+
+    async def test_quality_no_god_modules(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT)
+        # All seeded modules have <= 2 entities
+        assert result["god_modules"] == []
+
+    async def test_quality_coupling_stats(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT)
+        stats = result["coupling_stats"]
+        assert stats["max_fan_in"] >= 1
+        assert stats["max_fan_out"] >= 1
+        assert stats["avg_fan_in"] > 0
+        assert stats["avg_fan_out"] > 0
+
+    async def test_quality_instability(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT)
+        # api has fan_out=2, fan_in=0 → instability=1.0 (unstable)
+        unstable_mods = [m["module"] for m in result["instability"]["unstable"]]
+        assert "mypkg.sub.api" in unstable_mods
+
+    async def test_quality_worst_modules(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT)
+        # At least models/utils (circular) and api (unstable) should appear
+        assert len(result["worst_modules"]) >= 1
+        all_issues = set()
+        for m in result["worst_modules"]:
+            all_issues.update(m["issues"])
+        assert "circular_dependency" in all_issues or "unstable" in all_issues
+
+    async def test_quality_path_filter(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="quality", project=_PROJECT, path="mypkg/utils")
+        assert result["analysis"] == "quality"
+        assert 0 <= result["health_score"] <= 100
+
     async def test_path_filter(self, app_ctx, seeded_analysis_graph):
         result = await _invoke_tool(app_ctx, "analyze_repo", analysis="structure", project=_PROJECT, path="mypkg/utils")
         # Only entities under mypkg/utils.py
