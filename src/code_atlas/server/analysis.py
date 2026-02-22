@@ -19,8 +19,14 @@ if TYPE_CHECKING:
 
 _MERMAID_UNSAFE = re.compile(r"[^a-zA-Z0-9_]")
 
-_VALID_ANALYSES = frozenset({"structure", "centrality", "dependencies", "patterns"})
+_VALID_ANALYSES = frozenset({"structure", "centrality", "dependencies", "patterns", "quality"})
 _VALID_DIAGRAM_TYPES = frozenset({"packages", "imports", "inheritance", "module_detail"})
+
+# Quality analysis thresholds (v1 — hardcoded for medium Python projects)
+_GOD_MODULE_ENTITY_THRESHOLD = 30
+_TANGLED_FAN_THRESHOLD = 8
+_INSTABILITY_LOW = 0.1
+_INSTABILITY_HIGH = 0.9
 
 
 def _sid(name: str) -> str:
@@ -59,6 +65,7 @@ async def analyze_repo(
         "centrality": _analyze_centrality,
         "dependencies": _analyze_dependencies,
         "patterns": _analyze_patterns,
+        "quality": _analyze_quality,
     }
     return await dispatch[analysis](graph, project, path, limit)
 
@@ -446,6 +453,275 @@ async def _analyze_patterns(graph: GraphClient, project: str, path: str, limit: 
         ],
         "query_ms": round(elapsed, 1),
     }
+
+
+# ---------------------------------------------------------------------------
+# Quality (health score + spaghettification detection)
+# ---------------------------------------------------------------------------
+
+
+def _module_package(qn: str) -> str:
+    """Derive the parent package from a module qualified name."""
+    return qn.rsplit(".", 1)[0] if "." in qn else ""
+
+
+def _health_score(
+    modularity_ratio: float,
+    god_count: int,
+    circular_count: int,
+    tangled_count: int,
+    max_fan_in: int,
+    max_fan_out: int,
+    extreme_count: int,
+) -> tuple[int, dict[str, int]]:
+    """Compute a 0-100 composite health score from quality metrics."""
+    modularity_s = round(modularity_ratio * 100)
+    god_s = max(0, 100 - god_count * 20)
+    circular_s = max(0, 100 - circular_count * 15)
+    tangled_s = max(0, 100 - tangled_count * 20)
+    coupling_s = max(0, 100 - max(0, max_fan_in + max_fan_out - 10) * 5)
+    instability_s = max(0, 100 - extreme_count * 15)
+
+    score = round(
+        modularity_s * 0.25
+        + god_s * 0.20
+        + circular_s * 0.20
+        + tangled_s * 0.15
+        + coupling_s * 0.10
+        + instability_s * 0.10
+    )
+    breakdown = {
+        "modularity": modularity_s,
+        "god_modules": god_s,
+        "circular_deps": circular_s,
+        "tangled": tangled_s,
+        "coupling": coupling_s,
+        "instability": instability_s,
+    }
+    return score, breakdown
+
+
+def _compute_quality_flags(
+    all_modules: set[str],
+    entity_counts: dict[str, int],
+    file_paths: dict[str, str],
+    edge_weights: dict[tuple[str, str], int],
+    limit: int,
+) -> dict[str, Any]:
+    """Compute all quality metrics from pre-fetched graph data.
+
+    Returns the full result dict (minus ``analysis``, ``project``, ``query_ms``).
+    """
+    # Fan-in / fan-out per module
+    fan_out: dict[str, set[str]] = {}
+    fan_in: dict[str, set[str]] = {}
+    for from_mod, to_mod in edge_weights:
+        fan_out.setdefault(from_mod, set()).add(to_mod)
+        fan_in.setdefault(to_mod, set()).add(from_mod)
+
+    fo_counts = {m: len(fan_out.get(m, set())) for m in all_modules}
+    fi_counts = {m: len(fan_in.get(m, set())) for m in all_modules}
+
+    # Modularity ratio
+    intra, total = 0, 0
+    for (from_mod, to_mod), weight in edge_weights.items():
+        total += weight
+        if _module_package(from_mod) == _module_package(to_mod):
+            intra += weight
+    modularity_ratio = intra / total if total > 0 else 1.0
+
+    # God modules (full list for scoring, sliced for output)
+    god_modules_all = sorted(
+        [
+            {"module": m, "file_path": file_paths.get(m, ""), "entity_count": ec}
+            for m, ec in entity_counts.items()
+            if ec > _GOD_MODULE_ENTITY_THRESHOLD
+        ],
+        key=lambda x: x["entity_count"],
+        reverse=True,
+    )
+
+    # Circular dependencies
+    circular = _detect_circular(edge_weights)
+    circular_modules: set[str] = set()
+    for pair in circular:
+        circular_modules.add(pair["module_a"])
+        circular_modules.add(pair["module_b"])
+
+    # Tangled modules (full list for scoring, sliced for output)
+    tangled_all = sorted(
+        [
+            {"module": m, "file_path": file_paths.get(m, ""), "fan_in": fi_counts[m], "fan_out": fo_counts[m]}
+            for m in all_modules
+            if fi_counts[m] > _TANGLED_FAN_THRESHOLD and fo_counts[m] > _TANGLED_FAN_THRESHOLD
+        ],
+        key=lambda x: x["fan_in"] + x["fan_out"],
+        reverse=True,
+    )
+
+    # Coupling stats
+    fo_values = list(fo_counts.values()) if all_modules else []
+    fi_values = list(fi_counts.values()) if all_modules else []
+    max_fi = max(fi_values) if fi_values else 0
+    max_fo = max(fo_values) if fo_values else 0
+    coupling_stats = {
+        "avg_fan_in": round(sum(fi_values) / len(fi_values), 2) if fi_values else 0.0,
+        "max_fan_in": max_fi,
+        "avg_fan_out": round(sum(fo_values) / len(fo_values), 2) if fo_values else 0.0,
+        "max_fan_out": max_fo,
+    }
+
+    # Instability + extremes (full lists for scoring, sliced for output)
+    instabilities = _compute_instabilities(all_modules, fo_counts, fi_counts)
+    rigid_all = sorted(
+        [{"module": m, "instability": round(i, 3)} for m, i in instabilities.items() if i < _INSTABILITY_LOW],
+        key=lambda x: x["instability"],
+    )
+    unstable_all = sorted(
+        [{"module": m, "instability": round(i, 3)} for m, i in instabilities.items() if i > _INSTABILITY_HIGH],
+        key=lambda x: x["instability"],
+        reverse=True,
+    )
+
+    # Worst modules (aggregate flags)
+    worst_modules = _aggregate_worst_modules(
+        all_modules, entity_counts, file_paths, fo_counts, fi_counts, instabilities, circular_modules, limit
+    )
+
+    # Score uses full counts (not truncated lists) to avoid inflating the score
+    score, breakdown = _health_score(
+        modularity_ratio=modularity_ratio,
+        god_count=len(god_modules_all),
+        circular_count=len(circular),
+        tangled_count=len(tangled_all),
+        max_fan_in=max_fi,
+        max_fan_out=max_fo,
+        extreme_count=len(rigid_all) + len(unstable_all),
+    )
+
+    return {
+        "health_score": score,
+        "modularity_ratio": round(modularity_ratio, 3),
+        "god_modules": god_modules_all[:limit],
+        "circular_dependency_count": len(circular),
+        "circular_dependencies": circular[:limit],
+        "tangled_modules": tangled_all[:limit],
+        "coupling_stats": coupling_stats,
+        "instability": {"rigid": rigid_all[:limit], "unstable": unstable_all[:limit]},
+        "worst_modules": worst_modules,
+        "score_breakdown": breakdown,
+    }
+
+
+def _detect_circular(edge_weights: dict[tuple[str, str], int]) -> list[dict[str, str]]:
+    """Find mutually-importing module pairs."""
+    seen: set[tuple[str, str]] = set()
+    circular: list[dict[str, str]] = []
+    for from_mod, to_mod in edge_weights:
+        if (to_mod, from_mod) in edge_weights and from_mod < to_mod and (from_mod, to_mod) not in seen:
+            circular.append({"module_a": from_mod, "module_b": to_mod})
+            seen.add((from_mod, to_mod))
+    return circular
+
+
+def _compute_instabilities(modules: set[str], fo_counts: dict[str, int], fi_counts: dict[str, int]) -> dict[str, float]:
+    """Compute Martin's instability metric Ce/(Ca+Ce) per module."""
+    result: dict[str, float] = {}
+    for m in modules:
+        ce, ca = fo_counts[m], fi_counts[m]
+        result[m] = ce / (ca + ce) if (ca + ce) > 0 else 0.5
+    return result
+
+
+def _aggregate_worst_modules(
+    all_modules: set[str],
+    entity_counts: dict[str, int],
+    file_paths: dict[str, str],
+    fo_counts: dict[str, int],
+    fi_counts: dict[str, int],
+    instabilities: dict[str, float],
+    circular_modules: set[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Build the worst-modules list by aggregating per-module issue flags."""
+    issues: dict[str, list[str]] = {}
+    for m, ec in entity_counts.items():
+        if ec > _GOD_MODULE_ENTITY_THRESHOLD:
+            issues.setdefault(m, []).append("god_module")
+    for m in circular_modules:
+        issues.setdefault(m, []).append("circular_dependency")
+    for m in all_modules:
+        if fi_counts[m] > _TANGLED_FAN_THRESHOLD and fo_counts[m] > _TANGLED_FAN_THRESHOLD:
+            issues.setdefault(m, []).append("tangled")
+        if instabilities.get(m, 0.5) < _INSTABILITY_LOW:
+            issues.setdefault(m, []).append("rigid")
+        if instabilities.get(m, 0.5) > _INSTABILITY_HIGH:
+            issues.setdefault(m, []).append("unstable")
+    return sorted(
+        [
+            {
+                "module": m,
+                "file_path": file_paths.get(m, ""),
+                "issues": flags,
+                "fan_in": fi_counts.get(m, 0),
+                "fan_out": fo_counts.get(m, 0),
+                "entity_count": entity_counts.get(m, 0),
+                "instability": round(instabilities.get(m, 0.5), 3),
+            }
+            for m, flags in issues.items()
+        ],
+        key=lambda x: (len(x["issues"]), x["entity_count"]),
+        reverse=True,
+    )[:limit]
+
+
+async def _analyze_quality(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+    t0 = time.monotonic()
+    params: dict[str, Any] = {"project": project, "path": path}
+    pa_m = " AND m.file_path STARTS WITH $path" if path else ""
+    pa_m1 = " AND m1.file_path STARTS WITH $path" if path else ""
+
+    # Query 1: entity counts per module
+    entity_raw = await graph.execute(
+        "MATCH (m:Module {project_name: $project})-[:DEFINES]->(e) "
+        f"WHERE NOT e:Module{pa_m} "
+        "RETURN m.qualified_name AS module, m.file_path AS file_path, count(e) AS entity_count "
+        "ORDER BY entity_count DESC",
+        params,
+    )
+    entity_counts: dict[str, int] = {}
+    file_paths: dict[str, str] = {}
+    for r in entity_raw:
+        entity_counts[r["module"]] = r["entity_count"]
+        file_paths[r["module"]] = r["file_path"]
+
+    # Query 2 & 3: module-level import edges (reuse existing pattern)
+    direct_raw = await graph.execute(
+        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
+        "(m2:Module {project_name: $project}) "
+        f"WHERE m1 <> m2{pa_m1} "
+        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+        params,
+    )
+    indirect_raw = await graph.execute(
+        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
+        "<-[:DEFINES]-(m2:Module {project_name: $project}) "
+        f"WHERE m1 <> m2 AND NOT e:Module{pa_m1} "
+        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+        params,
+    )
+    edge_weights = _module_imports_from_records(direct_raw, indirect_raw)
+
+    # Collect all modules (including those with no edges)
+    all_modules: set[str] = set(entity_counts.keys())
+    for from_mod, to_mod in edge_weights:
+        all_modules.add(from_mod)
+        all_modules.add(to_mod)
+
+    metrics = _compute_quality_flags(all_modules, entity_counts, file_paths, edge_weights, limit)
+
+    elapsed = (time.monotonic() - t0) * 1000
+    return {"analysis": "quality", "project": project, **metrics, "query_ms": round(elapsed, 1)}
 
 
 # ---------------------------------------------------------------------------
