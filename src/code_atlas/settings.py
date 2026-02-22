@@ -109,11 +109,27 @@ def _find_atlas_toml() -> Path | None:
 
 
 class ScopeSettings(BaseSettings):
-    """File scope and ignore settings."""
+    """File scope and ignore settings (ruff-style include/exclude semantics)."""
 
-    include_paths: list[str] = Field(default_factory=list, description="Whitelist of paths to index (monorepo roots).")
-    exclude_patterns: list[str] = Field(
-        default_factory=list, description="Additional glob patterns to exclude beyond .gitignore."
+    paths: list[str] = Field(
+        default_factory=list,
+        description="Restrict indexing to these directory paths (monorepo scoping).",
+    )
+    include: list[str] | None = Field(
+        default=None,
+        description="File patterns to index. Overrides default language-based patterns when set.",
+    )
+    extend_include: list[str] = Field(
+        default_factory=list,
+        description="Additional file patterns to index, appended to defaults.",
+    )
+    exclude: list[str] | None = Field(
+        default=None,
+        description="Patterns to exclude from indexing. Overrides defaults when set.",
+    )
+    extend_exclude: list[str] = Field(
+        default_factory=list,
+        description="Additional patterns to exclude, appended to defaults.",
     )
 
 

@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from code_atlas.indexing.orchestrator import (
+    _DEFAULT_EXCLUDE,
+    _DEFAULT_INCLUDE,
     FileScope,
     StalenessChecker,
     _git_changed_files,
@@ -113,29 +115,29 @@ class TestScanFiles:
 
         assert result == ["src/app.py"]
 
-    def test_include_paths(self, tmp_path):
+    def test_scope_paths_via_settings(self, tmp_path):
         _write(tmp_path, "src/app.py", "x = 1")
         _write(tmp_path, "tests/test_app.py", "y = 2")
 
-        result = scan_files(tmp_path, _make_settings(tmp_path, include_paths=["src"]))
+        result = scan_files(tmp_path, _make_settings(tmp_path, paths=["src"]))
 
         assert result == ["src/app.py"]
 
     def test_exclude_before_include(self, tmp_path):
-        """Excluded files are NOT rescued by include paths."""
+        """Excluded files are NOT rescued by scope paths."""
         _write(tmp_path, ".atlasignore", "src/generated/\n")
         _write(tmp_path, "src/app.py", "x = 1")
         _write(tmp_path, "src/generated/out.py", "y = 2")
 
-        result = scan_files(tmp_path, _make_settings(tmp_path, include_paths=["src"]))
+        result = scan_files(tmp_path, _make_settings(tmp_path, paths=["src"]))
 
         assert result == ["src/app.py"]
 
-    def test_exclude_patterns_from_settings(self, tmp_path):
+    def test_extend_exclude_from_settings(self, tmp_path):
         _write(tmp_path, "app.py", "x = 1")
         _write(tmp_path, "tmp/scratch.py", "y = 2")
 
-        result = scan_files(tmp_path, _make_settings(tmp_path, exclude_patterns=["tmp/"]))
+        result = scan_files(tmp_path, _make_settings(tmp_path, extend_exclude=["tmp/"]))
 
         assert result == ["app.py"]
 
@@ -262,6 +264,75 @@ class TestScanFiles:
 
         assert "über/app.py" in result
         assert "日本語/lib.py" in result
+
+    def test_exclude_overrides_defaults(self, tmp_path):
+        """Setting exclude replaces _DEFAULT_EXCLUDE entirely."""
+        _write(tmp_path, "app.py", "x = 1")
+        # node_modules/ is in _DEFAULT_EXCLUDE but NOT in our custom exclude
+        _write(tmp_path, "node_modules/pkg/index.py", "y = 2")
+        # custom_skip/ is in our custom exclude
+        _write(tmp_path, "custom_skip/lib.py", "z = 3")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path, exclude=["custom_skip/", ".git/"]))
+
+        assert "app.py" in result
+        assert "node_modules/pkg/index.py" in result  # no longer excluded
+        assert "custom_skip/lib.py" not in result
+
+    def test_extend_exclude_appends_to_defaults(self, tmp_path):
+        """extend_exclude adds to defaults without replacing them."""
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "node_modules/pkg/index.py", "y = 2")  # default exclude
+        _write(tmp_path, "extra_skip/lib.py", "z = 3")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path, extend_exclude=["extra_skip/"]))
+
+        assert result == ["app.py"]
+
+    def test_include_restricts_files(self, tmp_path):
+        """Setting include restricts to only those patterns."""
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "lib.ts", "y = 2")
+        _write(tmp_path, "readme.md", "# Hello")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path, include=["*.py"]))
+
+        assert result == ["app.py"]
+
+    def test_extend_include_adds_patterns(self, tmp_path):
+        """extend_include adds to default include patterns."""
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "config.yaml", "key: val")
+
+        # .yaml is not in _DEFAULT_INCLUDE, but extend_include adds it
+        # config.yaml has no language parser so scan() won't return it,
+        # but is_included() should pass it through
+        scope = FileScope(tmp_path, _make_settings(tmp_path, extend_include=["*.yaml"]))
+        assert scope.is_included("config.yaml") is True
+        assert scope.is_included("app.py") is True
+
+    def test_default_include_covers_common_extensions(self, tmp_path):
+        """_DEFAULT_INCLUDE covers all common source extensions."""
+        expected_extensions = [".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".cs", ".rb", ".md"]
+        for ext in expected_extensions:
+            assert any(pat.endswith(ext) for pat in _DEFAULT_INCLUDE), f"{ext} missing from _DEFAULT_INCLUDE"
+
+    def test_gitignore_applied_with_custom_exclude(self, tmp_path):
+        """.gitignore still works when exclude overrides defaults."""
+        _write(tmp_path, ".gitignore", "secret/\n")
+        _write(tmp_path, "app.py", "x = 1")
+        _write(tmp_path, "secret/key.py", "y = 2")
+
+        # Custom exclude replaces defaults but .gitignore still applies
+        result = scan_files(tmp_path, _make_settings(tmp_path, exclude=[".git/"]))
+
+        assert result == ["app.py"]
+
+    def test_default_exclude_is_comprehensive(self, tmp_path):
+        """_DEFAULT_EXCLUDE covers all common build/cache/VCS directories."""
+        expected_dirs = [".git/", "node_modules/", "__pycache__/", ".venv/", "target/", "build/", "dist/"]
+        for pattern in expected_dirs:
+            assert pattern in _DEFAULT_EXCLUDE, f"{pattern} missing from _DEFAULT_EXCLUDE"
 
 
 # ---------------------------------------------------------------------------

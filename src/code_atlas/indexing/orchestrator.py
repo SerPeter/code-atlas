@@ -47,28 +47,100 @@ class DetectedProject:
     marker: str  # which marker file (or "explicit")
 
 
-_DEFAULT_EXCLUDES: list[str] = [
+_DEFAULT_EXCLUDE: list[str] = [
+    # Version control
     ".git/",
-    "node_modules/",
+    ".hg/",
+    ".svn/",
+    ".bzr/",
+    ".fossil/",
+    # IDE / editor
+    ".idea/",
+    ".vscode/",
+    ".vs/",
+    ".eclipse/",
+    # Python
     "__pycache__/",
     ".venv/",
     "venv/",
-    "vendor/",
-    "build/",
-    "dist/",
-    "target/",
-    ".tox/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    "site-packages/",
     ".eggs/",
     "*.pyc",
+    "*.pyo",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".pytest_cache/",
+    ".pytype/",
+    ".tox/",
+    ".nox/",
+    "site-packages/",
+    "__pypackages__/",
+    ".pdm-build/",
+    # JavaScript / TypeScript
+    "node_modules/",
+    "bower_components/",
+    ".next/",
+    ".nuxt/",
+    ".svelte-kit/",
+    # Rust
+    "target/",
+    # Java / JVM
+    ".gradle/",
+    # General build / dist
+    "build/",
+    "dist/",
+    "out/",
+    "vendor/",
+    # Environment / config
     ".env/",
+    ".direnv/",
+    # Caches
+    ".cache/",
+    ".parcel-cache/",
+    ".turbo/",
+    # Code Atlas
     ".atlas/",
 ]
 
+_DEFAULT_INCLUDE: list[str] = [
+    # Python
+    "*.py",
+    "*.pyi",
+    # TypeScript / JavaScript
+    "*.ts",
+    "*.tsx",
+    "*.js",
+    "*.jsx",
+    "*.mjs",
+    "*.cjs",
+    # Go
+    "*.go",
+    # Rust
+    "*.rs",
+    # C / C++
+    "*.c",
+    "*.h",
+    "*.cpp",
+    "*.cc",
+    "*.cxx",
+    "*.hpp",
+    "*.hxx",
+    "*.hh",
+    # Java
+    "*.java",
+    # C#
+    "*.cs",
+    # Ruby
+    "*.rb",
+    "*.rake",
+    "*.gemspec",
+    # PHP
+    "*.php",
+    # Markdown (documentation indexing)
+    "*.md",
+]
+
 # Directories to always skip during sub-project detection walk
-_DETECT_PRUNE_DIRS = frozenset(d.rstrip("/") for d in _DEFAULT_EXCLUDES if d.endswith("/"))
+_DETECT_PRUNE_DIRS = frozenset(d.rstrip("/") for d in _DEFAULT_EXCLUDE if d.endswith("/"))
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +288,10 @@ class FileScope:
     :meth:`is_included` method can be called independently (e.g. by a
     file watcher) without re-reading ignore files.
 
-    Exclusion order:
-      1. Default excludes (``.git/``, ``__pycache__/``, etc.)
-      2. Root ``.gitignore`` patterns
-      3. Root ``.atlasignore`` patterns
-      4. ``settings.scope.exclude_patterns``
-      5. Nested ``.gitignore`` files (discovered during :meth:`scan`)
-      6. Include-path prefix filter (if set)
+    Uses ruff-style include/exclude semantics:
+      - ``exclude`` replaces ``_DEFAULT_EXCLUDE``; ``extend_exclude`` appends.
+      - ``include`` replaces ``_DEFAULT_INCLUDE``; ``extend_include`` appends.
+      - ``.gitignore`` and ``.atlasignore`` always apply regardless of ``exclude``.
     """
 
     def __init__(
@@ -232,7 +301,8 @@ class FileScope:
         scope_paths: list[str] | None = None,
     ) -> None:
         self._root = Path(project_root).resolve()
-        self._global_spec = self._build_global_spec(settings)
+        self._exclude_spec = self._build_exclude_spec(settings)
+        self._include_spec = self._build_include_spec(settings)
         self._include_prefixes = self._build_include_prefixes(scope_paths, settings)
         # Nested gitignore specs populated during scan()
         self._nested_specs: dict[str, pathspec.PathSpec] = {}
@@ -290,9 +360,9 @@ class FileScope:
 
         Does **not** check language support — callers handle that separately.
         """
-        # 1. Global exclude
-        if self._global_spec.match_file(rel_path):
-            logger.trace("EXCLUDE {}: matched global pattern", rel_path)
+        # 1. Exclude spec (defaults or custom + .gitignore + .atlasignore)
+        if self._exclude_spec.match_file(rel_path):
+            logger.trace("EXCLUDE {}: matched exclude pattern", rel_path)
             return False
 
         # 2. Nested gitignore exclude
@@ -307,9 +377,14 @@ class FileScope:
                     logger.trace("EXCLUDE {}: matched nested .gitignore in {}/", rel_path, ancestor)
                     return False
 
-        # 3. Include-path prefix filter
+        # 3. Include spec (file-extension filter)
+        if self._include_spec is not None and not self._include_spec.match_file(rel_path):
+            logger.trace("EXCLUDE {}: not matched by include patterns", rel_path)
+            return False
+
+        # 4. Include-path prefix filter (monorepo scoping)
         if self._include_prefixes and not _matches_any_prefix(rel_path, self._include_prefixes):
-            logger.trace("EXCLUDE {}: not under any include path", rel_path)
+            logger.trace("EXCLUDE {}: not under any scope path", rel_path)
             return False
 
         logger.trace("INCLUDE {}", rel_path)
@@ -317,35 +392,41 @@ class FileScope:
 
     # -- private helpers -----------------------------------------------------
 
-    def _build_global_spec(self, settings: AtlasSettings) -> pathspec.PathSpec:
-        """Compile the global ignore spec from defaults, root ignore files, and settings."""
-        patterns: list[str] = list(_DEFAULT_EXCLUDES)
+    def _build_exclude_spec(self, settings: AtlasSettings) -> pathspec.PathSpec:
+        """Compile the exclude spec from defaults (or override), ignore files, and settings."""
+        base = list(settings.scope.exclude) if settings.scope.exclude is not None else list(_DEFAULT_EXCLUDE)
+        base.extend(settings.scope.extend_exclude)
 
+        # .gitignore and .atlasignore always applied regardless of exclude override
         gitignore = self._root / ".gitignore"
         if gitignore.is_file():
             gi_patterns = _read_ignore_file(gitignore)
-            patterns.extend(gi_patterns)
+            base.extend(gi_patterns)
             logger.debug("Loaded {} patterns from {}", len(gi_patterns), gitignore)
 
         atlasignore = self._root / ".atlasignore"
         if atlasignore.is_file():
             ai_patterns = _read_ignore_file(atlasignore)
-            patterns.extend(ai_patterns)
+            base.extend(ai_patterns)
             logger.debug("Loaded {} patterns from {}", len(ai_patterns), atlasignore)
 
-        patterns.extend(settings.scope.exclude_patterns)
+        return pathspec.PathSpec.from_lines("gitignore", base)
 
-        return pathspec.PathSpec.from_lines("gitignore", patterns)
+    def _build_include_spec(self, settings: AtlasSettings) -> pathspec.PathSpec | None:
+        """Compile include patterns into a PathSpec for file-extension filtering."""
+        base = list(settings.scope.include) if settings.scope.include is not None else list(_DEFAULT_INCLUDE)
+        base.extend(settings.scope.extend_include)
+        return pathspec.PathSpec.from_lines("gitignore", base) if base else None
 
     def _build_include_prefixes(self, scope_paths: list[str] | None, settings: AtlasSettings) -> list[str]:
-        """Normalise include paths to POSIX form."""
-        include_paths = scope_paths or settings.scope.include_paths or []
-        return [p.replace("\\", "/").rstrip("/") for p in include_paths]
+        """Normalise scope paths to POSIX form."""
+        paths = scope_paths or settings.scope.paths or []
+        return [p.replace("\\", "/").rstrip("/") for p in paths]
 
     def _is_dir_excluded(self, rel_dir: str) -> bool:
         """Check whether a directory should be pruned from the walk."""
         dir_pattern = f"{rel_dir}/"
-        if self._global_spec.match_file(dir_pattern):
+        if self._exclude_spec.match_file(dir_pattern):
             return True
 
         # Check nested gitignore specs
