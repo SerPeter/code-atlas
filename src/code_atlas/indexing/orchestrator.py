@@ -1176,7 +1176,6 @@ class _ProjectPublishResult:
     files_published: int
     mode: str  # "full" | "delta"
     decision: _DeltaDecision
-    start_time: float
 
 
 async def _publish_project(
@@ -1193,8 +1192,6 @@ async def _publish_project(
 
     Does NOT create consumers or wait for drain — callers manage the shared pipeline.
     """
-    start = time.monotonic()
-
     if full_reindex:
         logger.debug("Full reindex: deleting existing data for '{}'", project_name)
         await graph.delete_project_data(project_name)
@@ -1221,7 +1218,6 @@ async def _publish_project(
         files_published=published,
         mode=decision.mode,
         decision=decision,
-        start_time=start,
     )
 
 
@@ -1382,7 +1378,9 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             metadata["delta_files_deleted"] = len(pr.decision.files_deleted)
         await graph.update_project_metadata(pr.project_name, **metadata)
 
-        duration = time.monotonic() - pr.start_time
+        # Use shared start time — in monorepo mode all projects share one pipeline,
+        # so per-project publish timestamps don't reflect actual processing duration.
+        duration = time.monotonic() - start
         delta_stats = _build_delta_stats(pr.decision, tier2.stats) if pr.mode == "delta" else None
         results.append(
             IndexResult(

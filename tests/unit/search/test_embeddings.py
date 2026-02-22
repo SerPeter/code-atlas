@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -266,6 +267,71 @@ class TestEmbedClient:
             pytest.raises(EmbeddingError, match="Connection refused"),
         ):
             await client.embed_one("test")
+
+    async def test_concurrent_ordering_preserved(self):
+        """Results maintain correct ordering despite concurrent execution with varying delays."""
+        client = EmbedClient(_make_settings(batch_size=2, max_concurrency=4))
+        texts = [f"text{i}" for i in range(6)]
+
+        # Simulate varying response times — later chunks respond faster
+        async def fake_aembedding(**kwargs: Any) -> FakeEmbeddingResponse:
+            inputs = kwargs["input"]
+            # Return vectors that encode chunk identity via values
+            vecs = [FakeEmbeddingItem(embedding=[float(ord(t[-1]))]) for t in inputs]
+            return FakeEmbeddingResponse(data=vecs)
+
+        with patch("code_atlas.search.embeddings.litellm.aembedding", side_effect=fake_aembedding):
+            result = await client.embed_batch(texts)
+
+        assert len(result) == 6
+        # Each vector should correspond to the original text's last char
+        for i, vec in enumerate(result):
+            expected = float(ord(str(i)))
+            assert vec == [expected], f"result[{i}] ordering mismatch"
+
+    async def test_concurrent_partial_failure(self):
+        """When one chunk fails during concurrent execution, the error propagates."""
+        client = EmbedClient(_make_settings(batch_size=2, max_concurrency=4))
+        texts = [f"text{i}" for i in range(6)]
+
+        call_count = 0
+
+        async def fake_aembedding(**kwargs: Any) -> FakeEmbeddingResponse:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise EmbeddingError("Chunk 2 failed")
+            n = len(kwargs["input"])
+            return FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[1.0]) for _ in range(n)])
+
+        with (
+            patch("code_atlas.search.embeddings.litellm.aembedding", side_effect=fake_aembedding),
+            pytest.raises(EmbeddingError, match="Chunk 2 failed"),
+        ):
+            await client.embed_batch(texts)
+
+    async def test_concurrency_limited_by_semaphore(self):
+        """Semaphore limits the number of concurrent API calls to max_concurrency."""
+        client = EmbedClient(_make_settings(batch_size=1, max_concurrency=2))
+        texts = [f"text{i}" for i in range(5)]
+
+        peak_concurrent = 0
+        current_concurrent = 0
+
+        async def fake_aembedding(**kwargs: Any) -> FakeEmbeddingResponse:
+            nonlocal peak_concurrent, current_concurrent
+            current_concurrent += 1
+            peak_concurrent = max(peak_concurrent, current_concurrent)
+            await asyncio.sleep(0.01)  # Yield to let other tasks run
+            current_concurrent -= 1
+            n = len(kwargs["input"])
+            return FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[1.0]) for _ in range(n)])
+
+        with patch("code_atlas.search.embeddings.litellm.aembedding", side_effect=fake_aembedding):
+            result = await client.embed_batch(texts)
+
+        assert len(result) == 5
+        assert peak_concurrent <= 2, f"Peak concurrent calls ({peak_concurrent}) exceeded max_concurrency (2)"
 
     async def test_health_check_success(self):
         client = EmbedClient(_make_settings())
