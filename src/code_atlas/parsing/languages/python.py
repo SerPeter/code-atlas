@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import tree_sitter_python as tspython
 from tree_sitter import Language, Query
@@ -331,9 +331,45 @@ def _walk_python_node(
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
     enum_classes: set[str],
+    *,
+    in_type_checking: bool = False,
 ) -> None:
     """Recursively walk the parse tree to extract entities."""
     for child in node.children:
+        # Detect `if TYPE_CHECKING:` blocks and recurse with type_only flag
+        if child.type == "if_statement":
+            condition = child.child_by_field_name("condition")
+            if condition is not None and condition.type == "identifier" and node_text(condition) == "TYPE_CHECKING":
+                body = child.child_by_field_name("consequence")
+                if body is not None:
+                    _walk_python_node(
+                        body,
+                        path,
+                        source,
+                        project_name,
+                        module_qn,
+                        entities,
+                        relationships,
+                        seen,
+                        enum_classes,
+                        in_type_checking=True,
+                    )
+                # Also walk the else/elif branch (runtime code)
+                alternative = child.child_by_field_name("alternative")
+                if alternative is not None:
+                    _walk_python_node(
+                        alternative,
+                        path,
+                        source,
+                        project_name,
+                        module_qn,
+                        entities,
+                        relationships,
+                        seen,
+                        enum_classes,
+                    )
+                continue
+
         # Handle decorated definitions — extract the inner def/class
         if child.type == "decorated_definition":
             for inner in child.children:
@@ -350,7 +386,7 @@ def _walk_python_node(
             continue
 
         if child.type in ("import_statement", "import_from_statement"):
-            _process_import(child, project_name, module_qn, relationships)
+            _process_import(child, project_name, module_qn, relationships, type_only=in_type_checking)
             continue
 
         if child.type == "expression_statement":
@@ -359,7 +395,18 @@ def _walk_python_node(
 
         # Recurse into blocks (if, for, try, with, etc.) but not into functions/classes
         if child.type not in ("function_definition", "class_definition"):
-            _walk_python_node(child, path, source, project_name, module_qn, entities, relationships, seen, enum_classes)
+            _walk_python_node(
+                child,
+                path,
+                source,
+                project_name,
+                module_qn,
+                entities,
+                relationships,
+                seen,
+                enum_classes,
+                in_type_checking=in_type_checking,
+            )
 
 
 def _process_definition(
@@ -526,6 +573,9 @@ def _process_function(
         )
     )
 
+    # Extract USES_TYPE from parameter/return type annotations
+    _extract_type_refs(node, f"{project_name}:{qn}", relationships)
+
     # Walk function body for call sites
     body = node.child_by_field_name("body")
     if body is not None:
@@ -537,8 +587,11 @@ def _process_import(
     project_name: str,
     module_qn: str,
     relationships: list[ParsedRelationship],
+    *,
+    type_only: bool = False,
 ) -> None:
     """Process import_statement or import_from_statement."""
+    props: dict[str, Any] = {"type_only": True} if type_only else {}
     if node.type == "import_statement":
         for child in node.children:
             if child.type == "dotted_name":
@@ -548,6 +601,7 @@ def _process_import(
                         from_qualified_name=f"{project_name}:{module_qn}",
                         rel_type=RelType.IMPORTS,
                         to_name=import_name,
+                        properties=props,
                     )
                 )
             elif child.type == "aliased_import":
@@ -559,6 +613,7 @@ def _process_import(
                             from_qualified_name=f"{project_name}:{module_qn}",
                             rel_type=RelType.IMPORTS,
                             to_name=import_name,
+                            properties=props,
                         )
                     )
     elif node.type == "import_from_statement":
@@ -574,6 +629,7 @@ def _process_import(
                         from_qualified_name=f"{project_name}:{module_qn}",
                         rel_type=RelType.IMPORTS,
                         to_name=full_name,
+                        properties=props,
                     )
                 )
             elif child.type == "aliased_import":
@@ -586,6 +642,7 @@ def _process_import(
                             from_qualified_name=f"{project_name}:{module_qn}",
                             rel_type=RelType.IMPORTS,
                             to_name=full_name,
+                            properties=props,
                         )
                     )
 
@@ -676,6 +733,172 @@ def _extract_calls(
         # Recurse but don't descend into nested function/class definitions
         if child.type not in ("function_definition", "class_definition", "decorated_definition"):
             _extract_calls(child, source, from_qn, relationships)
+
+
+# ---------------------------------------------------------------------------
+# USES_TYPE extraction
+# ---------------------------------------------------------------------------
+
+_PYTHON_BUILTIN_TYPES: frozenset[str] = frozenset(
+    {
+        "int",
+        "str",
+        "float",
+        "bool",
+        "bytes",
+        "None",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "type",
+        "object",
+        "complex",
+        "frozenset",
+        "bytearray",
+        "memoryview",
+        "Any",
+    }
+)
+
+# Container types whose subscript arguments should be inspected for non-builtin refs
+_PYTHON_CONTAINER_TYPES: frozenset[str] = frozenset(
+    {
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "frozenset",
+        "List",
+        "Dict",
+        "Set",
+        "Tuple",
+        "FrozenSet",  # typing module aliases
+        "Optional",
+        "Union",
+        "Sequence",
+        "Mapping",
+        "Iterable",
+        "Iterator",
+        "Callable",
+        "ClassVar",
+        "Final",
+        "Literal",
+        "Annotated",
+        "Type",
+    }
+)
+
+
+def _collect_type_names_from_annotation(node: Node) -> list[str]:
+    """Extract non-builtin type names from a type annotation AST node.
+
+    Handles simple identifiers, attribute access (a.B → B), and subscript
+    types like Optional[Foo], list[Bar], Union[A, B].
+    """
+    names: list[str] = []
+    _walk_type_node(node, names)
+    return names
+
+
+def _walk_type_node(node: Node, names: list[str]) -> None:  # noqa: PLR0912
+    """Recursively walk a type annotation node to collect type names."""
+    if node.type == "identifier":
+        name = node_text(node)
+        if name not in _PYTHON_BUILTIN_TYPES and name not in _PYTHON_CONTAINER_TYPES:
+            names.append(name)
+    elif node.type == "attribute":
+        # e.g., module.ClassName — take the last attribute
+        attr = node.child_by_field_name("attribute")
+        if attr is not None:
+            name = node_text(attr)
+            if name not in _PYTHON_BUILTIN_TYPES and name not in _PYTHON_CONTAINER_TYPES:
+                names.append(name)
+    elif node.type == "subscript":
+        _walk_subscript_type(node, names)
+    elif node.type in ("binary_operator", "union_type"):
+        # X | Y syntax (Python 3.10+) or Union members
+        for child in node.children:
+            if child.type not in ("|", ","):
+                _walk_type_node(child, names)
+    elif node.type == "tuple":
+        # Multiple subscript args: dict[str, int], Union[A, B]
+        for child in node.children:
+            if child.type != ",":
+                _walk_type_node(child, names)
+    elif node.type == "string":
+        # Forward reference: "ClassName" — extract the string content
+        text = node_text(node).strip("'\"")
+        if text and text.isidentifier() and text not in _PYTHON_BUILTIN_TYPES:
+            names.append(text)
+    else:
+        for child in node.children:
+            _walk_type_node(child, names)
+
+
+def _walk_subscript_type(node: Node, names: list[str]) -> None:
+    """Handle subscript type nodes like Optional[Foo] or list[int]."""
+    value = node.child_by_field_name("value")
+    if value is not None:
+        # Resolve the terminal name for both identifiers and attributes (e.g. typing.Optional)
+        if value.type == "identifier":
+            value_name = node_text(value)
+        elif value.type == "attribute":
+            attr = value.child_by_field_name("attribute")
+            value_name = node_text(attr) if attr is not None else ""
+        else:
+            value_name = ""
+        if value_name in _PYTHON_BUILTIN_TYPES or value_name in _PYTHON_CONTAINER_TYPES:
+            # Builtin/container — descend into ALL type arguments.
+            # tree-sitter only tags the first arg as the "subscript" field;
+            # additional args (e.g. Dict[str, Result]) are unnamed siblings.
+            _syntax = frozenset({"[", "]", ","})
+            for child in node.children:
+                if child.id != value.id and child.type not in _syntax:
+                    _walk_type_node(child, names)
+        else:
+            # Non-builtin subscript (e.g., MyGeneric[T]) — emit the outer type
+            _walk_type_node(value, names)
+
+
+def _extract_type_refs(
+    node: Node,
+    from_qn: str,
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Extract USES_TYPE relationships from function parameter and return type annotations."""
+    seen_types: set[str] = set()
+
+    # Parameter type annotations
+    params = node.child_by_field_name("parameters")
+    if params is not None:
+        for param in params.children:
+            type_node = param.child_by_field_name("type")
+            if type_node is not None:
+                for name in _collect_type_names_from_annotation(type_node):
+                    if name not in seen_types:
+                        seen_types.add(name)
+                        relationships.append(
+                            ParsedRelationship(
+                                from_qualified_name=from_qn,
+                                rel_type=RelType.USES_TYPE,
+                                to_name=name,
+                            )
+                        )
+
+    # Return type annotation
+    return_type = node.child_by_field_name("return_type")
+    if return_type is not None:
+        for name in _collect_type_names_from_annotation(return_type):
+            if name not in seen_types:
+                seen_types.add(name)
+                relationships.append(
+                    ParsedRelationship(
+                        from_qualified_name=from_qn,
+                        rel_type=RelType.USES_TYPE,
+                        to_name=name,
+                    )
+                )
 
 
 # ---------------------------------------------------------------------------

@@ -932,3 +932,178 @@ def bar():
     assert "conditional" not in foo.tags
     bar = _entity_by_name(parsed, "bar")
     assert "conditional" not in bar.tags
+
+
+# ---------------------------------------------------------------------------
+# TYPE_CHECKING imports (type_only flag)
+# ---------------------------------------------------------------------------
+
+
+def test_type_checking_imports_marked_type_only():
+    """Imports inside `if TYPE_CHECKING:` blocks get type_only=True property."""
+    parsed = _parse(
+        """\
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from os.path import join
+    import sys
+"""
+    )
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    type_only_rels = [r for r in import_rels if r.properties.get("type_only")]
+    non_type_only_rels = [r for r in import_rels if not r.properties.get("type_only")]
+
+    type_only_names = {r.to_name for r in type_only_rels}
+    assert "os.path.join" in type_only_names
+    assert "sys" in type_only_names
+
+    # typing import should NOT be type_only
+    non_type_only_names = {r.to_name for r in non_type_only_rels}
+    assert "typing.TYPE_CHECKING" in non_type_only_names
+
+
+def test_regular_imports_not_type_only():
+    """Normal imports have no type_only property."""
+    parsed = _parse("import os\nfrom pathlib import Path\n")
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    for rel in import_rels:
+        assert not rel.properties.get("type_only"), f"Expected no type_only for {rel.to_name}"
+
+
+# ---------------------------------------------------------------------------
+# USES_TYPE extraction
+# ---------------------------------------------------------------------------
+
+
+def test_uses_type_from_function_params():
+    """Function with typed params emits USES_TYPE relationships."""
+    parsed = _parse(
+        """\
+def process(user: User, config: Config) -> None:
+    pass
+"""
+    )
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "User" in type_names
+    assert "Config" in type_names
+
+
+def test_uses_type_from_return_type():
+    """Function with return type emits USES_TYPE."""
+    parsed = _parse(
+        """\
+def get_user() -> UserModel:
+    pass
+"""
+    )
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "UserModel" in type_names
+
+
+def test_uses_type_skips_builtins():
+    """Built-in types like int, str, None don't produce USES_TYPE."""
+    parsed = _parse(
+        """\
+def add(x: int, y: str) -> bool:
+    pass
+"""
+    )
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    assert len(uses_type) == 0
+
+
+def test_uses_type_subscript_types():
+    """Optional[Foo] extracts Foo, list[int] is ignored."""
+    parsed = _parse(
+        """\
+def process(user: Optional[UserModel], items: list[int]) -> dict[str, Result]:
+    pass
+"""
+    )
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "UserModel" in type_names
+    assert "Result" in type_names
+    # Builtins should not appear
+    assert "int" not in type_names
+    assert "str" not in type_names
+    assert "list" not in type_names
+    assert "dict" not in type_names
+
+
+def test_uses_type_no_duplicates():
+    """Same type in params and return should only appear once per function."""
+    parsed = _parse(
+        """\
+def identity(x: Foo) -> Foo:
+    pass
+"""
+    )
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    assert len(uses_type) == 1
+    assert uses_type[0].to_name == "Foo"
+
+
+def test_uses_type_method():
+    """Methods inside classes also emit USES_TYPE."""
+    parsed = _parse(
+        """\
+class Service:
+    def handle(self, req: Request) -> Response:
+        pass
+"""
+    )
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "Request" in type_names
+    assert "Response" in type_names
+
+
+def test_type_checking_else_branch_indexed():
+    """Runtime code in the else branch of `if TYPE_CHECKING:` is still indexed."""
+    parsed = _parse(
+        """\
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from models import User
+else:
+    from stubs import UserStub
+
+def process(u: User) -> None:
+    pass
+"""
+    )
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    import_names = {r.to_name for r in import_rels}
+    # Both the TYPE_CHECKING import and the runtime else import should be captured
+    assert "models.User" in import_names
+    assert "stubs.UserStub" in import_names
+    # Only the TYPE_CHECKING import should be type_only
+    type_only = {r.to_name for r in import_rels if r.properties.get("type_only")}
+    non_type_only = {r.to_name for r in import_rels if not r.properties.get("type_only")}
+    assert "models.User" in type_only
+    assert "stubs.UserStub" in non_type_only
+
+
+def test_uses_type_typing_attribute_containers():
+    """typing.Optional[Foo] extracts Foo, not Optional."""
+    parsed = _parse(
+        """\
+import typing
+
+def process(user: typing.Optional[UserModel], items: typing.List[int]) -> typing.Dict[str, Result]:
+    pass
+"""
+    )
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "UserModel" in type_names
+    assert "Result" in type_names
+    # Container names should not appear
+    assert "Optional" not in type_names
+    assert "List" not in type_names
+    assert "Dict" not in type_names
