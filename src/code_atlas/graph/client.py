@@ -232,19 +232,19 @@ class GraphClient:
         stored = await self.get_schema_version()
 
         if stored is None:
-            logger.info("Fresh database — applying schema v{}", SCHEMA_VERSION)
+            logger.debug("Fresh database — applying schema v{}", SCHEMA_VERSION)
             await self._apply_full_schema()
             await self._set_schema_version(SCHEMA_VERSION)
-            logger.info("Schema v{} applied successfully", SCHEMA_VERSION)
+            logger.debug("Schema v{} applied successfully", SCHEMA_VERSION)
 
         elif stored == SCHEMA_VERSION:
             logger.debug("Schema v{} already current — no migration needed", SCHEMA_VERSION)
 
         elif stored < SCHEMA_VERSION:
-            logger.info("Migrating schema v{} → v{}", stored, SCHEMA_VERSION)
+            logger.debug("Migrating schema v{} → v{}", stored, SCHEMA_VERSION)
             await self._migrate_indices()
             await self._set_schema_version(SCHEMA_VERSION)
-            logger.info("Schema migrated to v{}", SCHEMA_VERSION)
+            logger.debug("Schema migrated to v{}", SCHEMA_VERSION)
 
         else:
             msg = (

@@ -29,7 +29,7 @@ app = typer.Typer(
 class OutputMode:
     quiet: bool = False
     json: bool = False
-    verbose: int = 0  # 0=normal, 1=debug, 2=trace
+    verbose: int = 0  # 0=warning, 1=info, 2=debug, 3=trace
     no_color: bool = False
 
 
@@ -46,20 +46,30 @@ def _configure_logger() -> None:
         return
 
     if _output.quiet:
-        level = "WARNING"
-    elif _output.verbose >= 2:
+        level = "ERROR"
+    elif _output.verbose >= 3:
         level = "TRACE"
-    elif _output.verbose >= 1:
+    elif _output.verbose >= 2:
         level = "DEBUG"
-    else:
+    elif _output.verbose >= 1:
         level = "INFO"
-
-    if _output.verbose >= 1:
-        fmt = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}"
     else:
+        level = "WARNING"
+
+    if _output.verbose >= 2:
+        fmt = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}"
+    elif _output.verbose >= 1:
         fmt = "{time:HH:mm:ss.SSS} | {level:<8} | {message}"
+    else:
+        fmt = "{message}"
 
     logger.add(sys.stderr, level=level, colorize=False if _output.no_color else None, format=fmt)
+
+
+def _echo(msg: str) -> None:
+    """Print a message to stderr (visible in default mode, suppressed by --json/--quiet)."""
+    if not _output.json and not _output.quiet:
+        typer.echo(msg, err=True)
 
 
 def _json_output(payload: dict[str, Any]) -> None:
@@ -73,7 +83,9 @@ def _json_output(payload: dict[str, Any]) -> None:
 def main(
     quiet: bool = typer.Option(False, "--quiet", "-q", envvar="ATLAS_QUIET", help="Suppress info output (CI mode)."),
     json_flag: bool = typer.Option(False, "--json", envvar="ATLAS_JSON", help="Machine-readable JSON output."),
-    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity (-v debug, -vv trace)."),
+    verbose: int = typer.Option(
+        0, "--verbose", "-v", count=True, help="Increase verbosity (-v info, -vv debug, -vvv trace)."
+    ),
     no_color: bool = typer.Option(False, "--no-color", envvar="NO_COLOR", help="Disable colored output."),
 ) -> None:
     """Code Atlas — map your codebase, search it three ways, feed it to agents."""
@@ -275,36 +287,25 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                     }
                 )
             else:
-                logger.info(
-                    "Done — {} projects, {} files, {} entities in {:.1f}s",
-                    len(results),
-                    total_files,
-                    total_entities,
-                    total_duration,
+                _echo(
+                    f"Done — {len(results)} projects, {total_files} files,"
+                    f" {total_entities} entities in {total_duration:.1f}s"
                 )
         else:
             result = await _index_single_with_spinner(settings, graph, bus, scope=scope, full_reindex=full_reindex)
             if _output.json:
                 _json_output(asdict(result))
             else:
-                logger.info(
-                    "Done ({}) — {} files, {} entities in {:.1f}s",
-                    result.mode,
-                    result.files_scanned,
-                    result.entities_total,
-                    result.duration_s,
+                _echo(
+                    f"Done ({result.mode}) — {result.files_scanned} files,"
+                    f" {result.entities_total} entities in {result.duration_s:.1f}s"
                 )
                 if result.delta_stats is not None:
                     ds = result.delta_stats
-                    logger.info(
-                        "Delta: files +{} ~{} -{} | entities +{} ~{} -{} ={} unchanged",
-                        ds.files_added,
-                        ds.files_modified,
-                        ds.files_deleted,
-                        ds.entities_added,
-                        ds.entities_modified,
-                        ds.entities_deleted,
-                        ds.entities_unchanged,
+                    _echo(
+                        f"Delta: files +{ds.files_added} ~{ds.files_modified} -{ds.files_deleted}"
+                        f" | entities +{ds.entities_added} ~{ds.entities_modified} -{ds.entities_deleted}"
+                        f" ={ds.entities_unchanged} unchanged"
                     )
     finally:
         await graph.close()
@@ -494,20 +495,13 @@ async def _run_search(  # noqa: PLR0912, PLR0915
             return
 
         if not results:
-            logger.info("No results found for '{}'", query)
+            _echo(f"No results found for '{query}'")
             return
         for i, r in enumerate(results, 1):
             sources = ", ".join(f"{ch}#{rank}" for ch, rank in r.sources.items())
             loc = f"{r.file_path}:{r.line_start}" if r.file_path and r.line_start else ""
-            logger.info(
-                "{}. {} ({}) — rrf={:.4f} [{}] {}",
-                i,
-                r.qualified_name or r.name,
-                r.kind or ", ".join(r.labels),
-                r.rrf_score,
-                sources,
-                loc,
-            )
+            kind = r.kind or ", ".join(r.labels)
+            _echo(f"{i}. {r.qualified_name or r.name} ({kind}) — rrf={r.rrf_score:.4f} [{sources}] {loc}")
 
         if info.stale:
             commit_str = info.last_indexed_commit[:8] if info.last_indexed_commit else "never"
@@ -570,7 +564,7 @@ async def _run_status() -> None:
             return
 
         if not projects:
-            logger.info("No indexed projects found.")
+            _echo("No indexed projects found.")
             return
 
         for row in projects:
@@ -584,14 +578,8 @@ async def _run_status() -> None:
             ts = datetime.datetime.fromtimestamp(last, tz=datetime.UTC).isoformat() if last else "never"
             deps = deps_by_project.get(name, [])
             deps_str = f" | depends_on: {', '.join(sorted(deps))}" if deps else ""
-            logger.info(
-                "Project: {} | indexed: {} | files: {} | entities: {} | git: {}{}",
-                name,
-                ts,
-                files,
-                entities,
-                git_hash,
-                deps_str,
+            _echo(
+                f"Project: {name} | indexed: {ts} | files: {files} | entities: {entities} | git: {git_hash}{deps_str}"
             )
     finally:
         await graph.close()
@@ -646,22 +634,26 @@ def _print_report(report: object, *, detailed: bool) -> None:
         )
         return
 
+    if _output.quiet:
+        return
+
     status_icon = {
-        CheckStatus.OK: "<green>\u2713</green>",
-        CheckStatus.WARN: "<yellow>!</yellow>",
-        CheckStatus.FAIL: "<red>\u2717</red>",
+        CheckStatus.OK: "[green]\u2713[/green]",
+        CheckStatus.WARN: "[yellow]![/yellow]",
+        CheckStatus.FAIL: "[red]\u2717[/red]",
     }
 
+    console = _make_stderr_console()
     for c in rpt.checks:
         icon = status_icon.get(c.status, "?")
-        logger.opt(colors=True).info("{} {:<20} {}", icon, c.name, c.message)
+        console.print(f"{icon} {c.name:<20} {c.message}")
         if detailed:
             if c.detail:
-                logger.info("    {}", c.detail)
+                console.print(f"    {c.detail}")
             if c.suggestion:
-                logger.opt(colors=True).info("    <dim>Suggestion: {}</dim>", c.suggestion)
+                console.print(f"    [dim]Suggestion: {c.suggestion}[/dim]")
 
-    logger.info("Completed in {:.0f}ms", rpt.elapsed_ms)
+    _echo(f"Completed in {rpt.elapsed_ms:.0f}ms")
 
 
 # ---------------------------------------------------------------------------

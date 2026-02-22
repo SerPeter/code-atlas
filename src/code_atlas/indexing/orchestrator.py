@@ -1321,9 +1321,9 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
     if len(all_project_names) > 1:
         rewired = await graph.resolve_cross_project_imports(all_project_names)
-        logger.info("Cross-project import resolution: {} imports rewired", rewired)
+        logger.debug("Cross-project import resolution: {} imports rewired", rewired)
         depends_count = await graph.create_depends_on_edges(all_project_names)
-        logger.info("Created {} DEPENDS_ON edge(s)", depends_count)
+        logger.debug("Created {} DEPENDS_ON edge(s)", depends_count)
 
     logger.debug("Monorepo indexing completed in {:.1f}s", time.monotonic() - start)
 
