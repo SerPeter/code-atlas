@@ -6,6 +6,7 @@ Uses litellm to route embedding requests to any OpenAI-compatible endpoint
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import struct
 from collections import OrderedDict
@@ -38,6 +39,7 @@ class EmbedClient:
     def __init__(self, settings: EmbeddingSettings) -> None:
         self._settings = settings
         self._batch_size = settings.batch_size
+        self._max_concurrency = settings.max_concurrency
         self._timeout = settings.timeout_s
         self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._query_cache_size = settings.query_cache_size
@@ -62,9 +64,25 @@ class EmbedClient:
             self._api_base = None
             self._api_key = None
 
+    def _build_kwargs(self, chunk: list[str]) -> dict[str, Any]:
+        """Build keyword arguments for a single litellm.aembedding call."""
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "input": chunk,
+            "timeout": self._timeout,
+        }
+        if self._api_base:
+            kwargs["api_base"] = self._api_base
+            # TEI rejects encoding_format=null; explicitly request floats
+            kwargs["encoding_format"] = "float"
+        if self._api_key:
+            kwargs["api_key"] = self._api_key
+        return kwargs
+
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of texts, chunking by ``batch_size``.
 
+        Fires chunks concurrently (up to ``max_concurrency``) for throughput.
         Returns a flat list of vectors in the same order as *texts*.
         Raises ``EmbeddingError`` on failure.
         """
@@ -74,32 +92,33 @@ class EmbedClient:
         with _tracer.start_as_current_span(
             "embed.embed_batch", attributes={"batch_size": len(texts), "model": self._model}
         ):
+            sem = asyncio.Semaphore(self._max_concurrency)
+
+            async def _do_chunk(chunk_idx: int, chunk: list[str]) -> tuple[int, list[list[float]]]:
+                async with sem:
+                    try:
+                        kwargs = self._build_kwargs(chunk)
+                        response = await litellm.aembedding(**kwargs)
+                    except Exception as exc:
+                        offset = chunk_idx * self._batch_size
+                        msg = f"Embedding failed for batch [{offset}:{offset + len(chunk)}]: {exc}"
+                        logger.error(msg)
+                        raise EmbeddingError(msg) from exc
+                    else:
+                        vectors = [
+                            item["embedding"] if isinstance(item, dict) else item.embedding for item in response.data
+                        ]
+                        return chunk_idx, vectors
+
+            tasks = [
+                _do_chunk(i, texts[i * self._batch_size : (i + 1) * self._batch_size])
+                for i in range((len(texts) + self._batch_size - 1) // self._batch_size)
+            ]
+            results = await asyncio.gather(*tasks)
+
             all_vectors: list[list[float]] = []
-            for i in range(0, len(texts), self._batch_size):
-                chunk = texts[i : i + self._batch_size]
-                try:
-                    kwargs: dict[str, Any] = {
-                        "model": self._model,
-                        "input": chunk,
-                        "timeout": self._timeout,
-                    }
-                    if self._api_base:
-                        kwargs["api_base"] = self._api_base
-                        # TEI rejects encoding_format=null; explicitly request floats
-                        kwargs["encoding_format"] = "float"
-                    if self._api_key:
-                        kwargs["api_key"] = self._api_key
-
-                    response = await litellm.aembedding(**kwargs)
-                    vectors = [
-                        item["embedding"] if isinstance(item, dict) else item.embedding for item in response.data
-                    ]
-                    all_vectors.extend(vectors)
-                except Exception as exc:
-                    msg = f"Embedding failed for batch [{i}:{i + len(chunk)}]: {exc}"
-                    logger.error(msg)
-                    raise EmbeddingError(msg) from exc
-
+            for _, vecs in sorted(results):
+                all_vectors.extend(vecs)
             return all_vectors
 
     async def embed_one(self, text: str) -> list[float]:

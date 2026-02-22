@@ -47,28 +47,100 @@ class DetectedProject:
     marker: str  # which marker file (or "explicit")
 
 
-_DEFAULT_EXCLUDES: list[str] = [
+_DEFAULT_EXCLUDE: list[str] = [
+    # Version control
     ".git/",
-    "node_modules/",
+    ".hg/",
+    ".svn/",
+    ".bzr/",
+    ".fossil/",
+    # IDE / editor
+    ".idea/",
+    ".vscode/",
+    ".vs/",
+    ".eclipse/",
+    # Python
     "__pycache__/",
     ".venv/",
     "venv/",
-    "vendor/",
-    "build/",
-    "dist/",
-    "target/",
-    ".tox/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    "site-packages/",
     ".eggs/",
     "*.pyc",
+    "*.pyo",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".pytest_cache/",
+    ".pytype/",
+    ".tox/",
+    ".nox/",
+    "site-packages/",
+    "__pypackages__/",
+    ".pdm-build/",
+    # JavaScript / TypeScript
+    "node_modules/",
+    "bower_components/",
+    ".next/",
+    ".nuxt/",
+    ".svelte-kit/",
+    # Rust
+    "target/",
+    # Java / JVM
+    ".gradle/",
+    # General build / dist
+    "build/",
+    "dist/",
+    "out/",
+    "vendor/",
+    # Environment / config
     ".env/",
+    ".direnv/",
+    # Caches
+    ".cache/",
+    ".parcel-cache/",
+    ".turbo/",
+    # Code Atlas
     ".atlas/",
 ]
 
+_DEFAULT_INCLUDE: list[str] = [
+    # Python
+    "*.py",
+    "*.pyi",
+    # TypeScript / JavaScript
+    "*.ts",
+    "*.tsx",
+    "*.js",
+    "*.jsx",
+    "*.mjs",
+    "*.cjs",
+    # Go
+    "*.go",
+    # Rust
+    "*.rs",
+    # C / C++
+    "*.c",
+    "*.h",
+    "*.cpp",
+    "*.cc",
+    "*.cxx",
+    "*.hpp",
+    "*.hxx",
+    "*.hh",
+    # Java
+    "*.java",
+    # C#
+    "*.cs",
+    # Ruby
+    "*.rb",
+    "*.rake",
+    "*.gemspec",
+    # PHP
+    "*.php",
+    # Markdown (documentation indexing)
+    "*.md",
+]
+
 # Directories to always skip during sub-project detection walk
-_DETECT_PRUNE_DIRS = frozenset(d.rstrip("/") for d in _DEFAULT_EXCLUDES if d.endswith("/"))
+_DETECT_PRUNE_DIRS = frozenset(d.rstrip("/") for d in _DEFAULT_EXCLUDE if d.endswith("/"))
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +288,10 @@ class FileScope:
     :meth:`is_included` method can be called independently (e.g. by a
     file watcher) without re-reading ignore files.
 
-    Exclusion order:
-      1. Default excludes (``.git/``, ``__pycache__/``, etc.)
-      2. Root ``.gitignore`` patterns
-      3. Root ``.atlasignore`` patterns
-      4. ``settings.scope.exclude_patterns``
-      5. Nested ``.gitignore`` files (discovered during :meth:`scan`)
-      6. Include-path prefix filter (if set)
+    Uses ruff-style include/exclude semantics:
+      - ``exclude`` replaces ``_DEFAULT_EXCLUDE``; ``extend_exclude`` appends.
+      - ``include`` replaces ``_DEFAULT_INCLUDE``; ``extend_include`` appends.
+      - ``.gitignore`` and ``.atlasignore`` always apply regardless of ``exclude``.
     """
 
     def __init__(
@@ -232,7 +301,8 @@ class FileScope:
         scope_paths: list[str] | None = None,
     ) -> None:
         self._root = Path(project_root).resolve()
-        self._global_spec = self._build_global_spec(settings)
+        self._exclude_spec = self._build_exclude_spec(settings)
+        self._include_spec = self._build_include_spec(settings)
         self._include_prefixes = self._build_include_prefixes(scope_paths, settings)
         # Nested gitignore specs populated during scan()
         self._nested_specs: dict[str, pathspec.PathSpec] = {}
@@ -290,9 +360,9 @@ class FileScope:
 
         Does **not** check language support — callers handle that separately.
         """
-        # 1. Global exclude
-        if self._global_spec.match_file(rel_path):
-            logger.trace("EXCLUDE {}: matched global pattern", rel_path)
+        # 1. Exclude spec (defaults or custom + .gitignore + .atlasignore)
+        if self._exclude_spec.match_file(rel_path):
+            logger.trace("EXCLUDE {}: matched exclude pattern", rel_path)
             return False
 
         # 2. Nested gitignore exclude
@@ -307,9 +377,14 @@ class FileScope:
                     logger.trace("EXCLUDE {}: matched nested .gitignore in {}/", rel_path, ancestor)
                     return False
 
-        # 3. Include-path prefix filter
+        # 3. Include spec (file-extension filter)
+        if self._include_spec is not None and not self._include_spec.match_file(rel_path):
+            logger.trace("EXCLUDE {}: not matched by include patterns", rel_path)
+            return False
+
+        # 4. Include-path prefix filter (monorepo scoping)
         if self._include_prefixes and not _matches_any_prefix(rel_path, self._include_prefixes):
-            logger.trace("EXCLUDE {}: not under any include path", rel_path)
+            logger.trace("EXCLUDE {}: not under any scope path", rel_path)
             return False
 
         logger.trace("INCLUDE {}", rel_path)
@@ -317,35 +392,41 @@ class FileScope:
 
     # -- private helpers -----------------------------------------------------
 
-    def _build_global_spec(self, settings: AtlasSettings) -> pathspec.PathSpec:
-        """Compile the global ignore spec from defaults, root ignore files, and settings."""
-        patterns: list[str] = list(_DEFAULT_EXCLUDES)
+    def _build_exclude_spec(self, settings: AtlasSettings) -> pathspec.PathSpec:
+        """Compile the exclude spec from defaults (or override), ignore files, and settings."""
+        base = list(settings.scope.exclude) if settings.scope.exclude is not None else list(_DEFAULT_EXCLUDE)
+        base.extend(settings.scope.extend_exclude)
 
+        # .gitignore and .atlasignore always applied regardless of exclude override
         gitignore = self._root / ".gitignore"
         if gitignore.is_file():
             gi_patterns = _read_ignore_file(gitignore)
-            patterns.extend(gi_patterns)
+            base.extend(gi_patterns)
             logger.debug("Loaded {} patterns from {}", len(gi_patterns), gitignore)
 
         atlasignore = self._root / ".atlasignore"
         if atlasignore.is_file():
             ai_patterns = _read_ignore_file(atlasignore)
-            patterns.extend(ai_patterns)
+            base.extend(ai_patterns)
             logger.debug("Loaded {} patterns from {}", len(ai_patterns), atlasignore)
 
-        patterns.extend(settings.scope.exclude_patterns)
+        return pathspec.PathSpec.from_lines("gitignore", base)
 
-        return pathspec.PathSpec.from_lines("gitignore", patterns)
+    def _build_include_spec(self, settings: AtlasSettings) -> pathspec.PathSpec | None:
+        """Compile include patterns into a PathSpec for file-extension filtering."""
+        base = list(settings.scope.include) if settings.scope.include is not None else list(_DEFAULT_INCLUDE)
+        base.extend(settings.scope.extend_include)
+        return pathspec.PathSpec.from_lines("gitignore", base) if base else None
 
     def _build_include_prefixes(self, scope_paths: list[str] | None, settings: AtlasSettings) -> list[str]:
-        """Normalise include paths to POSIX form."""
-        include_paths = scope_paths or settings.scope.include_paths or []
-        return [p.replace("\\", "/").rstrip("/") for p in include_paths]
+        """Normalise scope paths to POSIX form."""
+        paths = scope_paths or settings.scope.paths or []
+        return [p.replace("\\", "/").rstrip("/") for p in paths]
 
     def _is_dir_excluded(self, rel_dir: str) -> bool:
         """Check whether a directory should be pruned from the walk."""
         dir_pattern = f"{rel_dir}/"
-        if self._global_spec.match_file(dir_pattern):
+        if self._exclude_spec.match_file(dir_pattern):
             return True
 
         # Check nested gitignore specs
@@ -858,23 +939,27 @@ async def _publish_events(
     decision: _DeltaDecision,
     *,
     project_name: str = "",
+    project_root: str = "",
 ) -> int:
     """Publish FileChanged events and return the count published."""
     if mode == "delta":
         published = 0
         for fp in decision.files_added:
             await bus.publish(
-                Topic.FILE_CHANGED, FileChanged(path=fp, change_type="created", project_name=project_name)
+                Topic.FILE_CHANGED,
+                FileChanged(path=fp, change_type="created", project_name=project_name, project_root=project_root),
             )
             published += 1
         for fp in decision.files_modified:
             await bus.publish(
-                Topic.FILE_CHANGED, FileChanged(path=fp, change_type="modified", project_name=project_name)
+                Topic.FILE_CHANGED,
+                FileChanged(path=fp, change_type="modified", project_name=project_name, project_root=project_root),
             )
             published += 1
         for fp in decision.files_deleted:
             await bus.publish(
-                Topic.FILE_CHANGED, FileChanged(path=fp, change_type="deleted", project_name=project_name)
+                Topic.FILE_CHANGED,
+                FileChanged(path=fp, change_type="deleted", project_name=project_name, project_root=project_root),
             )
             published += 1
         logger.debug("Published {} FileChanged events (delta)", published)
@@ -882,7 +967,8 @@ async def _publish_events(
 
     for file_path in files:
         await bus.publish(
-            Topic.FILE_CHANGED, FileChanged(path=file_path, change_type="created", project_name=project_name)
+            Topic.FILE_CHANGED,
+            FileChanged(path=file_path, change_type="created", project_name=project_name, project_root=project_root),
         )
     logger.debug("Published {} FileChanged events (full)", len(files))
     return len(files)
@@ -1080,7 +1166,62 @@ async def index_monorepo(
         )
 
 
-async def _index_monorepo_inner(  # noqa: PLR0912
+@dataclass
+class _ProjectPublishResult:
+    """Result of the publish phase for a single project within a monorepo."""
+
+    project_name: str
+    project_root: Path
+    files_scanned: int
+    files_published: int
+    mode: str  # "full" | "delta"
+    decision: _DeltaDecision
+
+
+async def _publish_project(
+    settings: AtlasSettings,
+    graph: GraphClient,
+    bus: EventBus,
+    project_name: str,
+    project_root: Path,
+    files: list[str],
+    *,
+    full_reindex: bool = False,
+) -> _ProjectPublishResult:
+    """Scan, decide delta/full, create packages, and publish events for one project.
+
+    Does NOT create consumers or wait for drain — callers manage the shared pipeline.
+    """
+    if full_reindex:
+        logger.debug("Full reindex: deleting existing data for '{}'", project_name)
+        await graph.delete_project_data(project_name)
+
+    # Decide full vs. delta mode
+    if full_reindex:
+        decision = _DeltaDecision("full", set(), set(), set())
+    else:
+        decision = await _decide_delta_mode(settings, graph, project_name, project_root, set(files))
+
+    # Create Project + Package hierarchy
+    pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
+    logger.debug("'{}': {} package node(s)", project_name, pkg_count)
+
+    # Publish FileChanged events
+    published = await _publish_events(
+        bus, decision.mode, files, decision, project_name=project_name, project_root=str(project_root)
+    )
+
+    return _ProjectPublishResult(
+        project_name=project_name,
+        project_root=project_root,
+        files_scanned=len(files),
+        files_published=published,
+        mode=decision.mode,
+        decision=decision,
+    )
+
+
+async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     settings: AtlasSettings,
     graph: GraphClient,
     bus: EventBus,
@@ -1090,7 +1231,12 @@ async def _index_monorepo_inner(  # noqa: PLR0912
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list[IndexResult]:
-    """Inner implementation of index_monorepo."""
+    """Inner implementation of index_monorepo.
+
+    Uses a shared consumer pipeline across all sub-projects: file discovery
+    and publishing run per sub-project, but tier consumers run continuously
+    with a single drain at the end.
+    """
     project_root = Path(settings.project_root).resolve()
     sub_projects = detect_sub_projects(project_root, settings.monorepo)
 
@@ -1123,45 +1269,129 @@ async def _index_monorepo_inner(  # noqa: PLR0912
     has_root = bool(root_only_files)
     total = len(sub_projects) + (1 if has_root else 0)
 
+    # --- Shared embedding resources (created once) ---
+    embed: EmbedClient | None = None
+    cache: EmbedCache | None = None
+    if settings.embeddings.enabled:
+        embed = EmbedClient(settings.embeddings)
+        if settings.embeddings.cache_ttl_days > 0:
+            cache = EmbedCache(settings.redis, settings.embeddings)
+        dimension = settings.embeddings.dimension or 768
+        await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
+
+    if full_reindex and cache is not None:
+        await cache.clear()
+
+    # --- Start shared consumers (once for entire monorepo) ---
+    await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
+    await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
+
+    tier1 = Tier1GraphConsumer(bus, graph, settings)
+    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root)
+
+    consumer_tasks: list[asyncio.Task[None]] = [
+        asyncio.create_task(tier1.run()),
+        asyncio.create_task(tier2.run()),
+    ]
+
+    tier3: Tier3EmbedConsumer | None = None
+    if embed is not None:
+        await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
+        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        consumer_tasks.append(asyncio.create_task(tier3.run()))
+
+    start = time.monotonic()
+    publish_results: list[_ProjectPublishResult] = []
+
+    try:
+        # --- Publish phase: scan + publish per sub-project (fast) ---
+        for i, sub in enumerate(sub_projects, 1):
+            prefixed_name = f"{root_name}/{sub.name}"
+            logger.debug("Publishing sub-project '{}' at {}", prefixed_name, sub.path)
+            if on_progress is not None:
+                on_progress(prefixed_name, i - 1, total)
+
+            sub_files = scan_files(sub.root, settings)
+            pr = await _publish_project(
+                settings, graph, bus, prefixed_name, sub.root, sub_files, full_reindex=full_reindex
+            )
+            publish_results.append(pr)
+
+            if on_progress is not None:
+                on_progress(prefixed_name, i, total)
+
+        # Publish root project files (outside any sub-project)
+        root_pr: _ProjectPublishResult | None = None
+        if root_only_files:
+            logger.debug(
+                "Publishing root project '{}' ({} file(s) outside sub-projects)", root_name, len(root_only_files)
+            )
+            if on_progress is not None:
+                on_progress(root_name, total - 1, total)
+
+            root_pr = await _publish_project(
+                settings, graph, bus, root_name, project_root, root_only_files, full_reindex=full_reindex
+            )
+            publish_results.append(root_pr)
+
+            if on_progress is not None:
+                on_progress(root_name, total, total)
+
+        # --- Wait for ALL tiers to drain (once) ---
+        await _wait_for_drain(bus, drain_timeout_s, embed_enabled=embed is not None)
+
+    finally:
+        # --- Tear down consumers (once) ---
+        tier1.stop()
+        tier2.stop()
+        if tier3 is not None:
+            tier3.stop()
+        await asyncio.sleep(0.5)
+        for task in consumer_tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if cache is not None:
+            await cache.close()
+
+    # --- Update metadata + build results per project ---
     results: list[IndexResult] = []
+    for pr in publish_results:
+        # Set dependency versions
+        dep_versions = _parse_dependency_versions(pr.project_root)
+        if dep_versions:
+            await graph.update_external_package_versions(pr.project_name, dep_versions)
 
-    # Index each sub-project with prefixed name
-    for i, sub in enumerate(sub_projects, 1):
-        prefixed_name = f"{root_name}/{sub.name}"
-        logger.debug("Indexing sub-project '{}' at {}", prefixed_name, sub.path)
-        if on_progress is not None:
-            on_progress(prefixed_name, i - 1, total)
-        result = await index_project(
-            settings,
-            graph,
-            bus,
-            project_name=prefixed_name,
-            project_root=sub.root,
-            full_reindex=full_reindex,
-            drain_timeout_s=drain_timeout_s,
-        )
-        results.append(result)
-        if on_progress is not None:
-            on_progress(prefixed_name, i, total)
+        entity_count = await graph.count_entities(pr.project_name)
+        git_hash = _get_git_hash(pr.project_root)
+        metadata: dict[str, Any] = {
+            "last_indexed_at": time.time(),
+            "file_count": pr.files_scanned,
+            "entity_count": entity_count,
+            "index_mode": pr.mode,
+        }
+        if git_hash:
+            metadata["git_hash"] = git_hash
+        if pr.mode == "delta":
+            metadata["delta_files_added"] = len(pr.decision.files_added)
+            metadata["delta_files_modified"] = len(pr.decision.files_modified)
+            metadata["delta_files_deleted"] = len(pr.decision.files_deleted)
+        await graph.update_project_metadata(pr.project_name, **metadata)
 
-    # Index root project (files not inside any sub-project)
-    if root_only_files:
-        logger.debug("Indexing root project '{}' ({} file(s) outside sub-projects)", root_name, len(root_only_files))
-        if on_progress is not None:
-            on_progress(root_name, total - 1, total)
-        result = await _index_root_project(
-            settings,
-            graph,
-            bus,
-            root_name,
-            project_root,
-            root_only_files,
-            full_reindex=full_reindex,
-            drain_timeout_s=drain_timeout_s,
+        # Use shared start time — in monorepo mode all projects share one pipeline,
+        # so per-project publish timestamps don't reflect actual processing duration.
+        duration = time.monotonic() - start
+        delta_stats = _build_delta_stats(pr.decision, tier2.stats) if pr.mode == "delta" else None
+        results.append(
+            IndexResult(
+                files_scanned=pr.files_scanned,
+                files_published=pr.files_published,
+                entities_total=entity_count,
+                duration_s=duration,
+                mode=pr.mode,
+                delta_stats=delta_stats,
+            )
         )
-        results.append(result)
-        if on_progress is not None:
-            on_progress(root_name, total, total)
 
     # Cross-project import resolution
     all_project_names = [f"{root_name}/{sp.name}" for sp in sub_projects]
@@ -1170,79 +1400,13 @@ async def _index_monorepo_inner(  # noqa: PLR0912
 
     if len(all_project_names) > 1:
         rewired = await graph.resolve_cross_project_imports(all_project_names)
-        logger.info("Cross-project import resolution: {} imports rewired", rewired)
+        logger.debug("Cross-project import resolution: {} imports rewired", rewired)
         depends_count = await graph.create_depends_on_edges(all_project_names)
-        logger.info("Created {} DEPENDS_ON edge(s)", depends_count)
+        logger.debug("Created {} DEPENDS_ON edge(s)", depends_count)
+
+    logger.debug("Monorepo indexing completed in {:.1f}s", time.monotonic() - start)
 
     return results
-
-
-async def _index_root_project(
-    settings: AtlasSettings,
-    graph: GraphClient,
-    bus: EventBus,
-    project_name: str,
-    project_root: Path,
-    files: list[str],
-    *,
-    full_reindex: bool = False,
-    drain_timeout_s: float = 600.0,
-) -> IndexResult:
-    """Index root-level files (outside any sub-project) as the root project."""
-    start = time.monotonic()
-
-    if not files:
-        return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=time.monotonic() - start)
-
-    embed: EmbedClient | None = None
-    cache: EmbedCache | None = None
-    if settings.embeddings.enabled:
-        embed = EmbedClient(settings.embeddings)
-        if settings.embeddings.cache_ttl_days > 0:
-            cache = EmbedCache(settings.redis, settings.embeddings)
-
-    if full_reindex:
-        await graph.delete_project_data(project_name)
-
-    if settings.embeddings.enabled:
-        dimension = settings.embeddings.dimension or 768
-        await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
-
-    # Always full mode for root project (simpler — root files are typically few)
-    decision = _DeltaDecision("full", set(), set(), set())
-
-    pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
-    logger.debug("Root project: created {} package node(s)", pkg_count)
-
-    published = await _publish_events(bus, decision.mode, files, decision, project_name=project_name)
-
-    if published > 0:
-        await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s, project_root=project_root)
-
-    dep_versions = _parse_dependency_versions(project_root)
-    if dep_versions:
-        await graph.update_external_package_versions(project_name, dep_versions)
-
-    entity_count = await graph.count_entities(project_name)
-    git_hash = _get_git_hash(project_root)
-    metadata: dict[str, Any] = {
-        "last_indexed_at": time.time(),
-        "file_count": len(files),
-        "entity_count": entity_count,
-        "index_mode": decision.mode,
-    }
-    if git_hash:
-        metadata["git_hash"] = git_hash
-    await graph.update_project_metadata(project_name, **metadata)
-
-    duration = time.monotonic() - start
-    return IndexResult(
-        files_scanned=len(files),
-        files_published=published,
-        entities_total=entity_count,
-        duration_s=duration,
-        mode="full",
-    )
 
 
 def _build_delta_stats(decision: _DeltaDecision, t2stats: Any) -> DeltaStats:

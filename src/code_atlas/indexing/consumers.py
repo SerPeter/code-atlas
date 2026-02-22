@@ -182,19 +182,24 @@ class Tier1GraphConsumer(TierConsumer):
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier1.process_batch", attributes={"batch_id": batch_id}):
-            paths = [e.path for e in events if isinstance(e, FileChanged)]
-            # Forward project_name from FileChanged events (monorepo support)
-            project_name = ""
+            # Group files by (project_name, project_root) — monorepo batches can mix sub-projects
+            groups: dict[tuple[str, str], list[str]] = {}
             for e in events:
-                if isinstance(e, FileChanged) and e.project_name:
-                    project_name = e.project_name
-                    break
-            logger.debug("Tier1 batch {}: {} file(s)", batch_id, len(paths))
+                if isinstance(e, FileChanged):
+                    key = (e.project_name, e.project_root)
+                    groups.setdefault(key, []).append(e.path)
+
+            total = sum(len(p) for p in groups.values())
+            logger.debug("Tier1 batch {}: {} file(s) in {} group(s)", batch_id, total, len(groups))
 
             # TODO: Update Memgraph file nodes (timestamps, staleness flags)
 
-            # Always publish downstream — Tier 2 decides significance
-            await self.bus.publish(Topic.AST_DIRTY, ASTDirty(paths=paths, project_name=project_name, batch_id=batch_id))
+            # Publish one ASTDirty per project group — Tier 2 decides significance
+            for (project_name, project_root), paths in groups.items():
+                await self.bus.publish(
+                    Topic.AST_DIRTY,
+                    ASTDirty(paths=paths, project_name=project_name, project_root=project_root, batch_id=batch_id),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +270,16 @@ class Tier2ASTConsumer(TierConsumer):
         file_path: str,
         import_rels: list[ParsedRelationship],
         call_rels: list[ParsedRelationship],
+        *,
+        project_root: Path | None = None,
     ) -> tuple[set[str], list[EntityRef], Significance]:
         """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs, max_significance).
 
         Appends IMPORTS rels to *import_rels* and CALLS rels to *call_rels*
         for post-batch resolution.
         """
-        full_path = self._project_root / file_path
+        root = project_root if project_root is not None else self._project_root
+        full_path = root / file_path
         if not full_path.is_file():
             logger.debug("Tier2: file deleted, removing entities for {}", file_path)
             deleted = await self.graph.delete_file_entities(project_name, file_path)
@@ -349,50 +357,54 @@ class Tier2ASTConsumer(TierConsumer):
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
-            all_paths: list[str] = []
-            # Collect project_name from ASTDirty events (forwarded from FileChanged)
-            event_project_name = ""
+            # Group paths by (project_name, project_root) — monorepo batches can mix sub-projects
+            groups: dict[tuple[str, str], list[str]] = {}
             for e in events:
                 if isinstance(e, ASTDirty):
-                    all_paths.extend(e.paths)
-                    if e.project_name:
-                        event_project_name = e.project_name
-            unique_paths = list(dict.fromkeys(all_paths))
+                    key = (e.project_name, e.project_root)
+                    groups.setdefault(key, []).extend(e.paths)
 
-            logger.debug("Tier2 batch {}: {} unique path(s)", batch_id, len(unique_paths))
+            # Deduplicate paths within each group
+            groups = {key: list(dict.fromkeys(paths)) for key, paths in groups.items()}
 
-            project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
+            total_paths = sum(len(p) for p in groups.values())
+            logger.debug("Tier2 batch {}: {} unique path(s) in {} group(s)", batch_id, total_paths, len(groups))
+
             changed_entity_refs: list[EntityRef] = []
-            all_import_rels: list[ParsedRelationship] = []
-            all_call_rels: list[ParsedRelationship] = []
             skipped_before = self.stats.files_skipped
             total_changed = 0
             batch_max_sig = Significance.NONE
 
-            for file_path in unique_paths:
-                changed_qns, refs, file_sig = await self._process_file(
-                    project_name, file_path, all_import_rels, all_call_rels
-                )
-                total_changed += len(changed_qns)
-                changed_entity_refs.extend(refs)
-                if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
-                    batch_max_sig = file_sig
+            for (event_project_name, event_project_root), unique_paths in groups.items():
+                project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
+                effective_root = Path(event_project_root) if event_project_root else None
+                group_import_rels: list[ParsedRelationship] = []
+                group_call_rels: list[ParsedRelationship] = []
 
-            # Post-batch import resolution
-            if all_import_rels:
-                await self.graph.resolve_imports(project_name, all_import_rels)
+                for file_path in unique_paths:
+                    changed_qns, refs, file_sig = await self._process_file(
+                        project_name, file_path, group_import_rels, group_call_rels, project_root=effective_root
+                    )
+                    total_changed += len(changed_qns)
+                    changed_entity_refs.extend(refs)
+                    if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
+                        batch_max_sig = file_sig
 
-            # Post-batch call resolution (after imports so import map is available)
-            if all_call_rels:
-                await self.graph.resolve_calls(project_name, all_call_rels)
+                # Post-batch import resolution (per project)
+                if group_import_rels:
+                    await self.graph.resolve_imports(project_name, group_import_rels)
 
-            span.set_attribute("files_count", len(unique_paths))
+                # Post-batch call resolution (per project, after imports so import map is available)
+                if group_call_rels:
+                    await self.graph.resolve_calls(project_name, group_call_rels)
+
+            span.set_attribute("files_count", total_paths)
             span.set_attribute("entities_changed", total_changed)
 
             logger.debug(
                 "Tier2 batch {}: {} files, {} skipped, {} entities changed",
                 batch_id,
-                len(unique_paths),
+                total_paths,
                 self.stats.files_skipped - skipped_before,
                 total_changed,
             )

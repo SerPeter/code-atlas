@@ -541,6 +541,7 @@ def _apply_filters(
     exclude_tests: bool | None = None,
     exclude_stubs: bool | None = None,
     exclude_generated: bool | None = None,
+    code_only: bool = False,
     include_patterns: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
 ) -> list[SearchResult]:
@@ -560,6 +561,9 @@ def _apply_filters(
         basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
 
         # Exclude filters
+        if code_only and _is_doc_result(result):
+            excluded += 1
+            continue
         if do_tests and _is_test_result(result, settings.test_patterns):
             excluded += 1
             continue
@@ -588,12 +592,33 @@ def _apply_filters(
 
 _VIS_BOOST: dict[str, float] = {"public": 1.0, "protected": 0.97, "internal": 0.94, "private": 0.88}
 
+_LABEL_BOOST: dict[str, float] = {
+    "Callable": 1.15,
+    "TypeDef": 1.15,
+    "Module": 1.10,
+    "Value": 1.10,
+    "Package": 1.05,
+    "DocFile": 0.70,
+    "DocSection": 0.70,
+}
+
+_DOC_LABELS = frozenset({"DocFile", "DocSection"})
+
+
+def _is_doc_result(result: SearchResult) -> bool:
+    """Return True if *result* is a documentation entity (DocFile or DocSection)."""
+    return bool(_DOC_LABELS & set(result.labels))
+
 
 def _boost_results(results: list[SearchResult]) -> list[SearchResult]:
-    """Re-rank by RRF score * visibility boost. Preserves relative order for equal boosts."""
+    """Re-rank by RRF score * visibility boost * label boost."""
     return sorted(
         results,
-        key=lambda r: r.rrf_score * _VIS_BOOST.get(r.visibility, 1.0),
+        key=lambda r: (
+            r.rrf_score
+            * _VIS_BOOST.get(r.visibility, 1.0)
+            * max((_LABEL_BOOST.get(lbl, 1.0) for lbl in r.labels), default=1.0)
+        ),
         reverse=True,
     )
 
@@ -611,6 +636,7 @@ async def hybrid_search(
     exclude_tests: bool | None = None,
     exclude_stubs: bool | None = None,
     exclude_generated: bool | None = None,
+    code_only: bool = False,
     include_patterns: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
 ) -> list[SearchResult]:
@@ -640,6 +666,8 @@ async def hybrid_search(
         Exclude .pyi stubs (None = use settings.stub_filter).
     exclude_generated:
         Exclude generated code (None = use settings.generated_filter).
+    code_only:
+        Exclude documentation entities (DocSection, DocFile).
     include_patterns:
         Only include results whose basename matches one of these globs.
     exclude_patterns:
@@ -726,6 +754,7 @@ async def hybrid_search(
                 exclude_tests=exclude_tests,
                 exclude_stubs=exclude_stubs,
                 exclude_generated=exclude_generated,
+                code_only=code_only,
                 include_patterns=include_patterns,
                 exclude_patterns=exclude_patterns,
             )

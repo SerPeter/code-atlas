@@ -2,10 +2,14 @@
 # See: https://github.com/SerPeter/code-atlas
 
 [scope]
-# Whitelist paths to index (leave empty to index everything)
-include_paths = []
-# Additional exclude patterns beyond .gitignore and .atlasignore
-exclude_patterns = []
+# Restrict indexing to these directory paths (leave empty for everything)
+paths = []
+# Override defaults entirely (uncomment to customize):
+# include = ["*.py", "*.pyi"]
+# exclude = [".git/", "node_modules/"]
+# Extend defaults (recommended):
+extend_include = []
+extend_exclude = []
 
 [libraries]
 # Fully index these libraries (parse source, embed, full graph)

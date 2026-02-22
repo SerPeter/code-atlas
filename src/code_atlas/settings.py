@@ -109,11 +109,27 @@ def _find_atlas_toml() -> Path | None:
 
 
 class ScopeSettings(BaseSettings):
-    """File scope and ignore settings."""
+    """File scope and ignore settings (ruff-style include/exclude semantics)."""
 
-    include_paths: list[str] = Field(default_factory=list, description="Whitelist of paths to index (monorepo roots).")
-    exclude_patterns: list[str] = Field(
-        default_factory=list, description="Additional glob patterns to exclude beyond .gitignore."
+    paths: list[str] = Field(
+        default_factory=list,
+        description="Restrict indexing to these directory paths (monorepo scoping).",
+    )
+    include: list[str] | None = Field(
+        default=None,
+        description="File patterns to index. Overrides default language-based patterns when set.",
+    )
+    extend_include: list[str] = Field(
+        default_factory=list,
+        description="Additional file patterns to index, appended to defaults.",
+    )
+    exclude: list[str] | None = Field(
+        default=None,
+        description="Patterns to exclude from indexing. Overrides defaults when set.",
+    )
+    extend_exclude: list[str] = Field(
+        default_factory=list,
+        description="Additional patterns to exclude, appended to defaults.",
     )
 
 
@@ -160,6 +176,7 @@ class EmbeddingSettings(BaseSettings):
     base_url: str = Field(default="http://localhost:8080", description="OpenAI-compatible embedding endpoint URL.")
     dimension: int | None = Field(default=None, description="Embedding vector dimension. Auto-detected when None.")
     batch_size: int = Field(default=32, description="Max texts per embedding API call.")
+    max_concurrency: int = Field(default=4, description="Max concurrent embedding API calls.")
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
     query_cache_size: int = Field(default=128, description="Max cached query embeddings (LRU eviction).")
     cache_ttl_days: int = Field(default=7, description="Embedding cache TTL in days. 0 disables Valkey caching.")
