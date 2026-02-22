@@ -270,13 +270,14 @@ class Tier2ASTConsumer(TierConsumer):
         file_path: str,
         import_rels: list[ParsedRelationship],
         call_rels: list[ParsedRelationship],
+        type_rels: list[ParsedRelationship],
         *,
         project_root: Path | None = None,
     ) -> tuple[set[str], list[EntityRef], Significance]:
         """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs, max_significance).
 
-        Appends IMPORTS rels to *import_rels* and CALLS rels to *call_rels*
-        for post-batch resolution.
+        Appends IMPORTS rels to *import_rels*, CALLS rels to *call_rels*,
+        and USES_TYPE rels to *type_rels* for post-batch resolution.
         """
         root = project_root if project_root is not None else self._project_root
         full_path = root / file_path
@@ -301,10 +302,12 @@ class Tier2ASTConsumer(TierConsumer):
         det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
         all_rels = parsed.relationships + det_result.relationships
 
-        # Separate IMPORTS and CALLS rels for post-batch resolution
-        non_import_rels = [r for r in all_rels if r.rel_type not in {RelType.IMPORTS, RelType.CALLS}]
+        # Separate IMPORTS, CALLS, and USES_TYPE rels for post-batch resolution
+        _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE}
+        non_import_rels = [r for r in all_rels if r.rel_type not in _deferred]
         import_rels.extend(r for r in all_rels if r.rel_type == RelType.IMPORTS)
         call_rels.extend(r for r in all_rels if r.rel_type == RelType.CALLS)
+        type_rels.extend(r for r in all_rels if r.rel_type == RelType.USES_TYPE)
 
         result = await self.graph.upsert_file_entities(
             project_name=project_name,
@@ -380,10 +383,16 @@ class Tier2ASTConsumer(TierConsumer):
                 effective_root = Path(event_project_root) if event_project_root else None
                 group_import_rels: list[ParsedRelationship] = []
                 group_call_rels: list[ParsedRelationship] = []
+                group_type_rels: list[ParsedRelationship] = []
 
                 for file_path in unique_paths:
                     changed_qns, refs, file_sig = await self._process_file(
-                        project_name, file_path, group_import_rels, group_call_rels, project_root=effective_root
+                        project_name,
+                        file_path,
+                        group_import_rels,
+                        group_call_rels,
+                        group_type_rels,
+                        project_root=effective_root,
                     )
                     total_changed += len(changed_qns)
                     changed_entity_refs.extend(refs)
@@ -397,6 +406,10 @@ class Tier2ASTConsumer(TierConsumer):
                 # Post-batch call resolution (per project, after imports so import map is available)
                 if group_call_rels:
                     await self.graph.resolve_calls(project_name, group_call_rels)
+
+                # Post-batch USES_TYPE resolution (per project, after imports so import map is available)
+                if group_type_rels:
+                    await self.graph.resolve_type_refs(project_name, group_type_rels)
 
             span.set_attribute("files_count", total_paths)
             span.set_attribute("entities_changed", total_changed)

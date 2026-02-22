@@ -480,7 +480,7 @@ class GraphClient:
 
     # -- Import resolution helpers ---------------------------------------------
 
-    async def resolve_imports(
+    async def resolve_imports(  # noqa: PLR0912
         self,
         project_name: str,
         import_rels: list[ParsedRelationship],
@@ -505,17 +505,21 @@ class GraphClient:
         internal_map: dict[str, str] = {r["qn"]: r["uid"] for r in records}
 
         # 2. Classify imports as internal or external
-        import_edges: list[dict[str, str]] = []  # [{from_uid, to_uid}]
+        import_edges: list[dict[str, Any]] = []  # [{from_uid, to_uid, type_only?}]
         ext_packages: dict[str, dict[str, str]] = {}  # top_level → {uid, name, qn, project_name}
         ext_symbols: dict[str, dict[str, str]] = {}  # dotted_path → {uid, name, qn, package, project_name}
 
         for rel in import_rels:
             to_name = rel.to_name
             from_uid = rel.from_qualified_name  # already project-prefixed uid
+            is_type_only = rel.properties.get("type_only", False)
 
             # Check internal match
             if to_name in internal_map:
-                import_edges.append({"from_uid": from_uid, "to_uid": internal_map[to_name]})
+                edge: dict[str, Any] = {"from_uid": from_uid, "to_uid": internal_map[to_name]}
+                if is_type_only:
+                    edge["type_only"] = True
+                import_edges.append(edge)
                 continue
 
             # External import — derive top-level package
@@ -532,7 +536,10 @@ class GraphClient:
 
             if to_name == top_level:
                 # Bare package import (e.g. `import os`) → point to ExternalPackage
-                import_edges.append({"from_uid": from_uid, "to_uid": pkg_uid})
+                edge = {"from_uid": from_uid, "to_uid": pkg_uid}
+                if is_type_only:
+                    edge["type_only"] = True
+                import_edges.append(edge)
             else:
                 # Symbol import (e.g. `from loguru import logger`) → ExternalSymbol
                 sym_uid = f"{project_name}:ext/{to_name}"
@@ -545,7 +552,10 @@ class GraphClient:
                         "qualified_name": f"ext/{to_name}",
                         "package": top_level,
                     }
-                import_edges.append({"from_uid": from_uid, "to_uid": sym_uid})
+                edge = {"from_uid": from_uid, "to_uid": sym_uid}
+                if is_type_only:
+                    edge["type_only"] = True
+                import_edges.append(edge)
 
         # 3. MERGE ExternalPackage nodes
         if ext_packages:
@@ -581,12 +591,23 @@ class GraphClient:
             )
 
         # 6. IMPORTS edges (both internal and external targets)
-        if import_edges:
+        #    Split into type_only and normal for efficient batching
+        normal_edges = [e for e in import_edges if not e.get("type_only")]
+        type_only_edges = [e for e in import_edges if e.get("type_only")]
+
+        if normal_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
                 f"CREATE (a)-[:{RelType.IMPORTS}]->(b)",
-                {"rels": import_edges},
+                {"rels": normal_edges},
+            )
+        if type_only_edges:
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
+                f"CREATE (a)-[e:{RelType.IMPORTS}]->(b) SET e.type_only = true",
+                {"rels": type_only_edges},
             )
 
         logger.debug(
@@ -637,6 +658,87 @@ class GraphClient:
             )
 
         logger.debug("Resolved {} CALLS edges ({} unresolved)", resolved, unresolved)
+
+    async def resolve_type_refs(  # noqa: PLR0912
+        self,
+        project_name: str,
+        type_rels: list[ParsedRelationship],
+    ) -> None:
+        """Resolve USES_TYPE relationships after all files in a batch have been upserted.
+
+        Each type rel has a bare name (e.g. ``"MyClass"``) as ``to_name``.
+        Resolution strategy:
+        1. **Import match** — caller's module imports something with that name.
+        2. **Same-file TypeDef** — a TypeDef with that name in the same file.
+        3. **Project-wide TypeDef** — any TypeDef with that name (unique only).
+        4. **Unresolved** — skip silently (builtins, generic types).
+        """
+        if not type_rels:
+            return
+
+        lookup = await self._build_call_lookup(project_name)
+
+        # Also build a name → TypeDef uid map
+        td_records = await self.execute(
+            f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
+            "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
+            {"p": project_name},
+        )
+        name_to_typedefs: dict[str, list[tuple[str, str]]] = {}  # name → [(uid, file_path)]
+        for r in td_records:
+            name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
+
+        edges: set[tuple[str, str]] = set()
+        resolved = 0
+        for rel in type_rels:
+            from_uid = rel.from_qualified_name
+            type_name = rel.to_name
+
+            # Derive caller's file_path for same-file matching
+            caller_info = lookup.uid_to_info.get(from_uid)
+            caller_fp = caller_info[1] if caller_info else ""
+
+            # Derive module uid for import matching
+            caller_qn = from_uid.split(":", 1)[1] if ":" in from_uid else from_uid
+            parts = caller_qn.split(".")
+            module_uid: str | None = None
+            for i in range(len(parts) - 1, 0, -1):
+                candidate = f"{project_name}:{'.'.join(parts[:i])}"
+                if candidate in lookup.import_map:
+                    module_uid = candidate
+                    break
+
+            target_uid: str | None = None
+
+            # Strategy 1: Import match
+            if module_uid and type_name in lookup.import_map.get(module_uid, {}):
+                target_uid = lookup.import_map[module_uid][type_name]
+
+            # Strategy 2: Same-file TypeDef
+            if target_uid is None and caller_fp:
+                for uid, fp in name_to_typedefs.get(type_name, []):
+                    if fp == caller_fp:
+                        target_uid = uid
+                        break
+
+            # Strategy 3: Project-wide unique TypeDef
+            if target_uid is None:
+                candidates = name_to_typedefs.get(type_name, [])
+                if len(candidates) == 1:
+                    target_uid = candidates[0][0]
+
+            if target_uid is not None:
+                edges.add((from_uid, target_uid))
+                resolved += 1
+
+        if edges:
+            edge_params = [{"f": f, "t": t} for f, t in edges]
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) CREATE (a)-[:{RelType.USES_TYPE}]->(b)",
+                {"rels": edge_params},
+            )
+
+        logger.debug("Resolved {} USES_TYPE edges", resolved)
 
     async def _build_call_lookup(self, project_name: str) -> _CallLookup:
         """Build lookup tables needed for CALLS resolution."""

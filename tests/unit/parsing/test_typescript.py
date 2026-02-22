@@ -773,3 +773,82 @@ def test_js_module_entity():
     module = _entity_by_name(parsed, "util")
     assert module.label == NodeLabel.MODULE
     assert module.qualified_name == f"{PROJECT}:src.util"
+
+
+# ---------------------------------------------------------------------------
+# import type detection (type_only flag)
+# ---------------------------------------------------------------------------
+
+
+def test_import_type_marked_type_only():
+    """TypeScript `import type` syntax gets type_only=True property."""
+    parsed = _parse('import type { User } from "./models";\n')
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert len(import_rels) == 1
+    assert import_rels[0].properties.get("type_only") is True
+
+
+def test_regular_import_not_type_only():
+    """Regular TS imports have no type_only property."""
+    parsed = _parse('import { foo } from "./module";\n')
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert len(import_rels) == 1
+    assert not import_rels[0].properties.get("type_only")
+
+
+# ---------------------------------------------------------------------------
+# USES_TYPE extraction (TypeScript)
+# ---------------------------------------------------------------------------
+
+
+def test_uses_type_from_ts_function():
+    """TypeScript function type annotations emit USES_TYPE."""
+    parsed = _parse("""\
+function process(user: User, config: Config): Result {
+  return {} as Result;
+}
+""")
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "User" in type_names
+    assert "Config" in type_names
+    assert "Result" in type_names
+
+
+def test_uses_type_skips_ts_builtins():
+    """TS built-in types like string, number, boolean don't produce USES_TYPE."""
+    parsed = _parse("""\
+function add(x: number, y: string): boolean {
+  return true;
+}
+""")
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    assert len(uses_type) == 0
+
+
+def test_uses_type_from_ts_method():
+    """TypeScript method type annotations emit USES_TYPE."""
+    parsed = _parse("""\
+class Service {
+  handle(req: Request): Response {
+    return {} as Response;
+  }
+}
+""")
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "Request" in type_names
+    assert "Response" in type_names
+
+
+def test_uses_type_from_arrow_function():
+    """Arrow function type annotations emit USES_TYPE."""
+    parsed = _parse("""\
+const handler = (req: Request): Response => {
+  return {} as Response;
+};
+""")
+    uses_type = [r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE]
+    type_names = {r.to_name for r in uses_type}
+    assert "Request" in type_names
+    assert "Response" in type_names

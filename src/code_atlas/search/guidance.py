@@ -35,8 +35,8 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.INHERITS: "Subclass -> base class",
     RelType.IMPLEMENTS: "Class -> interface/protocol it implements",
     RelType.CALLS: "Caller -> callee function/method invocation",
-    RelType.IMPORTS: "Module/entity -> imported dependency",
-    RelType.USES_TYPE: "Entity -> type it references in annotations/signatures",
+    RelType.IMPORTS: "Module/entity -> imported dependency (has optional type_only=true for TYPE_CHECKING/import type)",
+    RelType.USES_TYPE: "Callable -> type referenced in parameter/return annotations (auto-extracted from signatures)",
     RelType.OVERRIDES: "Method -> parent method it overrides",
     RelType.DEPENDS_ON: "Project -> project dependency (monorepo)",
     RelType.DOCUMENTS: "Doc section -> code entity it documents",
@@ -87,6 +87,28 @@ CYPHER_EXAMPLES: list[dict[str, str]] = [
         "query": (
             "MATCH (n) WHERE n.file_path = $path "
             "RETURN n.name, n.qualified_name, labels(n)[0] AS label, n.kind ORDER BY n.line_start"
+        ),
+    },
+    {
+        "description": "Find type-only (TYPE_CHECKING) imports for a module",
+        "query": (
+            "MATCH (m:Module {name: $name})-[r:IMPORTS]->(dep) "
+            "WHERE r.type_only = true "
+            "RETURN dep.name, dep.qualified_name, labels(dep)[0] AS type"
+        ),
+    },
+    {
+        "description": "Find types used by a function (annotation references)",
+        "query": (
+            "MATCH (f:Callable {name: $name})-[:USES_TYPE]->(t) RETURN t.name, t.qualified_name, labels(t)[0] AS label"
+        ),
+    },
+    {
+        "description": "Runtime-only imports (exclude type-only)",
+        "query": (
+            "MATCH (m:Module {name: $name})-[r:IMPORTS]->(dep) "
+            "WHERE r.type_only IS NULL "
+            "RETURN dep.name, dep.qualified_name"
         ),
     },
 ]

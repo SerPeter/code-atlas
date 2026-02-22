@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from code_atlas.parsing.ast import (
     LanguageConfig,
@@ -206,12 +206,18 @@ def _process_import(
                 break
     if source_node is None:
         return
+
+    # Detect `import type` syntax — tree-sitter-typescript has a "type" keyword child
+    is_type_import = any(child.type == "type" for child in node.children)
+    props: dict[str, Any] = {"type_only": True} if is_type_import else {}
+
     import_source = _get_string_content(source_node)
     relationships.append(
         ParsedRelationship(
             from_qualified_name=f"{project_name}:{module_qn}",
             rel_type=RelType.IMPORTS,
             to_name=import_source,
+            properties=props,
         )
     )
 
@@ -399,6 +405,9 @@ def _process_method(
             to_name=f"{project_name}:{qn}",
         )
     )
+
+    # Extract USES_TYPE from parameter/return type annotations
+    _extract_type_refs_ts(node, f"{project_name}:{qn}", relationships)
 
     # Extract CALLS from method body
     body = node.child_by_field_name("body")
@@ -759,6 +768,9 @@ def _process_function(
         )
     )
 
+    # Extract USES_TYPE from parameter/return type annotations
+    _extract_type_refs_ts(node, f"{project_name}:{qn}", relationships)
+
     # CALLS from function body
     body = node.child_by_field_name("body")
     if body is not None:
@@ -905,6 +917,9 @@ def _process_variable_declarator(
             )
         )
 
+        # Extract USES_TYPE from arrow function type annotations
+        _extract_type_refs_ts(value_node, f"{project_name}:{qn}", relationships)
+
         # Extract CALLS from arrow function body
         body = value_node.child_by_field_name("body")
         if body is not None:
@@ -940,6 +955,94 @@ def _process_variable_declarator(
             to_name=f"{project_name}:{qn}",
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# USES_TYPE extraction
+# ---------------------------------------------------------------------------
+
+_TS_BUILTIN_TYPES: frozenset[str] = frozenset(
+    {
+        "string",
+        "number",
+        "boolean",
+        "void",
+        "null",
+        "undefined",
+        "any",
+        "never",
+        "unknown",
+        "object",
+        "symbol",
+        "bigint",
+    }
+)
+
+
+def _collect_type_names_ts(node: Node) -> list[str]:
+    """Extract non-builtin type names from a TypeScript type annotation node."""
+    names: list[str] = []
+    _walk_type_node_ts(node, names)
+    return names
+
+
+def _walk_type_node_ts(node: Node, names: list[str]) -> None:
+    """Recursively walk a TS type annotation to collect type identifiers."""
+    if node.type in ("type_identifier", "identifier"):
+        name = node_text(node)
+        if name not in _TS_BUILTIN_TYPES:
+            names.append(name)
+    elif node.type == "nested_type_identifier":
+        # e.g., Namespace.Type — take the last part
+        for child in node.children:
+            if child.type == "type_identifier":
+                name = node_text(child)
+                if name not in _TS_BUILTIN_TYPES:
+                    names.append(name)
+    else:
+        for child in node.children:
+            _walk_type_node_ts(child, names)
+
+
+def _extract_type_refs_ts(
+    node: Node,
+    from_qn: str,
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Extract USES_TYPE relationships from TS function parameter and return type annotations."""
+    seen_types: set[str] = set()
+
+    # Parameter type annotations
+    params = node.child_by_field_name("parameters")
+    if params is not None:
+        for param in params.children:
+            # TypeScript parameters have type_annotation children
+            for child in param.children:
+                if child.type == "type_annotation":
+                    for name in _collect_type_names_ts(child):
+                        if name not in seen_types:
+                            seen_types.add(name)
+                            relationships.append(
+                                ParsedRelationship(
+                                    from_qualified_name=from_qn,
+                                    rel_type=RelType.USES_TYPE,
+                                    to_name=name,
+                                )
+                            )
+
+    # Return type annotation
+    return_type = node.child_by_field_name("return_type")
+    if return_type is not None:
+        for name in _collect_type_names_ts(return_type):
+            if name not in seen_types:
+                seen_types.add(name)
+                relationships.append(
+                    ParsedRelationship(
+                        from_qualified_name=from_qn,
+                        rel_type=RelType.USES_TYPE,
+                        to_name=name,
+                    )
+                )
 
 
 # ---------------------------------------------------------------------------
