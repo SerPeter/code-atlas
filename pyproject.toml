@@ -82,7 +82,7 @@ Homepage = "https://github.com/SerPeter/code-atlas"
 Documentation = "https://github.com/SerPeter/code-atlas/tree/main/docs"
 Repository = "https://github.com/SerPeter/code-atlas"
 Issues = "https://github.com/SerPeter/code-atlas/issues"
-Changelog = "https://github.com/SerPeter/code-atlas/releases"
+Changelog = "https://github.com/SerPeter/code-atlas/blob/main/CHANGELOG.md"
 
 # --------------------------------------------------------------------------- #
 # Dev dependencies
@@ -161,3 +161,30 @@ allowed-unresolved-imports = [
     "tree_sitter_rust",
     "tree_sitter_typescript",
 ]
+
+# --------------------------------------------------------------------------- #
+# Semantic Release
+# --------------------------------------------------------------------------- #
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+commit_parser = "conventional"
+allow_zero_version = true       # project is 0.x
+major_on_zero = false            # breaking changes bump minor while 0.x
+tag_format = "v{version}"       # matches existing v0.1.0, v0.1.1, v0.1.2
+
+[tool.semantic_release.branches.main]
+match = "^(main|master)$"
+prerelease = false
+
+[tool.semantic_release.branches.feature]
+match = "^feature/.*$"
+prerelease = true
+prerelease_token = "dev"
+
+[tool.semantic_release.changelog]
+exclude_commit_patterns = ['chore\(release\):.*']
+
+[tool.semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"
+output_format = "md"
+mask_initial_release = false     # include full details for first PSR-managed release

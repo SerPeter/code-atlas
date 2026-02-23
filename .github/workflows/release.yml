@@ -1,46 +1,82 @@
 name: Release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
-      publish:
-        description: "Publish to PyPI (true/false)"
-        required: true
-        default: "false"
+      force:
+        description: "Force bump level (empty = auto-detect from commits)"
+        required: false
+        type: choice
+        options: ["", patch, minor, major]
+        default: ""
+      prerelease:
+        description: "Create a prerelease version"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
-  publish:
-    name: Publish to PyPI
+  # ------------------------------------------------------------------- #
+  # Job 1: Version bump, changelog, tag, push, GitHub Release
+  # ------------------------------------------------------------------- #
+  release:
     runs-on: ubuntu-latest
-    if:
-      github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish ==
-      'true')
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Semantic Release
+        id: release
+        uses: python-semantic-release/python-semantic-release@v10
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          git_committer_name: "github-actions[bot]"
+          git_committer_email: "github-actions[bot]@users.noreply.github.com"
+          force: ${{ inputs.force || '' }}
+          prerelease: ${{ inputs.prerelease || false }}
+
+      - name: Publish GitHub Release
+        if: steps.release.outputs.released == 'true'
+        uses: python-semantic-release/publish-action@v10
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ steps.release.outputs.tag }}
+
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      is_prerelease: ${{ steps.release.outputs.is_prerelease }}
+
+  # ------------------------------------------------------------------- #
+  # Job 2: Build and publish to PyPI
+  # ------------------------------------------------------------------- #
+  publish-pypi:
+    needs: release
+    if: needs.release.outputs.released == 'true' && needs.release.outputs.is_prerelease != 'true'
+    runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/code-atlas-mcp
     permissions:
-      id-token: write
       contents: read
+      id-token: write
+
     steps:
       - uses: actions/checkout@v6
-
-      - name: Verify tag matches pyproject.toml version
-        if: github.event_name == 'release'
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          TAG_VERSION="${TAG#v}"
-          PKG_VERSION=$(python -c "
-          import re, pathlib
-          m = re.search(r'^version\s*=\s*\"([^\"]+)\"', pathlib.Path('pyproject.toml').read_text(), re.M)
-          print(m.group(1))
-          ")
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "::error::Tag version ($TAG_VERSION) does not match pyproject.toml version ($PKG_VERSION)"
-            exit 1
-          fi
-          echo "Version check passed: $TAG_VERSION"
+        with:
+          ref: ${{ needs.release.outputs.tag }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -49,6 +85,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14-dev"
+
+      - name: Verify version matches tag
+        run: |
+          TAG="${{ needs.release.outputs.tag }}"
+          TOML_VERSION=$(python -c "import tomllib; print('v' + tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$TAG" != "$TOML_VERSION" ]; then
+            echo "::error::Tag $TAG does not match pyproject.toml version $TOML_VERSION"
+            exit 1
+          fi
 
       - run: uv build
 
