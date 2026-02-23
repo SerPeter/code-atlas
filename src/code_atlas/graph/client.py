@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
@@ -40,6 +41,18 @@ if TYPE_CHECKING:
     from code_atlas.settings import AtlasSettings
 
 _tracer = get_tracer(__name__)
+
+_VALID_LABELS: frozenset[str] = frozenset(lbl.value for lbl in NodeLabel)
+
+
+def _assert_valid_label(label: str) -> None:
+    """Raise ValueError if *label* is not a known NodeLabel value.
+
+    Prevents Cypher injection when labels are interpolated into queries.
+    """
+    if label not in _VALID_LABELS:
+        msg = f"Invalid node label: {label!r}"
+        raise ValueError(msg)
 
 
 def _build_graph_search_query(
@@ -1038,47 +1051,114 @@ class GraphClient:
             {"model": model, "dim": dimension},
         )
 
-    async def read_entity_texts(self, uids: list[str]) -> list[dict[str, Any]]:
+    async def read_entity_texts(
+        self,
+        uids: list[str],
+        *,
+        labels: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Batch-read entity properties needed for embedding.
 
         ``uids`` must be full uid strings (``project:qualified_name``).
+        If *labels* is provided (parallel to *uids*), entities are grouped
+        by label so each query uses a label-constrained MATCH, hitting the
+        per-label property index on ``uid`` instead of scanning all nodes.
 
         Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``kind``, ``_label``,
         ``embed_hash``, ``embedding``.
         """
-        return await self.execute(
-            "UNWIND $uids AS u "
-            "MATCH (n) WHERE n.uid = u "
+        ret = (
             "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
             "n.source AS source, "
             "n.kind AS kind, labels(n)[0] AS _label, "
-            "n.embed_hash AS embed_hash, n.embedding AS embedding",
-            {"uids": uids},
+            "n.embed_hash AS embed_hash, n.embedding AS embedding"
         )
 
-    async def write_embeddings(self, items: list[tuple[str, list[float]]], chunk_size: int = 50) -> None:
-        """Batch-write embedding vectors to nodes by uid."""
-        if not items:
-            return
-        for i in range(0, len(items), chunk_size):
-            chunk = items[i : i + chunk_size]
-            params = [{"uid": uid, "vector": vec} for uid, vec in chunk]
-            await self.execute_write(
-                "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embedding = item.vector",
-                {"items": params},
+        if labels is None or len(labels) != len(uids):
+            # Fallback: label-free scan (slow on large graphs)
+            return await self.execute(
+                f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}",
+                {"uids": uids},
             )
 
-    async def write_embed_hashes(self, items: list[tuple[str, str]]) -> None:
-        """Batch-write embed_hash values to nodes by uid."""
+        # Group uids by label → one indexed query per label
+        by_label: dict[str, list[str]] = defaultdict(list)
+        for uid, lbl in zip(uids, labels, strict=True):
+            by_label[lbl].append(uid)
+
+        results: list[dict[str, Any]] = []
+        for lbl, group_uids in by_label.items():
+            _assert_valid_label(lbl)
+            rows = await self.execute(
+                f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
+                {"uids": group_uids},
+            )
+            results.extend(rows)
+        return results
+
+    async def write_embeddings(
+        self,
+        items: list[tuple[str, list[float]]],
+        chunk_size: int = 50,
+        *,
+        labels: list[str] | None = None,
+    ) -> None:
+        """Batch-write embedding vectors to nodes by uid.
+
+        If *labels* is provided (parallel to *items*), writes are grouped by
+        label for index-backed matching.
+        """
         if not items:
             return
-        params = [{"uid": uid, "hash": h} for uid, h in items]
-        await self.execute_write(
-            "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embed_hash = item.hash",
-            {"items": params},
-        )
+
+        if labels is not None and len(labels) == len(items):
+            by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for (uid, vec), lbl in zip(items, labels, strict=True):
+                by_label[lbl].append({"uid": uid, "vector": vec})
+            for lbl, group in by_label.items():
+                _assert_valid_label(lbl)
+                for i in range(0, len(group), chunk_size):
+                    chunk = group[i : i + chunk_size]
+                    await self.execute_write(
+                        f"UNWIND $items AS item MATCH (n:{lbl}) WHERE n.uid = item.uid SET n.embedding = item.vector",
+                        {"items": chunk},
+                    )
+        else:
+            for i in range(0, len(items), chunk_size):
+                chunk_items = items[i : i + chunk_size]
+                params = [{"uid": uid, "vector": vec} for uid, vec in chunk_items]
+                await self.execute_write(
+                    "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embedding = item.vector",
+                    {"items": params},
+                )
+
+    async def write_embed_hashes(self, items: list[tuple[str, str]], *, labels: list[str] | None = None) -> None:
+        """Batch-write embed_hash values to nodes by uid.
+
+        If *labels* is provided (parallel to *items*), writes are grouped by
+        label for index-backed matching.
+        """
+        if not items:
+            return
+
+        if labels is not None and len(labels) == len(items):
+            by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for (uid, h), lbl in zip(items, labels, strict=True):
+                by_label[lbl].append({"uid": uid, "hash": h})
+            for lbl, group in by_label.items():
+                _assert_valid_label(lbl)
+                await self.execute_write(
+                    f"UNWIND $items AS item MATCH (n:{lbl}) WHERE n.uid = item.uid SET n.embed_hash = item.hash",
+                    {"items": group},
+                )
+        else:
+            params = [{"uid": uid, "hash": h} for uid, h in items]
+            await self.execute_write(
+                "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embed_hash = item.hash",
+                {"items": params},
+            )
 
     async def clear_all_embeddings(self) -> None:
         """Remove embedding vectors and content hashes from all nodes."""

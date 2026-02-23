@@ -342,6 +342,13 @@ async def _index_monorepo_with_progress(
         def on_progress(name: str, current: int, total: int) -> None:
             progress.update(task, total=total, completed=current, description=name)
 
+        def on_drain(t1: int, t2: int, t3: int) -> None:
+            remaining = t1 + t2 + t3
+            if remaining > 0:
+                progress.update(task, total=None, completed=0, description=f"Processing {remaining} event(s)")
+            else:
+                progress.update(task, total=None, completed=0, description="Finalizing")
+
         results: list[IndexResult] = await index_monorepo(
             settings,
             graph,
@@ -349,6 +356,7 @@ async def _index_monorepo_with_progress(
             scope_projects=projects,
             full_reindex=full_reindex,
             on_progress=on_progress,
+            on_drain_progress=on_drain,
         )
 
     return results
@@ -376,13 +384,22 @@ async def _index_single_with_spinner(
         disable=not show_progress,
         console=_make_stderr_console(),
     ) as progress:
-        progress.add_task("Indexing...", total=None)
+        task = progress.add_task("Indexing...", total=None)
+
+        def on_drain(t1: int, t2: int, t3: int) -> None:
+            remaining = t1 + t2 + t3
+            if remaining > 0:
+                progress.update(task, description=f"Processing {remaining} event(s)...")
+            else:
+                progress.update(task, description="Finalizing...")
+
         result = await index_project(
             settings,
             graph,
             bus,
             scope_paths=scope or None,
             full_reindex=full_reindex,
+            on_drain_progress=on_drain,
         )
 
     return result  # noqa: RET504

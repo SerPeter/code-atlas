@@ -107,9 +107,33 @@ class TierConsumer(ABC):
 
         pending: dict[str, tuple[bytes, Event]] = {}  # dedup_key → (msg_id, event)
         window_start: float | None = None
+        pel_drained = False  # True once all pending (unacked) messages have been reclaimed
 
         while not self._stop:
-            # Pull messages (short block so we can check flush + stop)
+            # First, reclaim any unacknowledged messages from the PEL (failed batches).
+            # Once the PEL is empty, switch to reading new messages only.
+            if not pel_drained:
+                reclaimed = await self.bus.read_pending(
+                    self.input_topic,
+                    self.group,
+                    self.consumer_name,
+                    count=self.policy.max_batch_size,
+                )
+                if reclaimed:
+                    for msg_id, fields in reclaimed:
+                        if not fields:
+                            # Tombstone (deleted message) — just ACK it
+                            await self.bus.ack(self.input_topic, self.group, msg_id)
+                            continue
+                        event = decode_event(self.input_topic, fields)
+                        key = self.dedup_key(event)
+                        pending[key] = (msg_id, event)
+                        if window_start is None:
+                            window_start = asyncio.get_event_loop().time()
+                else:
+                    pel_drained = True
+
+            # Pull new messages (short block so we can check flush + stop)
             block_ms = max(100, int(self.policy.time_window_s * 1000 // 2))
             messages = await self.bus.read_batch(
                 self.input_topic,
@@ -147,8 +171,9 @@ class TierConsumer(ABC):
                 await self.process_batch(events, batch_id)
                 await self.bus.ack(self.input_topic, self.group, *msg_ids)
             except Exception:
-                # Failed batch: do NOT ack — Redis will redeliver via PEL
+                # Failed batch: do NOT ack — messages stay in PEL for reclaim
                 logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
+                pel_drained = False  # re-check PEL on next iteration
 
             pending.clear()
             window_start = None
@@ -496,7 +521,7 @@ class Tier3EmbedConsumer(TierConsumer):
             await self.cache.put_many([(th, vec) for _, vec, th in result])
         return result
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:
+    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912
         with _tracer.start_as_current_span("tier3.process_batch", attributes={"batch_id": batch_id}) as span:
             # Collect and deduplicate entities across all events in the batch
             seen: dict[str, EntityRef] = {}
@@ -514,8 +539,17 @@ class Tier3EmbedConsumer(TierConsumer):
             t0 = asyncio.get_event_loop().time()
 
             # 1. Read entity properties from graph (includes embed_hash + embedding)
+            #    Pass labels so queries use per-label indices instead of full scans.
             qns = [e.qualified_name for e in entities]
-            entity_props = await self.graph.read_entity_texts(qns)
+            entity_labels = [e.node_type for e in entities]
+            entity_props = await self.graph.read_entity_texts(qns, labels=entity_labels)
+
+            # Build uid→label map for downstream writes
+            uid_label: dict[str, str] = {}
+            for props_row in entity_props:
+                lbl = props_row.get("_label")
+                if lbl:
+                    uid_label[props_row["uid"]] = lbl
 
             # 2. Build embed texts — graph-check for unchanged content
             to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
@@ -550,8 +584,23 @@ class Tier3EmbedConsumer(TierConsumer):
             # 5. Write all new/changed vectors + embed_hashes to graph
             all_resolved = cache_resolved + api_vectors
             if all_resolved:
-                await self.graph.write_embeddings([(qn, vec) for qn, vec, _ in all_resolved])
-                await self.graph.write_embed_hashes([(qn, th) for qn, _, th in all_resolved])
+                # Split into labeled (index-backed) and unlabeled (fallback) writes
+                labeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn in uid_label]
+                unlabeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn not in uid_label]
+
+                if labeled:
+                    lbl_list = [uid_label[qn] for qn, _, _ in labeled]
+                    await self.graph.write_embeddings(
+                        [(qn, vec) for qn, vec, _ in labeled],
+                        labels=lbl_list,
+                    )
+                    await self.graph.write_embed_hashes(
+                        [(qn, th) for qn, _, th in labeled],
+                        labels=lbl_list,
+                    )
+                if unlabeled:
+                    await self.graph.write_embeddings([(qn, vec) for qn, vec, _ in unlabeled])
+                    await self.graph.write_embed_hashes([(qn, th) for qn, _, th in unlabeled])
 
             elapsed = asyncio.get_event_loop().time() - t0
             span.set_attribute("entities_count", total)

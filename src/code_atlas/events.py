@@ -187,6 +187,34 @@ class EventBus:
             # result shape: [[stream_key, [(msg_id, fields), ...]]]
             return result[0][1]
 
+    async def read_pending(
+        self,
+        topic: Topic,
+        group: str,
+        consumer: str,
+        *,
+        count: int = 10,
+    ) -> list[tuple[bytes, dict[bytes, bytes]]]:
+        """Re-read unacknowledged (pending) messages from the PEL.
+
+        Uses ``XREADGROUP`` with ID ``"0"`` to fetch messages that were
+        delivered but never ACKed (e.g. after a failed batch).  Returns
+        the same shape as :meth:`read_batch`.  Returns an empty list when
+        no pending messages remain.
+        """
+        with _tracer.start_as_current_span(
+            "eventbus.read_pending", attributes={"topic": topic.value, "group": group, "consumer": consumer}
+        ):
+            result: Any = await self._redis.xreadgroup(
+                group,
+                consumer,
+                {self._stream_key(topic): "0"},
+                count=count,
+            )
+            if not result:
+                return []
+            return result[0][1]
+
     async def ack(self, topic: Topic, group: str, *msg_ids: bytes) -> int:
         """Acknowledge messages after successful processing."""
         return await self._redis.xack(self._stream_key(topic), group, *msg_ids)
