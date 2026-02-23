@@ -137,4 +137,4 @@ async def test_tier1_publishes_downstream(event_bus: EventBus) -> None:
 
     event = decode_event(Topic.AST_DIRTY, messages[0][1])
     assert isinstance(event, ASTDirty)
-    assert "src/app.py" in event.paths
+    assert event.path == "src/app.py"

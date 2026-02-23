@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -46,21 +45,19 @@ class EntityRef:
 
 @dataclass(frozen=True)
 class ASTDirty:
-    """Files need AST re-parsing (published by Tier 1, consumed by Tier 2)."""
+    """A single file needs AST re-parsing (published by Tier 1, consumed by Tier 2)."""
 
-    paths: list[str]
+    path: str
     project_name: str = ""  # monorepo sub-project (forwarded from FileChanged)
     project_root: str = ""  # absolute path to project root (forwarded from FileChanged)
-    batch_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
 @dataclass(frozen=True)
 class EmbedDirty:
-    """Entities need re-embedding (published by Tier 2, consumed by Tier 3)."""
+    """A single entity needs re-embedding (published by Tier 2, consumed by Tier 3)."""
 
-    entities: list[EntityRef]
+    entity: EntityRef
     significance: str  # "MODERATE" | "HIGH"
-    batch_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
 # Type alias for any pipeline event
@@ -114,7 +111,7 @@ def decode_event(topic: Topic, data: dict[bytes, bytes]) -> Event:
 
     # Reconstruct nested dataclasses that json.loads flattens to dicts
     if cls is EmbedDirty:
-        raw["entities"] = [EntityRef(**e) for e in raw["entities"]]
+        raw["entity"] = EntityRef(**raw["entity"])
 
     return cls(**raw)
 
@@ -157,6 +154,19 @@ class EventBus:
         """Publish an event to a stream. Returns the message ID."""
         with _tracer.start_as_current_span("eventbus.publish", attributes={"topic": topic.value}):
             return await self._redis.xadd(self._stream_key(topic), encode_event(event), maxlen=maxlen, approximate=True)
+
+    async def publish_many(self, topic: Topic, events: list[Event], *, maxlen: int = 10_000) -> list[bytes]:
+        """Publish multiple events in a single pipeline round-trip."""
+        if not events:
+            return []
+        with _tracer.start_as_current_span(
+            "eventbus.publish_many", attributes={"topic": topic.value, "count": len(events)}
+        ):
+            key = self._stream_key(topic)
+            async with self._redis.pipeline(transaction=False) as pipe:
+                for event in events:
+                    pipe.xadd(key, encode_event(event), maxlen=maxlen, approximate=True)
+                return await pipe.execute()
 
     async def read_batch(
         self,

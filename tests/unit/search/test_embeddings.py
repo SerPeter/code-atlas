@@ -365,8 +365,8 @@ class TestTier3CacheLookup:
         return EntityRef(qualified_name=qn, node_type="Callable", file_path="f.py")
 
     @staticmethod
-    def _make_embed_dirty(entities: list[EntityRef]) -> EmbedDirty:
-        return EmbedDirty(entities=entities, significance="HIGH", batch_id="test01")
+    def _make_embed_dirty(entity: EntityRef) -> EmbedDirty:
+        return EmbedDirty(entity=entity, significance="HIGH")
 
     async def test_graph_hit_skips_all(self):
         """When graph node has matching embed_hash+embedding, no cache or API call needed."""
@@ -396,7 +396,7 @@ class TestTier3CacheLookup:
 
         consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
-        event = self._make_embed_dirty([entity])
+        event = self._make_embed_dirty(entity)
 
         await consumer.process_batch([event], "test01")
 
@@ -434,7 +434,7 @@ class TestTier3CacheLookup:
 
         consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
-        event = self._make_embed_dirty([entity])
+        event = self._make_embed_dirty(entity)
 
         await consumer.process_batch([event], "test02")
 
@@ -476,7 +476,7 @@ class TestTier3CacheLookup:
 
         consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
-        event = self._make_embed_dirty([entity])
+        event = self._make_embed_dirty(entity)
 
         await consumer.process_batch([event], "test03")
 

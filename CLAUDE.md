@@ -84,6 +84,8 @@ src/code_atlas/
 
 **Deployment:** Daemon (`atlas daemon start`) for indexing + MCP (`atlas mcp`) per agent session, decoupled via Valkey + Memgraph
 
+**Event model:** Events are atomic — one logical change per event (one file per ASTDirty, one entity per EmbedDirty). Never bundle lists of work items into a single event; use `EventBus.publish_many()` for network-efficient batch publishing. The consumer's `max_batch_size` must directly control work volume, not just message count.
+
 **Infrastructure:** Memgraph (graph DB, port 7687), TEI (embeddings, port 8080), Valkey (event bus, port 6379)
 
 ## Code Style

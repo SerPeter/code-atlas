@@ -1056,6 +1056,7 @@ class GraphClient:
         uids: list[str],
         *,
         labels: list[str] | None = None,
+        chunk_size: int = 200,
     ) -> list[dict[str, Any]]:
         """Batch-read entity properties needed for embedding.
 
@@ -1063,6 +1064,9 @@ class GraphClient:
         If *labels* is provided (parallel to *uids*), entities are grouped
         by label so each query uses a label-constrained MATCH, hitting the
         per-label property index on ``uid`` instead of scanning all nodes.
+
+        Queries are chunked to *chunk_size* uids per round-trip to avoid
+        query timeouts on large batches.
 
         Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``kind``, ``_label``,
@@ -1077,13 +1081,18 @@ class GraphClient:
         )
 
         if labels is None or len(labels) != len(uids):
-            # Fallback: label-free scan (slow on large graphs)
-            return await self.execute(
-                f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}",
-                {"uids": uids},
-            )
+            # Fallback: label-free scan (slow on large graphs), chunked
+            results: list[dict[str, Any]] = []
+            for i in range(0, len(uids), chunk_size):
+                chunk = uids[i : i + chunk_size]
+                rows = await self.execute(
+                    f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}",
+                    {"uids": chunk},
+                )
+                results.extend(rows)
+            return results
 
-        # Group uids by label → one indexed query per label
+        # Group uids by label → one indexed query per label, chunked
         by_label: dict[str, list[str]] = defaultdict(list)
         for uid, lbl in zip(uids, labels, strict=True):
             by_label[lbl].append(uid)
@@ -1091,11 +1100,13 @@ class GraphClient:
         results: list[dict[str, Any]] = []
         for lbl, group_uids in by_label.items():
             _assert_valid_label(lbl)
-            rows = await self.execute(
-                f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
-                {"uids": group_uids},
-            )
-            results.extend(rows)
+            for i in range(0, len(group_uids), chunk_size):
+                chunk = group_uids[i : i + chunk_size]
+                rows = await self.execute(
+                    f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
+                    {"uids": chunk},
+                )
+                results.extend(rows)
         return results
 
     async def write_embeddings(
