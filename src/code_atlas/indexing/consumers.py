@@ -100,7 +100,7 @@ class TierConsumer(ABC):
         """Signal the consumer to stop after the current iteration."""
         self._stop = True
 
-    async def run(self) -> None:
+    async def run(self) -> None:  # noqa: PLR0912, PLR0915
         """Main consumer loop — runs until ``stop()`` is called."""
         await self.bus.ensure_group(self.input_topic, self.group)
         logger.debug("{} started (group={}, topic={})", self.consumer_name, self.group, self.input_topic.value)
@@ -125,8 +125,13 @@ class TierConsumer(ABC):
                             # Tombstone (deleted message) — just ACK it
                             await self.bus.ack(self.input_topic, self.group, msg_id)
                             continue
-                        event = decode_event(self.input_topic, fields)
-                        key = self.dedup_key(event)
+                        try:
+                            event = decode_event(self.input_topic, fields)
+                            key = self.dedup_key(event)
+                        except Exception:
+                            logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
+                            await self.bus.ack(self.input_topic, self.group, msg_id)
+                            continue
                         pending[key] = (msg_id, event)
                         if window_start is None:
                             window_start = asyncio.get_event_loop().time()
@@ -144,8 +149,13 @@ class TierConsumer(ABC):
             )
 
             for msg_id, fields in messages:
-                event = decode_event(self.input_topic, fields)
-                key = self.dedup_key(event)
+                try:
+                    event = decode_event(self.input_topic, fields)
+                    key = self.dedup_key(event)
+                except Exception:
+                    logger.exception("{} failed to decode message, skipping", self.consumer_name)
+                    await self.bus.ack(self.input_topic, self.group, msg_id)
+                    continue
                 pending[key] = (msg_id, event)  # latest wins
                 if window_start is None:
                     window_start = asyncio.get_event_loop().time()

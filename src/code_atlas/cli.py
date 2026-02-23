@@ -10,6 +10,7 @@ from typing import Any
 import typer
 from dotenv import find_dotenv, load_dotenv
 from loguru import logger
+from rich.console import Console
 
 _dotenv_path = find_dotenv(usecwd=True)  # '' when not found
 load_dotenv(_dotenv_path)  # Load .env into os.environ (ATLAS_* + provider API keys)
@@ -34,6 +35,10 @@ class OutputMode:
 
 
 _output = OutputMode()
+
+# Shared Rich console — used by both loguru sink and Progress bars so Rich can
+# coordinate output (log lines render *above* any live progress bar).
+_console = Console(stderr=True)
 
 
 def _configure_logger() -> None:
@@ -66,7 +71,12 @@ def _configure_logger() -> None:
     else:
         fmt = "{message}"
 
-    logger.add(sys.stderr, level=level, colorize=False if _output.no_color else None, format=fmt)
+    # Route loguru through the shared Rich console so log lines render above
+    # any active Progress bar instead of clobbering it.
+    def _rich_sink(message: str) -> None:
+        _console.print(message, end="", highlight=False, markup=False)
+
+    logger.add(_rich_sink, level=level, colorize=False, format=fmt)
 
 
 def _echo(msg: str) -> None:
@@ -96,6 +106,8 @@ def main(
     _output.json = json_flag
     _output.verbose = verbose
     _output.no_color = no_color
+    if no_color:
+        _console.no_color = True
     _configure_logger()
 
 
@@ -338,25 +350,32 @@ async def _index_monorepo_with_progress(
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         disable=not show_progress,
-        console=_make_stderr_console(),
+        console=_console,
     ) as progress:
         task = progress.add_task("Indexing", total=None)
 
         def on_progress(name: str, current: int, total: int) -> None:
             progress.update(task, total=total, completed=current, description=name)
 
-        drain_started = False
+        drain_prev_remaining: int | None = None
+        drain_processed = 0
 
         def on_drain(t1: int, t2: int, t3: int) -> None:
-            nonlocal drain_started
+            nonlocal drain_prev_remaining, drain_processed
             remaining = t1 + t2 + t3
-            if not drain_started:
-                progress.update(task, total=None, completed=0)
-                drain_started = True
-            if remaining > 0:
-                progress.update(task, description=f"Processing {remaining} event(s)")
+            if drain_prev_remaining is None:
+                # First drain tick — switch from project-count to event-count bar
+                drain_processed = 0
             else:
-                progress.update(task, description="Finalizing")
+                consumed = drain_prev_remaining - remaining
+                if consumed > 0:
+                    drain_processed += consumed
+            drain_prev_remaining = remaining
+            total = drain_processed + remaining
+            if remaining > 0:
+                progress.update(task, total=total, completed=drain_processed, description="Processing events")
+            else:
+                progress.update(task, total=total, completed=total, description="Done")
 
         results: list[IndexResult] = await index_monorepo(
             settings,
@@ -391,7 +410,7 @@ async def _index_single_with_spinner(
         TextColumn("{task.description}"),
         TimeElapsedColumn(),
         disable=not show_progress,
-        console=_make_stderr_console(),
+        console=_console,
     ) as progress:
         task = progress.add_task("Indexing...", total=None)
 
@@ -412,13 +431,6 @@ async def _index_single_with_spinner(
         )
 
     return result  # noqa: RET504
-
-
-def _make_stderr_console() -> Any:
-    """Create a Rich Console that writes to stderr (so stdout stays clean for --json)."""
-    from rich.console import Console
-
-    return Console(stderr=True, no_color=_output.no_color)
 
 
 async def _run_search(  # noqa: PLR0912, PLR0915
@@ -669,7 +681,7 @@ def _print_report(report: object, *, detailed: bool) -> None:
         CheckStatus.FAIL: "[red]\u2717[/red]",
     }
 
-    console = _make_stderr_console()
+    console = _console
     for c in rpt.checks:
         icon = status_icon.get(c.status, "?")
         console.print(f"{icon} {c.name:<20} {c.message}")

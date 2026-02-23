@@ -252,6 +252,11 @@ class EventBus:
 
         return {"pending": 0, "lag": 0}
 
+    async def flush(self) -> None:
+        """Delete all pipeline streams (for full reindex)."""
+        for topic in Topic:
+            await self._redis.delete(self._stream_key(topic))
+
     async def close(self) -> None:
         """Close the connection pool."""
         await self._redis.aclose()

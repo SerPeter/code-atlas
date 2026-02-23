@@ -1068,6 +1068,7 @@ async def _index_project_inner(
 
     if full_reindex:
         logger.debug("Full reindex: deleting existing data for '{}'", project_name)
+        await bus.flush()
         await graph.delete_project_data(project_name)
         if cache is not None:
             await cache.clear()
@@ -1300,8 +1301,10 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         dimension = settings.embeddings.dimension or 768
         await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
 
-    if full_reindex and cache is not None:
-        await cache.clear()
+    if full_reindex:
+        await bus.flush()
+        if cache is not None:
+            await cache.clear()
 
     # --- Start shared consumers (once for entire monorepo) ---
     await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
