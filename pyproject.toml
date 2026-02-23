@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-atlas-mcp"
-version = "0.2.0-dev.1"
+version = "0.1.2"
 description = "A code intelligence graph that gives AI coding agents deep, token-efficient understanding of your codebase."
 readme = "README.md"
 license = "Apache-2.0"
@@ -173,12 +173,11 @@ major_on_zero = false            # breaking changes bump minor while 0.x
 tag_format = "v{version}"       # matches existing v0.1.0, v0.1.1, v0.1.2
 
 [tool.semantic_release.branches.main]
-match = "(main|master)"
+match = "^(main|master)$"
 prerelease = false
-prerelease_token = "rc"
 
 [tool.semantic_release.branches.feature]
-match = "feature/.*"
+match = "^feature/.*$"
 prerelease = true
 prerelease_token = "dev"
 

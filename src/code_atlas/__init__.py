@@ -1,5 +1,8 @@
 """Code Atlas — code intelligence graph for AI coding agents."""
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = version("code-atlas-mcp")
+try:
+    __version__ = version("code-atlas-mcp")
+except PackageNotFoundError:
+    __version__ = "0.0.0-dev"
