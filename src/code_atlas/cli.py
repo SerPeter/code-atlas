@@ -39,6 +39,7 @@ _output = OutputMode()
 def _configure_logger() -> None:
     """Reconfigure loguru based on global output flags."""
     logger.remove()
+    logger.configure(extra={"consumer": ""})
 
     if _output.json:
         # JSON mode: only errors on stderr, no formatting noise
@@ -57,7 +58,9 @@ def _configure_logger() -> None:
         level = "WARNING"
 
     if _output.verbose >= 2:
-        fmt = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}"
+        fmt = (
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {extra[consumer]:<14} | {name}:{function}:{line} - {message}"
+        )
     elif _output.verbose >= 1:
         fmt = "{time:HH:mm:ss.SSS} | {level:<8} | {message}"
     else:
@@ -276,7 +279,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             )
             total_files = sum(r.files_scanned for r in results)
             total_entities = sum(r.entities_total for r in results)
-            total_duration = sum(r.duration_s for r in results)
+            total_duration = max((r.duration_s for r in results), default=0.0)
             if _output.json:
                 _json_output(
                     {
@@ -342,6 +345,19 @@ async def _index_monorepo_with_progress(
         def on_progress(name: str, current: int, total: int) -> None:
             progress.update(task, total=total, completed=current, description=name)
 
+        drain_started = False
+
+        def on_drain(t1: int, t2: int, t3: int) -> None:
+            nonlocal drain_started
+            remaining = t1 + t2 + t3
+            if not drain_started:
+                progress.update(task, total=None, completed=0)
+                drain_started = True
+            if remaining > 0:
+                progress.update(task, description=f"Processing {remaining} event(s)")
+            else:
+                progress.update(task, description="Finalizing")
+
         results: list[IndexResult] = await index_monorepo(
             settings,
             graph,
@@ -349,6 +365,7 @@ async def _index_monorepo_with_progress(
             scope_projects=projects,
             full_reindex=full_reindex,
             on_progress=on_progress,
+            on_drain_progress=on_drain,
         )
 
     return results
@@ -376,13 +393,22 @@ async def _index_single_with_spinner(
         disable=not show_progress,
         console=_make_stderr_console(),
     ) as progress:
-        progress.add_task("Indexing...", total=None)
+        task = progress.add_task("Indexing...", total=None)
+
+        def on_drain(t1: int, t2: int, t3: int) -> None:
+            remaining = t1 + t2 + t3
+            if remaining > 0:
+                progress.update(task, description=f"Processing {remaining} event(s)...")
+            else:
+                progress.update(task, description="Finalizing...")
+
         result = await index_project(
             settings,
             graph,
             bus,
             scope_paths=scope or None,
             full_reindex=full_reindex,
+            on_drain_progress=on_drain,
         )
 
     return result  # noqa: RET504

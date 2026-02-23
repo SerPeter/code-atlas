@@ -831,6 +831,7 @@ async def _run_pipeline(
     drain_timeout_s: float,
     *,
     project_root: Path | None = None,
+    on_drain_progress: Callable[[int, int, int], None] | None = None,
 ) -> Tier2ASTConsumer:
     """Start inline tier consumers and wait for the pipeline to drain.
 
@@ -853,7 +854,12 @@ async def _run_pipeline(
         task3 = asyncio.create_task(tier3.run())
 
     try:
-        await _wait_for_drain(bus, drain_timeout_s, embed_enabled=embed is not None)
+        await _wait_for_drain(
+            bus,
+            drain_timeout_s,
+            embed_enabled=embed is not None,
+            on_drain_progress=on_drain_progress,
+        )
     finally:
         tier1.stop()
         tier2.stop()
@@ -996,6 +1002,7 @@ async def index_project(
     drain_timeout_s: float = 600.0,
     project_name: str | None = None,
     project_root: Path | None = None,
+    on_drain_progress: Callable[[int, int, int], None] | None = None,
 ) -> IndexResult:
     """Run a full or delta index of the project through the event pipeline.
 
@@ -1023,6 +1030,7 @@ async def index_project(
             project_name=project_name,
             project_root=project_root,
             span=idx_span,
+            on_drain_progress=on_drain_progress,
         )
 
 
@@ -1037,6 +1045,7 @@ async def _index_project_inner(
     project_name: str,
     project_root: Path | None = None,
     span: Any = None,
+    on_drain_progress: Callable[[int, int, int], None] | None = None,
 ) -> IndexResult:
     """Inner implementation of index_project with active span."""
     start = time.monotonic()
@@ -1083,7 +1092,16 @@ async def _index_project_inner(
     # 6. Start inline consumers and wait for drain
     t2stats = None
     if published > 0:
-        tier2 = await _run_pipeline(bus, graph, settings, embed, cache, drain_timeout_s, project_root=project_root)
+        tier2 = await _run_pipeline(
+            bus,
+            graph,
+            settings,
+            embed,
+            cache,
+            drain_timeout_s,
+            project_root=project_root,
+            on_drain_progress=on_drain_progress,
+        )
         t2stats = tier2.stats
 
     # 7. Set dependency versions on ExternalPackage nodes
@@ -1141,6 +1159,7 @@ async def index_monorepo(
     full_reindex: bool = False,
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
+    on_drain_progress: Callable[[int, int, int], None] | None = None,
 ) -> list[IndexResult]:
     """Index a monorepo: detect sub-projects, index each, resolve cross-project imports.
 
@@ -1163,6 +1182,7 @@ async def index_monorepo(
             full_reindex=full_reindex,
             drain_timeout_s=drain_timeout_s,
             on_progress=on_progress,
+            on_drain_progress=on_drain_progress,
         )
 
 
@@ -1230,6 +1250,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     full_reindex: bool = False,
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
+    on_drain_progress: Callable[[int, int, int], None] | None = None,
 ) -> list[IndexResult]:
     """Inner implementation of index_monorepo.
 
@@ -1338,7 +1359,12 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 on_progress(root_name, total, total)
 
         # --- Wait for ALL tiers to drain (once) ---
-        await _wait_for_drain(bus, drain_timeout_s, embed_enabled=embed is not None)
+        await _wait_for_drain(
+            bus,
+            drain_timeout_s,
+            embed_enabled=embed is not None,
+            on_drain_progress=on_drain_progress,
+        )
 
     finally:
         # --- Tear down consumers (once) ---
@@ -1422,8 +1448,19 @@ def _build_delta_stats(decision: _DeltaDecision, t2stats: Any) -> DeltaStats:
     )
 
 
-async def _wait_for_drain(bus: EventBus, timeout_s: float, *, embed_enabled: bool = True) -> None:
-    """Poll stream groups until Tier 1, Tier 2, and (optionally) Tier 3 are drained."""
+async def _wait_for_drain(
+    bus: EventBus,
+    timeout_s: float,
+    *,
+    embed_enabled: bool = True,
+    on_drain_progress: Callable[[int, int, int], None] | None = None,
+) -> None:
+    """Poll stream groups until Tier 1, Tier 2, and (optionally) Tier 3 are drained.
+
+    If *on_drain_progress* is provided, it is called each poll cycle with
+    ``(t1_remaining, t2_remaining, t3_remaining)`` so callers can display
+    pipeline progress to the user.
+    """
     deadline = time.monotonic() + timeout_s
     settled_since: float | None = None
 
@@ -1439,6 +1476,9 @@ async def _wait_for_drain(bus: EventBus, timeout_s: float, *, embed_enabled: boo
             t3_remaining = t3_info["pending"] + t3_info["lag"]
         else:
             t3_remaining = 0
+
+        if on_drain_progress is not None:
+            on_drain_progress(t1_remaining, t2_remaining, t3_remaining)
 
         if t1_remaining == 0 and t2_remaining == 0 and t3_remaining == 0:
             if settled_since is None:
