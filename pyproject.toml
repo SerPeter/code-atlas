@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-atlas-mcp"
-version = "0.1.2"
+version = "0.2.0-dev.1"
 description = "A code intelligence graph that gives AI coding agents deep, token-efficient understanding of your codebase."
 readme = "README.md"
 license = "Apache-2.0"
