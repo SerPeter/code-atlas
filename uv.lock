@@ -194,7 +194,7 @@ wheels = [
 
 [[package]]
 name = "code-atlas-mcp"
-version = "0.2.0.dev4"
+version = "0.2.0.dev5"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
