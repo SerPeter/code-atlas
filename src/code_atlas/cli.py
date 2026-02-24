@@ -6,12 +6,15 @@ import asyncio
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import typer
 from dotenv import find_dotenv, load_dotenv
 from loguru import logger
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from code_atlas.settings import AtlasSettings
 
 _dotenv_path = find_dotenv(usecwd=True)  # '' when not found
 load_dotenv(_dotenv_path)  # Load .env into os.environ (ATLAS_* + provider API keys)
@@ -150,6 +153,17 @@ def _resolve_project_root(path: str, *, no_git_check: bool = False) -> tuple[Pat
     return git_root, scope_prefix
 
 
+def _load_settings(**overrides: object) -> AtlasSettings:
+    """Load ``AtlasSettings``, converting the git-root RuntimeError into a user-friendly exit."""
+    from code_atlas.settings import AtlasSettings
+
+    try:
+        return AtlasSettings(**overrides)  # type: ignore[arg-type]
+    except RuntimeError as exc:
+        logger.error("{}", exc)
+        raise typer.Exit(code=1) from None
+
+
 @app.command()
 def index(
     path: str = typer.Argument(".", help="Path to the project root to index."),
@@ -230,10 +244,9 @@ def mcp(
 ) -> None:
     """Start the MCP server for AI agent connections."""
     from code_atlas.server.mcp import create_mcp_server
-    from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     # CLI args override settings (None = use settings default)
     mcp_cfg = settings.mcp
     transport = transport or mcp_cfg.transport
@@ -486,10 +499,9 @@ async def _run_search(  # noqa: PLR0912, PLR0915
     from code_atlas.indexing.orchestrator import StalenessChecker
     from code_atlas.search.embeddings import EmbedClient
     from code_atlas.search.engine import SearchType, hybrid_search
-    from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     init_telemetry(settings.observability)
     graph = GraphClient(settings)
     try:
@@ -592,9 +604,8 @@ async def _run_search(  # noqa: PLR0912, PLR0915
 async def _run_status() -> None:
     """Async implementation of the ``atlas status`` command."""
     from code_atlas.graph.client import GraphClient
-    from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     graph = GraphClient(settings)
     try:
         await graph.ping()
@@ -668,9 +679,8 @@ async def _run_status() -> None:
 
 async def _run_health() -> None:
     from code_atlas.server.health import run_health_checks
-    from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings(project_root=Path.cwd())
+    settings = _load_settings()
     report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=False)
     raise typer.Exit(code=0 if report.ok else 1)
@@ -678,9 +688,8 @@ async def _run_health() -> None:
 
 async def _run_doctor() -> None:
     from code_atlas.server.health import run_health_checks
-    from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings(project_root=Path.cwd())
+    settings = _load_settings()
     report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=True)
     raise typer.Exit(code=0 if report.ok else 1)
@@ -788,10 +797,9 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.daemon import DaemonManager
-    from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     if no_embed:
         settings.embeddings.enabled = False
     init_telemetry(settings.observability)

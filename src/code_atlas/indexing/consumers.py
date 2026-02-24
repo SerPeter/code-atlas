@@ -12,6 +12,7 @@ deduplicates within its batch window.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -128,7 +129,7 @@ class TierConsumer(ABC):
                         try:
                             event = decode_event(self.input_topic, fields)
                             key = self.dedup_key(event)
-                        except Exception:
+                        except KeyError, TypeError, ValueError, json.JSONDecodeError:
                             logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
                             await self.bus.ack(self.input_topic, self.group, msg_id)
                             continue
@@ -152,7 +153,7 @@ class TierConsumer(ABC):
                 try:
                     event = decode_event(self.input_topic, fields)
                     key = self.dedup_key(event)
-                except Exception:
+                except KeyError, TypeError, ValueError, json.JSONDecodeError:
                     logger.exception("{} failed to decode message, skipping", self.consumer_name)
                     await self.bus.ack(self.input_topic, self.group, msg_id)
                     continue

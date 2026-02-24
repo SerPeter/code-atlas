@@ -253,9 +253,13 @@ class EventBus:
         return {"pending": 0, "lag": 0}
 
     async def flush(self) -> None:
-        """Delete all pipeline streams (for full reindex)."""
+        """Clear all pipeline streams for a full reindex.
+
+        Uses XTRIM to remove all entries while preserving consumer groups,
+        so long-running daemon consumers won't get NOGROUP errors.
+        """
         for topic in Topic:
-            await self._redis.delete(self._stream_key(topic))
+            await self._redis.xtrim(self._stream_key(topic), 0, approximate=False)
 
     async def close(self) -> None:
         """Close the connection pool."""
