@@ -97,6 +97,10 @@ _DEFAULT_EXCLUDE: list[str] = [
     ".cache/",
     ".parcel-cache/",
     ".turbo/",
+    # AI agents
+    ".claude/",
+    ".cursor/",
+    ".copilot/",
     # Code Atlas
     ".atlas/",
 ]
