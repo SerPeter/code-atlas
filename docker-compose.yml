@@ -61,8 +61,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: 4
           memory: 4g
+        reservations:
+          memory: 1g
+    command: --auto-truncate
     environment:
       MODEL_ID: ${TEI_MODEL:-Qwen/Qwen3-Embedding-0.6B}
     healthcheck:
