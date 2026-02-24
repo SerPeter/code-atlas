@@ -128,14 +128,17 @@ class EventBus:
     consumers implement their own batching and dedup.
     """
 
-    def __init__(self, settings: RedisSettings) -> None:
+    def __init__(self, settings: RedisSettings, *, project_name: str = "") -> None:
         url = f"redis://{settings.host}:{settings.port}/{settings.db}"
         if settings.password:
             url = f"redis://:{settings.password}@{settings.host}:{settings.port}/{settings.db}"
         self._redis = aioredis.from_url(url, decode_responses=False)
         self._prefix = settings.stream_prefix
+        self._project = project_name
 
     def _stream_key(self, topic: Topic) -> str:
+        if self._project:
+            return f"{self._prefix}:{self._project}:{topic.value}"
         return f"{self._prefix}:{topic.value}"
 
     async def ping(self) -> bool:

@@ -60,7 +60,7 @@ class DaemonManager:
             If ``False``, only start the tier consumers (no filesystem watcher).
             Useful for ``atlas daemon start`` which has no watch root.
         """
-        bus = EventBus(settings.redis)
+        bus = EventBus(settings.redis, project_name=derive_project_name(settings.project_root))
         try:
             await bus.ping()
         except Exception:

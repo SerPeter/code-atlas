@@ -292,8 +292,12 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         settings.embeddings.enabled = False
     init_telemetry(settings.observability)
 
+    from code_atlas.settings import derive_project_name
+
+    project_name = derive_project_name(settings.project_root)
+
     # Connect to Valkey
-    bus = EventBus(settings.redis)
+    bus = EventBus(settings.redis, project_name=project_name)
     try:
         await bus.ping()
     except Exception as exc:
