@@ -91,8 +91,12 @@ def derive_project_name(project_root: Path) -> str:
 
 
 def _default_project_root() -> Path:
-    """Git root if found, otherwise cwd."""
-    return find_git_root() or Path.cwd()
+    """Git root if found, otherwise raise."""
+    root = find_git_root()
+    if root is None:
+        msg = f"No git repository found at or above {Path.cwd()}. Run from inside a git repo or pass an explicit path."
+        raise RuntimeError(msg)
+    return root
 
 
 def _find_atlas_toml() -> Path | None:
@@ -178,6 +182,9 @@ class EmbeddingSettings(BaseSettings):
     batch_size: int = Field(default=32, description="Max texts per embedding API call.")
     max_concurrency: int = Field(default=4, description="Max concurrent embedding API calls.")
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
+    truncate_ratio: float = Field(
+        default=0.9, gt=0, le=1, description="Fraction of max input tokens to use as truncation limit."
+    )
     query_cache_size: int = Field(default=128, description="Max cached query embeddings (LRU eviction).")
     cache_ttl_days: int = Field(default=7, description="Embedding cache TTL in days. 0 disables Valkey caching.")
 

@@ -64,6 +64,55 @@ class EmbedClient:
             self._api_base = None
             self._api_key = None
 
+        # Infer max input tokens from litellm's model registry
+        self._max_input_tokens = self._resolve_max_input_tokens()
+
+    def _resolve_max_input_tokens(self) -> int | None:
+        """Resolve the model's max input token limit from litellm's model registry.
+
+        Applies ``truncate_ratio`` as a safety margin (e.g. 0.9 * 8192 = 7372).
+        """
+        try:
+            info = litellm.get_model_info(self._model)
+            limit = info.get("max_input_tokens")
+            if limit and limit > 0:
+                effective = int(limit * self._settings.truncate_ratio)
+                logger.debug("Embedding model max input tokens: {} (effective: {})", limit, effective)
+                return effective
+        except Exception:
+            logger.opt(exception=True).debug(
+                "Could not determine max input tokens for '{}'; truncation disabled", self._model
+            )
+            return None
+        logger.debug("Could not determine max input tokens for '{}'; truncation disabled", self._model)
+        return None
+
+    def _truncate_texts(self, texts: list[str]) -> list[str]:
+        """Truncate texts exceeding the model's max input token limit."""
+        if self._max_input_tokens is None:
+            return texts
+        limit = self._max_input_tokens
+        result: list[str] = []
+        for text in texts:
+            try:
+                tokens = litellm.encode(model=self._model, text=text)
+            except Exception:
+                result.append(text)
+                continue
+            if len(tokens) <= limit:
+                result.append(text)
+            else:
+                try:
+                    truncated = litellm.decode(model=self._model, tokens=tokens[:limit])
+                except Exception:
+                    truncated = text[: limit * 4]  # ~4 chars/token fallback
+                last_nl = truncated.rfind("\n")
+                if last_nl > 0:
+                    truncated = truncated[:last_nl]
+                logger.warning("Truncated embed text from {} to ~{} tokens", len(tokens), limit)
+                result.append(truncated)
+        return result
+
     def _build_kwargs(self, chunk: list[str]) -> dict[str, Any]:
         """Build keyword arguments for a single litellm.aembedding call."""
         kwargs: dict[str, Any] = {
@@ -88,6 +137,8 @@ class EmbedClient:
         """
         if not texts:
             return []
+
+        texts = self._truncate_texts(texts)
 
         with _tracer.start_as_current_span(
             "embed.embed_batch", attributes={"batch_size": len(texts), "model": self._model}

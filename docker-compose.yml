@@ -34,8 +34,12 @@ services:
       - "6379:6379"
     volumes:
       - valkey-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 384m
     command: >
-      valkey-server --appendonly no --save "" --maxmemory 64mb --maxmemory-policy noeviction
+      valkey-server --appendonly no --save "" --maxmemory 256mb --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
@@ -54,6 +58,13 @@ services:
       - "8080:80"
     volumes:
       - tei-models:/data
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 1g
+    command: --auto-truncate
     environment:
       MODEL_ID: ${TEI_MODEL:-Qwen/Qwen3-Embedding-0.6B}
     healthcheck:

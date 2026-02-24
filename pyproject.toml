@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-atlas-mcp"
-version = "0.2.0-dev.2"
+version = "0.2.0-dev.6"
 description = "A code intelligence graph that gives AI coding agents deep, token-efficient understanding of your codebase."
 readme = "README.md"
 license = "Apache-2.0"
@@ -55,6 +55,7 @@ dependencies = [
     "redis[hiredis]~=7.1",    # async Redis/Valkey client for event bus
     "watchfiles~=1.0",        # Rust-based filesystem watcher
     "python-dotenv~=1.1",     # Load .env files (API keys, ATLAS_* overrides)
+    "tenacity~=9.1",
 ]
 
 [project.optional-dependencies]

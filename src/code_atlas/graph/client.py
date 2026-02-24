@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from neo4j import AsyncGraphDatabase
+from neo4j.exceptions import TransientError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
@@ -209,11 +211,28 @@ class GraphClient:
             result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
             return [dict(record) async for record in result]
 
+    @retry(
+        retry=retry_if_exception_type(TransientError),
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=0.1, min=0.1, max=2),
+        before_sleep=lambda rs: logger.warning(
+            "Transient conflict, retrying {} in {:.1f}s (attempt {}): {}",
+            rs.fn.__qualname__,
+            rs.next_action.sleep,
+            rs.attempt_number,
+            rs.outcome.exception(),
+        ),
+        reraise=True,
+    )
     async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
-        """Execute a write query.
+        """Execute a write query with automatic retry on transient conflicts.
 
         Consumes the result to ensure server-side errors (e.g. constraint
         violations) are raised instead of being silently dropped.
+
+        Memgraph raises ``TransientError`` when concurrent transactions touch
+        the same nodes (MVCC conflict).  These are retried with exponential
+        back-off before propagating.
         """
         with _tracer.start_as_current_span("graph.execute_write", attributes={"db.statement": query[:200]}):
             try:

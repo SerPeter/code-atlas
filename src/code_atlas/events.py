@@ -128,14 +128,17 @@ class EventBus:
     consumers implement their own batching and dedup.
     """
 
-    def __init__(self, settings: RedisSettings) -> None:
+    def __init__(self, settings: RedisSettings, *, project_name: str = "") -> None:
         url = f"redis://{settings.host}:{settings.port}/{settings.db}"
         if settings.password:
             url = f"redis://:{settings.password}@{settings.host}:{settings.port}/{settings.db}"
         self._redis = aioredis.from_url(url, decode_responses=False)
         self._prefix = settings.stream_prefix
+        self._project = project_name
 
     def _stream_key(self, topic: Topic) -> str:
+        if self._project:
+            return f"{self._prefix}:{self._project}:{topic.value}"
         return f"{self._prefix}:{topic.value}"
 
     async def ping(self) -> bool:
@@ -251,6 +254,18 @@ class EventBus:
                 return {"pending": int(pending), "lag": int(lag or 0)}
 
         return {"pending": 0, "lag": 0}
+
+    async def flush(self) -> None:
+        """Clear all pipeline streams for a full reindex.
+
+        Uses XTRIM to remove all entries while preserving consumer groups,
+        so long-running daemon consumers won't get NOGROUP errors.
+        Batched in a single pipeline to avoid per-topic round-trips.
+        """
+        pipe = self._redis.pipeline(transaction=False)
+        for topic in Topic:
+            pipe.xtrim(self._stream_key(topic), 0, approximate=False)
+        await pipe.execute()
 
     async def close(self) -> None:
         """Close the connection pool."""

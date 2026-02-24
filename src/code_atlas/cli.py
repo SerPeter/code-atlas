@@ -5,11 +5,16 @@ from __future__ import annotations
 import asyncio
 import sys
 from dataclasses import asdict, dataclass
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import typer
 from dotenv import find_dotenv, load_dotenv
 from loguru import logger
+from rich.console import Console
+
+if TYPE_CHECKING:
+    from code_atlas.settings import AtlasSettings
 
 _dotenv_path = find_dotenv(usecwd=True)  # '' when not found
 load_dotenv(_dotenv_path)  # Load .env into os.environ (ATLAS_* + provider API keys)
@@ -34,6 +39,10 @@ class OutputMode:
 
 
 _output = OutputMode()
+
+# Shared Rich console — used by both loguru sink and Progress bars so Rich can
+# coordinate output (log lines render *above* any live progress bar).
+_console = Console(stderr=True)
 
 
 def _configure_logger() -> None:
@@ -66,7 +75,12 @@ def _configure_logger() -> None:
     else:
         fmt = "{message}"
 
-    logger.add(sys.stderr, level=level, colorize=False if _output.no_color else None, format=fmt)
+    # Route loguru through the shared Rich console so log lines render above
+    # any active Progress bar instead of clobbering it.
+    def _rich_sink(message: str) -> None:
+        _console.print(message, end="", highlight=False, markup=False)
+
+    logger.add(_rich_sink, level=level, colorize=not _output.no_color, format=fmt)
 
 
 def _echo(msg: str) -> None:
@@ -96,11 +110,58 @@ def main(
     _output.json = json_flag
     _output.verbose = verbose
     _output.no_color = no_color
+    if no_color:
+        _console.no_color = True
     _configure_logger()
 
 
 daemon_app = typer.Typer(name="daemon", help="Manage the Code Atlas indexing daemon.")
 app.add_typer(daemon_app)
+
+
+# ---------------------------------------------------------------------------
+# Git root resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_project_root(path: str, *, no_git_check: bool = False) -> tuple[Path, str | None]:
+    """Resolve project root from a user-supplied path.
+
+    Walks up to find the git root. If the target is a subdirectory of the repo,
+    returns the git root as project root and the relative path as a scope prefix.
+
+    Returns ``(project_root, scope_prefix)`` — *scope_prefix* is ``None`` when
+    *path* IS the git root.
+    """
+    from code_atlas.settings import find_git_root
+
+    target = Path(path).resolve()
+    if no_git_check:
+        return target, None
+
+    git_root = find_git_root(target)
+    if git_root is None:
+        logger.error("No git repository found at or above {}", target)
+        logger.error("Use --no-git-check to index a non-git directory")
+        raise typer.Exit(code=1)
+
+    if git_root == target:
+        return git_root, None
+
+    scope_prefix = target.relative_to(git_root).as_posix()
+    logger.info("Git root: {} — auto-scoping to {}/", git_root, scope_prefix)
+    return git_root, scope_prefix
+
+
+def _load_settings(**overrides: object) -> AtlasSettings:
+    """Load ``AtlasSettings``, converting the git-root RuntimeError into a user-friendly exit."""
+    from code_atlas.settings import AtlasSettings
+
+    try:
+        return AtlasSettings(**overrides)  # type: ignore[arg-type]
+    except RuntimeError as exc:
+        logger.error("{}", exc)
+        raise typer.Exit(code=1) from None
 
 
 @app.command()
@@ -112,9 +173,10 @@ def index(
     ),
     full_reindex: bool = typer.Option(False, "--full", help="Force full re-index, ignoring delta cache."),
     no_embed: bool = typer.Option(False, "--no-embed", help="Disable embeddings (lightweight mode)."),
+    no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow indexing outside a git repository."),
 ) -> None:
     """Index a codebase into the graph."""
-    asyncio.run(_run_index(path, scope, full_reindex, projects=project, no_embed=no_embed))
+    asyncio.run(_run_index(path, scope, full_reindex, projects=project, no_embed=no_embed, no_git_check=no_git_check))
 
 
 @app.command()
@@ -164,10 +226,11 @@ def watch(
     path: str = typer.Argument(".", help="Path to the project root to watch."),
     debounce: float | None = typer.Option(None, "--debounce", help="Debounce timer in seconds (default: 5)."),
     max_wait: float | None = typer.Option(None, "--max-wait", help="Max-wait ceiling in seconds (default: 30)."),
+    no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow watching outside a git repository."),
 ) -> None:
     """Watch a project for file changes and auto-index."""
     try:
-        asyncio.run(_run_watch(path, debounce=debounce, max_wait=max_wait))
+        asyncio.run(_run_watch(path, debounce=debounce, max_wait=max_wait, no_git_check=no_git_check))
     except KeyboardInterrupt:
         logger.info("Interrupted — shutting down")
 
@@ -181,10 +244,9 @@ def mcp(
 ) -> None:
     """Start the MCP server for AI agent connections."""
     from code_atlas.server.mcp import create_mcp_server
-    from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     # CLI args override settings (None = use settings default)
     mcp_cfg = settings.mcp
     transport = transport or mcp_cfg.transport
@@ -213,24 +275,29 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     *,
     projects: list[str] | None = None,
     no_embed: bool = False,
+    no_git_check: bool = False,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
-    from pathlib import Path
-
     from code_atlas.events import EventBus
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.orchestrator import detect_sub_projects
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    project_root = Path(path).resolve()
+    project_root, auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
+    if auto_scope:
+        scope = [auto_scope, *(scope or [])]
     settings = AtlasSettings(project_root=project_root)
     if no_embed:
         settings.embeddings.enabled = False
     init_telemetry(settings.observability)
 
+    from code_atlas.settings import derive_project_name
+
+    project_name = derive_project_name(settings.project_root)
+
     # Connect to Valkey
-    bus = EventBus(settings.redis)
+    bus = EventBus(settings.redis, project_name=project_name)
     try:
         await bus.ping()
     except Exception as exc:
@@ -338,25 +405,32 @@ async def _index_monorepo_with_progress(
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         disable=not show_progress,
-        console=_make_stderr_console(),
+        console=_console,
     ) as progress:
         task = progress.add_task("Indexing", total=None)
 
         def on_progress(name: str, current: int, total: int) -> None:
             progress.update(task, total=total, completed=current, description=name)
 
-        drain_started = False
+        drain_prev_remaining: int | None = None
+        drain_processed = 0
 
         def on_drain(t1: int, t2: int, t3: int) -> None:
-            nonlocal drain_started
+            nonlocal drain_prev_remaining, drain_processed
             remaining = t1 + t2 + t3
-            if not drain_started:
-                progress.update(task, total=None, completed=0)
-                drain_started = True
-            if remaining > 0:
-                progress.update(task, description=f"Processing {remaining} event(s)")
+            if drain_prev_remaining is None:
+                # First drain tick — switch from project-count to event-count bar
+                drain_processed = 0
             else:
-                progress.update(task, description="Finalizing")
+                consumed = drain_prev_remaining - remaining
+                if consumed > 0:
+                    drain_processed += consumed
+            drain_prev_remaining = remaining
+            total = drain_processed + remaining
+            if remaining > 0:
+                progress.update(task, total=total, completed=drain_processed, description="Processing events")
+            else:
+                progress.update(task, total=total, completed=total, description="Done")
 
         results: list[IndexResult] = await index_monorepo(
             settings,
@@ -391,7 +465,7 @@ async def _index_single_with_spinner(
         TextColumn("{task.description}"),
         TimeElapsedColumn(),
         disable=not show_progress,
-        console=_make_stderr_console(),
+        console=_console,
     ) as progress:
         task = progress.add_task("Indexing...", total=None)
 
@@ -414,13 +488,6 @@ async def _index_single_with_spinner(
     return result  # noqa: RET504
 
 
-def _make_stderr_console() -> Any:
-    """Create a Rich Console that writes to stderr (so stdout stays clean for --json)."""
-    from rich.console import Console
-
-    return Console(stderr=True, no_color=_output.no_color)
-
-
 async def _run_search(  # noqa: PLR0912, PLR0915
     query: str,
     type_: str,
@@ -436,10 +503,9 @@ async def _run_search(  # noqa: PLR0912, PLR0915
     from code_atlas.indexing.orchestrator import StalenessChecker
     from code_atlas.search.embeddings import EmbedClient
     from code_atlas.search.engine import SearchType, hybrid_search
-    from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     init_telemetry(settings.observability)
     graph = GraphClient(settings)
     try:
@@ -542,9 +608,8 @@ async def _run_search(  # noqa: PLR0912, PLR0915
 async def _run_status() -> None:
     """Async implementation of the ``atlas status`` command."""
     from code_atlas.graph.client import GraphClient
-    from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     graph = GraphClient(settings)
     try:
         await graph.ping()
@@ -618,9 +683,8 @@ async def _run_status() -> None:
 
 async def _run_health() -> None:
     from code_atlas.server.health import run_health_checks
-    from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=False)
     raise typer.Exit(code=0 if report.ok else 1)
@@ -628,9 +692,8 @@ async def _run_health() -> None:
 
 async def _run_doctor() -> None:
     from code_atlas.server.health import run_health_checks
-    from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=True)
     raise typer.Exit(code=0 if report.ok else 1)
@@ -669,7 +732,7 @@ def _print_report(report: object, *, detailed: bool) -> None:
         CheckStatus.FAIL: "[red]\u2717[/red]",
     }
 
-    console = _make_stderr_console()
+    console = _console
     for c in rpt.checks:
         icon = status_icon.get(c.status, "?")
         console.print(f"{icon} {c.name:<20} {c.message}")
@@ -687,16 +750,14 @@ def _print_report(report: object, *, detailed: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None) -> None:
+async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None, no_git_check: bool = False) -> None:
     """Async implementation of the ``atlas watch`` command."""
-    from pathlib import Path
-
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    project_root = Path(path).resolve()
+    project_root, _auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
     settings = AtlasSettings(project_root=project_root)
     init_telemetry(settings.observability)
     if debounce is not None:
@@ -740,10 +801,9 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
     """Start the EventBus and all tier consumers, run until interrupted."""
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.daemon import DaemonManager
-    from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    settings = AtlasSettings()
+    settings = _load_settings()
     if no_embed:
         settings.embeddings.enabled = False
     init_telemetry(settings.observability)
