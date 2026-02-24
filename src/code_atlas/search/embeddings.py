@@ -80,7 +80,10 @@ class EmbedClient:
                 logger.debug("Embedding model max input tokens: {} (effective: {})", limit, effective)
                 return effective
         except Exception:
-            pass
+            logger.opt(exception=True).debug(
+                "Could not determine max input tokens for '{}'; truncation disabled", self._model
+            )
+            return None
         logger.debug("Could not determine max input tokens for '{}'; truncation disabled", self._model)
         return None
 

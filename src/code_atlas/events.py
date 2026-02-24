@@ -257,9 +257,12 @@ class EventBus:
 
         Uses XTRIM to remove all entries while preserving consumer groups,
         so long-running daemon consumers won't get NOGROUP errors.
+        Batched in a single pipeline to avoid per-topic round-trips.
         """
+        pipe = self._redis.pipeline(transaction=False)
         for topic in Topic:
-            await self._redis.xtrim(self._stream_key(topic), 0, approximate=False)
+            pipe.xtrim(self._stream_key(topic), 0, approximate=False)
+        await pipe.execute()
 
     async def close(self) -> None:
         """Close the connection pool."""
