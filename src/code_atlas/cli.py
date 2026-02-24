@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -115,6 +116,40 @@ daemon_app = typer.Typer(name="daemon", help="Manage the Code Atlas indexing dae
 app.add_typer(daemon_app)
 
 
+# ---------------------------------------------------------------------------
+# Git root resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_project_root(path: str, *, no_git_check: bool = False) -> tuple[Path, str | None]:
+    """Resolve project root from a user-supplied path.
+
+    Walks up to find the git root. If the target is a subdirectory of the repo,
+    returns the git root as project root and the relative path as a scope prefix.
+
+    Returns ``(project_root, scope_prefix)`` — *scope_prefix* is ``None`` when
+    *path* IS the git root.
+    """
+    from code_atlas.settings import find_git_root
+
+    target = Path(path).resolve()
+    if no_git_check:
+        return target, None
+
+    git_root = find_git_root(target)
+    if git_root is None:
+        logger.error("No git repository found at or above {}", target)
+        logger.error("Use --no-git-check to index a non-git directory")
+        raise typer.Exit(code=1)
+
+    if git_root == target:
+        return git_root, None
+
+    scope_prefix = target.relative_to(git_root).as_posix()
+    logger.info("Git root: {} — auto-scoping to {}/", git_root, scope_prefix)
+    return git_root, scope_prefix
+
+
 @app.command()
 def index(
     path: str = typer.Argument(".", help="Path to the project root to index."),
@@ -124,9 +159,10 @@ def index(
     ),
     full_reindex: bool = typer.Option(False, "--full", help="Force full re-index, ignoring delta cache."),
     no_embed: bool = typer.Option(False, "--no-embed", help="Disable embeddings (lightweight mode)."),
+    no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow indexing outside a git repository."),
 ) -> None:
     """Index a codebase into the graph."""
-    asyncio.run(_run_index(path, scope, full_reindex, projects=project, no_embed=no_embed))
+    asyncio.run(_run_index(path, scope, full_reindex, projects=project, no_embed=no_embed, no_git_check=no_git_check))
 
 
 @app.command()
@@ -176,10 +212,11 @@ def watch(
     path: str = typer.Argument(".", help="Path to the project root to watch."),
     debounce: float | None = typer.Option(None, "--debounce", help="Debounce timer in seconds (default: 5)."),
     max_wait: float | None = typer.Option(None, "--max-wait", help="Max-wait ceiling in seconds (default: 30)."),
+    no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow watching outside a git repository."),
 ) -> None:
     """Watch a project for file changes and auto-index."""
     try:
-        asyncio.run(_run_watch(path, debounce=debounce, max_wait=max_wait))
+        asyncio.run(_run_watch(path, debounce=debounce, max_wait=max_wait, no_git_check=no_git_check))
     except KeyboardInterrupt:
         logger.info("Interrupted — shutting down")
 
@@ -225,17 +262,18 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     *,
     projects: list[str] | None = None,
     no_embed: bool = False,
+    no_git_check: bool = False,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
-    from pathlib import Path
-
     from code_atlas.events import EventBus
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.orchestrator import detect_sub_projects
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    project_root = Path(path).resolve()
+    project_root, auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
+    if auto_scope:
+        scope = [auto_scope, *(scope or [])]
     settings = AtlasSettings(project_root=project_root)
     if no_embed:
         settings.embeddings.enabled = False
@@ -632,7 +670,7 @@ async def _run_health() -> None:
     from code_atlas.server.health import run_health_checks
     from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings()
+    settings = AtlasSettings(project_root=Path.cwd())
     report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=False)
     raise typer.Exit(code=0 if report.ok else 1)
@@ -642,7 +680,7 @@ async def _run_doctor() -> None:
     from code_atlas.server.health import run_health_checks
     from code_atlas.settings import AtlasSettings
 
-    settings = AtlasSettings()
+    settings = AtlasSettings(project_root=Path.cwd())
     report = await run_health_checks(settings, dotenv_path=_dotenv_path)
     _print_report(report, detailed=True)
     raise typer.Exit(code=0 if report.ok else 1)
@@ -699,16 +737,14 @@ def _print_report(report: object, *, detailed: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None) -> None:
+async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None, no_git_check: bool = False) -> None:
     """Async implementation of the ``atlas watch`` command."""
-    from pathlib import Path
-
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
-    project_root = Path(path).resolve()
+    project_root, _auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
     settings = AtlasSettings(project_root=project_root)
     init_telemetry(settings.observability)
     if debounce is not None:

@@ -91,8 +91,12 @@ def derive_project_name(project_root: Path) -> str:
 
 
 def _default_project_root() -> Path:
-    """Git root if found, otherwise cwd."""
-    return find_git_root() or Path.cwd()
+    """Git root if found, otherwise raise."""
+    root = find_git_root()
+    if root is None:
+        msg = f"No git repository found at or above {Path.cwd()}. Run from inside a git repo or pass an explicit path."
+        raise RuntimeError(msg)
+    return root
 
 
 def _find_atlas_toml() -> Path | None:
