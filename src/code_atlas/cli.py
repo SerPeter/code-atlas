@@ -77,7 +77,7 @@ def _configure_logger() -> None:
     def _rich_sink(message: str) -> None:
         _console.print(message, end="", highlight=False, markup=False)
 
-    logger.add(_rich_sink, level=level, colorize=False, format=fmt)
+    logger.add(_rich_sink, level=level, colorize=not _output.no_color, format=fmt)
 
 
 def _echo(msg: str) -> None:
