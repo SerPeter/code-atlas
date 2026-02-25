@@ -443,17 +443,20 @@ class Tier2ASTConsumer(TierConsumer):
                     if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
                         batch_max_sig = file_sig
 
-                # Post-batch import resolution (per project)
+                # Post-batch import resolution (per project — must run first so import
+                # edges are available for the call/type lookup below)
                 if group_import_rels:
                     await self.graph.resolve_imports(project_name, group_import_rels)
 
-                # Post-batch call resolution (per project, after imports so import map is available)
-                if group_call_rels:
-                    await self.graph.resolve_calls(project_name, group_call_rels)
-
-                # Post-batch USES_TYPE resolution (per project, after imports so import map is available)
-                if group_type_rels:
-                    await self.graph.resolve_type_refs(project_name, group_type_rels)
+                # Post-batch CALLS + USES_TYPE resolution with shared lookup (saves 3 RTTs)
+                if group_call_rels or group_type_rels:
+                    shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
+                    if group_call_rels:
+                        await self.graph.resolve_calls(project_name, group_call_rels, lookup=shared_lookup)
+                    if group_type_rels:
+                        await self.graph.resolve_type_refs(
+                            project_name, group_type_rels, lookup=shared_lookup, name_to_typedefs=td_map
+                        )
 
             span.set_attribute("files_count", total_paths)
             span.set_attribute("entities_changed", total_changed)

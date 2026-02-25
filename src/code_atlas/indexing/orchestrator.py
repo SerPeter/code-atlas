@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 import pathspec
 from loguru import logger
 
-from code_atlas.events import EventBus, FileChanged, Topic
+from code_atlas.events import Event, EventBus, FileChanged, Topic
 from code_atlas.indexing.consumers import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
@@ -817,12 +817,8 @@ async def _create_package_hierarchy(graph: GraphClient, project_name: str, proje
     """Create Project + Package nodes and CONTAINS edges. Returns package count."""
     await graph.merge_project_node(project_name)
     packages = _detect_packages(project_root)
-    for qn, rel_path in packages:
-        pkg_name = qn.rsplit(".", 1)[-1]
-        await graph.merge_package_node(project_name, qn, pkg_name, f"{rel_path}/__init__.py")
-        parent_qn = qn.rsplit(".", 1)[0] if "." in qn else None
-        parent_uid = f"{project_name}:{parent_qn}" if parent_qn else project_name
-        await graph.create_contains_edge(parent_uid, f"{project_name}:{qn}")
+    batch = [(qn, qn.rsplit(".", 1)[-1], f"{rel_path}/__init__.py") for qn, rel_path in packages]
+    await graph.merge_package_batch(project_name, batch)
     return len(packages)
 
 
@@ -953,35 +949,32 @@ async def _publish_events(
 ) -> int:
     """Publish FileChanged events and return the count published."""
     if mode == "delta":
-        published = 0
-        for fp in decision.files_added:
-            await bus.publish(
-                Topic.FILE_CHANGED,
-                FileChanged(path=fp, change_type="created", project_name=project_name, project_root=project_root),
-            )
-            published += 1
-        for fp in decision.files_modified:
-            await bus.publish(
-                Topic.FILE_CHANGED,
-                FileChanged(path=fp, change_type="modified", project_name=project_name, project_root=project_root),
-            )
-            published += 1
-        for fp in decision.files_deleted:
-            await bus.publish(
-                Topic.FILE_CHANGED,
-                FileChanged(path=fp, change_type="deleted", project_name=project_name, project_root=project_root),
-            )
-            published += 1
-        logger.debug("Published {} FileChanged events (delta)", published)
-        return published
-
-    for file_path in files:
-        await bus.publish(
-            Topic.FILE_CHANGED,
-            FileChanged(path=file_path, change_type="created", project_name=project_name, project_root=project_root),
+        events: list[Event] = []
+        events.extend(
+            FileChanged(path=fp, change_type="created", project_name=project_name, project_root=project_root)
+            for fp in decision.files_added
         )
-    logger.debug("Published {} FileChanged events (full)", len(files))
-    return len(files)
+        events.extend(
+            FileChanged(path=fp, change_type="modified", project_name=project_name, project_root=project_root)
+            for fp in decision.files_modified
+        )
+        events.extend(
+            FileChanged(path=fp, change_type="deleted", project_name=project_name, project_root=project_root)
+            for fp in decision.files_deleted
+        )
+        if events:
+            await bus.publish_many(Topic.FILE_CHANGED, events)
+        logger.debug("Published {} FileChanged events (delta)", len(events))
+        return len(events)
+
+    full_events: list[Event] = [
+        FileChanged(path=file_path, change_type="created", project_name=project_name, project_root=project_root)
+        for file_path in files
+    ]
+    if full_events:
+        await bus.publish_many(Topic.FILE_CHANGED, full_events)
+    logger.debug("Published {} FileChanged events (full)", len(full_events))
+    return len(full_events)
 
 
 def _record_index_metrics(span: Any, mode: str, files: int, entities: int, duration: float) -> None:
@@ -1470,19 +1463,21 @@ async def _wait_for_drain(
     """
     deadline = time.monotonic() + timeout_s
     settled_since: float | None = None
+    poll_interval = 0.5
 
     while time.monotonic() < deadline:
-        t1_info = await bus.stream_group_info(Topic.FILE_CHANGED, "tier1-graph")
-        t2_info = await bus.stream_group_info(Topic.AST_DIRTY, "tier2-ast")
-
-        t1_remaining = t1_info["pending"] + t1_info["lag"]
-        t2_remaining = t2_info["pending"] + t2_info["lag"]
-
+        queries: list[tuple[Topic, str]] = [
+            (Topic.FILE_CHANGED, "tier1-graph"),
+            (Topic.AST_DIRTY, "tier2-ast"),
+        ]
         if embed_enabled:
-            t3_info = await bus.stream_group_info(Topic.EMBED_DIRTY, "tier3-embed")
-            t3_remaining = t3_info["pending"] + t3_info["lag"]
-        else:
-            t3_remaining = 0
+            queries.append((Topic.EMBED_DIRTY, "tier3-embed"))
+
+        infos = await bus.stream_group_info_multi(queries)
+
+        t1_remaining = infos[0]["pending"] + infos[0]["lag"]
+        t2_remaining = infos[1]["pending"] + infos[1]["lag"]
+        t3_remaining = infos[2]["pending"] + infos[2]["lag"] if embed_enabled else 0
 
         if on_drain_progress is not None:
             on_drain_progress(t1_remaining, t2_remaining, t3_remaining)
@@ -1493,9 +1488,12 @@ async def _wait_for_drain(
             elif time.monotonic() - settled_since >= 1.0:
                 logger.debug("Pipeline drained after {:.1f}s settling", time.monotonic() - settled_since)
                 return
+            # Adaptive backoff: poll less frequently once idle
+            poll_interval = min(2.0, poll_interval * 1.5)
         else:
             settled_since = None
+            poll_interval = 0.5  # reset to fast polling when work is happening
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(poll_interval)
 
     logger.warning("Pipeline drain timed out after {:.0f}s", timeout_s)

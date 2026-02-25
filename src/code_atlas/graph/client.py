@@ -191,6 +191,7 @@ class GraphClient:
         self._embeddings_enabled = settings.embeddings.enabled
         self._query_timeout_s = mg.query_timeout_s
         self._write_timeout_s = mg.write_timeout_s
+        self._active_tx: Any = None  # set during managed transactions
 
     async def ping(self) -> bool:
         """Health check — returns True if Memgraph is reachable."""
@@ -199,6 +200,9 @@ class GraphClient:
 
     async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute a read query and return results as a list of dicts."""
+        if self._active_tx is not None:
+            result = await self._active_tx.run(query, params or {})
+            return [dict(record) async for record in result]
         with _tracer.start_as_current_span("graph.execute", attributes={"db.statement": query[:200]}):
             try:
                 return await asyncio.wait_for(self._execute_inner(query, params), timeout=self._query_timeout_s)
@@ -210,6 +214,21 @@ class GraphClient:
         async with self._driver.session() as session:
             result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
             return [dict(record) async for record in result]
+
+    async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
+        """Execute a write query with automatic retry on transient conflicts.
+
+        Consumes the result to ensure server-side errors (e.g. constraint
+        violations) are raised instead of being silently dropped.
+
+        When called inside a managed transaction (``_active_tx`` is set),
+        errors propagate directly — the managed transaction handles retries.
+        """
+        if self._active_tx is not None:
+            result = await self._active_tx.run(query, params or {})
+            await result.consume()
+            return
+        await self._execute_write_with_retry(query, params)
 
     @retry(
         retry=retry_if_exception_type(TransientError),
@@ -224,16 +243,8 @@ class GraphClient:
         ),
         reraise=True,
     )
-    async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
-        """Execute a write query with automatic retry on transient conflicts.
-
-        Consumes the result to ensure server-side errors (e.g. constraint
-        violations) are raised instead of being silently dropped.
-
-        Memgraph raises ``TransientError`` when concurrent transactions touch
-        the same nodes (MVCC conflict).  These are retried with exponential
-        back-off before propagating.
-        """
+    async def _execute_write_with_retry(self, query: str, params: dict[str, Any] | None = None) -> None:
+        """Standalone write with retry + timeout (not used inside managed transactions)."""
         with _tracer.start_as_current_span("graph.execute_write", attributes={"db.statement": query[:200]}):
             try:
                 await asyncio.wait_for(self._execute_write_inner(query, params), timeout=self._write_timeout_s)
@@ -311,18 +322,40 @@ class GraphClient:
         classify each as added/modified/deleted/unchanged.  Unchanged entities
         are skipped entirely — their embed data is never touched.
 
-        When entities are added or deleted, unchanged entities may have shifted
-        line positions.  Their ``line_start``/``line_end`` are updated without
-        invalidating embeddings.
+        All graph reads and writes run inside a single managed transaction
+        for atomicity and reduced session overhead.  ``session.execute_write``
+        auto-retries on ``TransientError`` (MVCC conflicts).
 
         Returns an ``UpsertResult`` describing what changed.
         """
-        # 1. Read old content hashes + positions
-        old_data = await self.get_file_content_hashes(project_name, file_path)
-
-        # 2. Build new hash map keyed on uid (= qualified_name including project prefix)
+        # Pre-compute new hash map outside the transaction (pure Python)
         new_hashes: dict[str, str] = {e.qualified_name: e.content_hash for e in entities}
         new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
+
+        async def _tx_fn(tx: Any) -> UpsertResult:
+            self._active_tx = tx
+            try:
+                return await self._upsert_file_entities_inner(
+                    project_name, file_path, entities, relationships, new_hashes, new_entity_map
+                )
+            finally:
+                self._active_tx = None
+
+        async with self._driver.session() as session:
+            return await session.execute_write(_tx_fn)
+
+    async def _upsert_file_entities_inner(
+        self,
+        project_name: str,
+        file_path: str,
+        entities: list[ParsedEntity],
+        relationships: list[ParsedRelationship],
+        new_hashes: dict[str, str],
+        new_entity_map: dict[str, ParsedEntity],
+    ) -> UpsertResult:
+        """Core upsert logic — runs inside a managed transaction via ``_active_tx``."""
+        # 1. Read old content hashes + positions (routes through _active_tx)
+        old_data = await self.get_file_content_hashes(project_name, file_path)
 
         old_uids = set(old_data)
         new_uids = set(new_hashes)
@@ -333,24 +366,24 @@ class GraphClient:
         modified_uids = {uid for uid in common_uids if old_data[uid][0] != new_hashes[uid]}
         unchanged_uids = common_uids - modified_uids
 
-        # 3. Fast path: nothing changed → skip graph writes entirely
+        # 2. Fast path: nothing changed → skip graph writes entirely
         if not added_uids and not deleted_uids and not modified_uids:
             logger.debug("Delta skip (no changes) for {}", file_path)
             return UpsertResult(
                 unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
             )
 
-        # 4. Apply delta
-        # 4a. Delete removed entity nodes
+        # 3. Apply delta (all writes route through _active_tx)
+        # 3a. Delete removed entity nodes
         if deleted_uids:
             await self._batch_delete_entities(list(deleted_uids))
 
-        # 4b. Create new entity nodes
+        # 3b. Create new entity nodes
         if added_uids:
             added_entities = [new_entity_map[uid] for uid in added_uids]
             await self._batch_create_entities(project_name, added_entities)
 
-        # 4c. Update modified entity nodes + compute per-entity significance
+        # 3c. Update modified entity nodes + compute per-entity significance
         mod_significance: dict[str, str] = {}
         if modified_uids:
             modified_entities = [new_entity_map[uid] for uid in modified_uids]
@@ -365,11 +398,9 @@ class GraphClient:
                 elif (new_entity.docstring or "") != (old_doc or ""):
                     mod_significance[qn] = "MODERATE"
                 else:
-                    # Other semantic field change (name/kind/visibility/tags)
                     mod_significance[qn] = "HIGH"
 
-        # 4d. Update positions of unchanged entities that shifted
-        #     (only when entity count changed — adds or deletes cause shifts)
+        # 3d. Update positions of unchanged entities that shifted
         if unchanged_uids and (added_uids or deleted_uids):
             shifted = [
                 new_entity_map[uid]
@@ -380,8 +411,7 @@ class GraphClient:
             if shifted:
                 await self._batch_update_positions(shifted)
 
-        # 4e. Recreate ALL relationships for the file (delete old, create new).
-        #     Relationships are cheap and context-dependent — simpler to rebuild.
+        # 3e. Recreate ALL relationships for the file (delete old, create new).
         await self._recreate_file_relationships(project_name, file_path, relationships)
 
         result = UpsertResult(
@@ -446,6 +476,50 @@ class GraphClient:
         await self.execute_write(
             f"MATCH (a {{uid: $from_uid}}), (b {{uid: $to_uid}}) MERGE (a)-[:{RelType.CONTAINS}]->(b)",
             {"from_uid": from_uid, "to_uid": to_uid},
+        )
+
+    async def merge_package_batch(
+        self,
+        project_name: str,
+        packages: list[tuple[str, str, str]],
+    ) -> None:
+        """Create/update Package nodes and CONTAINS edges in two batched queries.
+
+        Each tuple is ``(qualified_name, name, file_path)``.  Parent UIDs are
+        derived from the dotted *qualified_name* prefix; top-level packages
+        point to the Project node.
+        """
+        if not packages:
+            return
+
+        params = []
+        for qn, name, fp in packages:
+            uid = f"{project_name}:{qn}"
+            parent_qn = qn.rsplit(".", 1)[0] if "." in qn else None
+            parent_uid = f"{project_name}:{parent_qn}" if parent_qn else project_name
+            params.append(
+                {
+                    "uid": uid,
+                    "project_name": project_name,
+                    "name": name,
+                    "qualified_name": qn,
+                    "file_path": fp,
+                    "parent_uid": parent_uid,
+                }
+            )
+
+        await self.execute_write(
+            f"UNWIND $pkgs AS p "
+            f"MERGE (n:{NodeLabel.PACKAGE} {{uid: p.uid}}) "
+            f"SET n.project_name = p.project_name, n.name = p.name, "
+            f"n.qualified_name = p.qualified_name, n.file_path = p.file_path",
+            {"pkgs": params},
+        )
+        await self.execute_write(
+            f"UNWIND $pkgs AS p "
+            f"MATCH (parent {{uid: p.parent_uid}}), (child {{uid: p.uid}}) "
+            f"MERGE (parent)-[:{RelType.CONTAINS}]->(child)",
+            {"pkgs": params},
         )
 
     async def delete_project_data(self, project_name: str) -> None:
@@ -631,14 +705,14 @@ class GraphClient:
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
-                f"CREATE (a)-[:{RelType.IMPORTS}]->(b)",
+                f"MERGE (a)-[:{RelType.IMPORTS}]->(b)",
                 {"rels": normal_edges},
             )
         if type_only_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
-                f"CREATE (a)-[e:{RelType.IMPORTS}]->(b) SET e.type_only = true",
+                f"MERGE (a)-[e:{RelType.IMPORTS}]->(b) ON CREATE SET e.type_only = true",
                 {"rels": type_only_edges},
             )
 
@@ -653,6 +727,8 @@ class GraphClient:
         self,
         project_name: str,
         call_rels: list[ParsedRelationship],
+        *,
+        lookup: _CallLookup | None = None,
     ) -> None:
         """Resolve CALLS relationships after all files in a batch have been upserted.
 
@@ -667,7 +743,8 @@ class GraphClient:
         if not call_rels:
             return
 
-        lookup = await self._build_call_lookup(project_name)
+        if lookup is None:
+            lookup = await self._build_call_lookup(project_name)
 
         # Resolve each call
         edges: set[tuple[str, str]] = set()
@@ -685,7 +762,7 @@ class GraphClient:
         if edges:
             edge_params = [{"f": f, "t": t} for f, t in edges]
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) CREATE (a)-[:{RelType.CALLS}]->(b)",
+                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) MERGE (a)-[:{RelType.CALLS}]->(b)",
                 {"rels": edge_params},
             )
 
@@ -695,6 +772,9 @@ class GraphClient:
         self,
         project_name: str,
         type_rels: list[ParsedRelationship],
+        *,
+        lookup: _CallLookup | None = None,
+        name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
     ) -> None:
         """Resolve USES_TYPE relationships after all files in a batch have been upserted.
 
@@ -708,17 +788,18 @@ class GraphClient:
         if not type_rels:
             return
 
-        lookup = await self._build_call_lookup(project_name)
+        if lookup is None:
+            lookup = await self._build_call_lookup(project_name)
 
-        # Also build a name → TypeDef uid map
-        td_records = await self.execute(
-            f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
-            "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
-            {"p": project_name},
-        )
-        name_to_typedefs: dict[str, list[tuple[str, str]]] = {}  # name → [(uid, file_path)]
-        for r in td_records:
-            name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
+        if name_to_typedefs is None:
+            td_records = await self.execute(
+                f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
+                "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
+                {"p": project_name},
+            )
+            name_to_typedefs = {}
+            for r in td_records:
+                name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
 
         edges: set[tuple[str, str]] = set()
         resolved = 0
@@ -766,7 +847,7 @@ class GraphClient:
         if edges:
             edge_params = [{"f": f, "t": t} for f, t in edges]
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) CREATE (a)-[:{RelType.USES_TYPE}]->(b)",
+                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) MERGE (a)-[:{RelType.USES_TYPE}]->(b)",
                 {"rels": edge_params},
             )
 
@@ -815,6 +896,27 @@ class GraphClient:
             parent_children=parent_children,
             uid_to_info=uid_to_info,
         )
+
+    async def build_resolution_lookup(self, project_name: str) -> tuple[_CallLookup, dict[str, list[tuple[str, str]]]]:
+        """Build shared lookup tables for both CALLS and USES_TYPE resolution.
+
+        Returns ``(call_lookup, name_to_typedefs)`` where *name_to_typedefs*
+        maps ``name → [(uid, file_path)]`` for TypeDef nodes.  Building both
+        in a single call saves 3 redundant graph queries vs. calling
+        ``_build_call_lookup`` twice.
+        """
+        lookup = await self._build_call_lookup(project_name)
+
+        td_records = await self.execute(
+            f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
+            "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
+            {"p": project_name},
+        )
+        name_to_typedefs: dict[str, list[tuple[str, str]]] = {}
+        for r in td_records:
+            name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
+
+        return lookup, name_to_typedefs
 
     async def update_external_package_versions(
         self,
@@ -1583,11 +1685,16 @@ class GraphClient:
         doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
         inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
 
-        for rel in inherits_rels:
+        if inherits_rels:
+            inh_params = [
+                {"from_uid": r.from_qualified_name, "project": project_name, "to_name": r.to_name}
+                for r in inherits_rels
+            ]
             await self.execute_write(
-                f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
+                f"UNWIND $rels AS r "
+                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: r.project, name: r.to_name}}) "
                 f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
-                {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
+                {"rels": inh_params},
             )
 
         if doc_rels:

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import re
 import time
 import tomllib
@@ -20,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
+import orjson
 from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
@@ -929,8 +929,8 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         weight_dict: dict[str, float] | None = None
         if weights:
             try:
-                weight_dict = json.loads(weights)
-            except json.JSONDecodeError:
+                weight_dict = orjson.loads(weights)
+            except orjson.JSONDecodeError:
                 return _error("Invalid weights JSON", code="INVALID_WEIGHTS")
 
         # Resolve scope: default to current project, expand globs/commas for monorepos
