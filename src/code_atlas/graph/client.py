@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
@@ -21,10 +22,12 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
+    _ENTITY_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     SCHEMA_VERSION,
     NodeLabel,
     RelType,
+    generate_composite_index_ddl,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
@@ -45,6 +48,14 @@ if TYPE_CHECKING:
 _tracer = get_tracer(__name__)
 
 _VALID_LABELS: frozenset[str] = frozenset(lbl.value for lbl in NodeLabel)
+
+# Entity labels that can appear as file-level nodes (excluding Package, Project).
+_FILE_ENTITY_LABELS: tuple[NodeLabel, ...] = tuple(
+    sorted(
+        (lbl for lbl in _ENTITY_LABELS if lbl not in {NodeLabel.PACKAGE, NodeLabel.PROJECT}),
+        key=lambda lbl: lbl.value,
+    )
+)
 
 
 def _assert_valid_label(label: str) -> None:
@@ -176,6 +187,10 @@ class CallStats:
     callee_names: list[str] = field(default_factory=list)
 
 
+# Per-task transaction context — prevents leaking between concurrent asyncio tasks.
+_active_tx_var: contextvars.ContextVar[Any] = contextvars.ContextVar("_active_tx_var", default=None)
+
+
 class GraphClient:
     """Async Memgraph client wrapping the neo4j Bolt driver.
 
@@ -191,7 +206,6 @@ class GraphClient:
         self._embeddings_enabled = settings.embeddings.enabled
         self._query_timeout_s = mg.query_timeout_s
         self._write_timeout_s = mg.write_timeout_s
-        self._active_tx: Any = None  # set during managed transactions
 
     async def ping(self) -> bool:
         """Health check — returns True if Memgraph is reachable."""
@@ -200,8 +214,9 @@ class GraphClient:
 
     async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute a read query and return results as a list of dicts."""
-        if self._active_tx is not None:
-            result = await self._active_tx.run(query, params or {})
+        active_tx = _active_tx_var.get()
+        if active_tx is not None:
+            result = await active_tx.run(query, params or {})
             return [dict(record) async for record in result]
         with _tracer.start_as_current_span("graph.execute", attributes={"db.statement": query[:200]}):
             try:
@@ -221,11 +236,12 @@ class GraphClient:
         Consumes the result to ensure server-side errors (e.g. constraint
         violations) are raised instead of being silently dropped.
 
-        When called inside a managed transaction (``_active_tx`` is set),
+        When called inside a managed transaction (``_active_tx_var`` is set),
         errors propagate directly — the managed transaction handles retries.
         """
-        if self._active_tx is not None:
-            result = await self._active_tx.run(query, params or {})
+        active_tx = _active_tx_var.get()
+        if active_tx is not None:
+            result = await active_tx.run(query, params or {})
             await result.consume()
             return
         await self._execute_write_with_retry(query, params)
@@ -298,16 +314,18 @@ class GraphClient:
 
     async def get_file_content_hashes(
         self, project_name: str, file_path: str
-    ) -> dict[str, tuple[str, int, int, str | None, str | None]]:
-        """Return ``{uid: (content_hash, line_start, line_end, signature, docstring)}`` for all non-structural nodes."""
+    ) -> dict[str, tuple[str, int, int, str | None, str | None, str]]:
+        """Return ``{uid: (hash, line_start, line_end, sig, doc, label)}`` for non-structural nodes."""
         records = await self.execute(
             f"MATCH (n {{project_name: $p, file_path: $f}}) "
             f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
             "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le, "
-            "n.signature AS sig, n.docstring AS doc",
+            "n.signature AS sig, n.docstring AS doc, labels(n)[0] AS lbl",
             {"p": project_name, "f": file_path},
         )
-        return {r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"]) for r in records}
+        return {
+            r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or "") for r in records
+        }
 
     async def upsert_file_entities(
         self,
@@ -333,13 +351,13 @@ class GraphClient:
         new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
 
         async def _tx_fn(tx: Any) -> UpsertResult:
-            self._active_tx = tx
+            token = _active_tx_var.set(tx)
             try:
                 return await self._upsert_file_entities_inner(
                     project_name, file_path, entities, relationships, new_hashes, new_entity_map
                 )
             finally:
-                self._active_tx = None
+                _active_tx_var.reset(token)
 
         async with self._driver.session() as session:
             return await session.execute_write(_tx_fn)
@@ -353,8 +371,8 @@ class GraphClient:
         new_hashes: dict[str, str],
         new_entity_map: dict[str, ParsedEntity],
     ) -> UpsertResult:
-        """Core upsert logic — runs inside a managed transaction via ``_active_tx``."""
-        # 1. Read old content hashes + positions (routes through _active_tx)
+        """Core upsert logic — runs inside a managed transaction via ``_active_tx_var``."""
+        # 1. Read old content hashes + positions (routes through _active_tx_var)
         old_data = await self.get_file_content_hashes(project_name, file_path)
 
         old_uids = set(old_data)
@@ -373,10 +391,13 @@ class GraphClient:
                 unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
             )
 
-        # 3. Apply delta (all writes route through _active_tx)
+        # 3. Apply delta (all writes route through _active_tx_var)
         # 3a. Delete removed entity nodes
         if deleted_uids:
-            await self._batch_delete_entities(list(deleted_uids))
+            uids_by_label: dict[str, list[str]] = defaultdict(list)
+            for uid in deleted_uids:
+                uids_by_label[old_data[uid][5]].append(uid)
+            await self._batch_delete_entities(dict(uids_by_label))
 
         # 3b. Create new entity nodes
         if added_uids:
@@ -412,7 +433,10 @@ class GraphClient:
                 await self._batch_update_positions(shifted)
 
         # 3e. Recreate ALL relationships for the file (delete old, create new).
-        await self._recreate_file_relationships(project_name, file_path, relationships)
+        uid_label_map = {e.qualified_name: e.label.value for e in entities}
+        await self._recreate_file_relationships(
+            project_name, file_path, relationships, uid_to_label=uid_label_map, skip_delete=not old_data
+        )
 
         result = UpsertResult(
             added=[self._strip_uid(uid) for uid in added_uids],
@@ -442,7 +466,10 @@ class GraphClient:
         """Delete all non-structural entity nodes for a file. Returns deleted uids."""
         old_data = await self.get_file_content_hashes(project_name, file_path)
         if old_data:
-            await self._batch_delete_entities(list(old_data.keys()))
+            uids_by_label: dict[str, list[str]] = defaultdict(list)
+            for uid, data in old_data.items():
+                uids_by_label[data[5]].append(uid)
+            await self._batch_delete_entities(dict(uids_by_label))
         return [self._strip_uid(uid) for uid in old_data]
 
     async def merge_project_node(self, project_name: str, **metadata: Any) -> None:
@@ -704,14 +731,14 @@ class GraphClient:
         if normal_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
+                f"MATCH (a:{NodeLabel.MODULE} {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
                 f"MERGE (a)-[:{RelType.IMPORTS}]->(b)",
                 {"rels": normal_edges},
             )
         if type_only_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
+                f"MATCH (a:{NodeLabel.MODULE} {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
                 f"MERGE (a)-[e:{RelType.IMPORTS}]->(b) ON CREATE SET e.type_only = true",
                 {"rels": type_only_edges},
             )
@@ -762,7 +789,9 @@ class GraphClient:
         if edges:
             edge_params = [{"f": f, "t": t} for f, t in edges]
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) MERGE (a)-[:{RelType.CALLS}]->(b)",
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.CALLABLE} {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
+                f"MERGE (a)-[:{RelType.CALLS}]->(b)",
                 {"rels": edge_params},
             )
 
@@ -847,7 +876,9 @@ class GraphClient:
         if edges:
             edge_params = [{"f": f, "t": t} for f, t in edges]
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) MERGE (a)-[:{RelType.USES_TYPE}]->(b)",
+                f"UNWIND $rels AS r "
+                f"MATCH (a {{uid: r.f}}), (b:{NodeLabel.TYPE_DEF} {{uid: r.t}}) "
+                f"MERGE (a)-[:{RelType.USES_TYPE}]->(b)",
                 {"rels": edge_params},
             )
 
@@ -1054,7 +1085,8 @@ class GraphClient:
         rewired = 0
         for es_uid, real_uid in sym_to_real.items():
             await self.execute_write(
-                f"MATCH (src)-[r:{RelType.IMPORTS}]->(es {{uid: $es_uid}}) "
+                f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
+                f"(es:{NodeLabel.EXTERNAL_SYMBOL} {{uid: $es_uid}}) "
                 f"MATCH (real {{uid: $real_uid}}) "
                 f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
@@ -1064,7 +1096,8 @@ class GraphClient:
 
         for ep_uid, real_uid in ep_to_real_pkg.items():
             await self.execute_write(
-                f"MATCH (src)-[r:{RelType.IMPORTS}]->(ep {{uid: $ep_uid}}) "
+                f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
+                f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $ep_uid}}) "
                 f"MATCH (real {{uid: $real_uid}}) "
                 f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
@@ -1573,66 +1606,84 @@ class GraphClient:
             await self.execute_write(query, {"entities": params})
 
     async def _batch_update_entities(self, entities: list[ParsedEntity]) -> None:
-        """Batch-update modified entity nodes by uid."""
-        params = [
-            {
-                "uid": e.qualified_name,
-                "name": e.name,
-                "kind": e.kind,
-                "line_start": e.line_start,
-                "line_end": e.line_end,
-                "visibility": e.visibility,
-                "docstring": e.docstring,
-                "signature": e.signature,
-                "source": e.source,
-                "tags": e.tags,
-                "header_path": e.header_path,
-                "header_level": e.header_level,
-                "content_hash": e.content_hash,
-            }
-            for e in entities
-        ]
-        await self.execute_write(
-            "UNWIND $entities AS e "
-            "MATCH (n {uid: e.uid}) "
-            "SET n.name = e.name, n.kind = e.kind, "
-            "n.line_start = e.line_start, n.line_end = e.line_end, "
-            "n.visibility = e.visibility, n.docstring = e.docstring, "
-            "n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
-            "n.header_path = e.header_path, n.header_level = e.header_level, "
-            "n.content_hash = e.content_hash",
-            {"entities": params},
-        )
+        """Batch-update modified entity nodes by uid, grouped by label."""
+        sorted_entities = sorted(entities, key=attrgetter("label"))
+        for label, group in groupby(sorted_entities, key=attrgetter("label")):
+            params = [
+                {
+                    "uid": e.qualified_name,
+                    "name": e.name,
+                    "kind": e.kind,
+                    "line_start": e.line_start,
+                    "line_end": e.line_end,
+                    "visibility": e.visibility,
+                    "docstring": e.docstring,
+                    "signature": e.signature,
+                    "source": e.source,
+                    "tags": e.tags,
+                    "header_path": e.header_path,
+                    "header_level": e.header_level,
+                    "content_hash": e.content_hash,
+                }
+                for e in group
+            ]
+            await self.execute_write(
+                f"UNWIND $entities AS e "
+                f"MATCH (n:{label.value} {{uid: e.uid}}) "
+                "SET n.name = e.name, n.kind = e.kind, "
+                "n.line_start = e.line_start, n.line_end = e.line_end, "
+                "n.visibility = e.visibility, n.docstring = e.docstring, "
+                "n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
+                "n.header_path = e.header_path, n.header_level = e.header_level, "
+                "n.content_hash = e.content_hash",
+                {"entities": params},
+            )
 
     async def _batch_update_positions(self, entities: list[ParsedEntity]) -> None:
         """Update only line_start/line_end for entities whose content didn't change."""
-        params = [{"uid": e.qualified_name, "ls": e.line_start, "le": e.line_end} for e in entities]
-        await self.execute_write(
-            "UNWIND $entities AS e MATCH (n {uid: e.uid}) SET n.line_start = e.ls, n.line_end = e.le",
-            {"entities": params},
-        )
+        sorted_entities = sorted(entities, key=attrgetter("label"))
+        for label, group in groupby(sorted_entities, key=attrgetter("label")):
+            params = [{"uid": e.qualified_name, "ls": e.line_start, "le": e.line_end} for e in group]
+            await self.execute_write(
+                f"UNWIND $entities AS e MATCH (n:{label.value} {{uid: e.uid}}) "
+                "SET n.line_start = e.ls, n.line_end = e.le",
+                {"entities": params},
+            )
 
-    async def _batch_delete_entities(self, uids: list[str]) -> None:
-        """Delete entity nodes by uid."""
-        await self.execute_write(
-            "UNWIND $uids AS uid MATCH (n {uid: uid}) DETACH DELETE n",
-            {"uids": uids},
-        )
+    async def _batch_delete_entities(self, uids_by_label: dict[str, list[str]]) -> None:
+        """Delete entity nodes by uid, grouped by label for index-backed matching."""
+        for label, uids in uids_by_label.items():
+            if label:
+                _assert_valid_label(label)
+                await self.execute_write(
+                    f"UNWIND $uids AS uid MATCH (n:{label} {{uid: uid}}) DETACH DELETE n",
+                    {"uids": uids},
+                )
+            else:
+                await self.execute_write(
+                    "UNWIND $uids AS uid MATCH (n {uid: uid}) DETACH DELETE n",
+                    {"uids": uids},
+                )
 
     async def _recreate_file_relationships(
         self,
         project_name: str,
         file_path: str,
         relationships: list[ParsedRelationship],
+        uid_to_label: dict[str, str] | None = None,
+        *,
+        skip_delete: bool = False,
     ) -> None:
         """Delete all relationships originating from this file's entities, then recreate them."""
-        # Delete existing relationships from file entities (excluding Package/Project)
-        await self.execute_write(
-            f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->() "
-            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            "DELETE r",
-            {"p": project_name, "f": file_path},
-        )
+        # Delete existing relationships from file entities — one label-constrained query
+        # per entity label, each hitting the composite (project_name, file_path) index.
+        # Skipped when the file has no prior entities (fresh reindex / new file).
+        if not skip_delete:
+            for lbl in _FILE_ENTITY_LABELS:
+                await self.execute_write(
+                    f"MATCH (n:{lbl.value} {{project_name: $p, file_path: $f}})-[r]->() DELETE r",
+                    {"p": project_name, "f": file_path},
+                )
 
         # Recreate: uid-based rels (both ends known by uid)
         # Includes structural rels and detector-produced rels (both ends resolved to UIDs)
@@ -1652,34 +1703,51 @@ class GraphClient:
         uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
         other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
 
+        _uid_lbl = uid_to_label or {}
+
         for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
             rels_list = list(group)
             has_props = any(r.properties for r in rels_list)
-            if has_props:
-                rel_params = [
-                    {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties} for r in rels_list
-                ]
-                await self.execute_write(
-                    f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                    f"CREATE (a)-[:{rel_type}]->(b)",
-                    {"rels": rel_params},
-                )
-                # SET properties in a second pass (Memgraph doesn't support dynamic props in CREATE)
-                for param in rel_params:
-                    if param["props"]:
-                        set_clause = ", ".join(f"e.{k} = $prop_{k}" for k in param["props"])
-                        prop_params = {f"prop_{k}": v for k, v in param["props"].items()}
-                        await self.execute_write(
-                            f"MATCH (a {{uid: $from_uid}})-[e:{rel_type}]->(b {{uid: $to_uid}}) SET {set_clause}",
-                            {"from_uid": param["from_uid"], "to_uid": param["to_uid"], **prop_params},
-                        )
-            else:
-                rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in rels_list]
-                await self.execute_write(
-                    f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                    f"CREATE (a)-[:{rel_type}]->(b)",
-                    {"rels": rel_params},
-                )
+
+            # Group rels by (from_label, to_label) for index-backed matching
+            by_label_pair: dict[tuple[str, str], list[ParsedRelationship]] = defaultdict(list)
+            for r in rels_list:
+                fl = _uid_lbl.get(r.from_qualified_name, "")
+                tl = _uid_lbl.get(r.to_name, "")
+                by_label_pair[(fl, tl)].append(r)
+
+            for (fl, tl), sub_rels in by_label_pair.items():
+                from_clause = f":{fl}" if fl else ""
+                to_clause = f":{tl}" if tl else ""
+
+                if has_props:
+                    rel_params = [
+                        {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties}
+                        for r in sub_rels
+                    ]
+                    await self.execute_write(
+                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
+                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
+                        {"rels": rel_params},
+                    )
+                    # SET properties in a second pass (Memgraph doesn't support dynamic props in CREATE)
+                    for param in rel_params:
+                        if param["props"]:
+                            rel_props: dict[str, Any] = param["props"]  # type: ignore[assignment]
+                            set_clause = ", ".join(f"e.{k} = $prop_{k}" for k in rel_props)
+                            prop_params = {f"prop_{k}": v for k, v in rel_props.items()}
+                            await self.execute_write(
+                                f"MATCH (a{from_clause} {{uid: $from_uid}})-[e:{rel_type}]->"
+                                f"(b{to_clause} {{uid: $to_uid}}) SET {set_clause}",
+                                {"from_uid": param["from_uid"], "to_uid": param["to_uid"], **prop_params},
+                            )
+                else:
+                    rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in sub_rels]
+                    await self.execute_write(
+                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
+                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
+                        {"rels": rel_params},
+                    )
 
         # Name-matched rels (IMPORTS are intentionally excluded — resolved post-batch)
         doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
@@ -1692,7 +1760,8 @@ class GraphClient:
             ]
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: r.project, name: r.to_name}}) "
+                f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}), "
+                f"(b:{NodeLabel.TYPE_DEF} {{project_name: r.project, name: r.to_name}}) "
                 f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
                 {"rels": inh_params},
             )
@@ -1725,7 +1794,8 @@ class GraphClient:
         if symbol_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: $project, name: r.to_name}}) "
+                f"MATCH (a:{NodeLabel.DOC_SECTION} {{uid: r.from_uid}}), "
+                f"(b {{project_name: $project, name: r.to_name}}) "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
                 {"rels": symbol_params, "project": project_name},
@@ -1735,7 +1805,7 @@ class GraphClient:
         if file_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: $project}}) "
+                f"MATCH (a:{NodeLabel.DOC_SECTION} {{uid: r.from_uid}}), (b {{project_name: $project}}) "
                 f"WHERE b.file_path ENDS WITH r.to_name "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
@@ -1770,13 +1840,22 @@ class GraphClient:
             await self._exec_ddl(stmt)
         for stmt in generate_index_ddl():
             await self._exec_ddl(stmt)
+        for stmt in generate_composite_index_ddl():
+            await self._exec_ddl(stmt)
         if self._embeddings_enabled:
             await self._create_vector_indices()
         for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
 
     async def _migrate_indices(self) -> None:
-        """Drop and recreate vector/text indices (dimension may have changed)."""
+        """Drop and recreate vector/text indices (dimension may have changed).
+
+        Also applies property and composite indices (idempotent via _exec_ddl).
+        """
+        for stmt in generate_index_ddl():
+            await self._exec_ddl(stmt)
+        for stmt in generate_composite_index_ddl():
+            await self._exec_ddl(stmt)
         await self._drop_all_vector_indices()
         for stmt in generate_drop_text_index_ddl():
             await self._exec_ddl(stmt)
