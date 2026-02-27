@@ -831,6 +831,7 @@ async def _run_pipeline(
     drain_timeout_s: float,
     *,
     project_root: Path | None = None,
+    project_filter: set[str] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
 ) -> Tier2ASTConsumer:
     """Start inline tier consumers and wait for the pipeline to drain.
@@ -840,8 +841,8 @@ async def _run_pipeline(
     await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
     await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
 
-    tier1 = Tier1GraphConsumer(bus, graph, settings)
-    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root)
+    tier1 = Tier1GraphConsumer(bus, graph, settings, project_filter=project_filter)
+    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root, project_filter=project_filter)
 
     task1 = asyncio.create_task(tier1.run())
     task2 = asyncio.create_task(tier2.run())
@@ -850,7 +851,7 @@ async def _run_pipeline(
     task3: asyncio.Task[None] | None = None
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, project_filter=project_filter)
         task3 = asyncio.create_task(tier3.run())
 
     try:
@@ -1098,6 +1099,7 @@ async def _index_project_inner(
             cache,
             drain_timeout_s,
             project_root=project_root,
+            project_filter={project_name},
             on_drain_progress=on_drain_progress,
         )
         t2stats = tier2.stats

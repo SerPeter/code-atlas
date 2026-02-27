@@ -111,6 +111,19 @@ class UpsertResult:
     modified_significance: dict[str, str] = field(default_factory=dict)  # qualified_name → Significance value
 
 
+@dataclass
+class _BatchClassification:
+    """Cross-file classification of entities for batched upsert."""
+
+    all_added: list[ParsedEntity]
+    all_modified: list[ParsedEntity]
+    all_deleted_by_label: dict[str, list[str]]  # label → [uids]
+    all_shifted: list[ParsedEntity]
+    per_file_results: dict[str, UpsertResult]  # file_path → UpsertResult
+    new_file_paths: set[str]  # files with no prior data (skip rel delete)
+    uid_to_label: dict[str, str]  # uid → label value (for relationship recreation)
+
+
 def _node_project_name(record: dict[str, Any]) -> str:
     """Extract project_name from a record containing a neo4j Node."""
     node = record.get("node") or record.get("n")
@@ -327,6 +340,35 @@ class GraphClient:
             r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or "") for r in records
         }
 
+    async def get_batch_file_content_hashes(
+        self,
+        project_name: str,
+        file_paths: list[str],
+    ) -> dict[str, dict[str, tuple[str, int, int, str | None, str | None, str]]]:
+        """Return ``{file_path: {uid: (hash, ls, le, sig, doc, label)}}`` for multiple files in one RTT."""
+        if not file_paths:
+            return {}
+        records = await self.execute(
+            f"UNWIND $fps AS fp "
+            f"MATCH (n {{project_name: $p, file_path: fp}}) "
+            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+            "RETURN n.file_path AS fp, n.uid AS uid, n.content_hash AS hash, "
+            "n.line_start AS ls, n.line_end AS le, "
+            "n.signature AS sig, n.docstring AS doc, labels(n)[0] AS lbl",
+            {"p": project_name, "fps": file_paths},
+        )
+        result: dict[str, dict[str, tuple[str, int, int, str | None, str | None, str]]] = defaultdict(dict)
+        for r in records:
+            result[r["fp"]][r["uid"]] = (
+                r["hash"] or "",
+                r["ls"] or 0,
+                r["le"] or 0,
+                r["sig"],
+                r["doc"],
+                r["lbl"] or "",
+            )
+        return dict(result)
+
     async def upsert_file_entities(
         self,
         project_name: str,
@@ -461,6 +503,160 @@ class GraphClient:
     def _strip_uid(uid: str) -> str:
         """Strip project prefix from uid to get qualified_name."""
         return uid.split(":", 1)[1] if ":" in uid else uid
+
+    @staticmethod
+    def _classify_batch(
+        old_data: dict[str, dict[str, tuple[str, int, int, str | None, str | None, str]]],
+        file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+    ) -> _BatchClassification:
+        """Pure-Python classification of entities across multiple files.
+
+        Compares new entities against *old_data* (from ``get_batch_file_content_hashes``)
+        and produces cross-file lists for batched graph writes.
+        """
+        all_added: list[ParsedEntity] = []
+        all_modified: list[ParsedEntity] = []
+        all_deleted_by_label: dict[str, list[str]] = defaultdict(list)
+        all_shifted: list[ParsedEntity] = []
+        per_file_results: dict[str, UpsertResult] = {}
+        new_file_paths: set[str] = set()
+        uid_to_label: dict[str, str] = {}
+
+        strip = GraphClient._strip_uid
+
+        for file_path, (entities, _rels) in file_data.items():
+            new_hashes: dict[str, str] = {e.qualified_name: e.content_hash for e in entities}
+            new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
+            file_old = old_data.get(file_path, {})
+
+            if not file_old:
+                new_file_paths.add(file_path)
+
+            old_uids = set(file_old)
+            new_uids = set(new_hashes)
+
+            added_uids = new_uids - old_uids
+            deleted_uids = old_uids - new_uids
+            common_uids = old_uids & new_uids
+            modified_uids = {uid for uid in common_uids if file_old[uid][0] != new_hashes[uid]}
+            unchanged_uids = common_uids - modified_uids
+
+            # Accumulate cross-file lists
+            all_added.extend(new_entity_map[uid] for uid in added_uids)
+            for uid in deleted_uids:
+                all_deleted_by_label[file_old[uid][5]].append(uid)
+            mod_significance: dict[str, str] = {}
+            for uid in modified_uids:
+                entity = new_entity_map[uid]
+                all_modified.append(entity)
+                old_sig, old_doc = file_old[uid][3], file_old[uid][4]
+                qn = strip(uid)
+                if (entity.signature or "") != (old_sig or ""):
+                    mod_significance[qn] = "HIGH"
+                elif (entity.docstring or "") != (old_doc or ""):
+                    mod_significance[qn] = "MODERATE"
+                else:
+                    mod_significance[qn] = "HIGH"
+
+            # Position shifts for unchanged entities
+            if unchanged_uids and (added_uids or deleted_uids):
+                for uid in unchanged_uids:
+                    entity = new_entity_map[uid]
+                    if (entity.line_start, entity.line_end) != (file_old[uid][1], file_old[uid][2]):
+                        all_shifted.append(entity)
+
+            # Build uid→label map from all current entities
+            for e in entities:
+                uid_to_label[e.qualified_name] = e.label.value
+
+            per_file_results[file_path] = UpsertResult(
+                added=[strip(uid) for uid in added_uids],
+                modified=[strip(uid) for uid in modified_uids],
+                deleted=[strip(uid) for uid in deleted_uids],
+                unchanged=[strip(uid) for uid in unchanged_uids],
+                modified_significance=mod_significance,
+            )
+
+        return _BatchClassification(
+            all_added=all_added,
+            all_modified=all_modified,
+            all_deleted_by_label=dict(all_deleted_by_label),
+            all_shifted=all_shifted,
+            per_file_results=per_file_results,
+            new_file_paths=new_file_paths,
+            uid_to_label=uid_to_label,
+        )
+
+    async def upsert_batch_entities(
+        self,
+        project_name: str,
+        file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+    ) -> dict[str, UpsertResult]:
+        """Batched multi-file upsert using two sequential managed transactions.
+
+        TX1 (Entity CRUD): batch hash read → classify → delete/create/update/positions.
+        TX2 (Relationships): delete old rels → create new rels → INHERITS → DOCUMENTS.
+
+        Returns ``{file_path: UpsertResult}`` for each file in *file_data*.
+        """
+        if not file_data:
+            return {}
+
+        file_paths = list(file_data)
+
+        # --- TX1: Entity CRUD ---
+        async def _entity_tx(tx: Any) -> _BatchClassification:
+            token = _active_tx_var.set(tx)
+            try:
+                old_data = await self.get_batch_file_content_hashes(project_name, file_paths)
+                classification = self._classify_batch(old_data, file_data)
+
+                if classification.all_deleted_by_label:
+                    await self._batch_delete_entities(classification.all_deleted_by_label)
+                if classification.all_added:
+                    await self._batch_create_entities(project_name, classification.all_added)
+                if classification.all_modified:
+                    await self._batch_update_entities(classification.all_modified)
+                if classification.all_shifted:
+                    await self._batch_update_positions(classification.all_shifted)
+
+                return classification
+            finally:
+                _active_tx_var.reset(token)
+
+        async with self._driver.session() as session:
+            classification = await session.execute_write(_entity_tx)
+
+        # --- TX2: Relationships ---
+        file_rels = {fp: rels for fp, (_, rels) in file_data.items()}
+
+        async def _rel_tx(tx: Any) -> None:
+            token = _active_tx_var.set(tx)
+            try:
+                await self._recreate_batch_relationships(
+                    project_name,
+                    file_rels,
+                    classification.uid_to_label,
+                    classification.new_file_paths,
+                )
+            finally:
+                _active_tx_var.reset(token)
+
+        async with self._driver.session() as session:
+            await session.execute_write(_rel_tx)
+
+        total_added = sum(len(r.added) for r in classification.per_file_results.values())
+        total_modified = sum(len(r.modified) for r in classification.per_file_results.values())
+        total_deleted = sum(len(r.deleted) for r in classification.per_file_results.values())
+        logger.debug(
+            "Batch upsert {} files (added={}, modified={}, deleted={})",
+            len(file_data),
+            total_added,
+            total_modified,
+            total_deleted,
+        )
+
+        return classification.per_file_results
 
     async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
         """Delete all non-structural entity nodes for a file. Returns deleted uids."""
@@ -1173,15 +1369,14 @@ class GraphClient:
     async def apply_property_enrichments(self, enrichments: list[PropertyEnrichment]) -> None:
         """Apply property enrichments from detectors to existing entity nodes.
 
-        Each enrichment SETs additional properties on a node matched by uid.
+        Batches all enrichments into a single UNWIND query.
         Uses ``+=`` (map merge) so existing properties are preserved.
         """
-        for enrichment in enrichments:
-            if not enrichment.properties:
-                continue
+        items = [{"uid": e.qualified_name, "props": e.properties} for e in enrichments if e.properties]
+        if items:
             await self.execute_write(
-                "MATCH (n {uid: $uid}) SET n += $props",
-                {"uid": enrichment.qualified_name, "props": enrichment.properties},
+                "UNWIND $items AS item MATCH (n {uid: item.uid}) SET n += item.props",
+                {"items": items},
             )
 
     # -- Embedding helpers -----------------------------------------------------
@@ -1664,6 +1859,111 @@ class GraphClient:
                     "UNWIND $uids AS uid MATCH (n {uid: uid}) DETACH DELETE n",
                     {"uids": uids},
                 )
+
+    async def _recreate_batch_relationships(
+        self,
+        project_name: str,
+        file_rels: dict[str, list[ParsedRelationship]],
+        uid_to_label: dict[str, str],
+        new_file_paths: set[str],
+    ) -> None:
+        """Delete then recreate relationships for multiple files in batched queries.
+
+        *new_file_paths* are files with no prior data — their old rels are skipped
+        in the delete phase.  All rels across files are pooled for creation.
+        """
+        # --- Delete phase: one query per entity label, file_path IN $fps ---
+        delete_fps = [fp for fp in file_rels if fp not in new_file_paths]
+        if delete_fps:
+            for lbl in _FILE_ENTITY_LABELS:
+                await self.execute_write(
+                    f"MATCH (n:{lbl.value} {{project_name: $p}})-[r]->() WHERE n.file_path IN $fps DELETE r",
+                    {"p": project_name, "fps": delete_fps},
+                )
+
+        # --- Create phase: pool all rels across files ---
+        all_rels: list[ParsedRelationship] = []
+        for rels in file_rels.values():
+            all_rels.extend(rels)
+
+        uid_rel_types = {
+            RelType.DEFINES,
+            RelType.CONTAINS,
+            RelType.OVERRIDES,
+            RelType.IMPLEMENTS,
+            RelType.EXPORTS,
+            RelType.TESTS,
+            RelType.HANDLES_ROUTE,
+            RelType.HANDLES_EVENT,
+            RelType.HANDLES_COMMAND,
+            RelType.REGISTERED_BY,
+            RelType.INJECTED_INTO,
+        }
+        uid_rels = [r for r in all_rels if r.rel_type in uid_rel_types]
+        other_rels = [r for r in all_rels if r.rel_type not in uid_rel_types]
+
+        # uid-based rels: group by (rel_type, from_label, to_label) for index-backed matching
+        for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
+            rels_list = list(group)
+            has_props = any(r.properties for r in rels_list)
+
+            by_label_pair: dict[tuple[str, str], list[ParsedRelationship]] = defaultdict(list)
+            for r in rels_list:
+                fl = uid_to_label.get(r.from_qualified_name, "")
+                tl = uid_to_label.get(r.to_name, "")
+                by_label_pair[(fl, tl)].append(r)
+
+            for (fl, tl), sub_rels in by_label_pair.items():
+                from_clause = f":{fl}" if fl else ""
+                to_clause = f":{tl}" if tl else ""
+
+                if has_props:
+                    rel_params = [
+                        {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties}
+                        for r in sub_rels
+                    ]
+                    await self.execute_write(
+                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
+                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
+                        {"rels": rel_params},
+                    )
+                    for param in rel_params:
+                        if param["props"]:
+                            rel_props: dict[str, Any] = param["props"]  # type: ignore[assignment]
+                            set_clause = ", ".join(f"e.{k} = $prop_{k}" for k in rel_props)
+                            prop_params = {f"prop_{k}": v for k, v in rel_props.items()}
+                            await self.execute_write(
+                                f"MATCH (a{from_clause} {{uid: $from_uid}})-[e:{rel_type}]->"
+                                f"(b{to_clause} {{uid: $to_uid}}) SET {set_clause}",
+                                {"from_uid": param["from_uid"], "to_uid": param["to_uid"], **prop_params},
+                            )
+                else:
+                    rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in sub_rels]
+                    await self.execute_write(
+                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
+                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
+                        {"rels": rel_params},
+                    )
+
+        # INHERITS rels — batched across all files
+        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
+        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
+
+        if inherits_rels:
+            inh_params = [
+                {"from_uid": r.from_qualified_name, "project": project_name, "to_name": r.to_name}
+                for r in inherits_rels
+            ]
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}), "
+                f"(b:{NodeLabel.TYPE_DEF} {{project_name: r.project, name: r.to_name}}) "
+                f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
+                {"rels": inh_params},
+            )
+
+        if doc_rels:
+            await self._create_doc_links(project_name, doc_rels)
 
     async def _recreate_file_relationships(
         self,

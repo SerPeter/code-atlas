@@ -32,8 +32,8 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.parsing.ast import ParsedRelationship, parse_file
-from code_atlas.parsing.detectors import get_enabled_detectors, run_detectors
+from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
+from code_atlas.parsing.detectors import PropertyEnrichment, get_enabled_detectors, run_detectors
 from code_atlas.schema import RelType
 from code_atlas.search.embeddings import EmbedCache, build_embed_text
 from code_atlas.settings import derive_project_name
@@ -79,12 +79,15 @@ class TierConsumer(ABC):
         group: str,
         consumer_name: str,
         policy: BatchPolicy,
+        *,
+        project_filter: set[str] | None = None,
     ) -> None:
         self.bus = bus
         self.input_topic = input_topic
         self.group = group
         self.consumer_name = consumer_name
         self.policy = policy
+        self._project_filter = project_filter
         self._stop = False
 
     @abstractmethod
@@ -96,6 +99,18 @@ class TierConsumer(ABC):
         if isinstance(event, FileChanged):
             return event.path
         return str(id(event))
+
+    def _matches_project(self, event: Event) -> bool:
+        """Check if an event belongs to the filtered project(s)."""
+        if self._project_filter is None:
+            return True
+        pn = ""
+        if isinstance(event, (FileChanged, ASTDirty)):
+            pn = event.project_name
+        elif isinstance(event, EmbedDirty):
+            # EmbedDirty doesn't carry project_name directly — always accept
+            return True
+        return pn in self._project_filter
 
     def stop(self) -> None:
         """Signal the consumer to stop after the current iteration."""
@@ -133,6 +148,9 @@ class TierConsumer(ABC):
                             logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
                             await self.bus.ack(self.input_topic, self.group, msg_id)
                             continue
+                        if not self._matches_project(event):
+                            await self.bus.ack(self.input_topic, self.group, msg_id)
+                            continue
                         pending[key] = (msg_id, event)
                         if window_start is None:
                             window_start = asyncio.get_event_loop().time()
@@ -155,6 +173,9 @@ class TierConsumer(ABC):
                     key = self.dedup_key(event)
                 except KeyError, TypeError, ValueError, json.JSONDecodeError:
                     logger.exception("{} failed to decode message, skipping", self.consumer_name)
+                    await self.bus.ack(self.input_topic, self.group, msg_id)
+                    continue
+                if not self._matches_project(event):
                     await self.bus.ack(self.input_topic, self.group, msg_id)
                     continue
                 pending[key] = (msg_id, event)  # latest wins
@@ -201,13 +222,16 @@ class TierConsumer(ABC):
 class Tier1GraphConsumer(TierConsumer):
     """Tier 1: Update file-level graph metadata, always publish ASTDirty downstream."""
 
-    def __init__(self, bus: EventBus, graph: GraphClient, settings: AtlasSettings) -> None:
+    def __init__(
+        self, bus: EventBus, graph: GraphClient, settings: AtlasSettings, *, project_filter: set[str] | None = None
+    ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.FILE_CHANGED,
             group="tier1-graph",
             consumer_name="tier1-graph-0",
             policy=BatchPolicy(time_window_s=0.5, max_batch_size=50),
+            project_filter=project_filter,
         )
         self.graph = graph
         self.settings = settings
@@ -277,6 +301,24 @@ class Tier2Stats:
     entities_unchanged: int = 0
 
 
+@dataclass(frozen=True)
+class _ParsedFileData:
+    """Parse + detect results for a single file, ready for batched graph write."""
+
+    file_path: str
+    entities: list[ParsedEntity]
+    non_import_rels: list[ParsedRelationship]
+    import_rels: list[ParsedRelationship]
+    call_rels: list[ParsedRelationship]
+    type_rels: list[ParsedRelationship]
+    enrichments: list[PropertyEnrichment]
+
+
+_SENTINEL_DELETED = _ParsedFileData(
+    file_path="", entities=[], non_import_rels=[], import_rels=[], call_rels=[], type_rels=[], enrichments=[]
+)
+
+
 class Tier2ASTConsumer(TierConsumer):
     """Tier 2: Parse AST via tree-sitter, write entities to graph, publish EmbedDirty."""
 
@@ -287,6 +329,7 @@ class Tier2ASTConsumer(TierConsumer):
         settings: AtlasSettings,
         *,
         project_root: Path | None = None,
+        project_filter: set[str] | None = None,
     ) -> None:
         super().__init__(
             bus=bus,
@@ -294,6 +337,7 @@ class Tier2ASTConsumer(TierConsumer):
             group="tier2-ast",
             consumer_name="tier2-ast-0",
             policy=BatchPolicy(time_window_s=3.0, max_batch_size=20),
+            project_filter=project_filter,
         )
         self.graph = graph
         self.settings = settings
@@ -306,101 +350,49 @@ class Tier2ASTConsumer(TierConsumer):
             return event.path
         return super().dedup_key(event)
 
-    async def _process_file(
+    async def _parse_file(
         self,
         project_name: str,
         file_path: str,
-        import_rels: list[ParsedRelationship],
-        call_rels: list[ParsedRelationship],
-        type_rels: list[ParsedRelationship],
         *,
         project_root: Path | None = None,
-    ) -> tuple[set[str], list[EntityRef], Significance]:
-        """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs, max_significance).
+    ) -> _ParsedFileData | None:
+        """Parse and detect a single file without graph writes.
 
-        Appends IMPORTS rels to *import_rels*, CALLS rels to *call_rels*,
-        and USES_TYPE rels to *type_rels* for post-batch resolution.
+        Returns ``None`` for unreadable/unsupported files, ``_SENTINEL_DELETED``
+        for deleted files, or a ``_ParsedFileData`` with parsed results.
         """
         root = project_root if project_root is not None else self._project_root
         full_path = root / file_path
         if not full_path.is_file():
-            logger.debug("Tier2: file deleted, removing entities for {}", file_path)
-            deleted = await self.graph.delete_file_entities(project_name, file_path)
-            self.stats.files_deleted += 1
-            self.stats.entities_deleted += len(deleted)
-            return set(), [], Significance.HIGH if deleted else Significance.NONE
+            return _SENTINEL_DELETED
 
         try:
             source = full_path.read_bytes()
         except OSError:
             logger.warning("Tier2: cannot read {}", file_path)
-            return set(), [], Significance.NONE
+            return None
 
         parsed = parse_file(file_path, source, project_name, max_source_chars=self.settings.index.max_source_chars)
         if parsed is None:
             logger.debug("Tier2: unsupported language for {}", file_path)
-            return set(), [], Significance.NONE
+            return None
 
         det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
         all_rels = parsed.relationships + det_result.relationships
 
-        # Separate IMPORTS, CALLS, and USES_TYPE rels for post-batch resolution
         _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE}
-        non_import_rels = [r for r in all_rels if r.rel_type not in _deferred]
-        import_rels.extend(r for r in all_rels if r.rel_type == RelType.IMPORTS)
-        call_rels.extend(r for r in all_rels if r.rel_type == RelType.CALLS)
-        type_rels.extend(r for r in all_rels if r.rel_type == RelType.USES_TYPE)
-
-        result = await self.graph.upsert_file_entities(
-            project_name=project_name,
+        return _ParsedFileData(
             file_path=file_path,
             entities=parsed.entities,
-            relationships=non_import_rels,
+            non_import_rels=[r for r in all_rels if r.rel_type not in _deferred],
+            import_rels=[r for r in all_rels if r.rel_type == RelType.IMPORTS],
+            call_rels=[r for r in all_rels if r.rel_type == RelType.CALLS],
+            type_rels=[r for r in all_rels if r.rel_type == RelType.USES_TYPE],
+            enrichments=det_result.enrichments,
         )
 
-        if det_result.enrichments:
-            await self.graph.apply_property_enrichments(det_result.enrichments)
-
-        self.stats.files_processed += 1
-        self.stats.entities_added += len(result.added)
-        self.stats.entities_modified += len(result.modified)
-        self.stats.entities_deleted += len(result.deleted)
-        self.stats.entities_unchanged += len(result.unchanged)
-
-        changed_qns = set(result.added) | set(result.modified)
-        if not changed_qns:
-            self.stats.files_skipped += 1
-            return set(), [], Significance.NONE
-
-        # Compute file-level significance from upsert result
-        if result.added or result.deleted:
-            file_sig = Significance.HIGH
-        elif result.modified_significance:
-            file_sig = max(
-                (Significance(v) for v in result.modified_significance.values()),
-                key=lambda s: _SIG_ORDER[s],
-            )
-        else:
-            file_sig = Significance.NONE
-
-        entity_map = {
-            (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
-            for e in parsed.entities
-        }
-        refs: list[EntityRef] = []
-        for qn in changed_qns:
-            entity = entity_map.get(qn)
-            if entity is not None:
-                refs.append(
-                    EntityRef(
-                        qualified_name=entity.qualified_name,
-                        node_type=entity.label.value,
-                        file_path=entity.file_path,
-                    )
-                )
-        return changed_qns, refs, file_sig
-
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:
+    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912, PLR0915
         with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
             # Group paths by (project_name, project_root) — monorepo batches can mix sub-projects
             groups: dict[tuple[str, str], list[str]] = {}
@@ -423,32 +415,95 @@ class Tier2ASTConsumer(TierConsumer):
             for (event_project_name, event_project_root), unique_paths in groups.items():
                 project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
                 effective_root = Path(event_project_root) if event_project_root else None
-                group_import_rels: list[ParsedRelationship] = []
-                group_call_rels: list[ParsedRelationship] = []
-                group_type_rels: list[ParsedRelationship] = []
+
+                # 1. Parse loop (async, per-file) — no graph writes
+                parsed_files: dict[str, _ParsedFileData] = {}
+                deleted_files: list[str] = []
 
                 for file_idx, file_path in enumerate(unique_paths, 1):
                     if file_idx % 50 == 0:
                         logger.debug("Tier2 batch {}: parsed {}/{} files", batch_id, file_idx, len(unique_paths))
-                    changed_qns, refs, file_sig = await self._process_file(
-                        project_name,
-                        file_path,
-                        group_import_rels,
-                        group_call_rels,
-                        group_type_rels,
-                        project_root=effective_root,
-                    )
-                    total_changed += len(changed_qns)
-                    changed_entity_refs.extend(refs)
-                    if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
-                        batch_max_sig = file_sig
+                    pfd = await self._parse_file(project_name, file_path, project_root=effective_root)
+                    if pfd is _SENTINEL_DELETED:
+                        deleted_files.append(file_path)
+                    elif pfd is not None:
+                        parsed_files[file_path] = pfd
 
-                # Post-batch import resolution (per project — must run first so import
-                # edges are available for the call/type lookup below)
+                # 2. Handle deleted files
+                for fp in deleted_files:
+                    logger.debug("Tier2: file deleted, removing entities for {}", fp)
+                    deleted = await self.graph.delete_file_entities(project_name, fp)
+                    self.stats.files_deleted += 1
+                    self.stats.entities_deleted += len(deleted)
+                    if deleted:
+                        batch_max_sig = Significance.HIGH
+
+                # 3. Batched upsert (2 managed transactions)
+                if parsed_files:
+                    file_data = {fp: (pfd.entities, pfd.non_import_rels) for fp, pfd in parsed_files.items()}
+                    results = await self.graph.upsert_batch_entities(project_name, file_data)
+
+                    # 4. Batched enrichments
+                    all_enrichments = [e for pfd in parsed_files.values() for e in pfd.enrichments]
+                    if all_enrichments:
+                        await self.graph.apply_property_enrichments(all_enrichments)
+
+                    # 5. Accumulate stats + entity refs from per-file results
+                    for fp, pfd in parsed_files.items():
+                        result = results.get(fp)
+                        if result is None:
+                            continue
+
+                        self.stats.files_processed += 1
+                        self.stats.entities_added += len(result.added)
+                        self.stats.entities_modified += len(result.modified)
+                        self.stats.entities_deleted += len(result.deleted)
+                        self.stats.entities_unchanged += len(result.unchanged)
+
+                        changed_qns = set(result.added) | set(result.modified)
+                        if not changed_qns:
+                            self.stats.files_skipped += 1
+                            continue
+
+                        total_changed += len(changed_qns)
+
+                        # Compute file-level significance
+                        if result.added or result.deleted:
+                            file_sig = Significance.HIGH
+                        elif result.modified_significance:
+                            file_sig = max(
+                                (Significance(v) for v in result.modified_significance.values()),
+                                key=lambda s: _SIG_ORDER[s],
+                            )
+                        else:
+                            file_sig = Significance.NONE
+
+                        if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
+                            batch_max_sig = file_sig
+
+                        entity_map = {
+                            (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
+                            for e in pfd.entities
+                        }
+                        for qn in changed_qns:
+                            entity = entity_map.get(qn)
+                            if entity is not None:
+                                changed_entity_refs.append(
+                                    EntityRef(
+                                        qualified_name=entity.qualified_name,
+                                        node_type=entity.label.value,
+                                        file_path=entity.file_path,
+                                    )
+                                )
+
+                # 6. Post-batch resolution (unchanged)
+                group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
+                group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
+                group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
+
                 if group_import_rels:
                     await self.graph.resolve_imports(project_name, group_import_rels)
 
-                # Post-batch CALLS + USES_TYPE resolution with shared lookup (saves 3 RTTs)
                 if group_call_rels or group_type_rels:
                     shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
                     if group_call_rels:
@@ -495,7 +550,13 @@ class Tier3EmbedConsumer(TierConsumer):
     """
 
     def __init__(
-        self, bus: EventBus, graph: GraphClient, embed: EmbedClient, *, cache: EmbedCache | None = None
+        self,
+        bus: EventBus,
+        graph: GraphClient,
+        embed: EmbedClient,
+        *,
+        cache: EmbedCache | None = None,
+        project_filter: set[str] | None = None,
     ) -> None:
         super().__init__(
             bus=bus,
@@ -503,6 +564,7 @@ class Tier3EmbedConsumer(TierConsumer):
             group="tier3-embed",
             consumer_name="tier3-embed-0",
             policy=BatchPolicy(time_window_s=15.0, max_batch_size=100),
+            project_filter=project_filter,
         )
         self.graph = graph
         self.embed = embed
