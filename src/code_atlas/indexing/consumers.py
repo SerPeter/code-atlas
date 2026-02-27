@@ -57,6 +57,7 @@ class BatchPolicy:
 
     time_window_s: float  # Max seconds to accumulate before flush
     max_batch_size: int  # Max items before flush (whichever hits first)
+    block_ms: int | None = None  # Override for XREADGROUP block; None = derive from time_window_s
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +159,11 @@ class TierConsumer(ABC):
                     pel_drained = True
 
             # Pull new messages (short block so we can check flush + stop)
-            block_ms = max(100, int(self.policy.time_window_s * 1000 // 2))
+            block_ms = (
+                self.policy.block_ms
+                if self.policy.block_ms is not None
+                else max(100, int(self.policy.time_window_s * 1000 // 2))
+            )
             messages = await self.bus.read_batch(
                 self.input_topic,
                 self.group,
@@ -330,13 +335,14 @@ class Tier2ASTConsumer(TierConsumer):
         *,
         project_root: Path | None = None,
         project_filter: set[str] | None = None,
+        policy: BatchPolicy | None = None,
     ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.AST_DIRTY,
             group="tier2-ast",
             consumer_name="tier2-ast-0",
-            policy=BatchPolicy(time_window_s=3.0, max_batch_size=20),
+            policy=policy or BatchPolicy(time_window_s=3.0, max_batch_size=30),
             project_filter=project_filter,
         )
         self.graph = graph
@@ -345,10 +351,59 @@ class Tier2ASTConsumer(TierConsumer):
         self.stats = Tier2Stats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
 
+        # Deferred resolution state — accumulate rels across batches, flush periodically.
+        # In reindex mode (time_window_s=0, block_ms=50) use larger intervals to skip
+        # redundant resolution; daemon mode (default policy) resolves every batch.
+        is_reindex = self.policy.time_window_s == 0
+        self._resolve_batch_interval: int = 5 if is_reindex else 1
+        self._resolve_time_interval_s: float = 30.0 if is_reindex else 5.0
+        self._batches_since_resolve: int = 0
+        self._last_resolve_time: float = 0.0
+        self._pending_import_rels: list[ParsedRelationship] = []
+        self._pending_call_rels: list[ParsedRelationship] = []
+        self._pending_type_rels: list[ParsedRelationship] = []
+        self._pending_project_names: set[str] = set()
+
     def dedup_key(self, event: Event) -> str:
         if isinstance(event, ASTDirty):
             return event.path
         return super().dedup_key(event)
+
+    async def run(self) -> None:
+        try:
+            await super().run()
+        finally:
+            # Final resolution flush for any remaining deferred rels
+            if self._pending_import_rels or self._pending_call_rels or self._pending_type_rels:
+                await self._flush_deferred_resolution()
+
+    async def _flush_deferred_resolution(self) -> None:
+        """Run resolution for all accumulated rels across batches."""
+        for project_name in self._pending_project_names:
+            proj_imports = [
+                r for r in self._pending_import_rels if r.from_qualified_name.startswith(project_name + ":")
+            ]
+            proj_calls = [r for r in self._pending_call_rels if r.from_qualified_name.startswith(project_name + ":")]
+            proj_types = [r for r in self._pending_type_rels if r.from_qualified_name.startswith(project_name + ":")]
+
+            if proj_imports:
+                await self.graph.resolve_imports(project_name, proj_imports)
+
+            if proj_calls or proj_types:
+                shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
+                if proj_calls:
+                    await self.graph.resolve_calls(project_name, proj_calls, lookup=shared_lookup)
+                if proj_types:
+                    await self.graph.resolve_type_refs(
+                        project_name, proj_types, lookup=shared_lookup, name_to_typedefs=td_map
+                    )
+
+        self._pending_import_rels.clear()
+        self._pending_call_rels.clear()
+        self._pending_type_rels.clear()
+        self._pending_project_names.clear()
+        self._batches_since_resolve = 0
+        self._last_resolve_time = asyncio.get_event_loop().time()
 
     async def _parse_file(
         self,
@@ -496,22 +551,23 @@ class Tier2ASTConsumer(TierConsumer):
                                     )
                                 )
 
-                # 6. Post-batch resolution (unchanged)
+                # 6. Accumulate rels for deferred resolution
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
                 group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
                 group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
 
-                if group_import_rels:
-                    await self.graph.resolve_imports(project_name, group_import_rels)
+                self._pending_import_rels.extend(group_import_rels)
+                self._pending_call_rels.extend(group_call_rels)
+                self._pending_type_rels.extend(group_type_rels)
+                self._pending_project_names.add(project_name)
 
-                if group_call_rels or group_type_rels:
-                    shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
-                    if group_call_rels:
-                        await self.graph.resolve_calls(project_name, group_call_rels, lookup=shared_lookup)
-                    if group_type_rels:
-                        await self.graph.resolve_type_refs(
-                            project_name, group_type_rels, lookup=shared_lookup, name_to_typedefs=td_map
-                        )
+            self._batches_since_resolve += 1
+            now = asyncio.get_event_loop().time()
+            if (
+                self._batches_since_resolve >= self._resolve_batch_interval
+                or (now - self._last_resolve_time) >= self._resolve_time_interval_s
+            ):
+                await self._flush_deferred_resolution()
 
             span.set_attribute("files_count", total_paths)
             span.set_attribute("entities_changed", total_changed)
@@ -557,13 +613,14 @@ class Tier3EmbedConsumer(TierConsumer):
         *,
         cache: EmbedCache | None = None,
         project_filter: set[str] | None = None,
+        policy: BatchPolicy | None = None,
     ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
             group="tier3-embed",
             consumer_name="tier3-embed-0",
-            policy=BatchPolicy(time_window_s=15.0, max_batch_size=100),
+            policy=policy or BatchPolicy(time_window_s=15.0, max_batch_size=100),
             project_filter=project_filter,
         )
         self.graph = graph

@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Any
 import pathspec
 from loguru import logger
 
-from code_atlas.events import Event, EventBus, FileChanged, Topic
-from code_atlas.indexing.consumers import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+from code_atlas.events import ASTDirty, Event, EventBus, FileChanged, Topic
+from code_atlas.indexing.consumers import BatchPolicy, Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
 from code_atlas.settings import derive_project_name, resolve_git_dir
@@ -833,25 +833,38 @@ async def _run_pipeline(
     project_root: Path | None = None,
     project_filter: set[str] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
+    skip_tier1: bool = False,
 ) -> Tier2ASTConsumer:
     """Start inline tier consumers and wait for the pipeline to drain.
 
     Returns the Tier2 consumer so callers can read accumulated stats.
+    When *skip_tier1* is True, Tier 1 is not created and reindex-tuned
+    policies are used for faster polling.
     """
-    await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
+    tier1: Tier1GraphConsumer | None = None
+    task1: asyncio.Task[None] | None = None
+
+    if not skip_tier1:
+        await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
+        tier1 = Tier1GraphConsumer(bus, graph, settings, project_filter=project_filter)
+        task1 = asyncio.create_task(tier1.run())
+
     await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
 
-    tier1 = Tier1GraphConsumer(bus, graph, settings, project_filter=project_filter)
-    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root, project_filter=project_filter)
+    # Reindex-tuned policies: flush immediately, short blocking reads
+    t2_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if skip_tier1 else None
+    t3_policy = BatchPolicy(time_window_s=0, max_batch_size=100, block_ms=50) if skip_tier1 else None
 
-    task1 = asyncio.create_task(tier1.run())
+    tier2 = Tier2ASTConsumer(
+        bus, graph, settings, project_root=project_root, project_filter=project_filter, policy=t2_policy
+    )
     task2 = asyncio.create_task(tier2.run())
 
     tier3: Tier3EmbedConsumer | None = None
     task3: asyncio.Task[None] | None = None
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, project_filter=project_filter)
+        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, project_filter=project_filter, policy=t3_policy)
         task3 = asyncio.create_task(tier3.run())
 
     try:
@@ -860,14 +873,17 @@ async def _run_pipeline(
             drain_timeout_s,
             embed_enabled=embed is not None,
             on_drain_progress=on_drain_progress,
+            skip_tier1=skip_tier1,
         )
     finally:
-        tier1.stop()
+        if tier1 is not None:
+            tier1.stop()
         tier2.stop()
         if tier3 is not None:
             tier3.stop()
         await asyncio.sleep(0.5)
-        task1.cancel()
+        if task1 is not None:
+            task1.cancel()
         task2.cancel()
         if task3 is not None:
             task3.cancel()
@@ -939,6 +955,111 @@ async def _decide_delta_mode(
     return _DeltaDecision("delta", files_added, files_modified, files_deleted)
 
 
+def _sort_files_for_indexing(files: list[str]) -> list[str]:
+    """Sort files so deep modules come before shallow re-exporters.
+
+    Ordering:
+    1. Sort by depth descending (deeper files first).
+    2. Within same depth: ``__init__.py`` files come LAST (they import from siblings).
+    3. Stable sort preserves alphabetical order within same priority.
+    """
+
+    def _sort_key(path: str) -> tuple[int, int]:
+        depth = path.count("/")
+        is_init = 1 if path.endswith("__init__.py") else 0
+        return (-depth, is_init)
+
+    return sorted(files, key=_sort_key)
+
+
+def _build_project_dep_graph(
+    sub_projects: list[DetectedProject],
+) -> dict[str, set[str]]:
+    """Parse ``pyproject.toml`` ``[tool.uv.sources]`` for workspace deps.
+
+    Returns ``{project_name: set of project_names it depends on}``.
+    Handles patterns like::
+
+        [tool.uv.sources]
+        trading-core = { workspace = true }
+    """
+    # Build a map from normalised package name → DetectedProject.name
+    pkg_to_project: dict[str, str] = {}
+    for sp in sub_projects:
+        # Try reading project name from pyproject.toml
+        pyproject = sp.root / "pyproject.toml"
+        if pyproject.is_file():
+            try:
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+                pkg_name = data.get("project", {}).get("name", "")
+                if pkg_name:
+                    pkg_to_project[pkg_name.lower().replace("-", "_")] = sp.name
+            except Exception:
+                pass
+        # Also map the directory basename
+        pkg_to_project[sp.name.lower().replace("-", "_")] = sp.name
+
+    dep_graph: dict[str, set[str]] = {sp.name: set() for sp in sub_projects}
+
+    for sp in sub_projects:
+        pyproject = sp.root / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        uv_sources = data.get("tool", {}).get("uv", {}).get("sources", {})
+        for pkg_name, source_spec in uv_sources.items():
+            if isinstance(source_spec, dict) and source_spec.get("workspace"):
+                normalised = pkg_name.lower().replace("-", "_")
+                dep_name = pkg_to_project.get(normalised)
+                if dep_name and dep_name != sp.name:
+                    dep_graph[sp.name].add(dep_name)
+
+    return dep_graph
+
+
+def _topo_sort_projects(
+    sub_projects: list[DetectedProject],
+    dep_graph: dict[str, set[str]],
+) -> list[DetectedProject]:
+    """Topological sort: dependencies first, then dependents.
+
+    Falls back to original order on cycles.
+    """
+    by_name = {sp.name: sp for sp in sub_projects}
+    result: list[str] = []
+    visited: set[str] = set()
+    in_stack: set[str] = set()
+    has_cycle = False
+
+    def _visit(name: str) -> None:
+        nonlocal has_cycle
+        if name in in_stack:
+            has_cycle = True
+            return
+        if name in visited:
+            return
+        in_stack.add(name)
+        for dep in dep_graph.get(name, ()):
+            if dep in by_name:
+                _visit(dep)
+        in_stack.discard(name)
+        visited.add(name)
+        result.append(name)
+
+    for sp in sub_projects:
+        _visit(sp.name)
+
+    if has_cycle:
+        logger.warning("Cycle detected in project dependency graph — using original order")
+        return sub_projects
+
+    return [by_name[name] for name in result if name in by_name]
+
+
 async def _publish_events(
     bus: EventBus,
     mode: str,
@@ -947,10 +1068,25 @@ async def _publish_events(
     *,
     project_name: str = "",
     project_root: str = "",
+    skip_tier1: bool = False,
 ) -> int:
-    """Publish FileChanged events and return the count published."""
+    """Publish FileChanged (or ASTDirty when skip_tier1) events and return the count published."""
+    if skip_tier1:
+        # Publish ASTDirty directly, bypassing Tier 1
+        if mode == "delta":
+            events: list[Event] = [
+                ASTDirty(path=fp, project_name=project_name, project_root=project_root)
+                for fp in decision.files_added | decision.files_modified | decision.files_deleted
+            ]
+        else:
+            events = [ASTDirty(path=fp, project_name=project_name, project_root=project_root) for fp in files]
+        if events:
+            await bus.publish_many(Topic.AST_DIRTY, events)
+        logger.debug("Published {} ASTDirty events (skip_tier1, {})", len(events), mode)
+        return len(events)
+
     if mode == "delta":
-        events: list[Event] = []
+        events = []
         events.extend(
             FileChanged(path=fp, change_type="created", project_name=project_name, project_root=project_root)
             for fp in decision.files_added
@@ -1032,7 +1168,7 @@ async def index_project(
         )
 
 
-async def _index_project_inner(
+async def _index_project_inner(  # noqa: PLR0915
     settings: AtlasSettings,
     graph: GraphClient,
     bus: EventBus,
@@ -1085,8 +1221,14 @@ async def _index_project_inner(
     pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
     logger.debug("Created {} package node(s)", pkg_count)
 
-    # 5. Publish FileChanged events
-    published = await _publish_events(bus, decision.mode, files, decision, project_name=project_name)
+    # 5. Sort files for optimal resolution order (deep modules before __init__.py)
+    files = _sort_files_for_indexing(files)
+
+    # 6. Publish events (skip Tier 1 for full reindex — ASTDirty directly)
+    skip_tier1 = full_reindex or decision.mode == "full"
+    published = await _publish_events(
+        bus, decision.mode, files, decision, project_name=project_name, skip_tier1=skip_tier1
+    )
 
     # 6. Start inline consumers and wait for drain
     t2stats = None
@@ -1101,6 +1243,7 @@ async def _index_project_inner(
             project_root=project_root,
             project_filter={project_name},
             on_drain_progress=on_drain_progress,
+            skip_tier1=skip_tier1,
         )
         t2stats = tier2.stats
 
@@ -1207,6 +1350,7 @@ async def _publish_project(
     files: list[str],
     *,
     full_reindex: bool = False,
+    skip_tier1: bool = False,
 ) -> _ProjectPublishResult:
     """Scan, decide delta/full, create packages, and publish events for one project.
 
@@ -1226,9 +1370,21 @@ async def _publish_project(
     pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
     logger.debug("'{}': {} package node(s)", project_name, pkg_count)
 
-    # Publish FileChanged events
+    # Sort files for optimal resolution order
+    files = _sort_files_for_indexing(files)
+
+    # Determine skip_tier1 from caller hint or decision mode
+    effective_skip = skip_tier1 or decision.mode == "full"
+
+    # Publish events (ASTDirty directly when skipping Tier 1)
     published = await _publish_events(
-        bus, decision.mode, files, decision, project_name=project_name, project_root=str(project_root)
+        bus,
+        decision.mode,
+        files,
+        decision,
+        project_name=project_name,
+        project_root=str(project_root),
+        skip_tier1=effective_skip,
     )
 
     return _ProjectPublishResult(
@@ -1279,6 +1435,10 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         sub_projects = filtered
         logger.info("Scoped to {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
 
+    # Topological sort: process dependency packages before dependents
+    dep_graph = _build_project_dep_graph(sub_projects)
+    sub_projects = _topo_sort_projects(sub_projects, dep_graph)
+
     # Compute the root name once — sub-projects are prefixed with it
     root_name = derive_project_name(project_root)
 
@@ -1306,21 +1466,29 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             await cache.clear()
 
     # --- Start shared consumers (once for entire monorepo) ---
-    await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
+    skip_tier1 = full_reindex  # full reindex publishes ASTDirty directly
+
+    tier1: Tier1GraphConsumer | None = None
+    if not skip_tier1:
+        await bus.ensure_group(Topic.FILE_CHANGED, "tier1-graph")
+        tier1 = Tier1GraphConsumer(bus, graph, settings)
+
     await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
 
-    tier1 = Tier1GraphConsumer(bus, graph, settings)
-    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root)
+    t2_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if skip_tier1 else None
+    t3_policy = BatchPolicy(time_window_s=0, max_batch_size=100, block_ms=50) if skip_tier1 else None
 
-    consumer_tasks: list[asyncio.Task[None]] = [
-        asyncio.create_task(tier1.run()),
-        asyncio.create_task(tier2.run()),
-    ]
+    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root, policy=t2_policy)
+
+    consumer_tasks: list[asyncio.Task[None]] = []
+    if tier1 is not None:
+        consumer_tasks.append(asyncio.create_task(tier1.run()))
+    consumer_tasks.append(asyncio.create_task(tier2.run()))
 
     tier3: Tier3EmbedConsumer | None = None
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, policy=t3_policy)
         consumer_tasks.append(asyncio.create_task(tier3.run()))
 
     start = time.monotonic()
@@ -1336,7 +1504,14 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
             sub_files = scan_files(sub.root, settings)
             pr = await _publish_project(
-                settings, graph, bus, prefixed_name, sub.root, sub_files, full_reindex=full_reindex
+                settings,
+                graph,
+                bus,
+                prefixed_name,
+                sub.root,
+                sub_files,
+                full_reindex=full_reindex,
+                skip_tier1=skip_tier1,
             )
             publish_results.append(pr)
 
@@ -1353,7 +1528,14 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 on_progress(root_name, total - 1, total)
 
             root_pr = await _publish_project(
-                settings, graph, bus, root_name, project_root, root_only_files, full_reindex=full_reindex
+                settings,
+                graph,
+                bus,
+                root_name,
+                project_root,
+                root_only_files,
+                full_reindex=full_reindex,
+                skip_tier1=skip_tier1,
             )
             publish_results.append(root_pr)
 
@@ -1366,11 +1548,13 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             drain_timeout_s,
             embed_enabled=embed is not None,
             on_drain_progress=on_drain_progress,
+            skip_tier1=skip_tier1,
         )
 
     finally:
         # --- Tear down consumers (once) ---
-        tier1.stop()
+        if tier1 is not None:
+            tier1.stop()
         tier2.stop()
         if tier3 is not None:
             tier3.stop()
@@ -1456,8 +1640,12 @@ async def _wait_for_drain(
     *,
     embed_enabled: bool = True,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
+    skip_tier1: bool = False,
 ) -> None:
     """Poll stream groups until Tier 1, Tier 2, and (optionally) Tier 3 are drained.
+
+    When *skip_tier1* is True, Tier 1 polling is skipped (events go directly
+    to Tier 2).
 
     If *on_drain_progress* is provided, it is called each poll cycle with
     ``(t1_remaining, t2_remaining, t3_remaining)`` so callers can display
@@ -1468,18 +1656,24 @@ async def _wait_for_drain(
     poll_interval = 0.5
 
     while time.monotonic() < deadline:
-        queries: list[tuple[Topic, str]] = [
-            (Topic.FILE_CHANGED, "tier1-graph"),
-            (Topic.AST_DIRTY, "tier2-ast"),
-        ]
+        queries: list[tuple[Topic, str]] = []
+        if not skip_tier1:
+            queries.append((Topic.FILE_CHANGED, "tier1-graph"))
+        queries.append((Topic.AST_DIRTY, "tier2-ast"))
         if embed_enabled:
             queries.append((Topic.EMBED_DIRTY, "tier3-embed"))
 
         infos = await bus.stream_group_info_multi(queries)
 
-        t1_remaining = infos[0]["pending"] + infos[0]["lag"]
-        t2_remaining = infos[1]["pending"] + infos[1]["lag"]
-        t3_remaining = infos[2]["pending"] + infos[2]["lag"] if embed_enabled else 0
+        idx = 0
+        if skip_tier1:
+            t1_remaining = 0
+        else:
+            t1_remaining = infos[idx]["pending"] + infos[idx]["lag"]
+            idx += 1
+        t2_remaining = infos[idx]["pending"] + infos[idx]["lag"]
+        idx += 1
+        t3_remaining = infos[idx]["pending"] + infos[idx]["lag"] if embed_enabled else 0
 
         if on_drain_progress is not None:
             on_drain_progress(t1_remaining, t2_remaining, t3_remaining)
