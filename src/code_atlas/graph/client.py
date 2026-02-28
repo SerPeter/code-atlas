@@ -224,6 +224,11 @@ class GraphClient:
         self._query_timeout_s = mg.query_timeout_s
         self._write_timeout_s = mg.write_timeout_s
 
+    @property
+    def dimension(self) -> int:
+        """Current embedding vector dimension used for vector indices."""
+        return self._dimension
+
     async def ping(self) -> bool:
         """Health check — returns True if Memgraph is reachable."""
         records = await self.execute("RETURN 1 AS n")
@@ -1423,14 +1428,14 @@ class GraphClient:
 
         Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``kind``, ``_label``,
-        ``embed_hash``, ``embedding``.
+        ``embed_hash``, ``has_embedding``.
         """
         ret = (
             "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
             "n.source AS source, "
             "n.kind AS kind, labels(n)[0] AS _label, "
-            "n.embed_hash AS embed_hash, n.embedding AS embedding"
+            "n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding"
         )
 
         if labels is None or len(labels) != len(uids):
@@ -1450,17 +1455,59 @@ class GraphClient:
         for uid, lbl in zip(uids, labels, strict=True):
             by_label[lbl].append(uid)
 
-        results: list[dict[str, Any]] = []
-        for lbl, group_uids in by_label.items():
+        async def _read_label(lbl: str, group_uids: list[str]) -> list[dict[str, Any]]:
             _assert_valid_label(lbl)
+            rows: list[dict[str, Any]] = []
             for i in range(0, len(group_uids), chunk_size):
                 chunk = group_uids[i : i + chunk_size]
-                rows = await self.execute(
-                    f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
-                    {"uids": chunk},
+                rows.extend(
+                    await self.execute(
+                        f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
+                        {"uids": chunk},
+                    )
                 )
-                results.extend(rows)
-        return results
+            return rows
+
+        label_results = await asyncio.gather(*[_read_label(lbl, guids) for lbl, guids in by_label.items()])
+        return [row for rows in label_results for row in rows]
+
+    async def read_embed_hashes(
+        self,
+        uids: list[str],
+        *,
+        labels: list[str] | None = None,
+    ) -> dict[str, tuple[str | None, bool]]:
+        """Batch-read embed_hash and embedding existence for entities.
+
+        Returns ``{uid: (embed_hash, has_embedding)}`` for each matched node.
+        Uses concurrent per-label reads when *labels* is provided.
+        """
+        ret = "RETURN n.uid AS uid, n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding"
+
+        if labels is None or len(labels) != len(uids):
+            rows = await self.execute(
+                f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}",
+                {"uids": uids},
+            )
+            return {r["uid"]: (r["embed_hash"], r["has_embedding"]) for r in rows}
+
+        by_label: dict[str, list[str]] = defaultdict(list)
+        for uid, lbl in zip(uids, labels, strict=True):
+            by_label[lbl].append(uid)
+
+        async def _read_label(lbl: str, group_uids: list[str]) -> list[dict[str, Any]]:
+            _assert_valid_label(lbl)
+            return await self.execute(
+                f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
+                {"uids": group_uids},
+            )
+
+        label_results = await asyncio.gather(*[_read_label(lbl, guids) for lbl, guids in by_label.items()])
+        result: dict[str, tuple[str | None, bool]] = {}
+        for rows in label_results:
+            for r in rows:
+                result[r["uid"]] = (r["embed_hash"], r["has_embedding"])
+        return result
 
     async def write_embeddings(
         self,

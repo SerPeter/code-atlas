@@ -397,7 +397,7 @@ class TestTier3CacheLookup:
                     "kind": "function",
                     "_label": "Callable",
                     "embed_hash": text_hash,
-                    "embedding": [0.1, 0.2, 0.3],
+                    "has_embedding": True,
                 }
             ]
         )
@@ -410,7 +410,7 @@ class TestTier3CacheLookup:
 
         embed.embed_batch.assert_not_called()
         cache.get_many.assert_not_called()
-        graph.run_in_write_transaction.assert_not_called()
+        graph.write_embeddings_and_hashes.assert_not_called()
 
     async def test_cache_hit_skips_embed(self):
         """When Valkey cache has the vector, API call is skipped."""
@@ -434,17 +434,11 @@ class TestTier3CacheLookup:
                     "kind": "function",
                     "_label": "Callable",
                     "embed_hash": None,
-                    "embedding": None,
+                    "has_embedding": False,
                 }
             ]
         )
         cache.get_many = AsyncMock(return_value={text_hash: cached_vec})
-
-        # run_in_write_transaction must call the passed closure
-        async def _run_tx(fn):
-            return await fn()
-
-        graph.run_in_write_transaction = AsyncMock(side_effect=_run_tx)
 
         consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
@@ -454,7 +448,6 @@ class TestTier3CacheLookup:
 
         embed.embed_batch.assert_not_called()
         cache.get_many.assert_called_once()
-        graph.run_in_write_transaction.assert_called_once()
         graph.write_embeddings_and_hashes.assert_called_once()
 
         # Verify correct vector was written (uid, vector, hash)
@@ -483,17 +476,12 @@ class TestTier3CacheLookup:
                     "kind": "function",
                     "_label": "Callable",
                     "embed_hash": None,
-                    "embedding": None,
+                    "has_embedding": False,
                 }
             ]
         )
         cache.get_many = AsyncMock(return_value={})  # no cache hit
         embed.embed_batch = AsyncMock(return_value=[api_vec])
-
-        async def _run_tx(fn):
-            return await fn()
-
-        graph.run_in_write_transaction = AsyncMock(side_effect=_run_tx)
 
         consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
@@ -503,7 +491,6 @@ class TestTier3CacheLookup:
 
         embed.embed_batch.assert_called_once()
         cache.put_many.assert_called_once()
-        graph.run_in_write_transaction.assert_called_once()
         graph.write_embeddings_and_hashes.assert_called_once()
 
         # Verify the API vector was written to graph (uid, vector, hash)

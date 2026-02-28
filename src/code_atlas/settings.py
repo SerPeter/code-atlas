@@ -172,7 +172,7 @@ class MonorepoSettings(BaseSettings):
 _PROVIDER_DEFAULTS: dict[str, dict[str, int]] = {
     "tei": {"batch_size": 32, "max_concurrency": 4},
     "ollama": {"batch_size": 32, "max_concurrency": 2},
-    "litellm": {"batch_size": 64, "max_concurrency": 8},
+    "litellm": {"batch_size": 128, "max_concurrency": 8},
 }
 
 

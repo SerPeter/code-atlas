@@ -744,6 +744,15 @@ class StalenessChecker:
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_dimension(embed: EmbedClient, configured: int | None) -> int:
+    """Return the embedding dimension, auto-detecting from the model if not configured."""
+    if configured is not None:
+        return configured
+    detected = await embed.detect_dimension()
+    logger.info("Auto-detected embedding dimension: {}", detected)
+    return detected
+
+
 async def _check_model_lock(
     graph: GraphClient,
     model: str,
@@ -752,12 +761,12 @@ async def _check_model_lock(
     reindex: bool,
     cache: EmbedCache | None = None,
 ) -> None:
-    """Enforce embedding model lock on the SchemaVersion node.
+    """Enforce embedding model/dimension lock on the SchemaVersion node.
 
     - First run (no stored model): write current config.
     - Reindex: clear embeddings + embed_hash, rebuild vector indices,
       flush all model keys from Valkey cache, write new config.
-    - Mismatch: raise RuntimeError with clear guidance.
+    - Model or dimension mismatch: raise RuntimeError with clear guidance.
     """
     if reindex:
         await graph.clear_all_embeddings()
@@ -769,11 +778,17 @@ async def _check_model_lock(
 
     stored = await graph.get_embedding_config()
     if stored is not None:
-        stored_model, _stored_dim = stored
+        stored_model, stored_dim = stored
         if stored_model != model:
             msg = (
                 f"Embedding model changed from '{stored_model}' to '{model}'. "
                 "Run 'atlas index --full' to rebuild all embeddings."
+            )
+            raise RuntimeError(msg)
+        if stored_dim != dimension:
+            msg = (
+                f"Embedding dimension changed from {stored_dim} to {dimension}. "
+                "Run 'atlas index --full' to rebuild vector indices."
             )
             raise RuntimeError(msg)
     else:
@@ -1218,8 +1233,8 @@ async def _index_project_inner(  # noqa: PLR0915
         if cache is not None:
             await cache.clear()
 
-    if settings.embeddings.enabled:
-        dimension = settings.embeddings.dimension or 768
+    if settings.embeddings.enabled and embed is not None:
+        dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
         await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
 
     # 3. Decide full vs. delta mode
@@ -1468,7 +1483,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         embed = EmbedClient(settings.embeddings)
         if settings.embeddings.cache_ttl_days > 0:
             cache = EmbedCache(settings.redis, settings.embeddings)
-        dimension = settings.embeddings.dimension or 768
+        dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
         await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
 
     if full_reindex:

@@ -462,7 +462,7 @@ class Tier2ASTConsumer(TierConsumer):
             total_paths = sum(len(p) for p in groups.values())
             logger.debug("Tier2 batch {}: {} unique path(s) in {} group(s)", batch_id, total_paths, len(groups))
 
-            changed_entity_refs: list[EntityRef] = []
+            embed_candidates: dict[str, tuple[EntityRef, str]] = {}  # uid → (ref, text_hash)
             skipped_before = self.stats.files_skipped
             total_changed = 0
             batch_max_sig = Significance.NONE
@@ -543,13 +543,29 @@ class Tier2ASTConsumer(TierConsumer):
                         for qn in changed_qns:
                             entity = entity_map.get(qn)
                             if entity is not None:
-                                changed_entity_refs.append(
-                                    EntityRef(
-                                        qualified_name=entity.qualified_name,
-                                        node_type=entity.label.value,
-                                        file_path=entity.file_path,
-                                    )
+                                ref = EntityRef(
+                                    qualified_name=entity.qualified_name,
+                                    node_type=entity.label.value,
+                                    file_path=entity.file_path,
                                 )
+                                # Build embed text from parsed entity data (same fields as graph)
+                                qn_bare = (
+                                    entity.qualified_name.split(":", 1)[1]
+                                    if ":" in entity.qualified_name
+                                    else entity.qualified_name
+                                )
+                                props = {
+                                    "_label": entity.label.value,
+                                    "qualified_name": qn_bare,
+                                    "kind": entity.kind,
+                                    "signature": entity.signature or "",
+                                    "docstring": entity.docstring or "",
+                                    "source": entity.source or "",
+                                }
+                                text = build_embed_text(props)
+                                if text:
+                                    text_hash = EmbedCache.hash_text(text)
+                                    embed_candidates[entity.qualified_name] = (ref, text_hash)
 
                 # 6. Accumulate rels for deferred resolution
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
@@ -582,13 +598,28 @@ class Tier2ASTConsumer(TierConsumer):
 
             if (
                 self.settings.embeddings.enabled
-                and changed_entity_refs
+                and embed_candidates
                 and _SIG_ORDER[batch_max_sig] >= _SIG_ORDER[Significance.MODERATE]
             ):
-                await self.bus.publish_many(
-                    Topic.EMBED_DIRTY,
-                    [EmbedDirty(entity=ref, significance=batch_max_sig) for ref in changed_entity_refs],
-                )
+                # Batch-read stored embed_hashes to filter graph hits
+                cand_uids = list(embed_candidates.keys())
+                cand_labels = [embed_candidates[uid][0].node_type for uid in cand_uids]
+                stored = await self.graph.read_embed_hashes(cand_uids, labels=cand_labels)
+
+                to_publish: list[EntityRef] = []
+                for uid, (ref, text_hash) in embed_candidates.items():
+                    stored_info = stored.get(uid)
+                    if stored_info is not None:
+                        stored_hash, has_embedding = stored_info
+                        if stored_hash == text_hash and has_embedding:
+                            continue  # graph hit — embedding still valid
+                    to_publish.append(ref)
+
+                if to_publish:
+                    await self.bus.publish_many(
+                        Topic.EMBED_DIRTY,
+                        [EmbedDirty(entity=ref, significance=batch_max_sig) for ref in to_publish],
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -616,18 +647,23 @@ class Tier3EmbedConsumer(TierConsumer):
         policy: BatchPolicy | None = None,
         max_concurrency: int | None = None,
     ) -> None:
+        _max_conc = max_concurrency or embed.max_concurrency
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
             group="tier3-embed",
             consumer_name="tier3-embed",
-            policy=policy or BatchPolicy(time_window_s=15.0, max_batch_size=embed.batch_size),
+            policy=policy
+            or BatchPolicy(
+                time_window_s=10.0,
+                max_batch_size=embed.batch_size * _max_conc,
+            ),
             project_filter=project_filter,
         )
         self.graph = graph
         self.embed = embed
         self.cache = cache
-        self._max_concurrency = max_concurrency or embed.max_concurrency
+        self._max_concurrency = _max_conc
         self._inflight: set[asyncio.Task[None]] = set()
         self._pel_dirty = False
 
@@ -792,7 +828,7 @@ class Tier3EmbedConsumer(TierConsumer):
             await self.cache.put_many([(th, vec) for _, vec, th in result])
         return result
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:
+    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912
         with _tracer.start_as_current_span("tier3.process_batch", attributes={"batch_id": batch_id}) as span:
             # Collect and deduplicate entities across all events in the batch
             seen: dict[str, EntityRef] = {}
@@ -830,7 +866,7 @@ class Tier3EmbedConsumer(TierConsumer):
                     continue
                 uid = props["uid"]
                 text_hash = EmbedCache.hash_text(text)
-                if props.get("embed_hash") == text_hash and props.get("embedding") is not None:
+                if props.get("embed_hash") == text_hash and props.get("has_embedding"):
                     graph_hits += 1
                 else:
                     to_process.append((uid, text, text_hash))
@@ -857,14 +893,11 @@ class Tier3EmbedConsumer(TierConsumer):
                 labeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn in uid_label]
                 unlabeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn not in uid_label]
 
-                async def _write_all() -> None:
-                    if labeled:
-                        lbl_list = [uid_label[qn] for qn, _, _ in labeled]
-                        await self.graph.write_embeddings_and_hashes(labeled, labels=lbl_list)
-                    if unlabeled:
-                        await self.graph.write_embeddings_and_hashes(unlabeled)
-
-                await self.graph.run_in_write_transaction(_write_all)
+                if labeled:
+                    lbl_list = [uid_label[qn] for qn, _, _ in labeled]
+                    await self.graph.write_embeddings_and_hashes(labeled, labels=lbl_list)
+                if unlabeled:
+                    await self.graph.write_embeddings_and_hashes(unlabeled)
 
             elapsed = asyncio.get_event_loop().time() - t0
             span.set_attribute("entities_count", total)
