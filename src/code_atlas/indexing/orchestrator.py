@@ -1725,4 +1725,11 @@ async def _wait_for_drain(
 
         await asyncio.sleep(poll_interval)
 
-    logger.warning("Pipeline drain timed out after {:.0f}s", timeout_s)
+    logger.warning(
+        "Pipeline drain timed out after {:.0f}s — t1={} t2={} t3={} (raw={})",
+        timeout_s,
+        t1_remaining,
+        t2_remaining,
+        t3_remaining,
+        infos,
+    )

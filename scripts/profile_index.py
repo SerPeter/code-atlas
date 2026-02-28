@@ -1,10 +1,14 @@
 """Profile the indexing pipeline per-tier with wall-clock timing.
 
 Usage:
-    uv run python scripts/profile_index.py [--full]
+    uv run python scripts/profile_index.py [--full] [--no-cache]
 
 Monkey-patches key methods with timing wrappers, runs index_project()
 on the current repo, and prints a breakdown of where time is spent.
+
+Flags:
+    --full       Force full reindex (wipe existing data)
+    --no-cache   Flush Valkey embedding cache before indexing
 """
 
 from __future__ import annotations
@@ -20,6 +24,16 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Timing infrastructure
 # ---------------------------------------------------------------------------
+
+# Monotonic reference for trace offsets (set at index start)
+_t0_ref: float = 0.0
+
+
+@dataclass
+class TraceEvent:
+    name: str
+    start_offset: float  # seconds since _t0_ref
+    duration: float  # seconds
 
 
 @dataclass
@@ -43,9 +57,11 @@ class TimingStat:
 @dataclass
 class TimingReport:
     stats: dict[str, TimingStat] = field(default_factory=lambda: defaultdict(TimingStat))
+    trace: list[TraceEvent] = field(default_factory=list)
 
-    def record(self, name: str, elapsed: float) -> None:
+    def record(self, name: str, start: float, elapsed: float) -> None:
         self.stats[name].record(elapsed)
+        self.trace.append(TraceEvent(name, start - _t0_ref, elapsed))
 
 
 _report = TimingReport()
@@ -61,7 +77,8 @@ def timed_async(name: str):
             try:
                 return await fn(*args, **kwargs)
             finally:
-                _report.record(name, time.monotonic() - t0)
+                elapsed = time.monotonic() - t0
+                _report.record(name, t0, elapsed)
 
         return wrapper
 
@@ -78,7 +95,8 @@ def timed_sync(name: str):
             try:
                 return fn(*args, **kwargs)
             finally:
-                _report.record(name, time.monotonic() - t0)
+                elapsed = time.monotonic() - t0
+                _report.record(name, t0, elapsed)
 
         return wrapper
 
@@ -183,12 +201,59 @@ def patch_all():
 # ---------------------------------------------------------------------------
 
 
+_TRACE_NOISE = frozenset(
+    {
+        "graph.execute",
+        "graph.execute_write",
+        "bus.read_batch",
+        "bus.read_pending",
+        "bus.ack",
+        "bus.stream_group_info_multi",
+    }
+)
+
+
+def print_trace(wall_time: float, *, min_duration: float = 0.05):
+    """Print a chronological trace of significant operations.
+
+    Filters out low-level graph/bus noise and events shorter than *min_duration*.
+    """
+    events = [e for e in _report.trace if e.name not in _TRACE_NOISE and e.duration >= min_duration]
+    if not events:
+        print("\n(No trace events above threshold)")
+        return
+
+    print("\n" + "=" * 100)
+    print(f" TRACE VIEW — wall clock: {wall_time:.2f}s  (threshold: {min_duration * 1000:.0f}ms)")
+    print("=" * 100)
+
+    # Timeline header
+    print(f" {'#':>4}  {'T+start':>9}  {'Duration':>10}  {'T+end':>9}  {'Operation'}")
+    print(f" {'':>4}  {'':>9}  {'':>10}  {'':>9}  {'-' * 60}")
+
+    for i, ev in enumerate(events, 1):
+        end = ev.start_offset + ev.duration
+        dur_str = f"{ev.duration * 1000:.0f}ms" if ev.duration < 1 else f"{ev.duration:.2f}s"
+        start_str = f"{ev.start_offset:.3f}s"
+        end_str = f"{end:.3f}s"
+
+        # Visual bar -- scale to 40-char width
+        bar_start = int(ev.start_offset / wall_time * 40) if wall_time > 0 else 0
+        bar_len = max(1, int(ev.duration / wall_time * 40)) if wall_time > 0 else 1
+        bar = "." * bar_start + "#" * bar_len
+
+        print(f" {i:>4}  {start_str:>9}  {dur_str:>10}  {end_str:>9}  {ev.name}")
+        print(f"       {'':>9}  {'':>10}  {'':>9}  {bar}")
+
+    print()
+
+
 def print_report(wall_time: float):
     """Print a formatted timing report."""
     stats = _report.stats
 
     print("\n" + "=" * 80)
-    print(f" PROFILING REPORT — wall clock: {wall_time:.2f}s")
+    print(f" CUMULATIVE REPORT — wall clock: {wall_time:.2f}s")
     print("=" * 80)
 
     # Group by tier
@@ -279,7 +344,10 @@ def print_report(wall_time: float):
 
 
 async def main():
+    global _t0_ref
+
     full_reindex = "--full" in sys.argv
+    no_cache = "--no-cache" in sys.argv
 
     patch_all()
 
@@ -287,6 +355,7 @@ async def main():
     from code_atlas.events import EventBus
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.orchestrator import index_project
+    from code_atlas.search.embeddings import EmbedCache
     from code_atlas.settings import AtlasSettings
 
     project_root = Path().resolve()
@@ -295,6 +364,7 @@ async def main():
     print(f"Profiling index on: {project_root}")
     print(f"Mode: {'full' if full_reindex else 'auto (delta/full)'}")
     print(f"Embeddings: {'enabled' if settings.embeddings.enabled else 'disabled'}")
+    print(f"Cache: {'disabled (--no-cache)' if no_cache else 'enabled'}")
     print()
 
     graph = GraphClient(settings)
@@ -303,7 +373,12 @@ async def main():
     try:
         await graph.ensure_schema()
 
-        t0 = time.monotonic()
+        if no_cache and settings.embeddings.enabled and settings.embeddings.cache_ttl_days > 0:
+            cache = EmbedCache(settings.redis, settings.embeddings)
+            await cache.clear_all_models()
+            print("Flushed embedding cache")
+
+        _t0_ref = time.monotonic()
         result = await index_project(
             settings,
             graph,
@@ -311,13 +386,14 @@ async def main():
             full_reindex=full_reindex,
             drain_timeout_s=120.0,
         )
-        wall_time = time.monotonic() - t0
+        wall_time = time.monotonic() - _t0_ref
 
         print(
             f"\nIndex result: {result.files_scanned} files, {result.entities_total} entities, "
             f"{result.duration_s:.2f}s ({result.mode})"
         )
 
+        print_trace(wall_time)
         print_report(wall_time)
 
     finally:

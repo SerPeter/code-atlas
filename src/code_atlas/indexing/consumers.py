@@ -113,6 +113,19 @@ class TierConsumer(ABC):
             return True
         return pn in self._project_filter
 
+    async def _dedup_put(
+        self,
+        pending: dict[str, tuple[bytes, Event]],
+        key: str,
+        msg_id: bytes,
+        event: Event,
+    ) -> None:
+        """Insert into *pending*, ACKing the superseded msg_id if the key already exists."""
+        old = pending.get(key)
+        if old is not None:
+            await self.bus.ack(self.input_topic, self.group, old[0])
+        pending[key] = (msg_id, event)
+
     def stop(self) -> None:
         """Signal the consumer to stop after the current iteration."""
         self._stop = True
@@ -152,7 +165,7 @@ class TierConsumer(ABC):
                         if not self._matches_project(event):
                             await self.bus.ack(self.input_topic, self.group, msg_id)
                             continue
-                        pending[key] = (msg_id, event)
+                        await self._dedup_put(pending, key, msg_id, event)
                         if window_start is None:
                             window_start = asyncio.get_event_loop().time()
                 else:
@@ -183,7 +196,7 @@ class TierConsumer(ABC):
                 if not self._matches_project(event):
                     await self.bus.ack(self.input_topic, self.group, msg_id)
                     continue
-                pending[key] = (msg_id, event)  # latest wins
+                await self._dedup_put(pending, key, msg_id, event)
                 if window_start is None:
                     window_start = asyncio.get_event_loop().time()
 
@@ -724,7 +737,7 @@ class Tier3EmbedConsumer(TierConsumer):
                         if not self._matches_project(event):
                             await self.bus.ack(self.input_topic, self.group, msg_id)
                             continue
-                        pending[key] = (msg_id, event)
+                        await self._dedup_put(pending, key, msg_id, event)
                         if window_start is None:
                             window_start = asyncio.get_event_loop().time()
                 else:
@@ -749,7 +762,7 @@ class Tier3EmbedConsumer(TierConsumer):
                     if not self._matches_project(event):
                         await self.bus.ack(self.input_topic, self.group, msg_id)
                         continue
-                    pending[key] = (msg_id, event)
+                    await self._dedup_put(pending, key, msg_id, event)
                     if window_start is None:
                         window_start = asyncio.get_event_loop().time()
 

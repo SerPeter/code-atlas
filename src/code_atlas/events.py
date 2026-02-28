@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -292,14 +293,28 @@ class EventBus:
     async def flush(self) -> None:
         """Clear all pipeline streams for a full reindex.
 
-        Uses XTRIM to remove all entries while preserving consumer groups,
-        so long-running daemon consumers won't get NOGROUP errors.
-        Batched in a single pipeline to avoid per-topic round-trips.
+        Trims all stream entries and destroys consumer groups to clear stale
+        pending entry lists (PEL). Groups are recreated by ``ensure_group()``
+        when consumers start.
         """
         pipe = self._redis.pipeline(transaction=False)
         for topic in Topic:
             pipe.xtrim(self._stream_key(topic), 0, approximate=False)
         await pipe.execute()
+
+        # Destroy consumer groups to purge stale PEL entries from previous runs.
+        for topic in Topic:
+            key = self._stream_key(topic)
+            try:
+                groups = await self._redis.xinfo_groups(key)
+            except Exception:
+                continue
+            for g in groups:
+                name = g.get(b"name", g.get("name", b""))
+                if isinstance(name, bytes):
+                    name = name.decode()
+                with contextlib.suppress(Exception):
+                    await self._redis.xgroup_destroy(key, name)
 
     async def close(self) -> None:
         """Close the connection pool."""

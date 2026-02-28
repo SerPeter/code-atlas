@@ -64,6 +64,12 @@ ignore = [
     "PLR2004",  # magic values are fine in tests
     "PLC0415",  # non-top-level imports — common in integration test fixtures
 ]
+"scripts/**/*.py" = [
+    "SLF001",   # private member access — monkey-patching for profiling
+    "PLC0415",  # non-top-level imports — deferred for monkey-patching
+    "PLW0603",  # global statement — needed for timing reference
+    "FURB177",  # Path.cwd() — pre-existing pattern
+]
 
 [lint.isort]
 known-first-party = ["code_atlas"]
