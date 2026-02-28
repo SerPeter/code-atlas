@@ -38,8 +38,12 @@ class EmbedClient:
 
     def __init__(self, settings: EmbeddingSettings) -> None:
         self._settings = settings
-        self._batch_size = settings.batch_size
-        self._max_concurrency = settings.max_concurrency
+        # batch_size and max_concurrency are guaranteed non-None after the
+        # _apply_provider_defaults model validator runs on EmbeddingSettings.
+        assert settings.batch_size is not None
+        assert settings.max_concurrency is not None
+        self._batch_size: int = settings.batch_size
+        self._max_concurrency: int = settings.max_concurrency
         self._timeout = settings.timeout_s
         self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._query_cache_size = settings.query_cache_size
@@ -66,6 +70,16 @@ class EmbedClient:
 
         # Infer max input tokens from litellm's model registry
         self._max_input_tokens = self._resolve_max_input_tokens()
+
+    @property
+    def batch_size(self) -> int:
+        """Resolved batch_size (after provider defaults)."""
+        return self._batch_size
+
+    @property
+    def max_concurrency(self) -> int:
+        """Resolved max_concurrency (after provider defaults)."""
+        return self._max_concurrency
 
     def _resolve_max_input_tokens(self) -> int | None:
         """Resolve the model's max input token limit from litellm's model registry.

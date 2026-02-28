@@ -614,13 +614,14 @@ class Tier3EmbedConsumer(TierConsumer):
         cache: EmbedCache | None = None,
         project_filter: set[str] | None = None,
         policy: BatchPolicy | None = None,
+        consumer_name: str = "tier3-embed-0",
     ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
             group="tier3-embed",
-            consumer_name="tier3-embed-0",
-            policy=policy or BatchPolicy(time_window_s=15.0, max_batch_size=100),
+            consumer_name=consumer_name,
+            policy=policy or BatchPolicy(time_window_s=15.0, max_batch_size=embed.batch_size),
             project_filter=project_filter,
         )
         self.graph = graph
@@ -662,7 +663,7 @@ class Tier3EmbedConsumer(TierConsumer):
             await self.cache.put_many([(th, vec) for _, vec, th in result])
         return result
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912
+    async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier3.process_batch", attributes={"batch_id": batch_id}) as span:
             # Collect and deduplicate entities across all events in the batch
             seen: dict[str, EntityRef] = {}
@@ -721,26 +722,20 @@ class Tier3EmbedConsumer(TierConsumer):
             cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
             api_vectors = await self._embed_and_store(need_embed)
 
-            # 5. Write all new/changed vectors + embed_hashes to graph
+            # 5. Write all new/changed vectors + embed_hashes to graph (combined, 1 UNWIND per label)
             all_resolved = cache_resolved + api_vectors
             if all_resolved:
-                # Split into labeled (index-backed) and unlabeled (fallback) writes
                 labeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn in uid_label]
                 unlabeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn not in uid_label]
 
-                if labeled:
-                    lbl_list = [uid_label[qn] for qn, _, _ in labeled]
-                    await self.graph.write_embeddings(
-                        [(qn, vec) for qn, vec, _ in labeled],
-                        labels=lbl_list,
-                    )
-                    await self.graph.write_embed_hashes(
-                        [(qn, th) for qn, _, th in labeled],
-                        labels=lbl_list,
-                    )
-                if unlabeled:
-                    await self.graph.write_embeddings([(qn, vec) for qn, vec, _ in unlabeled])
-                    await self.graph.write_embed_hashes([(qn, th) for qn, _, th in unlabeled])
+                async def _write_all() -> None:
+                    if labeled:
+                        lbl_list = [uid_label[qn] for qn, _, _ in labeled]
+                        await self.graph.write_embeddings_and_hashes(labeled, labels=lbl_list)
+                    if unlabeled:
+                        await self.graph.write_embeddings_and_hashes(unlabeled)
+
+                await self.graph.run_in_write_transaction(_write_all)
 
             elapsed = asyncio.get_event_loop().time() - t0
             span.set_attribute("entities_count", total)

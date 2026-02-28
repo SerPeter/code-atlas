@@ -368,11 +368,19 @@ class TestTier3CacheLookup:
     def _make_embed_dirty(entity: EntityRef) -> EmbedDirty:
         return EmbedDirty(entity=entity, significance="HIGH")
 
+    @staticmethod
+    def _mock_embed() -> AsyncMock:
+        """Build an EmbedClient mock with required properties."""
+        mock = AsyncMock()
+        mock.batch_size = 32
+        mock.max_concurrency = 4
+        return mock
+
     async def test_graph_hit_skips_all(self):
         """When graph node has matching embed_hash+embedding, no cache or API call needed."""
         bus = AsyncMock()
         graph = AsyncMock()
-        embed = AsyncMock()
+        embed = self._mock_embed()
         cache = AsyncMock()
 
         text = "Module: foo\nFunction: bar"
@@ -402,13 +410,13 @@ class TestTier3CacheLookup:
 
         embed.embed_batch.assert_not_called()
         cache.get_many.assert_not_called()
-        graph.write_embeddings.assert_not_called()
+        graph.run_in_write_transaction.assert_not_called()
 
     async def test_cache_hit_skips_embed(self):
         """When Valkey cache has the vector, API call is skipped."""
         bus = AsyncMock()
         graph = AsyncMock()
-        embed = AsyncMock()
+        embed = self._mock_embed()
         cache = AsyncMock()
 
         text = "Module: foo\nFunction: bar"
@@ -432,6 +440,12 @@ class TestTier3CacheLookup:
         )
         cache.get_many = AsyncMock(return_value={text_hash: cached_vec})
 
+        # run_in_write_transaction must call the passed closure
+        async def _run_tx(fn):
+            return await fn()
+
+        graph.run_in_write_transaction = AsyncMock(side_effect=_run_tx)
+
         consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
         event = self._make_embed_dirty(entity)
@@ -440,21 +454,23 @@ class TestTier3CacheLookup:
 
         embed.embed_batch.assert_not_called()
         cache.get_many.assert_called_once()
-        graph.write_embeddings.assert_called_once()
-        graph.write_embed_hashes.assert_called_once()
+        graph.run_in_write_transaction.assert_called_once()
+        graph.write_embeddings_and_hashes.assert_called_once()
 
-        # Verify correct vector was written (keyed by uid now)
-        write_args = graph.write_embeddings.call_args[0][0]
-        assert write_args[0] == ("foo.bar", cached_vec)
+        # Verify correct vector was written (uid, vector, hash)
+        write_args = graph.write_embeddings_and_hashes.call_args[0][0]
+        assert write_args[0] == ("foo.bar", cached_vec, text_hash)
 
     async def test_cache_miss_embeds_and_stores(self):
         """When no hits anywhere, API is called and result stored in cache."""
         bus = AsyncMock()
         graph = AsyncMock()
-        embed = AsyncMock()
+        embed = self._mock_embed()
         cache = AsyncMock()
 
         api_vec = [0.5, 0.6, 0.7]
+        text = "Module: foo\nFunction: bar"
+        text_hash = EmbedCache.hash_text(text)
 
         graph.read_entity_texts = AsyncMock(
             return_value=[
@@ -474,6 +490,11 @@ class TestTier3CacheLookup:
         cache.get_many = AsyncMock(return_value={})  # no cache hit
         embed.embed_batch = AsyncMock(return_value=[api_vec])
 
+        async def _run_tx(fn):
+            return await fn()
+
+        graph.run_in_write_transaction = AsyncMock(side_effect=_run_tx)
+
         consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
         event = self._make_embed_dirty(entity)
@@ -482,9 +503,9 @@ class TestTier3CacheLookup:
 
         embed.embed_batch.assert_called_once()
         cache.put_many.assert_called_once()
-        graph.write_embeddings.assert_called_once()
-        graph.write_embed_hashes.assert_called_once()
+        graph.run_in_write_transaction.assert_called_once()
+        graph.write_embeddings_and_hashes.assert_called_once()
 
-        # Verify the API vector was written to graph (keyed by uid now)
-        write_args = graph.write_embeddings.call_args[0][0]
-        assert write_args[0] == ("foo.bar", api_vec)
+        # Verify the API vector was written to graph (uid, vector, hash)
+        write_args = graph.write_embeddings_and_hashes.call_args[0][0]
+        assert write_args[0] == ("foo.bar", api_vec, text_hash)

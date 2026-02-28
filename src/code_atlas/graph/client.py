@@ -13,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from loguru import logger
 from neo4j import AsyncGraphDatabase
@@ -39,6 +39,8 @@ from code_atlas.schema import (
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from neo4j import AsyncDriver
 
     from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
@@ -202,6 +204,8 @@ class CallStats:
 
 # Per-task transaction context — prevents leaking between concurrent asyncio tasks.
 _active_tx_var: contextvars.ContextVar[Any] = contextvars.ContextVar("_active_tx_var", default=None)
+
+_T = TypeVar("_T")
 
 
 class GraphClient:
@@ -1519,6 +1523,58 @@ class GraphClient:
                 "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embed_hash = item.hash",
                 {"items": params},
             )
+
+    async def write_embeddings_and_hashes(
+        self,
+        items: list[tuple[str, list[float], str]],
+        *,
+        labels: list[str] | None = None,
+    ) -> None:
+        """Batch-write embedding vectors **and** embed_hashes in a single UNWIND per label.
+
+        Each *item* is ``(uid, vector, embed_hash)``.  When *labels* is
+        provided (parallel to *items*), writes are grouped by label for
+        index-backed matching.  This replaces two separate calls
+        (``write_embeddings`` + ``write_embed_hashes``).
+        """
+        if not items:
+            return
+
+        query_tmpl = (
+            "UNWIND $items AS item "
+            "MATCH (n{label_filter}) WHERE n.uid = item.uid "
+            "SET n.embedding = item.vector, n.embed_hash = item.hash"
+        )
+
+        if labels is not None and len(labels) == len(items):
+            by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for (uid, vec, h), lbl in zip(items, labels, strict=True):
+                by_label[lbl].append({"uid": uid, "vector": vec, "hash": h})
+            for lbl, group in by_label.items():
+                _assert_valid_label(lbl)
+                await self.execute_write(
+                    query_tmpl.format(label_filter=f":{lbl}"),
+                    {"items": group},
+                )
+        else:
+            params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
+            await self.execute_write(
+                query_tmpl.format(label_filter=""),
+                {"items": params},
+            )
+
+    async def run_in_write_transaction(self, fn: Callable[[], Awaitable[_T]]) -> _T:
+        """Run *fn* inside a managed write transaction (single session, auto-retry)."""
+
+        async def _tx(tx: Any) -> _T:
+            token = _active_tx_var.set(tx)
+            try:
+                return await fn()
+            finally:
+                _active_tx_var.reset(token)
+
+        async with self._driver.session() as session:
+            return await session.execute_write(_tx)
 
     async def clear_all_embeddings(self) -> None:
         """Remove embedding vectors and content hashes from all nodes."""

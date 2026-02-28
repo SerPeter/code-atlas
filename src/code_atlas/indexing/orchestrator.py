@@ -853,19 +853,34 @@ async def _run_pipeline(
 
     # Reindex-tuned policies: flush immediately, short blocking reads
     t2_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if skip_tier1 else None
-    t3_policy = BatchPolicy(time_window_s=0, max_batch_size=100, block_ms=50) if skip_tier1 else None
+    t3_policy = (
+        BatchPolicy(time_window_s=1.0, max_batch_size=embed.batch_size, block_ms=50)
+        if skip_tier1 and embed is not None
+        else None
+    )
 
     tier2 = Tier2ASTConsumer(
         bus, graph, settings, project_root=project_root, project_filter=project_filter, policy=t2_policy
     )
     task2 = asyncio.create_task(tier2.run())
 
-    tier3: Tier3EmbedConsumer | None = None
-    task3: asyncio.Task[None] | None = None
+    tier3_consumers: list[Tier3EmbedConsumer] = []
+    tier3_tasks: list[asyncio.Task[None]] = []
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, project_filter=project_filter, policy=t3_policy)
-        task3 = asyncio.create_task(tier3.run())
+        n_consumers = embed.max_concurrency
+        for i in range(n_consumers):
+            t3 = Tier3EmbedConsumer(
+                bus,
+                graph,
+                embed,
+                cache=cache,
+                project_filter=project_filter,
+                policy=t3_policy,
+                consumer_name=f"tier3-embed-{i}",
+            )
+            tier3_consumers.append(t3)
+            tier3_tasks.append(asyncio.create_task(t3.run()))
 
     try:
         await _wait_for_drain(
@@ -879,15 +894,15 @@ async def _run_pipeline(
         if tier1 is not None:
             tier1.stop()
         tier2.stop()
-        if tier3 is not None:
-            tier3.stop()
+        for t3 in tier3_consumers:
+            t3.stop()
         await asyncio.sleep(0.5)
         if task1 is not None:
             task1.cancel()
         task2.cancel()
-        if task3 is not None:
-            task3.cancel()
-        for t in (task1, task2, task3):
+        for t3t in tier3_tasks:
+            t3t.cancel()
+        for t in [task1, task2, *tier3_tasks]:
             if t is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
@@ -1476,7 +1491,11 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     await bus.ensure_group(Topic.AST_DIRTY, "tier2-ast")
 
     t2_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if skip_tier1 else None
-    t3_policy = BatchPolicy(time_window_s=0, max_batch_size=100, block_ms=50) if skip_tier1 else None
+    t3_policy = (
+        BatchPolicy(time_window_s=1.0, max_batch_size=embed.batch_size, block_ms=50)
+        if skip_tier1 and embed is not None
+        else None
+    )
 
     tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root, policy=t2_policy)
 
@@ -1485,11 +1504,21 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         consumer_tasks.append(asyncio.create_task(tier1.run()))
     consumer_tasks.append(asyncio.create_task(tier2.run()))
 
-    tier3: Tier3EmbedConsumer | None = None
+    tier3_consumers: list[Tier3EmbedConsumer] = []
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, policy=t3_policy)
-        consumer_tasks.append(asyncio.create_task(tier3.run()))
+        n_consumers = embed.max_concurrency
+        for i in range(n_consumers):
+            t3 = Tier3EmbedConsumer(
+                bus,
+                graph,
+                embed,
+                cache=cache,
+                policy=t3_policy,
+                consumer_name=f"tier3-embed-{i}",
+            )
+            tier3_consumers.append(t3)
+            consumer_tasks.append(asyncio.create_task(t3.run()))
 
     start = time.monotonic()
     publish_results: list[_ProjectPublishResult] = []
@@ -1556,8 +1585,8 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         if tier1 is not None:
             tier1.stop()
         tier2.stop()
-        if tier3 is not None:
-            tier3.stop()
+        for t3 in tier3_consumers:
+            t3.stop()
         await asyncio.sleep(0.5)
         for task in consumer_tasks:
             task.cancel()
