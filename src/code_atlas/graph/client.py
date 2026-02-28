@@ -22,7 +22,6 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
-    _ENTITY_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     SCHEMA_VERSION,
     NodeLabel,
@@ -50,14 +49,6 @@ if TYPE_CHECKING:
 _tracer = get_tracer(__name__)
 
 _VALID_LABELS: frozenset[str] = frozenset(lbl.value for lbl in NodeLabel)
-
-# Entity labels that can appear as file-level nodes (excluding Package, Project).
-_FILE_ENTITY_LABELS: tuple[NodeLabel, ...] = tuple(
-    sorted(
-        (lbl for lbl in _ENTITY_LABELS if lbl not in {NodeLabel.PACKAGE, NodeLabel.PROJECT}),
-        key=lambda lbl: lbl.value,
-    )
-)
 
 
 def _assert_valid_label(label: str) -> None:
@@ -123,7 +114,6 @@ class _BatchClassification:
     all_shifted: list[ParsedEntity]
     per_file_results: dict[str, UpsertResult]  # file_path → UpsertResult
     new_file_paths: set[str]  # files with no prior data (skip rel delete)
-    uid_to_label: dict[str, str]  # uid → label value (for relationship recreation)
 
 
 def _node_project_name(record: dict[str, Any]) -> str:
@@ -484,10 +474,7 @@ class GraphClient:
                 await self._batch_update_positions(shifted)
 
         # 3e. Recreate ALL relationships for the file (delete old, create new).
-        uid_label_map = {e.qualified_name: e.label.value for e in entities}
-        await self._recreate_file_relationships(
-            project_name, file_path, relationships, uid_to_label=uid_label_map, skip_delete=not old_data
-        )
+        await self._recreate_file_relationships(project_name, file_path, relationships, skip_delete=not old_data)
 
         result = UpsertResult(
             added=[self._strip_uid(uid) for uid in added_uids],
@@ -529,7 +516,6 @@ class GraphClient:
         all_shifted: list[ParsedEntity] = []
         per_file_results: dict[str, UpsertResult] = {}
         new_file_paths: set[str] = set()
-        uid_to_label: dict[str, str] = {}
 
         strip = GraphClient._strip_uid
 
@@ -574,10 +560,6 @@ class GraphClient:
                     if (entity.line_start, entity.line_end) != (file_old[uid][1], file_old[uid][2]):
                         all_shifted.append(entity)
 
-            # Build uid→label map from all current entities
-            for e in entities:
-                uid_to_label[e.qualified_name] = e.label.value
-
             per_file_results[file_path] = UpsertResult(
                 added=[strip(uid) for uid in added_uids],
                 modified=[strip(uid) for uid in modified_uids],
@@ -593,7 +575,6 @@ class GraphClient:
             all_shifted=all_shifted,
             per_file_results=per_file_results,
             new_file_paths=new_file_paths,
-            uid_to_label=uid_to_label,
         )
 
     async def upsert_batch_entities(
@@ -645,7 +626,6 @@ class GraphClient:
                 await self._recreate_batch_relationships(
                     project_name,
                     file_rels,
-                    classification.uid_to_label,
                     classification.new_file_paths,
                 )
             finally:
@@ -1574,41 +1554,21 @@ class GraphClient:
     async def write_embeddings_and_hashes(
         self,
         items: list[tuple[str, list[float], str]],
-        *,
-        labels: list[str] | None = None,
     ) -> None:
-        """Batch-write embedding vectors **and** embed_hashes in a single UNWIND per label.
+        """Batch-write embedding vectors **and** embed_hashes in a single UNWIND.
 
-        Each *item* is ``(uid, vector, embed_hash)``.  When *labels* is
-        provided (parallel to *items*), writes are grouped by label for
-        index-backed matching.  This replaces two separate calls
-        (``write_embeddings`` + ``write_embed_hashes``).
+        Each *item* is ``(uid, vector, embed_hash)``.
         """
         if not items:
             return
 
-        query_tmpl = (
+        params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
+        await self.execute_write(
             "UNWIND $items AS item "
-            "MATCH (n{label_filter}) WHERE n.uid = item.uid "
-            "SET n.embedding = item.vector, n.embed_hash = item.hash"
+            "MATCH (n) WHERE n.uid = item.uid "
+            "SET n.embedding = item.vector, n.embed_hash = item.hash",
+            {"items": params},
         )
-
-        if labels is not None and len(labels) == len(items):
-            by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for (uid, vec, h), lbl in zip(items, labels, strict=True):
-                by_label[lbl].append({"uid": uid, "vector": vec, "hash": h})
-            for lbl, group in by_label.items():
-                _assert_valid_label(lbl)
-                await self.execute_write(
-                    query_tmpl.format(label_filter=f":{lbl}"),
-                    {"items": group},
-                )
-        else:
-            params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
-            await self.execute_write(
-                query_tmpl.format(label_filter=""),
-                {"items": params},
-            )
 
     async def run_in_write_transaction(self, fn: Callable[[], Awaitable[_T]]) -> _T:
         """Run *fn* inside a managed write transaction (single session, auto-retry)."""
@@ -1967,7 +1927,6 @@ class GraphClient:
         self,
         project_name: str,
         file_rels: dict[str, list[ParsedRelationship]],
-        uid_to_label: dict[str, str],
         new_file_paths: set[str],
     ) -> None:
         """Delete then recreate relationships for multiple files in batched queries.
@@ -1975,14 +1934,15 @@ class GraphClient:
         *new_file_paths* are files with no prior data — their old rels are skipped
         in the delete phase.  All rels across files are pooled for creation.
         """
-        # --- Delete phase: one query per entity label, file_path IN $fps ---
+        # --- Delete phase: single label-free query for all file entities ---
         delete_fps = [fp for fp in file_rels if fp not in new_file_paths]
         if delete_fps:
-            for lbl in _FILE_ENTITY_LABELS:
-                await self.execute_write(
-                    f"MATCH (n:{lbl.value} {{project_name: $p}})-[r]->() WHERE n.file_path IN $fps DELETE r",
-                    {"p": project_name, "fps": delete_fps},
-                )
+            await self.execute_write(
+                f"MATCH (n {{project_name: $p}})-[r]->() "
+                f"WHERE n.file_path IN $fps AND NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+                f"DELETE r",
+                {"p": project_name, "fps": delete_fps},
+            )
 
         # --- Create phase: pool all rels across files ---
         all_rels: list[ParsedRelationship] = []
@@ -2005,48 +1965,16 @@ class GraphClient:
         uid_rels = [r for r in all_rels if r.rel_type in uid_rel_types]
         other_rels = [r for r in all_rels if r.rel_type not in uid_rel_types]
 
-        # uid-based rels: group by (rel_type, from_label, to_label) for index-backed matching
+        # uid-based rels: one label-free UNWIND per rel_type, props folded into CREATE
         for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
-            rels_list = list(group)
-            has_props = any(r.properties for r in rels_list)
-
-            by_label_pair: dict[tuple[str, str], list[ParsedRelationship]] = defaultdict(list)
-            for r in rels_list:
-                fl = uid_to_label.get(r.from_qualified_name, "")
-                tl = uid_to_label.get(r.to_name, "")
-                by_label_pair[(fl, tl)].append(r)
-
-            for (fl, tl), sub_rels in by_label_pair.items():
-                from_clause = f":{fl}" if fl else ""
-                to_clause = f":{tl}" if tl else ""
-
-                if has_props:
-                    rel_params = [
-                        {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties}
-                        for r in sub_rels
-                    ]
-                    await self.execute_write(
-                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
-                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
-                        {"rels": rel_params},
-                    )
-                    for param in rel_params:
-                        if param["props"]:
-                            rel_props: dict[str, Any] = param["props"]  # type: ignore[assignment]
-                            set_clause = ", ".join(f"e.{k} = $prop_{k}" for k in rel_props)
-                            prop_params = {f"prop_{k}": v for k, v in rel_props.items()}
-                            await self.execute_write(
-                                f"MATCH (a{from_clause} {{uid: $from_uid}})-[e:{rel_type}]->"
-                                f"(b{to_clause} {{uid: $to_uid}}) SET {set_clause}",
-                                {"from_uid": param["from_uid"], "to_uid": param["to_uid"], **prop_params},
-                            )
-                else:
-                    rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in sub_rels]
-                    await self.execute_write(
-                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
-                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
-                        {"rels": rel_params},
-                    )
+            rel_params = [
+                {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties or {}} for r in group
+            ]
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"CREATE (a)-[e:{rel_type}]->(b) SET e += r.props",
+                {"rels": rel_params},
+            )
 
         # INHERITS rels — batched across all files
         inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
@@ -2073,7 +2001,6 @@ class GraphClient:
         project_name: str,
         file_path: str,
         relationships: list[ParsedRelationship],
-        uid_to_label: dict[str, str] | None = None,
         *,
         skip_delete: bool = False,
     ) -> None:
@@ -2082,11 +2009,11 @@ class GraphClient:
         # per entity label, each hitting the composite (project_name, file_path) index.
         # Skipped when the file has no prior entities (fresh reindex / new file).
         if not skip_delete:
-            for lbl in _FILE_ENTITY_LABELS:
-                await self.execute_write(
-                    f"MATCH (n:{lbl.value} {{project_name: $p, file_path: $f}})-[r]->() DELETE r",
-                    {"p": project_name, "f": file_path},
-                )
+            await self.execute_write(
+                f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->() "
+                f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} DELETE r",
+                {"p": project_name, "f": file_path},
+            )
 
         # Recreate: uid-based rels (both ends known by uid)
         # Includes structural rels and detector-produced rels (both ends resolved to UIDs)
@@ -2106,51 +2033,15 @@ class GraphClient:
         uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
         other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
 
-        _uid_lbl = uid_to_label or {}
-
         for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
-            rels_list = list(group)
-            has_props = any(r.properties for r in rels_list)
-
-            # Group rels by (from_label, to_label) for index-backed matching
-            by_label_pair: dict[tuple[str, str], list[ParsedRelationship]] = defaultdict(list)
-            for r in rels_list:
-                fl = _uid_lbl.get(r.from_qualified_name, "")
-                tl = _uid_lbl.get(r.to_name, "")
-                by_label_pair[(fl, tl)].append(r)
-
-            for (fl, tl), sub_rels in by_label_pair.items():
-                from_clause = f":{fl}" if fl else ""
-                to_clause = f":{tl}" if tl else ""
-
-                if has_props:
-                    rel_params = [
-                        {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties}
-                        for r in sub_rels
-                    ]
-                    await self.execute_write(
-                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
-                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
-                        {"rels": rel_params},
-                    )
-                    # SET properties in a second pass (Memgraph doesn't support dynamic props in CREATE)
-                    for param in rel_params:
-                        if param["props"]:
-                            rel_props: dict[str, Any] = param["props"]  # type: ignore[assignment]
-                            set_clause = ", ".join(f"e.{k} = $prop_{k}" for k in rel_props)
-                            prop_params = {f"prop_{k}": v for k, v in rel_props.items()}
-                            await self.execute_write(
-                                f"MATCH (a{from_clause} {{uid: $from_uid}})-[e:{rel_type}]->"
-                                f"(b{to_clause} {{uid: $to_uid}}) SET {set_clause}",
-                                {"from_uid": param["from_uid"], "to_uid": param["to_uid"], **prop_params},
-                            )
-                else:
-                    rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in sub_rels]
-                    await self.execute_write(
-                        f"UNWIND $rels AS r MATCH (a{from_clause} {{uid: r.from_uid}}), "
-                        f"(b{to_clause} {{uid: r.to_uid}}) CREATE (a)-[:{rel_type}]->(b)",
-                        {"rels": rel_params},
-                    )
+            rel_params = [
+                {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties or {}} for r in group
+            ]
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"CREATE (a)-[e:{rel_type}]->(b) SET e += r.props",
+                {"rels": rel_params},
+            )
 
         # Name-matched rels (IMPORTS are intentionally excluded — resolved post-batch)
         doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]

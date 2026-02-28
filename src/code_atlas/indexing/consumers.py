@@ -841,7 +841,7 @@ class Tier3EmbedConsumer(TierConsumer):
             await self.cache.put_many([(th, vec) for _, vec, th in result])
         return result
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912
+    async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier3.process_batch", attributes={"batch_id": batch_id}) as span:
             # Collect and deduplicate entities across all events in the batch
             seen: dict[str, EntityRef] = {}
@@ -862,13 +862,6 @@ class Tier3EmbedConsumer(TierConsumer):
             qns = [e.qualified_name for e in entities]
             entity_labels = [e.node_type for e in entities]
             entity_props = await self.graph.read_entity_texts(qns, labels=entity_labels)
-
-            # Build uid→label map for downstream writes
-            uid_label: dict[str, str] = {}
-            for props_row in entity_props:
-                lbl = props_row.get("_label")
-                if lbl:
-                    uid_label[props_row["uid"]] = lbl
 
             # 2. Build embed texts — graph-check for unchanged content
             to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
@@ -900,17 +893,10 @@ class Tier3EmbedConsumer(TierConsumer):
             cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
             api_vectors = await self._embed_and_store(need_embed)
 
-            # 5. Write all new/changed vectors + embed_hashes to graph (combined, 1 UNWIND per label)
+            # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
             all_resolved = cache_resolved + api_vectors
             if all_resolved:
-                labeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn in uid_label]
-                unlabeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn not in uid_label]
-
-                if labeled:
-                    lbl_list = [uid_label[qn] for qn, _, _ in labeled]
-                    await self.graph.write_embeddings_and_hashes(labeled, labels=lbl_list)
-                if unlabeled:
-                    await self.graph.write_embeddings_and_hashes(unlabeled)
+                await self.graph.write_embeddings_and_hashes(all_resolved)
 
             elapsed = asyncio.get_event_loop().time() - t0
             span.set_attribute("entities_count", total)
