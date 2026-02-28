@@ -864,23 +864,19 @@ async def _run_pipeline(
     )
     task2 = asyncio.create_task(tier2.run())
 
-    tier3_consumers: list[Tier3EmbedConsumer] = []
-    tier3_tasks: list[asyncio.Task[None]] = []
+    tier3: Tier3EmbedConsumer | None = None
+    tier3_task: asyncio.Task[None] | None = None
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        n_consumers = embed.max_concurrency
-        for i in range(n_consumers):
-            t3 = Tier3EmbedConsumer(
-                bus,
-                graph,
-                embed,
-                cache=cache,
-                project_filter=project_filter,
-                policy=t3_policy,
-                consumer_name=f"tier3-embed-{i}",
-            )
-            tier3_consumers.append(t3)
-            tier3_tasks.append(asyncio.create_task(t3.run()))
+        tier3 = Tier3EmbedConsumer(
+            bus,
+            graph,
+            embed,
+            cache=cache,
+            project_filter=project_filter,
+            policy=t3_policy,
+        )
+        tier3_task = asyncio.create_task(tier3.run())
 
     try:
         await _wait_for_drain(
@@ -894,15 +890,15 @@ async def _run_pipeline(
         if tier1 is not None:
             tier1.stop()
         tier2.stop()
-        for t3 in tier3_consumers:
-            t3.stop()
+        if tier3 is not None:
+            tier3.stop()
         await asyncio.sleep(0.5)
         if task1 is not None:
             task1.cancel()
         task2.cancel()
-        for t3t in tier3_tasks:
-            t3t.cancel()
-        for t in [task1, task2, *tier3_tasks]:
+        if tier3_task is not None:
+            tier3_task.cancel()
+        for t in [task1, task2, tier3_task]:
             if t is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
@@ -1504,21 +1500,11 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         consumer_tasks.append(asyncio.create_task(tier1.run()))
     consumer_tasks.append(asyncio.create_task(tier2.run()))
 
-    tier3_consumers: list[Tier3EmbedConsumer] = []
+    tier3: Tier3EmbedConsumer | None = None
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        n_consumers = embed.max_concurrency
-        for i in range(n_consumers):
-            t3 = Tier3EmbedConsumer(
-                bus,
-                graph,
-                embed,
-                cache=cache,
-                policy=t3_policy,
-                consumer_name=f"tier3-embed-{i}",
-            )
-            tier3_consumers.append(t3)
-            consumer_tasks.append(asyncio.create_task(t3.run()))
+        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, policy=t3_policy)
+        consumer_tasks.append(asyncio.create_task(tier3.run()))
 
     start = time.monotonic()
     publish_results: list[_ProjectPublishResult] = []
@@ -1585,8 +1571,8 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         if tier1 is not None:
             tier1.stop()
         tier2.stop()
-        for t3 in tier3_consumers:
-            t3.stop()
+        if tier3 is not None:
+            tier3.stop()
         await asyncio.sleep(0.5)
         for task in consumer_tasks:
             task.cancel()
