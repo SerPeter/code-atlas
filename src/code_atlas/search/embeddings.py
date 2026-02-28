@@ -251,6 +251,7 @@ class EmbedCache:
         self._ttl_s = embed_settings.cache_ttl_days * 86400
         self._hits = 0
         self._misses = 0
+        self._bg_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def hits(self) -> int:
@@ -301,17 +302,29 @@ class EmbedCache:
             return result
 
     async def put_many(self, items: list[tuple[str, list[float]]]) -> None:
-        """Batch-store vectors by text hash with TTL."""
+        """Fire-and-forget batch-store of vectors by text hash with TTL.
+
+        The cache is a write-behind optimisation (Memgraph is the source of
+        truth), so we don't need to block on Valkey confirmation.  Errors are
+        logged when the background task completes.
+        """
         if not items or self._ttl_s <= 0:
             return
         with _tracer.start_as_current_span("embed_cache.put_many", attributes={"count": len(items)}):
-            try:
-                pipe = self._redis.pipeline(transaction=False)
-                for text_hash, vector in items:
-                    pipe.setex(self._key(text_hash), self._ttl_s, self._pack_vector(vector))
-                await pipe.execute()
-            except Exception:
-                logger.warning("EmbedCache.put_many failed, vectors not cached")
+            pipe = self._redis.pipeline(transaction=False)
+            for text_hash, vector in items:
+                pipe.setex(self._key(text_hash), self._ttl_s, self._pack_vector(vector))
+            task = asyncio.create_task(self._bg_pipe_execute(pipe, len(items)))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
+    @staticmethod
+    async def _bg_pipe_execute(pipe: aioredis.client.Pipeline, count: int) -> None:  # type: ignore[name-defined]
+        """Execute a pipeline in the background, logging failures."""
+        try:
+            await pipe.execute()
+        except Exception:
+            logger.warning("EmbedCache.put_many failed ({} vectors not cached)", count)
 
     async def clear(self) -> None:
         """Delete all cached embeddings for the current model."""
