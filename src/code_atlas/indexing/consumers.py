@@ -679,6 +679,7 @@ class Tier3EmbedConsumer(TierConsumer):
         self._max_concurrency = _max_conc
         self._inflight: set[asyncio.Task[None]] = set()
         self._pel_dirty = False
+        self._write_lock = asyncio.Lock()
 
     def dedup_key(self, event: Event) -> str:
         if isinstance(event, EmbedDirty):
@@ -894,9 +895,16 @@ class Tier3EmbedConsumer(TierConsumer):
             api_vectors = await self._embed_and_store(need_embed)
 
             # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
+            #    Serialized via _write_lock to avoid Memgraph write-lock contention.
             all_resolved = cache_resolved + api_vectors
             if all_resolved:
-                await self.graph.write_embeddings_and_hashes(all_resolved)
+                with _tracer.start_as_current_span("tier3.write_lock_wait"):
+                    await self._write_lock.acquire()
+                try:
+                    with _tracer.start_as_current_span("tier3.write_embeddings"):
+                        await self.graph.write_embeddings_and_hashes(all_resolved)
+                finally:
+                    self._write_lock.release()
 
             elapsed = asyncio.get_event_loop().time() - t0
             span.set_attribute("entities_count", total)
