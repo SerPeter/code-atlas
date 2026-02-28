@@ -900,6 +900,7 @@ async def _run_pipeline(
             embed_enabled=embed is not None,
             on_drain_progress=on_drain_progress,
             skip_tier1=skip_tier1,
+            settle_s=2.0 if skip_tier1 else 8.0,
         )
     finally:
         if tier1 is not None:
@@ -1579,6 +1580,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             embed_enabled=embed is not None,
             on_drain_progress=on_drain_progress,
             skip_tier1=skip_tier1,
+            settle_s=2.0 if skip_tier1 else 8.0,
         )
 
     finally:
@@ -1671,6 +1673,7 @@ async def _wait_for_drain(
     embed_enabled: bool = True,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
     skip_tier1: bool = False,
+    settle_s: float = 2.0,
 ) -> None:
     """Poll stream groups until Tier 1, Tier 2, and (optionally) Tier 3 are drained.
 
@@ -1699,11 +1702,11 @@ async def _wait_for_drain(
         if skip_tier1:
             t1_remaining = 0
         else:
-            t1_remaining = infos[idx]["pending"] + infos[idx]["lag"]
+            t1_remaining = infos[idx]["pending"]
             idx += 1
-        t2_remaining = infos[idx]["pending"] + infos[idx]["lag"]
+        t2_remaining = infos[idx]["pending"]
         idx += 1
-        t3_remaining = infos[idx]["pending"] + infos[idx]["lag"] if embed_enabled else 0
+        t3_remaining = infos[idx]["pending"] if embed_enabled else 0
 
         if on_drain_progress is not None:
             on_drain_progress(t1_remaining, t2_remaining, t3_remaining)
@@ -1711,7 +1714,7 @@ async def _wait_for_drain(
         if t1_remaining == 0 and t2_remaining == 0 and t3_remaining == 0:
             if settled_since is None:
                 settled_since = time.monotonic()
-            elif time.monotonic() - settled_since >= 1.0:
+            elif time.monotonic() - settled_since >= settle_s:
                 logger.debug("Pipeline drained after {:.1f}s settling", time.monotonic() - settled_since)
                 return
             # Adaptive backoff: poll less frequently once idle
