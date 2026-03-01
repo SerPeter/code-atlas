@@ -190,7 +190,7 @@ def patch_all():
     from code_atlas.events import EventBus
 
     EventBus.publish_many = timed_async("bus.publish_many")(EventBus.publish_many)
-    EventBus.read_batch = timed_async("bus.read_batch")(EventBus.read_batch)
+    # read_batch excluded — mostly idle XREADGROUP block time, not actual work.
     EventBus.read_pending = timed_async("bus.read_pending")(EventBus.read_pending)
     EventBus.ack = timed_async("bus.ack")(EventBus.ack)
     EventBus.stream_group_info_multi = timed_async("bus.stream_group_info_multi")(EventBus.stream_group_info_multi)
@@ -205,7 +205,6 @@ _TRACE_NOISE = frozenset(
     {
         "graph.execute",
         "graph.execute_write",
-        "bus.read_batch",
         "bus.read_pending",
         "bus.ack",
         "bus.stream_group_info_multi",
@@ -292,7 +291,6 @@ def print_report(wall_time: float):
         "Graph I/O (low-level)": ["graph.execute", "graph.execute_write"],
         "Event Bus (Valkey)": [
             "bus.publish_many",
-            "bus.read_batch",
             "bus.read_pending",
             "bus.ack",
             "bus.stream_group_info_multi",
