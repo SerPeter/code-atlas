@@ -144,15 +144,15 @@ uv run pre-commit install
 
 ## Performance
 
-| Metric              | Value                 |
-| ------------------- | --------------------- |
-| Parse throughput    | **600–700 files/sec** |
-| Graph search (p50)  | 7 ms                  |
-| BM25 search (p50)   | 34 ms                 |
-| Vector search (p50) | 102 ms                |
-| Concurrent QPS      | **238** (zero errors) |
+| Metric                     | Value                 |
+| -------------------------- | --------------------- |
+| Full index (107 files)     | **55s** (local TEI)   |
+| Parse-only throughput      | **600–700 files/sec** |
+| `get_node` / `text_search` | 7 ms / 34 ms          |
+| `vector_search`            | 102 ms                |
+| Concurrent QPS             | **238** (zero errors) |
 
-Full benchmark tables and methodology: [docs/benchmarks.md](docs/benchmarks.md)
+Full index includes parsing, graph upserts, and embedding via local TEI (8 concurrent workers). Parse-only is raw tree-sitter CPU time without I/O. Query latencies are averages from `scripts/profile_query.py`. Full benchmark tables: [docs/benchmarks.md](docs/benchmarks.md)
 
 ## Documentation
 

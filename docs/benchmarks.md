@@ -1,8 +1,23 @@
 # Benchmarks
 
-Benchmarked on a synthetic codebase with deterministic Python files (classes, methods, imports, docstrings).
+## Full Indexing Pipeline
 
-## Parsing
+Measured on the code-atlas repo (107 Python files, 2,706 entities) with local TEI embeddings. See
+`scripts/profile_index.py --full`.
+
+| Stage               | Wall Time | Notes                                          |
+| ------------------- | --------- | ---------------------------------------------- |
+| Scan + packages     | 0.1s      | File discovery + package hierarchy             |
+| Tier 2 (AST+graph)  | ~26s      | Parse, upsert, resolve imports/calls/types     |
+| Tier 3 (embeddings) | ~52s      | Embed API + graph writes (8 concurrent)        |
+| **Total**           | **55s**   | Embedding-bound; cached reindex is much faster |
+
+Tier 2 and Tier 3 overlap — embedding starts as soon as the first batch of entities is written. The bottleneck is the
+embedding API (75.8s cumulative across 8 workers, ~3.2s avg per batch of 128 entities).
+
+## Parse-Only Throughput
+
+Raw tree-sitter CPU benchmark — no I/O, no graph, no embeddings. Synthetic codebase with deterministic Python files.
 
 | Codebase | Files | Entities | Time  | Throughput        | Peak Memory |
 | -------- | ----- | -------- | ----- | ----------------- | ----------- |
