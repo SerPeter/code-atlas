@@ -12,7 +12,6 @@ deduplicates within its batch window.
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -130,104 +129,133 @@ class TierConsumer(ABC):
         """Signal the consumer to stop after the current iteration."""
         self._stop = True
 
+    async def _pre_run(self) -> None:  # noqa: B027
+        """Hook called before the main loop starts. Override for setup."""
+
+    async def _post_run(self) -> None:  # noqa: B027
+        """Hook called after the main loop exits. Override for teardown."""
+
+    async def _wait_for_slot(self) -> bool:
+        """Hook called at the top of each iteration before reading messages.
+
+        Return ``True`` to proceed, ``False`` to break the loop.
+        Default always proceeds.  Override for backpressure (e.g. semaphore).
+        """
+        return True
+
+    async def _dispatch_batch(
+        self,
+        events: list[Event],
+        msg_ids: list[bytes],
+        batch_id: str,
+    ) -> None:
+        """Process and ACK a batch. Override for async dispatch (e.g. worker tasks).
+
+        Default: process inline, ACK on success, leave in PEL on failure.
+        """
+        try:
+            with logger.contextualize(consumer=self.consumer_name):
+                await self.process_batch(events, batch_id)
+            await self.bus.ack(self.input_topic, self.group, *msg_ids)
+        except Exception:
+            logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
+            self._pel_dirty = True
+
     async def run(self) -> None:  # noqa: PLR0912, PLR0915
         """Main consumer loop — runs until ``stop()`` is called."""
         await self.bus.ensure_group(self.input_topic, self.group)
         logger.debug("{} started (group={}, topic={})", self.consumer_name, self.group, self.input_topic.value)
+        await self._pre_run()
 
         pending: dict[str, tuple[bytes, Event]] = {}  # dedup_key → (msg_id, event)
         window_start: float | None = None
         pel_drained = False  # True once all pending (unacked) messages have been reclaimed
+        self._pel_dirty = False
+        block_ms = (
+            self.policy.block_ms
+            if self.policy.block_ms is not None
+            else max(100, int(self.policy.time_window_s * 1000 // 2))
+        )
 
-        while not self._stop:
-            # First, reclaim any unacknowledged messages from the PEL (failed batches).
-            # Once the PEL is empty, switch to reading new messages only.
-            if not pel_drained:
-                reclaimed = await self.bus.read_pending(
+        try:
+            while not self._stop:
+                if not await self._wait_for_slot():
+                    break
+
+                # Reclaim unacknowledged messages from PEL (failed batches).
+                if not pel_drained or self._pel_dirty:
+                    self._pel_dirty = False
+                    reclaimed = await self.bus.read_pending(
+                        self.input_topic,
+                        self.group,
+                        self.consumer_name,
+                        count=self.policy.max_batch_size,
+                    )
+                    if reclaimed:
+                        for msg_id, fields in reclaimed:
+                            if not fields:
+                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                continue
+                            try:
+                                event = decode_event(self.input_topic, fields)
+                                key = self.dedup_key(event)
+                            except KeyError, TypeError, ValueError:
+                                logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
+                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                continue
+                            if not self._matches_project(event):
+                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                continue
+                            await self._dedup_put(pending, key, msg_id, event)
+                            if window_start is None:
+                                window_start = asyncio.get_event_loop().time()
+                    else:
+                        pel_drained = True
+
+                # Pull new messages
+                messages = await self.bus.read_batch(
                     self.input_topic,
                     self.group,
                     self.consumer_name,
                     count=self.policy.max_batch_size,
+                    block_ms=block_ms,
                 )
-                if reclaimed:
-                    for msg_id, fields in reclaimed:
-                        if not fields:
-                            # Tombstone (deleted message) — just ACK it
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        try:
-                            event = decode_event(self.input_topic, fields)
-                            key = self.dedup_key(event)
-                        except KeyError, TypeError, ValueError, json.JSONDecodeError:
-                            logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        if not self._matches_project(event):
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        await self._dedup_put(pending, key, msg_id, event)
-                        if window_start is None:
-                            window_start = asyncio.get_event_loop().time()
-                else:
-                    pel_drained = True
 
-            # Pull new messages (short block so we can check flush + stop)
-            block_ms = (
-                self.policy.block_ms
-                if self.policy.block_ms is not None
-                else max(100, int(self.policy.time_window_s * 1000 // 2))
-            )
-            messages = await self.bus.read_batch(
-                self.input_topic,
-                self.group,
-                self.consumer_name,
-                count=self.policy.max_batch_size,
-                block_ms=block_ms,
-            )
+                for msg_id, fields in messages:
+                    try:
+                        event = decode_event(self.input_topic, fields)
+                        key = self.dedup_key(event)
+                    except KeyError, TypeError, ValueError:
+                        logger.exception("{} failed to decode message, skipping", self.consumer_name)
+                        await self.bus.ack(self.input_topic, self.group, msg_id)
+                        continue
+                    if not self._matches_project(event):
+                        await self.bus.ack(self.input_topic, self.group, msg_id)
+                        continue
+                    await self._dedup_put(pending, key, msg_id, event)
+                    if window_start is None:
+                        window_start = asyncio.get_event_loop().time()
 
-            for msg_id, fields in messages:
-                try:
-                    event = decode_event(self.input_topic, fields)
-                    key = self.dedup_key(event)
-                except KeyError, TypeError, ValueError, json.JSONDecodeError:
-                    logger.exception("{} failed to decode message, skipping", self.consumer_name)
-                    await self.bus.ack(self.input_topic, self.group, msg_id)
+                # Decide whether to flush
+                if not pending:
                     continue
-                if not self._matches_project(event):
-                    await self.bus.ack(self.input_topic, self.group, msg_id)
+
+                elapsed = asyncio.get_event_loop().time() - (window_start or 0)
+                if len(pending) < self.policy.max_batch_size and elapsed < self.policy.time_window_s:
                     continue
-                await self._dedup_put(pending, key, msg_id, event)
-                if window_start is None:
-                    window_start = asyncio.get_event_loop().time()
 
-            # Decide whether to flush
-            if not pending:
-                continue
+                # Flush
+                msg_ids = [mid for mid, _ in pending.values()]
+                events = [ev for _, ev in pending.values()]
+                batch_id = uuid.uuid4().hex[:12]
 
-            elapsed = asyncio.get_event_loop().time() - (window_start or 0)
-            should_flush = len(pending) >= self.policy.max_batch_size or elapsed >= self.policy.time_window_s
+                logger.debug("{} flushing batch {} ({} events)", self.consumer_name, batch_id, len(events))
+                await self._dispatch_batch(events, msg_ids, batch_id)
 
-            if not should_flush:
-                continue
-
-            # Flush: extract events and message IDs
-            msg_ids = [mid for mid, _ in pending.values()]
-            events = [ev for _, ev in pending.values()]
-            batch_id = uuid.uuid4().hex[:12]
-
-            logger.debug("{} flushing batch {} ({} events)", self.consumer_name, batch_id, len(events))
-
-            try:
-                with logger.contextualize(consumer=self.consumer_name):
-                    await self.process_batch(events, batch_id)
-                await self.bus.ack(self.input_topic, self.group, *msg_ids)
-            except Exception:
-                # Failed batch: do NOT ack — messages stay in PEL for reclaim
-                logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
-                pel_drained = False  # re-check PEL on next iteration
-
-            pending.clear()
-            window_start = None
+                pending.clear()
+                window_start = None
+        finally:
+            await self._post_run()
 
         logger.debug("{} stopped", self.consumer_name)
 
@@ -677,6 +705,7 @@ class Tier3EmbedConsumer(TierConsumer):
         self.embed = embed
         self.cache = cache
         self._max_concurrency = _max_conc
+        self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
         self._pel_dirty = False
         self._write_lock = asyncio.Lock()
@@ -686,116 +715,31 @@ class Tier3EmbedConsumer(TierConsumer):
             return event.entity.qualified_name
         return super().dedup_key(event)
 
-    async def run(self) -> None:  # noqa: PLR0912, PLR0915
-        """Dispatcher loop: single reader, semaphore-bounded worker dispatch."""
-        await self.bus.ensure_group(self.input_topic, self.group)
-        sem = asyncio.Semaphore(self._max_concurrency)
-        logger.debug(
-            "{} dispatcher started (group={}, concurrency={})",
-            self.consumer_name,
-            self.group,
-            self._max_concurrency,
-        )
+    async def _pre_run(self) -> None:
+        logger.debug("{} concurrency={}", self.consumer_name, self._max_concurrency)
 
-        pel_drained = False
-        block_ms = (
-            self.policy.block_ms
-            if self.policy.block_ms is not None
-            else max(100, int(self.policy.time_window_s * 1000 // 2))
-        )
-
-        while not self._stop:
-            # --- Backpressure: wait for a free worker slot ---
-            await sem.acquire()
-            if self._stop:
-                sem.release()
-                break
-
-            # --- Accumulate one batch ---
-            pending: dict[str, tuple[bytes, Event]] = {}
-            window_start: float | None = None
-
-            # PEL reclaim (unacked messages from failed workers)
-            if not pel_drained or self._pel_dirty:
-                self._pel_dirty = False
-                reclaimed = await self.bus.read_pending(
-                    self.input_topic,
-                    self.group,
-                    self.consumer_name,
-                    count=self.policy.max_batch_size,
-                )
-                if reclaimed:
-                    for msg_id, fields in reclaimed:
-                        if not fields:
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        try:
-                            event = decode_event(self.input_topic, fields)
-                            key = self.dedup_key(event)
-                        except KeyError, TypeError, ValueError, json.JSONDecodeError:
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        if not self._matches_project(event):
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        await self._dedup_put(pending, key, msg_id, event)
-                        if window_start is None:
-                            window_start = asyncio.get_event_loop().time()
-                else:
-                    pel_drained = True
-
-            # Inner read loop — accumulate until flush criteria met
-            while not self._stop:
-                messages = await self.bus.read_batch(
-                    self.input_topic,
-                    self.group,
-                    self.consumer_name,
-                    count=self.policy.max_batch_size,
-                    block_ms=block_ms,
-                )
-                for msg_id, fields in messages:
-                    try:
-                        event = decode_event(self.input_topic, fields)
-                        key = self.dedup_key(event)
-                    except KeyError, TypeError, ValueError, json.JSONDecodeError:
-                        await self.bus.ack(self.input_topic, self.group, msg_id)
-                        continue
-                    if not self._matches_project(event):
-                        await self.bus.ack(self.input_topic, self.group, msg_id)
-                        continue
-                    await self._dedup_put(pending, key, msg_id, event)
-                    if window_start is None:
-                        window_start = asyncio.get_event_loop().time()
-
-                if not pending:
-                    continue
-                elapsed = asyncio.get_event_loop().time() - (window_start or 0)
-                if len(pending) >= self.policy.max_batch_size or elapsed >= self.policy.time_window_s:
-                    break
-
-            if not pending:
-                sem.release()
-                continue
-
-            # --- Dispatch as worker task ---
-            msg_ids = [mid for mid, _ in pending.values()]
-            events = [ev for _, ev in pending.values()]
-            batch_id = uuid.uuid4().hex[:12]
-
-            task = asyncio.create_task(self._worker(sem, events, msg_ids, batch_id))
-            self._inflight.add(task)
-            task.add_done_callback(self._inflight.discard)
-            # Semaphore released inside _worker, not here
-
-        # Drain in-flight workers before returning
+    async def _post_run(self) -> None:
         if self._inflight:
             logger.debug("{} draining {} in-flight worker(s)", self.consumer_name, len(self._inflight))
             await asyncio.gather(*self._inflight, return_exceptions=True)
-        logger.debug("{} dispatcher stopped", self.consumer_name)
+
+    async def _dispatch_batch(
+        self,
+        events: list[Event],
+        msg_ids: list[bytes],
+        batch_id: str,
+    ) -> None:
+        """Acquire a worker slot, then dispatch as a background task."""
+        await self._sem.acquire()
+        if self._stop:
+            self._sem.release()
+            return
+        task = asyncio.create_task(self._worker(events, msg_ids, batch_id))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
 
     async def _worker(
         self,
-        sem: asyncio.Semaphore,
         events: list[Event],
         msg_ids: list[bytes],
         batch_id: str,
@@ -810,7 +754,7 @@ class Tier3EmbedConsumer(TierConsumer):
             logger.exception("{} batch {} failed, will retry via PEL", self.consumer_name, batch_id)
             self._pel_dirty = True
         finally:
-            sem.release()
+            self._sem.release()
 
     async def _resolve_cache(
         self, to_process: list[tuple[str, str, str]]

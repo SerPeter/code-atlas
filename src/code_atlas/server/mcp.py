@@ -625,13 +625,9 @@ def _register_node_tools(mcp: FastMCP) -> None:
                 # Deduplicate by uid, keeping highest _match_score
                 seen: dict[str, dict[str, Any]] = {}
                 for r in found:
-                    node = r.get("n")
-                    uid = node.get("uid", "") if hasattr(node, "get") else getattr(node, "uid", "")
-                    if not uid:
-                        uid = id(node)  # type: ignore[assignment]
-                    existing = seen.get(uid)  # type: ignore[arg-type]
-                    if existing is None or r.get("_match_score", 0) > existing.get("_match_score", 0):
-                        seen[uid] = r  # type: ignore[assignment]
+                    uid = r["n"]["uid"]
+                    if r.get("_match_score", 0) > seen.get(uid, {}).get("_match_score", -1):
+                        seen[uid] = r
                 found = sorted(seen.values(), key=lambda rec: rec.get("_match_score", 0), reverse=True)[:clamped]
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")

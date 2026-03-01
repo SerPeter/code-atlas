@@ -40,8 +40,9 @@ class EmbedClient:
         self._settings = settings
         # batch_size and max_concurrency are guaranteed non-None after the
         # _apply_provider_defaults model validator runs on EmbeddingSettings.
-        assert settings.batch_size is not None
-        assert settings.max_concurrency is not None
+        if settings.batch_size is None or settings.max_concurrency is None:
+            msg = "EmbeddingSettings.batch_size and .max_concurrency must be set (provider defaults should apply)"
+            raise ValueError(msg)
         self._batch_size: int = settings.batch_size
         self._max_concurrency: int = settings.max_concurrency
         self._timeout = settings.timeout_s

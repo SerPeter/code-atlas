@@ -201,9 +201,9 @@ class EmbeddingSettings(BaseSettings):
     def _apply_provider_defaults(self) -> EmbeddingSettings:
         defaults = _PROVIDER_DEFAULTS.get(self.provider, _PROVIDER_DEFAULTS["tei"])
         if self.batch_size is None:
-            object.__setattr__(self, "batch_size", defaults["batch_size"])
+            self.batch_size = defaults["batch_size"]
         if self.max_concurrency is None:
-            object.__setattr__(self, "max_concurrency", defaults["max_concurrency"])
+            self.max_concurrency = defaults["max_concurrency"]
         return self
 
 

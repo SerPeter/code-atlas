@@ -1698,15 +1698,11 @@ async def _wait_for_drain(
 
         infos = await bus.stream_group_info_multi(queries)
 
-        idx = 0
-        if skip_tier1:
-            t1_remaining = 0
-        else:
-            t1_remaining = infos[idx]["pending"]
-            idx += 1
-        t2_remaining = infos[idx]["pending"]
-        idx += 1
-        t3_remaining = infos[idx]["pending"] if embed_enabled else 0
+        # Build a topic→remaining map so we don't need fragile index tracking
+        remaining = {topic: info["pending"] + info["lag"] for (topic, _), info in zip(queries, infos, strict=True)}
+        t1_remaining = remaining.get(Topic.FILE_CHANGED, 0)
+        t2_remaining = remaining.get(Topic.AST_DIRTY, 0)
+        t3_remaining = remaining.get(Topic.EMBED_DIRTY, 0)
 
         if on_drain_progress is not None:
             on_drain_progress(t1_remaining, t2_remaining, t3_remaining)

@@ -13,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from loguru import logger
 from neo4j import AsyncGraphDatabase
@@ -93,6 +93,17 @@ class QueryTimeoutError(Exception):
         super().__init__(f"Query timed out after {timeout_s}s: {query_prefix}")
 
 
+class EntityHashData(NamedTuple):
+    """Stored entity data used for delta comparison during upsert."""
+
+    content_hash: str
+    line_start: int
+    line_end: int
+    signature: str | None
+    docstring: str | None
+    label: str
+
+
 @dataclass(frozen=True)
 class UpsertResult:
     """Result of a delta-aware upsert for a single file."""
@@ -102,6 +113,81 @@ class UpsertResult:
     deleted: list[str] = field(default_factory=list)  # qualified_names removed from file
     unchanged: list[str] = field(default_factory=list)  # qualified_names with matching content_hash
     modified_significance: dict[str, str] = field(default_factory=dict)  # qualified_name → Significance value
+
+
+@dataclass
+class _FileClassification:
+    """Delta classification for a single file's entities."""
+
+    added: list[ParsedEntity]
+    modified: list[ParsedEntity]
+    deleted_by_label: dict[str, list[str]]  # label → [uids]
+    shifted: list[ParsedEntity]
+    result: UpsertResult
+
+
+def _classify_file(
+    old_data: dict[str, EntityHashData],
+    entities: list[ParsedEntity],
+    strip_uid: Callable[[str], str],
+) -> _FileClassification:
+    """Pure-Python classification of entities for a single file.
+
+    Compares new entities against *old_data* and classifies each as
+    added/modified/deleted/unchanged.  Shared by both single-file and
+    batched upsert paths.
+    """
+    new_hashes = {e.qualified_name: e.content_hash for e in entities}
+    new_entity_map = {e.qualified_name: e for e in entities}
+
+    old_uids = set(old_data)
+    new_uids = set(new_hashes)
+
+    added_uids = new_uids - old_uids
+    deleted_uids = old_uids - new_uids
+    common_uids = old_uids & new_uids
+    modified_uids = {uid for uid in common_uids if old_data[uid].content_hash != new_hashes[uid]}
+    unchanged_uids = common_uids - modified_uids
+
+    # Deleted entities grouped by label for index-backed deletion
+    deleted_by_label: dict[str, list[str]] = defaultdict(list)
+    for uid in deleted_uids:
+        deleted_by_label[old_data[uid].label].append(uid)
+
+    # Significance per modified entity
+    mod_significance: dict[str, str] = {}
+    for uid in modified_uids:
+        old = old_data[uid]
+        new_entity = new_entity_map[uid]
+        qn = strip_uid(uid)
+        if (new_entity.signature or "") != (old.signature or ""):
+            mod_significance[qn] = "HIGH"
+        elif (new_entity.docstring or "") != (old.docstring or ""):
+            mod_significance[qn] = "MODERATE"
+        else:
+            mod_significance[qn] = "HIGH"
+
+    # Position shifts for unchanged entities
+    shifted: list[ParsedEntity] = []
+    if unchanged_uids and (added_uids or deleted_uids):
+        for uid in unchanged_uids:
+            entity = new_entity_map[uid]
+            if (entity.line_start, entity.line_end) != (old_data[uid].line_start, old_data[uid].line_end):
+                shifted.append(entity)
+
+    return _FileClassification(
+        added=[new_entity_map[uid] for uid in added_uids],
+        modified=[new_entity_map[uid] for uid in modified_uids],
+        deleted_by_label=dict(deleted_by_label),
+        shifted=shifted,
+        result=UpsertResult(
+            added=[strip_uid(uid) for uid in added_uids],
+            modified=[strip_uid(uid) for uid in modified_uids],
+            deleted=[strip_uid(uid) for uid in deleted_uids],
+            unchanged=[strip_uid(uid) for uid in unchanged_uids],
+            modified_significance=mod_significance,
+        ),
+    )
 
 
 @dataclass
@@ -324,10 +410,8 @@ class GraphClient:
             )
             raise RuntimeError(msg)
 
-    async def get_file_content_hashes(
-        self, project_name: str, file_path: str
-    ) -> dict[str, tuple[str, int, int, str | None, str | None, str]]:
-        """Return ``{uid: (hash, line_start, line_end, sig, doc, label)}`` for non-structural nodes."""
+    async def get_file_content_hashes(self, project_name: str, file_path: str) -> dict[str, EntityHashData]:
+        """Return ``{uid: EntityHashData}`` for non-structural nodes."""
         records = await self.execute(
             f"MATCH (n {{project_name: $p, file_path: $f}}) "
             f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
@@ -336,15 +420,16 @@ class GraphClient:
             {"p": project_name, "f": file_path},
         )
         return {
-            r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or "") for r in records
+            r["uid"]: EntityHashData(r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or "")
+            for r in records
         }
 
     async def get_batch_file_content_hashes(
         self,
         project_name: str,
         file_paths: list[str],
-    ) -> dict[str, dict[str, tuple[str, int, int, str | None, str | None, str]]]:
-        """Return ``{file_path: {uid: (hash, ls, le, sig, doc, label)}}`` for multiple files in one RTT."""
+    ) -> dict[str, dict[str, EntityHashData]]:
+        """Return ``{file_path: {uid: EntityHashData}}`` for multiple files in one RTT."""
         if not file_paths:
             return {}
         records = await self.execute(
@@ -356,15 +441,10 @@ class GraphClient:
             "n.signature AS sig, n.docstring AS doc, labels(n)[0] AS lbl",
             {"p": project_name, "fps": file_paths},
         )
-        result: dict[str, dict[str, tuple[str, int, int, str | None, str | None, str]]] = defaultdict(dict)
+        result: dict[str, dict[str, EntityHashData]] = defaultdict(dict)
         for r in records:
-            result[r["fp"]][r["uid"]] = (
-                r["hash"] or "",
-                r["ls"] or 0,
-                r["le"] or 0,
-                r["sig"],
-                r["doc"],
-                r["lbl"] or "",
+            result[r["fp"]][r["uid"]] = EntityHashData(
+                r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or ""
             )
         return dict(result)
 
@@ -387,16 +467,11 @@ class GraphClient:
 
         Returns an ``UpsertResult`` describing what changed.
         """
-        # Pre-compute new hash map outside the transaction (pure Python)
-        new_hashes: dict[str, str] = {e.qualified_name: e.content_hash for e in entities}
-        new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
 
         async def _tx_fn(tx: Any) -> UpsertResult:
             token = _active_tx_var.set(tx)
             try:
-                return await self._upsert_file_entities_inner(
-                    project_name, file_path, entities, relationships, new_hashes, new_entity_map
-                )
+                return await self._upsert_file_entities_inner(project_name, file_path, entities, relationships)
             finally:
                 _active_tx_var.reset(token)
 
@@ -409,91 +484,39 @@ class GraphClient:
         file_path: str,
         entities: list[ParsedEntity],
         relationships: list[ParsedRelationship],
-        new_hashes: dict[str, str],
-        new_entity_map: dict[str, ParsedEntity],
     ) -> UpsertResult:
         """Core upsert logic — runs inside a managed transaction via ``_active_tx_var``."""
-        # 1. Read old content hashes + positions (routes through _active_tx_var)
         old_data = await self.get_file_content_hashes(project_name, file_path)
+        fc = _classify_file(old_data, entities, self._strip_uid)
 
-        old_uids = set(old_data)
-        new_uids = set(new_hashes)
-
-        added_uids = new_uids - old_uids
-        deleted_uids = old_uids - new_uids
-        common_uids = old_uids & new_uids
-        modified_uids = {uid for uid in common_uids if old_data[uid][0] != new_hashes[uid]}
-        unchanged_uids = common_uids - modified_uids
-
-        # 2. Fast path: nothing changed → skip graph writes entirely
-        if not added_uids and not deleted_uids and not modified_uids:
+        # Fast path: nothing changed
+        if not fc.added and not fc.modified and not fc.result.deleted:
             logger.debug("Delta skip (no changes) for {}", file_path)
-            return UpsertResult(
-                unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
-            )
+            return fc.result
 
-        # 3. Apply delta (all writes route through _active_tx_var)
-        # 3a. Delete removed entity nodes
-        if deleted_uids:
-            uids_by_label: dict[str, list[str]] = defaultdict(list)
-            for uid in deleted_uids:
-                uids_by_label[old_data[uid][5]].append(uid)
-            await self._batch_delete_entities(dict(uids_by_label))
+        # Apply delta (all writes route through _active_tx_var)
+        if fc.deleted_by_label:
+            await self._batch_delete_entities(fc.deleted_by_label)
+        if fc.added:
+            await self._batch_create_entities(project_name, fc.added)
+        if fc.modified:
+            await self._batch_update_entities(fc.modified)
+        if fc.shifted:
+            await self._batch_update_positions(fc.shifted)
 
-        # 3b. Create new entity nodes
-        if added_uids:
-            added_entities = [new_entity_map[uid] for uid in added_uids]
-            await self._batch_create_entities(project_name, added_entities)
-
-        # 3c. Update modified entity nodes + compute per-entity significance
-        mod_significance: dict[str, str] = {}
-        if modified_uids:
-            modified_entities = [new_entity_map[uid] for uid in modified_uids]
-            await self._batch_update_entities(modified_entities)
-
-            for uid in modified_uids:
-                old_sig, old_doc = old_data[uid][3], old_data[uid][4]
-                new_entity = new_entity_map[uid]
-                qn = self._strip_uid(uid)
-                if (new_entity.signature or "") != (old_sig or ""):
-                    mod_significance[qn] = "HIGH"
-                elif (new_entity.docstring or "") != (old_doc or ""):
-                    mod_significance[qn] = "MODERATE"
-                else:
-                    mod_significance[qn] = "HIGH"
-
-        # 3d. Update positions of unchanged entities that shifted
-        if unchanged_uids and (added_uids or deleted_uids):
-            shifted = [
-                new_entity_map[uid]
-                for uid in unchanged_uids
-                if (new_entity_map[uid].line_start, new_entity_map[uid].line_end)
-                != (old_data[uid][1], old_data[uid][2])
-            ]
-            if shifted:
-                await self._batch_update_positions(shifted)
-
-        # 3e. Recreate ALL relationships for the file (delete old, create new).
+        # Recreate ALL relationships for the file (delete old, create new).
         await self._recreate_file_relationships(project_name, file_path, relationships, skip_delete=not old_data)
-
-        result = UpsertResult(
-            added=[self._strip_uid(uid) for uid in added_uids],
-            modified=[self._strip_uid(uid) for uid in modified_uids],
-            deleted=[self._strip_uid(uid) for uid in deleted_uids],
-            unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
-            modified_significance=mod_significance,
-        )
 
         logger.debug(
             "Upserted {} (added={}, modified={}, deleted={}, unchanged={}) for {}",
             len(entities),
-            len(result.added),
-            len(result.modified),
-            len(result.deleted),
-            len(result.unchanged),
+            len(fc.result.added),
+            len(fc.result.modified),
+            len(fc.result.deleted),
+            len(fc.result.unchanged),
             file_path,
         )
-        return result
+        return fc.result
 
     @staticmethod
     def _strip_uid(uid: str) -> str:
@@ -502,7 +525,7 @@ class GraphClient:
 
     @staticmethod
     def _classify_batch(
-        old_data: dict[str, dict[str, tuple[str, int, int, str | None, str | None, str]]],
+        old_data: dict[str, dict[str, EntityHashData]],
         file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
     ) -> _BatchClassification:
         """Pure-Python classification of entities across multiple files.
@@ -520,53 +543,18 @@ class GraphClient:
         strip = GraphClient._strip_uid
 
         for file_path, (entities, _rels) in file_data.items():
-            new_hashes: dict[str, str] = {e.qualified_name: e.content_hash for e in entities}
-            new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
             file_old = old_data.get(file_path, {})
-
             if not file_old:
                 new_file_paths.add(file_path)
 
-            old_uids = set(file_old)
-            new_uids = set(new_hashes)
+            fc = _classify_file(file_old, entities, strip)
 
-            added_uids = new_uids - old_uids
-            deleted_uids = old_uids - new_uids
-            common_uids = old_uids & new_uids
-            modified_uids = {uid for uid in common_uids if file_old[uid][0] != new_hashes[uid]}
-            unchanged_uids = common_uids - modified_uids
-
-            # Accumulate cross-file lists
-            all_added.extend(new_entity_map[uid] for uid in added_uids)
-            for uid in deleted_uids:
-                all_deleted_by_label[file_old[uid][5]].append(uid)
-            mod_significance: dict[str, str] = {}
-            for uid in modified_uids:
-                entity = new_entity_map[uid]
-                all_modified.append(entity)
-                old_sig, old_doc = file_old[uid][3], file_old[uid][4]
-                qn = strip(uid)
-                if (entity.signature or "") != (old_sig or ""):
-                    mod_significance[qn] = "HIGH"
-                elif (entity.docstring or "") != (old_doc or ""):
-                    mod_significance[qn] = "MODERATE"
-                else:
-                    mod_significance[qn] = "HIGH"
-
-            # Position shifts for unchanged entities
-            if unchanged_uids and (added_uids or deleted_uids):
-                for uid in unchanged_uids:
-                    entity = new_entity_map[uid]
-                    if (entity.line_start, entity.line_end) != (file_old[uid][1], file_old[uid][2]):
-                        all_shifted.append(entity)
-
-            per_file_results[file_path] = UpsertResult(
-                added=[strip(uid) for uid in added_uids],
-                modified=[strip(uid) for uid in modified_uids],
-                deleted=[strip(uid) for uid in deleted_uids],
-                unchanged=[strip(uid) for uid in unchanged_uids],
-                modified_significance=mod_significance,
-            )
+            all_added.extend(fc.added)
+            all_modified.extend(fc.modified)
+            for lbl, uids in fc.deleted_by_label.items():
+                all_deleted_by_label[lbl].extend(uids)
+            all_shifted.extend(fc.shifted)
+            per_file_results[file_path] = fc.result
 
         return _BatchClassification(
             all_added=all_added,
@@ -653,7 +641,7 @@ class GraphClient:
         if old_data:
             uids_by_label: dict[str, list[str]] = defaultdict(list)
             for uid, data in old_data.items():
-                uids_by_label[data[5]].append(uid)
+                uids_by_label[data.label].append(uid)
             await self._batch_delete_entities(dict(uids_by_label))
         return [self._strip_uid(uid) for uid in old_data]
 
@@ -1954,52 +1942,7 @@ class GraphClient:
         for rels in file_rels.values():
             all_rels.extend(rels)
 
-        uid_rel_types = {
-            RelType.DEFINES,
-            RelType.CONTAINS,
-            RelType.OVERRIDES,
-            RelType.IMPLEMENTS,
-            RelType.EXPORTS,
-            RelType.TESTS,
-            RelType.HANDLES_ROUTE,
-            RelType.HANDLES_EVENT,
-            RelType.HANDLES_COMMAND,
-            RelType.REGISTERED_BY,
-            RelType.INJECTED_INTO,
-        }
-        uid_rels = [r for r in all_rels if r.rel_type in uid_rel_types]
-        other_rels = [r for r in all_rels if r.rel_type not in uid_rel_types]
-
-        # uid-based rels: one label-free UNWIND per rel_type, props folded into CREATE
-        for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
-            rel_params = [
-                {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties or {}} for r in group
-            ]
-            await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                f"CREATE (a)-[e:{rel_type}]->(b) SET e += r.props",
-                {"rels": rel_params},
-            )
-
-        # INHERITS rels — batched across all files
-        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
-        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
-
-        if inherits_rels:
-            inh_params = [
-                {"from_uid": r.from_qualified_name, "project": project_name, "to_name": r.to_name}
-                for r in inherits_rels
-            ]
-            await self.execute_write(
-                f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}), "
-                f"(b:{NodeLabel.TYPE_DEF} {{project_name: r.project, name: r.to_name}}) "
-                f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
-                {"rels": inh_params},
-            )
-
-        if doc_rels:
-            await self._create_doc_links(project_name, doc_rels)
+        await self._create_relationships(project_name, all_rels)
 
     async def _recreate_file_relationships(
         self,
@@ -2010,18 +1953,24 @@ class GraphClient:
         skip_delete: bool = False,
     ) -> None:
         """Delete all relationships originating from this file's entities, then recreate them."""
-        # Delete existing relationships from file entities — one label-constrained query
-        # per entity label, each hitting the composite (project_name, file_path) index.
-        # Skipped when the file has no prior entities (fresh reindex / new file).
         if not skip_delete:
             await self.execute_write(
                 f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->() "
                 f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} DELETE r",
                 {"p": project_name, "f": file_path},
             )
+        await self._create_relationships(project_name, relationships)
 
-        # Recreate: uid-based rels (both ends known by uid)
-        # Includes structural rels and detector-produced rels (both ends resolved to UIDs)
+    async def _create_relationships(
+        self,
+        project_name: str,
+        relationships: list[ParsedRelationship],
+    ) -> None:
+        """Create relationships from a flat list of ParsedRelationship.
+
+        Shared by both single-file and batched upsert paths.
+        IMPORTS, CALLS, and USES_TYPE are excluded — they're resolved post-batch.
+        """
         uid_rel_types = {
             RelType.DEFINES,
             RelType.CONTAINS,
@@ -2038,6 +1987,7 @@ class GraphClient:
         uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
         other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
 
+        # uid-based rels: one UNWIND per rel_type
         for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
             rel_params = [
                 {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties or {}} for r in group
@@ -2048,9 +1998,9 @@ class GraphClient:
                 {"rels": rel_params},
             )
 
-        # Name-matched rels (IMPORTS are intentionally excluded — resolved post-batch)
-        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
+        # Name-matched rels
         inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
+        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
 
         if inherits_rels:
             inh_params = [
