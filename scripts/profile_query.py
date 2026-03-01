@@ -126,43 +126,33 @@ _tool_report = TimingReport()
 
 
 # ---------------------------------------------------------------------------
-# get_node cascade (replicates mcp.py 5-stage lookup)
+# get_node cascade (replicates mcp.py 2-stage lookup)
 # ---------------------------------------------------------------------------
 
 
 async def _get_node(graph: GraphClient, name: str, limit: int = 20) -> list[dict]:
-    """Replicate the 5-stage cascade from mcp.py's get_node tool."""
-    # Stage 1: Exact uid match
-    if ":" in name:
-        records = await graph.execute(f"MATCH (n {{uid: $name}}) RETURN n LIMIT {limit}", {"name": name})
-        if records:
-            return records
-
-    # Stage 2: Exact name match
-    records = await graph.execute(f"MATCH (n) WHERE n.name = $name RETURN n LIMIT {limit}", {"name": name})
-    if records:
-        return records
-
-    # Stage 3: ENDS WITH suffix match
-    suffix = f".{name}"
-    records = await graph.execute(
-        f"MATCH (n) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {limit}", {"suffix": suffix}
-    )
-    if records:
-        return records
-
-    # Stage 4: STARTS WITH prefix match
-    prefix = f"{name}."
-    records = await graph.execute(
-        f"MATCH (n) WHERE n.qualified_name STARTS WITH $prefix RETURN n LIMIT {limit}", {"prefix": prefix}
-    )
-    if records:
-        return records
-
-    # Stage 5: CONTAINS match
-    return await graph.execute(
-        f"MATCH (n) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name RETURN n LIMIT {limit}",
+    """Replicate the 2-stage cascade from mcp.py's get_node tool."""
+    # Stage A: Exact matches (uid + exact name) — 1 RTT
+    found = await graph.execute(
+        f"MATCH (n {{uid: $name}}) RETURN n LIMIT {limit} "
+        f"UNION ALL "
+        f"MATCH (n) WHERE n.name = $name RETURN n LIMIT {limit}",
         {"name": name},
+    )
+    if found:
+        return found
+
+    # Stage B: Partial matches (suffix > prefix > contains) — 1 RTT
+    return await graph.execute(
+        f"MATCH (n) WHERE n.qualified_name ENDS WITH $suffix "
+        f"RETURN n, 3 AS _match_score LIMIT {limit} "
+        f"UNION ALL "
+        f"MATCH (n) WHERE n.qualified_name STARTS WITH $prefix "
+        f"RETURN n, 2 AS _match_score LIMIT {limit} "
+        f"UNION ALL "
+        f"MATCH (n) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
+        f"RETURN n, 1 AS _match_score LIMIT {limit}",
+        {"name": name, "suffix": f".{name}", "prefix": f"{name}."},
     )
 
 

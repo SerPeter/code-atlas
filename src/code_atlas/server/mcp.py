@@ -563,7 +563,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Find code entities by name. "
-            "Cascade: exact uid → exact name → suffix → prefix → contains. "
+            "Cascade: exact (uid + name) → partial (suffix > prefix > contains). "
             "First stage with results wins. Results ranked by relevance. "
             "Use get_context to expand a result. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
@@ -601,51 +601,38 @@ def _register_node_tools(mcp: FastMCP) -> None:
         found: list[dict[str, Any]] | None = None
 
         try:
-            # Stage 1: Exact uid match (if name contains ':')
-            if ":" in name:
-                records = await app.graph.execute(
-                    f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {clamped}",
-                    {"name": name},
-                )
-                if records:
-                    found = records
+            # Stage A: Exact matches (uid + exact name) — 1 RTT
+            found = await app.graph.execute(
+                f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {clamped} "
+                f"UNION ALL "
+                f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
+                {"name": name},
+            )
 
-            # Stage 2: Exact name match
-            if found is None:
-                records = await app.graph.execute(
-                    f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
-                    {"name": name},
-                )
-                if records:
-                    found = records
-
-            # Stage 3: ENDS WITH suffix match
-            if found is None:
-                suffix = f".{name}"
-                records = await app.graph.execute(
-                    f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix RETURN n LIMIT {clamped}",
-                    {"suffix": suffix},
-                )
-                if records:
-                    found = records
-
-            # Stage 4: STARTS WITH prefix match
-            if found is None:
-                prefix = f"{name}."
-                records = await app.graph.execute(
-                    f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix RETURN n LIMIT {clamped}",
-                    {"prefix": prefix},
-                )
-                if records:
-                    found = records
-
-            # Stage 5: CONTAINS match (qualified_name or name)
-            if found is None:
+            # Stage B: Partial matches (suffix > prefix > contains) — 1 RTT
+            if not found:
                 found = await app.graph.execute(
+                    f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix "
+                    f"RETURN n, 3 AS _match_score LIMIT {clamped} "
+                    f"UNION ALL "
+                    f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix "
+                    f"RETURN n, 2 AS _match_score LIMIT {clamped} "
+                    f"UNION ALL "
                     f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
-                    f"RETURN n LIMIT {clamped}",
-                    {"name": name},
+                    f"RETURN n, 1 AS _match_score LIMIT {clamped}",
+                    {"name": name, "suffix": f".{name}", "prefix": f"{name}."},
                 )
+                # Deduplicate by uid, keeping highest _match_score
+                seen: dict[str, dict[str, Any]] = {}
+                for r in found:
+                    node = r.get("n")
+                    uid = node.get("uid", "") if hasattr(node, "get") else getattr(node, "uid", "")
+                    if not uid:
+                        uid = id(node)  # type: ignore[assignment]
+                    existing = seen.get(uid)  # type: ignore[arg-type]
+                    if existing is None or r.get("_match_score", 0) > existing.get("_match_score", 0):
+                        seen[uid] = r  # type: ignore[assignment]
+                found = sorted(seen.values(), key=lambda rec: rec.get("_match_score", 0), reverse=True)[:clamped]
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 

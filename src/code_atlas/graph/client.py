@@ -1634,19 +1634,21 @@ class GraphClient:
             )
             fetch_limit = limit * 3 if filter_projects else limit
 
-            all_results: list[dict[str, Any]] = []
-            for index_name in indices:
+            async def _ts_one(idx: str) -> list[dict[str, Any]]:
                 cypher = (
-                    f"CALL text_search.search_all('{index_name}', $query, {fetch_limit}) "
+                    f"CALL text_search.search_all('{idx}', $query, {fetch_limit}) "
                     "YIELD node, score "
                     "RETURN node, score "
                     f"ORDER BY score DESC LIMIT {fetch_limit}"
                 )
                 try:
-                    records = await self.execute(cypher, {"query": query})
-                    all_results.extend(records)
+                    return await self.execute(cypher, {"query": query})
                 except Exception as exc:
-                    logger.warning("Text search on {} failed: {}", index_name, exc)
+                    logger.warning("Text search on {} failed: {}", idx, exc)
+                    return []
+
+            results_per_index = await asyncio.gather(*(_ts_one(idx) for idx in indices))
+            all_results: list[dict[str, Any]] = [r for batch in results_per_index for r in batch]
 
             # Post-filter by project scope
             if filter_projects:
@@ -1702,19 +1704,21 @@ class GraphClient:
             filtering = bool(filter_projects) or threshold > 0.0
             fetch_limit = limit * 3 if filtering else limit
 
-            all_results: list[dict[str, Any]] = []
-            for index_name in indices:
+            async def _vs_one(idx: str) -> list[dict[str, Any]]:
                 cypher = (
-                    f"CALL vector_search.search('{index_name}', {fetch_limit}, $vector) "
+                    f"CALL vector_search.search('{idx}', {fetch_limit}, $vector) "
                     "YIELD node, similarity "
                     "RETURN node, similarity "
                     f"ORDER BY similarity DESC LIMIT {fetch_limit}"
                 )
                 try:
-                    records = await self.execute(cypher, {"vector": vector})
-                    all_results.extend(records)
+                    return await self.execute(cypher, {"vector": vector})
                 except Exception as exc:
-                    logger.warning("Vector search on {} failed: {}", index_name, exc)
+                    logger.warning("Vector search on {} failed: {}", idx, exc)
+                    return []
+
+            results_per_index = await asyncio.gather(*(_vs_one(idx) for idx in indices))
+            all_results: list[dict[str, Any]] = [r for batch in results_per_index for r in batch]
 
             if threshold > 0.0:
                 all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
