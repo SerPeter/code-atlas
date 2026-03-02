@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import tiktoken
 from loguru import logger
 
-from code_atlas.schema import RelType
+from code_atlas.schema import NodeLabel, RelType
 from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 
 if TYPE_CHECKING:
@@ -906,6 +906,9 @@ async def _expand_context_inner(
 ) -> ExpandedContext | None:
     """Inner implementation of expand_context (separated to keep span wrapper clean)."""
     call_depth = max(1, min(call_depth, 3))
+    if label and label not in NodeLabel:
+        msg = f"Invalid node label: {label!r}"
+        raise ValueError(msg)
     label_clause = f":{label}" if label else ""
 
     # Always fetch the target node

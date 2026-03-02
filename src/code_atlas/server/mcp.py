@@ -596,6 +596,9 @@ def _register_node_tools(mcp: FastMCP) -> None:
         app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
+        if label and label not in NodeLabel:
+            valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
+            return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
         label_filter = f":{label}" if label else ""
         t0 = time.monotonic()
         found: list[dict[str, Any]] | None = None

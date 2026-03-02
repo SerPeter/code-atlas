@@ -1542,21 +1542,38 @@ class GraphClient:
     async def write_embeddings_and_hashes(
         self,
         items: list[tuple[str, list[float], str]],
+        *,
+        labels: list[str] | None = None,
     ) -> None:
         """Batch-write embedding vectors **and** embed_hashes in a single UNWIND.
 
-        Each *item* is ``(uid, vector, embed_hash)``.
+        Each *item* is ``(uid, vector, embed_hash)``.  When *labels* is
+        provided (parallel to *items*), writes are grouped by label so the
+        ``MATCH`` can use label-scoped uid indices.
         """
         if not items:
             return
 
-        params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
-        await self.execute_write(
-            "UNWIND $items AS item "
-            "MATCH (n) WHERE n.uid = item.uid "
-            "SET n.embedding = item.vector, n.embed_hash = item.hash",
-            {"items": params},
-        )
+        if labels is not None:
+            by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for (uid, vec, h), lbl in zip(items, labels, strict=True):
+                by_label[lbl].append({"uid": uid, "vector": vec, "hash": h})
+            for lbl, group in by_label.items():
+                _assert_valid_label(lbl)
+                await self.execute_write(
+                    f"UNWIND $items AS item "
+                    f"MATCH (n:{lbl}) WHERE n.uid = item.uid "
+                    "SET n.embedding = item.vector, n.embed_hash = item.hash",
+                    {"items": group},
+                )
+        else:
+            params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
+            await self.execute_write(
+                "UNWIND $items AS item "
+                "MATCH (n) WHERE n.uid = item.uid "
+                "SET n.embedding = item.vector, n.embed_hash = item.hash",
+                {"items": params},
+            )
 
     async def run_in_write_transaction(self, fn: Callable[[], Awaitable[_T]]) -> _T:
         """Run *fn* inside a managed write transaction (single session, auto-retry)."""

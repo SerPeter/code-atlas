@@ -810,6 +810,7 @@ class Tier3EmbedConsumer(TierConsumer):
 
             # 2. Build embed texts — graph-check for unchanged content
             to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
+            uid_to_label: dict[str, str] = {}
             graph_hits = 0
             for props in entity_props:
                 text = build_embed_text(props)
@@ -817,6 +818,8 @@ class Tier3EmbedConsumer(TierConsumer):
                     continue
                 uid = props["uid"]
                 text_hash = EmbedCache.hash_text(text)
+                if lbl := props.get("_label"):
+                    uid_to_label[uid] = lbl
                 if props.get("embed_hash") == text_hash and props.get("has_embedding"):
                     graph_hits += 1
                 else:
@@ -846,7 +849,8 @@ class Tier3EmbedConsumer(TierConsumer):
                     await self._write_lock.acquire()
                 try:
                     with _tracer.start_as_current_span("tier3.write_embeddings"):
-                        await self.graph.write_embeddings_and_hashes(all_resolved)
+                        write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
+                        await self.graph.write_embeddings_and_hashes(all_resolved, labels=write_labels)
                 finally:
                     self._write_lock.release()
 
