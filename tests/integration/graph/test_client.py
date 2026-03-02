@@ -620,7 +620,7 @@ async def test_read_entity_texts_includes_embed_fields(graph_client: GraphClient
     assert len(results) == 1
     assert results[0]["uid"] == "ret:proj.func"
     assert results[0]["embed_hash"] == "abc"
-    assert results[0]["embedding"] == embedding
+    assert results[0]["has_embedding"] is True
 
 
 # ---------------------------------------------------------------------------

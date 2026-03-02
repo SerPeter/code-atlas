@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from loguru import logger
 from neo4j import AsyncGraphDatabase
@@ -25,6 +26,7 @@ from code_atlas.schema import (
     SCHEMA_VERSION,
     NodeLabel,
     RelType,
+    generate_composite_index_ddl,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
@@ -36,6 +38,8 @@ from code_atlas.schema import (
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from neo4j import AsyncDriver
 
     from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
@@ -89,6 +93,17 @@ class QueryTimeoutError(Exception):
         super().__init__(f"Query timed out after {timeout_s}s: {query_prefix}")
 
 
+class EntityHashData(NamedTuple):
+    """Stored entity data used for delta comparison during upsert."""
+
+    content_hash: str
+    line_start: int
+    line_end: int
+    signature: str | None
+    docstring: str | None
+    label: str
+
+
 @dataclass(frozen=True)
 class UpsertResult:
     """Result of a delta-aware upsert for a single file."""
@@ -98,6 +113,93 @@ class UpsertResult:
     deleted: list[str] = field(default_factory=list)  # qualified_names removed from file
     unchanged: list[str] = field(default_factory=list)  # qualified_names with matching content_hash
     modified_significance: dict[str, str] = field(default_factory=dict)  # qualified_name → Significance value
+
+
+@dataclass
+class _FileClassification:
+    """Delta classification for a single file's entities."""
+
+    added: list[ParsedEntity]
+    modified: list[ParsedEntity]
+    deleted_by_label: dict[str, list[str]]  # label → [uids]
+    shifted: list[ParsedEntity]
+    result: UpsertResult
+
+
+def _classify_file(
+    old_data: dict[str, EntityHashData],
+    entities: list[ParsedEntity],
+    strip_uid: Callable[[str], str],
+) -> _FileClassification:
+    """Pure-Python classification of entities for a single file.
+
+    Compares new entities against *old_data* and classifies each as
+    added/modified/deleted/unchanged.  Shared by both single-file and
+    batched upsert paths.
+    """
+    new_hashes = {e.qualified_name: e.content_hash for e in entities}
+    new_entity_map = {e.qualified_name: e for e in entities}
+
+    old_uids = set(old_data)
+    new_uids = set(new_hashes)
+
+    added_uids = new_uids - old_uids
+    deleted_uids = old_uids - new_uids
+    common_uids = old_uids & new_uids
+    modified_uids = {uid for uid in common_uids if old_data[uid].content_hash != new_hashes[uid]}
+    unchanged_uids = common_uids - modified_uids
+
+    # Deleted entities grouped by label for index-backed deletion
+    deleted_by_label: dict[str, list[str]] = defaultdict(list)
+    for uid in deleted_uids:
+        deleted_by_label[old_data[uid].label].append(uid)
+
+    # Significance per modified entity
+    mod_significance: dict[str, str] = {}
+    for uid in modified_uids:
+        old = old_data[uid]
+        new_entity = new_entity_map[uid]
+        qn = strip_uid(uid)
+        if (new_entity.signature or "") != (old.signature or ""):
+            mod_significance[qn] = "HIGH"
+        elif (new_entity.docstring or "") != (old.docstring or ""):
+            mod_significance[qn] = "MODERATE"
+        else:
+            mod_significance[qn] = "HIGH"
+
+    # Position shifts for unchanged entities
+    shifted: list[ParsedEntity] = []
+    if unchanged_uids and (added_uids or deleted_uids):
+        for uid in unchanged_uids:
+            entity = new_entity_map[uid]
+            if (entity.line_start, entity.line_end) != (old_data[uid].line_start, old_data[uid].line_end):
+                shifted.append(entity)
+
+    return _FileClassification(
+        added=[new_entity_map[uid] for uid in added_uids],
+        modified=[new_entity_map[uid] for uid in modified_uids],
+        deleted_by_label=dict(deleted_by_label),
+        shifted=shifted,
+        result=UpsertResult(
+            added=[strip_uid(uid) for uid in added_uids],
+            modified=[strip_uid(uid) for uid in modified_uids],
+            deleted=[strip_uid(uid) for uid in deleted_uids],
+            unchanged=[strip_uid(uid) for uid in unchanged_uids],
+            modified_significance=mod_significance,
+        ),
+    )
+
+
+@dataclass
+class _BatchClassification:
+    """Cross-file classification of entities for batched upsert."""
+
+    all_added: list[ParsedEntity]
+    all_modified: list[ParsedEntity]
+    all_deleted_by_label: dict[str, list[str]]  # label → [uids]
+    all_shifted: list[ParsedEntity]
+    per_file_results: dict[str, UpsertResult]  # file_path → UpsertResult
+    new_file_paths: set[str]  # files with no prior data (skip rel delete)
 
 
 def _node_project_name(record: dict[str, Any]) -> str:
@@ -176,6 +278,12 @@ class CallStats:
     callee_names: list[str] = field(default_factory=list)
 
 
+# Per-task transaction context — prevents leaking between concurrent asyncio tasks.
+_active_tx_var: contextvars.ContextVar[Any] = contextvars.ContextVar("_active_tx_var", default=None)
+
+_T = TypeVar("_T")
+
+
 class GraphClient:
     """Async Memgraph client wrapping the neo4j Bolt driver.
 
@@ -192,6 +300,11 @@ class GraphClient:
         self._query_timeout_s = mg.query_timeout_s
         self._write_timeout_s = mg.write_timeout_s
 
+    @property
+    def dimension(self) -> int:
+        """Current embedding vector dimension used for vector indices."""
+        return self._dimension
+
     async def ping(self) -> bool:
         """Health check — returns True if Memgraph is reachable."""
         records = await self.execute("RETURN 1 AS n")
@@ -199,6 +312,10 @@ class GraphClient:
 
     async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute a read query and return results as a list of dicts."""
+        active_tx = _active_tx_var.get()
+        if active_tx is not None:
+            result = await active_tx.run(query, params or {})
+            return [dict(record) async for record in result]
         with _tracer.start_as_current_span("graph.execute", attributes={"db.statement": query[:200]}):
             try:
                 return await asyncio.wait_for(self._execute_inner(query, params), timeout=self._query_timeout_s)
@@ -210,6 +327,22 @@ class GraphClient:
         async with self._driver.session() as session:
             result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
             return [dict(record) async for record in result]
+
+    async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
+        """Execute a write query with automatic retry on transient conflicts.
+
+        Consumes the result to ensure server-side errors (e.g. constraint
+        violations) are raised instead of being silently dropped.
+
+        When called inside a managed transaction (``_active_tx_var`` is set),
+        errors propagate directly — the managed transaction handles retries.
+        """
+        active_tx = _active_tx_var.get()
+        if active_tx is not None:
+            result = await active_tx.run(query, params or {})
+            await result.consume()
+            return
+        await self._execute_write_with_retry(query, params)
 
     @retry(
         retry=retry_if_exception_type(TransientError),
@@ -224,16 +357,8 @@ class GraphClient:
         ),
         reraise=True,
     )
-    async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
-        """Execute a write query with automatic retry on transient conflicts.
-
-        Consumes the result to ensure server-side errors (e.g. constraint
-        violations) are raised instead of being silently dropped.
-
-        Memgraph raises ``TransientError`` when concurrent transactions touch
-        the same nodes (MVCC conflict).  These are retried with exponential
-        back-off before propagating.
-        """
+    async def _execute_write_with_retry(self, query: str, params: dict[str, Any] | None = None) -> None:
+        """Standalone write with retry + timeout (not used inside managed transactions)."""
         with _tracer.start_as_current_span("graph.execute_write", attributes={"db.statement": query[:200]}):
             try:
                 await asyncio.wait_for(self._execute_write_inner(query, params), timeout=self._write_timeout_s)
@@ -285,18 +410,43 @@ class GraphClient:
             )
             raise RuntimeError(msg)
 
-    async def get_file_content_hashes(
-        self, project_name: str, file_path: str
-    ) -> dict[str, tuple[str, int, int, str | None, str | None]]:
-        """Return ``{uid: (content_hash, line_start, line_end, signature, docstring)}`` for all non-structural nodes."""
+    async def get_file_content_hashes(self, project_name: str, file_path: str) -> dict[str, EntityHashData]:
+        """Return ``{uid: EntityHashData}`` for non-structural nodes."""
         records = await self.execute(
             f"MATCH (n {{project_name: $p, file_path: $f}}) "
             f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
             "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le, "
-            "n.signature AS sig, n.docstring AS doc",
+            "n.signature AS sig, n.docstring AS doc, labels(n)[0] AS lbl",
             {"p": project_name, "f": file_path},
         )
-        return {r["uid"]: (r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"]) for r in records}
+        return {
+            r["uid"]: EntityHashData(r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or "")
+            for r in records
+        }
+
+    async def get_batch_file_content_hashes(
+        self,
+        project_name: str,
+        file_paths: list[str],
+    ) -> dict[str, dict[str, EntityHashData]]:
+        """Return ``{file_path: {uid: EntityHashData}}`` for multiple files in one RTT."""
+        if not file_paths:
+            return {}
+        records = await self.execute(
+            f"UNWIND $fps AS fp "
+            f"MATCH (n {{project_name: $p, file_path: fp}}) "
+            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+            "RETURN n.file_path AS fp, n.uid AS uid, n.content_hash AS hash, "
+            "n.line_start AS ls, n.line_end AS le, "
+            "n.signature AS sig, n.docstring AS doc, labels(n)[0] AS lbl",
+            {"p": project_name, "fps": file_paths},
+        )
+        result: dict[str, dict[str, EntityHashData]] = defaultdict(dict)
+        for r in records:
+            result[r["fp"]][r["uid"]] = EntityHashData(
+                r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or ""
+            )
+        return dict(result)
 
     async def upsert_file_entities(
         self,
@@ -311,108 +461,188 @@ class GraphClient:
         classify each as added/modified/deleted/unchanged.  Unchanged entities
         are skipped entirely — their embed data is never touched.
 
-        When entities are added or deleted, unchanged entities may have shifted
-        line positions.  Their ``line_start``/``line_end`` are updated without
-        invalidating embeddings.
+        All graph reads and writes run inside a single managed transaction
+        for atomicity and reduced session overhead.  ``session.execute_write``
+        auto-retries on ``TransientError`` (MVCC conflicts).
 
         Returns an ``UpsertResult`` describing what changed.
         """
-        # 1. Read old content hashes + positions
+
+        async def _tx_fn(tx: Any) -> UpsertResult:
+            token = _active_tx_var.set(tx)
+            try:
+                return await self._upsert_file_entities_inner(project_name, file_path, entities, relationships)
+            finally:
+                _active_tx_var.reset(token)
+
+        async with self._driver.session() as session:
+            return await session.execute_write(_tx_fn)
+
+    async def _upsert_file_entities_inner(
+        self,
+        project_name: str,
+        file_path: str,
+        entities: list[ParsedEntity],
+        relationships: list[ParsedRelationship],
+    ) -> UpsertResult:
+        """Core upsert logic — runs inside a managed transaction via ``_active_tx_var``."""
         old_data = await self.get_file_content_hashes(project_name, file_path)
+        fc = _classify_file(old_data, entities, self._strip_uid)
 
-        # 2. Build new hash map keyed on uid (= qualified_name including project prefix)
-        new_hashes: dict[str, str] = {e.qualified_name: e.content_hash for e in entities}
-        new_entity_map: dict[str, ParsedEntity] = {e.qualified_name: e for e in entities}
-
-        old_uids = set(old_data)
-        new_uids = set(new_hashes)
-
-        added_uids = new_uids - old_uids
-        deleted_uids = old_uids - new_uids
-        common_uids = old_uids & new_uids
-        modified_uids = {uid for uid in common_uids if old_data[uid][0] != new_hashes[uid]}
-        unchanged_uids = common_uids - modified_uids
-
-        # 3. Fast path: nothing changed → skip graph writes entirely
-        if not added_uids and not deleted_uids and not modified_uids:
+        # Fast path: nothing changed
+        if not fc.added and not fc.modified and not fc.result.deleted:
             logger.debug("Delta skip (no changes) for {}", file_path)
-            return UpsertResult(
-                unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
-            )
+            return fc.result
 
-        # 4. Apply delta
-        # 4a. Delete removed entity nodes
-        if deleted_uids:
-            await self._batch_delete_entities(list(deleted_uids))
+        # Apply delta (all writes route through _active_tx_var)
+        if fc.deleted_by_label:
+            await self._batch_delete_entities(fc.deleted_by_label)
+        if fc.added:
+            await self._batch_create_entities(project_name, fc.added)
+        if fc.modified:
+            await self._batch_update_entities(fc.modified)
+        if fc.shifted:
+            await self._batch_update_positions(fc.shifted)
 
-        # 4b. Create new entity nodes
-        if added_uids:
-            added_entities = [new_entity_map[uid] for uid in added_uids]
-            await self._batch_create_entities(project_name, added_entities)
-
-        # 4c. Update modified entity nodes + compute per-entity significance
-        mod_significance: dict[str, str] = {}
-        if modified_uids:
-            modified_entities = [new_entity_map[uid] for uid in modified_uids]
-            await self._batch_update_entities(modified_entities)
-
-            for uid in modified_uids:
-                old_sig, old_doc = old_data[uid][3], old_data[uid][4]
-                new_entity = new_entity_map[uid]
-                qn = self._strip_uid(uid)
-                if (new_entity.signature or "") != (old_sig or ""):
-                    mod_significance[qn] = "HIGH"
-                elif (new_entity.docstring or "") != (old_doc or ""):
-                    mod_significance[qn] = "MODERATE"
-                else:
-                    # Other semantic field change (name/kind/visibility/tags)
-                    mod_significance[qn] = "HIGH"
-
-        # 4d. Update positions of unchanged entities that shifted
-        #     (only when entity count changed — adds or deletes cause shifts)
-        if unchanged_uids and (added_uids or deleted_uids):
-            shifted = [
-                new_entity_map[uid]
-                for uid in unchanged_uids
-                if (new_entity_map[uid].line_start, new_entity_map[uid].line_end)
-                != (old_data[uid][1], old_data[uid][2])
-            ]
-            if shifted:
-                await self._batch_update_positions(shifted)
-
-        # 4e. Recreate ALL relationships for the file (delete old, create new).
-        #     Relationships are cheap and context-dependent — simpler to rebuild.
-        await self._recreate_file_relationships(project_name, file_path, relationships)
-
-        result = UpsertResult(
-            added=[self._strip_uid(uid) for uid in added_uids],
-            modified=[self._strip_uid(uid) for uid in modified_uids],
-            deleted=[self._strip_uid(uid) for uid in deleted_uids],
-            unchanged=[self._strip_uid(uid) for uid in unchanged_uids],
-            modified_significance=mod_significance,
-        )
+        # Recreate ALL relationships for the file (delete old, create new).
+        await self._recreate_file_relationships(project_name, file_path, relationships, skip_delete=not old_data)
 
         logger.debug(
             "Upserted {} (added={}, modified={}, deleted={}, unchanged={}) for {}",
             len(entities),
-            len(result.added),
-            len(result.modified),
-            len(result.deleted),
-            len(result.unchanged),
+            len(fc.result.added),
+            len(fc.result.modified),
+            len(fc.result.deleted),
+            len(fc.result.unchanged),
             file_path,
         )
-        return result
+        return fc.result
 
     @staticmethod
     def _strip_uid(uid: str) -> str:
         """Strip project prefix from uid to get qualified_name."""
         return uid.split(":", 1)[1] if ":" in uid else uid
 
+    @staticmethod
+    def _classify_batch(
+        old_data: dict[str, dict[str, EntityHashData]],
+        file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+    ) -> _BatchClassification:
+        """Pure-Python classification of entities across multiple files.
+
+        Compares new entities against *old_data* (from ``get_batch_file_content_hashes``)
+        and produces cross-file lists for batched graph writes.
+        """
+        all_added: list[ParsedEntity] = []
+        all_modified: list[ParsedEntity] = []
+        all_deleted_by_label: dict[str, list[str]] = defaultdict(list)
+        all_shifted: list[ParsedEntity] = []
+        per_file_results: dict[str, UpsertResult] = {}
+        new_file_paths: set[str] = set()
+
+        strip = GraphClient._strip_uid
+
+        for file_path, (entities, _rels) in file_data.items():
+            file_old = old_data.get(file_path, {})
+            if not file_old:
+                new_file_paths.add(file_path)
+
+            fc = _classify_file(file_old, entities, strip)
+
+            all_added.extend(fc.added)
+            all_modified.extend(fc.modified)
+            for lbl, uids in fc.deleted_by_label.items():
+                all_deleted_by_label[lbl].extend(uids)
+            all_shifted.extend(fc.shifted)
+            per_file_results[file_path] = fc.result
+
+        return _BatchClassification(
+            all_added=all_added,
+            all_modified=all_modified,
+            all_deleted_by_label=dict(all_deleted_by_label),
+            all_shifted=all_shifted,
+            per_file_results=per_file_results,
+            new_file_paths=new_file_paths,
+        )
+
+    async def upsert_batch_entities(
+        self,
+        project_name: str,
+        file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+    ) -> dict[str, UpsertResult]:
+        """Batched multi-file upsert using two sequential managed transactions.
+
+        TX1 (Entity CRUD): batch hash read → classify → delete/create/update/positions.
+        TX2 (Relationships): delete old rels → create new rels → INHERITS → DOCUMENTS.
+
+        Returns ``{file_path: UpsertResult}`` for each file in *file_data*.
+        """
+        if not file_data:
+            return {}
+
+        file_paths = list(file_data)
+
+        # --- TX1: Entity CRUD ---
+        async def _entity_tx(tx: Any) -> _BatchClassification:
+            token = _active_tx_var.set(tx)
+            try:
+                old_data = await self.get_batch_file_content_hashes(project_name, file_paths)
+                classification = self._classify_batch(old_data, file_data)
+
+                if classification.all_deleted_by_label:
+                    await self._batch_delete_entities(classification.all_deleted_by_label)
+                if classification.all_added:
+                    await self._batch_create_entities(project_name, classification.all_added)
+                if classification.all_modified:
+                    await self._batch_update_entities(classification.all_modified)
+                if classification.all_shifted:
+                    await self._batch_update_positions(classification.all_shifted)
+
+                return classification
+            finally:
+                _active_tx_var.reset(token)
+
+        async with self._driver.session() as session:
+            classification = await session.execute_write(_entity_tx)
+
+        # --- TX2: Relationships ---
+        file_rels = {fp: rels for fp, (_, rels) in file_data.items()}
+
+        async def _rel_tx(tx: Any) -> None:
+            token = _active_tx_var.set(tx)
+            try:
+                await self._recreate_batch_relationships(
+                    project_name,
+                    file_rels,
+                    classification.new_file_paths,
+                )
+            finally:
+                _active_tx_var.reset(token)
+
+        async with self._driver.session() as session:
+            await session.execute_write(_rel_tx)
+
+        total_added = sum(len(r.added) for r in classification.per_file_results.values())
+        total_modified = sum(len(r.modified) for r in classification.per_file_results.values())
+        total_deleted = sum(len(r.deleted) for r in classification.per_file_results.values())
+        logger.debug(
+            "Batch upsert {} files (added={}, modified={}, deleted={})",
+            len(file_data),
+            total_added,
+            total_modified,
+            total_deleted,
+        )
+
+        return classification.per_file_results
+
     async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
         """Delete all non-structural entity nodes for a file. Returns deleted uids."""
         old_data = await self.get_file_content_hashes(project_name, file_path)
         if old_data:
-            await self._batch_delete_entities(list(old_data.keys()))
+            uids_by_label: dict[str, list[str]] = defaultdict(list)
+            for uid, data in old_data.items():
+                uids_by_label[data.label].append(uid)
+            await self._batch_delete_entities(dict(uids_by_label))
         return [self._strip_uid(uid) for uid in old_data]
 
     async def merge_project_node(self, project_name: str, **metadata: Any) -> None:
@@ -446,6 +676,50 @@ class GraphClient:
         await self.execute_write(
             f"MATCH (a {{uid: $from_uid}}), (b {{uid: $to_uid}}) MERGE (a)-[:{RelType.CONTAINS}]->(b)",
             {"from_uid": from_uid, "to_uid": to_uid},
+        )
+
+    async def merge_package_batch(
+        self,
+        project_name: str,
+        packages: list[tuple[str, str, str]],
+    ) -> None:
+        """Create/update Package nodes and CONTAINS edges in two batched queries.
+
+        Each tuple is ``(qualified_name, name, file_path)``.  Parent UIDs are
+        derived from the dotted *qualified_name* prefix; top-level packages
+        point to the Project node.
+        """
+        if not packages:
+            return
+
+        params = []
+        for qn, name, fp in packages:
+            uid = f"{project_name}:{qn}"
+            parent_qn = qn.rsplit(".", 1)[0] if "." in qn else None
+            parent_uid = f"{project_name}:{parent_qn}" if parent_qn else project_name
+            params.append(
+                {
+                    "uid": uid,
+                    "project_name": project_name,
+                    "name": name,
+                    "qualified_name": qn,
+                    "file_path": fp,
+                    "parent_uid": parent_uid,
+                }
+            )
+
+        await self.execute_write(
+            f"UNWIND $pkgs AS p "
+            f"MERGE (n:{NodeLabel.PACKAGE} {{uid: p.uid}}) "
+            f"SET n.project_name = p.project_name, n.name = p.name, "
+            f"n.qualified_name = p.qualified_name, n.file_path = p.file_path",
+            {"pkgs": params},
+        )
+        await self.execute_write(
+            f"UNWIND $pkgs AS p "
+            f"MATCH (parent {{uid: p.parent_uid}}), (child {{uid: p.uid}}) "
+            f"MERGE (parent)-[:{RelType.CONTAINS}]->(child)",
+            {"pkgs": params},
         )
 
     async def delete_project_data(self, project_name: str) -> None:
@@ -630,15 +904,15 @@ class GraphClient:
         if normal_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
-                f"CREATE (a)-[:{RelType.IMPORTS}]->(b)",
+                f"MATCH (a:{NodeLabel.MODULE} {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"MERGE (a)-[:{RelType.IMPORTS}]->(b)",
                 {"rels": normal_edges},
             )
         if type_only_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                "MATCH (a {uid: r.from_uid}), (b {uid: r.to_uid}) "
-                f"CREATE (a)-[e:{RelType.IMPORTS}]->(b) SET e.type_only = true",
+                f"MATCH (a:{NodeLabel.MODULE} {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"MERGE (a)-[e:{RelType.IMPORTS}]->(b) ON CREATE SET e.type_only = true",
                 {"rels": type_only_edges},
             )
 
@@ -653,6 +927,8 @@ class GraphClient:
         self,
         project_name: str,
         call_rels: list[ParsedRelationship],
+        *,
+        lookup: _CallLookup | None = None,
     ) -> None:
         """Resolve CALLS relationships after all files in a batch have been upserted.
 
@@ -667,7 +943,8 @@ class GraphClient:
         if not call_rels:
             return
 
-        lookup = await self._build_call_lookup(project_name)
+        if lookup is None:
+            lookup = await self._build_call_lookup(project_name)
 
         # Resolve each call
         edges: set[tuple[str, str]] = set()
@@ -685,7 +962,9 @@ class GraphClient:
         if edges:
             edge_params = [{"f": f, "t": t} for f, t in edges]
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) CREATE (a)-[:{RelType.CALLS}]->(b)",
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.CALLABLE} {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
+                f"MERGE (a)-[:{RelType.CALLS}]->(b)",
                 {"rels": edge_params},
             )
 
@@ -695,6 +974,9 @@ class GraphClient:
         self,
         project_name: str,
         type_rels: list[ParsedRelationship],
+        *,
+        lookup: _CallLookup | None = None,
+        name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
     ) -> None:
         """Resolve USES_TYPE relationships after all files in a batch have been upserted.
 
@@ -708,17 +990,18 @@ class GraphClient:
         if not type_rels:
             return
 
-        lookup = await self._build_call_lookup(project_name)
+        if lookup is None:
+            lookup = await self._build_call_lookup(project_name)
 
-        # Also build a name → TypeDef uid map
-        td_records = await self.execute(
-            f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
-            "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
-            {"p": project_name},
-        )
-        name_to_typedefs: dict[str, list[tuple[str, str]]] = {}  # name → [(uid, file_path)]
-        for r in td_records:
-            name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
+        if name_to_typedefs is None:
+            td_records = await self.execute(
+                f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
+                "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
+                {"p": project_name},
+            )
+            name_to_typedefs = {}
+            for r in td_records:
+                name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
 
         edges: set[tuple[str, str]] = set()
         resolved = 0
@@ -766,7 +1049,9 @@ class GraphClient:
         if edges:
             edge_params = [{"f": f, "t": t} for f, t in edges]
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.f}}), (b {{uid: r.t}}) CREATE (a)-[:{RelType.USES_TYPE}]->(b)",
+                f"UNWIND $rels AS r "
+                f"MATCH (a {{uid: r.f}}), (b:{NodeLabel.TYPE_DEF} {{uid: r.t}}) "
+                f"MERGE (a)-[:{RelType.USES_TYPE}]->(b)",
                 {"rels": edge_params},
             )
 
@@ -815,6 +1100,27 @@ class GraphClient:
             parent_children=parent_children,
             uid_to_info=uid_to_info,
         )
+
+    async def build_resolution_lookup(self, project_name: str) -> tuple[_CallLookup, dict[str, list[tuple[str, str]]]]:
+        """Build shared lookup tables for both CALLS and USES_TYPE resolution.
+
+        Returns ``(call_lookup, name_to_typedefs)`` where *name_to_typedefs*
+        maps ``name → [(uid, file_path)]`` for TypeDef nodes.  Building both
+        in a single call saves 3 redundant graph queries vs. calling
+        ``_build_call_lookup`` twice.
+        """
+        lookup = await self._build_call_lookup(project_name)
+
+        td_records = await self.execute(
+            f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
+            "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
+            {"p": project_name},
+        )
+        name_to_typedefs: dict[str, list[tuple[str, str]]] = {}
+        for r in td_records:
+            name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
+
+        return lookup, name_to_typedefs
 
     async def update_external_package_versions(
         self,
@@ -952,7 +1258,8 @@ class GraphClient:
         rewired = 0
         for es_uid, real_uid in sym_to_real.items():
             await self.execute_write(
-                f"MATCH (src)-[r:{RelType.IMPORTS}]->(es {{uid: $es_uid}}) "
+                f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
+                f"(es:{NodeLabel.EXTERNAL_SYMBOL} {{uid: $es_uid}}) "
                 f"MATCH (real {{uid: $real_uid}}) "
                 f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
@@ -962,7 +1269,8 @@ class GraphClient:
 
         for ep_uid, real_uid in ep_to_real_pkg.items():
             await self.execute_write(
-                f"MATCH (src)-[r:{RelType.IMPORTS}]->(ep {{uid: $ep_uid}}) "
+                f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
+                f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $ep_uid}}) "
                 f"MATCH (real {{uid: $real_uid}}) "
                 f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
@@ -1038,15 +1346,14 @@ class GraphClient:
     async def apply_property_enrichments(self, enrichments: list[PropertyEnrichment]) -> None:
         """Apply property enrichments from detectors to existing entity nodes.
 
-        Each enrichment SETs additional properties on a node matched by uid.
+        Batches all enrichments into a single UNWIND query.
         Uses ``+=`` (map merge) so existing properties are preserved.
         """
-        for enrichment in enrichments:
-            if not enrichment.properties:
-                continue
+        items = [{"uid": e.qualified_name, "props": e.properties} for e in enrichments if e.properties]
+        if items:
             await self.execute_write(
-                "MATCH (n {uid: $uid}) SET n += $props",
-                {"uid": enrichment.qualified_name, "props": enrichment.properties},
+                "UNWIND $items AS item MATCH (n {uid: item.uid}) SET n += item.props",
+                {"items": items},
             )
 
     # -- Embedding helpers -----------------------------------------------------
@@ -1089,14 +1396,14 @@ class GraphClient:
 
         Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``kind``, ``_label``,
-        ``embed_hash``, ``embedding``.
+        ``embed_hash``, ``has_embedding``.
         """
         ret = (
             "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
             "n.source AS source, "
             "n.kind AS kind, labels(n)[0] AS _label, "
-            "n.embed_hash AS embed_hash, n.embedding AS embedding"
+            "n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding"
         )
 
         if labels is None or len(labels) != len(uids):
@@ -1116,17 +1423,59 @@ class GraphClient:
         for uid, lbl in zip(uids, labels, strict=True):
             by_label[lbl].append(uid)
 
-        results: list[dict[str, Any]] = []
-        for lbl, group_uids in by_label.items():
+        async def _read_label(lbl: str, group_uids: list[str]) -> list[dict[str, Any]]:
             _assert_valid_label(lbl)
+            rows: list[dict[str, Any]] = []
             for i in range(0, len(group_uids), chunk_size):
                 chunk = group_uids[i : i + chunk_size]
-                rows = await self.execute(
-                    f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
-                    {"uids": chunk},
+                rows.extend(
+                    await self.execute(
+                        f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
+                        {"uids": chunk},
+                    )
                 )
-                results.extend(rows)
-        return results
+            return rows
+
+        label_results = await asyncio.gather(*[_read_label(lbl, guids) for lbl, guids in by_label.items()])
+        return [row for rows in label_results for row in rows]
+
+    async def read_embed_hashes(
+        self,
+        uids: list[str],
+        *,
+        labels: list[str] | None = None,
+    ) -> dict[str, tuple[str | None, bool]]:
+        """Batch-read embed_hash and embedding existence for entities.
+
+        Returns ``{uid: (embed_hash, has_embedding)}`` for each matched node.
+        Uses concurrent per-label reads when *labels* is provided.
+        """
+        ret = "RETURN n.uid AS uid, n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding"
+
+        if labels is None or len(labels) != len(uids):
+            rows = await self.execute(
+                f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}",
+                {"uids": uids},
+            )
+            return {r["uid"]: (r["embed_hash"], r["has_embedding"]) for r in rows}
+
+        by_label: dict[str, list[str]] = defaultdict(list)
+        for uid, lbl in zip(uids, labels, strict=True):
+            by_label[lbl].append(uid)
+
+        async def _read_label(lbl: str, group_uids: list[str]) -> list[dict[str, Any]]:
+            _assert_valid_label(lbl)
+            return await self.execute(
+                f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}",
+                {"uids": group_uids},
+            )
+
+        label_results = await asyncio.gather(*[_read_label(lbl, guids) for lbl, guids in by_label.items()])
+        result: dict[str, tuple[str | None, bool]] = {}
+        for rows in label_results:
+            for r in rows:
+                result[r["uid"]] = (r["embed_hash"], r["has_embedding"])
+        return result
 
     async def write_embeddings(
         self,
@@ -1190,6 +1539,55 @@ class GraphClient:
                 {"items": params},
             )
 
+    async def write_embeddings_and_hashes(
+        self,
+        items: list[tuple[str, list[float], str]],
+        *,
+        labels: list[str] | None = None,
+    ) -> None:
+        """Batch-write embedding vectors **and** embed_hashes in a single UNWIND.
+
+        Each *item* is ``(uid, vector, embed_hash)``.  When *labels* is
+        provided (parallel to *items*), writes are grouped by label so the
+        ``MATCH`` can use label-scoped uid indices.
+        """
+        if not items:
+            return
+
+        if labels is not None:
+            by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for (uid, vec, h), lbl in zip(items, labels, strict=True):
+                by_label[lbl].append({"uid": uid, "vector": vec, "hash": h})
+            for lbl, group in by_label.items():
+                _assert_valid_label(lbl)
+                await self.execute_write(
+                    f"UNWIND $items AS item "
+                    f"MATCH (n:{lbl}) WHERE n.uid = item.uid "
+                    "SET n.embedding = item.vector, n.embed_hash = item.hash",
+                    {"items": group},
+                )
+        else:
+            params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
+            await self.execute_write(
+                "UNWIND $items AS item "
+                "MATCH (n) WHERE n.uid = item.uid "
+                "SET n.embedding = item.vector, n.embed_hash = item.hash",
+                {"items": params},
+            )
+
+    async def run_in_write_transaction(self, fn: Callable[[], Awaitable[_T]]) -> _T:
+        """Run *fn* inside a managed write transaction (single session, auto-retry)."""
+
+        async def _tx(tx: Any) -> _T:
+            token = _active_tx_var.set(tx)
+            try:
+                return await fn()
+            finally:
+                _active_tx_var.reset(token)
+
+        async with self._driver.session() as session:
+            return await session.execute_write(_tx)
+
     async def clear_all_embeddings(self) -> None:
         """Remove embedding vectors and content hashes from all nodes."""
         await self.execute_write(
@@ -1241,19 +1639,21 @@ class GraphClient:
             )
             fetch_limit = limit * 3 if filter_projects else limit
 
-            all_results: list[dict[str, Any]] = []
-            for index_name in indices:
+            async def _ts_one(idx: str) -> list[dict[str, Any]]:
                 cypher = (
-                    f"CALL text_search.search_all('{index_name}', $query, {fetch_limit}) "
+                    f"CALL text_search.search_all('{idx}', $query, {fetch_limit}) "
                     "YIELD node, score "
                     "RETURN node, score "
                     f"ORDER BY score DESC LIMIT {fetch_limit}"
                 )
                 try:
-                    records = await self.execute(cypher, {"query": query})
-                    all_results.extend(records)
+                    return await self.execute(cypher, {"query": query})
                 except Exception as exc:
-                    logger.warning("Text search on {} failed: {}", index_name, exc)
+                    logger.warning("Text search on {} failed: {}", idx, exc)
+                    return []
+
+            results_per_index = await asyncio.gather(*(_ts_one(idx) for idx in indices))
+            all_results: list[dict[str, Any]] = [r for batch in results_per_index for r in batch]
 
             # Post-filter by project scope
             if filter_projects:
@@ -1309,19 +1709,21 @@ class GraphClient:
             filtering = bool(filter_projects) or threshold > 0.0
             fetch_limit = limit * 3 if filtering else limit
 
-            all_results: list[dict[str, Any]] = []
-            for index_name in indices:
+            async def _vs_one(idx: str) -> list[dict[str, Any]]:
                 cypher = (
-                    f"CALL vector_search.search('{index_name}', {fetch_limit}, $vector) "
+                    f"CALL vector_search.search('{idx}', {fetch_limit}, $vector) "
                     "YIELD node, similarity "
                     "RETURN node, similarity "
                     f"ORDER BY similarity DESC LIMIT {fetch_limit}"
                 )
                 try:
-                    records = await self.execute(cypher, {"vector": vector})
-                    all_results.extend(records)
+                    return await self.execute(cypher, {"vector": vector})
                 except Exception as exc:
-                    logger.warning("Vector search on {} failed: {}", index_name, exc)
+                    logger.warning("Vector search on {} failed: {}", idx, exc)
+                    return []
+
+            results_per_index = await asyncio.gather(*(_vs_one(idx) for idx in indices))
+            all_results: list[dict[str, Any]] = [r for batch in results_per_index for r in batch]
 
             if threshold > 0.0:
                 all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
@@ -1393,26 +1795,27 @@ class GraphClient:
 
     async def batch_call_stats(self, uids: list[str], *, top_n: int = 5) -> dict[str, CallStats]:
         """Return caller/callee counts and top-N names per uid in a single round-trip."""
-        if not uids:
-            return {}
-        records = await self.execute(
-            "UNWIND $uids AS uid "
-            "MATCH (n {uid: uid}) "
-            f"OPTIONAL MATCH (caller)-[:{RelType.CALLS}]->(n) "
-            "WITH uid, n, count(DISTINCT caller) AS cc, collect(DISTINCT caller.name)[0..$top_n] AS cn "
-            f"OPTIONAL MATCH (n)-[:{RelType.CALLS}]->(callee) "
-            "RETURN uid, cc, cn, count(DISTINCT callee) AS ec, collect(DISTINCT callee.name)[0..$top_n] AS en",
-            {"uids": uids, "top_n": top_n},
-        )
-        return {
-            r["uid"]: CallStats(
-                caller_count=r["cc"],
-                callee_count=r["ec"],
-                caller_names=r["cn"] or [],
-                callee_names=r["en"] or [],
+        with _tracer.start_as_current_span("graph.batch_call_stats", attributes={"count": len(uids)}):
+            if not uids:
+                return {}
+            records = await self.execute(
+                "UNWIND $uids AS uid "
+                "MATCH (n {uid: uid}) "
+                f"OPTIONAL MATCH (caller)-[:{RelType.CALLS}]->(n) "
+                "WITH uid, n, count(DISTINCT caller) AS cc, collect(DISTINCT caller.name)[0..$top_n] AS cn "
+                f"OPTIONAL MATCH (n)-[:{RelType.CALLS}]->(callee) "
+                "RETURN uid, cc, cn, count(DISTINCT callee) AS ec, collect(DISTINCT callee.name)[0..$top_n] AS en",
+                {"uids": uids, "top_n": top_n},
             )
-            for r in records
-        }
+            return {
+                r["uid"]: CallStats(
+                    caller_count=r["cc"],
+                    callee_count=r["ec"],
+                    caller_names=r["cn"] or [],
+                    callee_names=r["en"] or [],
+                )
+                for r in records
+            }
 
     async def close(self) -> None:
         """Close the driver and release connections."""
@@ -1471,69 +1874,120 @@ class GraphClient:
             await self.execute_write(query, {"entities": params})
 
     async def _batch_update_entities(self, entities: list[ParsedEntity]) -> None:
-        """Batch-update modified entity nodes by uid."""
-        params = [
-            {
-                "uid": e.qualified_name,
-                "name": e.name,
-                "kind": e.kind,
-                "line_start": e.line_start,
-                "line_end": e.line_end,
-                "visibility": e.visibility,
-                "docstring": e.docstring,
-                "signature": e.signature,
-                "source": e.source,
-                "tags": e.tags,
-                "header_path": e.header_path,
-                "header_level": e.header_level,
-                "content_hash": e.content_hash,
-            }
-            for e in entities
-        ]
-        await self.execute_write(
-            "UNWIND $entities AS e "
-            "MATCH (n {uid: e.uid}) "
-            "SET n.name = e.name, n.kind = e.kind, "
-            "n.line_start = e.line_start, n.line_end = e.line_end, "
-            "n.visibility = e.visibility, n.docstring = e.docstring, "
-            "n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
-            "n.header_path = e.header_path, n.header_level = e.header_level, "
-            "n.content_hash = e.content_hash",
-            {"entities": params},
-        )
+        """Batch-update modified entity nodes by uid, grouped by label."""
+        sorted_entities = sorted(entities, key=attrgetter("label"))
+        for label, group in groupby(sorted_entities, key=attrgetter("label")):
+            params = [
+                {
+                    "uid": e.qualified_name,
+                    "name": e.name,
+                    "kind": e.kind,
+                    "line_start": e.line_start,
+                    "line_end": e.line_end,
+                    "visibility": e.visibility,
+                    "docstring": e.docstring,
+                    "signature": e.signature,
+                    "source": e.source,
+                    "tags": e.tags,
+                    "header_path": e.header_path,
+                    "header_level": e.header_level,
+                    "content_hash": e.content_hash,
+                }
+                for e in group
+            ]
+            await self.execute_write(
+                f"UNWIND $entities AS e "
+                f"MATCH (n:{label.value} {{uid: e.uid}}) "
+                "SET n.name = e.name, n.kind = e.kind, "
+                "n.line_start = e.line_start, n.line_end = e.line_end, "
+                "n.visibility = e.visibility, n.docstring = e.docstring, "
+                "n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
+                "n.header_path = e.header_path, n.header_level = e.header_level, "
+                "n.content_hash = e.content_hash",
+                {"entities": params},
+            )
 
     async def _batch_update_positions(self, entities: list[ParsedEntity]) -> None:
         """Update only line_start/line_end for entities whose content didn't change."""
-        params = [{"uid": e.qualified_name, "ls": e.line_start, "le": e.line_end} for e in entities]
-        await self.execute_write(
-            "UNWIND $entities AS e MATCH (n {uid: e.uid}) SET n.line_start = e.ls, n.line_end = e.le",
-            {"entities": params},
-        )
+        sorted_entities = sorted(entities, key=attrgetter("label"))
+        for label, group in groupby(sorted_entities, key=attrgetter("label")):
+            params = [{"uid": e.qualified_name, "ls": e.line_start, "le": e.line_end} for e in group]
+            await self.execute_write(
+                f"UNWIND $entities AS e MATCH (n:{label.value} {{uid: e.uid}}) "
+                "SET n.line_start = e.ls, n.line_end = e.le",
+                {"entities": params},
+            )
 
-    async def _batch_delete_entities(self, uids: list[str]) -> None:
-        """Delete entity nodes by uid."""
-        await self.execute_write(
-            "UNWIND $uids AS uid MATCH (n {uid: uid}) DETACH DELETE n",
-            {"uids": uids},
-        )
+    async def _batch_delete_entities(self, uids_by_label: dict[str, list[str]]) -> None:
+        """Delete entity nodes by uid, grouped by label for index-backed matching."""
+        for label, uids in uids_by_label.items():
+            if label:
+                _assert_valid_label(label)
+                await self.execute_write(
+                    f"UNWIND $uids AS uid MATCH (n:{label} {{uid: uid}}) DETACH DELETE n",
+                    {"uids": uids},
+                )
+            else:
+                await self.execute_write(
+                    "UNWIND $uids AS uid MATCH (n {uid: uid}) DETACH DELETE n",
+                    {"uids": uids},
+                )
+
+    async def _recreate_batch_relationships(
+        self,
+        project_name: str,
+        file_rels: dict[str, list[ParsedRelationship]],
+        new_file_paths: set[str],
+    ) -> None:
+        """Delete then recreate relationships for multiple files in batched queries.
+
+        *new_file_paths* are files with no prior data — their old rels are skipped
+        in the delete phase.  All rels across files are pooled for creation.
+        """
+        # --- Delete phase: single label-free query for all file entities ---
+        delete_fps = [fp for fp in file_rels if fp not in new_file_paths]
+        if delete_fps:
+            await self.execute_write(
+                f"MATCH (n {{project_name: $p}})-[r]->() "
+                f"WHERE n.file_path IN $fps AND NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+                f"DELETE r",
+                {"p": project_name, "fps": delete_fps},
+            )
+
+        # --- Create phase: pool all rels across files ---
+        all_rels: list[ParsedRelationship] = []
+        for rels in file_rels.values():
+            all_rels.extend(rels)
+
+        await self._create_relationships(project_name, all_rels)
 
     async def _recreate_file_relationships(
         self,
         project_name: str,
         file_path: str,
         relationships: list[ParsedRelationship],
+        *,
+        skip_delete: bool = False,
     ) -> None:
         """Delete all relationships originating from this file's entities, then recreate them."""
-        # Delete existing relationships from file entities (excluding Package/Project)
-        await self.execute_write(
-            f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->() "
-            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            "DELETE r",
-            {"p": project_name, "f": file_path},
-        )
+        if not skip_delete:
+            await self.execute_write(
+                f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->() "
+                f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} DELETE r",
+                {"p": project_name, "f": file_path},
+            )
+        await self._create_relationships(project_name, relationships)
 
-        # Recreate: uid-based rels (both ends known by uid)
-        # Includes structural rels and detector-produced rels (both ends resolved to UIDs)
+    async def _create_relationships(
+        self,
+        project_name: str,
+        relationships: list[ParsedRelationship],
+    ) -> None:
+        """Create relationships from a flat list of ParsedRelationship.
+
+        Shared by both single-file and batched upsert paths.
+        IMPORTS, CALLS, and USES_TYPE are excluded — they're resolved post-batch.
+        """
         uid_rel_types = {
             RelType.DEFINES,
             RelType.CONTAINS,
@@ -1550,44 +2004,32 @@ class GraphClient:
         uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
         other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
 
+        # uid-based rels: one UNWIND per rel_type
         for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
-            rels_list = list(group)
-            has_props = any(r.properties for r in rels_list)
-            if has_props:
-                rel_params = [
-                    {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties} for r in rels_list
-                ]
-                await self.execute_write(
-                    f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                    f"CREATE (a)-[:{rel_type}]->(b)",
-                    {"rels": rel_params},
-                )
-                # SET properties in a second pass (Memgraph doesn't support dynamic props in CREATE)
-                for param in rel_params:
-                    if param["props"]:
-                        set_clause = ", ".join(f"e.{k} = $prop_{k}" for k in param["props"])
-                        prop_params = {f"prop_{k}": v for k, v in param["props"].items()}
-                        await self.execute_write(
-                            f"MATCH (a {{uid: $from_uid}})-[e:{rel_type}]->(b {{uid: $to_uid}}) SET {set_clause}",
-                            {"from_uid": param["from_uid"], "to_uid": param["to_uid"], **prop_params},
-                        )
-            else:
-                rel_params = [{"from_uid": r.from_qualified_name, "to_uid": r.to_name} for r in rels_list]
-                await self.execute_write(
-                    f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                    f"CREATE (a)-[:{rel_type}]->(b)",
-                    {"rels": rel_params},
-                )
-
-        # Name-matched rels (IMPORTS are intentionally excluded — resolved post-batch)
-        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
-        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
-
-        for rel in inherits_rels:
+            rel_params = [
+                {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties or {}} for r in group
+            ]
             await self.execute_write(
-                f"MATCH (a {{uid: $from_uid}}), (b {{project_name: $project, name: $to_name}}) "
+                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"CREATE (a)-[e:{rel_type}]->(b) SET e += r.props",
+                {"rels": rel_params},
+            )
+
+        # Name-matched rels
+        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
+        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
+
+        if inherits_rels:
+            inh_params = [
+                {"from_uid": r.from_qualified_name, "project": project_name, "to_name": r.to_name}
+                for r in inherits_rels
+            ]
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}), "
+                f"(b:{NodeLabel.TYPE_DEF} {{project_name: r.project, name: r.to_name}}) "
                 f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
-                {"from_uid": rel.from_qualified_name, "project": project_name, "to_name": rel.to_name},
+                {"rels": inh_params},
             )
 
         if doc_rels:
@@ -1618,7 +2060,8 @@ class GraphClient:
         if symbol_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: $project, name: r.to_name}}) "
+                f"MATCH (a:{NodeLabel.DOC_SECTION} {{uid: r.from_uid}}), "
+                f"(b {{project_name: $project, name: r.to_name}}) "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
                 {"rels": symbol_params, "project": project_name},
@@ -1628,7 +2071,7 @@ class GraphClient:
         if file_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b {{project_name: $project}}) "
+                f"MATCH (a:{NodeLabel.DOC_SECTION} {{uid: r.from_uid}}), (b {{project_name: $project}}) "
                 f"WHERE b.file_path ENDS WITH r.to_name "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
@@ -1663,13 +2106,22 @@ class GraphClient:
             await self._exec_ddl(stmt)
         for stmt in generate_index_ddl():
             await self._exec_ddl(stmt)
+        for stmt in generate_composite_index_ddl():
+            await self._exec_ddl(stmt)
         if self._embeddings_enabled:
             await self._create_vector_indices()
         for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
 
     async def _migrate_indices(self) -> None:
-        """Drop and recreate vector/text indices (dimension may have changed)."""
+        """Drop and recreate vector/text indices (dimension may have changed).
+
+        Also applies property and composite indices (idempotent via _exec_ddl).
+        """
+        for stmt in generate_index_ddl():
+            await self._exec_ddl(stmt)
+        for stmt in generate_composite_index_ddl():
+            await self._exec_ddl(stmt)
         await self._drop_all_vector_indices()
         for stmt in generate_drop_text_index_ddl():
             await self._exec_ddl(stmt)

@@ -91,9 +91,9 @@ def _echo(msg: str) -> None:
 
 def _json_output(payload: dict[str, Any]) -> None:
     """Write a JSON object to stdout."""
-    import json as _json
+    import orjson
 
-    print(_json.dumps(payload, indent=2, default=str))
+    print(orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_NON_STR_KEYS, default=str).decode())
 
 
 @app.callback()

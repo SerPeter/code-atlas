@@ -54,30 +54,30 @@ For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code
 
 15 tools exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), designed to minimize context window overhead.
 
-| Tool                   | What it does                                                                                 | Search | Full |
-| ---------------------- | -------------------------------------------------------------------------------------------- | -----: | ---: |
-| **Search**             |                                                                                              |        |      |
-| `hybrid_search`        | **Primary tool** — fuses graph + BM25 + vector via RRF. Auto-adjusts weights by query shape. |   ~117 | ~497 |
-| `text_search`          | BM25 keyword search. Quoted phrases, wildcards, field-specific queries.                      |    ~90 | ~275 |
-| `vector_search`        | Semantic similarity via embeddings. Finds code by meaning, not name.                         |    ~67 | ~297 |
-| `get_node`             | Find entities by name. Cascade: exact uid → name → suffix → prefix → contains.               |   ~100 | ~254 |
-| **Navigation**         |                                                                                              |        |      |
-| `get_context`          | Expand a node's neighborhood: parent, siblings, callers, callees, docs.                      |    ~64 | ~273 |
-| `cypher_query`         | Run read-only Cypher against the graph. Auto-limited, write-protected.                       |    ~59 | ~168 |
-| **Analysis**           |                                                                                              |        |      |
-| `analyze_repo`         | Structure, centrality, dependencies, or pattern analysis.                                    |    ~41 | ~266 |
-| `generate_diagram`     | Mermaid diagrams: packages, imports, inheritance, module detail.                             |    ~37 | ~254 |
-| **Guidance**           |                                                                                              |        |      |
-| `get_usage_guide`      | Quick-start or topic-specific guidance for the agent.                                        |    ~35 | ~106 |
-| `plan_search_strategy` | Recommends which search tool + params for a question.                                        |    ~40 |  ~97 |
-| `validate_cypher`      | Catches Cypher errors before execution.                                                      |    ~58 | ~116 |
-| `schema_info`          | Full graph schema: labels, relationships, Cypher examples.                                   |    ~75 |  ~96 |
-| **Status**             |                                                                                              |        |      |
-| `index_status`         | Projects, entity counts, schema version, index health.                                       |    ~72 |  ~93 |
-| `list_projects`        | Monorepo project list with dependency relationships.                                         |    ~56 |  ~77 |
-| `health_check`         | Infrastructure diagnostics: Memgraph, TEI, Valkey, schema.                                   |    ~55 |  ~76 |
+| Tool                   | What it does                                                                                 | Search | Full | Latency (avg / p95) |
+| ---------------------- | -------------------------------------------------------------------------------------------- | -----: | ---: | ------------------: |
+| **Search**             |                                                                                              |        |      |                     |
+| `hybrid_search`        | **Primary tool** — fuses graph + BM25 + vector via RRF. Auto-adjusts weights by query shape. |   ~117 | ~497 |        548 / 677 ms |
+| `text_search`          | BM25 keyword search. Quoted phrases, wildcards, field-specific queries.                      |    ~90 | ~275 |          34 / 36 ms |
+| `vector_search`        | Semantic similarity via embeddings. Finds code by meaning, not name.                         |    ~67 | ~297 |        102 / 125 ms |
+| `get_node`             | Find entities by name. Cascade: exact (uid + name) → partial (suffix > prefix > contains).   |   ~100 | ~254 |            7 / 8 ms |
+| **Navigation**         |                                                                                              |        |      |                     |
+| `get_context`          | Expand a node's neighborhood: parent, siblings, callers, callees, docs.                      |    ~64 | ~273 |          34 / 36 ms |
+| `cypher_query`         | Run read-only Cypher against the graph. Auto-limited, write-protected.                       |    ~59 | ~168 |            3 / 3 ms |
+| **Analysis**           |                                                                                              |        |      |                     |
+| `analyze_repo`         | Structure, centrality, dependencies, pattern, or quality analysis.                           |    ~41 | ~266 |          22 / 23 ms |
+| `generate_diagram`     | Mermaid diagrams: packages, imports, inheritance, module detail.                             |    ~37 | ~254 |            3 / 3 ms |
+| **Guidance**           |                                                                                              |        |      |                     |
+| `get_usage_guide`      | Quick-start or topic-specific guidance for the agent.                                        |    ~35 | ~106 |        < 1 / < 1 ms |
+| `plan_search_strategy` | Recommends which search tool + params for a question.                                        |    ~40 |  ~97 |        < 1 / < 1 ms |
+| `validate_cypher`      | Catches Cypher errors before execution.                                                      |    ~58 | ~116 |            1 / 2 ms |
+| `schema_info`          | Full graph schema: labels, relationships, Cypher examples.                                   |    ~75 |  ~96 |        < 1 / < 1 ms |
+| **Status**             |                                                                                              |        |      |                     |
+| `index_status`         | Projects, entity counts, schema version, index health.                                       |    ~72 |  ~93 |          22 / 23 ms |
+| `list_projects`        | Monorepo project list with dependency relationships.                                         |    ~56 |  ~77 |          12 / 13 ms |
+| `health_check`         | Infrastructure diagnostics: Memgraph, TEI, Valkey, schema.                                   |    ~55 |  ~76 |        218 / 264 ms |
 
-Token counts measured from MCP JSON tool definitions (tiktoken cl100k_base). **Search** = name + description (~966 total); **Full** = name + description + parameter schema with field descriptions, enums, and constraints (~2,945 total). All parameters are self-documented — agents can one-shot any tool without calling `get_usage_guide` first.
+Token counts measured from MCP JSON tool definitions (tiktoken cl100k_base). **Search** = name + description (~966 total); **Full** = name + description + parameter schema with field descriptions, enums, and constraints (~2,945 total). All parameters are self-documented — agents can one-shot any tool without calling `get_usage_guide` first. **Latency** measured with local TEI embeddings on the code-atlas repo (~1,400 entities), 5 iterations, warm embedding cache. See `scripts/profile_query.py`.
 
 ## Quick Start
 
@@ -144,15 +144,15 @@ uv run pre-commit install
 
 ## Performance
 
-| Metric              | Value                 |
-| ------------------- | --------------------- |
-| Parse throughput    | **600–700 files/sec** |
-| Graph search (p50)  | 8 ms                  |
-| BM25 search (p50)   | 10 ms                 |
-| Vector search (p50) | 47 ms                 |
-| Concurrent QPS      | **238** (zero errors) |
+| Metric                     | Value                 |
+| -------------------------- | --------------------- |
+| Full index (107 files)     | **55s** (local TEI)   |
+| Parse-only throughput      | **600–700 files/sec** |
+| `get_node` / `text_search` | 7 ms / 34 ms          |
+| `vector_search`            | 102 ms                |
+| Concurrent QPS             | **238** (zero errors) |
 
-Full benchmark tables and methodology: [docs/benchmarks.md](docs/benchmarks.md)
+Full index includes parsing, graph upserts, and embedding via local TEI (8 concurrent workers). Parse-only is raw tree-sitter CPU time without I/O. Query latencies are averages from `scripts/profile_query.py`. Full benchmark tables: [docs/benchmarks.md](docs/benchmarks.md)
 
 ## Documentation
 

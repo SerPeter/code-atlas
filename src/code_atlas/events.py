@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
+import contextlib
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+import orjson
 import redis.asyncio as aioredis
 
 from code_atlas.telemetry import get_tracer
@@ -101,12 +102,12 @@ _TOPIC_EVENT_MAP: dict[Topic, type[Event]] = {
 
 def encode_event(event: Event) -> dict[bytes, bytes]:
     """Serialize an event for XADD. Returns ``{b"data": <json_bytes>}``."""
-    return {b"data": json.dumps(asdict(event)).encode()}
+    return {b"data": orjson.dumps(asdict(event))}
 
 
 def decode_event(topic: Topic, data: dict[bytes, bytes]) -> Event:
     """Deserialize a Redis Stream message back into a typed event."""
-    raw = json.loads(data[b"data"])
+    raw = orjson.loads(data[b"data"])
     cls = _TOPIC_EVENT_MAP[topic]
 
     # Reconstruct nested dataclasses that json.loads flattens to dicts
@@ -255,17 +256,65 @@ class EventBus:
 
         return {"pending": 0, "lag": 0}
 
+    async def stream_group_info_multi(self, queries: list[tuple[Topic, str]]) -> list[dict[str, int]]:
+        """Return pending + lag counts for multiple consumer groups in one pipelined RTT.
+
+        Each entry in *queries* is ``(topic, group_name)``.  Returns a list of
+        ``{"pending": N, "lag": N}`` dicts in the same order.
+        """
+        if not queries:
+            return []
+
+        pipe = self._redis.pipeline(transaction=False)
+        for topic, _group in queries:
+            pipe.xinfo_groups(self._stream_key(topic))
+        results = await pipe.execute()
+
+        out: list[dict[str, int]] = []
+        for (_topic, group), raw in zip(queries, results, strict=True):
+            if isinstance(raw, Exception):
+                out.append({"pending": 0, "lag": 0})
+                continue
+            found = False
+            for g in raw:
+                name = g.get(b"name", g.get("name", b""))
+                if isinstance(name, bytes):
+                    name = name.decode()
+                if name == group:
+                    pending = g.get(b"pending", g.get("pending", 0))
+                    lag = g.get(b"lag", g.get("lag", 0))
+                    out.append({"pending": int(pending), "lag": int(lag or 0)})
+                    found = True
+                    break
+            if not found:
+                out.append({"pending": 0, "lag": 0})
+        return out
+
     async def flush(self) -> None:
         """Clear all pipeline streams for a full reindex.
 
-        Uses XTRIM to remove all entries while preserving consumer groups,
-        so long-running daemon consumers won't get NOGROUP errors.
-        Batched in a single pipeline to avoid per-topic round-trips.
+        Trims all stream entries and destroys consumer groups to clear stale
+        pending entry lists (PEL). Groups are recreated by ``ensure_group()``
+        when consumers start.
         """
         pipe = self._redis.pipeline(transaction=False)
         for topic in Topic:
             pipe.xtrim(self._stream_key(topic), 0, approximate=False)
         await pipe.execute()
+
+        # Destroy consumer groups to purge stale PEL entries from previous runs.
+        for topic in Topic:
+            key = self._stream_key(topic)
+            try:
+                groups = await self._redis.xinfo_groups(key)
+            except Exception:
+                continue
+            for g in groups:
+                name = g.get(b"name", g.get("name", b""))
+                if isinstance(name, bytes):
+                    name = name.decode()
+                with contextlib.suppress(Exception):
+                    await self._redis.xgroup_destroy(key, name)
 
     async def close(self) -> None:
         """Close the connection pool."""

@@ -12,12 +12,14 @@ from code_atlas.schema import (
     _ENTITY_LABELS,
     _EXTERNAL_LABELS,
     _TEXT_SEARCHABLE_LABELS,
+    COMPOSITE_INDICES,
     EXISTENCE_CONSTRAINTS,
     LABEL_PROPERTY_INDICES,
     SCHEMA_VERSION,
     TEXT_INDICES,
     UNIQUE_CONSTRAINTS,
     NodeLabel,
+    generate_composite_index_ddl,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
@@ -73,7 +75,7 @@ class TestDDLGeneration:
     def test_index_ddl_has_expected_properties(self):
         stmts = generate_index_ddl()
         all_text = " ".join(stmts)
-        for prop in ("qualified_name", "file_path", "name", "kind", "content_hash"):
+        for prop in ("uid", "qualified_name", "file_path", "name", "kind", "content_hash"):
             assert prop in all_text, f"Missing index for property: {prop}"
 
     def test_index_ddl_syntax(self):
@@ -135,6 +137,28 @@ class TestDDLGeneration:
             assert stmt.startswith("DROP TEXT INDEX")
             assert stmt.endswith(";")
             assert "CALL" not in stmt
+
+
+class TestCompositeIndexDDL:
+    """Composite index DDL generators produce valid Cypher syntax."""
+
+    def test_composite_index_ddl_syntax(self):
+        stmts = generate_composite_index_ddl()
+        assert len(stmts) == len(COMPOSITE_INDICES)
+        for stmt in stmts:
+            assert stmt.startswith("CREATE INDEX ON :")
+            assert ", " in stmt  # composite has multiple properties
+            assert stmt.endswith(";")
+
+    def test_composite_index_covers_entity_labels(self):
+        index_labels = {spec.label for spec in COMPOSITE_INDICES}
+        assert index_labels == _ENTITY_LABELS
+
+    def test_composite_index_has_expected_property_combos(self):
+        stmts = generate_composite_index_ddl()
+        all_text = " ".join(stmts)
+        assert "project_name, file_path" in all_text
+        assert "project_name, name" in all_text
 
 
 class TestSchemaVersion:

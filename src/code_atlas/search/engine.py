@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import tiktoken
 from loguru import logger
 
-from code_atlas.schema import RelType
+from code_atlas.schema import NodeLabel, RelType
 from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 
 if TYPE_CHECKING:
@@ -845,6 +845,7 @@ async def expand_context(
     graph: GraphClient,
     uid: str,
     *,
+    label: str | None = None,
     include_hierarchy: bool = True,
     include_calls: bool = True,
     call_depth: int = 1,
@@ -879,6 +880,7 @@ async def expand_context(
         return await _expand_context_inner(
             graph,
             uid,
+            label=label,
             span=span,
             include_hierarchy=include_hierarchy,
             include_calls=include_calls,
@@ -893,6 +895,7 @@ async def _expand_context_inner(
     graph: GraphClient,
     uid: str,
     *,
+    label: str | None = None,
     span: Any,
     include_hierarchy: bool,
     include_calls: bool,
@@ -903,9 +906,13 @@ async def _expand_context_inner(
 ) -> ExpandedContext | None:
     """Inner implementation of expand_context (separated to keep span wrapper clean)."""
     call_depth = max(1, min(call_depth, 3))
+    if label and label not in NodeLabel:
+        msg = f"Invalid node label: {label!r}"
+        raise ValueError(msg)
+    label_clause = f":{label}" if label else ""
 
     # Always fetch the target node
-    target_records = await graph.execute("MATCH (n {uid: $uid}) RETURN n", {"uid": uid})
+    target_records = await graph.execute(f"MATCH (n{label_clause} {{uid: $uid}}) RETURN n", {"uid": uid})
     if not target_records:
         return None
 
@@ -932,19 +939,20 @@ async def _expand_context_inner(
 
     if include_calls:
         coros["callers"] = graph.execute(
-            f"MATCH (caller)-[:{RelType.CALLS}*1..{call_depth}]->(n {{uid: $uid}}) "
+            f"MATCH (caller:Callable)-[:{RelType.CALLS}*1..{call_depth}]->"
+            f"(n{label_clause} {{uid: $uid}}) "
             f"RETURN DISTINCT caller AS n LIMIT {max_callers * 2}",
             {"uid": uid},
         )
         coros["callees"] = graph.execute(
-            f"MATCH (n {{uid: $uid}})-[:{RelType.CALLS}*1..{call_depth}]->(callee) "
-            "RETURN DISTINCT callee AS n LIMIT 20",
+            f"MATCH (n{label_clause} {{uid: $uid}})-[:{RelType.CALLS}*1..{call_depth}]->"
+            f"(callee:Callable) RETURN DISTINCT callee AS n LIMIT 20",
             {"uid": uid},
         )
 
     if include_docs:
         coros["docs"] = graph.execute(
-            f"MATCH (doc)-[:{RelType.DOCUMENTS}]->(n {{uid: $uid}}) RETURN doc AS n LIMIT 10",
+            f"MATCH (doc:DocSection)-[:{RelType.DOCUMENTS}]->(n{label_clause} {{uid: $uid}}) RETURN doc AS n LIMIT 10",
             {"uid": uid},
         )
 

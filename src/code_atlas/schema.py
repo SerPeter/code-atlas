@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 # ---------------------------------------------------------------------------
 # Node labels
@@ -192,6 +192,12 @@ class IndexSpec:
 
 
 @dataclass(frozen=True)
+class CompositeIndexSpec:
+    label: NodeLabel
+    properties: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class VectorIndexSpec:
     name: str
     label: NodeLabel
@@ -232,6 +238,7 @@ EXISTENCE_CONSTRAINTS: tuple[ExistenceConstraintSpec, ...] = (
 
 # Property indices for fast lookups
 _INDEX_PROPERTIES: tuple[str, ...] = (
+    "uid",
     "qualified_name",
     "file_path",
     "name",
@@ -244,6 +251,18 @@ LABEL_PROPERTY_INDICES: tuple[IndexSpec, ...] = tuple(
     IndexSpec(label=lbl, property=prop)
     for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)
     for prop in _INDEX_PROPERTIES
+)
+
+# Composite property indices for multi-property lookups
+_COMPOSITE_PROPERTIES: tuple[tuple[str, ...], ...] = (
+    ("project_name", "file_path"),
+    ("project_name", "name"),
+)
+
+COMPOSITE_INDICES: tuple[CompositeIndexSpec, ...] = tuple(
+    CompositeIndexSpec(label=lbl, properties=props)
+    for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)
+    for props in _COMPOSITE_PROPERTIES
 )
 
 # Text (BM25) indices — one per searchable label
@@ -291,6 +310,11 @@ def generate_existence_constraint_ddl() -> list[str]:
 def generate_index_ddl() -> list[str]:
     """Generate CREATE INDEX statements for label-property pairs."""
     return [f"CREATE INDEX ON :{spec.label.value}({spec.property});" for spec in LABEL_PROPERTY_INDICES]
+
+
+def generate_composite_index_ddl() -> list[str]:
+    """Generate CREATE INDEX statements for composite (multi-property) indices."""
+    return [f"CREATE INDEX ON :{spec.label.value}({', '.join(spec.properties)});" for spec in COMPOSITE_INDICES]
 
 
 def generate_vector_index_ddl(dimension: int, capacity: int = 50_000) -> list[str]:

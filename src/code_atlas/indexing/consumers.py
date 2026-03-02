@@ -12,7 +12,6 @@ deduplicates within its batch window.
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -32,8 +31,8 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.parsing.ast import ParsedRelationship, parse_file
-from code_atlas.parsing.detectors import get_enabled_detectors, run_detectors
+from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
+from code_atlas.parsing.detectors import PropertyEnrichment, get_enabled_detectors, run_detectors
 from code_atlas.schema import RelType
 from code_atlas.search.embeddings import EmbedCache, build_embed_text
 from code_atlas.settings import derive_project_name
@@ -57,6 +56,7 @@ class BatchPolicy:
 
     time_window_s: float  # Max seconds to accumulate before flush
     max_batch_size: int  # Max items before flush (whichever hits first)
+    block_ms: int | None = None  # Override for XREADGROUP block; None = derive from time_window_s
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +79,15 @@ class TierConsumer(ABC):
         group: str,
         consumer_name: str,
         policy: BatchPolicy,
+        *,
+        project_filter: set[str] | None = None,
     ) -> None:
         self.bus = bus
         self.input_topic = input_topic
         self.group = group
         self.consumer_name = consumer_name
         self.policy = policy
+        self._project_filter = project_filter
         self._stop = False
 
     @abstractmethod
@@ -97,98 +100,162 @@ class TierConsumer(ABC):
             return event.path
         return str(id(event))
 
+    def _matches_project(self, event: Event) -> bool:
+        """Check if an event belongs to the filtered project(s)."""
+        if self._project_filter is None:
+            return True
+        pn = ""
+        if isinstance(event, (FileChanged, ASTDirty)):
+            pn = event.project_name
+        elif isinstance(event, EmbedDirty):
+            # EmbedDirty doesn't carry project_name directly — always accept
+            return True
+        return pn in self._project_filter
+
+    async def _dedup_put(
+        self,
+        pending: dict[str, tuple[bytes, Event]],
+        key: str,
+        msg_id: bytes,
+        event: Event,
+    ) -> None:
+        """Insert into *pending*, ACKing the superseded msg_id if the key already exists."""
+        old = pending.get(key)
+        if old is not None:
+            await self.bus.ack(self.input_topic, self.group, old[0])
+        pending[key] = (msg_id, event)
+
     def stop(self) -> None:
         """Signal the consumer to stop after the current iteration."""
         self._stop = True
+
+    async def _pre_run(self) -> None:  # noqa: B027
+        """Hook called before the main loop starts. Override for setup."""
+
+    async def _post_run(self) -> None:  # noqa: B027
+        """Hook called after the main loop exits. Override for teardown."""
+
+    async def _wait_for_slot(self) -> bool:
+        """Hook called at the top of each iteration before reading messages.
+
+        Return ``True`` to proceed, ``False`` to break the loop.
+        Default always proceeds.  Override for backpressure (e.g. semaphore).
+        """
+        return True
+
+    async def _dispatch_batch(
+        self,
+        events: list[Event],
+        msg_ids: list[bytes],
+        batch_id: str,
+    ) -> None:
+        """Process and ACK a batch. Override for async dispatch (e.g. worker tasks).
+
+        Default: process inline, ACK on success, leave in PEL on failure.
+        """
+        try:
+            with logger.contextualize(consumer=self.consumer_name):
+                await self.process_batch(events, batch_id)
+            await self.bus.ack(self.input_topic, self.group, *msg_ids)
+        except Exception:
+            logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
+            self._pel_dirty = True
 
     async def run(self) -> None:  # noqa: PLR0912, PLR0915
         """Main consumer loop — runs until ``stop()`` is called."""
         await self.bus.ensure_group(self.input_topic, self.group)
         logger.debug("{} started (group={}, topic={})", self.consumer_name, self.group, self.input_topic.value)
+        await self._pre_run()
 
         pending: dict[str, tuple[bytes, Event]] = {}  # dedup_key → (msg_id, event)
         window_start: float | None = None
         pel_drained = False  # True once all pending (unacked) messages have been reclaimed
+        self._pel_dirty = False
+        block_ms = (
+            self.policy.block_ms
+            if self.policy.block_ms is not None
+            else max(100, int(self.policy.time_window_s * 1000 // 2))
+        )
 
-        while not self._stop:
-            # First, reclaim any unacknowledged messages from the PEL (failed batches).
-            # Once the PEL is empty, switch to reading new messages only.
-            if not pel_drained:
-                reclaimed = await self.bus.read_pending(
+        try:
+            while not self._stop:
+                if not await self._wait_for_slot():
+                    break
+
+                # Reclaim unacknowledged messages from PEL (failed batches).
+                if not pel_drained or self._pel_dirty:
+                    self._pel_dirty = False
+                    reclaimed = await self.bus.read_pending(
+                        self.input_topic,
+                        self.group,
+                        self.consumer_name,
+                        count=self.policy.max_batch_size,
+                    )
+                    if reclaimed:
+                        for msg_id, fields in reclaimed:
+                            if not fields:
+                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                continue
+                            try:
+                                event = decode_event(self.input_topic, fields)
+                                key = self.dedup_key(event)
+                            except KeyError, TypeError, ValueError:
+                                logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
+                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                continue
+                            if not self._matches_project(event):
+                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                continue
+                            await self._dedup_put(pending, key, msg_id, event)
+                            if window_start is None:
+                                window_start = asyncio.get_event_loop().time()
+                    else:
+                        pel_drained = True
+
+                # Pull new messages
+                messages = await self.bus.read_batch(
                     self.input_topic,
                     self.group,
                     self.consumer_name,
                     count=self.policy.max_batch_size,
+                    block_ms=block_ms,
                 )
-                if reclaimed:
-                    for msg_id, fields in reclaimed:
-                        if not fields:
-                            # Tombstone (deleted message) — just ACK it
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        try:
-                            event = decode_event(self.input_topic, fields)
-                            key = self.dedup_key(event)
-                        except KeyError, TypeError, ValueError, json.JSONDecodeError:
-                            logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
-                            await self.bus.ack(self.input_topic, self.group, msg_id)
-                            continue
-                        pending[key] = (msg_id, event)
-                        if window_start is None:
-                            window_start = asyncio.get_event_loop().time()
-                else:
-                    pel_drained = True
 
-            # Pull new messages (short block so we can check flush + stop)
-            block_ms = max(100, int(self.policy.time_window_s * 1000 // 2))
-            messages = await self.bus.read_batch(
-                self.input_topic,
-                self.group,
-                self.consumer_name,
-                count=self.policy.max_batch_size,
-                block_ms=block_ms,
-            )
+                for msg_id, fields in messages:
+                    try:
+                        event = decode_event(self.input_topic, fields)
+                        key = self.dedup_key(event)
+                    except KeyError, TypeError, ValueError:
+                        logger.exception("{} failed to decode message, skipping", self.consumer_name)
+                        await self.bus.ack(self.input_topic, self.group, msg_id)
+                        continue
+                    if not self._matches_project(event):
+                        await self.bus.ack(self.input_topic, self.group, msg_id)
+                        continue
+                    await self._dedup_put(pending, key, msg_id, event)
+                    if window_start is None:
+                        window_start = asyncio.get_event_loop().time()
 
-            for msg_id, fields in messages:
-                try:
-                    event = decode_event(self.input_topic, fields)
-                    key = self.dedup_key(event)
-                except KeyError, TypeError, ValueError, json.JSONDecodeError:
-                    logger.exception("{} failed to decode message, skipping", self.consumer_name)
-                    await self.bus.ack(self.input_topic, self.group, msg_id)
+                # Decide whether to flush
+                if not pending:
                     continue
-                pending[key] = (msg_id, event)  # latest wins
-                if window_start is None:
-                    window_start = asyncio.get_event_loop().time()
 
-            # Decide whether to flush
-            if not pending:
-                continue
+                elapsed = asyncio.get_event_loop().time() - (window_start or 0)
+                if len(pending) < self.policy.max_batch_size and elapsed < self.policy.time_window_s:
+                    continue
 
-            elapsed = asyncio.get_event_loop().time() - (window_start or 0)
-            should_flush = len(pending) >= self.policy.max_batch_size or elapsed >= self.policy.time_window_s
+                # Flush
+                msg_ids = [mid for mid, _ in pending.values()]
+                events = [ev for _, ev in pending.values()]
+                batch_id = uuid.uuid4().hex[:12]
 
-            if not should_flush:
-                continue
+                logger.debug("{} flushing batch {} ({} events)", self.consumer_name, batch_id, len(events))
+                await self._dispatch_batch(events, msg_ids, batch_id)
 
-            # Flush: extract events and message IDs
-            msg_ids = [mid for mid, _ in pending.values()]
-            events = [ev for _, ev in pending.values()]
-            batch_id = uuid.uuid4().hex[:12]
-
-            logger.debug("{} flushing batch {} ({} events)", self.consumer_name, batch_id, len(events))
-
-            try:
-                with logger.contextualize(consumer=self.consumer_name):
-                    await self.process_batch(events, batch_id)
-                await self.bus.ack(self.input_topic, self.group, *msg_ids)
-            except Exception:
-                # Failed batch: do NOT ack — messages stay in PEL for reclaim
-                logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
-                pel_drained = False  # re-check PEL on next iteration
-
-            pending.clear()
-            window_start = None
+                pending.clear()
+                window_start = None
+        finally:
+            await self._post_run()
 
         logger.debug("{} stopped", self.consumer_name)
 
@@ -201,13 +268,16 @@ class TierConsumer(ABC):
 class Tier1GraphConsumer(TierConsumer):
     """Tier 1: Update file-level graph metadata, always publish ASTDirty downstream."""
 
-    def __init__(self, bus: EventBus, graph: GraphClient, settings: AtlasSettings) -> None:
+    def __init__(
+        self, bus: EventBus, graph: GraphClient, settings: AtlasSettings, *, project_filter: set[str] | None = None
+    ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.FILE_CHANGED,
             group="tier1-graph",
             consumer_name="tier1-graph-0",
             policy=BatchPolicy(time_window_s=0.5, max_batch_size=50),
+            project_filter=project_filter,
         )
         self.graph = graph
         self.settings = settings
@@ -277,6 +347,24 @@ class Tier2Stats:
     entities_unchanged: int = 0
 
 
+@dataclass(frozen=True)
+class _ParsedFileData:
+    """Parse + detect results for a single file, ready for batched graph write."""
+
+    file_path: str
+    entities: list[ParsedEntity]
+    non_import_rels: list[ParsedRelationship]
+    import_rels: list[ParsedRelationship]
+    call_rels: list[ParsedRelationship]
+    type_rels: list[ParsedRelationship]
+    enrichments: list[PropertyEnrichment]
+
+
+_SENTINEL_DELETED = _ParsedFileData(
+    file_path="", entities=[], non_import_rels=[], import_rels=[], call_rels=[], type_rels=[], enrichments=[]
+)
+
+
 class Tier2ASTConsumer(TierConsumer):
     """Tier 2: Parse AST via tree-sitter, write entities to graph, publish EmbedDirty."""
 
@@ -287,13 +375,16 @@ class Tier2ASTConsumer(TierConsumer):
         settings: AtlasSettings,
         *,
         project_root: Path | None = None,
+        project_filter: set[str] | None = None,
+        policy: BatchPolicy | None = None,
     ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.AST_DIRTY,
             group="tier2-ast",
             consumer_name="tier2-ast-0",
-            policy=BatchPolicy(time_window_s=3.0, max_batch_size=20),
+            policy=policy or BatchPolicy(time_window_s=3.0, max_batch_size=30),
+            project_filter=project_filter,
         )
         self.graph = graph
         self.settings = settings
@@ -301,106 +392,103 @@ class Tier2ASTConsumer(TierConsumer):
         self.stats = Tier2Stats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
 
+        # Deferred resolution state — accumulate rels across batches, flush periodically.
+        # In reindex mode (time_window_s=0, block_ms=50) use larger intervals to skip
+        # redundant resolution; daemon mode (default policy) resolves every batch.
+        is_reindex = self.policy.time_window_s == 0
+        self._resolve_batch_interval: int = 5 if is_reindex else 1
+        self._resolve_time_interval_s: float = 30.0 if is_reindex else 5.0
+        self._batches_since_resolve: int = 0
+        self._last_resolve_time: float = 0.0
+        self._pending_import_rels: list[ParsedRelationship] = []
+        self._pending_call_rels: list[ParsedRelationship] = []
+        self._pending_type_rels: list[ParsedRelationship] = []
+        self._pending_project_names: set[str] = set()
+
     def dedup_key(self, event: Event) -> str:
         if isinstance(event, ASTDirty):
             return event.path
         return super().dedup_key(event)
 
-    async def _process_file(
+    async def run(self) -> None:
+        try:
+            await super().run()
+        finally:
+            # Final resolution flush for any remaining deferred rels
+            if self._pending_import_rels or self._pending_call_rels or self._pending_type_rels:
+                await self._flush_deferred_resolution()
+
+    async def _flush_deferred_resolution(self) -> None:
+        """Run resolution for all accumulated rels across batches."""
+        for project_name in self._pending_project_names:
+            proj_imports = [
+                r for r in self._pending_import_rels if r.from_qualified_name.startswith(project_name + ":")
+            ]
+            proj_calls = [r for r in self._pending_call_rels if r.from_qualified_name.startswith(project_name + ":")]
+            proj_types = [r for r in self._pending_type_rels if r.from_qualified_name.startswith(project_name + ":")]
+
+            if proj_imports:
+                await self.graph.resolve_imports(project_name, proj_imports)
+
+            if proj_calls or proj_types:
+                shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
+                if proj_calls:
+                    await self.graph.resolve_calls(project_name, proj_calls, lookup=shared_lookup)
+                if proj_types:
+                    await self.graph.resolve_type_refs(
+                        project_name, proj_types, lookup=shared_lookup, name_to_typedefs=td_map
+                    )
+
+        self._pending_import_rels.clear()
+        self._pending_call_rels.clear()
+        self._pending_type_rels.clear()
+        self._pending_project_names.clear()
+        self._batches_since_resolve = 0
+        self._last_resolve_time = asyncio.get_event_loop().time()
+
+    async def _parse_file(
         self,
         project_name: str,
         file_path: str,
-        import_rels: list[ParsedRelationship],
-        call_rels: list[ParsedRelationship],
-        type_rels: list[ParsedRelationship],
         *,
         project_root: Path | None = None,
-    ) -> tuple[set[str], list[EntityRef], Significance]:
-        """Process a single file: parse, detect, upsert. Returns (changed_qns, entity_refs, max_significance).
+    ) -> _ParsedFileData | None:
+        """Parse and detect a single file without graph writes.
 
-        Appends IMPORTS rels to *import_rels*, CALLS rels to *call_rels*,
-        and USES_TYPE rels to *type_rels* for post-batch resolution.
+        Returns ``None`` for unreadable/unsupported files, ``_SENTINEL_DELETED``
+        for deleted files, or a ``_ParsedFileData`` with parsed results.
         """
         root = project_root if project_root is not None else self._project_root
         full_path = root / file_path
         if not full_path.is_file():
-            logger.debug("Tier2: file deleted, removing entities for {}", file_path)
-            deleted = await self.graph.delete_file_entities(project_name, file_path)
-            self.stats.files_deleted += 1
-            self.stats.entities_deleted += len(deleted)
-            return set(), [], Significance.HIGH if deleted else Significance.NONE
+            return _SENTINEL_DELETED
 
         try:
             source = full_path.read_bytes()
         except OSError:
             logger.warning("Tier2: cannot read {}", file_path)
-            return set(), [], Significance.NONE
+            return None
 
         parsed = parse_file(file_path, source, project_name, max_source_chars=self.settings.index.max_source_chars)
         if parsed is None:
             logger.debug("Tier2: unsupported language for {}", file_path)
-            return set(), [], Significance.NONE
+            return None
 
         det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
         all_rels = parsed.relationships + det_result.relationships
 
-        # Separate IMPORTS, CALLS, and USES_TYPE rels for post-batch resolution
         _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE}
-        non_import_rels = [r for r in all_rels if r.rel_type not in _deferred]
-        import_rels.extend(r for r in all_rels if r.rel_type == RelType.IMPORTS)
-        call_rels.extend(r for r in all_rels if r.rel_type == RelType.CALLS)
-        type_rels.extend(r for r in all_rels if r.rel_type == RelType.USES_TYPE)
-
-        result = await self.graph.upsert_file_entities(
-            project_name=project_name,
+        return _ParsedFileData(
             file_path=file_path,
             entities=parsed.entities,
-            relationships=non_import_rels,
+            non_import_rels=[r for r in all_rels if r.rel_type not in _deferred],
+            import_rels=[r for r in all_rels if r.rel_type == RelType.IMPORTS],
+            call_rels=[r for r in all_rels if r.rel_type == RelType.CALLS],
+            type_rels=[r for r in all_rels if r.rel_type == RelType.USES_TYPE],
+            enrichments=det_result.enrichments,
         )
 
-        if det_result.enrichments:
-            await self.graph.apply_property_enrichments(det_result.enrichments)
-
-        self.stats.files_processed += 1
-        self.stats.entities_added += len(result.added)
-        self.stats.entities_modified += len(result.modified)
-        self.stats.entities_deleted += len(result.deleted)
-        self.stats.entities_unchanged += len(result.unchanged)
-
-        changed_qns = set(result.added) | set(result.modified)
-        if not changed_qns:
-            self.stats.files_skipped += 1
-            return set(), [], Significance.NONE
-
-        # Compute file-level significance from upsert result
-        if result.added or result.deleted:
-            file_sig = Significance.HIGH
-        elif result.modified_significance:
-            file_sig = max(
-                (Significance(v) for v in result.modified_significance.values()),
-                key=lambda s: _SIG_ORDER[s],
-            )
-        else:
-            file_sig = Significance.NONE
-
-        entity_map = {
-            (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
-            for e in parsed.entities
-        }
-        refs: list[EntityRef] = []
-        for qn in changed_qns:
-            entity = entity_map.get(qn)
-            if entity is not None:
-                refs.append(
-                    EntityRef(
-                        qualified_name=entity.qualified_name,
-                        node_type=entity.label.value,
-                        file_path=entity.file_path,
-                    )
-                )
-        return changed_qns, refs, file_sig
-
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:
+    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912, PLR0915
         with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
             # Group paths by (project_name, project_root) — monorepo batches can mix sub-projects
             groups: dict[tuple[str, str], list[str]] = {}
@@ -415,7 +503,7 @@ class Tier2ASTConsumer(TierConsumer):
             total_paths = sum(len(p) for p in groups.values())
             logger.debug("Tier2 batch {}: {} unique path(s) in {} group(s)", batch_id, total_paths, len(groups))
 
-            changed_entity_refs: list[EntityRef] = []
+            embed_candidates: dict[str, tuple[EntityRef, str]] = {}  # uid → (ref, text_hash)
             skipped_before = self.stats.files_skipped
             total_changed = 0
             batch_max_sig = Significance.NONE
@@ -423,37 +511,120 @@ class Tier2ASTConsumer(TierConsumer):
             for (event_project_name, event_project_root), unique_paths in groups.items():
                 project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
                 effective_root = Path(event_project_root) if event_project_root else None
-                group_import_rels: list[ParsedRelationship] = []
-                group_call_rels: list[ParsedRelationship] = []
-                group_type_rels: list[ParsedRelationship] = []
+
+                # 1. Parse loop (async, per-file) — no graph writes
+                parsed_files: dict[str, _ParsedFileData] = {}
+                deleted_files: list[str] = []
 
                 for file_idx, file_path in enumerate(unique_paths, 1):
                     if file_idx % 50 == 0:
                         logger.debug("Tier2 batch {}: parsed {}/{} files", batch_id, file_idx, len(unique_paths))
-                    changed_qns, refs, file_sig = await self._process_file(
-                        project_name,
-                        file_path,
-                        group_import_rels,
-                        group_call_rels,
-                        group_type_rels,
-                        project_root=effective_root,
-                    )
-                    total_changed += len(changed_qns)
-                    changed_entity_refs.extend(refs)
-                    if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
-                        batch_max_sig = file_sig
+                    pfd = await self._parse_file(project_name, file_path, project_root=effective_root)
+                    if pfd is _SENTINEL_DELETED:
+                        deleted_files.append(file_path)
+                    elif pfd is not None:
+                        parsed_files[file_path] = pfd
 
-                # Post-batch import resolution (per project)
-                if group_import_rels:
-                    await self.graph.resolve_imports(project_name, group_import_rels)
+                # 2. Handle deleted files
+                for fp in deleted_files:
+                    logger.debug("Tier2: file deleted, removing entities for {}", fp)
+                    deleted = await self.graph.delete_file_entities(project_name, fp)
+                    self.stats.files_deleted += 1
+                    self.stats.entities_deleted += len(deleted)
+                    if deleted:
+                        batch_max_sig = Significance.HIGH
 
-                # Post-batch call resolution (per project, after imports so import map is available)
-                if group_call_rels:
-                    await self.graph.resolve_calls(project_name, group_call_rels)
+                # 3. Batched upsert (2 managed transactions)
+                if parsed_files:
+                    file_data = {fp: (pfd.entities, pfd.non_import_rels) for fp, pfd in parsed_files.items()}
+                    results = await self.graph.upsert_batch_entities(project_name, file_data)
 
-                # Post-batch USES_TYPE resolution (per project, after imports so import map is available)
-                if group_type_rels:
-                    await self.graph.resolve_type_refs(project_name, group_type_rels)
+                    # 4. Batched enrichments
+                    all_enrichments = [e for pfd in parsed_files.values() for e in pfd.enrichments]
+                    if all_enrichments:
+                        await self.graph.apply_property_enrichments(all_enrichments)
+
+                    # 5. Accumulate stats + entity refs from per-file results
+                    for fp, pfd in parsed_files.items():
+                        result = results.get(fp)
+                        if result is None:
+                            continue
+
+                        self.stats.files_processed += 1
+                        self.stats.entities_added += len(result.added)
+                        self.stats.entities_modified += len(result.modified)
+                        self.stats.entities_deleted += len(result.deleted)
+                        self.stats.entities_unchanged += len(result.unchanged)
+
+                        changed_qns = set(result.added) | set(result.modified)
+                        if not changed_qns:
+                            self.stats.files_skipped += 1
+                            continue
+
+                        total_changed += len(changed_qns)
+
+                        # Compute file-level significance
+                        if result.added or result.deleted:
+                            file_sig = Significance.HIGH
+                        elif result.modified_significance:
+                            file_sig = max(
+                                (Significance(v) for v in result.modified_significance.values()),
+                                key=lambda s: _SIG_ORDER[s],
+                            )
+                        else:
+                            file_sig = Significance.NONE
+
+                        if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
+                            batch_max_sig = file_sig
+
+                        entity_map = {
+                            (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
+                            for e in pfd.entities
+                        }
+                        for qn in changed_qns:
+                            entity = entity_map.get(qn)
+                            if entity is not None:
+                                ref = EntityRef(
+                                    qualified_name=entity.qualified_name,
+                                    node_type=entity.label.value,
+                                    file_path=entity.file_path,
+                                )
+                                # Build embed text from parsed entity data (same fields as graph)
+                                qn_bare = (
+                                    entity.qualified_name.split(":", 1)[1]
+                                    if ":" in entity.qualified_name
+                                    else entity.qualified_name
+                                )
+                                props = {
+                                    "_label": entity.label.value,
+                                    "qualified_name": qn_bare,
+                                    "kind": entity.kind,
+                                    "signature": entity.signature or "",
+                                    "docstring": entity.docstring or "",
+                                    "source": entity.source or "",
+                                }
+                                text = build_embed_text(props)
+                                if text:
+                                    text_hash = EmbedCache.hash_text(text)
+                                    embed_candidates[entity.qualified_name] = (ref, text_hash)
+
+                # 6. Accumulate rels for deferred resolution
+                group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
+                group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
+                group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
+
+                self._pending_import_rels.extend(group_import_rels)
+                self._pending_call_rels.extend(group_call_rels)
+                self._pending_type_rels.extend(group_type_rels)
+                self._pending_project_names.add(project_name)
+
+            self._batches_since_resolve += 1
+            now = asyncio.get_event_loop().time()
+            if (
+                self._batches_since_resolve >= self._resolve_batch_interval
+                or (now - self._last_resolve_time) >= self._resolve_time_interval_s
+            ):
+                await self._flush_deferred_resolution()
 
             span.set_attribute("files_count", total_paths)
             span.set_attribute("entities_changed", total_changed)
@@ -468,13 +639,28 @@ class Tier2ASTConsumer(TierConsumer):
 
             if (
                 self.settings.embeddings.enabled
-                and changed_entity_refs
+                and embed_candidates
                 and _SIG_ORDER[batch_max_sig] >= _SIG_ORDER[Significance.MODERATE]
             ):
-                await self.bus.publish_many(
-                    Topic.EMBED_DIRTY,
-                    [EmbedDirty(entity=ref, significance=batch_max_sig) for ref in changed_entity_refs],
-                )
+                # Batch-read stored embed_hashes to filter graph hits
+                cand_uids = list(embed_candidates.keys())
+                cand_labels = [embed_candidates[uid][0].node_type for uid in cand_uids]
+                stored = await self.graph.read_embed_hashes(cand_uids, labels=cand_labels)
+
+                to_publish: list[EntityRef] = []
+                for uid, (ref, text_hash) in embed_candidates.items():
+                    stored_info = stored.get(uid)
+                    if stored_info is not None:
+                        stored_hash, has_embedding = stored_info
+                        if stored_hash == text_hash and has_embedding:
+                            continue  # graph hit — embedding still valid
+                    to_publish.append(ref)
+
+                if to_publish:
+                    await self.bus.publish_many(
+                        Topic.EMBED_DIRTY,
+                        [EmbedDirty(entity=ref, significance=batch_max_sig) for ref in to_publish],
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -492,23 +678,83 @@ class Tier3EmbedConsumer(TierConsumer):
     """
 
     def __init__(
-        self, bus: EventBus, graph: GraphClient, embed: EmbedClient, *, cache: EmbedCache | None = None
+        self,
+        bus: EventBus,
+        graph: GraphClient,
+        embed: EmbedClient,
+        *,
+        cache: EmbedCache | None = None,
+        project_filter: set[str] | None = None,
+        policy: BatchPolicy | None = None,
+        max_concurrency: int | None = None,
     ) -> None:
+        _max_conc = max_concurrency or embed.max_concurrency
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
             group="tier3-embed",
-            consumer_name="tier3-embed-0",
-            policy=BatchPolicy(time_window_s=15.0, max_batch_size=100),
+            consumer_name="tier3-embed",
+            policy=policy
+            or BatchPolicy(
+                time_window_s=10.0,
+                max_batch_size=embed.batch_size * _max_conc,
+            ),
+            project_filter=project_filter,
         )
         self.graph = graph
         self.embed = embed
         self.cache = cache
+        self._max_concurrency = _max_conc
+        self._sem = asyncio.Semaphore(self._max_concurrency)
+        self._inflight: set[asyncio.Task[None]] = set()
+        self._pel_dirty = False
+        self._write_lock = asyncio.Lock()
 
     def dedup_key(self, event: Event) -> str:
         if isinstance(event, EmbedDirty):
             return event.entity.qualified_name
         return super().dedup_key(event)
+
+    async def _pre_run(self) -> None:
+        logger.debug("{} concurrency={}", self.consumer_name, self._max_concurrency)
+
+    async def _post_run(self) -> None:
+        if self._inflight:
+            logger.debug("{} draining {} in-flight worker(s)", self.consumer_name, len(self._inflight))
+            await asyncio.gather(*self._inflight, return_exceptions=True)
+
+    async def _dispatch_batch(
+        self,
+        events: list[Event],
+        msg_ids: list[bytes],
+        batch_id: str,
+    ) -> None:
+        """Acquire a worker slot, then dispatch as a background task."""
+        await self._sem.acquire()
+        if self._stop:
+            self._sem.release()
+            return
+        task = asyncio.create_task(self._worker(events, msg_ids, batch_id))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+
+    async def _worker(
+        self,
+        events: list[Event],
+        msg_ids: list[bytes],
+        batch_id: str,
+    ) -> None:
+        """Execute process_batch for a single batch, then release the semaphore."""
+        try:
+            logger.debug("{} dispatching batch {} ({} events)", self.consumer_name, batch_id, len(events))
+            with logger.contextualize(consumer=self.consumer_name):
+                await self.process_batch(events, batch_id)
+            await self.bus.ack(self.input_topic, self.group, *msg_ids)
+        except Exception:
+            logger.exception("{} batch {} failed, will retry via PEL", self.consumer_name, batch_id)
+            self._pel_dirty = True
+        finally:
+            self._sem.release()
 
     async def _resolve_cache(
         self, to_process: list[tuple[str, str, str]]
@@ -540,7 +786,7 @@ class Tier3EmbedConsumer(TierConsumer):
             await self.cache.put_many([(th, vec) for _, vec, th in result])
         return result
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912
+    async def process_batch(self, events: list[Event], batch_id: str) -> None:
         with _tracer.start_as_current_span("tier3.process_batch", attributes={"batch_id": batch_id}) as span:
             # Collect and deduplicate entities across all events in the batch
             seen: dict[str, EntityRef] = {}
@@ -562,15 +808,9 @@ class Tier3EmbedConsumer(TierConsumer):
             entity_labels = [e.node_type for e in entities]
             entity_props = await self.graph.read_entity_texts(qns, labels=entity_labels)
 
-            # Build uid→label map for downstream writes
-            uid_label: dict[str, str] = {}
-            for props_row in entity_props:
-                lbl = props_row.get("_label")
-                if lbl:
-                    uid_label[props_row["uid"]] = lbl
-
             # 2. Build embed texts — graph-check for unchanged content
             to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
+            uid_to_label: dict[str, str] = {}
             graph_hits = 0
             for props in entity_props:
                 text = build_embed_text(props)
@@ -578,7 +818,9 @@ class Tier3EmbedConsumer(TierConsumer):
                     continue
                 uid = props["uid"]
                 text_hash = EmbedCache.hash_text(text)
-                if props.get("embed_hash") == text_hash and props.get("embedding") is not None:
+                if lbl := props.get("_label"):
+                    uid_to_label[uid] = lbl
+                if props.get("embed_hash") == text_hash and props.get("has_embedding"):
                     graph_hits += 1
                 else:
                     to_process.append((uid, text, text_hash))
@@ -599,26 +841,18 @@ class Tier3EmbedConsumer(TierConsumer):
             cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
             api_vectors = await self._embed_and_store(need_embed)
 
-            # 5. Write all new/changed vectors + embed_hashes to graph
+            # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
+            #    Serialized via _write_lock to avoid Memgraph write-lock contention.
             all_resolved = cache_resolved + api_vectors
             if all_resolved:
-                # Split into labeled (index-backed) and unlabeled (fallback) writes
-                labeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn in uid_label]
-                unlabeled = [(qn, vec, th) for qn, vec, th in all_resolved if qn not in uid_label]
-
-                if labeled:
-                    lbl_list = [uid_label[qn] for qn, _, _ in labeled]
-                    await self.graph.write_embeddings(
-                        [(qn, vec) for qn, vec, _ in labeled],
-                        labels=lbl_list,
-                    )
-                    await self.graph.write_embed_hashes(
-                        [(qn, th) for qn, _, th in labeled],
-                        labels=lbl_list,
-                    )
-                if unlabeled:
-                    await self.graph.write_embeddings([(qn, vec) for qn, vec, _ in unlabeled])
-                    await self.graph.write_embed_hashes([(qn, th) for qn, _, th in unlabeled])
+                with _tracer.start_as_current_span("tier3.write_lock_wait"):
+                    await self._write_lock.acquire()
+                try:
+                    with _tracer.start_as_current_span("tier3.write_embeddings"):
+                        write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
+                        await self.graph.write_embeddings_and_hashes(all_resolved, labels=write_labels)
+                finally:
+                    self._write_lock.release()
 
             elapsed = asyncio.get_event_loop().time() - t0
             span.set_attribute("entities_count", total)

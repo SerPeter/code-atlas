@@ -1,8 +1,23 @@
 # Benchmarks
 
-Benchmarked on a synthetic codebase with deterministic Python files (classes, methods, imports, docstrings).
+## Full Indexing Pipeline
 
-## Parsing
+Measured on the code-atlas repo (107 Python files, 2,706 entities) with local TEI embeddings. See
+`scripts/profile_index.py --full`.
+
+| Stage               | Wall Time | Notes                                          |
+| ------------------- | --------- | ---------------------------------------------- |
+| Scan + packages     | 0.1s      | File discovery + package hierarchy             |
+| Tier 2 (AST+graph)  | ~26s      | Parse, upsert, resolve imports/calls/types     |
+| Tier 3 (embeddings) | ~52s      | Embed API + graph writes (8 concurrent)        |
+| **Total**           | **55s**   | Embedding-bound; cached reindex is much faster |
+
+Tier 2 and Tier 3 overlap — embedding starts as soon as the first batch of entities is written. The bottleneck is the
+embedding API (75.8s cumulative across 8 workers, ~3.2s avg per batch of 128 entities).
+
+## Parse-Only Throughput
+
+Raw tree-sitter CPU benchmark — no I/O, no graph, no embeddings. Synthetic codebase with deterministic Python files.
 
 | Codebase | Files | Entities | Time  | Throughput        | Peak Memory |
 | -------- | ----- | -------- | ----- | ----------------- | ----------- |
@@ -12,15 +27,22 @@ Benchmarked on a synthetic codebase with deterministic Python files (classes, me
 Memory scales linearly (~16 KB per entity) when accumulating all parse results. In production, entities are streamed to
 the graph and not held in memory simultaneously.
 
-## Query Latency (p50 / p95)
+## Query Latency (avg / p95)
 
-| Search Type      | p50   | p95   | p99    |
-| ---------------- | ----- | ----- | ------ |
-| Graph search     | 8 ms  | 63 ms | 66 ms  |
-| BM25 text search | 10 ms | 19 ms | 29 ms  |
-| Vector search    | 47 ms | 71 ms | 164 ms |
+Measured on the code-atlas repo (~1,400 entities), 5 iterations, local TEI embeddings. See `scripts/profile_query.py`.
 
-All three search types use single-round-trip queries against Memgraph.
+| Tool            | Avg    | p95    | Max    |
+| --------------- | ------ | ------ | ------ |
+| `hybrid_search` | 548 ms | 677 ms | 677 ms |
+| `text_search`   | 34 ms  | 36 ms  | 36 ms  |
+| `vector_search` | 102 ms | 125 ms | 125 ms |
+| `get_node`      | 7 ms   | 8 ms   | 8 ms   |
+| `get_context`   | 34 ms  | 36 ms  | 36 ms  |
+| `analyze_repo`  | 22 ms  | 23 ms  | 23 ms  |
+| `index_status`  | 22 ms  | 23 ms  | 23 ms  |
+
+Text and vector search queries run in parallel across all 5 indices via `asyncio.gather()`. The `get_node` cascade uses
+2-stage UNION ALL queries (max 2 RTTs).
 
 ## Concurrent Queries
 
