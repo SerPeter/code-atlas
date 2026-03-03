@@ -18,7 +18,7 @@ import pathspec
 from loguru import logger
 
 from code_atlas.events import Event, EventBus, FileChanged, Topic
-from code_atlas.indexing.consumers import BatchPolicy, Tier2ASTConsumer, Tier3EmbedConsumer
+from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
 from code_atlas.settings import derive_project_name, resolve_git_dir
@@ -849,41 +849,41 @@ async def _run_pipeline(
     project_filter: set[str] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
     reindex_mode: bool = False,
-) -> Tier2ASTConsumer:
-    """Start inline tier consumers and wait for the pipeline to drain.
+) -> ASTConsumer:
+    """Start inline consumers and wait for the pipeline to drain.
 
-    Returns the Tier2 consumer so callers can read accumulated stats.
+    Returns the AST consumer so callers can read accumulated stats.
     When *reindex_mode* is True, reindex-tuned policies are used for
     faster polling.
     """
-    await bus.ensure_group(Topic.FILE_CHANGED, "tier2-ast")
+    await bus.ensure_group(Topic.FILE_CHANGED, "ast")
 
     # Reindex-tuned policies: flush immediately, short blocking reads
-    t2_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if reindex_mode else None
-    t3_policy = (
+    ast_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if reindex_mode else None
+    embed_policy = (
         BatchPolicy(time_window_s=1.0, max_batch_size=embed.batch_size, block_ms=50)
         if reindex_mode and embed is not None
         else None
     )
 
-    tier2 = Tier2ASTConsumer(
-        bus, graph, settings, project_root=project_root, project_filter=project_filter, policy=t2_policy
+    ast_consumer = ASTConsumer(
+        bus, graph, settings, project_root=project_root, project_filter=project_filter, policy=ast_policy
     )
-    task2 = asyncio.create_task(tier2.run())
+    ast_task = asyncio.create_task(ast_consumer.run())
 
-    tier3: Tier3EmbedConsumer | None = None
-    tier3_task: asyncio.Task[None] | None = None
+    embed_consumer: EmbedConsumer | None = None
+    embed_task: asyncio.Task[None] | None = None
     if embed is not None:
-        await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        tier3 = Tier3EmbedConsumer(
+        await bus.ensure_group(Topic.EMBED_DIRTY, "embed")
+        embed_consumer = EmbedConsumer(
             bus,
             graph,
             embed,
             cache=cache,
             project_filter=project_filter,
-            policy=t3_policy,
+            policy=embed_policy,
         )
-        tier3_task = asyncio.create_task(tier3.run())
+        embed_task = asyncio.create_task(embed_consumer.run())
 
     try:
         await _wait_for_drain(
@@ -894,21 +894,21 @@ async def _run_pipeline(
             settle_s=2.0,
         )
     finally:
-        tier2.stop()
-        if tier3 is not None:
-            tier3.stop()
+        ast_consumer.stop()
+        if embed_consumer is not None:
+            embed_consumer.stop()
         await asyncio.sleep(0.5)
-        task2.cancel()
-        if tier3_task is not None:
-            tier3_task.cancel()
-        for t in [task2, tier3_task]:
+        ast_task.cancel()
+        if embed_task is not None:
+            embed_task.cancel()
+        for t in [ast_task, embed_task]:
             if t is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
         if cache is not None:
             await cache.close()
 
-    return tier2
+    return ast_consumer
 
 
 @dataclass
@@ -1144,7 +1144,7 @@ async def index_project(
     3. Decide full vs. delta mode (git diff, threshold check)
     4. Create Project + Package hierarchy in the graph
     5. Publish FileChanged events to Valkey (all or delta-only)
-    6. Run inline Tier 1 + Tier 2 consumers until the pipeline drains
+    6. Run inline AST + Embed consumers until the pipeline drains
     7. Update Project metadata (counts, git hash, delta stats)
 
     In monorepo mode, *project_name* and *project_root* override the
@@ -1228,9 +1228,9 @@ async def _index_project_inner(  # noqa: PLR0915
 
     # 7. Start inline consumers and wait for drain
     reindex_mode = full_reindex or decision.mode == "full"
-    t2stats = None
+    ast_stats = None
     if published > 0:
-        tier2 = await _run_pipeline(
+        ast_consumer = await _run_pipeline(
             bus,
             graph,
             settings,
@@ -1242,7 +1242,7 @@ async def _index_project_inner(  # noqa: PLR0915
             on_drain_progress=on_drain_progress,
             reindex_mode=reindex_mode,
         )
-        t2stats = tier2.stats
+        ast_stats = ast_consumer.stats
 
     # 7. Set dependency versions on ExternalPackage nodes
     dep_versions = _parse_dependency_versions(project_root)
@@ -1267,7 +1267,7 @@ async def _index_project_inner(  # noqa: PLR0915
     await graph.update_project_metadata(project_name, **metadata)
 
     duration = time.monotonic() - start
-    delta_stats = _build_delta_stats(decision, t2stats) if decision.mode == "delta" else None
+    delta_stats = _build_delta_stats(decision, ast_stats) if decision.mode == "delta" else None
 
     logger.debug(
         "Indexing complete ({}): {} files scanned, {} published, {} entities, {:.1f}s",
@@ -1460,25 +1460,25 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     # --- Start shared consumers (once for entire monorepo) ---
     reindex_mode = full_reindex
 
-    await bus.ensure_group(Topic.FILE_CHANGED, "tier2-ast")
+    await bus.ensure_group(Topic.FILE_CHANGED, "ast")
 
-    t2_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if reindex_mode else None
-    t3_policy = (
+    ast_policy = BatchPolicy(time_window_s=0, max_batch_size=30, block_ms=50) if reindex_mode else None
+    embed_policy = (
         BatchPolicy(time_window_s=1.0, max_batch_size=embed.batch_size, block_ms=50)
         if reindex_mode and embed is not None
         else None
     )
 
-    tier2 = Tier2ASTConsumer(bus, graph, settings, project_root=project_root, policy=t2_policy)
+    ast_consumer = ASTConsumer(bus, graph, settings, project_root=project_root, policy=ast_policy)
 
     consumer_tasks: list[asyncio.Task[None]] = []
-    consumer_tasks.append(asyncio.create_task(tier2.run()))
+    consumer_tasks.append(asyncio.create_task(ast_consumer.run()))
 
-    tier3: Tier3EmbedConsumer | None = None
+    embed_consumer: EmbedConsumer | None = None
     if embed is not None:
-        await bus.ensure_group(Topic.EMBED_DIRTY, "tier3-embed")
-        tier3 = Tier3EmbedConsumer(bus, graph, embed, cache=cache, policy=t3_policy)
-        consumer_tasks.append(asyncio.create_task(tier3.run()))
+        await bus.ensure_group(Topic.EMBED_DIRTY, "embed")
+        embed_consumer = EmbedConsumer(bus, graph, embed, cache=cache, policy=embed_policy)
+        consumer_tasks.append(asyncio.create_task(embed_consumer.run()))
 
     start = time.monotonic()
     publish_results: list[_ProjectPublishResult] = []
@@ -1529,7 +1529,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             if on_progress is not None:
                 on_progress(root_name, total, total)
 
-        # --- Wait for ALL tiers to drain (once) ---
+        # --- Wait for ALL stages to drain (once) ---
         await _wait_for_drain(
             bus,
             drain_timeout_s,
@@ -1540,9 +1540,9 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
     finally:
         # --- Tear down consumers (once) ---
-        tier2.stop()
-        if tier3 is not None:
-            tier3.stop()
+        ast_consumer.stop()
+        if embed_consumer is not None:
+            embed_consumer.stop()
         await asyncio.sleep(0.5)
         for task in consumer_tasks:
             task.cancel()
@@ -1578,7 +1578,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         # Use shared start time — in monorepo mode all projects share one pipeline,
         # so per-project publish timestamps don't reflect actual processing duration.
         duration = time.monotonic() - start
-        delta_stats = _build_delta_stats(pr.decision, tier2.stats) if pr.mode == "delta" else None
+        delta_stats = _build_delta_stats(pr.decision, ast_consumer.stats) if pr.mode == "delta" else None
         results.append(
             IndexResult(
                 files_scanned=pr.files_scanned,
@@ -1606,16 +1606,16 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     return results
 
 
-def _build_delta_stats(decision: _DeltaDecision, t2stats: Any) -> DeltaStats:
-    """Build DeltaStats from the decision and Tier2 stats."""
+def _build_delta_stats(decision: _DeltaDecision, ast_stats: Any) -> DeltaStats:
+    """Build DeltaStats from the decision and AST consumer stats."""
     return DeltaStats(
         files_added=len(decision.files_added),
         files_modified=len(decision.files_modified),
         files_deleted=len(decision.files_deleted),
-        entities_added=t2stats.entities_added if t2stats else 0,
-        entities_modified=t2stats.entities_modified if t2stats else 0,
-        entities_deleted=t2stats.entities_deleted if t2stats else 0,
-        entities_unchanged=t2stats.entities_unchanged if t2stats else 0,
+        entities_added=ast_stats.entities_added if ast_stats else 0,
+        entities_modified=ast_stats.entities_modified if ast_stats else 0,
+        entities_deleted=ast_stats.entities_deleted if ast_stats else 0,
+        entities_unchanged=ast_stats.entities_unchanged if ast_stats else 0,
     )
 
 
@@ -1627,7 +1627,7 @@ async def _wait_for_drain(
     on_drain_progress: Callable[[int, int, int], None] | None = None,
     settle_s: float = 2.0,
 ) -> None:
-    """Poll stream groups until Tier 2 and (optionally) Tier 3 are drained.
+    """Poll stream groups until AST and (optionally) Embed consumers are drained.
 
     If *on_drain_progress* is provided, it is called each poll cycle with
     ``(t1_remaining, t2_remaining, t3_remaining)`` so callers can display
@@ -1639,9 +1639,9 @@ async def _wait_for_drain(
     poll_interval = 0.5
 
     while time.monotonic() < deadline:
-        queries: list[tuple[Topic, str]] = [(Topic.FILE_CHANGED, "tier2-ast")]
+        queries: list[tuple[Topic, str]] = [(Topic.FILE_CHANGED, "ast")]
         if embed_enabled:
-            queries.append((Topic.EMBED_DIRTY, "tier3-embed"))
+            queries.append((Topic.EMBED_DIRTY, "embed"))
 
         infos = await bus.stream_group_info_multi(queries)
 

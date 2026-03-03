@@ -461,7 +461,7 @@ def _build_doc_section_text(qualified_name: str, docstring: str) -> str:
     """Build embed text for DocSection nodes.
 
     The ``qualified_name`` encodes the header breadcrumb
-    (e.g. ``docs/architecture.md > Architecture > Event Pipeline > Tier 2``).
+    (e.g. ``docs/architecture.md > Architecture > Event Pipeline > AST Stage``).
     """
     # Split on " > " to get file path and section headers
     breadcrumb_parts = qualified_name.split(" > ")

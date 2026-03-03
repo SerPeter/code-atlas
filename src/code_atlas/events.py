@@ -46,7 +46,7 @@ class EntityRef:
 
 @dataclass(frozen=True)
 class EmbedDirty:
-    """A single entity needs re-embedding (published by Tier 2, consumed by Tier 3)."""
+    """A single entity needs re-embedding (published by AST stage, consumed by Embed stage)."""
 
     entity: EntityRef
     significance: str  # "MODERATE" | "HIGH"

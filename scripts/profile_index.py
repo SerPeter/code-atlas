@@ -209,25 +209,25 @@ def patch_all():
     orch._wait_for_drain = timed_async("orch.wait_for_drain")(orch._wait_for_drain)
 
     # --- Parser ---
-    parser_mod.parse_file = timed_sync("tier2.parse_file")(parser_mod.parse_file)
+    parser_mod.parse_file = timed_sync("ast.parse_file")(parser_mod.parse_file)
 
     # --- Detectors ---
-    det_mod.run_detectors = timed_async("tier2.run_detectors")(det_mod.run_detectors)
+    det_mod.run_detectors = timed_async("ast.run_detectors")(det_mod.run_detectors)
 
     # --- Graph client methods ---
-    gc.GraphClient.upsert_file_entities = timed_async("tier2.upsert_file_entities")(gc.GraphClient.upsert_file_entities)
-    gc.GraphClient.upsert_batch_entities = timed_async("tier2.upsert_batch_entities")(
+    gc.GraphClient.upsert_file_entities = timed_async("ast.upsert_file_entities")(gc.GraphClient.upsert_file_entities)
+    gc.GraphClient.upsert_batch_entities = timed_async("ast.upsert_batch_entities")(
         gc.GraphClient.upsert_batch_entities
     )
-    gc.GraphClient.resolve_imports = timed_async("tier2.resolve_imports")(gc.GraphClient.resolve_imports)
-    gc.GraphClient.build_resolution_lookup = timed_async("tier2.build_resolution_lookup")(
+    gc.GraphClient.resolve_imports = timed_async("ast.resolve_imports")(gc.GraphClient.resolve_imports)
+    gc.GraphClient.build_resolution_lookup = timed_async("ast.build_resolution_lookup")(
         gc.GraphClient.build_resolution_lookup
     )
-    gc.GraphClient.resolve_calls = timed_async("tier2.resolve_calls")(gc.GraphClient.resolve_calls)
-    gc.GraphClient.resolve_type_refs = timed_async("tier2.resolve_type_refs")(gc.GraphClient.resolve_type_refs)
+    gc.GraphClient.resolve_calls = timed_async("ast.resolve_calls")(gc.GraphClient.resolve_calls)
+    gc.GraphClient.resolve_type_refs = timed_async("ast.resolve_type_refs")(gc.GraphClient.resolve_type_refs)
     gc.GraphClient.merge_package_batch = timed_async("orch.merge_package_batch")(gc.GraphClient.merge_package_batch)
-    gc.GraphClient.delete_file_entities = timed_async("tier2.delete_file_entities")(gc.GraphClient.delete_file_entities)
-    gc.GraphClient.apply_property_enrichments = timed_async("tier2.apply_enrichments")(
+    gc.GraphClient.delete_file_entities = timed_async("ast.delete_file_entities")(gc.GraphClient.delete_file_entities)
+    gc.GraphClient.apply_property_enrichments = timed_async("ast.apply_enrichments")(
         gc.GraphClient.apply_property_enrichments
     )
 
@@ -249,16 +249,16 @@ def patch_all():
         gc.GraphClient._recreate_batch_relationships
     )
 
-    # --- Tier 3 ---
-    gc.GraphClient.read_entity_texts = timed_async("tier3.read_entity_texts")(gc.GraphClient.read_entity_texts)
-    gc.GraphClient.write_embeddings_and_hashes = timed_async("tier3.write_embeddings_and_hashes")(
+    # --- Embed stage ---
+    gc.GraphClient.read_entity_texts = timed_async("embed.read_entity_texts")(gc.GraphClient.read_entity_texts)
+    gc.GraphClient.write_embeddings_and_hashes = timed_async("embed.write_embeddings_and_hashes")(
         gc.GraphClient.write_embeddings_and_hashes
     )
-    emb_mod.EmbedClient.embed_batch = timed_async("tier3.embed_api")(emb_mod.EmbedClient.embed_batch)
+    emb_mod.EmbedClient.embed_batch = timed_async("embed.embed_api")(emb_mod.EmbedClient.embed_batch)
 
-    # Tier 3 cache
-    emb_mod.EmbedCache.get_many = timed_async("tier3.cache_get_many")(emb_mod.EmbedCache.get_many)
-    emb_mod.EmbedCache.put_many = timed_async("tier3.cache_put_many")(emb_mod.EmbedCache.put_many)
+    # Embed cache
+    emb_mod.EmbedCache.get_many = timed_async("embed.cache_get_many")(emb_mod.EmbedCache.get_many)
+    emb_mod.EmbedCache.put_many = timed_async("embed.cache_put_many")(emb_mod.EmbedCache.put_many)
 
     # --- EventBus ---
     EventBus.publish_many = timed_async("bus.publish_many")(EventBus.publish_many)
@@ -348,17 +348,17 @@ def print_report(wall_time: float):
             "orch.wait_for_drain",
             "orch.merge_package_batch",
         ],
-        "Tier 2 (AST + Graph)": [
-            "tier2.parse_file",
-            "tier2.run_detectors",
-            "tier2.upsert_file_entities",
-            "tier2.upsert_batch_entities",
-            "tier2.delete_file_entities",
-            "tier2.apply_enrichments",
-            "tier2.resolve_imports",
-            "tier2.build_resolution_lookup",
-            "tier2.resolve_calls",
-            "tier2.resolve_type_refs",
+        "AST Stage (Parse + Graph)": [
+            "ast.parse_file",
+            "ast.run_detectors",
+            "ast.upsert_file_entities",
+            "ast.upsert_batch_entities",
+            "ast.delete_file_entities",
+            "ast.apply_enrichments",
+            "ast.resolve_imports",
+            "ast.build_resolution_lookup",
+            "ast.resolve_calls",
+            "ast.resolve_type_refs",
             # Upsert inner breakdown
             "upsert.get_hashes",
             "upsert.get_batch_hashes",
@@ -369,12 +369,12 @@ def print_report(wall_time: float):
             "upsert.recreate_rels",
             "upsert.recreate_batch_rels",
         ],
-        "Tier 3 (Embeddings)": [
-            "tier3.read_entity_texts",
-            "tier3.cache_get_many",
-            "tier3.embed_api",
-            "tier3.cache_put_many",
-            "tier3.write_embeddings_and_hashes",
+        "Embed Stage (Embeddings)": [
+            "embed.read_entity_texts",
+            "embed.cache_get_many",
+            "embed.embed_api",
+            "embed.cache_put_many",
+            "embed.write_embeddings_and_hashes",
         ],
         "Event Bus (Valkey)": [
             "bus.publish_many",

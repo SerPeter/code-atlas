@@ -103,7 +103,7 @@ invisible to AST parsing.
 
 ```python
 # Do
-class Tier2Consumer(TierConsumer): ...
+class ASTConsumer(TierConsumer): ...
 
 # Don't
 Consumer = make_consumer(TierConsumer, features=["ast"])

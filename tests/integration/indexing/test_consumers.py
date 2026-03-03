@@ -17,7 +17,7 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.indexing.consumers import BatchPolicy, Tier2ASTConsumer
+from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy
 
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
@@ -115,23 +115,23 @@ async def test_dedup_within_batch(event_bus: EventBus) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tier 2 consumer tests
+# AST consumer tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("_clean_streams")
-async def test_tier2_consumes_file_changed(
+async def test_ast_consumes_file_changed(
     event_bus: EventBus,
     graph_client: GraphClient,
     settings: AtlasSettings,
 ) -> None:
-    """Tier 2 consumes FileChanged from the file-changed topic and writes entities to graph."""
+    """AST consumer processes FileChanged from the file-changed topic and writes entities to graph."""
     await graph_client.ensure_schema()
 
-    # Write a Python file for Tier 2 to parse
+    # Write a Python file for the AST consumer to parse
     _write_python_file(settings.project_root, "hello.py", "def greet(name: str) -> str:\n    return f'Hello {name}'\n")
 
-    consumer = Tier2ASTConsumer(
+    consumer = ASTConsumer(
         event_bus,
         graph_client,
         settings,
@@ -181,7 +181,7 @@ async def test_file_hash_gate_skips_unchanged(
     )
 
     # First run: processes the file and stores its hash
-    c1 = Tier2ASTConsumer(
+    c1 = ASTConsumer(
         event_bus,
         graph_client,
         settings,
@@ -195,7 +195,7 @@ async def test_file_hash_gate_skips_unchanged(
     assert c1.stats.files_processed >= 1
 
     # Second run: same file, same content — should be skipped
-    c2 = Tier2ASTConsumer(
+    c2 = ASTConsumer(
         event_bus,
         graph_client,
         settings,
@@ -232,7 +232,7 @@ async def test_file_hash_gate_processes_modified(
     )
 
     # First run
-    c1 = Tier2ASTConsumer(
+    c1 = ASTConsumer(
         event_bus,
         graph_client,
         settings,
@@ -249,7 +249,7 @@ async def test_file_hash_gate_processes_modified(
     _write_python_file(settings.project_root, "changing.py", "X = 2\nY = 3\n")
 
     # Second run: changed content — should process again
-    c2 = Tier2ASTConsumer(
+    c2 = ASTConsumer(
         event_bus,
         graph_client,
         settings,
@@ -277,7 +277,7 @@ async def test_cooldown_defers_rapid_edits(
 
     project_name = settings.project_root.resolve().name
 
-    consumer = Tier2ASTConsumer(
+    consumer = ASTConsumer(
         event_bus,
         graph_client,
         settings,
@@ -338,7 +338,7 @@ async def test_cooldown_disabled_processes_all(
 
     project_name = settings.project_root.resolve().name
 
-    consumer = Tier2ASTConsumer(
+    consumer = ASTConsumer(
         event_bus,
         graph_client,
         settings,

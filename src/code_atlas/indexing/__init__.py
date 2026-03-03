@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from code_atlas.indexing.consumers import (
+    ASTConsumer,
     BatchPolicy,
-    Tier2ASTConsumer,
-    Tier3EmbedConsumer,
+    EmbedConsumer,
     TierConsumer,
 )
 from code_atlas.indexing.daemon import DaemonManager
@@ -24,17 +24,17 @@ from code_atlas.indexing.orchestrator import (
 from code_atlas.indexing.watcher import FileWatcher
 
 __all__ = [
+    "ASTConsumer",
     "BatchPolicy",
     "DaemonManager",
     "DeltaStats",
     "DetectedProject",
+    "EmbedConsumer",
     "FileScope",
     "FileWatcher",
     "IndexResult",
     "StalenessChecker",
     "StalenessInfo",
-    "Tier2ASTConsumer",
-    "Tier3EmbedConsumer",
     "TierConsumer",
     "classify_file_project",
     "detect_sub_projects",

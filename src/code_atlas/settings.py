@@ -188,7 +188,7 @@ class EmbeddingSettings(BaseSettings):
     dimension: int | None = Field(default=None, description="Embedding vector dimension. Auto-detected when None.")
     batch_size: int | None = Field(default=None, description="Max texts per embedding API call. Auto from provider.")
     max_concurrency: int | None = Field(
-        default=None, description="Max concurrent embedding API calls / Tier 3 consumers. Auto from provider."
+        default=None, description="Max concurrent embedding API calls / embed consumers. Auto from provider."
     )
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
     truncate_ratio: float = Field(

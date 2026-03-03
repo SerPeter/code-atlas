@@ -1,9 +1,9 @@
-"""Two-tier consumer pipeline for event-driven indexing.
+"""Two-stage consumer pipeline for event-driven indexing.
 
-    FileChanged → Tier 2 (hash gate + AST parse + diff)
-                → significance gate → EmbedDirty → Tier 3 (embeddings)
+    FileChanged → AST stage (hash gate + AST parse + diff)
+                → significance gate → EmbedDirty → Embed stage (embeddings)
 
-Each tier uses batch-pull with configurable time/count policy and
+Each stage uses batch-pull with configurable time/count policy and
 deduplicates within its batch window.
 """
 
@@ -279,10 +279,10 @@ class TierConsumer(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Tier 2: AST parse + graph write (medium cost)
+# AST stage: parse + graph write (medium cost)
 # ---------------------------------------------------------------------------
 
-# Significance levels for the Tier 2 → Tier 3 gate
+# Significance levels for the AST → Embed gate
 #
 # | Condition                        | Level    | Action        |
 # |----------------------------------|----------|---------------|
@@ -304,8 +304,8 @@ _SIG_ORDER: dict[Significance, int] = {
 
 
 @dataclass
-class Tier2Stats:
-    """Accumulated delta statistics for Tier 2 processing."""
+class ASTStats:
+    """Accumulated delta statistics for AST stage processing."""
 
     files_processed: int = 0
     files_skipped: int = 0
@@ -334,8 +334,8 @@ _SENTINEL_DELETED = _ParsedFileData(
 )
 
 
-class Tier2ASTConsumer(TierConsumer):
-    """Tier 2: Parse AST via tree-sitter, write entities to graph, publish EmbedDirty."""
+class ASTConsumer(TierConsumer):
+    """AST stage: Parse AST via tree-sitter, write entities to graph, publish EmbedDirty."""
 
     def __init__(
         self,
@@ -351,15 +351,15 @@ class Tier2ASTConsumer(TierConsumer):
         super().__init__(
             bus=bus,
             input_topic=Topic.FILE_CHANGED,
-            group="tier2-ast",
-            consumer_name="tier2-ast-0",
+            group="ast",
+            consumer_name="ast-0",
             policy=policy or BatchPolicy(time_window_s=3.0, max_batch_size=30),
             project_filter=project_filter,
         )
         self.graph = graph
         self.settings = settings
         self._project_root = project_root or Path(settings.project_root)
-        self.stats = Tier2Stats()
+        self.stats = ASTStats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
 
         # Per-file cooldown state (daemon mode)
@@ -472,12 +472,12 @@ class Tier2ASTConsumer(TierConsumer):
             try:
                 source = full_path.read_bytes()
             except OSError:
-                logger.warning("Tier2: cannot read {}", file_path)
+                logger.warning("AST: cannot read {}", file_path)
                 return None
 
         parsed = parse_file(file_path, source, project_name, max_source_chars=self.settings.index.max_source_chars)
         if parsed is None:
-            logger.debug("Tier2: unsupported language for {}", file_path)
+            logger.debug("AST: unsupported language for {}", file_path)
             return None
 
         det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
@@ -495,7 +495,7 @@ class Tier2ASTConsumer(TierConsumer):
         )
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912, PLR0915
-        with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
+        with _tracer.start_as_current_span("ast.process_batch", attributes={"batch_id": batch_id}) as span:
             # Per-file cooldown filter: defer events for recently-processed files
             if self._cooldown_s > 0:
                 now = asyncio.get_event_loop().time()
@@ -510,7 +510,7 @@ class Tier2ASTConsumer(TierConsumer):
                     else:
                         processable.append(ev)
                 if deferred_count:
-                    logger.debug("Tier2 batch {}: {} event(s) deferred by cooldown", batch_id, deferred_count)
+                    logger.debug("AST batch {}: {} event(s) deferred by cooldown", batch_id, deferred_count)
                 events = processable
                 if not events:
                     return
@@ -526,7 +526,7 @@ class Tier2ASTConsumer(TierConsumer):
             groups = {key: list(dict.fromkeys(paths)) for key, paths in groups.items()}
 
             total_paths = sum(len(p) for p in groups.values())
-            logger.debug("Tier2 batch {}: {} unique path(s) in {} group(s)", batch_id, total_paths, len(groups))
+            logger.debug("AST batch {}: {} unique path(s) in {} group(s)", batch_id, total_paths, len(groups))
 
             embed_candidates: dict[str, tuple[EntityRef, str]] = {}  # uid → (ref, text_hash)
             skipped_before = self.stats.files_skipped
@@ -555,7 +555,7 @@ class Tier2ASTConsumer(TierConsumer):
                             file_sources[fp] = full_path.read_bytes()
                             live_paths.append(fp)
                         except OSError:
-                            logger.warning("Tier2: cannot read {}", fp)
+                            logger.warning("AST: cannot read {}", fp)
 
                 # Apply hash gate to live files
                 if use_hash_gate and live_paths:
@@ -575,7 +575,7 @@ class Tier2ASTConsumer(TierConsumer):
                     hash_skipped = len(live_paths) - len(gate_passed)
                     if hash_skipped:
                         logger.debug(
-                            "Tier2 batch {}: hash gate skipped {}/{} file(s)",
+                            "AST batch {}: hash gate skipped {}/{} file(s)",
                             batch_id,
                             hash_skipped,
                             len(live_paths),
@@ -589,7 +589,7 @@ class Tier2ASTConsumer(TierConsumer):
 
                 for file_idx, file_path in enumerate(live_paths, 1):
                     if file_idx % 50 == 0:
-                        logger.debug("Tier2 batch {}: parsed {}/{} files", batch_id, file_idx, len(live_paths))
+                        logger.debug("AST batch {}: parsed {}/{} files", batch_id, file_idx, len(live_paths))
                     pfd = await self._parse_file(
                         project_name,
                         file_path,
@@ -603,7 +603,7 @@ class Tier2ASTConsumer(TierConsumer):
 
                 # 2. Handle deleted files
                 for fp in deleted_files:
-                    logger.debug("Tier2: file deleted, removing entities for {}", fp)
+                    logger.debug("AST: file deleted, removing entities for {}", fp)
                     deleted = await self.graph.delete_file_entities(project_name, fp)
                     self.stats.files_deleted += 1
                     self.stats.entities_deleted += len(deleted)
@@ -718,7 +718,7 @@ class Tier2ASTConsumer(TierConsumer):
             span.set_attribute("entities_changed", total_changed)
 
             logger.debug(
-                "Tier2 batch {}: {} files, {} skipped, {} entities changed",
+                "AST batch {}: {} files, {} skipped, {} entities changed",
                 batch_id,
                 total_paths,
                 self.stats.files_skipped - skipped_before,
@@ -752,14 +752,14 @@ class Tier2ASTConsumer(TierConsumer):
 
 
 # ---------------------------------------------------------------------------
-# Tier 3: Embeddings (expensive, heavily batched)
+# Embed stage: Embeddings (expensive, heavily batched)
 # ---------------------------------------------------------------------------
 
 
-class Tier3EmbedConsumer(TierConsumer):
-    """Tier 3: Re-embed entities via TEI. Deduplicates by qualified name.
+class EmbedConsumer(TierConsumer):
+    """Embed stage: Re-embed entities via TEI. Deduplicates by qualified name.
 
-    Implements a three-tier lookup to minimize expensive embedding API calls:
+    Implements a three-level lookup to minimize expensive embedding API calls:
       1. **Graph hit** — node already has ``embed_hash`` matching current text (free).
       2. **Valkey cache hit** — vector stored in Redis from a previous run (1 round-trip).
       3. **API call** — embed via TEI / cloud provider (expensive).
@@ -780,8 +780,8 @@ class Tier3EmbedConsumer(TierConsumer):
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
-            group="tier3-embed",
-            consumer_name="tier3-embed",
+            group="embed",
+            consumer_name="embed",
             policy=policy
             or BatchPolicy(
                 time_window_s=10.0,
@@ -875,7 +875,7 @@ class Tier3EmbedConsumer(TierConsumer):
         return result
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:
-        with _tracer.start_as_current_span("tier3.process_batch", attributes={"batch_id": batch_id}) as span:
+        with _tracer.start_as_current_span("embed.process_batch", attributes={"batch_id": batch_id}) as span:
             # Collect and deduplicate entities across all events in the batch
             seen: dict[str, EntityRef] = {}
             for e in events:
@@ -883,7 +883,7 @@ class Tier3EmbedConsumer(TierConsumer):
                     seen[e.entity.qualified_name] = e.entity
 
             entities = list(seen.values())
-            logger.debug("Tier3 batch {}: {} unique entity(ies)", batch_id, len(entities))
+            logger.debug("Embed batch {}: {} unique entity(ies)", batch_id, len(entities))
 
             if not entities:
                 return
@@ -917,7 +917,7 @@ class Tier3EmbedConsumer(TierConsumer):
             if not to_process:
                 elapsed = asyncio.get_event_loop().time() - t0
                 logger.debug(
-                    "Tier3 batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
+                    "Embed batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
                     batch_id,
                     total,
                     graph_hits,
@@ -933,10 +933,10 @@ class Tier3EmbedConsumer(TierConsumer):
             #    Serialized via _write_lock to avoid Memgraph write-lock contention.
             all_resolved = cache_resolved + api_vectors
             if all_resolved:
-                with _tracer.start_as_current_span("tier3.write_lock_wait"):
+                with _tracer.start_as_current_span("embed.write_lock_wait"):
                     await self._write_lock.acquire()
                 try:
-                    with _tracer.start_as_current_span("tier3.write_embeddings"):
+                    with _tracer.start_as_current_span("embed.write_embeddings"):
                         write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
                         await self.graph.write_embeddings_and_hashes(all_resolved, labels=write_labels)
                 finally:
@@ -951,7 +951,7 @@ class Tier3EmbedConsumer(TierConsumer):
             get_metrics().embedding_latency.record(elapsed)
 
             logger.debug(
-                "Tier3 batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
+                "Embed batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
                 batch_id,
                 total,
                 graph_hits,

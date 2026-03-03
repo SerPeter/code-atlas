@@ -51,7 +51,7 @@ src/code_atlas/
 ├── __init__.py          # __version__ only
 ├── schema.py            # Graph schema (labels, relationships, DDL generators)
 ├── settings.py          # Pydantic configuration (atlas.toml + env vars)
-├── events.py            # Event types (FileChanged, ASTDirty, EmbedDirty) + Valkey Streams EventBus
+├── events.py            # Event types (FileChanged, EmbedDirty) + Valkey Streams EventBus
 ├── telemetry.py         # OpenTelemetry integration
 ├── cli.py               # Typer CLI entrypoint (index, search, status, mcp, daemon commands)
 │
@@ -69,7 +69,7 @@ src/code_atlas/
 │
 ├── indexing/
 │   ├── orchestrator.py  # Full-index, monorepo detection, staleness checking
-│   ├── consumers.py     # Tier 1/2/3 event consumers (batch-pull pattern)
+│   ├── consumers.py     # AST + Embed event consumers (batch-pull pattern)
 │   ├── watcher.py       # Filesystem watcher (watchfiles + hybrid debounce)
 │   └── daemon.py        # Daemon lifecycle manager (watcher + pipeline)
 │
@@ -78,13 +78,13 @@ src/code_atlas/
     └── health.py        # Infrastructure health checks + diagnostics
 ```
 
-**Event Pipeline:** File Watcher → Valkey Streams → Tier 1 (graph metadata) → Tier 2 (AST diff + gate) → Tier 3 (embeddings) → Memgraph
+**Event Pipeline:** File Watcher → Valkey Streams → AST stage (hash gate + parse + diff) → Embed stage (embeddings) → Memgraph
 
 **Query Pipeline:** MCP Server → Query Router → [Graph Search | Vector Search | BM25 Search] → RRF Fusion → Results
 
 **Deployment:** Daemon (`atlas daemon start`) for indexing + MCP (`atlas mcp`) per agent session, decoupled via Valkey + Memgraph
 
-**Event model:** Events are atomic — one logical change per event (one file per ASTDirty, one entity per EmbedDirty). Never bundle lists of work items into a single event; use `EventBus.publish_many()` for network-efficient batch publishing. The consumer's `max_batch_size` must directly control work volume, not just message count.
+**Event model:** Events are atomic — one logical change per event (one file per FileChanged, one entity per EmbedDirty). Never bundle lists of work items into a single event; use `EventBus.publish_many()` for network-efficient batch publishing. The consumer's `max_batch_size` must directly control work volume, not just message count.
 
 **Infrastructure:** Memgraph (graph DB, port 7687), TEI (embeddings, port 8080), Valkey (event bus, port 6379)
 
