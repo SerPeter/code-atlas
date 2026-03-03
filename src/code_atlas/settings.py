@@ -293,6 +293,7 @@ class WatcherSettings(BaseSettings):
 
     debounce_s: float = Field(default=5.0, description="Debounce timer in seconds (resets per change).")
     max_wait_s: float = Field(default=30.0, description="Max-wait ceiling in seconds (per batch).")
+    cooldown_s: float = Field(default=10.0, description="Per-file cooldown after processing (seconds). 0 disables.")
 
 
 class McpSettings(BaseSettings):

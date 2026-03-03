@@ -78,7 +78,7 @@ class DaemonManager:
             self._cache = cache
 
         consumers: list[Tier2ASTConsumer | Tier3EmbedConsumer] = [
-            Tier2ASTConsumer(bus, graph, settings),
+            Tier2ASTConsumer(bus, graph, settings, cooldown_s=settings.watcher.cooldown_s),
         ]
         if embed is not None:
             consumers.append(Tier3EmbedConsumer(bus, graph, embed, cache=cache))

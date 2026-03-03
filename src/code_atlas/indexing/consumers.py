@@ -10,6 +10,7 @@ deduplicates within its batch window.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import re
 import uuid
@@ -345,6 +346,7 @@ class Tier2ASTConsumer(TierConsumer):
         project_root: Path | None = None,
         project_filter: set[str] | None = None,
         policy: BatchPolicy | None = None,
+        cooldown_s: float = 0.0,
     ) -> None:
         super().__init__(
             bus=bus,
@@ -359,6 +361,12 @@ class Tier2ASTConsumer(TierConsumer):
         self._project_root = project_root or Path(settings.project_root)
         self.stats = Tier2Stats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
+
+        # Per-file cooldown state (daemon mode)
+        self._cooldown_s = cooldown_s
+        self._cooldowns: dict[str, float] = {}  # file_path → expiry (monotonic)
+        self._deferred: dict[str, FileChanged] = {}  # file_path → latest deferred event
+        self._deferred_drain_task: asyncio.Task[None] | None = None
 
         # Deferred resolution state — accumulate rels across batches, flush periodically.
         # In reindex mode (time_window_s=0, block_ms=50) use larger intervals to skip
@@ -377,6 +385,32 @@ class Tier2ASTConsumer(TierConsumer):
         if isinstance(event, FileChanged):
             return event.path
         return super().dedup_key(event)
+
+    async def _pre_run(self) -> None:
+        if self._cooldown_s > 0:
+            self._deferred_drain_task = asyncio.create_task(self._drain_deferred_loop())
+
+    async def _post_run(self) -> None:
+        if self._deferred_drain_task is not None:
+            self._deferred_drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._deferred_drain_task
+            self._deferred_drain_task = None
+
+    async def _drain_deferred_loop(self) -> None:
+        """Re-publish deferred events whose cooldown has expired.
+
+        Runs as a background task so deferred events are eventually
+        processed even if no new events arrive to trigger ``process_batch``.
+        """
+        while not self._stop:
+            await asyncio.sleep(2.0)
+            now = asyncio.get_event_loop().time()
+            expired = [(fp, ev) for fp, ev in self._deferred.items() if now >= self._cooldowns.get(fp, 0)]
+            for fp, _ in expired:
+                del self._deferred[fp]
+            if expired:
+                await self.bus.publish_many(Topic.FILE_CHANGED, [ev for _, ev in expired])
 
     async def run(self) -> None:
         try:
@@ -462,6 +496,25 @@ class Tier2ASTConsumer(TierConsumer):
 
     async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912, PLR0915
         with _tracer.start_as_current_span("tier2.process_batch", attributes={"batch_id": batch_id}) as span:
+            # Per-file cooldown filter: defer events for recently-processed files
+            if self._cooldown_s > 0:
+                now = asyncio.get_event_loop().time()
+                # Clean expired cooldowns
+                self._cooldowns = {fp: exp for fp, exp in self._cooldowns.items() if exp > now}
+                processable: list[Event] = []
+                deferred_count = 0
+                for ev in events:
+                    if isinstance(ev, FileChanged) and ev.path in self._cooldowns:
+                        self._deferred[ev.path] = ev  # latest overwrites
+                        deferred_count += 1
+                    else:
+                        processable.append(ev)
+                if deferred_count:
+                    logger.debug("Tier2 batch {}: {} event(s) deferred by cooldown", batch_id, deferred_count)
+                events = processable
+                if not events:
+                    return
+
             # Group paths by (project_name, project_root) — monorepo batches can mix sub-projects
             groups: dict[tuple[str, str], list[str]] = {}
             for e in events:
@@ -646,6 +699,12 @@ class Tier2ASTConsumer(TierConsumer):
                 self._pending_call_rels.extend(group_call_rels)
                 self._pending_type_rels.extend(group_type_rels)
                 self._pending_project_names.add(project_name)
+
+                # 8. Set per-file cooldown for processed files
+                if self._cooldown_s > 0:
+                    expiry = asyncio.get_event_loop().time() + self._cooldown_s
+                    for fp in list(parsed_files) + deleted_files:
+                        self._cooldowns[fp] = expiry
 
             self._batches_since_resolve += 1
             now = asyncio.get_event_loop().time()
