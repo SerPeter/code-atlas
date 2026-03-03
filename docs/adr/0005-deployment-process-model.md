@@ -95,12 +95,12 @@ decoupled via Valkey Streams and Memgraph:
               └───────┬────────┘
                       ▼
               ┌────────────────┐
-              │ Create Consumer│    Idempotent XGROUP CREATE for all 3 streams
+              │ Create Consumer│    Idempotent XGROUP CREATE for pipeline streams
               │    Groups      │
               └───────┬────────┘
                       ▼
               ┌────────────────┐
-              │ Start Tier     │    asyncio.gather(tier1.run(), tier2.run(), tier3.run())
+              │ Start Pipeline │    asyncio.gather(ast.run(), embed.run())
               │  Consumers     │
               └───────┬────────┘
                       ▼
@@ -111,7 +111,7 @@ decoupled via Valkey Streams and Memgraph:
                       ▼
               ┌────────────────┐    Git-based fast path: diff stored_commit..HEAD
               │  Reconcile     │    Fallback: mtime comparison for non-git or rebases
-              │  (progressive) │    Enqueue stale files → Tier 1 → 2 → 3
+              │  (progressive) │    Enqueue stale files → AST → Embed
               └───────┬────────┘
                       ▼
               ┌────────────────┐
@@ -230,17 +230,11 @@ Queries:    Agent calls MCP tools ─────► Memgraph ◄──── Da
 ### Data Flow at Runtime
 
 ```
-  ┌──────────┐     FileChanged      ┌─────────┐       ASTDirty        ┌─────────┐
-  │   File   │ ──► events ────────► │ Tier 1  │ ──► events ─────────► │ Tier 2  │
-  │  Watcher │     (Valkey Stream)  │ (graph) │     (Valkey Stream)   │  (AST)  │
-  └──────────┘                      └─────────┘                       └────┬────┘
-                                                                      gate │
-                                                                  EmbedDirty│
-                                                                  (if sig)  │
-                                                                      ┌────▼────┐
-                                                                      │ Tier 3  │
-                                                                      │ (embed) │
-                                                                      └────┬────┘
+  ┌──────────┐     FileChanged      ┌───────────┐     EmbedDirty     ┌───────────┐
+  │   File   │ ──► events ────────► │ AST Stage │ ──► events ──────► │  Embed    │
+  │  Watcher │     (Valkey Stream)  │  (parse)  │    (Valkey Stream) │  Stage    │
+  └──────────┘                      └─────┬─────┘                    └─────┬────┘
+                                          │                                │
                                                                            │
                                        ┌──────────┐                       │
   Agent ◄──── MCP Server ◄──── reads   │ Memgraph │ ◄──── writes ────────┘

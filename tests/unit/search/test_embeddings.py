@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from code_atlas.events import EmbedDirty, EntityRef
-from code_atlas.indexing.consumers import Tier3EmbedConsumer
+from code_atlas.indexing.consumers import EmbedConsumer
 from code_atlas.search.embeddings import EmbedCache, EmbedClient, EmbeddingError, build_embed_text
 from code_atlas.settings import EmbeddingSettings
 
@@ -89,15 +89,15 @@ class TestBuildEmbedText:
     def test_doc_section(self):
         props = {
             "_label": "DocSection",
-            "qualified_name": "docs/architecture.md > Architecture > Event Pipeline > Tier 2",
+            "qualified_name": "docs/architecture.md > Architecture > Event Pipeline > AST Stage",
             "kind": "",
             "signature": "",
-            "docstring": "The AST parsing tier processes file changes...",
+            "docstring": "The AST stage processes file changes...",
         }
         text = build_embed_text(props)
         assert "File: docs/architecture.md" in text
-        assert "Section: Architecture > Event Pipeline > Tier 2" in text
-        assert '"""The AST parsing tier processes file changes..."""' in text
+        assert "Section: Architecture > Event Pipeline > AST Stage" in text
+        assert '"""The AST stage processes file changes..."""' in text
 
     def test_empty_qualified_name_returns_empty(self):
         props = {"_label": "Callable", "qualified_name": "", "kind": "function"}
@@ -353,12 +353,12 @@ class TestEmbedClient:
 
 
 # ---------------------------------------------------------------------------
-# Tier3 cache integration tests (mocked graph + embed + cache)
+# Embed consumer cache integration tests (mocked graph + embed + cache)
 # ---------------------------------------------------------------------------
 
 
-class TestTier3CacheLookup:
-    """Test the three-tier lookup logic in Tier3EmbedConsumer with mocks."""
+class TestEmbedCacheLookup:
+    """Test the three-level lookup logic in EmbedConsumer with mocks."""
 
     @staticmethod
     def _make_entity_ref(qn: str) -> EntityRef:
@@ -402,7 +402,7 @@ class TestTier3CacheLookup:
             ]
         )
 
-        consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        consumer = EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
         event = self._make_embed_dirty(entity)
 
@@ -440,7 +440,7 @@ class TestTier3CacheLookup:
         )
         cache.get_many = AsyncMock(return_value={text_hash: cached_vec})
 
-        consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        consumer = EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
         event = self._make_embed_dirty(entity)
 
@@ -483,7 +483,7 @@ class TestTier3CacheLookup:
         cache.get_many = AsyncMock(return_value={})  # no cache hit
         embed.embed_batch = AsyncMock(return_value=[api_vec])
 
-        consumer = Tier3EmbedConsumer(bus, graph, embed, cache=cache)
+        consumer = EmbedConsumer(bus, graph, embed, cache=cache)
         entity = self._make_entity_ref("foo.bar")
         event = self._make_embed_dirty(entity)
 

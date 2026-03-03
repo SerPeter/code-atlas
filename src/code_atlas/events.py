@@ -45,24 +45,15 @@ class EntityRef:
 
 
 @dataclass(frozen=True)
-class ASTDirty:
-    """A single file needs AST re-parsing (published by Tier 1, consumed by Tier 2)."""
-
-    path: str
-    project_name: str = ""  # monorepo sub-project (forwarded from FileChanged)
-    project_root: str = ""  # absolute path to project root (forwarded from FileChanged)
-
-
-@dataclass(frozen=True)
 class EmbedDirty:
-    """A single entity needs re-embedding (published by Tier 2, consumed by Tier 3)."""
+    """A single entity needs re-embedding (published by AST stage, consumed by Embed stage)."""
 
     entity: EntityRef
     significance: str  # "MODERATE" | "HIGH"
 
 
 # Type alias for any pipeline event
-Event = FileChanged | ASTDirty | EmbedDirty
+Event = FileChanged | EmbedDirty
 
 
 class Significance(StrEnum):
@@ -83,14 +74,12 @@ class Topic(StrEnum):
     """Redis Stream keys for the pipeline."""
 
     FILE_CHANGED = "file-changed"
-    AST_DIRTY = "ast-dirty"
     EMBED_DIRTY = "embed-dirty"
 
 
 # Map topic → event class for deserialization
 _TOPIC_EVENT_MAP: dict[Topic, type[Event]] = {
     Topic.FILE_CHANGED: FileChanged,
-    Topic.AST_DIRTY: ASTDirty,
     Topic.EMBED_DIRTY: EmbedDirty,
 }
 

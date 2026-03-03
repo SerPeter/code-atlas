@@ -655,6 +655,46 @@ class GraphClient:
             props,
         )
 
+    async def get_batch_file_hashes(
+        self,
+        project_name: str,
+        file_paths: list[str],
+    ) -> dict[str, str | None]:
+        """Return ``{file_path: file_hash}`` for Module/Package nodes in one RTT.
+
+        Returns ``None`` for files that have no stored hash.
+        """
+        if not file_paths:
+            return {}
+        records = await self.execute(
+            f"UNWIND $fps AS fp "
+            f"MATCH (n {{project_name: $p, file_path: fp}}) "
+            f"WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE} "
+            "RETURN DISTINCT n.file_path AS fp, n.file_hash AS fh",
+            {"p": project_name, "fps": file_paths},
+        )
+        result: dict[str, str | None] = dict.fromkeys(file_paths)
+        for r in records:
+            result[r["fp"]] = r["fh"]
+        return result
+
+    async def set_batch_file_hashes(
+        self,
+        project_name: str,
+        file_hashes: dict[str, str],
+    ) -> None:
+        """Write ``file_hash`` on Module/Package nodes for each file path."""
+        if not file_hashes:
+            return
+        params = [{"fp": fp, "fh": fh} for fp, fh in file_hashes.items()]
+        await self.execute_write(
+            f"UNWIND $items AS item "
+            f"MATCH (n {{project_name: $p, file_path: item.fp}}) "
+            f"WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE} "
+            "SET n.file_hash = item.fh",
+            {"p": project_name, "items": params},
+        )
+
     async def merge_package_node(self, project_name: str, qualified_name: str, name: str, file_path: str) -> None:
         """Create or update a Package node by uid."""
         uid = f"{project_name}:{qualified_name}"

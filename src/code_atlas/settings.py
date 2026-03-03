@@ -188,7 +188,7 @@ class EmbeddingSettings(BaseSettings):
     dimension: int | None = Field(default=None, description="Embedding vector dimension. Auto-detected when None.")
     batch_size: int | None = Field(default=None, description="Max texts per embedding API call. Auto from provider.")
     max_concurrency: int | None = Field(
-        default=None, description="Max concurrent embedding API calls / Tier 3 consumers. Auto from provider."
+        default=None, description="Max concurrent embedding API calls / embed consumers. Auto from provider."
     )
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
     truncate_ratio: float = Field(
@@ -272,6 +272,10 @@ class IndexSettings(BaseSettings):
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
     )
     max_source_chars: int = Field(default=2000, description="Max characters for entity source text (0 to disable).")
+    file_hash_gate: bool = Field(default=True, description="Skip files whose content hash hasn't changed.")
+    strip_whitespace: bool = Field(
+        default=True, description="Normalize whitespace before hashing (ignores formatting-only changes)."
+    )
 
 
 class ObservabilitySettings(BaseSettings):
@@ -289,6 +293,7 @@ class WatcherSettings(BaseSettings):
 
     debounce_s: float = Field(default=5.0, description="Debounce timer in seconds (resets per change).")
     max_wait_s: float = Field(default=30.0, description="Max-wait ceiling in seconds (per batch).")
+    cooldown_s: float = Field(default=10.0, description="Per-file cooldown after processing (seconds). 0 disables.")
 
 
 class McpSettings(BaseSettings):

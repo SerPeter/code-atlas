@@ -25,9 +25,8 @@ graph TB
 
     subgraph "Code Atlas — Daemon"
         FW[File Watcher]
-        T1[Tier 1: Graph Metadata]
-        T2[Tier 2: AST Diff]
-        T3[Tier 3: Embeddings]
+        AST[AST Stage]
+        EMB[Embed Stage]
     end
 
     subgraph "Code Atlas — MCP"
@@ -72,15 +71,12 @@ graph TB
     BS --> MG
 
     FW --> VK
-    VK --> T1
-    T1 --> VK
-    VK --> T2
-    T2 --> VK
-    VK --> T3
-    T1 --> MG
-    T2 --> MG
-    T3 --> MG
-    T3 --> TEI
+    VK --> AST
+    AST --> VK
+    VK --> EMB
+    AST --> MG
+    EMB --> MG
+    EMB --> TEI
 ```
 
 ## Component Architecture
@@ -111,34 +107,28 @@ Spawned per agent session via `atlas mcp`, it reads Memgraph directly with no de
 
 ### Event-Driven Pipeline
 
-The indexing pipeline is event-driven, with three tiers of increasing cost connected via Valkey (Redis) Streams. Each
-tier pulls at its own pace, deduplicates within its batch window, and gates downstream work based on significance.
+The indexing pipeline is event-driven, with two stages of increasing cost connected via Valkey (Redis) Streams. Each
+stage pulls at its own pace, deduplicates within its batch window, and gates downstream work based on significance.
 
 ```mermaid
 graph LR
     FW[File Watcher] -->|FileChanged| S1[atlas:file-changed]
-    S1 -->|XREADGROUP| T1[Tier 1: Graph Metadata<br/>0.5s batch, dedup by path]
-    T1 -->|ASTDirty| S2[atlas:ast-dirty]
-    S2 -->|XREADGROUP| T2[Tier 2: AST Diff<br/>3s batch, significance gate]
-    T2 -->|EmbedDirty| S3[atlas:embed-dirty]
-    S3 -->|XREADGROUP| T3[Tier 3: Embeddings<br/>15s batch, dedup by entity]
-    T1 -->|write| MG[(Memgraph)]
-    T2 -->|write| MG
-    T3 -->|write| MG
-    T3 -->|embed| TEI[TEI]
+    S1 -->|XREADGROUP| AST[AST Stage<br/>hash gate + parse + diff]
+    AST -->|EmbedDirty| S2[atlas:embed-dirty]
+    S2 -->|XREADGROUP| EMB[Embed Stage<br/>dedup by entity]
+    AST -->|write| MG[(Memgraph)]
+    EMB -->|write| MG
+    EMB -->|embed| TEI[TEI]
 ```
 
-**Tier 1 — Graph Metadata** (cheap, ~0.5s batch): Updates file node timestamps and staleness flags. Always publishes
-`ASTDirty` downstream.
+**AST Stage** (medium cost, ~3s batch): Applies a file hash gate to skip unchanged files, re-parses AST via tree-sitter,
+diffs entities, updates graph nodes/edges. Evaluates a significance gate — trivial changes (whitespace, formatting) stop
+here; semantic changes (signature, body, docstring) publish `EmbedDirty` to the Embed stage.
 
-**Tier 2 — AST Diff** (medium, ~3s batch): Re-parses AST via tree-sitter, diffs entities, updates graph nodes/edges.
-Evaluates a significance gate — trivial changes (whitespace, formatting) stop here; semantic changes (signature, body,
-docstring) publish `EmbedDirty` to Tier 3.
+**Embed Stage** (expensive, ~15s batch): Re-embeds affected entities via TEI, writes vectors to Memgraph. Deduplicates
+by entity qualified name across all events in the batch.
 
-**Tier 3 — Embeddings** (expensive, ~15s batch): Re-embeds affected entities via TEI, writes vectors to Memgraph.
-Deduplicates by entity qualified name across all events in the batch.
-
-**Significance Gate (Tier 2 → 3):**
+**Significance Gate (AST → Embed):**
 
 - Whitespace/formatting only → stop
 - Non-docstring comment → stop
@@ -259,17 +249,17 @@ MCP server is spawned per agent session.
 ```bash
 docker compose up -d                  # Memgraph (7687) + Valkey (6379)
 docker compose --profile tei up -d   # Include TEI (8080) for local embeddings
-atlas daemon start             # File watcher + tier consumers (long-running)
+atlas daemon start             # File watcher + AST/Embed consumers (long-running)
 atlas mcp                      # MCP server — stdio (Claude Code, Cursor)
 atlas mcp --transport http     # MCP server — Streamable HTTP (VS Code, JetBrains)
 ```
 
-The daemon publishes file change events to Valkey Streams, where tier consumers process them and write to Memgraph. The
-MCP server reads Memgraph directly — no dependency on the daemon for queries, so agents can query immediately even with
-a stale index.
+The daemon publishes file change events to Valkey Streams, where the AST and Embed consumers process them and write to
+Memgraph. The MCP server reads Memgraph directly — no dependency on the daemon for queries, so agents can query
+immediately even with a stale index.
 
 On startup, the daemon runs a reconciliation pass: compares filesystem state against the index and enqueues stale files
-through the pipeline progressively (Tier 1 first, then 2, then 3).
+through the pipeline progressively (AST stage first, then Embed stage).
 
 See [ADR-0005](adr/0005-deployment-process-model.md) for full rationale.
 

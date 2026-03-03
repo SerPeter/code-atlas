@@ -6,19 +6,22 @@ Requires Memgraph + Valkey (provided by conftest fixtures).
 from __future__ import annotations
 
 import asyncio
+import time
+from typing import TYPE_CHECKING
 
 import pytest
 
 from code_atlas.events import (
-    ASTDirty,
     EventBus,
     FileChanged,
     Topic,
     decode_event,
 )
-from code_atlas.indexing.consumers import Tier1GraphConsumer
-from code_atlas.settings import AtlasSettings
-from tests.conftest import NO_EMBED
+from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy
+
+if TYPE_CHECKING:
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.settings import AtlasSettings
 
 # All tests in this module require a live Redis/Valkey
 pytestmark = pytest.mark.integration
@@ -41,8 +44,15 @@ async def _clean_streams(event_bus: EventBus):
         await event_bus._redis.delete(key)
 
 
+def _write_python_file(root, rel_path: str, content: str) -> None:
+    """Write a Python file under *root* at the given relative path."""
+    full = root / rel_path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text(content, encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
-# Tests
+# EventBus tests
 # ---------------------------------------------------------------------------
 
 
@@ -104,37 +114,257 @@ async def test_dedup_within_batch(event_bus: EventBus) -> None:
     assert pending["src/main.py"].timestamp == 1004.0
 
 
-@pytest.mark.usefixtures("_clean_streams")
-async def test_tier1_publishes_downstream(event_bus: EventBus) -> None:
-    """Run Tier1 briefly, verify ASTDirty appears on the ast-dirty stream."""
-    # Set up consumer group for downstream
-    await event_bus.ensure_group(Topic.AST_DIRTY, "test-downstream")
+# ---------------------------------------------------------------------------
+# AST consumer tests
+# ---------------------------------------------------------------------------
 
-    # Publish a FileChanged event
-    await event_bus.publish(
-        Topic.FILE_CHANGED,
-        FileChanged(path="src/app.py", change_type="modified", timestamp=2000.0),
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_ast_consumes_file_changed(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """AST consumer processes FileChanged from the file-changed topic and writes entities to graph."""
+    await graph_client.ensure_schema()
+
+    # Write a Python file for the AST consumer to parse
+    _write_python_file(settings.project_root, "hello.py", "def greet(name: str) -> str:\n    return f'Hello {name}'\n")
+
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
     )
 
-    # Run Tier1 for a short period then stop
-    # Tier1 needs graph + settings but we're only testing event flow here;
-    # it doesn't call graph in its current implementation.
-    from unittest.mock import AsyncMock
+    # Publish a FileChanged and let the consumer process it
+    project_name = settings.project_root.resolve().name
+    await event_bus.publish(
+        Topic.FILE_CHANGED,
+        FileChanged(
+            path="hello.py",
+            change_type="created",
+            timestamp=time.time(),
+            project_name=project_name,
+            project_root=str(settings.project_root),
+        ),
+    )
 
-    mock_graph = AsyncMock()
-    test_settings = AtlasSettings(embeddings=NO_EMBED)
-    tier1 = Tier1GraphConsumer(event_bus, mock_graph, test_settings)
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(1.0)
+    consumer.stop()
+    await asyncio.wait_for(task, timeout=5.0)
 
-    async def stop_after_delay() -> None:
-        await asyncio.sleep(1.5)
-        tier1.stop()
+    assert consumer.stats.files_processed >= 1
+    assert consumer.stats.entities_added >= 1
 
-    await asyncio.gather(tier1.run(), stop_after_delay())
 
-    # Read from the downstream ast-dirty stream
-    messages = await event_bus.read_batch(Topic.AST_DIRTY, "test-downstream", "test-ds-0", count=10, block_ms=500)
-    assert len(messages) >= 1
+@pytest.mark.usefixtures("_clean_streams")
+async def test_file_hash_gate_skips_unchanged(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """Hash gate skips a file when content hasn't changed between runs."""
+    await graph_client.ensure_schema()
 
-    event = decode_event(Topic.AST_DIRTY, messages[0][1])
-    assert isinstance(event, ASTDirty)
-    assert event.path == "src/app.py"
+    _write_python_file(settings.project_root, "stable.py", "X = 42\n")
+
+    project_name = settings.project_root.resolve().name
+    ev = FileChanged(
+        path="stable.py",
+        change_type="modified",
+        timestamp=time.time(),
+        project_name=project_name,
+        project_root=str(settings.project_root),
+    )
+
+    # First run: processes the file and stores its hash
+    c1 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, ev)
+    task = asyncio.create_task(c1.run())
+    await asyncio.sleep(1.0)
+    c1.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+    assert c1.stats.files_processed >= 1
+
+    # Second run: same file, same content — should be skipped
+    c2 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, ev)
+    task = asyncio.create_task(c2.run())
+    await asyncio.sleep(1.0)
+    c2.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert c2.stats.files_skipped >= 1
+    assert c2.stats.files_processed == 0
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_file_hash_gate_processes_modified(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """Hash gate allows a file through when content changes between runs."""
+    await graph_client.ensure_schema()
+
+    _write_python_file(settings.project_root, "changing.py", "X = 1\n")
+
+    project_name = settings.project_root.resolve().name
+    ev = FileChanged(
+        path="changing.py",
+        change_type="modified",
+        timestamp=time.time(),
+        project_name=project_name,
+        project_root=str(settings.project_root),
+    )
+
+    # First run
+    c1 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, ev)
+    task = asyncio.create_task(c1.run())
+    await asyncio.sleep(1.0)
+    c1.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+    assert c1.stats.files_processed >= 1
+
+    # Modify the file
+    _write_python_file(settings.project_root, "changing.py", "X = 2\nY = 3\n")
+
+    # Second run: changed content — should process again
+    c2 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, ev)
+    task = asyncio.create_task(c2.run())
+    await asyncio.sleep(1.0)
+    c2.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert c2.stats.files_processed >= 1
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_cooldown_defers_rapid_edits(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """Per-file cooldown defers rapid re-edits so only the first is processed immediately."""
+    await graph_client.ensure_schema()
+
+    _write_python_file(settings.project_root, "rapid.py", "A = 1\n")
+
+    project_name = settings.project_root.resolve().name
+
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+        cooldown_s=60.0,  # Long cooldown — second event should be deferred
+    )
+
+    # Publish first event
+    await event_bus.publish(
+        Topic.FILE_CHANGED,
+        FileChanged(
+            path="rapid.py",
+            change_type="modified",
+            timestamp=time.time(),
+            project_name=project_name,
+            project_root=str(settings.project_root),
+        ),
+    )
+
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(1.0)
+
+    # First event should be processed
+    assert consumer.stats.files_processed >= 1
+    first_processed = consumer.stats.files_processed
+
+    # Publish a second event for the same file — should be deferred
+    await event_bus.publish(
+        Topic.FILE_CHANGED,
+        FileChanged(
+            path="rapid.py",
+            change_type="modified",
+            timestamp=time.time(),
+            project_name=project_name,
+            project_root=str(settings.project_root),
+        ),
+    )
+    await asyncio.sleep(1.0)
+
+    consumer.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    # Second event deferred — files_processed should not have increased
+    assert consumer.stats.files_processed == first_processed
+    assert consumer.stats.files_deferred >= 1
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_cooldown_disabled_processes_all(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """With cooldown_s=0, all events are processed immediately (reindex mode)."""
+    await graph_client.ensure_schema()
+
+    _write_python_file(settings.project_root, "nodelay.py", "Z = 1\n")
+
+    project_name = settings.project_root.resolve().name
+
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+        cooldown_s=0.0,  # No cooldown
+    )
+
+    # Publish two events for the same file
+    for i in range(2):
+        await event_bus.publish(
+            Topic.FILE_CHANGED,
+            FileChanged(
+                path="nodelay.py",
+                change_type="modified",
+                timestamp=time.time() + i,
+                project_name=project_name,
+                project_root=str(settings.project_root),
+            ),
+        )
+    # Small gap so they arrive in separate batches
+    await asyncio.sleep(0.1)
+
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(2.0)
+    consumer.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    # No deferral when cooldown is disabled
+    assert consumer.stats.files_deferred == 0

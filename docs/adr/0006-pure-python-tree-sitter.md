@@ -17,7 +17,7 @@ actual cost breakdown:
 - **Subprocess overhead** (spawn, JSON serialization, IPC) exceeded the parse time itself for typical files
 - **Build complexity** required both `uv` and `cargo` toolchains in dev/CI/Docker
 - **Contributor friction** — Rust was isolated to one component, but still required a full toolchain install
-- **Parallelism** is already handled by the event bus (multiple Tier 2 consumer instances via Valkey Streams), not by
+- **Parallelism** is already handled by the event bus (multiple AST consumer instances via Valkey Streams), not by
   Rust's threading model
 
 Meanwhile, `py-tree-sitter` uses the exact same C parsing library (tree-sitter) via Python bindings. The grammar
@@ -25,13 +25,13 @@ packages (`tree-sitter-python`, etc.) ship pre-compiled wheels — no compilatio
 
 ## Decision
 
-Drop the Rust binary (`crates/atlas-parser`) and use **py-tree-sitter** called in-process within the Tier 2 pipeline
+Drop the Rust binary (`crates/atlas-parser`) and use **py-tree-sitter** called in-process within the AST pipeline
 consumer. The parser module lives at `src/code_atlas/parser.py`.
 
 ### Architecture
 
 ```
-Tier 2 Consumer
+AST Consumer
   └── parser.parse_file(path, source, project_name)
         └── tree-sitter C engine (via py-tree-sitter bindings)
               └── tree-sitter-python grammar (pre-compiled wheel)
@@ -39,7 +39,7 @@ Tier 2 Consumer
 
 ### Parallelism Model
 
-Multiple Tier 2 consumer instances can run concurrently — each pulls from the `atlas:ast-dirty` Valkey Stream via its
+Multiple AST consumer instances can run concurrently — each pulls from the `atlas:file-changed` Valkey Stream via its
 own consumer group member. This gives process-level parallelism without the GIL concern, since each consumer is an
 independent process.
 

@@ -21,7 +21,7 @@
 - **ci**: Resolve ty check failures with --all-extras in CI
   ([`3f74816`](https://github.com/SerPeter/code-atlas/commit/3f7481635091d2d676aed75c3fbcaa5db4332242))
 
-- **consumers**: Group batches by project in Tier1/Tier2
+- **consumers**: Group batches by project in AST/Embed consumers
   ([#2](https://github.com/SerPeter/code-atlas/pull/2),
   [`5107b24`](https://github.com/SerPeter/code-atlas/commit/5107b24a7dfbcb44cadc7917f632ae6a9743c057))
 
@@ -190,7 +190,7 @@
 - **docs**: Add markdown parser with tree-sitter-markdown
   ([`e8d372c`](https://github.com/SerPeter/code-atlas/commit/e8d372c162652d6d73d1f66da5e14a61fcb2136a))
 
-- **embeddings**: Add EmbedClient with litellm routing and Tier 3 pipeline
+- **embeddings**: Add EmbedClient with litellm routing and embed pipeline
   ([`ad7c972`](https://github.com/SerPeter/code-atlas/commit/ad7c9726f2e48fdb8746b50547089c5c483bcb75))
 
 - **embeddings**: Add three-tier embedding cache with Valkey backend
@@ -241,7 +241,7 @@
 - **naming**: Worktree-aware naming and monorepo sub-project prefixing
   ([`2acdfb3`](https://github.com/SerPeter/code-atlas/commit/2acdfb33ba4b486f966272a01cf8a37f670661f6))
 
-- **parser**: Add py-tree-sitter parser, implement Tier 2 pipeline, drop Rust
+- **parser**: Add py-tree-sitter parser, implement AST pipeline, drop Rust
   ([`d56e7d2`](https://github.com/SerPeter/code-atlas/commit/d56e7d2a686ec279a52d85bbc4903f4d85f51a4e))
 
 - **parsing**: Add multi-language support (10 languages, 7 modules)

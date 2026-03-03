@@ -45,53 +45,50 @@ Redis Streams provide the pub/sub backbone with consumer groups:
 Typed frozen dataclasses with JSON serialization for Redis transport:
 
 - `FileChanged(path, change_type, timestamp)` — published by file watcher
-- `ASTDirty(paths, batch_id)` — published by Tier 1
-- `EmbedDirty(entities: list[EntityRef], significance, batch_id)` — published by Tier 2
+- `EmbedDirty(entities: list[EntityRef], significance, batch_id)` — published by AST stage
 
-### Three-Stream Pipeline
+### Two-Stage Pipeline
 
 ```
-                     atlas:file-changed        atlas:ast-dirty         atlas:embed-dirty
-                          stream                   stream                   stream
-                            │                        │                        │
-                     ┌──────▼───────┐         ┌──────▼───────┐        ┌──────▼───────┐
-  File Watcher ────► │   Tier 1     │ ──────► │   Tier 2     │ ─gate─►│   Tier 3     │
-                     │ Graph Metadata│ always  │  AST Diff +  │ only   │  Embeddings  │
-                     │  (0.5s batch) │         │  Graph Update │ if sig │ (15s batch)  │
-                     └──────────────┘         │  (3s batch)  │ change └──────────────┘
-                                              └──────────────┘
+                     atlas:file-changed                                atlas:embed-dirty
+                          stream                                           stream
+                            │                                                │
+                     ┌──────▼───────┐                                ┌──────▼───────┐
+  File Watcher ────► │  AST Stage   │ ─────── significance gate ───► │ Embed Stage  │
+                     │ hash gate +  │  only if semantically changed  │  Embeddings  │
+                     │ parse + diff │                                │ (15s batch)  │
+                     │  (3s batch)  │                                └──────────────┘
+                     └──────────────┘
 ```
 
-Each tier pulls at its own pace via `XREADGROUP`, deduplicates within its batch window, and publishes downstream only if
-warranted.
+Each stage pulls at its own pace via `XREADGROUP`, deduplicates within its batch window, and publishes downstream only
+if warranted.
 
 ### Per-Consumer Batch Policy
 
-| Tier           | Window | Max Batch | Dedup Key             |
-| -------------- | ------ | --------- | --------------------- |
-| Tier 1 (Graph) | 0.5s   | 50        | File path             |
-| Tier 2 (AST)   | 3.0s   | 20        | File path             |
-| Tier 3 (Embed) | 15.0s  | 100       | Entity qualified name |
+| Stage | Window | Max Batch | Dedup Key             |
+| ----- | ------ | --------- | --------------------- |
+| AST   | 3.0s   | 30        | File path             |
+| Embed | 15.0s  | 100       | Entity qualified name |
 
 Hybrid batching: flush when count OR time threshold hit, whichever first. Same file changed 5× in window = 1 work item.
 
 ### Event Data Flow
 
 ```
-FileChanged                ASTDirty                     EmbedDirty
-┌─────────────┐            ┌──────────────────┐          ┌──────────────────────────┐
-│ path: str   │            │ paths: [str]     │          │ entities: [EntityRef]    │
-│ change_type │ ─Tier 1──► │ batch_id: str    │ ─Tier 2─►│ significance: str        │
-│ timestamp   │            └──────────────────┘   gate   │ batch_id: str            │
-└─────────────┘                                          └──────────────────────────┘
-                                                          EntityRef:
-                                                            qualified_name, node_type,
-                                                            file_path
+FileChanged                                         EmbedDirty
+┌─────────────┐                                     ┌──────────────────────────┐
+│ path: str   │                                     │ entity: EntityRef        │
+│ change_type │ ─── AST stage ── sig gate ────────► │ significance: str        │
+│ timestamp   │                                     └──────────────────────────┘
+└─────────────┘                                      EntityRef:
+                                                       qualified_name, node_type,
+                                                       file_path
 ```
 
-### Significance Gating (Tier 2 → 3)
+### Significance Gating (AST → Embed)
 
-Tier 2 evaluates whether a change is semantically significant enough to warrant re-embedding:
+The AST stage evaluates whether a change is semantically significant enough to warrant re-embedding:
 
 | Condition                   | Level    | Action              |
 | --------------------------- | -------- | ------------------- |
@@ -115,25 +112,25 @@ own retries through this mechanism, avoiding the need for a separate dead-letter
 - Cheap operations (staleness flags, graph metadata) are near-instant — MCP queries reflect changes within ~1s
 - Expensive operations (embeddings) only run when semantically justified — significant cost reduction
 - Decoupled stages can be developed, tested, and scaled independently
-- Batching per tier matches the cost profile of each operation
+- Batching per stage matches the cost profile of each operation
 - Multi-process from day one — no rewrite needed when scaling
 - Dual-use of Valkey for event bus + embedding cache
-- Natural extension point: new tiers or event types can be added without restructuring
+- Natural extension point: new stages or event types can be added without restructuring
 
 ### Negative
 
 - More architectural complexity than a simple "reindex everything on change"
 - Significance threshold heuristics need tuning and may produce false negatives (skipping re-embeds that should have
   happened)
-- Debugging event flow across tiers is harder than a linear pipeline
+- Debugging event flow across stages is harder than a linear pipeline
 - Additional infrastructure dependency (Valkey), though lightweight
 
 ### Risks
 
 - Threshold tuning: too aggressive = stale embeddings, too conservative = excessive TEI calls. Need observability on
   gate decisions.
-- Event ordering: if Tier 2 processes file A before file B, but B depends on A's entities, the diff may be incorrect.
-  Batch boundaries must align with dependency boundaries.
+- Event ordering: if the AST stage processes file A before file B, but B depends on A's entities, the diff may be
+  incorrect. Batch boundaries must align with dependency boundaries.
 - Complexity creep: the event bus must stay simple. If we find ourselves adding routing rules, dead-letter queues, or
   retry logic, we've gone too far.
 
