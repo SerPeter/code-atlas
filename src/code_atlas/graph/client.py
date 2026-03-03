@@ -673,7 +673,10 @@ class GraphClient:
             "RETURN DISTINCT n.file_path AS fp, n.file_hash AS fh",
             {"p": project_name, "fps": file_paths},
         )
-        return {r["fp"]: r["fh"] for r in records}
+        result: dict[str, str | None] = dict.fromkeys(file_paths)
+        for r in records:
+            result[r["fp"]] = r["fh"]
+        return result
 
     async def set_batch_file_hashes(
         self,

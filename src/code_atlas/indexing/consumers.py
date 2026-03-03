@@ -51,12 +51,13 @@ _COLLAPSE_BLANK_RE = re.compile(rb"\n{3,}")
 def _compute_file_hash(source: bytes, *, strip_whitespace: bool = True) -> str:
     """Compute a short SHA-256 hash of file contents.
 
-    When *strip_whitespace* is True: strip leading/trailing whitespace per
-    line, collapse consecutive blank lines, then hash.  This makes the gate
-    ignore formatting-only changes (e.g. ``ruff format``).
+    When *strip_whitespace* is True: strip trailing whitespace per line,
+    collapse consecutive blank lines, then hash.  This makes the gate
+    ignore formatting-only changes (e.g. ``ruff format``) while preserving
+    leading indentation for indentation-sensitive languages.
     """
     if strip_whitespace:
-        lines = [line.strip() for line in source.splitlines()]
+        lines = [line.rstrip() for line in source.splitlines()]
         normalized = b"\n".join(lines)
         normalized = _COLLAPSE_BLANK_RE.sub(b"\n\n", normalized)
         return hashlib.sha256(normalized).hexdigest()[:16]
@@ -309,6 +310,7 @@ class ASTStats:
 
     files_processed: int = 0
     files_skipped: int = 0
+    files_deferred: int = 0
     files_deleted: int = 0
     entities_added: int = 0
     entities_modified: int = 0
@@ -510,6 +512,7 @@ class ASTConsumer(TierConsumer):
                     else:
                         processable.append(ev)
                 if deferred_count:
+                    self.stats.files_deferred += deferred_count
                     logger.debug("AST batch {}: {} event(s) deferred by cooldown", batch_id, deferred_count)
                 events = processable
                 if not events:

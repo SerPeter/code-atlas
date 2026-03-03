@@ -322,7 +322,7 @@ async def test_cooldown_defers_rapid_edits(
 
     # Second event deferred — files_processed should not have increased
     assert consumer.stats.files_processed == first_processed
-    assert "rapid.py" in consumer._deferred
+    assert consumer.stats.files_deferred >= 1
 
 
 @pytest.mark.usefixtures("_clean_streams")
@@ -366,5 +366,5 @@ async def test_cooldown_disabled_processes_all(
     consumer.stop()
     await asyncio.wait_for(task, timeout=5.0)
 
-    # Both events processed — no deferral
-    assert not consumer._deferred
+    # No deferral when cooldown is disabled
+    assert consumer.stats.files_deferred == 0
