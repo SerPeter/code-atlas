@@ -10,6 +10,8 @@ deduplicates within its batch window.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -41,6 +43,24 @@ if TYPE_CHECKING:
     from code_atlas.settings import AtlasSettings
 
 _tracer = get_tracer(__name__)
+
+_COLLAPSE_BLANK_RE = re.compile(rb"\n{3,}")
+
+
+def _compute_file_hash(source: bytes, *, strip_whitespace: bool = True) -> str:
+    """Compute a short SHA-256 hash of file contents.
+
+    When *strip_whitespace* is True: strip leading/trailing whitespace per
+    line, collapse consecutive blank lines, then hash.  This makes the gate
+    ignore formatting-only changes (e.g. ``ruff format``).
+    """
+    if strip_whitespace:
+        lines = [line.strip() for line in source.splitlines()]
+        normalized = b"\n".join(lines)
+        normalized = _COLLAPSE_BLANK_RE.sub(b"\n\n", normalized)
+        return hashlib.sha256(normalized).hexdigest()[:16]
+    return hashlib.sha256(source).hexdigest()[:16]
+
 
 # ---------------------------------------------------------------------------
 # Batch policy
@@ -400,22 +420,26 @@ class Tier2ASTConsumer(TierConsumer):
         file_path: str,
         *,
         project_root: Path | None = None,
+        source: bytes | None = None,
     ) -> _ParsedFileData | None:
         """Parse and detect a single file without graph writes.
 
         Returns ``None`` for unreadable/unsupported files, ``_SENTINEL_DELETED``
         for deleted files, or a ``_ParsedFileData`` with parsed results.
+
+        If *source* is provided, it is used directly (avoids re-reading from disk
+        when the hash gate has already read the file).
         """
         root = project_root if project_root is not None else self._project_root
-        full_path = root / file_path
-        if not full_path.is_file():
-            return _SENTINEL_DELETED
-
-        try:
-            source = full_path.read_bytes()
-        except OSError:
-            logger.warning("Tier2: cannot read {}", file_path)
-            return None
+        if source is None:
+            full_path = root / file_path
+            if not full_path.is_file():
+                return _SENTINEL_DELETED
+            try:
+                source = full_path.read_bytes()
+            except OSError:
+                logger.warning("Tier2: cannot read {}", file_path)
+                return None
 
         parsed = parse_file(file_path, source, project_name, max_source_chars=self.settings.index.max_source_chars)
         if parsed is None:
@@ -459,15 +483,66 @@ class Tier2ASTConsumer(TierConsumer):
             for (event_project_name, event_project_root), unique_paths in groups.items():
                 project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
                 effective_root = Path(event_project_root) if event_project_root else None
+                root = effective_root if effective_root is not None else self._project_root
+
+                # 0. File hash gate — read files, compute hashes, skip unchanged
+                use_hash_gate = self.settings.index.file_hash_gate
+                strip_ws = self.settings.index.strip_whitespace
+                file_sources: dict[str, bytes] = {}  # file_path → source bytes (pre-read)
+                deleted_files: list[str] = []
+
+                # Separate deleted files (always process) and read live files
+                live_paths: list[str] = []
+                for fp in unique_paths:
+                    full_path = root / fp
+                    if not full_path.is_file():
+                        deleted_files.append(fp)
+                    else:
+                        try:
+                            file_sources[fp] = full_path.read_bytes()
+                            live_paths.append(fp)
+                        except OSError:
+                            logger.warning("Tier2: cannot read {}", fp)
+
+                # Apply hash gate to live files
+                if use_hash_gate and live_paths:
+                    new_hashes = {
+                        fp: _compute_file_hash(file_sources[fp], strip_whitespace=strip_ws) for fp in live_paths
+                    }
+                    stored_hashes = await self.graph.get_batch_file_hashes(project_name, live_paths)
+
+                    gate_passed: list[str] = []
+                    for fp in live_paths:
+                        stored = stored_hashes.get(fp)
+                        if stored is not None and stored == new_hashes[fp]:
+                            self.stats.files_skipped += 1
+                        else:
+                            gate_passed.append(fp)
+
+                    hash_skipped = len(live_paths) - len(gate_passed)
+                    if hash_skipped:
+                        logger.debug(
+                            "Tier2 batch {}: hash gate skipped {}/{} file(s)",
+                            batch_id,
+                            hash_skipped,
+                            len(live_paths),
+                        )
+                    live_paths = gate_passed
+                else:
+                    new_hashes = {}
 
                 # 1. Parse loop (async, per-file) — no graph writes
                 parsed_files: dict[str, _ParsedFileData] = {}
-                deleted_files: list[str] = []
 
-                for file_idx, file_path in enumerate(unique_paths, 1):
+                for file_idx, file_path in enumerate(live_paths, 1):
                     if file_idx % 50 == 0:
-                        logger.debug("Tier2 batch {}: parsed {}/{} files", batch_id, file_idx, len(unique_paths))
-                    pfd = await self._parse_file(project_name, file_path, project_root=effective_root)
+                        logger.debug("Tier2 batch {}: parsed {}/{} files", batch_id, file_idx, len(live_paths))
+                    pfd = await self._parse_file(
+                        project_name,
+                        file_path,
+                        project_root=effective_root,
+                        source=file_sources.get(file_path),
+                    )
                     if pfd is _SENTINEL_DELETED:
                         deleted_files.append(file_path)
                     elif pfd is not None:
@@ -556,7 +631,13 @@ class Tier2ASTConsumer(TierConsumer):
                                     text_hash = EmbedCache.hash_text(text)
                                     embed_candidates[entity.qualified_name] = (ref, text_hash)
 
-                # 6. Accumulate rels for deferred resolution
+                # 6. Write back file hashes for processed files
+                if new_hashes:
+                    hashes_to_write = {fp: new_hashes[fp] for fp in parsed_files if fp in new_hashes}
+                    if hashes_to_write:
+                        await self.graph.set_batch_file_hashes(project_name, hashes_to_write)
+
+                # 7. Accumulate rels for deferred resolution
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
                 group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
                 group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]

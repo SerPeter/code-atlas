@@ -272,6 +272,10 @@ class IndexSettings(BaseSettings):
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
     )
     max_source_chars: int = Field(default=2000, description="Max characters for entity source text (0 to disable).")
+    file_hash_gate: bool = Field(default=True, description="Skip files whose content hash hasn't changed.")
+    strip_whitespace: bool = Field(
+        default=True, description="Normalize whitespace before hashing (ignores formatting-only changes)."
+    )
 
 
 class ObservabilitySettings(BaseSettings):
