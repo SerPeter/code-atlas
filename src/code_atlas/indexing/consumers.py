@@ -1,8 +1,6 @@
-"""Tiered consumer pipeline for event-driven indexing.
+"""Two-tier consumer pipeline for event-driven indexing.
 
-Three tiers form a linear pipeline, each pulling at its own pace:
-
-    FileChanged → Tier 1 (graph metadata) → ASTDirty → Tier 2 (AST parse)
+    FileChanged → Tier 2 (hash gate + AST parse + diff)
                 → significance gate → EmbedDirty → Tier 3 (embeddings)
 
 Each tier uses batch-pull with configurable time/count policy and
@@ -21,7 +19,6 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from code_atlas.events import (
-    ASTDirty,
     EmbedDirty,
     EntityRef,
     Event,
@@ -105,7 +102,7 @@ class TierConsumer(ABC):
         if self._project_filter is None:
             return True
         pn = ""
-        if isinstance(event, (FileChanged, ASTDirty)):
+        if isinstance(event, FileChanged):
             pn = event.project_name
         elif isinstance(event, EmbedDirty):
             # EmbedDirty doesn't carry project_name directly — always accept
@@ -261,55 +258,6 @@ class TierConsumer(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Tier 1: Graph metadata (cheap, fast)
-# ---------------------------------------------------------------------------
-
-
-class Tier1GraphConsumer(TierConsumer):
-    """Tier 1: Update file-level graph metadata, always publish ASTDirty downstream."""
-
-    def __init__(
-        self, bus: EventBus, graph: GraphClient, settings: AtlasSettings, *, project_filter: set[str] | None = None
-    ) -> None:
-        super().__init__(
-            bus=bus,
-            input_topic=Topic.FILE_CHANGED,
-            group="tier1-graph",
-            consumer_name="tier1-graph-0",
-            policy=BatchPolicy(time_window_s=0.5, max_batch_size=50),
-            project_filter=project_filter,
-        )
-        self.graph = graph
-        self.settings = settings
-
-    def dedup_key(self, event: Event) -> str:
-        if isinstance(event, FileChanged):
-            return event.path
-        return super().dedup_key(event)
-
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:
-        with _tracer.start_as_current_span("tier1.process_batch", attributes={"batch_id": batch_id}):
-            # Group files by (project_name, project_root) — monorepo batches can mix sub-projects
-            groups: dict[tuple[str, str], list[str]] = {}
-            for e in events:
-                if isinstance(e, FileChanged):
-                    key = (e.project_name, e.project_root)
-                    groups.setdefault(key, []).append(e.path)
-
-            total = sum(len(p) for p in groups.values())
-            logger.debug("Tier1 batch {}: {} file(s) in {} group(s)", batch_id, total, len(groups))
-
-            # TODO: Update Memgraph file nodes (timestamps, staleness flags)
-
-            # Publish one ASTDirty per file — Tier 2 decides significance
-            for (project_name, project_root), paths in groups.items():
-                await self.bus.publish_many(
-                    Topic.AST_DIRTY,
-                    [ASTDirty(path=p, project_name=project_name, project_root=project_root) for p in paths],
-                )
-
-
-# ---------------------------------------------------------------------------
 # Tier 2: AST parse + graph write (medium cost)
 # ---------------------------------------------------------------------------
 
@@ -380,7 +328,7 @@ class Tier2ASTConsumer(TierConsumer):
     ) -> None:
         super().__init__(
             bus=bus,
-            input_topic=Topic.AST_DIRTY,
+            input_topic=Topic.FILE_CHANGED,
             group="tier2-ast",
             consumer_name="tier2-ast-0",
             policy=policy or BatchPolicy(time_window_s=3.0, max_batch_size=30),
@@ -406,7 +354,7 @@ class Tier2ASTConsumer(TierConsumer):
         self._pending_project_names: set[str] = set()
 
     def dedup_key(self, event: Event) -> str:
-        if isinstance(event, ASTDirty):
+        if isinstance(event, FileChanged):
             return event.path
         return super().dedup_key(event)
 
@@ -493,7 +441,7 @@ class Tier2ASTConsumer(TierConsumer):
             # Group paths by (project_name, project_root) — monorepo batches can mix sub-projects
             groups: dict[tuple[str, str], list[str]] = {}
             for e in events:
-                if isinstance(e, ASTDirty):
+                if isinstance(e, FileChanged):
                     key = (e.project_name, e.project_root)
                     groups.setdefault(key, []).append(e.path)
 

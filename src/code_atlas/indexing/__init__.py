@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from code_atlas.indexing.consumers import (
     BatchPolicy,
-    Tier1GraphConsumer,
     Tier2ASTConsumer,
     Tier3EmbedConsumer,
     TierConsumer,
@@ -34,7 +33,6 @@ __all__ = [
     "IndexResult",
     "StalenessChecker",
     "StalenessInfo",
-    "Tier1GraphConsumer",
     "Tier2ASTConsumer",
     "Tier3EmbedConsumer",
     "TierConsumer",

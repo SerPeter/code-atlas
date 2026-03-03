@@ -1,7 +1,7 @@
 """Daemon manager — reusable watcher + pipeline lifecycle.
 
 Encapsulates the EventBus, FileWatcher, EmbedClient, EmbedCache,
-and Tier 1/2/3 consumers.  Used by both the CLI (``atlas watch``,
+and Tier 2/3 consumers.  Used by both the CLI (``atlas watch``,
 ``atlas daemon start``) and the MCP server for auto-indexing.
 """
 
@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from code_atlas.events import EventBus
-from code_atlas.indexing.consumers import Tier1GraphConsumer, Tier2ASTConsumer, Tier3EmbedConsumer
+from code_atlas.indexing.consumers import Tier2ASTConsumer, Tier3EmbedConsumer
 from code_atlas.indexing.orchestrator import FileScope, detect_sub_projects
 from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
@@ -31,9 +31,7 @@ class DaemonManager:
 
     _bus: EventBus | None = field(default=None, repr=False)
     _watcher: FileWatcher | None = field(default=None, repr=False)
-    _consumers: list[Tier1GraphConsumer | Tier2ASTConsumer | Tier3EmbedConsumer] = field(
-        default_factory=list, repr=False
-    )
+    _consumers: list[Tier2ASTConsumer | Tier3EmbedConsumer] = field(default_factory=list, repr=False)
     _tasks: list[asyncio.Task[None]] = field(default_factory=list, repr=False)
     _cache: EmbedCache | None = field(default=None, repr=False)
     _embed: EmbedClient | None = field(default=None, repr=False)
@@ -79,8 +77,7 @@ class DaemonManager:
                 cache = EmbedCache(settings.redis, settings.embeddings)
             self._cache = cache
 
-        consumers: list[Tier1GraphConsumer | Tier2ASTConsumer | Tier3EmbedConsumer] = [
-            Tier1GraphConsumer(bus, graph, settings),
+        consumers: list[Tier2ASTConsumer | Tier3EmbedConsumer] = [
             Tier2ASTConsumer(bus, graph, settings),
         ]
         if embed is not None:
@@ -146,7 +143,7 @@ class DaemonManager:
             logger.exception("File watcher crashed")
 
     @staticmethod
-    async def _run_consumer(consumer: Tier1GraphConsumer | Tier2ASTConsumer | Tier3EmbedConsumer) -> None:
+    async def _run_consumer(consumer: Tier2ASTConsumer | Tier3EmbedConsumer) -> None:
         """Run a consumer, catching exceptions so one failure doesn't crash the rest."""
         try:
             await consumer.run()

@@ -5,20 +5,14 @@ Requires Memgraph + Valkey (provided by conftest fixtures).
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from code_atlas.events import (
-    ASTDirty,
     EventBus,
     FileChanged,
     Topic,
     decode_event,
 )
-from code_atlas.indexing.consumers import Tier1GraphConsumer
-from code_atlas.settings import AtlasSettings
-from tests.conftest import NO_EMBED
 
 # All tests in this module require a live Redis/Valkey
 pytestmark = pytest.mark.integration
@@ -102,39 +96,3 @@ async def test_dedup_within_batch(event_bus: EventBus) -> None:
 
     assert len(pending) == 1
     assert pending["src/main.py"].timestamp == 1004.0
-
-
-@pytest.mark.usefixtures("_clean_streams")
-async def test_tier1_publishes_downstream(event_bus: EventBus) -> None:
-    """Run Tier1 briefly, verify ASTDirty appears on the ast-dirty stream."""
-    # Set up consumer group for downstream
-    await event_bus.ensure_group(Topic.AST_DIRTY, "test-downstream")
-
-    # Publish a FileChanged event
-    await event_bus.publish(
-        Topic.FILE_CHANGED,
-        FileChanged(path="src/app.py", change_type="modified", timestamp=2000.0),
-    )
-
-    # Run Tier1 for a short period then stop
-    # Tier1 needs graph + settings but we're only testing event flow here;
-    # it doesn't call graph in its current implementation.
-    from unittest.mock import AsyncMock
-
-    mock_graph = AsyncMock()
-    test_settings = AtlasSettings(embeddings=NO_EMBED)
-    tier1 = Tier1GraphConsumer(event_bus, mock_graph, test_settings)
-
-    async def stop_after_delay() -> None:
-        await asyncio.sleep(1.5)
-        tier1.stop()
-
-    await asyncio.gather(tier1.run(), stop_after_delay())
-
-    # Read from the downstream ast-dirty stream
-    messages = await event_bus.read_batch(Topic.AST_DIRTY, "test-downstream", "test-ds-0", count=10, block_ms=500)
-    assert len(messages) >= 1
-
-    event = decode_event(Topic.AST_DIRTY, messages[0][1])
-    assert isinstance(event, ASTDirty)
-    assert event.path == "src/app.py"
