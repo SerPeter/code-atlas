@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-03-04)
+
+### Features
+
+- **indexing**: Add file hash gate to skip unchanged files
+  ([#9](https://github.com/SerPeter/code-atlas/pull/9))
+- **indexing**: Add per-file cooldown for daemon mode
+  ([#9](https://github.com/SerPeter/code-atlas/pull/9))
+
+### Performance Improvements
+
+- Reduce RTTs across indexing and query pipelines
+  ([`cf3a519`](https://github.com/SerPeter/code-atlas/commit/cf3a519))
+
+### Refactoring
+
+- **indexing**: Eliminate Tier 1 consumer, simplify to two-tier pipeline
+  ([#9](https://github.com/SerPeter/code-atlas/pull/9))
+- **indexing**: Rename Tier 2/3 to AST/Embed stage across code and docs
+  ([#9](https://github.com/SerPeter/code-atlas/pull/9))
+
+### Bug Fixes
+
+- **ci**: Remove detached HEAD checkout in release workflow
+
 ## v0.2.0-dev.2 (2026-02-23)
 
 ### Bug Fixes
