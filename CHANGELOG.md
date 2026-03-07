@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.1 (2026-03-07)
+
+### Bug Fixes
+
+- **ci**: Use GitHub App token to push to protected main branch
+  ([`13b46b9`](https://github.com/SerPeter/code-atlas/commit/13b46b972f900e4d1170b9c42af0c40d9c0cf35c))
+
+
 ## v0.3.0 (2026-03-04)
 
 ### Features
