@@ -42,6 +42,11 @@ def _slabel(text: str, max_len: int = 40) -> str:
     return text
 
 
+def _module_package(qn: str) -> str:
+    """Derive the parent package from a module qualified name."""
+    return qn.rsplit(".", 1)[0] if "." in qn else ""
+
+
 # ---------------------------------------------------------------------------
 # Public dispatchers
 # ---------------------------------------------------------------------------
@@ -308,8 +313,8 @@ async def _analyze_dependencies(graph: GraphClient, project: str, path: str, lim
     # Cross-package coupling (derive from module imports)
     pkg_edges: dict[tuple[str, str], int] = {}
     for (from_mod, to_mod), weight in edge_weights.items():
-        from_pkg = from_mod.split(".")[0]
-        to_pkg = to_mod.split(".")[0]
+        from_pkg = _module_package(from_mod)
+        to_pkg = _module_package(to_mod)
         if from_pkg != to_pkg:
             key = (from_pkg, to_pkg)
             pkg_edges[key] = pkg_edges.get(key, 0) + weight
@@ -458,11 +463,6 @@ async def _analyze_patterns(graph: GraphClient, project: str, path: str, limit: 
 # ---------------------------------------------------------------------------
 # Quality (health score + spaghettification detection)
 # ---------------------------------------------------------------------------
-
-
-def _module_package(qn: str) -> str:
-    """Derive the parent package from a module qualified name."""
-    return qn.rsplit(".", 1)[0] if "." in qn else ""
 
 
 def _health_score(
