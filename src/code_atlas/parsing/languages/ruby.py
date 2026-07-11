@@ -184,6 +184,22 @@ def _walk_ruby_body(
             new_vis = _handle_visibility_call(child)
             if new_vis is not None:
                 current_visibility = new_vis
+            else:
+                # Inline form: `private def foo` — the definition is wrapped in
+                # the call's arguments. Extract it with the modifier's visibility;
+                # the modifier applies to that method only, not subsequent ones.
+                _process_inline_visibility_method(
+                    child,
+                    path,
+                    source,
+                    project_name,
+                    module_qn,
+                    parent_qn,
+                    parent_type,
+                    entities,
+                    relationships,
+                    scope_stack,
+                )
             continue
 
         # Also handle bare identifiers: `private`, `protected`, `public` on their own line
@@ -258,6 +274,65 @@ def _is_visibility_modifier(call_node: Node) -> bool:
         return False
     name = node_text(method_node)
     return name in ("private", "protected", "public")
+
+
+def _visibility_modifier_value(call_node: Node) -> str:
+    """Map a visibility modifier call node to its Visibility value."""
+    method_node = call_node.child_by_field_name("method")
+    name = node_text(method_node) if method_node is not None else ""
+    return {"private": Visibility.PRIVATE, "protected": Visibility.PROTECTED}.get(name, Visibility.PUBLIC)
+
+
+def _process_inline_visibility_method(
+    call_node: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    module_qn: str,
+    parent_qn: str,
+    parent_type: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+    scope_stack: list[str],
+) -> None:
+    """Process ``private def foo`` / ``public def foo`` / ``protected def foo``.
+
+    The method definition is wrapped in the visibility call's arguments; the
+    modifier's visibility applies to that method only. Symbol arguments
+    (``private :foo``) contain no definition nodes and are skipped.
+    """
+    inline_vis = _visibility_modifier_value(call_node)
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return
+    for arg in args.children:
+        if arg.type == "method":
+            _process_ruby_method(
+                arg,
+                path,
+                source,
+                project_name,
+                module_qn,
+                parent_qn,
+                parent_type,
+                inline_vis,
+                entities,
+                relationships,
+                scope_stack,
+            )
+        elif arg.type == "singleton_method":
+            _process_ruby_singleton_method(
+                arg,
+                path,
+                source,
+                project_name,
+                module_qn,
+                parent_qn,
+                inline_vis,
+                entities,
+                relationships,
+                scope_stack,
+            )
 
 
 def _handle_visibility_call(call_node: Node) -> str | None:

@@ -232,6 +232,99 @@ end
     assert visible.visibility == Visibility.PUBLIC
 
 
+def test_inline_private_def():
+    parsed = _parse("""\
+class Account
+  def visible
+  end
+
+  private def helper
+    42
+  end
+
+  def after_inline
+  end
+end
+""")
+    helper = _entity_by_name(parsed, "helper")
+    assert helper.label == NodeLabel.CALLABLE
+    assert helper.kind == CallableKind.METHOD
+    assert helper.qualified_name == f"{PROJECT}:lib.example.Account.helper"
+    assert helper.visibility == Visibility.PRIVATE
+
+    # Inline modifier applies only to the wrapped method, not subsequent ones
+    assert _entity_by_name(parsed, "after_inline").visibility == Visibility.PUBLIC
+
+
+def test_inline_protected_def():
+    parsed = _parse("""\
+class Base
+  protected def compare(other)
+  end
+end
+""")
+    method = _entity_by_name(parsed, "compare")
+    assert method.visibility == Visibility.PROTECTED
+
+
+def test_inline_public_def():
+    parsed = _parse("""\
+class Example
+  private
+
+  def hidden
+  end
+
+  public def shown
+  end
+
+  def still_hidden
+  end
+end
+""")
+    shown = _entity_by_name(parsed, "shown")
+    assert shown.visibility == Visibility.PUBLIC
+
+    # Inline `public def` does not end the surrounding private section
+    assert _entity_by_name(parsed, "hidden").visibility == Visibility.PRIVATE
+    assert _entity_by_name(parsed, "still_hidden").visibility == Visibility.PRIVATE
+
+
+def test_inline_private_def_defines_and_calls():
+    parsed = _parse("""\
+class Worker
+  def perform
+    helper
+  end
+
+  private def helper
+    validate
+  end
+end
+""")
+    defines = _rels_from(parsed, "lib.example.Worker", RelType.DEFINES)
+    assert any(r.to_name == f"{PROJECT}:lib.example.Worker.helper" for r in defines)
+
+    calls = _rels_from(parsed, "lib.example.Worker.helper", RelType.CALLS)
+    assert any(r.to_name == "validate" for r in calls)
+
+
+def test_inline_visibility_mixed_with_bare_sections():
+    parsed = _parse("""\
+class Mixed
+  private def early_helper
+  end
+
+  private
+
+  def section_private
+  end
+end
+""")
+    assert _entity_by_name(parsed, "early_helper").visibility == Visibility.PRIVATE
+    assert _entity_by_name(parsed, "section_private").visibility == Visibility.PRIVATE
+
+
 # ---------------------------------------------------------------------------
 # 8. require / require_relative -> IMPORTS
 # ---------------------------------------------------------------------------
