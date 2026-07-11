@@ -161,6 +161,80 @@ public class Foo {
         assert ctors[0].kind == CallableKind.CONSTRUCTOR
 
 
+class TestJavaOverloads:
+    @pytest.fixture(autouse=True)
+    def _require_java(self):
+        pytest.importorskip("tree_sitter_java")
+
+    OVERLOAD_SOURCE = """\
+class A {
+    void process(Order o) { helperOne(); }
+    void process(java.util.List<Order> os, String... rest) { helperTwo(); }
+    void single(int x) {}
+}
+"""
+
+    def test_method_overloads_distinct_qualified_names(self):
+        parsed = _parse(self.OVERLOAD_SOURCE)
+        overloads = [e for e in parsed.entities if e.name == "process"]
+        assert len(overloads) == 2
+        assert all(e.label == NodeLabel.CALLABLE for e in overloads)
+        assert {e.qualified_name for e in overloads} == {
+            f"{PROJECT}:src.Example.A.process(Order)",
+            f"{PROJECT}:src.Example.A.process(List<Order>,String[])",
+        }
+        # Non-overloaded sibling keeps today's bare qn
+        single = _entity_by_name(parsed, "single")
+        assert single.qualified_name == f"{PROJECT}:src.Example.A.single"
+
+    def test_constructor_overloads_distinct(self):
+        source = """\
+class A {
+    A() {}
+    A(int x) {}
+}
+"""
+        parsed = _parse(source)
+        ctors = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.kind == CallableKind.CONSTRUCTOR]
+        expected = {f"{PROJECT}:src.Example.A.A()", f"{PROJECT}:src.Example.A.A(int)"}
+        assert {e.qualified_name for e in ctors} == expected
+        defines = _rels_from(parsed, "src.Example.A", RelType.DEFINES)
+        assert expected <= {r.to_name for r in defines}
+
+    def test_overload_suffix_stable_under_reordering(self):
+        swapped = """\
+class A {
+    void process(java.util.List<Order> os, String... rest) { helperTwo(); }
+    void process(Order o) { helperOne(); }
+    void single(int x) {}
+}
+"""
+        qns_original = {e.qualified_name for e in _parse(self.OVERLOAD_SOURCE).entities if e.name == "process"}
+        qns_swapped = {e.qualified_name for e in _parse(swapped).entities if e.name == "process"}
+        assert qns_original == qns_swapped
+        assert qns_original == {
+            f"{PROJECT}:src.Example.A.process(Order)",
+            f"{PROJECT}:src.Example.A.process(List<Order>,String[])",
+        }
+
+    def test_calls_attributed_to_correct_overload(self):
+        parsed = _parse(self.OVERLOAD_SOURCE)
+        calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+        pairs = {(r.from_qualified_name, r.to_name) for r in calls}
+        assert (f"{PROJECT}:src.Example.A.process(Order)", "helperOne") in pairs
+        assert (f"{PROJECT}:src.Example.A.process(List<Order>,String[])", "helperTwo") in pairs
+
+    def test_varargs_suffix_is_dot_free(self):
+        """Varargs render as 'T[]', never 'T...' — dots in qualified_name separate scope segments only (S6)."""
+        parsed = _parse(self.OVERLOAD_SOURCE)
+        varargs_qn = next(
+            e.qualified_name for e in parsed.entities if e.name == "process" and "String[]" in e.qualified_name
+        )
+        suffix = varargs_qn.split(".process", 1)[1]
+        assert suffix == "(List<Order>,String[])"
+        assert "." not in suffix
+
+
 class TestJavaVisibility:
     @pytest.fixture(autouse=True)
     def _require_java(self):
@@ -223,6 +297,13 @@ class TestJavaInheritance:
         impl_names = {r.to_name for r in implements}
         assert "Runnable" in impl_names
         assert "Serializable" in impl_names
+
+    def test_implements_emits_bare_names(self):
+        """IMPLEMENTS to_name is the bare interface name — never a uid (no ':'), per the S1 contract."""
+        parsed = _parse("public class Foo implements Runnable {}\n")
+        implements = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+        assert {r.to_name for r in implements} == {"Runnable"}
+        assert all(":" not in r.to_name for r in implements)
 
 
 class TestJavaDocstring:
@@ -543,6 +624,61 @@ public class Foo {
         assert ctors[0].name == "Foo"
 
 
+class TestCSharpOverloads:
+    @pytest.fixture(autouse=True)
+    def _require_csharp(self):
+        pytest.importorskip("tree_sitter_c_sharp")
+
+    def test_ref_modifier_overloads_distinct(self):
+        source = """\
+public class A {
+    public void Set(int v) {}
+    public void Set(ref int v) {}
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        overloads = [e for e in parsed.entities if e.name == "Set"]
+        assert {e.qualified_name for e in overloads} == {
+            f"{PROJECT}:src.Example.A.Set(int)",
+            f"{PROJECT}:src.Example.A.Set(ref int)",
+        }
+
+    def test_generic_arity_overloads_distinct(self):
+        source = """\
+public class A {
+    public void F<T>(T t) {}
+    public void F() {}
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        overloads = [e for e in parsed.entities if e.name == "F"]
+        assert {e.qualified_name for e in overloads} == {
+            f"{PROJECT}:src.Example.A.F<T>(T)",
+            f"{PROJECT}:src.Example.A.F()",
+        }
+
+    def test_constructor_and_params_array_overloads(self):
+        source = """\
+public class A {
+    public A() {}
+    public A(int x) {}
+    public void Log(string fmt) {}
+    public void Log(string fmt, params object[] args) {}
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        ctors = [e for e in parsed.entities if e.kind == CallableKind.CONSTRUCTOR]
+        assert {e.qualified_name for e in ctors} == {
+            f"{PROJECT}:src.Example.A.A()",
+            f"{PROJECT}:src.Example.A.A(int)",
+        }
+        logs = [e for e in parsed.entities if e.name == "Log"]
+        assert {e.qualified_name for e in logs} == {
+            f"{PROJECT}:src.Example.A.Log(string)",
+            f"{PROJECT}:src.Example.A.Log(string,params object[])",
+        }
+
+
 class TestCSharpVisibility:
     @pytest.fixture(autouse=True)
     def _require_csharp(self):
@@ -609,6 +745,13 @@ class TestCSharpInheritance:
         parsed = _parse("public class Foo : IDisposable {}\n", path="src/Example.cs")
         implements = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
         assert any(r.to_name == "IDisposable" for r in implements)
+
+    def test_implements_emits_bare_names(self):
+        """IMPLEMENTS to_name is the bare interface name — never a uid (no ':'), per the S1 contract."""
+        parsed = _parse("public class Foo : IDisposable {}\n", path="src/Example.cs")
+        implements = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+        assert {r.to_name for r in implements} == {"IDisposable"}
+        assert all(":" not in r.to_name for r in implements)
 
 
 class TestCSharpDocstring:

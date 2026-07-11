@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -231,6 +232,82 @@ def _extract_signature_from_node(node: Node, source: bytes) -> str | None:
     return text or None
 
 
+# Node types whose same-named siblings form an overload set (Java and C# share these).
+_OVERLOADABLE_MEMBER_TYPES: frozenset[str] = frozenset({"method_declaration", "constructor_declaration"})
+
+_TYPE_QUALIFIER_RE = re.compile(r"[\w$]+(?:\.|::)")
+
+
+def _normalize_type_text(text: str) -> str:
+    """Normalize a parameter type for overload suffixes: strip whitespace and package/namespace qualifiers."""
+    return _TYPE_QUALIFIER_RE.sub("", "".join(text.split()))
+
+
+def _overloaded_callable_names(node: Node) -> frozenset[str]:
+    """Names declared by 2+ method/constructor declarations among *node*'s direct children."""
+    counts: Counter[str] = Counter()
+    for child in node.children:
+        if child.type in _OVERLOADABLE_MEMBER_TYPES:
+            name_node = child.child_by_field_name("name")
+            if name_node is not None:
+                counts[node_text(name_node)] += 1
+    return frozenset(name for name, c in counts.items() if c > 1)
+
+
+def _java_param_types(node: Node) -> str:
+    """Comma-joined normalized parameter types for a Java method/constructor declaration."""
+    params = node.child_by_field_name("parameters")
+    if params is None:
+        return ""
+    types: list[str] = []
+    for child in params.named_children:
+        if child.type == "formal_parameter":
+            t = child.child_by_field_name("type")
+            if t is not None:
+                types.append(_normalize_type_text(node_text(t)))
+        elif child.type == "spread_parameter":
+            # No fields in the grammar: type is the first named child that isn't modifiers/declarator.
+            # Varargs render as 'T[]', not 'T...': the suffix must stay dot-free (dots in
+            # qualified_name separate scope segments only), and Java forbids a same-erasure
+            # T[] overload next to T..., so '[]' can never collide within an overload set.
+            for sc in child.named_children:
+                if sc.type not in ("modifiers", "variable_declarator"):
+                    types.append(_normalize_type_text(node_text(sc)) + "[]")
+                    break
+    return ",".join(types)
+
+
+def _csharp_param_types(node: Node) -> str:
+    """Comma-joined normalized parameter types for a C# method/constructor declaration."""
+    params = node.child_by_field_name("parameters")
+    if params is None:
+        return ""
+    types: list[str] = []
+    pending_params = False
+    for i, child in enumerate(params.children):
+        if child.type == "parameter":
+            t = child.child_by_field_name("type")
+            if t is None:
+                continue
+            mods = [node_text(m) for m in child.children if m.type == "modifier"]
+            types.append(" ".join([*mods, _normalize_type_text(node_text(t))]))
+        elif child.type == "params":
+            pending_params = True
+        elif params.field_name_for_child(i) == "type":
+            # `params T[] name` is spliced directly into parameter_list (tree-sitter-c-sharp 0.23)
+            prefix = "params " if pending_params else ""
+            types.append(prefix + _normalize_type_text(node_text(child)))
+            pending_params = False
+    return ",".join(types)
+
+
+def _overload_suffix(node: Node, param_types: str) -> str:
+    """Disambiguating qn suffix for an overloaded callable: ``[<TypeParams>](<param types>)``."""
+    tp = node.child_by_field_name("type_parameters")
+    tp_text = "".join(node_text(tp).split()) if tp is not None else ""
+    return f"{tp_text}({param_types})"
+
+
 def _extract_calls(
     node: Node,
     source: bytes,
@@ -420,6 +497,7 @@ def _walk_java_node(
     parent_qn: str | None,
 ) -> None:
     """Recursively walk Java AST nodes to extract entities."""
+    overloaded = _overloaded_callable_names(node)
     for child in node.children:
         # Type declarations (class, interface, enum, annotation, record)
         if child.type in _JAVA_TYPE_NODES:
@@ -428,12 +506,16 @@ def _walk_java_node(
 
         # Methods
         if child.type == "method_declaration":
-            _process_java_method(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
+            _process_java_method(
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn, overloaded
+            )
             continue
 
         # Constructors
         if child.type == "constructor_declaration":
-            _process_java_constructor(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
+            _process_java_constructor(
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn, overloaded
+            )
             continue
 
         # Fields
@@ -533,6 +615,7 @@ def _process_java_method(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     parent_qn: str | None,
+    overloaded: frozenset[str],
 ) -> None:
     """Process a Java method_declaration."""
     name_node = node.child_by_field_name("name")
@@ -544,7 +627,8 @@ def _process_java_method(
 
     is_method = parent_qn is not None
     kind = CallableKind.METHOD if is_method else CallableKind.FUNCTION
-    qn = f"{parent_qn}.{name}" if parent_qn else f"{module_qn}.{name}"
+    qn_name = f"{name}{_overload_suffix(node, _java_param_types(node))}" if name in overloaded else name
+    qn = f"{parent_qn}.{qn_name}" if parent_qn else f"{module_qn}.{qn_name}"
     full_qn = f"{project_name}:{qn}"
 
     # Check for static -> STATIC_METHOD
@@ -599,6 +683,7 @@ def _process_java_constructor(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     parent_qn: str | None,
+    overloaded: frozenset[str],
 ) -> None:
     """Process a Java constructor_declaration."""
     name_node = node.child_by_field_name("name")
@@ -608,7 +693,8 @@ def _process_java_constructor(
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
 
-    qn = f"{parent_qn}.{name}" if parent_qn else f"{module_qn}.{name}"
+    qn_name = f"{name}{_overload_suffix(node, _java_param_types(node))}" if name in overloaded else name
+    qn = f"{parent_qn}.{qn_name}" if parent_qn else f"{module_qn}.{qn_name}"
     full_qn = f"{project_name}:{qn}"
 
     visibility = _extract_visibility(node, default=Visibility.INTERNAL)
@@ -833,6 +919,7 @@ def _walk_csharp_node(
     parent_qn: str | None,
 ) -> None:
     """Recursively walk C# AST nodes to extract entities."""
+    overloaded = _overloaded_callable_names(node)
     for child in node.children:
         # Namespace declarations — recurse into them
         if child.type in ("namespace_declaration", "file_scoped_namespace_declaration"):
@@ -852,13 +939,15 @@ def _walk_csharp_node(
 
         # Methods
         if child.type == "method_declaration":
-            _process_csharp_method(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
+            _process_csharp_method(
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn, overloaded
+            )
             continue
 
         # Constructors
         if child.type == "constructor_declaration":
             _process_csharp_constructor(
-                child, path, source, project_name, module_qn, entities, relationships, parent_qn
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn, overloaded
             )
             continue
 
@@ -1000,6 +1089,7 @@ def _process_csharp_method(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     parent_qn: str | None,
+    overloaded: frozenset[str],
 ) -> None:
     """Process a C# method_declaration."""
     name_node = node.child_by_field_name("name")
@@ -1016,7 +1106,8 @@ def _process_csharp_method(
     else:
         kind = CallableKind.METHOD if is_method else CallableKind.FUNCTION
 
-    qn = f"{parent_qn}.{name}" if parent_qn else f"{module_qn}.{name}"
+    qn_name = f"{name}{_overload_suffix(node, _csharp_param_types(node))}" if name in overloaded else name
+    qn = f"{parent_qn}.{qn_name}" if parent_qn else f"{module_qn}.{qn_name}"
     full_qn = f"{project_name}:{qn}"
 
     visibility = _extract_visibility(node, default=Visibility.PRIVATE)
@@ -1065,6 +1156,7 @@ def _process_csharp_constructor(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     parent_qn: str | None,
+    overloaded: frozenset[str],
 ) -> None:
     """Process a C# constructor_declaration."""
     name_node = node.child_by_field_name("name")
@@ -1074,7 +1166,8 @@ def _process_csharp_constructor(
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
 
-    qn = f"{parent_qn}.{name}" if parent_qn else f"{module_qn}.{name}"
+    qn_name = f"{name}{_overload_suffix(node, _csharp_param_types(node))}" if name in overloaded else name
+    qn = f"{parent_qn}.{qn_name}" if parent_qn else f"{module_qn}.{qn_name}"
     full_qn = f"{project_name}:{qn}"
 
     visibility = _extract_visibility(node, default=Visibility.PRIVATE)
