@@ -320,7 +320,7 @@ class EmbedCache:
             task.add_done_callback(self._bg_tasks.discard)
 
     @staticmethod
-    async def _bg_pipe_execute(pipe: aioredis.client.Pipeline, count: int) -> None:  # type: ignore[name-defined]
+    async def _bg_pipe_execute(pipe: aioredis.client.Pipeline, count: int) -> None:
         """Execute a pipeline in the background, logging failures."""
         try:
             await pipe.execute()

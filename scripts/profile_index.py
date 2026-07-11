@@ -157,7 +157,7 @@ def _patch_handles():
     class _TimedHandle(_orig_handle):
         __slots__ = ()
 
-        def _run(self):  # type: ignore[override]  # CPython internal
+        def _run(self):  # CPython internal
             t0 = time.perf_counter()
             try:
                 return super()._run()
