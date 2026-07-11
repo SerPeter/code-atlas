@@ -520,6 +520,7 @@ def test_defines_module_to_struct():
 
 
 def test_defines_struct_to_method():
+    """Same-file impl methods emit the deferred member-DEFINES contract (S5)."""
     parsed = _parse(
         """\
 struct Foo;
@@ -529,9 +530,16 @@ impl Foo {
 }
 """
     )
-    defines = _rels_from(parsed, "src.example.Foo", RelType.DEFINES)
-    targets = {r.to_name for r in defines}
-    assert f"{PROJECT}:src.example.Foo.bar" in targets
+    defines = [
+        r
+        for r in parsed.relationships
+        if r.rel_type == RelType.DEFINES and r.to_name == f"{PROJECT}:src.example.Foo.bar"
+    ]
+    assert len(defines) == 1
+    assert defines[0].from_qualified_name == f"{PROJECT}:src.example"
+    assert defines[0].properties == {"parent_type_name": "Foo"}
+    # No relationship may originate from the fabricated type uid
+    assert not any(r.from_qualified_name == f"{PROJECT}:src.example.Foo" for r in parsed.relationships)
 
 
 def test_defines_module_to_function():
@@ -715,3 +723,182 @@ pub struct Config {
     field = _entity_by_name(parsed, "debug")
     assert field.docstring is not None
     assert "debug flag" in field.docstring
+
+
+# ---------------------------------------------------------------------------
+# 23. Inline modules (mod foo { ... })
+# ---------------------------------------------------------------------------
+
+
+def test_inline_mod_entities_extracted():
+    parsed = _parse(
+        """\
+pub mod config {
+    pub struct Config {
+        pub name: String,
+    }
+
+    impl Config {
+        pub fn new() -> Self {
+            Config { name: String::new() }
+        }
+    }
+}
+""",
+        path="src/lib.rs",
+    )
+    st = _entity_by_name(parsed, "Config")
+    assert st.label == NodeLabel.TYPE_DEF
+    assert st.qualified_name == f"{PROJECT}:src.lib.config.Config"
+    name_field = _entity_by_name(parsed, "name")
+    assert name_field.qualified_name == f"{PROJECT}:src.lib.config.Config.name"
+    new = _entity_by_name(parsed, "new")
+    assert new.qualified_name == f"{PROJECT}:src.lib.config.Config.new"
+
+
+def test_inline_mod_module_entity_and_defines():
+    parsed = _parse(
+        """\
+pub mod config {
+    pub struct Config;
+}
+""",
+        path="src/lib.rs",
+    )
+    mod = _entity_by_name(parsed, "config")
+    assert mod.label == NodeLabel.MODULE
+    assert mod.kind == "module"
+    assert mod.qualified_name == f"{PROJECT}:src.lib.config"
+    assert mod.visibility == Visibility.PUBLIC
+    # File module defines the inline module, which defines the struct
+    file_defines = _rels_from(parsed, "src.lib", RelType.DEFINES)
+    assert f"{PROJECT}:src.lib.config" in {r.to_name for r in file_defines}
+    mod_defines = _rels_from(parsed, "src.lib.config", RelType.DEFINES)
+    assert f"{PROJECT}:src.lib.config.Config" in {r.to_name for r in mod_defines}
+
+
+def test_nested_inline_mods():
+    parsed = _parse(
+        """\
+mod a {
+    mod b {
+        fn f() {}
+    }
+}
+"""
+    )
+    f = _entity_by_name(parsed, "f")
+    assert f.qualified_name == f"{PROJECT}:src.example.a.b.f"
+
+
+def test_cfg_test_mod_entities_extracted():
+    parsed = _parse(
+        """\
+#[cfg(test)]
+mod tests {
+    fn helper() {}
+}
+"""
+    )
+    helper = _entity_by_name(parsed, "helper")
+    assert helper.qualified_name == f"{PROJECT}:src.example.tests.helper"
+
+
+def test_inline_mod_emits_no_imports():
+    parsed = _parse("mod inline_mod {\n    fn f() {}\n}\n")
+    imports = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert imports == []
+
+
+def test_mod_declaration_emits_imports():
+    """``mod foo;`` (no body) still references another file via IMPORTS."""
+    parsed = _parse("mod foo;\n")
+    imports = _rels_from(parsed, "src.example", RelType.IMPORTS)
+    assert {r.to_name for r in imports} == {"foo"}
+
+
+# ---------------------------------------------------------------------------
+# 24. Impl-block member DEFINES contract (S5) and IMPLEMENTS bare names (S1)
+# ---------------------------------------------------------------------------
+
+
+def test_impl_method_cross_file_emits_parent_type_name():
+    """Impl methods for a type defined in another file must not fabricate the type uid."""
+    parsed = _parse(
+        """\
+impl Widget {
+    pub fn draw(&self) {}
+}
+""",
+        path="src/render.rs",
+    )
+    draw = _entity_by_name(parsed, "draw")
+    assert draw.qualified_name == f"{PROJECT}:src.render.Widget.draw"
+    defines = [
+        r
+        for r in parsed.relationships
+        if r.rel_type == RelType.DEFINES and r.to_name == f"{PROJECT}:src.render.Widget.draw"
+    ]
+    assert len(defines) == 1
+    assert defines[0].from_qualified_name == f"{PROJECT}:src.render"
+    assert defines[0].properties == {"parent_type_name": "Widget"}
+    assert not any(r.from_qualified_name == f"{PROJECT}:src.render.Widget" for r in parsed.relationships)
+
+
+def test_generic_impl_parent_type_name_is_bare():
+    """parent_type_name strips type parameters: impl<T> Container<T> -> Container."""
+    parsed = _parse(
+        """\
+impl<T> Container<T> {
+    pub fn get(&self) -> &T {
+        &self.item
+    }
+}
+"""
+    )
+    get = _entity_by_name(parsed, "get")
+    assert get.qualified_name == f"{PROJECT}:src.example.Container.get"
+    rel = next(r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name == get.qualified_name)
+    assert rel.from_qualified_name == f"{PROJECT}:src.example"
+    assert rel.properties == {"parent_type_name": "Container"}
+
+
+def test_trait_body_methods_keep_uid_defines():
+    """Trait-body members are same-file by construction — plain uid-matched DEFINES."""
+    parsed = _parse(
+        """\
+pub trait Service {
+    fn process(&self) {}
+    fn handle(&self, x: i32) -> i32;
+}
+"""
+    )
+    for method in ("process", "handle"):
+        rel = next(
+            r
+            for r in parsed.relationships
+            if r.rel_type == RelType.DEFINES and r.to_name == f"{PROJECT}:src.example.Service.{method}"
+        )
+        assert rel.from_qualified_name == f"{PROJECT}:src.example.Service"
+        assert rel.properties == {}
+
+
+def test_implements_bare_trait_name_no_colon():
+    """S1 contract pin: IMPLEMENTS to_name is a bare trait name — never contains ':'."""
+    parsed = _parse(
+        """\
+struct Foo;
+
+impl std::fmt::Display for Foo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "foo")
+    }
+}
+"""
+    )
+    impl_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+    assert len(impl_rels) == 1
+    assert impl_rels[0].to_name == "Display"
+    assert ":" not in impl_rels[0].to_name
+    assert impl_rels[0].from_qualified_name == f"{PROJECT}:src.example.Foo"
+    assert impl_rels[0].properties == {}

@@ -262,7 +262,7 @@ def _walk_rust_items(
         elif child.type in ("const_item", "static_item"):
             _process_const_static(child, path, project_name, module_qn, owner_name, entities, relationships)
         elif child.type == "mod_item":
-            _process_mod(child, project_name, module_qn, relationships)
+            _process_mod(child, path, source, project_name, module_qn, entities, relationships)
 
 
 # ---------------------------------------------------------------------------
@@ -571,11 +571,14 @@ def _process_function(
     owner_name: str | None,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    *,
+    from_impl: bool = False,
 ) -> None:
     """Process a ``function_item`` node.
 
     ``owner_name`` is the type/trait name when the function is inside an
-    impl or trait block, None for top-level functions.
+    impl or trait block, None for top-level functions.  ``from_impl`` marks
+    impl-block members, whose owner type may be defined in another file.
     """
     name_node = node.child_by_field_name("name")
     if name_node is None:
@@ -597,11 +600,9 @@ def _process_function(
             kind: str = CallableKind.METHOD
         else:
             kind = CallableKind.STATIC_METHOD
-        parent_qn = f"{module_qn}.{owner_name}"
     else:
         qn = f"{module_qn}.{name}"
         kind = CallableKind.FUNCTION
-        parent_qn = module_qn
 
     entities.append(
         ParsedEntity(
@@ -619,13 +620,29 @@ def _process_function(
             tags=tags,
         )
     )
-    relationships.append(
-        ParsedRelationship(
-            from_qualified_name=f"{project_name}:{parent_qn}",
-            rel_type=RelType.DEFINES,
-            to_name=f"{project_name}:{qn}",
+    if from_impl and owner_name is not None:
+        # DEFINES: impl'd type -> method.  The type may be defined in another
+        # file, so emit its NAME for post-batch resolution via
+        # GraphClient.resolve_member_defines, with this file's module as the
+        # fallback parent in from_qualified_name.
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{module_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qn}",
+                properties={"parent_type_name": owner_name},
+            )
         )
-    )
+    else:
+        # DEFINES: module or same-file trait -> function
+        parent_qn = f"{module_qn}.{owner_name}" if owner_name is not None else module_qn
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{parent_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qn}",
+            )
+        )
 
     # Extract CALLS from the function body
     body = node.child_by_field_name("body")
@@ -730,7 +747,9 @@ def _process_impl(
     if body is not None:
         for child in body.children:
             if child.type == "function_item":
-                _process_function(child, path, source, project_name, module_qn, type_name, entities, relationships)
+                _process_function(
+                    child, path, source, project_name, module_qn, type_name, entities, relationships, from_impl=True
+                )
             elif child.type == "const_item":
                 _process_const_static(child, path, project_name, module_qn, type_name, entities, relationships)
             elif child.type == "type_item":
@@ -1027,22 +1046,57 @@ def _process_enum_variant(
 
 def _process_mod(
     node: Node,
+    path: str,
+    source: bytes,
     project_name: str,
     module_qn: str,
+    entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
 ) -> None:
-    """Process ``mod foo;`` declarations as IMPORTS relationships."""
+    """Process ``mod`` items.
+
+    ``mod foo;`` declarations reference another file and emit IMPORTS.
+    Inline modules (``mod foo { ... }``) define a nested module here: emit a
+    Module entity and walk the body with the extended qualified name.
+    """
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
     name = node_text(name_node)
+    body = node.child_by_field_name("body")
+    if body is None:
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{module_qn}",
+                rel_type=RelType.IMPORTS,
+                to_name=name,
+            )
+        )
+        return
+
+    inner_qn = f"{module_qn}.{name}"
+    entities.append(
+        ParsedEntity(
+            name=name,
+            qualified_name=f"{project_name}:{inner_qn}",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=node.start_point[0] + 1,
+            line_end=node.end_point[0] + 1,
+            file_path=path,
+            docstring=_extract_doc_comments(node),
+            visibility=_visibility_from_node(node),
+            tags=_extract_attributes(node),
+        )
+    )
     relationships.append(
         ParsedRelationship(
             from_qualified_name=f"{project_name}:{module_qn}",
-            rel_type=RelType.IMPORTS,
-            to_name=name,
+            rel_type=RelType.DEFINES,
+            to_name=f"{project_name}:{inner_qn}",
         )
     )
+    _walk_rust_items(body, path, source, project_name, inner_qn, None, entities, relationships)
 
 
 # ---------------------------------------------------------------------------
