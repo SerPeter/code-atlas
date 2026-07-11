@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict, TomlConfigSettingsSource
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ def _find_atlas_toml() -> Path | None:
         current = parent
 
 
-class ScopeSettings(BaseSettings):
+class ScopeSettings(BaseModel):
     """File scope and ignore settings (ruff-style include/exclude semantics)."""
 
     paths: list[str] = Field(
@@ -137,14 +137,14 @@ class ScopeSettings(BaseSettings):
     )
 
 
-class LibrarySettings(BaseSettings):
+class LibrarySettings(BaseModel):
     """Library and dependency indexing settings."""
 
     full_index: list[str] = Field(default_factory=list, description="Libraries to fully parse and index.")
     stub_index: list[str] = Field(default_factory=list, description="Libraries to index at type-stub level only.")
 
 
-class MonorepoSettings(BaseSettings):
+class MonorepoSettings(BaseModel):
     """Monorepo detection and scoping settings."""
 
     auto_detect: bool = Field(default=True, description="Auto-detect sub-projects by project markers.")
@@ -176,7 +176,7 @@ _PROVIDER_DEFAULTS: dict[str, dict[str, int]] = {
 }
 
 
-class EmbeddingSettings(BaseSettings):
+class EmbeddingSettings(BaseModel):
     """Embedding settings — routes through litellm for any provider."""
 
     enabled: bool = Field(
@@ -207,7 +207,7 @@ class EmbeddingSettings(BaseSettings):
         return self
 
 
-class MemgraphSettings(BaseSettings):
+class MemgraphSettings(BaseModel):
     """Memgraph connection settings."""
 
     host: str = Field(default="localhost", description="Memgraph host.")
@@ -218,7 +218,7 @@ class MemgraphSettings(BaseSettings):
     write_timeout_s: float = Field(default=60.0, description="Timeout in seconds for write queries.")
 
 
-class SearchSettings(BaseSettings):
+class SearchSettings(BaseModel):
     """Search and retrieval settings."""
 
     default_token_budget: int = Field(default=8000, description="Default token budget for context assembly.")
@@ -245,7 +245,7 @@ class SearchSettings(BaseSettings):
     )
 
 
-class DetectorSettings(BaseSettings):
+class DetectorSettings(BaseModel):
     """Pattern detector settings."""
 
     enabled: list[str] = Field(
@@ -261,7 +261,7 @@ class DetectorSettings(BaseSettings):
     )
 
 
-class IndexSettings(BaseSettings):
+class IndexSettings(BaseModel):
     """Indexing delta settings."""
 
     delta_threshold: float = Field(
@@ -278,7 +278,7 @@ class IndexSettings(BaseSettings):
     )
 
 
-class ObservabilitySettings(BaseSettings):
+class ObservabilitySettings(BaseModel):
     """OpenTelemetry observability settings (requires ``[otel]`` extra)."""
 
     enabled: bool = Field(default=False, description="Enable OpenTelemetry tracing and metrics.")
@@ -288,7 +288,7 @@ class ObservabilitySettings(BaseSettings):
     sample_rate: float = Field(default=1.0, description="Trace sample rate (1.0 = all, 0.1 = 10%).")
 
 
-class WatcherSettings(BaseSettings):
+class WatcherSettings(BaseModel):
     """File watcher debounce settings."""
 
     debounce_s: float = Field(default=5.0, description="Debounce timer in seconds (resets per change).")
@@ -296,7 +296,7 @@ class WatcherSettings(BaseSettings):
     cooldown_s: float = Field(default=10.0, description="Per-file cooldown after processing (seconds). 0 disables.")
 
 
-class McpSettings(BaseSettings):
+class McpSettings(BaseModel):
     """MCP server settings."""
 
     host: str = Field(default="127.0.0.1", description="Bind address for HTTP transports (ignored for stdio).")
@@ -305,7 +305,7 @@ class McpSettings(BaseSettings):
     strict: bool = Field(default=False, description="Refuse to start if embedding model mismatch.")
 
 
-class RedisSettings(BaseSettings):
+class RedisSettings(BaseModel):
     """Redis/Valkey connection settings for event bus."""
 
     host: str = Field(default="localhost", description="Redis/Valkey host.")
@@ -313,6 +313,11 @@ class RedisSettings(BaseSettings):
     db: int = Field(default=0, description="Redis database number.")
     password: str = Field(default="", description="Redis/Valkey password.")
     stream_prefix: str = Field(default="atlas", description="Prefix for Redis Stream keys.")
+    stream_maxlen: int = Field(
+        default=1_000_000,
+        description="Max entries per Redis Stream (XADD maxlen, approximate). "
+        "Must exceed the largest expected publish backlog. 0 disables trimming.",
+    )
 
 
 class AtlasSettings(BaseSettings):
