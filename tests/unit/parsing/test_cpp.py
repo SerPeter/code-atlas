@@ -784,3 +784,224 @@ void public_func() {}
         )
         func = _entity_by_name(parsed, "public_func")
         assert func.visibility == Visibility.PUBLIC
+
+
+# ---------------------------------------------------------------------------
+# 27. Template declarations
+# ---------------------------------------------------------------------------
+
+
+class TestCppTemplates:
+    def test_template_class_and_method(self):
+        parsed = _parse(
+            """\
+template <typename T>
+class Box {
+public:
+    T get() const { return value_; }
+private:
+    T value_;
+};
+""",
+            path="include/box.hpp",
+        )
+        cls = _entity_by_name(parsed, "Box")
+        assert cls.label == NodeLabel.TYPE_DEF
+        assert cls.kind == TypeDefKind.CLASS
+        assert cls.qualified_name == f"{PROJECT}:include.box.Box"
+        assert "template" in cls.tags
+
+        method = _entity_by_name(parsed, "get")
+        assert method.label == NodeLabel.CALLABLE
+        assert method.kind == CallableKind.METHOD
+        assert method.qualified_name == f"{PROJECT}:include.box.Box.get"
+
+        field = _entity_by_name(parsed, "value_")
+        assert field.kind == ValueKind.FIELD
+
+        defines = _rels_from(parsed, "include.box.Box", RelType.DEFINES)
+        targets = {r.to_name for r in defines}
+        assert f"{PROJECT}:include.box.Box.get" in targets
+        assert f"{PROJECT}:include.box.Box.value_" in targets
+
+    def test_template_function(self):
+        parsed = _parse(
+            """\
+template <typename T>
+T max_of(T a, T b) { return a > b ? a : b; }
+""",
+            path="src/algo.cpp",
+        )
+        func = _entity_by_name(parsed, "max_of")
+        assert func.label == NodeLabel.CALLABLE
+        assert func.kind == CallableKind.FUNCTION
+        assert "template" in func.tags
+
+    def test_out_of_line_template_method(self):
+        parsed = _parse(
+            """\
+template <typename T>
+T Box<T>::get() const { return value_; }
+""",
+            path="src/box.cpp",
+        )
+        method = _entity_by_name(parsed, "get")
+        assert method.label == NodeLabel.CALLABLE
+        assert method.kind == CallableKind.METHOD
+        # Template arguments are stripped from the scope: Box<T> -> Box
+        assert method.qualified_name == f"{PROJECT}:src.box.Box.get"
+
+        rels = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name == method.qualified_name]
+        assert len(rels) == 1
+        assert rels[0].from_qualified_name == f"{PROJECT}:src.box"
+        assert rels[0].properties["parent_type_name"] == "Box"
+
+
+# ---------------------------------------------------------------------------
+# 28. In-class method prototypes
+# ---------------------------------------------------------------------------
+
+
+class TestCppMethodPrototypes:
+    def test_prototype_is_callable(self):
+        parsed = _parse(
+            """\
+class Widget {
+public:
+    void draw() const;
+    int n_;
+};
+""",
+            path="include/widget.hpp",
+        )
+        draw = _entity_by_name(parsed, "draw")
+        assert draw.label == NodeLabel.CALLABLE
+        assert draw.kind == CallableKind.METHOD
+        assert draw.visibility == Visibility.PUBLIC
+
+        n = _entity_by_name(parsed, "n_")
+        assert n.label == NodeLabel.VALUE
+        assert n.kind == ValueKind.FIELD
+
+        defines = _rels_from(parsed, "include.widget.Widget", RelType.DEFINES)
+        targets = {r.to_name for r in defines}
+        assert f"{PROJECT}:include.widget.Widget.draw" in targets
+
+    def test_pointer_and_reference_return_prototypes(self):
+        parsed = _parse(
+            """\
+class Widget {
+public:
+    int* alloc_buffer(int n);
+    int& ref_get();
+};
+""",
+            path="include/widget.hpp",
+        )
+        alloc = _entity_by_name(parsed, "alloc_buffer")
+        assert alloc.label == NodeLabel.CALLABLE
+        assert alloc.kind == CallableKind.METHOD
+
+        ref = _entity_by_name(parsed, "ref_get")
+        assert ref.label == NodeLabel.CALLABLE
+        assert ref.kind == CallableKind.METHOD
+
+    def test_pure_virtual_and_static_prototypes(self):
+        parsed = _parse(
+            """\
+class Shape {
+public:
+    virtual void render() = 0;
+    static int count();
+};
+""",
+            path="include/shape.hpp",
+        )
+        render = _entity_by_name(parsed, "render")
+        assert render.label == NodeLabel.CALLABLE
+        assert render.kind == CallableKind.METHOD
+        assert "virtual" in render.tags
+
+        count = _entity_by_name(parsed, "count")
+        assert count.label == NodeLabel.CALLABLE
+        assert count.kind == CallableKind.STATIC_METHOD
+
+    def test_function_pointer_field_stays_field(self):
+        parsed = _parse(
+            """\
+class Widget {
+public:
+    int (*cb)(int);
+};
+""",
+            path="include/widget.hpp",
+        )
+        cb = _entity_by_name(parsed, "cb")
+        assert cb.label == NodeLabel.VALUE
+        assert cb.kind == ValueKind.FIELD
+
+    def test_file_scope_pointer_prototype_skipped(self):
+        """Pointer-returning free-function prototypes must not become Value variables."""
+        parsed = _parse("int* alloc_buffer(int n);\n", path="src/proto.cpp")
+        assert not [e for e in parsed.entities if e.name == "alloc_buffer"]
+
+
+# ---------------------------------------------------------------------------
+# 29. Out-of-line method definitions (S5 cross-file member contract)
+# ---------------------------------------------------------------------------
+
+
+class TestCppOutOfLineMethods:
+    def test_out_of_line_method_emits_parent_type_name(self):
+        parsed = _parse("void Widget::draw() { }\n", path="src/widget.cpp")
+        draw = _entity_by_name(parsed, "draw")
+        assert draw.label == NodeLabel.CALLABLE
+        assert draw.kind == CallableKind.METHOD
+        assert draw.qualified_name == f"{PROJECT}:src.widget.Widget.draw"
+
+        rels = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name == draw.qualified_name]
+        assert len(rels) == 1
+        assert rels[0].from_qualified_name == f"{PROJECT}:src.widget"
+        assert rels[0].properties["parent_type_name"] == "Widget"
+        # No rel may originate from the fabricated parent uid
+        assert all(r.from_qualified_name != f"{PROJECT}:src.widget.Widget" for r in parsed.relationships)
+
+        # Control: in-body methods keep plain uid-matched DEFINES with no parent_type_name
+        header = _parse("class Widget {\npublic:\n    void resize() { }\n};\n", path="include/widget.hpp")
+        resize = _entity_by_name(header, "resize")
+        header_rels = [
+            r for r in header.relationships if r.rel_type == RelType.DEFINES and r.to_name == resize.qualified_name
+        ]
+        assert len(header_rels) == 1
+        assert header_rels[0].from_qualified_name == f"{PROJECT}:include.widget.Widget"
+        assert "parent_type_name" not in header_rels[0].properties
+
+    def test_out_of_line_constructor(self):
+        parsed = _parse("Widget::Widget() { }\n", path="src/widget.cpp")
+        ctor = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.name == "Widget"]
+        assert len(ctor) == 1
+        assert ctor[0].kind == CallableKind.CONSTRUCTOR
+
+        rels = [
+            r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name == ctor[0].qualified_name
+        ]
+        assert len(rels) == 1
+        assert rels[0].from_qualified_name == f"{PROJECT}:src.widget"
+        assert rels[0].properties["parent_type_name"] == "Widget"
+
+    def test_out_of_line_method_in_namespace_block(self):
+        parsed = _parse(
+            """\
+namespace mylib {
+void Widget::draw() { }
+}
+""",
+            path="src/widget.cpp",
+        )
+        draw = _entity_by_name(parsed, "draw")
+        assert draw.qualified_name == f"{PROJECT}:src.widget.mylib.Widget.draw"
+
+        rels = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name == draw.qualified_name]
+        assert len(rels) == 1
+        assert rels[0].from_qualified_name == f"{PROJECT}:src.widget"
+        assert rels[0].properties["parent_type_name"] == "Widget"

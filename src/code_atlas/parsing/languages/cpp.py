@@ -241,6 +241,35 @@ def _get_declarator_name(declarator: Node) -> str | None:
     return None
 
 
+def _template_wrapper(node: Node) -> Node | None:
+    """Return the enclosing template_declaration wrapper, if any."""
+    parent = node.parent
+    return parent if parent is not None and parent.type == "template_declaration" else None
+
+
+def _prototype_declarator(declarator: Node) -> Node | None:
+    """Return the function_declarator of a function prototype, unwrapping pointer/reference returns.
+
+    Returns None for non-function declarators and for function-pointer
+    declarators like ``int (*cb)(int)`` whose inner declarator is parenthesized.
+    """
+    node = declarator
+    while node.type in ("pointer_declarator", "reference_declarator"):
+        # reference_declarator carries its inner declarator as an unnamed field
+        inner = node.child_by_field_name("declarator") or next(
+            (c for c in node.named_children if c.type.endswith("declarator")), None
+        )
+        if inner is None:
+            return None
+        node = inner
+    if node.type != "function_declarator":
+        return None
+    inner = node.child_by_field_name("declarator")
+    if inner is None or inner.type == "parenthesized_declarator":
+        return None
+    return node
+
+
 def _get_qualified_declarator_name(declarator: Node) -> tuple[str | None, str | None]:
     """Extract name from declarator, returning (scope, name) for qualified names.
 
@@ -250,6 +279,9 @@ def _get_qualified_declarator_name(declarator: Node) -> tuple[str | None, str | 
     if declarator.type == "qualified_identifier":
         scope_node = declarator.child_by_field_name("scope")
         name_node = declarator.child_by_field_name("name")
+        if scope_node is not None and scope_node.type == "template_type":
+            # Box<T>::method — strip template arguments from the scope
+            scope_node = scope_node.child_by_field_name("name") or scope_node
         scope = node_text(scope_node) if scope_node is not None else None
         name = node_text(name_node) if name_node is not None else None
         return (scope, name)
@@ -354,7 +386,7 @@ def _parent_qn(project_name: str, module_qn: str, namespace_parts: list[str], cl
     return f"{project_name}:{'.'.join(parts)}"
 
 
-def _walk_translation_unit(
+def _walk_translation_unit(  # noqa: PLR0912
     node: Node,
     *,
     path: str,
@@ -386,6 +418,25 @@ def _walk_translation_unit(
                 is_cpp=is_cpp,
                 namespace_parts=namespace_parts,
                 class_stack=class_stack,
+                entities=entities,
+                relationships=relationships,
+            )
+            continue
+
+        # ----- template wrapper (C++ only) -----
+        if is_cpp and child.type == "template_declaration":
+            # The declared class/function is a child of the wrapper — recurse so
+            # the existing dispatch branches process it.
+            _walk_translation_unit(
+                child,
+                path=path,
+                source=source,
+                project_name=project_name,
+                module_qn=module_qn,
+                is_cpp=is_cpp,
+                namespace_parts=namespace_parts,
+                class_stack=class_stack,
+                current_visibility=current_visibility,
                 entities=entities,
                 relationships=relationships,
             )
@@ -474,6 +525,7 @@ def _walk_translation_unit(
             _process_field_declaration(
                 child,
                 path=path,
+                source=source,
                 project_name=project_name,
                 module_qn=module_qn,
                 namespace_parts=namespace_parts,
@@ -596,9 +648,11 @@ def _process_type_def(
     }
     kind = kind_map.get(node.type, TypeDefKind.STRUCT)
 
+    template_parent = _template_wrapper(node)
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
-    docstring = _extract_doxygen_comment(node, source)
+    # Doc comments for templates sit above the template_declaration wrapper
+    docstring = _extract_doxygen_comment(template_parent or node, source)
     qn = _build_qn(module_qn, namespace_parts, class_stack, name)
 
     # Visibility: at file scope (no class stack), use current_visibility or PUBLIC
@@ -618,6 +672,7 @@ def _process_type_def(
             file_path=path,
             docstring=docstring,
             visibility=visibility,
+            tags=["template"] if template_parent is not None else [],
         )
     )
 
@@ -828,6 +883,9 @@ def _process_function(
         return
 
     tags = _extract_tags(node)
+    template_parent = _template_wrapper(node)
+    if template_parent is not None:
+        tags.append("template")
     scope, name = _get_qualified_declarator_name(declarator)
 
     if name is None:
@@ -835,20 +893,30 @@ def _process_function(
 
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
-    docstring = _extract_doxygen_comment(node, source)
+    # Doc comments for templates sit above the template_declaration wrapper
+    docstring = _extract_doxygen_comment(template_parent or node, source)
     signature = _extract_function_signature(node, source)
 
     # Determine if this is a method (inside class body or qualified with class scope)
     is_method = bool(class_stack) or (is_cpp and scope is not None)
 
+    parent_type_name: str | None = None
     if is_method:
         # Method inside class body or qualified (ClassName::method)
         actual_class = class_stack[-1] if class_stack else (scope or "")
         kind = _method_callable_kind(name, actual_class, tags)
 
-        effective_stack = [scope] if (scope is not None and not class_stack) else list(class_stack)
-        qn = _build_qn(module_qn, namespace_parts, effective_stack, name)
-        parent_qn_str = _parent_qn(project_name, module_qn, namespace_parts, effective_stack)
+        if not class_stack and scope is not None:
+            # Out-of-line definition — the class usually lives in another file
+            # (header/impl split), so emit its NAME for post-batch resolution
+            # (GraphClient.resolve_member_defines).  Fallback parent is this
+            # file's Module (namespaces have no nodes).
+            qn = _build_qn(module_qn, namespace_parts, [scope], name)
+            parent_qn_str = f"{project_name}:{module_qn}"
+            parent_type_name = scope
+        else:
+            qn = _build_qn(module_qn, namespace_parts, class_stack, name)
+            parent_qn_str = _parent_qn(project_name, module_qn, namespace_parts, class_stack)
         visibility = current_visibility
     else:
         kind = CallableKind.FUNCTION
@@ -880,6 +948,7 @@ def _process_function(
             from_qualified_name=parent_qn_str,
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
+            properties={"parent_type_name": parent_type_name} if parent_type_name else {},
         )
     )
 
@@ -938,8 +1007,9 @@ def _process_declaration(
     if declarator is None:
         return
 
-    # Skip function declarations
-    if declarator.type == "function_declarator":
+    # Skip function declarations, including pointer/reference-returning prototypes
+    # (`int* alloc(int);` wraps the function_declarator in a pointer_declarator)
+    if declarator.type == "function_declarator" or _prototype_declarator(declarator) is not None:
         return
 
     name = _get_declarator_name(declarator)
@@ -985,6 +1055,7 @@ def _process_field_declaration(
     node: Node,
     *,
     path: str,
+    source: bytes,
     project_name: str,
     module_qn: str,
     namespace_parts: list[str],
@@ -1005,18 +1076,39 @@ def _process_field_declaration(
     line_end = node.end_point[0] + 1
     qn = _build_qn(module_qn, namespace_parts, class_stack, name)
 
-    entities.append(
-        ParsedEntity(
-            name=name,
-            qualified_name=f"{project_name}:{qn}",
-            label=NodeLabel.VALUE,
-            kind=ValueKind.FIELD,
-            line_start=line_start,
-            line_end=line_end,
-            file_path=path,
-            visibility=current_visibility,
+    if _prototype_declarator(declarator) is not None:
+        # Method declaration without a body (`void draw() const;`) — a Callable,
+        # not a field.  Function-pointer members stay on the field path.
+        tags = _extract_tags(node)
+        kind = _method_callable_kind(name, class_stack[-1] if class_stack else "", tags)
+        entities.append(
+            ParsedEntity(
+                name=name,
+                qualified_name=f"{project_name}:{qn}",
+                label=NodeLabel.CALLABLE,
+                kind=kind,
+                line_start=line_start,
+                line_end=line_end,
+                file_path=path,
+                docstring=_extract_doxygen_comment(node, source),
+                signature=_extract_function_signature(node, source),
+                visibility=current_visibility,
+                tags=tags,
+            )
         )
-    )
+    else:
+        entities.append(
+            ParsedEntity(
+                name=name,
+                qualified_name=f"{project_name}:{qn}",
+                label=NodeLabel.VALUE,
+                kind=ValueKind.FIELD,
+                line_start=line_start,
+                line_end=line_end,
+                file_path=path,
+                visibility=current_visibility,
+            )
+        )
 
     parent_full_qn = _parent_qn(project_name, module_qn, namespace_parts, class_stack)
     relationships.append(
