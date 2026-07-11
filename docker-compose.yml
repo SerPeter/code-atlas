@@ -47,6 +47,51 @@ services:
       retries: 5
 
   # ---------------------------------------------------------------------------
+  # Test instances — isolated infra for integration tests:
+  # docker compose --profile test up -d
+  # ---------------------------------------------------------------------------
+  memgraph-test:
+    profiles: [test]
+    image: memgraph/memgraph:3.7.2
+    restart: unless-stopped
+    ports:
+      - "7688:7687" # Bolt protocol (test)
+    tmpfs:
+      # uid/gid required: a bare tmpfs mounts root-owned and Memgraph (uid 101) segfaults on startup
+      - /var/lib/memgraph:rw,uid=101,gid=103,mode=0750
+    environment:
+      MEMGRAPH_ENTERPRISE_LICENSE: "" # Community edition
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    command: >
+      --log-level=WARNING --memory-limit=1800 --storage-wal-enabled=false
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  valkey-test:
+    profiles: [test]
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    command: >
+      valkey-server --appendonly no --save "" --maxmemory 64mb --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
   # TEI — text embeddings inference (self-hosted embeddings)
   # Optional: docker compose --profile tei up -d
   # ---------------------------------------------------------------------------

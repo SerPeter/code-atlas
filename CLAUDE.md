@@ -18,7 +18,7 @@ uv sync --group dev              # Include dev dependencies
 # Run tests
 uv run pytest                    # All tests
 uv run pytest -m "not slow"      # Skip slow tests
-uv run pytest -m integration     # Integration tests only (requires Memgraph)
+uv run pytest -m integration     # Integration tests only (requires Docker — testcontainers by default, see Testing)
 uv run pytest tests/test_foo.py::test_bar  # Single test
 
 # Lint and format
@@ -32,7 +32,8 @@ uv run pre-commit install        # Install hooks
 uv run pre-commit run --all-files  # Run all hooks manually
 
 # Infrastructure
-docker compose up -d             # Start Memgraph + Valkey
+docker compose up -d             # Start Memgraph + Valkey (production index: 7687/6379)
+docker compose --profile test up -d  # Optional integration-test fast path (memgraph-test :7688, valkey-test :6380, see Testing)
 docker compose --profile tei up -d  # Include local embeddings (TEI)
 docker compose down              # Stop services
 
@@ -128,6 +129,7 @@ src/code_atlas/
 - **High gear (default):** Integration tests exercising full workflows and public APIs
 - **Low gear (selective):** Unit tests only for complex algorithms or edge cases unreachable via integration
 - Don't test every function. Test system behavior.
+- Integration tests start session-scoped testcontainers on random ports by default (Docker required; skip if unavailable). Fast path: `docker compose --profile test up -d`, then `ATLAS_TEST_MEMGRAPH_PORT=7688 ATLAS_TEST_VALKEY_PORT=6380 uv run pytest -m integration` — the env vars point tests at any isolated stack (e.g. CI service containers). Never connects to the production Memgraph/Valkey on 7687/6379. A conftest guard refuses to wipe any Memgraph containing project data not prefixed `test`/`bench`; `ATLAS_TEST_DB=1` bypasses it for known-disposable instances only.
 
 ## Commits
 

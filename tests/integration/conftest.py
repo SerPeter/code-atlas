@@ -1,4 +1,10 @@
-"""Integration test fixtures — require Memgraph + Valkey (via docker compose or testcontainers)."""
+"""Integration test fixtures — provision ISOLATED test Memgraph + Valkey.
+
+Default: session-scoped testcontainers on random ports (Docker required).
+Fast path: ``docker compose --profile test up -d`` then export
+``ATLAS_TEST_MEMGRAPH_PORT=7688 ATLAS_TEST_VALKEY_PORT=6380``. Never
+connects to the production instances on 7687/6379.
+"""
 
 from __future__ import annotations
 
@@ -42,68 +48,143 @@ def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def _export_atlas_env(ep: InfraEndpoints) -> InfraEndpoints:
+    """Point any AtlasSettings constructed inside tests at the test instances.
+
+    Defense-in-depth: fixtures pass explicit Memgraph/Redis settings, but the
+    repo-root atlas.toml hardcodes the production ports (7687/6379), so a bare
+    ``AtlasSettings(project_root=tmp_path)`` would otherwise resolve to the
+    production infrastructure (init > env > toml). Env beats toml.
+    """
+    os.environ["ATLAS_MEMGRAPH__HOST"] = ep.memgraph_host
+    os.environ["ATLAS_MEMGRAPH__PORT"] = str(ep.memgraph_port)
+    os.environ["ATLAS_REDIS__HOST"] = ep.valkey_host
+    os.environ["ATLAS_REDIS__PORT"] = str(ep.valkey_port)
+    return ep
+
+
 @pytest.fixture(scope="session")
 def _infra_endpoints() -> Iterator[InfraEndpoints]:
-    """Discover or start Memgraph + Valkey.
+    """Provision ISOLATED test Memgraph + Valkey for the whole session.
 
-    1. Try default ports (``docker compose up`` workflow) — zero overhead.
-    2. Fall back to testcontainers with random ports.
-    3. Skip if no Docker and services aren't running.
+    1. Explicit env override — ``ATLAS_TEST_MEMGRAPH_PORT`` / ``ATLAS_TEST_VALKEY_PORT``
+       point at existing isolated instances (CI service containers, or the
+       compose fast path: ``docker compose --profile test up -d`` →
+       memgraph-test :7688, valkey-test :6380).
+    2. Default — session-scoped testcontainers on random ports.
+    3. Skip with instructions if Docker is unavailable.
+
+    The production ports (7687/6379) are NEVER used or probed. The
+    production-data guard (_assert_disposable_db) applies on every path.
     """
-    default_mg_host, default_mg_port = "localhost", 7687
-    default_vk_host, default_vk_port = "localhost", 6379
-
-    if _is_port_open(default_mg_host, default_mg_port) and _is_port_open(default_vk_host, default_vk_port):
-        yield InfraEndpoints(
-            memgraph_host=default_mg_host,
-            memgraph_port=default_mg_port,
-            valkey_host=default_vk_host,
-            valkey_port=default_vk_port,
+    mg_env = os.environ.get("ATLAS_TEST_MEMGRAPH_PORT")
+    vk_env = os.environ.get("ATLAS_TEST_VALKEY_PORT")
+    if mg_env or vk_env:
+        # Unset var falls back to its compose test-profile port
+        yield _export_atlas_env(
+            InfraEndpoints(
+                memgraph_host="localhost",
+                memgraph_port=int(mg_env or "7688"),
+                valkey_host="localhost",
+                valkey_port=int(vk_env or "6380"),
+            )
         )
         return
 
-    # --- testcontainers fallback ---
+    # --- default: testcontainers on random ports ---
+    _fast_path_hint = (
+        "docker compose --profile test up -d && "
+        "ATLAS_TEST_MEMGRAPH_PORT=7688 ATLAS_TEST_VALKEY_PORT=6380 uv run pytest -m integration"
+    )
     try:
         from testcontainers.core.container import DockerContainer
-        from testcontainers.core.wait_strategies import LogMessageWaitStrategy
+        from testcontainers.core.wait_strategies import ExecWaitStrategy
     except ImportError:
-        pytest.skip("Services not running and testcontainers not installed")
+        pytest.skip(
+            "testcontainers not installed (uv sync --group dev). "
+            f"Alternatively point tests at an existing isolated stack: {_fast_path_hint}"
+        )
 
     # Windows: testcontainers may resolve host as named pipe
     os.environ.setdefault("TC_HOST", "localhost")
 
+    # Readiness probes mirror the compose healthchecks — Memgraph accepts TCP
+    # before Bolt is queryable, so port/log waits are not enough.
     mg = (
         DockerContainer("memgraph/memgraph:3.7.2")
         .with_exposed_ports(7687)
         .with_command("--log-level=WARNING --memory-limit=2048 --storage-wal-enabled=false")
-        .waiting_for(LogMessageWaitStrategy("is ready").with_startup_timeout(60))
+        .waiting_for(ExecWaitStrategy(["bash", "-c", "echo 'RETURN 1;' | mgconsole"]).with_startup_timeout(60))
     )
     vk = (
         DockerContainer("valkey/valkey:8-alpine")
         .with_exposed_ports(6379)
         .with_command('valkey-server --appendonly no --save "" --maxmemory 64mb --maxmemory-policy noeviction')
+        .waiting_for(ExecWaitStrategy(["valkey-cli", "ping"]).with_startup_timeout(30))
     )
 
     try:
         mg.start()
         vk.start()
     except Exception:
-        pytest.skip("Docker not available and services not running")
+        with contextlib.suppress(Exception):
+            mg.stop()
+        pytest.skip(
+            "Docker unavailable — integration tests start testcontainers by default. "
+            f"Start Docker, or use an existing isolated stack: {_fast_path_hint}"
+        )
 
     mg_host = mg.get_container_host_ip()
     mg_port = int(mg.get_exposed_port(7687))
     vk_host = vk.get_container_host_ip()
     vk_port = int(vk.get_exposed_port(6379))
 
-    yield InfraEndpoints(
-        memgraph_host=mg_host,
-        memgraph_port=mg_port,
-        valkey_host=vk_host,
-        valkey_port=vk_port,
+    yield _export_atlas_env(
+        InfraEndpoints(memgraph_host=mg_host, memgraph_port=mg_port, valkey_host=vk_host, valkey_port=vk_port)
     )
 
     mg.stop()
     vk.stop()
+
+
+# ---------------------------------------------------------------------------
+# Production-data guard
+# ---------------------------------------------------------------------------
+
+_GUARD_OK: set[tuple[str, int]] = set()
+"""(host, port) pairs already verified safe to wipe this session."""
+
+
+async def _assert_disposable_db(client: GraphClient, host: str, port: int) -> None:
+    """Refuse to run destructive fixtures against a DB that looks like production.
+
+    All integration/bench test data derives project names from pytest tmp
+    directories (``test_...`` / ``bench_...``); anything else means this is a
+    real index. Aborts the whole session via pytest.exit — never wipes.
+    Override with ATLAS_TEST_DB=1 only for known-disposable instances (CI).
+    """
+    if os.environ.get("ATLAS_TEST_DB") == "1" or (host, port) in _GUARD_OK:
+        return
+    rows = await client.execute(
+        "MATCH (n) "
+        "WHERE (n:Project AND NOT (n.name STARTS WITH 'test' OR n.name STARTS WITH 'bench')) "
+        "   OR (n.project_name IS NOT NULL "
+        "       AND NOT (n.project_name STARTS WITH 'test' OR n.project_name STARTS WITH 'bench')) "
+        "RETURN DISTINCT coalesce(n.project_name, n.name) AS name LIMIT 5"
+    )
+    if rows:
+        names = sorted({r["name"] for r in rows})
+        pytest.exit(
+            f"REFUSING to wipe Memgraph at {host}:{port} — it contains non-test data (projects: {names}). "
+            "This looks like a production index; integration fixtures would DESTROY it. "
+            "Unset ATLAS_TEST_MEMGRAPH_PORT/ATLAS_TEST_VALKEY_PORT to use disposable testcontainers, "
+            "or point them at the isolated compose stack (docker compose --profile test up -d → "
+            "memgraph-test :7688, valkey-test :6380). If this instance really is disposable "
+            "(e.g. residue on the test instance from an aborted run — clear it with "
+            "`docker compose restart memgraph-test`), set ATLAS_TEST_DB=1 to override.",
+            returncode=1,
+        )
+    _GUARD_OK.add((host, port))
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +229,7 @@ async def graph_client(settings) -> AsyncIterator[GraphClient]:
     except Exception:
         pytest.skip("Memgraph not available")
 
+    await _assert_disposable_db(client, settings.memgraph.host, settings.memgraph.port)
     # Clean slate: wipe nodes and drop search indices (dimension may differ)
     await client.execute_write("MATCH (n) DETACH DELETE n")
     for stmt in generate_drop_vector_index_ddl():
@@ -284,6 +366,7 @@ async def tei_graph_client(tei_settings) -> AsyncIterator[GraphClient]:
     except Exception:
         pytest.skip("Memgraph not available")
 
+    await _assert_disposable_db(client, tei_settings.memgraph.host, tei_settings.memgraph.port)
     await client.execute_write("MATCH (n) DETACH DELETE n")
     for stmt in generate_drop_vector_index_ddl():
         with contextlib.suppress(Exception):
