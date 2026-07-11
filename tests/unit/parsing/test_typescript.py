@@ -354,6 +354,23 @@ def test_extends_and_implements():
     assert impl_rels[0].to_name == "IBar"
 
 
+def test_implements_bare_name_contract():
+    """S1 contract: IMPLEMENTS is emitted with a bare interface name (never uid-shaped).
+
+    GraphClient._create_relationships routes IMPLEMENTS by shape — ``:`` in to_name
+    means uid (detector path), no ``:`` means bare name resolved like INHERITS.
+    The parser must emit from_qualified_name as the full uid and to_name bare.
+    """
+    parsed = _parse("class FileLogger implements Logger {}\n", path="src/logger.ts")
+    impl_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+    assert len(impl_rels) == 1
+    rel = impl_rels[0]
+    assert rel.from_qualified_name == f"{PROJECT}:src.logger.FileLogger"
+    assert rel.to_name == "Logger"
+    assert ":" not in rel.to_name
+    assert not rel.properties
+
+
 # ---------------------------------------------------------------------------
 # 13. Docstring (JSDoc) extraction
 # ---------------------------------------------------------------------------
@@ -726,6 +743,70 @@ const handler = () => {
     called = {r.to_name for r in calls}
     assert "doWork" in called
     assert "log" in called
+
+
+# ---------------------------------------------------------------------------
+# 24. TSX (JSX) parsing
+# ---------------------------------------------------------------------------
+
+
+def test_tsx_jsx_function_component():
+    """.tsx files must use the TSX grammar — JSX-returning components are extracted."""
+    parsed = _parse(
+        """\
+export function App() {
+  return <div className="app">{render()}</div>;
+}
+""",
+        path="src/components/App.tsx",
+    )
+    funcs = [e for e in parsed.entities if e.name == "App" and e.label == NodeLabel.CALLABLE]
+    assert len(funcs) == 1
+    func = funcs[0]
+    assert func.kind == CallableKind.FUNCTION
+    assert "exported" in func.tags
+
+    defines = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES]
+    assert any(r.to_name == f"{PROJECT}:src.components.App.App" for r in defines)
+
+    calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+    assert any(r.to_name == "render" for r in calls)
+
+
+def test_tsx_jsx_multiple_components():
+    """Declarations following JSX are not swallowed into ERROR subtrees."""
+    parsed = _parse(
+        """\
+function Toolbar() {
+  return <div className="toolbar">{render()}</div>;
+}
+
+export const Button = () => <button onClick={handleClick}>Go</button>;
+
+export function App() {
+  return (
+    <main>
+      <Toolbar />
+      <Button />
+    </main>
+  );
+}
+""",
+        path="src/components/App.tsx",
+    )
+    names = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+    assert names == {"Toolbar", "Button", "App"}
+
+    calls = _rels_from(parsed, "src.components.App.Toolbar", RelType.CALLS)
+    assert any(r.to_name == "render" for r in calls)
+
+
+def test_ts_old_style_type_assertion():
+    """.ts stays on the plain typescript grammar — old-style <T>expr assertions parse."""
+    parsed = _parse("const x = <string>getValue();\n", path="src/legacy.ts")
+    val = _entity_by_name(parsed, "x")
+    assert val.label == NodeLabel.VALUE
+    assert val.kind == ValueKind.CONSTANT
 
 
 # ---------------------------------------------------------------------------

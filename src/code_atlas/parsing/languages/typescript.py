@@ -1204,9 +1204,25 @@ try:
     register_language(
         LanguageConfig(
             name="typescript",
-            extensions=frozenset({".ts", ".tsx"}),
+            extensions=frozenset({".ts"}),
             language=_TS_LANGUAGE,
             query=_TS_QUERY,
+            parse_func=_parse_typescript,
+        )
+    )
+
+    # .tsx needs the separate TSX grammar — the plain typescript grammar has no
+    # JSX productions (and the tsx grammar conflicts with old-style <T>expr
+    # type assertions, so .ts stays on language_typescript).
+    _TSX_LANGUAGE = Language(_ts_ts.language_tsx())
+    _TSX_QUERY = Query(_TSX_LANGUAGE, "(program) @root")
+
+    register_language(
+        LanguageConfig(
+            name="tsx",
+            extensions=frozenset({".tsx"}),
+            language=_TSX_LANGUAGE,
+            query=_TSX_QUERY,
             parse_func=_parse_typescript,
         )
     )
