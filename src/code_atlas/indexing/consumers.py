@@ -10,7 +10,6 @@ deduplicates within its batch window.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import re
 import uuid
@@ -82,6 +81,15 @@ class BatchPolicy:
 # Abstract tier consumer
 # ---------------------------------------------------------------------------
 
+# Batches a message may fail before it is parked (ACKed + dropped) on the next PEL reclaim.
+_MAX_BATCH_FAILURES = 5
+
+
+def _stream_id_key(msg_id: bytes) -> tuple[int, int]:
+    """Numeric sort key for a Redis Stream id (``b"<ms>-<seq>"``)."""
+    ms, _, seq = msg_id.partition(b"-")
+    return int(ms), int(seq or 0)
+
 
 class TierConsumer(ABC):
     """Base class for tiered pipeline consumers.
@@ -108,15 +116,25 @@ class TierConsumer(ABC):
         self.policy = policy
         self._project_filter = project_filter
         self._stop = False
+        self._pel_dirty = False
+        self._fail_counts: dict[bytes, int] = {}  # msg_id → failed-batch count (poison cap)
 
     @abstractmethod
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:
-        """Process a deduplicated batch. Subclasses implement tier logic."""
+    async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:
+        """Process a deduplicated batch. Subclasses implement tier logic.
+
+        Returns dedup keys of events that were DEFERRED and must stay
+        un-ACKed in the PEL; None/empty when fully handled.
+        """
 
     def dedup_key(self, event: Event) -> str:
-        """Return a dedup key for an event. Override for custom logic."""
+        """Return a dedup key for an event. Override for custom logic.
+
+        FileChanged keys include project_name — monorepo sub-projects routinely
+        share relative paths, and equal keys ACK-supersede each other in _dedup_put.
+        """
         if isinstance(event, FileChanged):
-            return event.path
+            return f"{event.project_name}:{event.path}"
         return str(id(event))
 
     def _matches_project(self, event: Event) -> bool:
@@ -138,15 +156,45 @@ class TierConsumer(ABC):
         msg_id: bytes,
         event: Event,
     ) -> None:
-        """Insert into *pending*, ACKing the superseded msg_id if the key already exists."""
+        """Insert into *pending*, keeping the NEWEST msg_id per dedup key.
+
+        The superseded (older) msg_id is ACKed; the retained one stays in the
+        PEL. A byte-equal msg_id is a PEL re-read — no ACK. Keep-newest makes
+        the PEL reclaim idempotent: re-feeding an older un-ACKed message never
+        displaces (or double-ACKs against) a newer one already held in *pending*.
+        """
         old = pending.get(key)
-        if old is not None:
-            await self.bus.ack(self.input_topic, self.group, old[0])
+        if old is None:
+            pending[key] = (msg_id, event)
+            return
+        if old[0] == msg_id:
+            return
+        if _stream_id_key(msg_id) < _stream_id_key(old[0]):
+            await self._ack(msg_id)
+            return
+        await self._ack(old[0])
         pending[key] = (msg_id, event)
+
+    async def _ack(self, *msg_ids: bytes) -> None:
+        """ACK messages and drop their poison-tracking state.
+
+        Every ACK path must go through here: an ACKed message can never be
+        re-delivered, so keeping its ``_fail_counts`` entry (supersession,
+        project-filter, undecodable, empty-fields and park paths never reach
+        ``_ack_processed``) would leak memory unboundedly.
+        """
+        await self.bus.ack(self.input_topic, self.group, *msg_ids)
+        for mid in msg_ids:
+            self._fail_counts.pop(mid, None)
 
     def stop(self) -> None:
         """Signal the consumer to stop after the current iteration."""
         self._stop = True
+
+    @property
+    def stopped(self) -> bool:
+        """True once ``stop()`` has been called (used by daemon supervision)."""
+        return self._stop
 
     async def _pre_run(self) -> None:  # noqa: B027
         """Hook called before the main loop starts. Override for setup."""
@@ -162,6 +210,19 @@ class TierConsumer(ABC):
         """
         return True
 
+    async def _ack_processed(self, events: list[Event], msg_ids: list[bytes], deferred: set[str]) -> None:
+        """ACK msg_ids whose events were fully handled; deferred ones stay in the PEL."""
+        ack_ids = [mid for mid, ev in zip(msg_ids, events, strict=True) if self.dedup_key(ev) not in deferred]
+        if ack_ids:
+            await self._ack(*ack_ids)
+        if deferred:
+            self._pel_dirty = True  # deferred messages stay in PEL; reclaim re-delivers them
+
+    def _note_batch_failure(self, msg_ids: list[bytes]) -> None:
+        for mid in msg_ids:
+            self._fail_counts[mid] = self._fail_counts.get(mid, 0) + 1
+        self._pel_dirty = True
+
     async def _dispatch_batch(
         self,
         events: list[Event],
@@ -170,15 +231,15 @@ class TierConsumer(ABC):
     ) -> None:
         """Process and ACK a batch. Override for async dispatch (e.g. worker tasks).
 
-        Default: process inline, ACK on success, leave in PEL on failure.
+        Default: process inline, ACK non-deferred on success, leave in PEL on failure.
         """
         try:
             with logger.contextualize(consumer=self.consumer_name):
-                await self.process_batch(events, batch_id)
-            await self.bus.ack(self.input_topic, self.group, *msg_ids)
+                deferred = await self.process_batch(events, batch_id) or set()
+            await self._ack_processed(events, msg_ids, deferred)
         except Exception:
             logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
-            self._pel_dirty = True
+            self._note_batch_failure(msg_ids)
 
     async def run(self) -> None:  # noqa: PLR0912, PLR0915
         """Main consumer loop — runs until ``stop()`` is called."""
@@ -213,17 +274,28 @@ class TierConsumer(ABC):
                     if reclaimed:
                         for msg_id, fields in reclaimed:
                             if not fields:
-                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                await self._ack(msg_id)
                                 continue
                             try:
                                 event = decode_event(self.input_topic, fields)
                                 key = self.dedup_key(event)
                             except KeyError, TypeError, ValueError:
                                 logger.exception("{} failed to decode pending message, skipping", self.consumer_name)
-                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                await self._ack(msg_id)
                                 continue
                             if not self._matches_project(event):
-                                await self.bus.ack(self.input_topic, self.group, msg_id)
+                                await self._ack(msg_id)
+                                continue
+                            if self._fail_counts.get(msg_id, 0) >= _MAX_BATCH_FAILURES:
+                                logger.error(
+                                    "{} parking poison message {} (key={}) after {} failed batches — "
+                                    "change is dropped until the file is re-indexed",
+                                    self.consumer_name,
+                                    msg_id,
+                                    key,
+                                    _MAX_BATCH_FAILURES,
+                                )
+                                await self._ack(msg_id)
                                 continue
                             await self._dedup_put(pending, key, msg_id, event)
                             if window_start is None:
@@ -246,10 +318,10 @@ class TierConsumer(ABC):
                         key = self.dedup_key(event)
                     except KeyError, TypeError, ValueError:
                         logger.exception("{} failed to decode message, skipping", self.consumer_name)
-                        await self.bus.ack(self.input_topic, self.group, msg_id)
+                        await self._ack(msg_id)
                         continue
                     if not self._matches_project(event):
-                        await self.bus.ack(self.input_topic, self.group, msg_id)
+                        await self._ack(msg_id)
                         continue
                     await self._dedup_put(pending, key, msg_id, event)
                     if window_start is None:
@@ -285,15 +357,16 @@ class TierConsumer(ABC):
 
 # Significance levels for the AST → Embed gate
 #
-# | Condition                        | Level    | Action        |
-# |----------------------------------|----------|---------------|
-# | Whitespace/formatting only       | NONE     | Stop          |
-# | Non-docstring comment            | TRIVIAL  | Stop          |
-# | Docstring changed                | MODERATE | Gate through  |
-# | Body changed < 20% AST diff     | MODERATE | Gate through  |
-# | Body changed >= 20%             | HIGH     | Gate through  |
-# | Signature changed                | HIGH     | Always gate   |
-# | Entity added/deleted             | HIGH     | Always gate   |
+# | Condition                                  | Level    | Action       |
+# |--------------------------------------------|----------|--------------|
+# | Docstring-only changed                     | MODERATE | Gate through |
+# | Signature/body/name/tags/visibility change | HIGH     | Gate through |
+# | Entity added/deleted                       | HIGH     | Always gate  |
+#
+# Whitespace-only file changes never reach classification — the file hash
+# gate strips whitespace (_compute_file_hash). Every added|modified entity
+# becomes an embed candidate; the embed_hash gate (read_embed_hashes) is
+# what suppresses re-embedding when the embed text is unchanged.
 
 
 _SIG_ORDER: dict[Significance, int] = {
@@ -328,11 +401,19 @@ class _ParsedFileData:
     import_rels: list[ParsedRelationship]
     call_rels: list[ParsedRelationship]
     type_rels: list[ParsedRelationship]
+    member_rels: list[ParsedRelationship]
     enrichments: list[PropertyEnrichment]
 
 
 _SENTINEL_DELETED = _ParsedFileData(
-    file_path="", entities=[], non_import_rels=[], import_rels=[], call_rels=[], type_rels=[], enrichments=[]
+    file_path="",
+    entities=[],
+    non_import_rels=[],
+    import_rels=[],
+    call_rels=[],
+    type_rels=[],
+    member_rels=[],
+    enrichments=[],
 )
 
 
@@ -364,11 +445,10 @@ class ASTConsumer(TierConsumer):
         self.stats = ASTStats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
 
-        # Per-file cooldown state (daemon mode)
+        # Per-file cooldown state (daemon mode). Cooldown-deferred events stay
+        # un-ACKed in the PEL and are redelivered by the reclaim loop.
         self._cooldown_s = cooldown_s
-        self._cooldowns: dict[str, float] = {}  # file_path → expiry (monotonic)
-        self._deferred: dict[str, FileChanged] = {}  # file_path → latest deferred event
-        self._deferred_drain_task: asyncio.Task[None] | None = None
+        self._cooldowns: dict[str, float] = {}  # "project_name:path" → expiry (monotonic)
 
         # Deferred resolution state — accumulate rels across batches, flush periodically.
         # In reindex mode (time_window_s=0, block_ms=50) use larger intervals to skip
@@ -381,45 +461,20 @@ class ASTConsumer(TierConsumer):
         self._pending_import_rels: list[ParsedRelationship] = []
         self._pending_call_rels: list[ParsedRelationship] = []
         self._pending_type_rels: list[ParsedRelationship] = []
+        self._pending_member_rels: list[ParsedRelationship] = []
         self._pending_project_names: set[str] = set()
-
-    def dedup_key(self, event: Event) -> str:
-        if isinstance(event, FileChanged):
-            return event.path
-        return super().dedup_key(event)
-
-    async def _pre_run(self) -> None:
-        if self._cooldown_s > 0:
-            self._deferred_drain_task = asyncio.create_task(self._drain_deferred_loop())
-
-    async def _post_run(self) -> None:
-        if self._deferred_drain_task is not None:
-            self._deferred_drain_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._deferred_drain_task
-            self._deferred_drain_task = None
-
-    async def _drain_deferred_loop(self) -> None:
-        """Re-publish deferred events whose cooldown has expired.
-
-        Runs as a background task so deferred events are eventually
-        processed even if no new events arrive to trigger ``process_batch``.
-        """
-        while not self._stop:
-            await asyncio.sleep(2.0)
-            now = asyncio.get_event_loop().time()
-            expired = [(fp, ev) for fp, ev in self._deferred.items() if now >= self._cooldowns.get(fp, 0)]
-            for fp, _ in expired:
-                del self._deferred[fp]
-            if expired:
-                await self.bus.publish_many(Topic.FILE_CHANGED, [ev for _, ev in expired])
 
     async def run(self) -> None:
         try:
             await super().run()
         finally:
             # Final resolution flush for any remaining deferred rels
-            if self._pending_import_rels or self._pending_call_rels or self._pending_type_rels:
+            if (
+                self._pending_import_rels
+                or self._pending_call_rels
+                or self._pending_type_rels
+                or self._pending_member_rels
+            ):
                 await self._flush_deferred_resolution()
 
     async def _flush_deferred_resolution(self) -> None:
@@ -430,11 +485,14 @@ class ASTConsumer(TierConsumer):
             ]
             proj_calls = [r for r in self._pending_call_rels if r.from_qualified_name.startswith(project_name + ":")]
             proj_types = [r for r in self._pending_type_rels if r.from_qualified_name.startswith(project_name + ":")]
+            proj_members = [
+                r for r in self._pending_member_rels if r.from_qualified_name.startswith(project_name + ":")
+            ]
 
             if proj_imports:
                 await self.graph.resolve_imports(project_name, proj_imports)
 
-            if proj_calls or proj_types:
+            if proj_calls or proj_types or proj_members:
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
                 if proj_calls:
                     await self.graph.resolve_calls(project_name, proj_calls, lookup=shared_lookup)
@@ -442,10 +500,15 @@ class ASTConsumer(TierConsumer):
                     await self.graph.resolve_type_refs(
                         project_name, proj_types, lookup=shared_lookup, name_to_typedefs=td_map
                     )
+                if proj_members:
+                    await self.graph.resolve_member_defines(
+                        project_name, proj_members, lookup=shared_lookup, name_to_typedefs=td_map
+                    )
 
         self._pending_import_rels.clear()
         self._pending_call_rels.clear()
         self._pending_type_rels.clear()
+        self._pending_member_rels.clear()
         self._pending_project_names.clear()
         self._batches_since_resolve = 0
         self._last_resolve_time = asyncio.get_event_loop().time()
@@ -486,37 +549,50 @@ class ASTConsumer(TierConsumer):
         all_rels = parsed.relationships + det_result.relationships
 
         _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE}
+
+        def _is_member(r: ParsedRelationship) -> bool:
+            # Member DEFINES whose parent type may live in another file —
+            # resolved post-batch via GraphClient.resolve_member_defines.
+            return r.rel_type == RelType.DEFINES and "parent_type_name" in r.properties
+
         return _ParsedFileData(
             file_path=file_path,
             entities=parsed.entities,
-            non_import_rels=[r for r in all_rels if r.rel_type not in _deferred],
+            non_import_rels=[r for r in all_rels if r.rel_type not in _deferred and not _is_member(r)],
             import_rels=[r for r in all_rels if r.rel_type == RelType.IMPORTS],
             call_rels=[r for r in all_rels if r.rel_type == RelType.CALLS],
             type_rels=[r for r in all_rels if r.rel_type == RelType.USES_TYPE],
+            member_rels=[r for r in all_rels if _is_member(r)],
             enrichments=det_result.enrichments,
         )
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:  # noqa: PLR0912, PLR0915
+    async def process_batch(self, events: list[Event], batch_id: str) -> set[str]:  # noqa: PLR0912, PLR0915
+        deferred_keys: set[str] = set()
         with _tracer.start_as_current_span("ast.process_batch", attributes={"batch_id": batch_id}) as span:
-            # Per-file cooldown filter: defer events for recently-processed files
+            # Per-file cooldown filter: defer events for recently-processed files.
+            # Deferred events stay un-ACKed in the PEL and are redelivered every
+            # batch window until the cooldown expires, so files_deferred counts
+            # retry passes too.
             if self._cooldown_s > 0:
                 now = asyncio.get_event_loop().time()
                 # Clean expired cooldowns
-                self._cooldowns = {fp: exp for fp, exp in self._cooldowns.items() if exp > now}
+                self._cooldowns = {k: exp for k, exp in self._cooldowns.items() if exp > now}
                 processable: list[Event] = []
                 deferred_count = 0
                 for ev in events:
-                    if isinstance(ev, FileChanged) and ev.path in self._cooldowns:
-                        self._deferred[ev.path] = ev  # latest overwrites
-                        deferred_count += 1
-                    else:
-                        processable.append(ev)
+                    if isinstance(ev, FileChanged):
+                        key = self.dedup_key(ev)
+                        if key in self._cooldowns:
+                            deferred_keys.add(key)
+                            deferred_count += 1
+                            continue
+                    processable.append(ev)
                 if deferred_count:
                     self.stats.files_deferred += deferred_count
                     logger.debug("AST batch {}: {} event(s) deferred by cooldown", batch_id, deferred_count)
                 events = processable
                 if not events:
-                    return
+                    return deferred_keys
 
             # Group paths by (project_name, project_root) — monorepo batches can mix sub-projects
             groups: dict[tuple[str, str], list[str]] = {}
@@ -697,17 +773,19 @@ class ASTConsumer(TierConsumer):
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
                 group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
                 group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
+                group_member_rels = [r for pfd in parsed_files.values() for r in pfd.member_rels]
 
                 self._pending_import_rels.extend(group_import_rels)
                 self._pending_call_rels.extend(group_call_rels)
                 self._pending_type_rels.extend(group_type_rels)
+                self._pending_member_rels.extend(group_member_rels)
                 self._pending_project_names.add(project_name)
 
                 # 8. Set per-file cooldown for processed files
                 if self._cooldown_s > 0:
                     expiry = asyncio.get_event_loop().time() + self._cooldown_s
                     for fp in list(parsed_files) + deleted_files:
-                        self._cooldowns[fp] = expiry
+                        self._cooldowns[f"{event_project_name}:{fp}"] = expiry
 
             self._batches_since_resolve += 1
             now = asyncio.get_event_loop().time()
@@ -752,6 +830,8 @@ class ASTConsumer(TierConsumer):
                         Topic.EMBED_DIRTY,
                         [EmbedDirty(entity=ref, significance=batch_max_sig) for ref in to_publish],
                     )
+
+        return deferred_keys
 
 
 # ---------------------------------------------------------------------------
@@ -798,7 +878,6 @@ class EmbedConsumer(TierConsumer):
         self._max_concurrency = _max_conc
         self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
-        self._pel_dirty = False
         self._write_lock = asyncio.Lock()
 
     def dedup_key(self, event: Event) -> str:
@@ -839,11 +918,11 @@ class EmbedConsumer(TierConsumer):
         try:
             logger.debug("{} dispatching batch {} ({} events)", self.consumer_name, batch_id, len(events))
             with logger.contextualize(consumer=self.consumer_name):
-                await self.process_batch(events, batch_id)
-            await self.bus.ack(self.input_topic, self.group, *msg_ids)
+                deferred = await self.process_batch(events, batch_id) or set()
+            await self._ack_processed(events, msg_ids, deferred)
         except Exception:
             logger.exception("{} batch {} failed, will retry via PEL", self.consumer_name, batch_id)
-            self._pel_dirty = True
+            self._note_batch_failure(msg_ids)
         finally:
             self._sem.release()
 
@@ -877,7 +956,7 @@ class EmbedConsumer(TierConsumer):
             await self.cache.put_many([(th, vec) for _, vec, th in result])
         return result
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> None:
+    async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:
         with _tracer.start_as_current_span("embed.process_batch", attributes={"batch_id": batch_id}) as span:
             # Collect and deduplicate entities across all events in the batch
             seen: dict[str, EntityRef] = {}

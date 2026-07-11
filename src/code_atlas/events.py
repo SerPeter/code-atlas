@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -125,6 +124,7 @@ class EventBus:
         self._redis = aioredis.from_url(url, decode_responses=False)
         self._prefix = settings.stream_prefix
         self._project = project_name
+        self._maxlen: int | None = settings.stream_maxlen if settings.stream_maxlen > 0 else None
 
     def _stream_key(self, topic: Topic) -> str:
         if self._project:
@@ -143,12 +143,18 @@ class EventBus:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-    async def publish(self, topic: Topic, event: Event, *, maxlen: int = 10_000) -> bytes:
-        """Publish an event to a stream. Returns the message ID."""
-        with _tracer.start_as_current_span("eventbus.publish", attributes={"topic": topic.value}):
-            return await self._redis.xadd(self._stream_key(topic), encode_event(event), maxlen=maxlen, approximate=True)
+    async def publish(self, topic: Topic, event: Event) -> bytes:
+        """Publish an event to a stream. Returns the message ID.
 
-    async def publish_many(self, topic: Topic, events: list[Event], *, maxlen: int = 10_000) -> list[bytes]:
+        Streams are trimmed to ``RedisSettings.stream_maxlen`` (approximate);
+        0 disables trimming. Callers cannot pass their own ceiling.
+        """
+        with _tracer.start_as_current_span("eventbus.publish", attributes={"topic": topic.value}):
+            return await self._redis.xadd(
+                self._stream_key(topic), encode_event(event), maxlen=self._maxlen, approximate=True
+            )
+
+    async def publish_many(self, topic: Topic, events: list[Event]) -> list[bytes]:
         """Publish multiple events in a single pipeline round-trip."""
         if not events:
             return []
@@ -158,7 +164,7 @@ class EventBus:
             key = self._stream_key(topic)
             async with self._redis.pipeline(transaction=False) as pipe:
                 for event in events:
-                    pipe.xadd(key, encode_event(event), maxlen=maxlen, approximate=True)
+                    pipe.xadd(key, encode_event(event), maxlen=self._maxlen, approximate=True)
                 return await pipe.execute()
 
     async def read_batch(
@@ -222,11 +228,14 @@ class EventBus:
         """Acknowledge messages after successful processing."""
         return await self._redis.xack(self._stream_key(topic), group, *msg_ids)
 
-    async def stream_group_info(self, topic: Topic, group: str) -> dict[str, int]:
+    async def stream_group_info(self, topic: Topic, group: str) -> dict[str, int | None]:
         """Return pending + lag counts for a consumer group via XINFO GROUPS.
 
-        Returns ``{"pending": N, "lag": N}`` or ``{"pending": 0, "lag": 0}``
-        if the group does not exist yet.
+        Returns ``{"pending": N, "lag": N}``. ``lag`` is ``None`` when Redis
+        reports it as unknown (the stream was trimmed past the group's read
+        position) — callers must treat that as NOT drained, never as 0.
+        Returns ``{"pending": 0, "lag": 0}`` if the group does not exist yet
+        (a missing group genuinely has no backlog).
         """
         try:
             groups = await self._redis.xinfo_groups(self._stream_key(topic))
@@ -241,15 +250,17 @@ class EventBus:
             if name == group:
                 pending = g.get(b"pending", g.get("pending", 0))
                 lag = g.get(b"lag", g.get("lag", 0))
-                return {"pending": int(pending), "lag": int(lag or 0)}
+                return {"pending": int(pending), "lag": int(lag) if lag is not None else None}
 
         return {"pending": 0, "lag": 0}
 
-    async def stream_group_info_multi(self, queries: list[tuple[Topic, str]]) -> list[dict[str, int]]:
+    async def stream_group_info_multi(self, queries: list[tuple[Topic, str]]) -> list[dict[str, int | None]]:
         """Return pending + lag counts for multiple consumer groups in one pipelined RTT.
 
         Each entry in *queries* is ``(topic, group_name)``.  Returns a list of
-        ``{"pending": N, "lag": N}`` dicts in the same order.
+        ``{"pending": N, "lag": N}`` dicts in the same order.  ``lag`` is
+        ``None`` when unknown (stream trimmed past the group's read position);
+        callers must treat that as NOT drained.
         """
         if not queries:
             return []
@@ -259,7 +270,7 @@ class EventBus:
             pipe.xinfo_groups(self._stream_key(topic))
         results = await pipe.execute()
 
-        out: list[dict[str, int]] = []
+        out: list[dict[str, int | None]] = []
         for (_topic, group), raw in zip(queries, results, strict=True):
             if isinstance(raw, Exception):
                 out.append({"pending": 0, "lag": 0})
@@ -272,7 +283,7 @@ class EventBus:
                 if name == group:
                     pending = g.get(b"pending", g.get("pending", 0))
                     lag = g.get(b"lag", g.get("lag", 0))
-                    out.append({"pending": int(pending), "lag": int(lag or 0)})
+                    out.append({"pending": int(pending), "lag": int(lag) if lag is not None else None})
                     found = True
                     break
             if not found:
@@ -280,30 +291,16 @@ class EventBus:
         return out
 
     async def flush(self) -> None:
-        """Clear all pipeline streams for a full reindex.
+        """Trim all pipeline streams for a full reindex.
 
-        Trims all stream entries and destroys consumer groups to clear stale
-        pending entry lists (PEL). Groups are recreated by ``ensure_group()``
-        when consumers start.
+        Consumer groups are preserved — live consumers keep running; PEL
+        entries whose data was trimmed are ACKed by consumers when redelivered
+        with empty fields.
         """
         pipe = self._redis.pipeline(transaction=False)
         for topic in Topic:
             pipe.xtrim(self._stream_key(topic), 0, approximate=False)
         await pipe.execute()
-
-        # Destroy consumer groups to purge stale PEL entries from previous runs.
-        for topic in Topic:
-            key = self._stream_key(topic)
-            try:
-                groups = await self._redis.xinfo_groups(key)
-            except Exception:
-                continue
-            for g in groups:
-                name = g.get(b"name", g.get("name", b""))
-                if isinstance(name, bytes):
-                    name = name.decode()
-                with contextlib.suppress(Exception):
-                    await self._redis.xgroup_destroy(key, name)
 
     async def close(self) -> None:
         """Close the connection pool."""

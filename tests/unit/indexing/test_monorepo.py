@@ -163,17 +163,21 @@ class TestClassifyFileProject:
             DetectedProject(name="auth", path="services/auth", root=Path("x"), marker="pyproject.toml"),
         ]
 
-        assert classify_file_project("services/auth/main.py", sub_projects) == "auth"
-        assert classify_file_project("services/other.py", sub_projects) == "services"
+        result = classify_file_project("services/auth/main.py", sub_projects)
+        assert result is not None
+        assert result.name == "auth"
+        result = classify_file_project("services/other.py", sub_projects)
+        assert result is not None
+        assert result.name == "services"
 
-    def test_no_match_returns_empty(self):
-        """Files outside any sub-project return empty string."""
+    def test_no_match_returns_none(self):
+        """Files outside any sub-project return None."""
         sub_projects = [
             DetectedProject(name="auth", path="services/auth", root=Path("x"), marker="pyproject.toml"),
         ]
 
-        assert classify_file_project("root_file.py", sub_projects) == ""
-        assert classify_file_project("other/file.py", sub_projects) == ""
+        assert classify_file_project("root_file.py", sub_projects) is None
+        assert classify_file_project("other/file.py", sub_projects) is None
 
     def test_exact_path_match(self):
         """File path exactly matching a sub-project path is classified."""
@@ -182,11 +186,13 @@ class TestClassifyFileProject:
         ]
 
         # This shouldn't normally happen (paths are to files), but test robustness
-        assert classify_file_project("services/auth", sub_projects) == "auth"
+        result = classify_file_project("services/auth", sub_projects)
+        assert result is not None
+        assert result.name == "auth"
 
     def test_empty_sub_projects(self):
         """No sub-projects means all files are unclassified."""
-        assert classify_file_project("any/file.py", []) == ""
+        assert classify_file_project("any/file.py", []) is None
 
 
 # ---------------------------------------------------------------------------

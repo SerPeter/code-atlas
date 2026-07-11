@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from code_atlas.events import Topic
 from code_atlas.indexing.orchestrator import StalenessChecker, index_project
 from code_atlas.schema import NodeLabel
-from code_atlas.settings import AtlasSettings, IndexSettings
+from code_atlas.settings import AtlasSettings, IndexSettings, derive_project_name
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
 if TYPE_CHECKING:
@@ -274,6 +275,70 @@ class TestDeltaIndexIntegration:
             settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
         )
         assert r2.mode == "full"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline durability — integration tests (require Memgraph + Valkey + git)
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineDurabilityIntegration:
+    async def test_drain_timeout_does_not_advance_git_hash(self, tmp_path, graph_client, event_bus):
+        """S7(f): a timed-out drain must not advance git_hash — the next run retries the delta.
+
+        Before the fix the timeout only logged a warning, git_hash advanced to
+        HEAD anyway, and the IndexResult carried no failure signal.
+        """
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "src/__init__.py", "")
+        _write(tmp_path, "src/app.py", 'def hello():\n    return "hello"\n')
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project_name = derive_project_name(tmp_path)
+
+        # settle_s=2.0 inside the pipeline makes draining within 0.01s impossible
+        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=0.01)
+
+        assert r1.drained is False
+        assert await graph_client.get_project_git_hash(project_name) is None
+
+        # A follow-up run with a normal timeout processes the files, THEN advances git_hash
+        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert r2.drained is True
+        assert r2.entities_total > 0
+        assert await graph_client.get_project_git_hash(project_name) == _get_head(tmp_path)
+
+    async def test_full_reindex_preserves_foreign_consumer_group(self, tmp_path, graph_client, event_bus):
+        """S7(e): a full reindex must not destroy consumer groups a live daemon depends on.
+
+        Before the fix ``bus.flush()`` destroyed every consumer group on the
+        pipeline streams, permanently killing a concurrently running daemon's
+        consumers.
+        """
+        _write(tmp_path, "app.py", "x = 1\n")
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+
+        # Simulate a live daemon's consumer group on the FileChanged stream
+        await event_bus.ensure_group(Topic.FILE_CHANGED, "daemon-sim")
+        key = event_bus._stream_key(Topic.FILE_CHANGED)
+
+        try:
+            await index_project(
+                settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            )
+
+            groups = await event_bus._redis.xinfo_groups(key)
+            names = set()
+            for g in groups:
+                name = g.get(b"name", g.get("name", b""))
+                names.add(name.decode() if isinstance(name, bytes) else name)
+            assert "daemon-sim" in names
+        finally:
+            await event_bus._redis.xgroup_destroy(key, "daemon-sim")
 
 
 # ---------------------------------------------------------------------------

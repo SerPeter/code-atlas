@@ -20,6 +20,7 @@ from loguru import logger
 from code_atlas.events import Event, EventBus, FileChanged, Topic
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
+from code_atlas.parsing.languages.python import module_qualified_name
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
 from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
@@ -239,19 +240,19 @@ def detect_sub_projects(
     return result
 
 
-def classify_file_project(rel_path: str, sub_projects: list[DetectedProject]) -> str:
-    """Return the project_name for the most specific (longest prefix) matching sub-project.
+def classify_file_project(rel_path: str, sub_projects: list[DetectedProject]) -> DetectedProject | None:
+    """Return the most specific (longest path prefix) sub-project owning *rel_path*.
 
-    Returns empty string if the file doesn't belong to any sub-project.
+    Returns ``None`` if the file doesn't belong to any sub-project.
     """
-    best_name = ""
+    best: DetectedProject | None = None
     best_len = -1
     for proj in sub_projects:
         prefix = proj.path
         if (rel_path == prefix or rel_path.startswith(prefix + "/")) and len(prefix) > best_len:
             best_len = len(prefix)
-            best_name = proj.name
-    return best_name
+            best = proj
+    return best
 
 
 @dataclass(frozen=True)
@@ -277,6 +278,7 @@ class IndexResult:
     duration_s: float
     mode: str = "full"  # "full" | "delta"
     delta_stats: DeltaStats | None = None
+    drained: bool = True  # False when the pipeline drain timed out; git_hash was NOT advanced
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +501,9 @@ def _detect_packages(project_root: Path) -> list[tuple[str, str]]:
             rel = Path(dirpath).relative_to(root).as_posix()
             if rel == ".":
                 continue
-            # qualified name: replace / with .
-            qn = rel.replace("/", ".")
+            # Shared parser derivation so Package uids converge with parsed
+            # __init__.py entities (strips source roots like 'src/')
+            qn = module_qualified_name(f"{rel}/__init__.py")
             packages.append((qn, rel))
     packages.sort(key=lambda t: t[0].count("."))
     return packages
@@ -538,12 +541,15 @@ def _git_changed_files(project_root: Path, from_hash: str) -> list[tuple[str, st
     """Return files changed between *from_hash* and HEAD as ``[(path, change_type), ...]``.
 
     Uses ``git diff --name-status --no-renames`` so renames appear as delete+add.
+    Paths are relative to *project_root* (POSIX separators), matching
+    ``scan_files()`` output — required for monorepo sub-projects and any
+    project_root below the git top-level.
     Returns ``None`` if git fails (invalid hash, not a repo, etc.) — caller
     falls back to full mode.
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-status", "--no-renames", from_hash, "--", "."],
+            ["git", "diff", "--name-status", "--no-renames", "--relative", from_hash, "--", "."],
             cwd=project_root,
             capture_output=True,
             text=True,
@@ -764,35 +770,42 @@ async def _check_model_lock(
     """Enforce embedding model/dimension lock on the SchemaVersion node.
 
     - First run (no stored model): write current config.
-    - Reindex: clear embeddings + embed_hash, rebuild vector indices,
-      flush all model keys from Valkey cache, write new config.
-    - Model or dimension mismatch: raise RuntimeError with clear guidance.
+    - Stored config unchanged: no-op — a full reindex of one project must not
+      wipe other projects' embeddings in the shared database.
+    - Model or dimension changed with *reindex*: clear embeddings + embed_hash
+      database-wide, rebuild vector indices, flush all model keys from the
+      Valkey cache, write new config (vector indices are shared, so a config
+      change is necessarily database-wide).
+    - Model or dimension changed without *reindex*: raise RuntimeError with
+      clear guidance.
     """
-    if reindex:
-        await graph.clear_all_embeddings()
-        await graph.rebuild_vector_indices(dimension)
-        if cache is not None:
-            await cache.clear_all_models()
+    stored = await graph.get_embedding_config()
+    if stored is None:
         await graph.set_embedding_config(model, dimension)
         return
 
-    stored = await graph.get_embedding_config()
-    if stored is not None:
-        stored_model, stored_dim = stored
+    stored_model, stored_dim = stored
+    if stored_model == model and stored_dim == dimension:
+        return
+
+    if not reindex:
         if stored_model != model:
             msg = (
                 f"Embedding model changed from '{stored_model}' to '{model}'. "
                 "Run 'atlas index --full' to rebuild all embeddings."
             )
-            raise RuntimeError(msg)
-        if stored_dim != dimension:
+        else:
             msg = (
                 f"Embedding dimension changed from {stored_dim} to {dimension}. "
                 "Run 'atlas index --full' to rebuild vector indices."
             )
-            raise RuntimeError(msg)
-    else:
-        await graph.set_embedding_config(model, dimension)
+        raise RuntimeError(msg)
+
+    await graph.clear_all_embeddings()
+    await graph.rebuild_vector_indices(dimension)
+    if cache is not None:
+        await cache.clear_all_models()
+    await graph.set_embedding_config(model, dimension)
 
 
 # ---------------------------------------------------------------------------
@@ -849,10 +862,11 @@ async def _run_pipeline(
     project_filter: set[str] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
     reindex_mode: bool = False,
-) -> ASTConsumer:
+) -> tuple[ASTConsumer, bool]:
     """Start inline consumers and wait for the pipeline to drain.
 
-    Returns the AST consumer so callers can read accumulated stats.
+    Returns the AST consumer (so callers can read accumulated stats) and
+    whether the pipeline fully drained before the timeout.
     When *reindex_mode* is True, reindex-tuned policies are used for
     faster polling.
     """
@@ -886,7 +900,7 @@ async def _run_pipeline(
         embed_task = asyncio.create_task(embed_consumer.run())
 
     try:
-        await _wait_for_drain(
+        drained = await _wait_for_drain(
             bus,
             drain_timeout_s,
             embed_enabled=embed is not None,
@@ -908,7 +922,7 @@ async def _run_pipeline(
         if cache is not None:
             await cache.close()
 
-    return ast_consumer
+    return ast_consumer, drained
 
 
 @dataclass
@@ -1150,6 +1164,9 @@ async def index_project(
     In monorepo mode, *project_name* and *project_root* override the
     settings-derived defaults so that each sub-project can be indexed
     with its own root while sharing infra config from the monorepo settings.
+
+    On drain timeout the run returns ``drained=False`` and git_hash is not
+    advanced, so the next run retries the delta.
     """
     project_name = project_name or derive_project_name(Path(settings.project_root))
     with _tracer.start_as_current_span("index_project", attributes={"project_name": project_name}) as idx_span:
@@ -1224,13 +1241,16 @@ async def _index_project_inner(  # noqa: PLR0915
     files = _sort_files_for_indexing(files)
 
     # 6. Publish events
-    published = await _publish_events(bus, decision.mode, files, decision, project_name=project_name)
+    published = await _publish_events(
+        bus, decision.mode, files, decision, project_name=project_name, project_root=str(project_root)
+    )
 
     # 7. Start inline consumers and wait for drain
     reindex_mode = full_reindex or decision.mode == "full"
     ast_stats = None
+    drained = True
     if published > 0:
-        ast_consumer = await _run_pipeline(
+        ast_consumer, drained = await _run_pipeline(
             bus,
             graph,
             settings,
@@ -1258,7 +1278,10 @@ async def _index_project_inner(  # noqa: PLR0915
         "entity_count": entity_count,
         "index_mode": decision.mode,
     }
-    if git_hash:
+    # Only advance git_hash when the pipeline drained: an un-advanced git_hash
+    # makes the next delta run republish the missed files and drain the
+    # leftover backlog (durability contract #5).
+    if git_hash and drained:
         metadata["git_hash"] = git_hash
     if decision.mode == "delta":
         metadata["delta_files_added"] = len(decision.files_added)
@@ -1287,6 +1310,7 @@ async def _index_project_inner(  # noqa: PLR0915
         duration_s=duration,
         mode=decision.mode,
         delta_stats=delta_stats,
+        drained=drained,
     )
 
 
@@ -1482,6 +1506,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
     start = time.monotonic()
     publish_results: list[_ProjectPublishResult] = []
+    drained = False
 
     try:
         # --- Publish phase: scan + publish per sub-project (fast) ---
@@ -1530,7 +1555,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 on_progress(root_name, total, total)
 
         # --- Wait for ALL stages to drain (once) ---
-        await _wait_for_drain(
+        drained = await _wait_for_drain(
             bus,
             drain_timeout_s,
             embed_enabled=embed is not None,
@@ -1567,7 +1592,10 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             "entity_count": entity_count,
             "index_mode": pr.mode,
         }
-        if git_hash:
+        # Only advance git_hash when the shared pipeline drained (coarse per-run
+        # gate): an un-advanced git_hash makes the next delta run republish the
+        # missed files and drain the leftover backlog (durability contract #5).
+        if git_hash and drained:
             metadata["git_hash"] = git_hash
         if pr.mode == "delta":
             metadata["delta_files_added"] = len(pr.decision.files_added)
@@ -1587,6 +1615,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 duration_s=duration,
                 mode=pr.mode,
                 delta_stats=delta_stats,
+                drained=drained,
             )
         )
 
@@ -1626,8 +1655,13 @@ async def _wait_for_drain(
     embed_enabled: bool = True,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
     settle_s: float = 2.0,
-) -> None:
+) -> bool:
     """Poll stream groups until AST and (optionally) Embed consumers are drained.
+
+    Returns ``True`` when every queried group has ``pending == 0`` and
+    ``lag == 0`` sustained for *settle_s*, ``False`` on timeout.  A ``lag``
+    of ``None`` means unknown (the stream was trimmed past the group's read
+    position) and is treated as NOT drained.
 
     If *on_drain_progress* is provided, it is called each poll cycle with
     ``(t1_remaining, t2_remaining, t3_remaining)`` so callers can display
@@ -1637,6 +1671,9 @@ async def _wait_for_drain(
     deadline = time.monotonic() + timeout_s
     settled_since: float | None = None
     poll_interval = 0.5
+    t2_remaining: int | None = -1
+    t3_remaining: int | None = -1
+    infos = []
 
     while time.monotonic() < deadline:
         queries: list[tuple[Topic, str]] = [(Topic.FILE_CHANGED, "ast")]
@@ -1645,20 +1682,26 @@ async def _wait_for_drain(
 
         infos = await bus.stream_group_info_multi(queries)
 
-        # Build a topic→remaining map so we don't need fragile index tracking
-        remaining = {topic: info["pending"] + info["lag"] for (topic, _), info in zip(queries, infos, strict=True)}
+        # Build topic→remaining maps so we don't need fragile index tracking.
+        # lag=None → remaining unknown (not drained); display pending only.
+        remaining: dict[Topic, int | None] = {}
+        display: dict[Topic, int] = {}
+        for (topic, _), info in zip(queries, infos, strict=True):
+            pending, lag = info["pending"], info["lag"]
+            remaining[topic] = None if lag is None else pending + lag
+            display[topic] = pending if lag is None else pending + lag
         t2_remaining = remaining.get(Topic.FILE_CHANGED, 0)
         t3_remaining = remaining.get(Topic.EMBED_DIRTY, 0)
 
         if on_drain_progress is not None:
-            on_drain_progress(0, t2_remaining, t3_remaining)
+            on_drain_progress(0, display.get(Topic.FILE_CHANGED, 0), display.get(Topic.EMBED_DIRTY, 0))
 
         if t2_remaining == 0 and t3_remaining == 0:
             if settled_since is None:
                 settled_since = time.monotonic()
             elif time.monotonic() - settled_since >= settle_s:
                 logger.debug("Pipeline drained after {:.1f}s settling", time.monotonic() - settled_since)
-                return
+                return True
             # Adaptive backoff: poll less frequently once idle
             poll_interval = min(2.0, poll_interval * 1.5)
         else:
@@ -1667,10 +1710,11 @@ async def _wait_for_drain(
 
         await asyncio.sleep(poll_interval)
 
-    logger.warning(
-        "Pipeline drain timed out after {:.0f}s — t2={} t3={} (raw={})",
+    logger.error(
+        "Pipeline drain timed out after {:.0f}s — t2={} t3={}; "
+        "index metadata will NOT advance; re-run 'atlas index' to retry the missed files",
         timeout_s,
         t2_remaining,
         t3_remaining,
-        infos,
     )
+    return False

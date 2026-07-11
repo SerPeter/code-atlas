@@ -14,8 +14,11 @@ from code_atlas.indexing.orchestrator import (
     _DEFAULT_INCLUDE,
     FileScope,
     StalenessChecker,
+    _check_model_lock,
+    _detect_packages,
     _git_changed_files,
     _read_git_head,
+    _wait_for_drain,
     scan_files,
 )
 from code_atlas.settings import AtlasSettings, ScopeSettings, derive_project_name, resolve_git_dir
@@ -336,6 +339,39 @@ class TestScanFiles:
 
 
 # ---------------------------------------------------------------------------
+# _detect_packages — unit tests (no infrastructure needed)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectPackages:
+    def test_detect_packages_strips_source_root(self, tmp_path):
+        """Package qns must converge with parser uids: 'src/' stripped, rel_path stays physical."""
+        _write(tmp_path, "src/mypkg/__init__.py")
+        _write(tmp_path, "src/mypkg/sub/__init__.py")
+
+        result = _detect_packages(tmp_path)
+
+        assert ("mypkg", "src/mypkg") in result
+        assert ("mypkg.sub", "src/mypkg/sub") in result
+        assert all(not qn.startswith("src.") for qn, _ in result)
+
+    def test_detect_packages_flat_layout_unchanged(self, tmp_path):
+        _write(tmp_path, "mypkg/__init__.py")
+        _write(tmp_path, "mypkg/sub/__init__.py")
+
+        result = _detect_packages(tmp_path)
+
+        assert ("mypkg", "mypkg") in result
+        assert ("mypkg.sub", "mypkg/sub") in result
+
+    def test_detect_packages_src_itself_a_package(self, tmp_path):
+        """A source root that is itself a package keeps qn 'src'."""
+        _write(tmp_path, "src/__init__.py")
+
+        assert ("src", "src") in _detect_packages(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # _git_changed_files — unit tests (requires git CLI, no infrastructure)
 # ---------------------------------------------------------------------------
 
@@ -445,6 +481,29 @@ class TestGitChangedFiles:
 
         assert changes is not None
         assert changes == []
+
+    def test_subdir_project_paths_relative_to_project_root(self, tmp_path):
+        """Paths from a project_root below the git top-level are project-root-relative.
+
+        Without ``--relative`` git prints repo-root-relative paths, so
+        ``git_changed_paths & current_file_set`` is permanently empty for
+        monorepo sub-projects.
+        """
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "packages/core/src/mod.py", "x = 1")
+        _write(tmp_path, "root.py", "y = 1")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        base_hash = _get_head(tmp_path)
+
+        _write(tmp_path, "packages/core/src/mod.py", "x = 2")
+        _write(tmp_path, "root.py", "y = 2")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "modify")
+
+        changes = _git_changed_files(tmp_path / "packages" / "core", base_hash)
+
+        assert changes == [("src/mod.py", "modified")]
 
 
 # ---------------------------------------------------------------------------
@@ -659,3 +718,149 @@ class TestStalenessChecker:
 
         checker = StalenessChecker(worktree)
         assert checker.project_name == "myapp@dev"
+
+
+# ---------------------------------------------------------------------------
+# _wait_for_drain — unit tests with a fake bus (no infrastructure)
+# ---------------------------------------------------------------------------
+
+
+class FakeDrainBus:
+    """Stub bus returning a canned info dict for every queried group."""
+
+    def __init__(self, info: dict) -> None:
+        self._info = info
+
+    async def stream_group_info_multi(self, queries):
+        return [dict(self._info) for _ in queries]
+
+
+class TestWaitForDrain:
+    async def test_drained_returns_true(self):
+        """pending == 0 and lag == 0 sustained for settle_s returns True."""
+        bus = FakeDrainBus({"pending": 0, "lag": 0})
+
+        drained = await _wait_for_drain(bus, 5.0, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+
+        assert drained is True
+
+    async def test_timeout_returns_false(self):
+        """Outstanding work at the deadline returns False instead of falling through."""
+        bus = FakeDrainBus({"pending": 3, "lag": 2})
+
+        drained = await _wait_for_drain(bus, 0.6, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+
+        assert drained is False
+
+    async def test_null_lag_is_not_drained(self):
+        """lag=None (stream trimmed past group read position) means unknown → not drained."""
+        bus = FakeDrainBus({"pending": 0, "lag": None})
+
+        drained = await _wait_for_drain(bus, 0.6, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+
+        assert drained is False
+
+    async def test_zero_timeout_returns_false_without_error(self):
+        """timeout_s <= 0 returns False immediately (no NameError on unset locals)."""
+        bus = FakeDrainBus({"pending": 0, "lag": 0})
+
+        drained = await _wait_for_drain(bus, 0.0, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+
+        assert drained is False
+
+    async def test_progress_callback_reports_pending_when_lag_unknown(self):
+        """With lag=None the progress callback receives the pending count (display only)."""
+        seen: list[tuple[int, int, int]] = []
+        bus = FakeDrainBus({"pending": 4, "lag": None})
+
+        await _wait_for_drain(
+            bus,  # type: ignore[arg-type]
+            0.3,
+            embed_enabled=False,
+            settle_s=0.0,
+            on_drain_progress=lambda t1, t2, t3: seen.append((t1, t2, t3)),
+        )
+
+        assert seen
+        assert seen[0] == (0, 4, 0)
+
+
+# ---------------------------------------------------------------------------
+# _check_model_lock — unit tests with fakes (no infrastructure)
+# ---------------------------------------------------------------------------
+
+
+class FakeLockGraph:
+    """Records destructive/config calls made by _check_model_lock."""
+
+    def __init__(self, stored: tuple[str, int] | None = None) -> None:
+        self.stored = stored
+        self.calls: list[tuple] = []
+
+    async def get_embedding_config(self):
+        return self.stored
+
+    async def set_embedding_config(self, model, dimension):
+        self.calls.append(("set_embedding_config", model, dimension))
+
+    async def clear_all_embeddings(self):
+        self.calls.append(("clear_all_embeddings",))
+
+    async def rebuild_vector_indices(self, dimension):
+        self.calls.append(("rebuild_vector_indices", dimension))
+
+
+class FakeLockCache:
+    def __init__(self) -> None:
+        self.cleared_all = False
+
+    async def clear_all_models(self):
+        self.cleared_all = True
+
+
+class TestCheckModelLock:
+    async def test_full_reindex_unchanged_config_is_not_destructive(self):
+        """--full with unchanged model/dimension must not wipe other projects' embeddings."""
+        graph = FakeLockGraph(stored=("model-a", 768))
+        cache = FakeLockCache()
+
+        await _check_model_lock(graph, "model-a", 768, reindex=True, cache=cache)  # type: ignore[arg-type]
+
+        call_names = {c[0] for c in graph.calls}
+        assert "clear_all_embeddings" not in call_names
+        assert "rebuild_vector_indices" not in call_names
+        assert cache.cleared_all is False
+
+    async def test_full_reindex_first_run_writes_config_without_wipe(self):
+        """--full on a fresh database writes config without a destructive pass."""
+        graph = FakeLockGraph(stored=None)
+        cache = FakeLockCache()
+
+        await _check_model_lock(graph, "model-a", 768, reindex=True, cache=cache)  # type: ignore[arg-type]
+
+        assert graph.calls == [("set_embedding_config", "model-a", 768)]
+        assert cache.cleared_all is False
+
+    async def test_full_reindex_model_change_rebuilds_globally(self):
+        """Changing the model with --full still wipes + rebuilds (shared vector indices)."""
+        graph = FakeLockGraph(stored=("model-a", 768))
+        cache = FakeLockCache()
+
+        await _check_model_lock(graph, "model-b", 768, reindex=True, cache=cache)  # type: ignore[arg-type]
+
+        assert ("clear_all_embeddings",) in graph.calls
+        assert ("rebuild_vector_indices", 768) in graph.calls
+        assert ("set_embedding_config", "model-b", 768) in graph.calls
+        assert cache.cleared_all is True
+
+    async def test_model_mismatch_without_reindex_raises(self):
+        graph = FakeLockGraph(stored=("model-a", 768))
+
+        with pytest.raises(RuntimeError, match="model changed"):
+            await _check_model_lock(graph, "model-b", 768, reindex=False)  # type: ignore[arg-type]
+
+    async def test_dimension_mismatch_without_reindex_raises(self):
+        graph = FakeLockGraph(stored=("model-a", 512))
+
+        with pytest.raises(RuntimeError, match="dimension changed"):
+            await _check_model_lock(graph, "model-a", 768, reindex=False)  # type: ignore[arg-type]

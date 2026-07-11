@@ -7,13 +7,15 @@ from typing import TYPE_CHECKING
 
 from watchfiles import Change
 
+from code_atlas.events import FileChanged
+from code_atlas.indexing.orchestrator import DetectedProject
 from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.settings import WatcherSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from code_atlas.events import FileChanged, Topic
+    from code_atlas.events import Topic
 
 
 # ---------------------------------------------------------------------------
@@ -37,14 +39,36 @@ class StubScope:
 
 
 class RecordingBus:
-    """Fake EventBus that records published events."""
+    """Fake EventBus that records published events.
+
+    ``publish`` yields control before recording — the real bus suspends on
+    network I/O, which is exactly where a pending cancellation of the
+    flushing timer task would be delivered. A non-yielding fake masks the
+    _flush self-cancel bug entirely.
+    """
 
     def __init__(self) -> None:
         self.published: list[tuple[Topic, FileChanged]] = []
 
-    async def publish(self, topic: Topic, event: FileChanged, *, maxlen: int = 10_000) -> bytes:
+    async def publish(self, topic: Topic, event: FileChanged) -> bytes:
+        await asyncio.sleep(0)
         self.published.append((topic, event))
         return b"fake-id"
+
+
+class FlakyBus(RecordingBus):
+    """Bus whose publish raises a configurable number of times, then succeeds."""
+
+    def __init__(self, failures: int = 1) -> None:
+        super().__init__()
+        self._failures = failures
+
+    async def publish(self, topic: Topic, event: FileChanged) -> bytes:
+        await asyncio.sleep(0)
+        if self._failures > 0:
+            self._failures -= 1
+            raise ConnectionError("bus down")
+        return await super().publish(topic, event)
 
 
 def _make_watcher(
@@ -61,6 +85,24 @@ def _make_watcher(
     return FileWatcher(tmp_path, bus, scope, settings)  # type: ignore[arg-type]
 
 
+def _make_monorepo_watcher(
+    tmp_path: Path,
+    bus: RecordingBus,
+    subs: list[DetectedProject],
+    *,
+    root_name: str = "mono",
+) -> FileWatcher:
+    """Create a monorepo FileWatcher with detected sub-projects."""
+    return FileWatcher(
+        tmp_path,
+        bus,  # type: ignore[arg-type]
+        StubScope(),  # type: ignore[arg-type]
+        WatcherSettings(debounce_s=0.05, max_wait_s=0.5),
+        sub_projects=subs,
+        root_name=root_name,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -73,19 +115,22 @@ class TestChangeTypeMapping:
         bus = RecordingBus()
         watcher = _make_watcher(tmp_path, bus)
         watcher._on_change({(Change.added, str(tmp_path / "new.py"))})
-        assert watcher._pending == {"new.py": ("created", "")}
+        ev = watcher._pending["new.py"]
+        assert ev.change_type == "created"
 
     async def test_modified_maps_to_modified(self, tmp_path: Path) -> None:
         bus = RecordingBus()
         watcher = _make_watcher(tmp_path, bus)
         watcher._on_change({(Change.modified, str(tmp_path / "edit.py"))})
-        assert watcher._pending == {"edit.py": ("modified", "")}
+        ev = watcher._pending["edit.py"]
+        assert ev.change_type == "modified"
 
     async def test_deleted_maps_to_deleted(self, tmp_path: Path) -> None:
         bus = RecordingBus()
         watcher = _make_watcher(tmp_path, bus)
         watcher._on_change({(Change.deleted, str(tmp_path / "gone.py"))})
-        assert watcher._pending == {"gone.py": ("deleted", "")}
+        ev = watcher._pending["gone.py"]
+        assert ev.change_type == "deleted"
 
 
 class TestExclusionFiltering:
@@ -114,6 +159,42 @@ class TestExclusionFiltering:
         watcher = _make_watcher(tmp_path, bus)
         watcher._on_change({(Change.modified, "/some/other/path/file.py")})
         assert watcher._pending == {}
+
+
+class TestTimerFiredFlush:
+    """Timer-fired flushes must publish every pending event.
+
+    Regression for the _flush self-cancel bug: _flush() cancelled the timer
+    task currently executing it, so CancelledError fired at the first await
+    inside bus.publish — after _pending was already cleared — and every
+    timer-fired batch was silently dropped.
+    """
+
+    async def test_debounce_flush_publishes_all_events(self, tmp_path: Path) -> None:
+        bus = RecordingBus()
+        watcher = _make_watcher(tmp_path, bus, debounce_s=0.05, max_wait_s=5.0)
+
+        watcher._on_change(
+            {
+                (Change.modified, str(tmp_path / "a.py")),
+                (Change.modified, str(tmp_path / "b.py")),
+                (Change.modified, str(tmp_path / "c.py")),
+            }
+        )
+        await asyncio.sleep(0.3)
+
+        assert {ev.path for _, ev in bus.published} == {"a.py", "b.py", "c.py"}
+        assert watcher._pending == {}
+
+    async def test_max_wait_flush_publishes_all_events(self, tmp_path: Path) -> None:
+        bus = RecordingBus()
+        watcher = _make_watcher(tmp_path, bus, debounce_s=5.0, max_wait_s=0.1)
+
+        watcher._on_change({(Change.modified, str(tmp_path / "a.py"))})
+        watcher._on_change({(Change.modified, str(tmp_path / "b.py"))})
+        await asyncio.sleep(0.4)
+
+        assert {ev.path for _, ev in bus.published} == {"a.py", "b.py"}
 
 
 class TestDebounceReset:
@@ -209,7 +290,7 @@ class TestGracefulShutdown:
         assert watcher._debounce_task is not None
 
         watcher.stop()
-        assert watcher._stop_event.is_set()
+        assert watcher.stopped
         assert watcher._debounce_task is None
         assert watcher._max_wait_task is None
 
@@ -219,9 +300,112 @@ class TestGracefulShutdown:
         watcher = _make_watcher(tmp_path, bus, debounce_s=10.0, max_wait_s=30.0)
 
         # Manually add pending changes (simulating what _on_change does)
-        watcher._pending["drain_me.py"] = ("modified", "")
+        watcher._pending["drain_me.py"] = FileChanged(path="drain_me.py", change_type="modified")
 
         # Flush should publish the pending change
         await watcher._flush()
         assert len(bus.published) == 1
         assert bus.published[0][1].path == "drain_me.py"
+
+
+class TestFlushPublishFailure:
+    """A publish failure must not drop the snapshotted batch.
+
+    Regression for the silent-loss path: _flush cleared _pending before
+    publishing, so a raised publish lost the whole batch and the exception
+    died in the unobserved timer task.
+    """
+
+    async def test_failed_publish_requeues_remainder_and_retries(self, tmp_path: Path) -> None:
+        bus = FlakyBus(failures=1)
+        watcher = _make_watcher(tmp_path, bus, debounce_s=0.05, max_wait_s=5.0)
+        watcher._on_change(
+            {
+                (Change.modified, str(tmp_path / "a.py")),
+                (Change.modified, str(tmp_path / "b.py")),
+            }
+        )
+
+        # First flush: publish raises on the first event — the whole batch is re-queued
+        await watcher._flush()
+        assert bus.published == []
+        assert set(watcher._pending) == {"a.py", "b.py"}
+        assert watcher._debounce_task is not None  # retry flush is scheduled
+
+        # Retry succeeds and drains the re-queued batch
+        await watcher._flush()
+        assert {ev.path for _, ev in bus.published} == {"a.py", "b.py"}
+        assert watcher._pending == {}
+
+
+class TestMonorepoPathIdentity:
+    """Watcher seals the S4 path-identity contract into published events.
+
+    FileChanged.path must be relative to the OWNING project's root (the
+    sub-project root for monorepo sub-project files), project_name must be
+    the graph identity ("{root}/{sub}"), and project_root must be the
+    owning project root — matching what the full indexer stores on nodes.
+    """
+
+    async def test_sub_project_event_identity(self, tmp_path: Path) -> None:
+        bus = RecordingBus()
+        subs = [
+            DetectedProject(
+                name="core",
+                path="packages/core",
+                root=tmp_path / "packages" / "core",
+                marker="pyproject.toml",
+            )
+        ]
+        watcher = _make_monorepo_watcher(tmp_path, bus, subs)
+
+        watcher._on_change({(Change.modified, str(tmp_path / "packages" / "core" / "src" / "foo.py"))})
+        await watcher._flush()
+
+        assert len(bus.published) == 1
+        ev = bus.published[0][1]
+        assert ev.path == "src/foo.py"
+        assert ev.project_name == "mono/core"
+        assert ev.project_root == str(tmp_path / "packages" / "core")
+
+    async def test_root_file_event_identity(self, tmp_path: Path) -> None:
+        bus = RecordingBus()
+        subs = [
+            DetectedProject(
+                name="core",
+                path="packages/core",
+                root=tmp_path / "packages" / "core",
+                marker="pyproject.toml",
+            )
+        ]
+        watcher = _make_monorepo_watcher(tmp_path, bus, subs)
+
+        watcher._on_change({(Change.modified, str(tmp_path / "tools" / "run.py"))})
+        await watcher._flush()
+
+        assert len(bus.published) == 1
+        ev = bus.published[0][1]
+        assert ev.path == "tools/run.py"
+        assert ev.project_name == "mono"
+        assert ev.project_root == str(tmp_path.resolve())
+
+    async def test_colliding_sub_relative_paths_both_published(self, tmp_path: Path) -> None:
+        bus = RecordingBus()
+        subs = [
+            DetectedProject(name="a", path="packages/a", root=tmp_path / "packages" / "a", marker="pyproject.toml"),
+            DetectedProject(name="b", path="packages/b", root=tmp_path / "packages" / "b", marker="pyproject.toml"),
+        ]
+        watcher = _make_monorepo_watcher(tmp_path, bus, subs)
+
+        watcher._on_change(
+            {
+                (Change.modified, str(tmp_path / "packages" / "a" / "src" / "main.py")),
+                (Change.modified, str(tmp_path / "packages" / "b" / "src" / "main.py")),
+            }
+        )
+        await watcher._flush()
+
+        assert len(bus.published) == 2
+        events = [ev for _, ev in bus.published]
+        assert {ev.path for ev in events} == {"src/main.py"}
+        assert {ev.project_name for ev in events} == {"mono/a", "mono/b"}

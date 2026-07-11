@@ -68,8 +68,8 @@ class FileWatcher:
         self._sub_projects = sub_projects or []
         self._root_name = root_name
 
-        # Pending changes: {rel_path: (change_type, project_name)}  (latest wins)
-        self._pending: dict[str, tuple[str, str]] = {}
+        # Pending changes keyed by watch-root-relative POSIX path (latest event wins)
+        self._pending: dict[str, FileChanged] = {}
         self._flush_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
 
@@ -108,6 +108,11 @@ class FileWatcher:
             self._max_wait_task.cancel()
             self._max_wait_task = None
 
+    @property
+    def stopped(self) -> bool:
+        """True once :meth:`stop` has been called."""
+        return self._stop_event.is_set()
+
     def _on_change(self, changes: set[tuple[Change, str]]) -> None:
         """Filter and accumulate changes, then reset debounce timer."""
         accepted = 0
@@ -125,18 +130,23 @@ class FileWatcher:
             if change_type is None:
                 continue
 
-            # Classify sub-project for monorepo mode
-            project_name = ""
-            if self._sub_projects:
-                project_name = classify_file_project(rel_path, self._sub_projects)
-
-            # Prefix with root_name for monorepo sub-project naming
-            if project_name and self._root_name:
-                project_name = f"{self._root_name}/{project_name}"
-            elif not project_name and self._root_name:
+            # Resolve the owning project: monorepo sub-project or the watch root itself
+            sub = classify_file_project(rel_path, self._sub_projects) if self._sub_projects else None
+            if sub is not None:
+                project_name = f"{self._root_name}/{sub.name}" if self._root_name else sub.name
+                event_path = rel_path[len(sub.path) + 1 :]  # re-relativize to the sub-project root
+                project_root = str(sub.root)
+            else:
                 project_name = self._root_name
+                event_path = rel_path
+                project_root = str(self._root)
 
-            self._pending[rel_path] = (change_type, project_name)
+            self._pending[rel_path] = FileChanged(
+                path=event_path,
+                change_type=change_type,
+                project_name=project_name,
+                project_root=project_root,
+            )
             accepted += 1
 
         if accepted == 0:
@@ -178,12 +188,18 @@ class FileWatcher:
         during flush are accumulated for the next batch.
         """
         async with self._flush_lock:
-            # Cancel timers (whoever didn't trigger the flush)
+            # Cancel the timer that didn't trigger this flush — never the task
+            # currently executing it (a self-cancel would abort the publish
+            # loop at its first await, after _pending was already cleared).
+            # Null both refs so a change arriving mid-publish starts fresh timers.
+            current = asyncio.current_task()
             if self._debounce_task is not None:
-                self._debounce_task.cancel()
+                if self._debounce_task is not current:
+                    self._debounce_task.cancel()
                 self._debounce_task = None
             if self._max_wait_task is not None:
-                self._max_wait_task.cancel()
+                if self._max_wait_task is not current:
+                    self._max_wait_task.cancel()
                 self._max_wait_task = None
 
             if not self._pending:
@@ -195,6 +211,18 @@ class FileWatcher:
 
         # Publish outside the lock so new changes can accumulate
         logger.info("Flushing {} file change(s)", len(batch))
-        for rel_path, (change_type, project_name) in batch.items():
-            event = FileChanged(path=rel_path, change_type=change_type, project_name=project_name)
-            await self._bus.publish(Topic.FILE_CHANGED, event)
+        items = list(batch.items())
+        for i, (_, event) in enumerate(items):
+            try:
+                await self._bus.publish(Topic.FILE_CHANGED, event)
+            except Exception:
+                # Never drop the snapshotted batch: re-queue the unpublished
+                # remainder so the next flush retries it (S7 durability spirit).
+                remainder = items[i:]
+                logger.exception("Publish failed — re-queueing {} unpublished change(s) for retry", len(remainder))
+                for key, ev in remainder:
+                    # A newer event that arrived mid-publish wins over the requeued one
+                    self._pending.setdefault(key, ev)
+                if not self._stop_event.is_set():
+                    self._reset_debounce()  # schedule the retry flush
+                return

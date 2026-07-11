@@ -1,0 +1,155 @@
+"""Integration tests for DaemonManager durability: supervision + startup catch-up.
+
+Requires Memgraph + Valkey (provided by conftest fixtures).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import TYPE_CHECKING
+
+import pytest
+
+from code_atlas.events import FileChanged, Topic
+from code_atlas.indexing.daemon import DaemonManager
+from code_atlas.indexing.orchestrator import index_project
+from code_atlas.settings import derive_project_name
+
+if TYPE_CHECKING:
+    from code_atlas.events import EventBus
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.settings import AtlasSettings
+
+pytestmark = pytest.mark.integration
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_python_file(root, rel_path: str, content: str) -> None:
+    """Write a Python file under *root* at the given relative path."""
+    full = root / rel_path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text(content, encoding="utf-8")
+
+
+async def _wait_for_rows(
+    graph_client: GraphClient,
+    query: str,
+    params: dict,
+    *,
+    timeout_s: float = 30.0,
+) -> list:
+    """Poll *query* until it returns rows or the deadline passes."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        rows = await graph_client.execute(query, params)
+        if rows:
+            return rows
+        await asyncio.sleep(0.5)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Supervision: consumer crash → restart
+# ---------------------------------------------------------------------------
+
+
+async def test_consumer_restarts_after_group_destroyed(
+    settings: AtlasSettings,
+    graph_client: GraphClient,
+    event_bus: EventBus,
+) -> None:
+    """One uncaught consumer exception must not permanently kill consumption.
+
+    Destroying the 'ast' group out from under a blocked XREADGROUP raises
+    NOGROUP inside TierConsumer.run(). Before supervision, the consumer died
+    once and the daemon starved forever; now the supervised restart loop
+    re-runs run(), whose ensure_group() recreates the group, and the
+    published change is consumed.
+    """
+    settings.embeddings.enabled = False
+    await graph_client.ensure_schema()
+
+    daemon = DaemonManager()
+    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=False)
+    assert started is True
+    try:
+        bus = daemon._bus
+        assert bus is not None
+        # Let the consumer enter its read loop (run() creates the group)
+        await asyncio.sleep(0.5)
+
+        # Simulate the pre-fix bus.flush() / Valkey data loss
+        key = bus._stream_key(Topic.FILE_CHANGED)
+        await bus._redis.xgroup_destroy(key, "ast")
+
+        # Publish a change for a real file on the daemon's (project-scoped) bus
+        _write_python_file(settings.project_root, "hello.py", "def greet():\n    return 'hi'\n")
+        project_name = derive_project_name(settings.project_root)
+        await bus.publish(
+            Topic.FILE_CHANGED,
+            FileChanged(
+                path="hello.py",
+                change_type="created",
+                project_name=project_name,
+                project_root=str(settings.project_root),
+            ),
+        )
+
+        rows = await _wait_for_rows(
+            graph_client,
+            "MATCH (c:Callable {name: 'greet'}) WHERE c.uid STARTS WITH $prefix RETURN c.uid AS uid",
+            {"prefix": f"{project_name}:"},
+            timeout_s=30.0,
+        )
+        assert rows, "entity never appeared — consumer was not restarted after NOGROUP"
+        assert daemon.status()["crash_counts"].get("ast-0", 0) >= 1
+    finally:
+        await daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Startup catch-up: edits made while the daemon was down
+# ---------------------------------------------------------------------------
+
+
+async def test_daemon_start_runs_catchup_delta(
+    settings: AtlasSettings,
+    graph_client: GraphClient,
+    event_bus: EventBus,
+) -> None:
+    """Files changed while nothing was running are indexed by start(catchup=True).
+
+    Before the fix nothing ever indexed them: the watcher only sees future
+    changes and StalenessChecker only annotates query results.
+    """
+    settings.embeddings.enabled = False
+    await graph_client.ensure_schema()
+
+    # Initial index of a small project (several files keep the later add
+    # under the delta threshold)
+    for i in range(5):
+        _write_python_file(settings.project_root, f"mod_{i}.py", f"def fn_{i}():\n    return {i}\n")
+    await index_project(settings, graph_client, event_bus, drain_timeout_s=60.0)
+
+    # Edit while nothing is running — no watcher, no daemon, no consumers
+    _write_python_file(settings.project_root, "added_later.py", "def beta():\n    return 42\n")
+
+    daemon = DaemonManager()
+    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=True)
+    assert started is True
+    try:
+        # Catch-up is awaited inside start(): the new file's entities must
+        # already be in the graph by the time start() returns.
+        project_name = derive_project_name(settings.project_root)
+        rows = await graph_client.execute(
+            "MATCH (c:Callable {name: 'beta'}) WHERE c.uid STARTS WITH $prefix RETURN c.uid AS uid",
+            {"prefix": f"{project_name}:"},
+        )
+        assert rows, "file added while the daemon was down was not indexed by startup catch-up"
+    finally:
+        await daemon.stop()

@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from code_atlas.events import EventBus
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
-from code_atlas.indexing.orchestrator import FileScope, detect_sub_projects
+from code_atlas.indexing.orchestrator import FileScope, detect_sub_projects, index_monorepo, index_project
 from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
 from code_atlas.settings import derive_project_name
@@ -35,6 +35,17 @@ class DaemonManager:
     _tasks: list[asyncio.Task[None]] = field(default_factory=list, repr=False)
     _cache: EmbedCache | None = field(default=None, repr=False)
     _embed: EmbedClient | None = field(default=None, repr=False)
+    _crash_counts: dict[str, int] = field(default_factory=dict, repr=False)
+    _last_crash: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def status(self) -> dict[str, Any]:
+        """Task liveness + crash state, consumed by the ``pipeline`` health check."""
+        return {
+            "tasks_running": sum(1 for t in self._tasks if not t.done()),
+            "tasks_total": len(self._tasks),
+            "crash_counts": dict(self._crash_counts),
+            "last_crash": dict(self._last_crash),
+        }
 
     async def start(
         self,
@@ -42,6 +53,7 @@ class DaemonManager:
         graph: GraphClient,
         *,
         include_watcher: bool = True,
+        catchup: bool = True,
     ) -> bool:
         """Try to start watcher + pipeline.
 
@@ -56,7 +68,10 @@ class DaemonManager:
             An already-connected :class:`GraphClient`.
         include_watcher:
             If ``False``, only start the tier consumers (no filesystem watcher).
-            Useful for ``atlas daemon start`` which has no watch root.
+        catchup:
+            If ``True``, run one delta index pass before consuming so edits
+            made while the daemon was down are indexed. Failures are logged
+            and non-fatal.
         """
         bus = EventBus(settings.redis, project_name=derive_project_name(settings.project_root))
         try:
@@ -97,13 +112,31 @@ class DaemonManager:
                 root_name=root_name,
             )
 
-        # Spawn background tasks
+        # Spawn the watcher first so no change is missed while catch-up runs;
+        # its events wait in the stream until the consumers start.
         if self._watcher is not None:
             self._tasks.append(asyncio.get_running_loop().create_task(self._run_watcher()))
+
+        # Catch-up must finish BEFORE the daemon's consumers start: its inline
+        # pipeline uses the same consumer names, so the two must never coexist
+        # in this process.
+        if catchup:
+            await self._catchup(settings, graph, bus)
+
         for consumer in self._consumers:
             self._tasks.append(asyncio.get_running_loop().create_task(self._run_consumer(consumer)))
 
         return True
+
+    async def _catchup(self, settings: AtlasSettings, graph: GraphClient, bus: EventBus) -> None:
+        """One delta index pass so changes made while the daemon was down get indexed."""
+        try:
+            if detect_sub_projects(settings.project_root, settings.monorepo):
+                await index_monorepo(settings, graph, bus)
+            else:
+                await index_project(settings, graph, bus)
+        except Exception:
+            logger.exception("Startup catch-up index failed — continuing with live events only")
 
     async def wait(self) -> None:
         """Block until all background tasks finish (or are cancelled)."""
@@ -118,10 +151,13 @@ class DaemonManager:
         for consumer in self._consumers:
             consumer.stop()
 
-        # Cancel tasks and wait for them to finish
-        for task in self._tasks:
-            task.cancel()
+        # Let tasks observe the stop flags first — the watcher drains its
+        # pending changes and consumers finish their current batch — then
+        # cancel whatever is still running.
         if self._tasks:
+            _done, still_pending = await asyncio.wait(self._tasks, timeout=10.0)
+            for task in still_pending:
+                task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
@@ -134,20 +170,48 @@ class DaemonManager:
         logger.debug("DaemonManager stopped")
 
     async def _run_watcher(self) -> None:
-        """Run the file watcher, logging crashes instead of propagating."""
-        try:
-            await self._watcher.run()  # type: ignore[union-attr]
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("File watcher crashed")
+        """Run the file watcher under supervision: crash → log + backoff restart."""
+        watcher = self._watcher
+        if watcher is None:  # pragma: no cover — spawned only when a watcher was built
+            return
+        backoff = 1.0
+        while not watcher.stopped:
+            started = asyncio.get_running_loop().time()
+            try:
+                await watcher.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._crash_counts["watcher"] = self._crash_counts.get("watcher", 0) + 1
+                self._last_crash["watcher"] = repr(exc)
+                logger.exception("File watcher crashed — restarting in {:.0f}s", backoff)
+                if asyncio.get_running_loop().time() - started > 60.0:
+                    backoff = 1.0  # healthy for a while before this crash — reset
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+            else:
+                return  # clean exit via stop()
 
-    @staticmethod
-    async def _run_consumer(consumer: ASTConsumer | EmbedConsumer) -> None:
-        """Run a consumer, catching exceptions so one failure doesn't crash the rest."""
-        try:
-            await consumer.run()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Consumer {} crashed", consumer.consumer_name)
+    async def _run_consumer(self, consumer: ASTConsumer | EmbedConsumer) -> None:
+        """Run a consumer under supervision: crash → log + backoff restart.
+
+        ``run()`` re-runs ``ensure_group()`` at its top, so a Valkey restart
+        that lost the consumer group (NOGROUP) heals on the first restart.
+        """
+        backoff = 1.0
+        while not consumer.stopped:
+            started = asyncio.get_running_loop().time()
+            try:
+                await consumer.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._crash_counts[consumer.consumer_name] = self._crash_counts.get(consumer.consumer_name, 0) + 1
+                self._last_crash[consumer.consumer_name] = repr(exc)
+                logger.exception("Consumer {} crashed — restarting in {:.0f}s", consumer.consumer_name, backoff)
+                if asyncio.get_running_loop().time() - started > 60.0:
+                    backoff = 1.0  # healthy for a while before this crash — reset
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+            else:
+                return  # clean exit via stop()

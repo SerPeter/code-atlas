@@ -39,12 +39,19 @@ class StubScope:
 
 
 class RecordingBus:
-    """Fake EventBus that records published events."""
+    """Fake EventBus that records published events.
+
+    ``publish`` yields control before recording — the real bus suspends on
+    network I/O, which is exactly where a pending cancellation of the
+    flushing timer task would be delivered. A non-yielding fake masks the
+    _flush self-cancel bug entirely.
+    """
 
     def __init__(self) -> None:
         self.published: list[tuple[Topic, FileChanged]] = []
 
-    async def publish(self, topic: Topic, event: FileChanged, *, maxlen: int = 10_000) -> bytes:
+    async def publish(self, topic: Topic, event: FileChanged) -> bytes:
+        await asyncio.sleep(0)
         self.published.append((topic, event))
         return b"fake-id"
 

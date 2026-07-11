@@ -361,6 +361,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                     f"Done — {len(results)} projects, {total_files} files,"
                     f" {total_entities} entities in {total_duration:.1f}s"
                 )
+                if any(not r.drained for r in results):
+                    _echo("WARNING: pipeline did not drain — index incomplete; re-run 'atlas index' to retry")
         else:
             result = await _index_single_with_spinner(settings, graph, bus, scope=scope, full_reindex=full_reindex)
             if _output.json:
@@ -377,6 +379,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                         f" | entities +{ds.entities_added} ~{ds.entities_modified} -{ds.entities_deleted}"
                         f" ={ds.entities_unchanged} unchanged"
                     )
+                if not result.drained:
+                    _echo("WARNING: pipeline did not drain — index incomplete; re-run 'atlas index' to retry")
     finally:
         await graph.close()
         await bus.close()
@@ -798,7 +802,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 
 
 async def _run_daemon(*, no_embed: bool = False) -> None:
-    """Start the EventBus and all tier consumers, run until interrupted."""
+    """Start the EventBus, file watcher, and all tier consumers, run until interrupted."""
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -818,7 +822,7 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
     await graph.ensure_schema()
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph, include_watcher=False)
+    started = await daemon.start(settings, graph, include_watcher=True)
     if not started:
         logger.error("Valkey required for daemon mode")
         await graph.close()
