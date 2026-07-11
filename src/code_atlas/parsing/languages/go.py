@@ -117,18 +117,18 @@ def _extract_receiver_type(node: Node) -> str | None:
 
 
 def _type_name_from_node(type_node: Node) -> str:
-    """Extract the simple type name from a type node, stripping pointers."""
+    """Extract the simple type name from a type node, stripping pointers and type parameters."""
     if type_node.type == "pointer_type":
-        # *Server -> Server
-        for child in type_node.children:
-            if child.type == "type_identifier":
-                return node_text(child)
-        # Fallback: recurse into nested pointers
-        for child in type_node.children:
-            if child.type == "pointer_type":
+        # *Server -> Server, *Cache[K, V] -> Cache
+        for child in type_node.named_children:
+            if child.type != "comment":
                 return _type_name_from_node(child)
-    if type_node.type == "type_identifier":
         return node_text(type_node)
+    if type_node.type == "generic_type":
+        # Cache[K, V] -> Cache
+        inner = type_node.child_by_field_name("type")
+        if inner is not None:
+            return node_text(inner)
     return node_text(type_node)
 
 
@@ -645,12 +645,7 @@ def _process_method(
     name = node_text(name_node)
     receiver_type = _extract_receiver_type(node)
 
-    if receiver_type:
-        qn = f"{module_qn}.{receiver_type}.{name}"
-        parent_qn = f"{module_qn}.{receiver_type}"
-    else:
-        qn = f"{module_qn}.{name}"
-        parent_qn = module_qn
+    qn = f"{module_qn}.{receiver_type}.{name}" if receiver_type else f"{module_qn}.{name}"
 
     docstring = _extract_doc_comment(node, source)
     signature = _extract_function_signature(node, source)
@@ -676,14 +671,28 @@ def _process_method(
         )
     )
 
-    # DEFINES: struct -> method
-    relationships.append(
-        ParsedRelationship(
-            from_qualified_name=f"{project_name}:{parent_qn}",
-            rel_type=RelType.DEFINES,
-            to_name=f"{project_name}:{qn}",
+    if receiver_type:
+        # DEFINES: receiver type -> method.  The receiver type may be declared in
+        # another file of the same package, so emit its NAME for post-batch
+        # resolution (GraphClient.resolve_member_defines); from_qualified_name is
+        # the fallback parent (this file's module).
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{module_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qn}",
+                properties={"parent_type_name": receiver_type, "parent_scope": "package"},
+            )
         )
-    )
+    else:
+        # DEFINES: module -> method (no resolvable receiver)
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{module_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qn}",
+            )
+        )
 
     # Extract call sites from body
     body = node.child_by_field_name("body")

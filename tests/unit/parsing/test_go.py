@@ -461,14 +461,23 @@ type Server struct {}
 
 
 def test_defines_struct_to_method():
+    """Receiver methods emit a name-based DEFINES from the module (cross-file contract)."""
     parsed = _parse("""\
 package main
 
 func (s *Server) Handle() {}
 """)
-    defines = _rels_from(parsed, "src.example.Server", RelType.DEFINES)
-    targets = {r.to_name for r in defines}
-    assert f"{PROJECT}:src.example.Server.Handle" in targets
+    defines = [
+        r
+        for r in parsed.relationships
+        if r.rel_type == RelType.DEFINES and r.to_name == f"{PROJECT}:src.example.Server.Handle"
+    ]
+    assert len(defines) == 1
+    rel = defines[0]
+    assert rel.from_qualified_name == f"{PROJECT}:src.example"
+    assert rel.properties == {"parent_type_name": "Server", "parent_scope": "package"}
+    # No relationship may originate from the fabricated parent uid
+    assert not any(r.from_qualified_name == f"{PROJECT}:src.example.Server" for r in parsed.relationships)
 
 
 def test_defines_struct_to_field():
@@ -668,6 +677,33 @@ func (s Server) String() string { return "" }
     method = _entity_by_name(parsed, "String")
     assert "Server.String" in method.qualified_name
     assert f"{PROJECT}:src.example.Server.String" == method.qualified_name
+
+
+def test_generic_receiver_names_normalized():
+    """Generic receivers are normalized: *Cache[K, V] / Cache[K, V] -> Cache (same-file receiver type)."""
+    parsed = _parse("""\
+package main
+
+type Cache[K comparable, V any] struct{}
+
+func (c *Cache[K, V]) Get(k K) (V, bool) { var v V; return v, false }
+
+func (c Cache[K, V]) Len() int { return 0 }
+""")
+    get = _entity_by_name(parsed, "Get")
+    assert get.qualified_name == f"{PROJECT}:src.example.Cache.Get"
+    length = _entity_by_name(parsed, "Len")
+    assert length.qualified_name == f"{PROJECT}:src.example.Cache.Len"
+
+    method_defines = [
+        r
+        for r in parsed.relationships
+        if r.rel_type == RelType.DEFINES
+        and r.to_name in (f"{PROJECT}:src.example.Cache.Get", f"{PROJECT}:src.example.Cache.Len")
+    ]
+    assert len(method_defines) == 2
+    for rel in method_defines:
+        assert rel.properties["parent_type_name"] == "Cache"
 
 
 # ---------------------------------------------------------------------------
