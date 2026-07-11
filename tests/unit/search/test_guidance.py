@@ -95,6 +95,21 @@ class TestValidateCypherStatic:
         errors = [i for i in issues if i.level == "error"]
         assert errors == []
 
+    def test_bound_variable_rel_not_flagged_as_label(self):
+        """`[r:IMPORTS]` is a relationship type, not a node label — must not error."""
+        issues = validate_cypher_static("MATCH (m:Module {name: $name})-[r:IMPORTS]->(dep) RETURN dep LIMIT 10")
+        errors = [i for i in issues if i.level == "error"]
+        assert errors == [], f"Bound-variable relationship misflagged: {[e.message for e in errors]}"
+
+    def test_cookbook_examples_have_no_errors(self):
+        """Every documented CYPHER_EXAMPLES query must pass static validation cleanly."""
+        for ex in CYPHER_EXAMPLES:
+            issues = validate_cypher_static(ex["query"])
+            errors = [i for i in issues if i.level == "error"]
+            assert errors == [], (
+                f"Cookbook example {ex['description']!r} produced errors: {[e.message for e in errors]}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Search strategy planner

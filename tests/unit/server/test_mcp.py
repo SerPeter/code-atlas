@@ -264,6 +264,49 @@ class TestVectorSearchMock:
 
 
 # ---------------------------------------------------------------------------
+# Label validation on search tools — Cypher injection guard (no DB needed)
+# ---------------------------------------------------------------------------
+
+_MALICIOUS_LABEL = "callable', $query, 60) YIELD node WITH node LIMIT 1 MATCH (m) DETACH DELETE m //"
+
+
+class TestSearchLabelValidation:
+    async def test_text_search_rejects_malicious_label(self, settings):
+        """An unwhitelisted label must be refused before any graph call (injection guard)."""
+        graph = AsyncMock(spec=GraphClient)
+        graph.text_search = AsyncMock()
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "text_search", query="x", label=_MALICIOUS_LABEL)
+        assert "error" in result
+        assert "Invalid label" in result["error"]
+        graph.text_search.assert_not_awaited()
+
+    async def test_vector_search_rejects_malicious_label(self, settings):
+        graph = AsyncMock(spec=GraphClient)
+        graph.vector_search = AsyncMock()
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed, vector_enabled=True)
+
+        result = await _invoke_tool(app, "vector_search", query="x", label=_MALICIOUS_LABEL)
+        assert "error" in result
+        assert "Invalid label" in result["error"]
+        graph.vector_search.assert_not_awaited()
+
+    async def test_text_search_accepts_valid_label(self, settings):
+        graph = AsyncMock(spec=GraphClient)
+        graph.text_search = AsyncMock(return_value=[])
+        graph.batch_call_stats = AsyncMock(return_value={})
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "text_search", query="x", label="Callable")
+        assert "error" not in result
+        graph.text_search.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Enhanced schema_info (no DB needed)
 # ---------------------------------------------------------------------------
 
@@ -559,9 +602,10 @@ class TestMaybeUpdateRoot:
         assert app.settings.project_root == settings.project_root
 
     async def test_restarts_daemon_on_new_root(self, tmp_path, settings):
-        """list_roots() returns different root → daemon stop+start called."""
+        """list_roots() returns a different *project* root → daemon stop+start called."""
         new_root = tmp_path / "other_project"
         new_root.mkdir()
+        (new_root / ".git").mkdir()  # a real project root (git repo) — eligible to switch
 
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
@@ -595,6 +639,39 @@ class TestMaybeUpdateRoot:
         old_daemon.stop.assert_awaited_once()
         assert app.settings.project_root == new_root
         assert app.resolved_root == new_root
+
+    async def test_ignores_non_project_root(self, tmp_path, settings):
+        """A probed root that is not an Atlas project (no atlas.toml, not a git root)
+        must NOT hijack the served project namespace — identity stays stable."""
+        bare_root = tmp_path / "not_a_project"
+        bare_root.mkdir()  # no .git, no atlas.toml
+
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        old_daemon = AsyncMock()
+        old_daemon.stop = AsyncMock()
+        app = AppContext(
+            graph=mock_graph,
+            settings=settings,
+            embed=embed,
+            daemon=old_daemon,
+            resolved_root=settings.project_root,
+        )
+
+        mock_root = MagicMock()
+        mock_root.uri = bare_root.as_uri()
+        mock_result = MagicMock()
+        mock_result.roots = [mock_root]
+
+        ctx = MagicMock()
+        ctx.session.list_roots = AsyncMock(return_value=mock_result)
+
+        await _maybe_update_root(app, ctx)
+
+        assert app.roots_checked is True
+        old_daemon.stop.assert_not_awaited()
+        assert app.settings.project_root == settings.project_root
+        assert app.resolved_root == settings.project_root
 
 
 # ---------------------------------------------------------------------------

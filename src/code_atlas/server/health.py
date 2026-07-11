@@ -16,6 +16,7 @@ from code_atlas.search.embeddings import EmbedClient
 from code_atlas.settings import _find_atlas_toml, find_git_root
 
 if TYPE_CHECKING:
+    from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
 
 _CHECK_TIMEOUT = 3.0  # seconds per individual check
@@ -54,6 +55,15 @@ class HealthReport:
     def ok(self) -> bool:
         """True when no check has FAIL status (WARN is treated as passing)."""
         return all(c.status != CheckStatus.FAIL for c in self.checks)
+
+    @property
+    def degraded(self) -> bool:
+        """True when any check is not fully OK (WARN or FAIL).
+
+        Surfaces non-fatal degradations (e.g. Valkey down = indexing disabled,
+        embeddings unreachable = vector search disabled) that ``ok`` alone hides.
+        """
+        return any(c.status != CheckStatus.OK for c in self.checks)
 
 
 # ---------------------------------------------------------------------------
@@ -161,16 +171,22 @@ async def check_valkey(redis_settings: RedisSettings) -> CheckResult:
     name = "valkey"
     addr = f"{redis_settings.host}:{redis_settings.port}"
     bus = EventBus(redis_settings)
+    _indexing_disabled = "auto-indexing disabled — file changes will NOT be indexed until Valkey is reachable"
     try:
         ok = await asyncio.wait_for(bus.ping(), timeout=_CHECK_TIMEOUT)
         if ok:
             return CheckResult(name, CheckStatus.OK, f"Connected ({addr})")
-        return CheckResult(name, CheckStatus.WARN, f"Ping failed ({addr})", suggestion="docker compose up -d valkey")
+        return CheckResult(
+            name,
+            CheckStatus.WARN,
+            f"Ping failed ({addr}) — {_indexing_disabled}",
+            suggestion="docker compose up -d valkey",
+        )
     except Exception as exc:
         return CheckResult(
             name,
             CheckStatus.WARN,
-            f"Unreachable ({addr})",
+            f"Unreachable ({addr}) — {_indexing_disabled}",
             detail=str(exc),
             suggestion="docker compose up -d valkey",
         )
@@ -280,6 +296,25 @@ async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResul
     return CheckResult(name, CheckStatus.OK, f"{len(project_names)} project(s) up to date", detail=detail)
 
 
+def check_pipeline(daemon: DaemonManager) -> CheckResult:
+    """Report in-process indexing pipeline liveness from the DaemonManager."""
+    st = daemon.status()
+    if st["crash_counts"]:
+        worst = max(st["crash_counts"], key=st["crash_counts"].get)
+        return CheckResult(
+            "pipeline",
+            CheckStatus.WARN,
+            f"{st['tasks_running']}/{st['tasks_total']} task(s) running; "
+            f"'{worst}' crashed {st['crash_counts'][worst]}x (supervised restart)",
+            detail=st["last_crash"].get(worst, ""),
+        )
+    if st["tasks_running"] < st["tasks_total"]:
+        return CheckResult(
+            "pipeline", CheckStatus.FAIL, f"{st['tasks_total'] - st['tasks_running']} pipeline task(s) dead"
+        )
+    return CheckResult("pipeline", CheckStatus.OK, f"{st['tasks_running']} pipeline task(s) running")
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -292,6 +327,7 @@ async def run_health_checks(
     *,
     graph: GraphClient | None = None,
     embed: EmbedClient | None = None,
+    daemon: DaemonManager | None = None,
     dotenv_path: str = "",
 ) -> HealthReport:
     """Run all health checks and return an aggregated report.
@@ -341,6 +377,10 @@ async def run_health_checks(
             results.append(schema_res)
             results.append(model_res)
             results.append(index_res)
+
+        # In-process pipeline liveness — only when a live DaemonManager is passed (MCP)
+        if daemon is not None:
+            results.append(check_pipeline(daemon))
     finally:
         if own_graph:
             assert graph is not None

@@ -249,8 +249,12 @@ _LABEL_ALIASES: dict[str, str] = {
     "Dependency": "ExternalPackage",
 }
 
-# Regex to extract labels from :Label patterns in Cypher (exclude [:REL] inside brackets)
-_LABEL_REF_RE = re.compile(r"(?<!\[):([A-Z][A-Za-z_]+)")
+# Relationship refs live inside [...] (e.g. the bound-variable form [r:IMPORTS])
+# and must not be mistaken for node labels. Strip bracketed segments before
+# scanning for :Label node labels.
+_BRACKET_RE = re.compile(r"\[[^\]]*\]")
+# Regex to extract node labels from :Label patterns in Cypher
+_LABEL_REF_RE = re.compile(r":([A-Z][A-Za-z_]+)")
 
 # Regex to extract relationship types from [:REL_TYPE] patterns
 _REL_REF_RE = re.compile(r"\[:([A-Z_]+(?:\*[0-9.]*)?)\]")
@@ -317,7 +321,8 @@ def validate_cypher_static(query: str) -> list[ValidationIssue]:
     if not _RETURN_RE.search(query):
         issues.append(ValidationIssue("warning", "Query has no RETURN clause — results may be empty."))
 
-    for match in _LABEL_REF_RE.finditer(query):
+    label_scan = _BRACKET_RE.sub(" ", query)
+    for match in _LABEL_REF_RE.finditer(label_scan):
         label = match.group(1)
         if label not in _LABEL_NAMES:
             # Check explicit aliases first, then fuzzy match

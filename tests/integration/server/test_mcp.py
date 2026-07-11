@@ -285,6 +285,19 @@ class TestTextSearch:
         assert "results" in result
         assert "count" in result
 
+    async def test_malicious_label_rejected_and_graph_survives(self, app_ctx, seeded_graph):
+        """A Cypher-injection label must be refused, and the graph must be intact afterwards."""
+        malicious = "callable', $query, 60) YIELD node WITH node LIMIT 1 MATCH (m) DETACH DELETE m //"
+        before = await seeded_graph.execute("MATCH (n) RETURN count(n) AS c")
+        assert before[0]["c"] > 0
+
+        result = await _invoke_tool(app_ctx, "text_search", query="x", label=malicious)
+        assert "error" in result
+        assert "Invalid label" in result["error"]
+
+        after = await seeded_graph.execute("MATCH (n) RETURN count(n) AS c")
+        assert after[0]["c"] == before[0]["c"], "Injection payload must not have deleted any nodes"
+
 
 # ---------------------------------------------------------------------------
 # Integration: validate_cypher with EXPLAIN

@@ -55,7 +55,7 @@ from code_atlas.search.guidance import (
 from code_atlas.server.analysis import analyze_repo as _analyze_repo
 from code_atlas.server.analysis import generate_diagram as _generate_diagram
 from code_atlas.server.health import run_health_checks
-from code_atlas.settings import AtlasSettings, derive_project_name
+from code_atlas.settings import AtlasSettings, derive_project_name, find_git_root
 from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
 
 if TYPE_CHECKING:
@@ -166,6 +166,17 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
         logger.info("Query-only mode for new root: {} (no Valkey)", new_root)
 
 
+def _is_project_root(path: Path) -> bool:
+    """True when *path* is a plausible Atlas project root — it has its own
+    ``atlas.toml`` or is a git root.
+
+    Guards the roots probe from silently hijacking the served project namespace
+    with an incidental subdirectory or unrelated folder the MCP client happens
+    to advertise (which would orphan the configured/indexed project).
+    """
+    return (path / "atlas.toml").is_file() or find_git_root(path) == path
+
+
 async def _maybe_update_root(app: AppContext, ctx: Context) -> None:
     """On first tool call, try MCP roots.  Restart daemon if root changed.
 
@@ -184,6 +195,15 @@ async def _maybe_update_root(app: AppContext, ctx: Context) -> None:
     current = app.settings.project_root.resolve()
     if root == current:
         logger.debug("MCP root matches current root: {}", current)
+        return
+
+    if not _is_project_root(root):
+        logger.warning(
+            "MCP client root {} is not an Atlas project (no atlas.toml, not a git root) — "
+            "keeping the configured project {}; queries stay scoped to the indexed project.",
+            root,
+            current,
+        )
         return
 
     logger.info("MCP root differs from current root ({} → {}), switching…", current, root)
@@ -436,8 +456,14 @@ def create_mcp_server(  # noqa: PLR0915
     strict: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
+    catchup: bool = True,
 ) -> FastMCP:
-    """Create and configure the Code Atlas MCP server."""
+    """Create and configure the Code Atlas MCP server.
+
+    *catchup* (default True) runs one blocking delta index pass at startup so
+    edits made while the daemon was down are indexed before live consumption.
+    Set False to skip it (faster startup at the cost of missing offline edits).
+    """
 
     @asynccontextmanager
     async def app_lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: PLR0915
@@ -513,8 +539,9 @@ def create_mcp_server(  # noqa: PLR0915
         except Exception:
             logger.debug("Could not register roots/list_changed handler — root updates via notification disabled")
 
-        # Auto-start watcher + pipeline if Valkey is reachable
-        daemon_running = await daemon.start(settings, graph)
+        # Auto-start watcher + pipeline if Valkey is reachable.
+        # catchup runs one blocking delta index pass before consumers start.
+        daemon_running = await daemon.start(settings, graph, catchup=catchup)
         if daemon_running:
             logger.info("Auto-indexing active (watching {})", settings.project_root)
         else:
@@ -766,6 +793,9 @@ def _register_search_tools(mcp: FastMCP) -> None:
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
+        if label and label not in NodeLabel:
+            valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
+            return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
         clamped = _clamp_limit(limit)
         resolved_project = project or derive_project_name(app.settings.project_root)
 
@@ -812,6 +842,9 @@ def _register_search_tools(mcp: FastMCP) -> None:
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
+        if label and label not in NodeLabel:
+            valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
+            return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
         if not app.vector_enabled:
             if not app.settings.embeddings.enabled:
                 return _error(
@@ -1142,15 +1175,17 @@ def _register_info_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "Check infrastructure health: Memgraph, TEI, Valkey, schema, config, index. "
-            "Returns: {ok: bool, checks: [{name, status, message, detail, suggestion}], elapsed_ms}."
+            "Check infrastructure health: Memgraph, TEI, Valkey, schema, config, index, pipeline. "
+            "Returns: {ok: bool, degraded: bool, checks: [{name, status, message, detail, suggestion}], "
+            "elapsed_ms}. degraded is true when any check is WARN/FAIL (e.g. Valkey down = auto-indexing off)."
         ),
     )
     async def health_check(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         app = await _ensure_root(ctx)
-        report = await run_health_checks(app.settings, graph=app.graph, embed=app.embed)
+        report = await run_health_checks(app.settings, graph=app.graph, embed=app.embed, daemon=app.daemon)
         return {
             "ok": report.ok,
+            "degraded": report.degraded,
             "checks": [
                 {
                     "name": c.name,
