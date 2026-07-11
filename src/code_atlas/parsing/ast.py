@@ -122,7 +122,8 @@ def get_language_for_file(path: str) -> LanguageConfig | None:
 def _compute_content_hash(entity: ParsedEntity) -> str:
     """Compute a deterministic hash of an entity's semantic fields.
 
-    Hashes name, kind, visibility, signature, docstring, and sorted tags.
+    Hashes name, kind, visibility, signature, docstring, sorted tags, and
+    source (the full entity text, hashed before truncation — see _finalize).
     Excludes positional fields (line_start/line_end, file_path) so that
     moving code without changing it produces the same hash.
     """
@@ -133,6 +134,7 @@ def _compute_content_hash(entity: ParsedEntity) -> str:
         entity.signature or "",
         entity.docstring or "",
         ",".join(sorted(entity.tags)),
+        entity.source or "",
     ]
     data = "\0".join(parts).encode("utf-8")
     return hashlib.sha256(data).hexdigest()[:16]

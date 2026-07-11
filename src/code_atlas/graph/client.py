@@ -169,11 +169,10 @@ def _classify_file(
 
     # Position shifts for unchanged entities
     shifted: list[ParsedEntity] = []
-    if unchanged_uids and (added_uids or deleted_uids):
-        for uid in unchanged_uids:
-            entity = new_entity_map[uid]
-            if (entity.line_start, entity.line_end) != (old_data[uid].line_start, old_data[uid].line_end):
-                shifted.append(entity)
+    for uid in unchanged_uids:
+        entity = new_entity_map[uid]
+        if (entity.line_start, entity.line_end) != (old_data[uid].line_start, old_data[uid].line_end):
+            shifted.append(entity)
 
     return _FileClassification(
         added=[new_entity_map[uid] for uid in added_uids],
@@ -372,8 +371,12 @@ class GraphClient:
             await result.consume()
 
     async def get_schema_version(self) -> int | None:
-        """Read the current schema version from the SchemaVersion node."""
-        records = await self.execute(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) RETURN sv.version AS version")
+        """Read the current schema version from the SchemaVersion node.
+
+        Returns the MAX across nodes — defensive against duplicate
+        SchemaVersion nodes left behind by the pre-fix migration MERGE.
+        """
+        records = await self.execute(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) RETURN max(sv.version) AS version")
         if not records:
             return None
         return records[0]["version"]
@@ -400,6 +403,8 @@ class GraphClient:
         elif stored < SCHEMA_VERSION:
             logger.info("Migrating schema v{} → v{}", stored, SCHEMA_VERSION)
             await self._migrate_indices()
+            if stored < 3:  # v3 data migration threshold
+                await self._migrate_v3_clear_freshness_markers()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -489,9 +494,12 @@ class GraphClient:
         old_data = await self.get_file_content_hashes(project_name, file_path)
         fc = _classify_file(old_data, entities, self._strip_uid)
 
-        # Fast path: nothing changed
+        # Fast path: no content changes — apply position-only drift and skip
+        # relationship recreation (rels can't change if no entity content changed)
         if not fc.added and not fc.modified and not fc.result.deleted:
-            logger.debug("Delta skip (no changes) for {}", file_path)
+            if fc.shifted:
+                await self._batch_update_positions(fc.shifted)
+            logger.debug("Delta skip (no content changes) for {}", file_path)
             return fc.result
 
         # Apply delta (all writes route through _active_tx_var)
@@ -826,7 +834,7 @@ class GraphClient:
 
     # -- Import resolution helpers ---------------------------------------------
 
-    async def resolve_imports(  # noqa: PLR0912
+    async def resolve_imports(  # noqa: PLR0912, PLR0915
         self,
         project_name: str,
         import_rels: list[ParsedRelationship],
@@ -845,10 +853,15 @@ class GraphClient:
             f"MATCH (n {{project_name: $p}}) "
             f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
             f"AND NOT n:{NodeLabel.SCHEMA_VERSION} AND NOT n:{NodeLabel.PROJECT} "
-            "RETURN n.qualified_name AS qn, n.uid AS uid",
+            "RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp",
             {"p": project_name},
         )
-        internal_map: dict[str, str] = {r["qn"]: r["uid"] for r in records}
+        internal_map: dict[str, str] = {}
+        py_importers: set[str] = set()  # uids of Python-file entities (prefix fallback is Python-only)
+        for r in records:
+            internal_map[r["qn"]] = r["uid"]
+            if (r["fp"] or "").endswith((".py", ".pyi")):
+                py_importers.add(r["uid"])
 
         # 2. Classify imports as internal or external
         import_edges: list[dict[str, Any]] = []  # [{from_uid, to_uid, type_only?}]
@@ -860,9 +873,21 @@ class GraphClient:
             from_uid = rel.from_qualified_name  # already project-prefixed uid
             is_type_only = rel.properties.get("type_only", False)
 
-            # Check internal match
-            if to_name in internal_map:
-                edge: dict[str, Any] = {"from_uid": from_uid, "to_uid": internal_map[to_name]}
+            # Internal match — exact first; for Python importers, fall back to
+            # progressively shorter dotted prefixes (imports of re-exported or
+            # non-entity names resolve to the closest containing module/package).
+            # The fallback is Python-only per S2: in other languages, dotted
+            # import paths (java.util.List, System.Collections.Generic) live in
+            # a different namespace than path-derived qualified_names, so a
+            # prefix hit there would misclassify an external import as internal.
+            target_uid = internal_map.get(to_name)
+            if target_uid is None and from_uid in py_importers:
+                prefix = to_name
+                while target_uid is None and "." in prefix:
+                    prefix = prefix.rsplit(".", 1)[0]
+                    target_uid = internal_map.get(prefix)
+            if target_uid is not None:
+                edge: dict[str, Any] = {"from_uid": from_uid, "to_uid": target_uid}
                 if is_type_only:
                     edge["type_only"] = True
                 import_edges.append(edge)
@@ -870,6 +895,9 @@ class GraphClient:
 
             # External import — derive top-level package
             top_level = to_name.split(".")[0]
+            if not top_level:
+                logger.debug("Skipping malformed import name {!r} from {}", to_name, from_uid)
+                continue
             pkg_uid = f"{project_name}:ext/{top_level}"
 
             if top_level not in ext_packages:
@@ -944,14 +972,14 @@ class GraphClient:
         if normal_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.MODULE} {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
                 f"MERGE (a)-[:{RelType.IMPORTS}]->(b)",
                 {"rels": normal_edges},
             )
         if type_only_edges:
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.MODULE} {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
                 f"MERGE (a)-[e:{RelType.IMPORTS}]->(b) ON CREATE SET e.type_only = true",
                 {"rels": type_only_edges},
             )
@@ -1097,6 +1125,99 @@ class GraphClient:
 
         logger.debug("Resolved {} USES_TYPE edges", resolved)
 
+    async def resolve_member_defines(
+        self,
+        project_name: str,
+        member_rels: list[ParsedRelationship],
+        *,
+        lookup: _CallLookup | None = None,
+        name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
+    ) -> None:
+        """Resolve DEFINES edges from a parent TYPE NAME to a member Callable.
+
+        Emitted by parsers for members whose parent type may live in another
+        file (Go methods on package types, C++ out-of-line definitions).  Each
+        rel carries the member uid in ``to_name``, the declaring module uid in
+        ``from_qualified_name`` (fallback parent), and the parent type's bare
+        name in ``properties["parent_type_name"]``.  ``parent_scope="package"``
+        restricts matching to the member's directory (Go package rule).
+
+        Ladder (first non-empty rung wins; >1 candidates in a rung => module
+        fallback — never guess, no false edges):
+        1. TypeDef with that name in the member's file.
+        2. TypeDef with that name in the member's directory.
+        3. Project-wide unique TypeDef (skipped when parent_scope="package").
+        4. Fallback: DEFINES from the member's own Module.
+        """
+        if not member_rels:
+            return
+        if lookup is None:
+            lookup = await self._build_call_lookup(project_name)
+        if name_to_typedefs is None:
+            td_records = await self.execute(
+                f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
+                "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
+                {"p": project_name},
+            )
+            name_to_typedefs = {}
+            for r in td_records:
+                name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
+
+        type_edges: set[tuple[str, str]] = set()
+        module_edges: set[tuple[str, str]] = set()
+        for rel in member_rels:
+            member_uid = rel.to_name
+            type_name = rel.properties.get("parent_type_name", "")
+            member_info = lookup.uid_to_info.get(member_uid)
+            member_fp = member_info[1] if member_info else ""
+            member_dir = member_fp.rsplit("/", 1)[0] if "/" in member_fp else ""
+
+            candidates = name_to_typedefs.get(type_name, []) if type_name else []
+            same_file = [uid for uid, fp in candidates if fp == member_fp]
+            same_dir = [uid for uid, fp in candidates if (fp.rsplit("/", 1)[0] if "/" in fp else "") == member_dir]
+
+            target_uid: str | None = None
+            if len(same_file) == 1:
+                target_uid = same_file[0]
+            elif not same_file and len(same_dir) == 1:
+                target_uid = same_dir[0]
+            elif (
+                not same_file
+                and not same_dir
+                and rel.properties.get("parent_scope") != "package"
+                and len(candidates) == 1
+            ):
+                target_uid = candidates[0][0]
+
+            if target_uid is not None:
+                type_edges.add((target_uid, member_uid))
+            else:
+                module_edges.add((rel.from_qualified_name, member_uid))
+
+        # Re-resolution is authoritative: drop previously-resolved parent edges
+        # for these members first. The file-scoped rel delete preserves
+        # cross-file DEFINES edges (see _recreate_file_relationships), so a
+        # stale type edge would otherwise linger next to the new resolution.
+        await self.execute_write(
+            f"UNWIND $uids AS uid MATCH (a)-[r:{RelType.DEFINES}]->(b {{uid: uid}}) "
+            f"WHERE a:{NodeLabel.TYPE_DEF} OR a:{NodeLabel.MODULE} DELETE r",
+            {"uids": sorted({rel.to_name for rel in member_rels})},
+        )
+
+        if type_edges:
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.f}}), (b {{uid: r.t}}) "
+                f"MERGE (a)-[:{RelType.DEFINES}]->(b)",
+                {"rels": [{"f": f, "t": t} for f, t in type_edges]},
+            )
+        if module_edges:
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a:{NodeLabel.MODULE} {{uid: r.f}}), (b {{uid: r.t}}) "
+                f"MERGE (a)-[:{RelType.DEFINES}]->(b)",
+                {"rels": [{"f": f, "t": t} for f, t in module_edges]},
+            )
+        logger.debug("Resolved {} member DEFINES edges ({} fell back to module)", len(type_edges), len(module_edges))
+
     async def _build_call_lookup(self, project_name: str) -> _CallLookup:
         """Build lookup tables needed for CALLS resolution."""
         # name → [(uid, file_path, visibility)]
@@ -1111,15 +1232,16 @@ class GraphClient:
             name_to_callables.setdefault(r["name"], []).append((r["uid"], r["fp"] or "", r["vis"] or "public"))
             uid_to_info[r["uid"]] = (r["name"], r["fp"] or "")
 
-        # module_uid → {imported_name: target_uid}
-        import_records = await self.execute(
-            f"MATCH (m:{NodeLabel.MODULE} {{project_name: $p}})-[:{RelType.IMPORTS}]->(t) "
-            "RETURN m.uid AS mod_uid, t.name AS name, t.uid AS uid",
-            {"p": project_name},
-        )
+        # module/package uid → {imported_name: target_uid}
         import_map: dict[str, dict[str, str]] = {}
-        for r in import_records:
-            import_map.setdefault(r["mod_uid"], {})[r["name"]] = r["uid"]
+        for lbl in (NodeLabel.MODULE, NodeLabel.PACKAGE):
+            import_records = await self.execute(
+                f"MATCH (m:{lbl} {{project_name: $p}})-[:{RelType.IMPORTS}]->(t) "
+                "RETURN m.uid AS mod_uid, t.name AS name, t.uid AS uid",
+                {"p": project_name},
+            )
+            for r in import_records:
+                import_map.setdefault(r["mod_uid"], {})[r["name"]] = r["uid"]
 
         # caller_uid → parent TypeDef uid, parent → children
         parent_records = await self.execute(
@@ -1233,7 +1355,9 @@ class GraphClient:
             {"ep_uid": ep["uid"], "pkg_name": ep["name"], "target_project": ep["target"]} for ep in matched_eps
         ]
 
-        # Bulk-resolve real entities for ExternalSymbols
+        # Bulk-resolve real entities for ExternalSymbols.  No LIMIT — Cypher
+        # LIMIT is global (one row for the whole UNWIND, not per pair); the
+        # dict comprehension dedups multiple name matches per stub instead.
         sym_to_real: dict[str, str] = {}
         if lookup_pairs:
             real_matches = await self.execute(
@@ -1241,7 +1365,7 @@ class GraphClient:
                 "MATCH (n {project_name: p.target_project, name: p.name}) "
                 f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
                 f"AND NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
-                "RETURN p.es_uid AS es_uid, n.uid AS real_uid LIMIT 1",
+                "RETURN p.es_uid AS es_uid, n.uid AS real_uid",
                 {"pairs": lookup_pairs},
             )
             sym_to_real = {m["es_uid"]: m["real_uid"] for m in real_matches}
@@ -1252,7 +1376,7 @@ class GraphClient:
             real_pkgs = await self.execute(
                 "UNWIND $pairs AS p "
                 f"MATCH (pkg:{NodeLabel.PACKAGE} {{project_name: p.target_project, name: p.pkg_name}}) "
-                "RETURN p.ep_uid AS ep_uid, pkg.uid AS real_uid LIMIT 1",
+                "RETURN p.ep_uid AS ep_uid, pkg.uid AS real_uid",
                 {"pairs": pkg_rewire},
             )
             ep_to_real_pkg = {m["ep_uid"]: m["real_uid"] for m in real_pkgs}
@@ -1402,9 +1526,15 @@ class GraphClient:
         """Read embedding model and dimension from the SchemaVersion node.
 
         Returns ``(model, dimension)`` or ``None`` if not yet configured.
+        Deterministic against duplicate SchemaVersion nodes (pre-fix damage):
+        reads the canonical node — highest version, config-bearing preferred —
+        never an arbitrary duplicate.
         """
         records = await self.execute(
-            f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) RETURN sv.embedding_model AS model, sv.embedding_dimension AS dim"
+            f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) "
+            "RETURN sv.embedding_model AS model, sv.embedding_dimension AS dim "
+            "ORDER BY coalesce(sv.version, -1) DESC, "
+            "(CASE WHEN sv.embedding_model IS NULL THEN 0 ELSE 1 END) DESC LIMIT 1"
         )
         if not records or records[0]["model"] is None:
             return None
@@ -1985,11 +2115,15 @@ class GraphClient:
         in the delete phase.  All rels across files are pooled for creation.
         """
         # --- Delete phase: single label-free query for all file entities ---
+        # Cross-file DEFINES edges are preserved: they are created by
+        # resolve_member_defines from the MEMBER file's parse, so this file's
+        # recreation would never restore them.
         delete_fps = [fp for fp in file_rels if fp not in new_file_paths]
         if delete_fps:
             await self.execute_write(
-                f"MATCH (n {{project_name: $p}})-[r]->() "
+                f"MATCH (n {{project_name: $p}})-[r]->(m) "
                 f"WHERE n.file_path IN $fps AND NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+                f"AND NOT (type(r) = '{RelType.DEFINES}' AND coalesce(m.file_path, n.file_path) <> n.file_path) "
                 f"DELETE r",
                 {"p": project_name, "fps": delete_fps},
             )
@@ -2009,11 +2143,16 @@ class GraphClient:
         *,
         skip_delete: bool = False,
     ) -> None:
-        """Delete all relationships originating from this file's entities, then recreate them."""
+        """Delete all relationships originating from this file's entities, then recreate them.
+
+        Cross-file DEFINES edges (resolve_member_defines output, owned by the
+        member file's parse) are preserved — recreation would never restore them.
+        """
         if not skip_delete:
             await self.execute_write(
-                f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->() "
-                f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} DELETE r",
+                f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->(m) "
+                f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
+                f"AND NOT (type(r) = '{RelType.DEFINES}' AND coalesce(m.file_path, $f) <> $f) DELETE r",
                 {"p": project_name, "f": file_path},
             )
         await self._create_relationships(project_name, relationships)
@@ -2027,12 +2166,16 @@ class GraphClient:
 
         Shared by both single-file and batched upsert paths.
         IMPORTS, CALLS, and USES_TYPE are excluded — they're resolved post-batch.
+        DEFINES rels carrying a ``parent_type_name`` property are also excluded —
+        resolved post-batch via ``resolve_member_defines``.
+        IMPLEMENTS arrives in two shapes: detector-emitted target uids (always
+        contain ``:``) follow the uid path; parser-emitted bare type names
+        (TS/Java/C#/PHP/Rust) resolve by name like INHERITS.
         """
         uid_rel_types = {
             RelType.DEFINES,
             RelType.CONTAINS,
             RelType.OVERRIDES,
-            RelType.IMPLEMENTS,
             RelType.EXPORTS,
             RelType.TESTS,
             RelType.HANDLES_ROUTE,
@@ -2041,8 +2184,19 @@ class GraphClient:
             RelType.REGISTERED_BY,
             RelType.INJECTED_INTO,
         }
-        uid_rels = [r for r in relationships if r.rel_type in uid_rel_types]
-        other_rels = [r for r in relationships if r.rel_type not in uid_rel_types]
+        # IMPLEMENTS arrives in two shapes: detector-emitted target uids
+        # (always contain ':') and parser-emitted bare type names
+        # (TS/Java/C#/PHP/Rust) — bare names resolve like INHERITS.
+        uid_rels: list[ParsedRelationship] = []
+        other_rels: list[ParsedRelationship] = []
+        for r in relationships:
+            if r.rel_type == RelType.IMPLEMENTS:
+                (uid_rels if ":" in r.to_name else other_rels).append(r)
+            elif r.rel_type in uid_rel_types:
+                if "parent_type_name" not in r.properties:
+                    uid_rels.append(r)
+            else:
+                other_rels.append(r)
 
         # uid-based rels: one UNWIND per rel_type
         for rel_type, group in groupby(sorted(uid_rels, key=attrgetter("rel_type")), key=attrgetter("rel_type")):
@@ -2057,19 +2211,21 @@ class GraphClient:
 
         # Name-matched rels
         inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
+        implements_rels = [r for r in other_rels if r.rel_type == RelType.IMPLEMENTS]
         doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
 
-        if inherits_rels:
-            inh_params = [
-                {"from_uid": r.from_qualified_name, "project": project_name, "to_name": r.to_name}
-                for r in inherits_rels
+        for name_rel_type, name_rels in ((RelType.INHERITS, inherits_rels), (RelType.IMPLEMENTS, implements_rels)):
+            if not name_rels:
+                continue
+            params = [
+                {"from_uid": r.from_qualified_name, "project": project_name, "to_name": r.to_name} for r in name_rels
             ]
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}), "
                 f"(b:{NodeLabel.TYPE_DEF} {{project_name: r.project, name: r.to_name}}) "
-                f"CREATE (a)-[:{RelType.INHERITS}]->(b)",
-                {"rels": inh_params},
+                f"CREATE (a)-[:{name_rel_type}]->(b)",
+                {"rels": params},
             )
 
         if doc_rels:
@@ -2170,19 +2326,45 @@ class GraphClient:
         for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
 
-    async def _set_schema_version(self, version: int) -> None:
-        """Create or update the SchemaVersion singleton node."""
+    async def _migrate_v3_clear_freshness_markers(self) -> None:
+        """v3: content_hash now covers entity source. Clear file/git hashes so the
+        next index run re-parses every file and heals entities whose body-only
+        edits were invisible under the v2 hash formula.
+        """
         await self.execute_write(
-            f"MERGE (sv:{NodeLabel.SCHEMA_VERSION} {{version: $old_version}}) SET sv.version = $version",
-            {"old_version": version, "version": version},
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
         )
-        # Also handle fresh creation (no existing node to merge on)
-        records = await self.execute(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) RETURN count(sv) AS cnt")
-        if records[0]["cnt"] == 0:
-            await self.execute_write(
-                f"CREATE (sv:{NodeLabel.SCHEMA_VERSION} {{version: $version}})",
-                {"version": version},
-            )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v3: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v3"
+        )
+
+    async def _set_schema_version(self, version: int) -> None:
+        """Create or update the SchemaVersion singleton node.
+
+        Collapses duplicate SchemaVersion nodes (left behind by the pre-fix
+        migration MERGE) into one canonical node first: the highest-version
+        node wins, back-filling missing embedding-config fields from the
+        duplicates being removed so ``get_embedding_config`` never loses the
+        stored config to the collapse.
+        """
+        await self.execute_write(
+            f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) "
+            "WITH sv ORDER BY coalesce(sv.version, -1) DESC, "
+            "(CASE WHEN sv.embedding_model IS NULL THEN 0 ELSE 1 END) DESC "
+            "WITH collect(sv) AS nodes WHERE size(nodes) > 1 "
+            "WITH head(nodes) AS keep, tail(nodes) AS dupes "
+            "SET keep.embedding_model = coalesce(keep.embedding_model, "
+            "        head([d IN dupes WHERE d.embedding_model IS NOT NULL | d.embedding_model])), "
+            "    keep.embedding_dimension = coalesce(keep.embedding_dimension, "
+            "        head([d IN dupes WHERE d.embedding_dimension IS NOT NULL | d.embedding_dimension])) "
+            "WITH dupes UNWIND dupes AS d DETACH DELETE d"
+        )
+        await self.execute_write(
+            f"MERGE (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = $version",
+            {"version": version},
+        )
 
     async def _exec_ddl(self, stmt: str) -> None:
         """Execute a DDL statement, ignoring 'already exists' / 'doesn't exist' errors."""

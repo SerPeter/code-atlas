@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from code_atlas.parsing.ast import ParsedFile, get_language_for_file, parse_file
+from code_atlas.parsing.languages.python import module_qualified_name
 from code_atlas.schema import (
     CallableKind,
     NodeLabel,
@@ -63,7 +66,7 @@ def test_module_entity():
     module = _entity_by_name(parsed, "parser")
     assert module.label == NodeLabel.MODULE
     assert module.kind == "module"
-    assert module.qualified_name == f"{PROJECT}:src.code_atlas.parser"
+    assert module.qualified_name == f"{PROJECT}:code_atlas.parser"
 
 
 def test_package_entity():
@@ -71,7 +74,7 @@ def test_package_entity():
     pkg = _entity_by_name(parsed, "code_atlas")
     assert pkg.label == NodeLabel.PACKAGE
     assert pkg.kind == "package"
-    assert pkg.qualified_name == f"{PROJECT}:src.code_atlas"
+    assert pkg.qualified_name == f"{PROJECT}:code_atlas"
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +138,11 @@ def baz():
     )
     bar = _entity_by_name(parsed, "bar")
     assert bar.kind == CallableKind.METHOD
-    assert bar.qualified_name == f"{PROJECT}:src.example.Foo.bar"
+    assert bar.qualified_name == f"{PROJECT}:example.Foo.bar"
 
     baz = _entity_by_name(parsed, "baz")
     assert baz.kind == CallableKind.FUNCTION
-    assert baz.qualified_name == f"{PROJECT}:src.example.baz"
+    assert baz.qualified_name == f"{PROJECT}:example.baz"
 
 
 def test_constructor():
@@ -212,6 +215,89 @@ def test_import_from():
 
 
 # ---------------------------------------------------------------------------
+# Source-root stripping and relative import resolution (S2 contract)
+# ---------------------------------------------------------------------------
+
+
+def _imports(parsed: ParsedFile) -> set[str]:
+    return {r.to_name for r in parsed.relationships if r.rel_type == RelType.IMPORTS}
+
+
+@pytest.mark.parametrize(
+    ("file_path", "expected"),
+    [
+        ("src/code_atlas/events.py", "code_atlas.events"),
+        ("src/code_atlas/__init__.py", "code_atlas"),
+        ("code_atlas/util.py", "code_atlas.util"),
+        ("src/__init__.py", "src"),
+        ("src/main.py", "main"),
+        ("src/code_atlas/parser.py", "code_atlas.parser"),
+    ],
+)
+def test_module_qualified_name_contract_examples(file_path: str, expected: str):
+    """S2 namespace contract: import-system names with the source root stripped."""
+    assert module_qualified_name(file_path) == expected
+
+
+def test_module_qualified_name_strips_source_root():
+    """Source-root dirs like src/ are stripped so module qns match the import system."""
+    parsed = _parse("x = 1\n", path="src/code_atlas/parser.py")
+    module = _entity_by_name(parsed, "parser")
+    assert module.qualified_name == f"{PROJECT}:code_atlas.parser"
+
+    parsed = _parse("", path="src/code_atlas/__init__.py")
+    pkg = _entity_by_name(parsed, "code_atlas")
+    assert pkg.label == NodeLabel.PACKAGE
+    assert pkg.qualified_name == f"{PROJECT}:code_atlas"
+
+    # Flat layout unchanged
+    parsed = _parse("x = 1\n", path="code_atlas/util.py")
+    module = _entity_by_name(parsed, "util")
+    assert module.qualified_name == f"{PROJECT}:code_atlas.util"
+
+    # A source root that is itself a package is kept
+    parsed = _parse("", path="src/__init__.py")
+    pkg = _entity_by_name(parsed, "src")
+    assert pkg.qualified_name == f"{PROJECT}:src"
+
+
+def test_relative_import_resolved_from_module():
+    """Relative imports resolve against the module's parent package at parse time."""
+    parsed = _parse(
+        "from .other import thing\nfrom . import sibling\nfrom ..top import x\n",
+        path="pkg/sub/mod.py",
+    )
+    assert _imports(parsed) == {"pkg.sub.other.thing", "pkg.sub.sibling", "pkg.top.x"}
+
+
+def test_relative_import_resolved_from_package_init():
+    """__init__.py relative imports resolve against the package itself, not its parent."""
+    parsed = _parse("from .mod import foo\nfrom . import bar\n", path="pkg/sub/__init__.py")
+    assert _imports(parsed) == {"pkg.sub.mod.foo", "pkg.sub.bar"}
+
+
+def test_relative_import_beyond_top_level_dropped():
+    """Relative imports whose dots escape the top-level package emit no relationship."""
+    parsed = _parse("from . import x\n", path="mod.py")
+    assert _imports(parsed) == set()
+
+    parsed = _parse("from ...deep import y\n", path="pkg/mod.py")
+    assert _imports(parsed) == set()
+
+
+def test_relative_import_multilevel_with_alias():
+    """'..pkg.sub'-style dotted suffixes and aliased names resolve correctly."""
+    parsed = _parse("from ..util.text import slug as s\n", path="app/core/handlers/mod.py")
+    assert _imports(parsed) == {"app.core.util.text.slug"}
+
+
+def test_relative_import_src_layout():
+    """Relative import in a src-layout __init__ resolves into the stripped namespace."""
+    parsed = _parse("from .ast import parse_file\n", path="src/code_atlas/parsing/__init__.py")
+    assert _imports(parsed) == {"code_atlas.parsing.ast.parse_file"}
+
+
+# ---------------------------------------------------------------------------
 # Module-level assignments (Values)
 # ---------------------------------------------------------------------------
 
@@ -247,14 +333,14 @@ def baz():
 """
     )
     # Module DEFINES Foo
-    mod_defines = _rels_from(parsed, "src.example", RelType.DEFINES)
+    mod_defines = _rels_from(parsed, "example", RelType.DEFINES)
     targets = {r.to_name for r in mod_defines}
-    assert f"{PROJECT}:src.example.Foo" in targets
-    assert f"{PROJECT}:src.example.baz" in targets
+    assert f"{PROJECT}:example.Foo" in targets
+    assert f"{PROJECT}:example.baz" in targets
 
     # Foo DEFINES bar
-    foo_defines = _rels_from(parsed, "src.example.Foo", RelType.DEFINES)
-    assert any(r.to_name == f"{PROJECT}:src.example.Foo.bar" for r in foo_defines)
+    foo_defines = _rels_from(parsed, "example.Foo", RelType.DEFINES)
+    assert any(r.to_name == f"{PROJECT}:example.Foo.bar" for r in foo_defines)
 
 
 def test_calls_relationship():
@@ -265,7 +351,7 @@ def caller():
     some_func()
 """
     )
-    calls = _rels_from(parsed, "src.example.caller", RelType.CALLS)
+    calls = _rels_from(parsed, "example.caller", RelType.CALLS)
     called = {r.to_name for r in calls}
     assert "print" in called
     assert "some_func" in called
@@ -801,15 +887,23 @@ def test_source_truncated_custom():
     assert len(func.source) == 50
 
 
-def test_source_not_in_content_hash():
-    """Same signature/name but different bodies produce the same content_hash."""
+def test_content_hash_changes_on_body():
+    """Same signature/name but different bodies produce different content_hashes."""
     parsed1 = _parse("def work():\n    return 1\n")
     parsed2 = _parse("def work():\n    return 2\n")
     func1 = _entity_by_name(parsed1, "work")
     func2 = _entity_by_name(parsed2, "work")
-    assert func1.content_hash == func2.content_hash
-    # But source differs
-    assert func1.source != func2.source
+    assert func1.content_hash != func2.content_hash
+
+
+def test_content_hash_covers_source_beyond_truncation():
+    """Edits past the max_source_chars cap still change the hash (hash runs pre-truncation)."""
+    filler = "    x = 1\n" * 300  # ~3000 chars, past the 2000 default cap
+    p1 = _parse(f"def big():\n{filler}    return 1\n")
+    p2 = _parse(f"def big():\n{filler}    return 2\n")
+    f1, f2 = _entity_by_name(p1, "big"), _entity_by_name(p2, "big")
+    assert f1.content_hash != f2.content_hash
+    assert f1.source == f2.source  # truncated prefix identical
 
 
 # ---------------------------------------------------------------------------

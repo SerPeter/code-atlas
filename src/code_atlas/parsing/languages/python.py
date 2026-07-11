@@ -104,11 +104,17 @@ _PY_QUERY = Query(_PY_LANGUAGE, _PYTHON_QUERY)
 # ---------------------------------------------------------------------------
 
 
-def _module_qualified_name(file_path: str) -> str:
+# Conventional source-root directories that are not import packages (src-layout).
+_SOURCE_ROOTS: frozenset[str] = frozenset({"src"})
+
+
+def module_qualified_name(file_path: str) -> str:
     """Convert file path to a Python module qualified name.
 
-    ``src/code_atlas/parser.py`` -> ``src.code_atlas.parser``
-    ``src/code_atlas/__init__.py`` -> ``src.code_atlas``
+    ``src/code_atlas/parser.py`` -> ``code_atlas.parser`` (source-root dirs
+    like ``src/`` are stripped so names match the import system)
+    ``code_atlas/__init__.py`` -> ``code_atlas``
+    ``src/__init__.py`` -> ``src`` (a source root that is itself a package is kept)
     """
     p = PurePosixPath(file_path.replace("\\", "/"))
     parts = list(p.parts)
@@ -119,6 +125,8 @@ def _module_qualified_name(file_path: str) -> str:
             parts = parts[:-1]
         else:
             parts[-1] = filename.rsplit(".", 1)[0]
+    if len(parts) > 1 and parts[0] in _SOURCE_ROOTS:
+        parts = parts[1:]
     return ".".join(parts)
 
 
@@ -282,8 +290,10 @@ def _parse_python(
     project_name: str,
 ) -> ParsedFile:
     """Extract entities and relationships from a Python parse tree."""
-    module_qn = _module_qualified_name(path)
-    is_package = path.replace("\\", "/").endswith("__init__.py")
+    module_qn = module_qualified_name(path)
+    is_package = path.replace("\\", "/").endswith(("__init__.py", "__init__.pyi"))
+    # __package__ equivalent: the package itself for __init__, else the parent
+    package_qn = module_qn if is_package else (module_qn.rsplit(".", 1)[0] if "." in module_qn else "")
 
     entities: list[ParsedEntity] = []
     relationships: list[ParsedRelationship] = []
@@ -308,7 +318,9 @@ def _parse_python(
     )
 
     # Walk the tree for classes, functions, imports, assignments
-    _walk_python_node(root, path, source, project_name, module_qn, entities, relationships, seen, enum_classes)
+    _walk_python_node(
+        root, path, source, project_name, module_qn, package_qn, entities, relationships, seen, enum_classes
+    )
 
     # Post-processing: tag conditional (duplicate) definitions
     _tag_conditional_definitions(entities)
@@ -327,6 +339,7 @@ def _walk_python_node(
     source: bytes,
     project_name: str,
     module_qn: str,
+    package_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
@@ -348,6 +361,7 @@ def _walk_python_node(
                         source,
                         project_name,
                         module_qn,
+                        package_qn,
                         entities,
                         relationships,
                         seen,
@@ -363,6 +377,7 @@ def _walk_python_node(
                         source,
                         project_name,
                         module_qn,
+                        package_qn,
                         entities,
                         relationships,
                         seen,
@@ -375,18 +390,27 @@ def _walk_python_node(
             for inner in child.children:
                 if inner.type in ("function_definition", "class_definition"):
                     _process_definition(
-                        inner, path, source, project_name, module_qn, entities, relationships, seen, enum_classes
+                        inner,
+                        path,
+                        source,
+                        project_name,
+                        module_qn,
+                        package_qn,
+                        entities,
+                        relationships,
+                        seen,
+                        enum_classes,
                     )
             continue
 
         if child.type in ("function_definition", "class_definition"):
             _process_definition(
-                child, path, source, project_name, module_qn, entities, relationships, seen, enum_classes
+                child, path, source, project_name, module_qn, package_qn, entities, relationships, seen, enum_classes
             )
             continue
 
         if child.type in ("import_statement", "import_from_statement"):
-            _process_import(child, project_name, module_qn, relationships, type_only=in_type_checking)
+            _process_import(child, project_name, module_qn, package_qn, relationships, type_only=in_type_checking)
             continue
 
         if child.type == "expression_statement":
@@ -401,6 +425,7 @@ def _walk_python_node(
                 source,
                 project_name,
                 module_qn,
+                package_qn,
                 entities,
                 relationships,
                 seen,
@@ -415,6 +440,7 @@ def _process_definition(
     source: bytes,
     project_name: str,
     module_qn: str,
+    package_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
@@ -434,7 +460,9 @@ def _process_definition(
     seen.add(key)
 
     if node.type == "class_definition":
-        _process_class(node, path, source, project_name, module_qn, name, entities, relationships, seen, enum_classes)
+        _process_class(
+            node, path, source, project_name, module_qn, package_qn, name, entities, relationships, seen, enum_classes
+        )
     elif node.type == "function_definition":
         _process_function(node, path, source, project_name, module_qn, name, entities, relationships)
 
@@ -448,6 +476,7 @@ def _process_class(
     source: bytes,
     project_name: str,
     module_qn: str,
+    package_qn: str,
     name: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
@@ -513,7 +542,9 @@ def _process_class(
     # Recurse into class body for methods, nested classes, etc.
     body = node.child_by_field_name("body")
     if body is not None:
-        _walk_python_node(body, path, source, project_name, module_qn, entities, relationships, seen, enum_classes)
+        _walk_python_node(
+            body, path, source, project_name, module_qn, package_qn, entities, relationships, seen, enum_classes
+        )
 
 
 def _process_function(
@@ -582,10 +613,26 @@ def _process_function(
         _extract_calls(body, source, f"{project_name}:{qn}", relationships)
 
 
-def _process_import(
+def _resolve_relative_import(package_qn: str, relative_text: str) -> str | None:
+    """Resolve a relative import ('.', '.mod', '..pkg.sub') against the
+    importing module's package. Returns an absolute dotted module path, or
+    ``None`` when the dots escape the top-level package.
+    """
+    dots = len(relative_text) - len(relative_text.lstrip("."))
+    suffix = relative_text[dots:]
+    parts = package_qn.split(".") if package_qn else []
+    if dots > len(parts):
+        return None  # relative import beyond top-level package
+    base_parts = parts[: len(parts) - (dots - 1)] if dots > 1 else parts
+    base = ".".join(base_parts)
+    return f"{base}.{suffix}" if suffix else base
+
+
+def _process_import(  # noqa: PLR0912
     node: Node,
     project_name: str,
     module_qn: str,
+    package_qn: str,
     relationships: list[ParsedRelationship],
     *,
     type_only: bool = False,
@@ -618,7 +665,13 @@ def _process_import(
                     )
     elif node.type == "import_from_statement":
         module_node = node.child_by_field_name("module_name")
-        module_name = node_text(module_node) if module_node else ""
+        if module_node is not None and module_node.type == "relative_import":
+            resolved = _resolve_relative_import(package_qn, node_text(module_node))
+            if resolved is None:
+                return  # beyond top-level package — nothing to link
+            module_name = resolved
+        else:
+            module_name = node_text(module_node) if module_node else ""
         # Collect imported names
         for child in node.children:
             if child.type == "dotted_name" and child != module_node:

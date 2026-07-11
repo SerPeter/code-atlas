@@ -5,12 +5,13 @@ Requires a running Memgraph instance (docker compose up -d memgraph).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
 
 from code_atlas.graph.client import QueryTimeoutError
-from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
+from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
 from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
 
 if TYPE_CHECKING:
@@ -63,6 +64,87 @@ async def test_ensure_schema_rejects_downgrade(graph_client: GraphClient):
 
     with pytest.raises(RuntimeError, match="newer than code"):
         await graph_client.ensure_schema()
+
+
+async def test_set_schema_version_no_duplicate_nodes(graph_client: GraphClient):
+    """Migrating from an older version updates the existing SchemaVersion node in place."""
+    await graph_client.ensure_schema()
+
+    # Simulate an old database: force the stored version below current
+    await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 1")
+
+    await graph_client.ensure_schema()  # migrates 1 → SCHEMA_VERSION
+
+    records = await graph_client.execute(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) RETURN count(sv) AS cnt")
+    assert records[0]["cnt"] == 1
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
+
+
+async def test_get_schema_version_returns_max_across_duplicates(graph_client: GraphClient):
+    """Defensive: duplicate SchemaVersion nodes (pre-fix damage) resolve to the max version."""
+    await graph_client.execute_write(f"CREATE (:{NodeLabel.SCHEMA_VERSION} {{version: 1}})")
+    await graph_client.execute_write(f"CREATE (:{NodeLabel.SCHEMA_VERSION} {{version: $v}})", {"v": SCHEMA_VERSION})
+
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
+
+
+async def test_duplicate_schema_versions_collapsed_preserving_embedding_config(graph_client: GraphClient):
+    """Migration collapses duplicate SchemaVersion nodes into one, keeping the embedding config."""
+    # Pre-fix damage: stale duplicate carries the embedding config, newer node has none
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.SCHEMA_VERSION} {{version: 1, embedding_model: 'old-model', embedding_dimension: 768}})"
+    )
+    await graph_client.execute_write(f"CREATE (:{NodeLabel.SCHEMA_VERSION} {{version: 2}})")
+
+    await graph_client.ensure_schema()  # migrates to SCHEMA_VERSION, collapsing duplicates
+
+    records = await graph_client.execute(
+        f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) "
+        "RETURN sv.version AS v, sv.embedding_model AS m, sv.embedding_dimension AS d"
+    )
+    assert len(records) == 1
+    assert records[0]["v"] == SCHEMA_VERSION
+    assert (records[0]["m"], records[0]["d"]) == ("old-model", 768)
+    assert await graph_client.get_embedding_config() == ("old-model", 768)
+
+
+async def test_get_embedding_config_reads_canonical_node_across_duplicates(graph_client: GraphClient):
+    """With duplicates still present, the config comes from the highest-version node, not an arbitrary one."""
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.SCHEMA_VERSION} {{version: 1, embedding_model: 'stale', embedding_dimension: 384}})"
+    )
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.SCHEMA_VERSION} {{version: $v, embedding_model: 'current', embedding_dimension: 1024}})",
+        {"v": SCHEMA_VERSION},
+    )
+
+    assert await graph_client.get_embedding_config() == ("current", 1024)
+
+
+async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):
+    """Migrating from v2 clears Module.file_hash and Project.git_hash so the next index re-parses."""
+    await graph_client.ensure_schema()
+
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.MODULE} {{"
+        "  uid: 'mig3:mod', project_name: 'mig3', name: 'mod',"
+        "  qualified_name: 'mod', file_path: 'mod.py', kind: 'module',"
+        "  content_hash: 'ch', file_hash: 'stale'"
+        "})"
+    )
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.PROJECT} {{uid: 'mig3', project_name: 'mig3', name: 'mig3', git_hash: 'oldcommit'}})"
+    )
+    # Force the stored version back to 2 (pre-v3 database)
+    await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 2")
+
+    await graph_client.ensure_schema()
+
+    mod = await graph_client.execute("MATCH (n {uid: 'mig3:mod'}) RETURN n.file_hash AS fh")
+    assert mod[0]["fh"] is None
+    proj = await graph_client.execute("MATCH (p {uid: 'mig3'}) RETURN p.git_hash AS gh")
+    assert proj[0]["gh"] is None
+    assert await graph_client.get_schema_version() == 3
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +993,86 @@ async def test_upsert_updates_positions_on_shift(graph_client: GraphClient):
     assert records[0]["hash"] == "emb_b"
 
 
+async def test_upsert_body_only_edit_classified_modified(graph_client: GraphClient):
+    """A body-only edit (same signature/docstring) is classified modified, not unchanged."""
+    await graph_client.ensure_schema()
+
+    project = "delta_body"
+    fp = "src/mod.py"
+
+    parsed1 = parse_file(fp, b"def f():\n    return 1\n", project)
+    assert parsed1 is not None
+    await graph_client.upsert_file_entities(project, fp, parsed1.entities, parsed1.relationships)
+
+    parsed2 = parse_file(fp, b"def f():\n    return 2\n", project)
+    assert parsed2 is not None
+    result = await graph_client.upsert_file_entities(project, fp, parsed2.entities, parsed2.relationships)
+
+    assert "mod.f" in result.modified
+    assert "mod.f" not in result.unchanged
+
+    records = await graph_client.execute("MATCH (n {uid: $uid}) RETURN n.source AS src", {"uid": f"{project}:mod.f"})
+    assert len(records) == 1
+    assert "return 2" in records[0]["src"]
+
+
+async def test_upsert_shifted_positions_updated_on_modified_only(graph_client: GraphClient):
+    """Position shifts apply for unchanged entities even when nothing was added/deleted."""
+    await graph_client.ensure_schema()
+
+    project = "delta_shift_mod"
+    fp = "src/mod.py"
+
+    entities_v1 = [
+        _make_entity(project, "func_a", fp, line_start=1, line_end=5, content_hash="a1"),
+        _make_entity(project, "func_b", fp, line_start=7, line_end=11, content_hash="b"),
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities_v1, [])
+
+    # func_a grows (modified); func_b is unchanged but shifted down
+    entities_v2 = [
+        _make_entity(project, "func_a", fp, line_start=1, line_end=8, content_hash="a2"),
+        _make_entity(project, "func_b", fp, line_start=10, line_end=14, content_hash="b"),
+    ]
+    result = await graph_client.upsert_file_entities(project, fp, entities_v2, [])
+    assert "src.mod.func_a" in result.modified
+    assert "src.mod.func_b" in result.unchanged
+
+    records = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN n.line_start AS ls, n.line_end AS le",
+        {"uid": f"{project}:src.mod.func_b"},
+    )
+    assert (records[0]["ls"], records[0]["le"]) == (10, 14)
+    records_a = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN n.line_end AS le",
+        {"uid": f"{project}:src.mod.func_a"},
+    )
+    assert records_a[0]["le"] == 8
+
+
+async def test_upsert_positions_updated_on_pure_shift(graph_client: GraphClient):
+    """A pure position shift (e.g. comment inserted above) still updates stored positions."""
+    await graph_client.ensure_schema()
+
+    project = "delta_shift_pure"
+    fp = "src/mod.py"
+
+    await graph_client.upsert_file_entities(
+        project, fp, [_make_entity(project, "func_a", fp, line_start=2, line_end=6, content_hash="a")], []
+    )
+    result = await graph_client.upsert_file_entities(
+        project, fp, [_make_entity(project, "func_a", fp, line_start=4, line_end=8, content_hash="a")], []
+    )
+    assert result.unchanged == ["src.mod.func_a"]
+    assert result.modified == []
+
+    records = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN n.line_start AS ls, n.line_end AS le",
+        {"uid": f"{project}:src.mod.func_a"},
+    )
+    assert (records[0]["ls"], records[0]["le"]) == (4, 8)
+
+
 # ---------------------------------------------------------------------------
 # Import resolution
 # ---------------------------------------------------------------------------
@@ -1175,6 +1337,287 @@ async def test_external_package_versions(graph_client: GraphClient):
     version_map = {r["name"]: r["version"] for r in records}
     assert version_map["loguru"] == "~=0.7"
     assert version_map["pydantic"] == ">=2.0,<3.0"
+
+
+async def test_resolve_imports_prefix_fallback_reexport(graph_client: GraphClient):
+    """Imports of re-exported names resolve to the closest containing module, not External* stubs."""
+    await graph_client.ensure_schema()
+
+    project = "imp_prefix"
+    fp_utils = "pkg/utils.py"
+    utils_entities = [
+        ParsedEntity(
+            name="utils",
+            qualified_name=f"{project}:pkg.utils",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=5,
+            file_path=fp_utils,
+            content_hash="u_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_utils, utils_entities, [])
+
+    fp_app = "pkg/app.py"
+    app_entities = [
+        ParsedEntity(
+            name="app",
+            qualified_name=f"{project}:pkg.app",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=5,
+            file_path=fp_app,
+            content_hash="a_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_app, app_entities, [])
+
+    # 'reexported_helper' is not a stored entity — only the containing module is
+    import_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:pkg.app",
+            rel_type=RelType.IMPORTS,
+            to_name="pkg.utils.reexported_helper",
+        ),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    imports = await graph_client.execute(
+        f"MATCH (:{NodeLabel.MODULE} {{name: 'app'}})-[:{RelType.IMPORTS}]->(n:{NodeLabel.MODULE}) "
+        "RETURN n.name AS name",
+    )
+    assert len(imports) == 1
+    assert imports[0]["name"] == "utils"
+
+    ext = await graph_client.execute(
+        f"MATCH (n {{project_name: $p}}) "
+        f"WHERE n:{NodeLabel.EXTERNAL_PACKAGE} OR n:{NodeLabel.EXTERNAL_SYMBOL} RETURN n",
+        {"p": project},
+    )
+    assert len(ext) == 0
+
+
+async def test_resolve_imports_prefix_fallback_python_only(graph_client: GraphClient):
+    """The dotted-prefix fallback must not fire for non-Python importers.
+
+    A C# ``using System.Collections.Generic`` must classify as external even
+    when the project happens to contain a module named 'System' — dotted import
+    paths in non-Python languages live in a different namespace than the
+    path-derived qualified_names, so a prefix hit would be a misclassification.
+    """
+    await graph_client.ensure_schema()
+
+    project = "imp_lang_gate"
+    for name, qn, fp in (("System", "System", "System.cs"), ("App", "src.App", "src/App.cs")):
+        entities = [
+            ParsedEntity(
+                name=name,
+                qualified_name=f"{project}:{qn}",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=5,
+                file_path=fp,
+                content_hash=f"{name}_hash",
+            ),
+        ]
+        await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    import_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.App",
+            rel_type=RelType.IMPORTS,
+            to_name="System.Collections.Generic",
+        ),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    internal = await graph_client.execute(
+        f"MATCH (:{NodeLabel.MODULE} {{uid: $u}})-[:{RelType.IMPORTS}]->(m:{NodeLabel.MODULE}) RETURN m.name AS name",
+        {"u": f"{project}:src.App"},
+    )
+    assert internal == []
+
+    ext = await graph_client.execute(
+        f"MATCH (:{NodeLabel.MODULE} {{uid: $u}})-[:{RelType.IMPORTS}]->(s:{NodeLabel.EXTERNAL_SYMBOL}) "
+        "RETURN s.qualified_name AS qn",
+        {"u": f"{project}:src.App"},
+    )
+    assert [r["qn"] for r in ext] == ["ext/System.Collections.Generic"]
+
+
+async def test_resolve_imports_from_package_node(graph_client: GraphClient):
+    """IMPORTS edges from __init__.py (Package-labeled) source nodes are created."""
+    await graph_client.ensure_schema()
+
+    project = "imp_pkg"
+    pkg_entity = ParsedEntity(
+        name="pkg",
+        qualified_name=f"{project}:pkg",
+        label=NodeLabel.PACKAGE,
+        kind="package",
+        line_start=1,
+        line_end=2,
+        file_path="pkg/__init__.py",
+        content_hash="p_hash",
+    )
+    await graph_client.upsert_file_entities(project, "pkg/__init__.py", [pkg_entity], [])
+
+    for mod_name in ("mod", "types"):
+        entities = [
+            ParsedEntity(
+                name=mod_name,
+                qualified_name=f"{project}:pkg.{mod_name}",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=5,
+                file_path=f"pkg/{mod_name}.py",
+                content_hash=f"{mod_name}_hash",
+            ),
+        ]
+        await graph_client.upsert_file_entities(project, f"pkg/{mod_name}.py", entities, [])
+
+    import_rels = [
+        ParsedRelationship(from_qualified_name=f"{project}:pkg", rel_type=RelType.IMPORTS, to_name="pkg.mod"),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:pkg",
+            rel_type=RelType.IMPORTS,
+            to_name="pkg.types",
+            properties={"type_only": True},
+        ),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    normal = await graph_client.execute(
+        f"MATCH (p:{NodeLabel.PACKAGE} {{uid: $u}})-[:{RelType.IMPORTS}]->(m:{NodeLabel.MODULE} {{name: 'mod'}}) "
+        "RETURN count(*) AS cnt",
+        {"u": f"{project}:pkg"},
+    )
+    assert normal[0]["cnt"] == 1
+
+    type_only = await graph_client.execute(
+        f"MATCH (p:{NodeLabel.PACKAGE} {{uid: $u}})-[e:{RelType.IMPORTS}]->(m:{NodeLabel.MODULE} {{name: 'types'}}) "
+        "RETURN e.type_only AS to",
+        {"u": f"{project}:pkg"},
+    )
+    assert len(type_only) == 1
+    assert type_only[0]["to"] is True
+
+
+async def test_src_layout_end_to_end_import_resolution(graph_client: GraphClient):
+    """Full src-layout chain: parse → upsert → resolve produces internal Package→Callable IMPORTS."""
+    await graph_client.ensure_schema()
+
+    project = "imp_srclayout"
+    parsed_init = parse_file("src/mypkg/__init__.py", b"from .util import helper\n", project)
+    parsed_util = parse_file("src/mypkg/util.py", b"def helper():\n    return 1\n", project)
+    assert parsed_init is not None
+    assert parsed_util is not None
+
+    import_rels = [r for r in parsed_init.relationships if r.rel_type == RelType.IMPORTS]
+    assert import_rels, "parser should emit an IMPORTS rel for the relative import"
+
+    await graph_client.upsert_file_entities(
+        project, "src/mypkg/__init__.py", parsed_init.entities, parsed_init.relationships
+    )
+    await graph_client.upsert_file_entities(
+        project, "src/mypkg/util.py", parsed_util.entities, parsed_util.relationships
+    )
+
+    await graph_client.resolve_imports(project, import_rels)
+
+    imports = await graph_client.execute(
+        f"MATCH (p:{NodeLabel.PACKAGE} {{project_name: $proj, name: 'mypkg'}})-[:{RelType.IMPORTS}]->"
+        f"(c:{NodeLabel.CALLABLE}) RETURN c.name AS name",
+        {"proj": project},
+    )
+    assert len(imports) == 1
+    assert imports[0]["name"] == "helper"
+
+    ext = await graph_client.execute(
+        f"MATCH (n {{project_name: $proj}}) "
+        f"WHERE n:{NodeLabel.EXTERNAL_PACKAGE} OR n:{NodeLabel.EXTERNAL_SYMBOL} RETURN n",
+        {"proj": project},
+    )
+    assert len(ext) == 0
+
+
+# ---------------------------------------------------------------------------
+# Cross-project import resolution
+# ---------------------------------------------------------------------------
+
+
+async def test_cross_project_resolution_rewires_all_symbols(graph_client: GraphClient):
+    """Cross-project resolution rewires EVERY matched symbol, not just one row per query."""
+    await graph_client.ensure_schema()
+
+    proj_app, proj_lib = "xp_app", "xp_lib"
+
+    # Project A: module importing two symbols from libpkg
+    fp_app = "src/app.py"
+    app_entities, app_uid = _setup_module_node(proj_app, fp_app)
+    await graph_client.upsert_file_entities(proj_app, fp_app, app_entities, [])
+    import_rels = [
+        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="libpkg.func_one"),
+        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="libpkg.func_two"),
+    ]
+    await graph_client.resolve_imports(proj_app, import_rels)
+
+    # Project B: the real libpkg package with both callables
+    await graph_client.merge_package_node(proj_lib, "libpkg", "libpkg", "libpkg/__init__.py")
+    lib_entities = [
+        ParsedEntity(
+            name="mod",
+            qualified_name=f"{proj_lib}:libpkg.mod",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path="libpkg/mod.py",
+            content_hash="m",
+        ),
+        ParsedEntity(
+            name="func_one",
+            qualified_name=f"{proj_lib}:libpkg.mod.func_one",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=1,
+            line_end=2,
+            file_path="libpkg/mod.py",
+            content_hash="f1",
+        ),
+        ParsedEntity(
+            name="func_two",
+            qualified_name=f"{proj_lib}:libpkg.mod.func_two",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=4,
+            line_end=5,
+            file_path="libpkg/mod.py",
+            content_hash="f2",
+        ),
+    ]
+    await graph_client.upsert_file_entities(proj_lib, "libpkg/mod.py", lib_entities, [])
+
+    rewired = await graph_client.resolve_cross_project_imports([proj_app, proj_lib])
+    assert rewired == 2
+
+    edges = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE} {{project_name: $a}})-[:{RelType.IMPORTS}]->"
+        f"(c:{NodeLabel.CALLABLE} {{project_name: $b}}) "
+        "RETURN c.name AS name ORDER BY c.name",
+        {"a": proj_app, "b": proj_lib},
+    )
+    assert [e["name"] for e in edges] == ["func_one", "func_two"]
+
+    stubs = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: $a}}) RETURN n",
+        {"a": proj_app},
+    )
+    assert len(stubs) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1470,6 +1913,587 @@ async def test_resolve_calls_deduplication(graph_client: GraphClient):
 
 
 # ---------------------------------------------------------------------------
+# IMPLEMENTS resolution (bare names vs uids)
+# ---------------------------------------------------------------------------
+
+
+async def _count_implements(graph_client: GraphClient, project: str, impl_name: str, iface_name: str) -> int:
+    """Count (:TypeDef {impl_name})-[:IMPLEMENTS]->(:TypeDef {iface_name}) edges in *project*."""
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.TYPE_DEF} {{project_name: $p, name: $impl}})-[:{RelType.IMPLEMENTS}]->"
+        f"(b:{NodeLabel.TYPE_DEF} {{project_name: $p, name: $iface}}) RETURN count(*) AS cnt",
+        {"p": project, "impl": impl_name, "iface": iface_name},
+    )
+    return records[0]["cnt"]
+
+
+async def test_implements_bare_name_resolved(graph_client: GraphClient):
+    """Parser-emitted bare-name IMPLEMENTS resolves to the same-project TypeDef by name."""
+    await graph_client.ensure_schema()
+
+    project = "impl_bare"
+    fp = "src/log.py"
+    entities = [
+        _make_entity(project, "Logger", fp, label=NodeLabel.TYPE_DEF, kind="interface", content_hash="ifc"),
+        _make_entity(
+            project,
+            "FileLogger",
+            fp,
+            label=NodeLabel.TYPE_DEF,
+            kind="class",
+            line_start=6,
+            line_end=10,
+            content_hash="cls",
+        ),
+    ]
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.log.FileLogger",
+            rel_type=RelType.IMPLEMENTS,
+            to_name="Logger",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities, rels)
+
+    assert await _count_implements(graph_client, project, "FileLogger", "Logger") == 1
+
+
+async def test_implements_bare_name_cross_file(graph_client: GraphClient):
+    """IMPLEMENTS resolves across files — the interface lives in another module."""
+    await graph_client.ensure_schema()
+
+    project = "impl_xfile"
+    iface = _make_entity(
+        project, "Logger", "src/contracts.py", label=NodeLabel.TYPE_DEF, kind="interface", content_hash="i"
+    )
+    await graph_client.upsert_file_entities(project, "src/contracts.py", [iface], [])
+
+    impl = _make_entity(
+        project, "FileLogger", "src/service.py", label=NodeLabel.TYPE_DEF, kind="class", content_hash="c"
+    )
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.service.FileLogger",
+            rel_type=RelType.IMPLEMENTS,
+            to_name="Logger",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, "src/service.py", [impl], rels)
+
+    assert await _count_implements(graph_client, project, "FileLogger", "Logger") == 1
+
+
+async def test_implements_ambiguous_name_fans_out(graph_client: GraphClient):
+    """Ambiguous names fan out to all same-project matches; other projects get no edge."""
+    await graph_client.ensure_schema()
+
+    project = "impl_fan"
+    for fp in ("src/log_a.py", "src/log_b.py"):
+        iface = _make_entity(project, "Logger", fp, label=NodeLabel.TYPE_DEF, kind="interface", content_hash=f"i_{fp}")
+        await graph_client.upsert_file_entities(project, fp, [iface], [])
+
+    # Same-named TypeDef in a DIFFERENT project must not receive an edge
+    other = "impl_fan_other"
+    other_iface = _make_entity(
+        other, "Logger", "src/log.py", label=NodeLabel.TYPE_DEF, kind="interface", content_hash="oi"
+    )
+    await graph_client.upsert_file_entities(other, "src/log.py", [other_iface], [])
+
+    impl = _make_entity(project, "FileLogger", "src/svc.py", label=NodeLabel.TYPE_DEF, kind="class", content_hash="c")
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.svc.FileLogger",
+            rel_type=RelType.IMPLEMENTS,
+            to_name="Logger",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, "src/svc.py", [impl], rels)
+
+    assert await _count_implements(graph_client, project, "FileLogger", "Logger") == 2
+
+    cross = await graph_client.execute(
+        f"MATCH (:{NodeLabel.TYPE_DEF} {{project_name: $p}})-[:{RelType.IMPLEMENTS}]->"
+        f"(b:{NodeLabel.TYPE_DEF} {{project_name: $o}}) RETURN count(*) AS cnt",
+        {"p": project, "o": other},
+    )
+    assert cross[0]["cnt"] == 0
+
+
+async def test_implements_unresolved_name_no_edge_no_error(graph_client: GraphClient):
+    """Behavior pin: unresolvable interface names (external/stdlib) silently create no edge."""
+    await graph_client.ensure_schema()
+
+    project = "impl_unres"
+    impl = _make_entity(project, "Task", "src/task.py", label=NodeLabel.TYPE_DEF, kind="class", content_hash="t")
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.task.Task",
+            rel_type=RelType.IMPLEMENTS,
+            to_name="Runnable",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, "src/task.py", [impl], rels)
+
+    records = await graph_client.execute(f"MATCH ()-[r:{RelType.IMPLEMENTS}]->() RETURN count(r) AS cnt")
+    assert records[0]["cnt"] == 0
+
+
+async def test_implements_uid_shape_detector_path_unbroken(graph_client: GraphClient):
+    """uid-shaped IMPLEMENTS (detector-emitted, Callable→Callable) still flows through the uid path."""
+    await graph_client.ensure_schema()
+
+    project = "impl_uid"
+    base = ParsedEntity(
+        name="save",
+        qualified_name=f"{project}:src.base.Base.save",
+        label=NodeLabel.CALLABLE,
+        kind="method",
+        line_start=2,
+        line_end=4,
+        file_path="src/base.py",
+        content_hash="b",
+    )
+    await graph_client.upsert_file_entities(project, "src/base.py", [base], [])
+
+    child = ParsedEntity(
+        name="save",
+        qualified_name=f"{project}:src.app.Child.save",
+        label=NodeLabel.CALLABLE,
+        kind="method",
+        line_start=2,
+        line_end=4,
+        file_path="src/app.py",
+        content_hash="c",
+    )
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.app.Child.save",
+            rel_type=RelType.IMPLEMENTS,
+            to_name=f"{project}:src.base.Base.save",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, "src/app.py", [child], rels)
+
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE} {{uid: $c}})-[:{RelType.IMPLEMENTS}]->(b:{NodeLabel.CALLABLE} {{uid: $b}}) "
+        "RETURN count(*) AS cnt",
+        {"c": f"{project}:src.app.Child.save", "b": f"{project}:src.base.Base.save"},
+    )
+    assert records[0]["cnt"] == 1
+
+
+async def _parse_upsert_count_implements(
+    graph_client: GraphClient,
+    project: str,
+    path: str,
+    source: bytes,
+    impl_name: str,
+    iface_name: str,
+) -> int:
+    """Parse a real source file, upsert it, and count the resulting IMPLEMENTS edges."""
+    parsed = parse_file(path, source, project)
+    assert parsed is not None
+    await graph_client.upsert_file_entities(project, path, parsed.entities, parsed.relationships)
+    return await _count_implements(graph_client, project, impl_name, iface_name)
+
+
+async def test_implements_e2e_typescript(graph_client: GraphClient):
+    pytest.importorskip("tree_sitter_typescript")
+    await graph_client.ensure_schema()
+    cnt = await _parse_upsert_count_implements(
+        graph_client,
+        "impl_e2e_ts",
+        "src/logger.ts",
+        b"interface Logger { log(msg: string): void }\nclass FileLogger implements Logger { log(msg: string) {} }\n",
+        "FileLogger",
+        "Logger",
+    )
+    assert cnt == 1
+
+
+async def test_implements_e2e_java(graph_client: GraphClient):
+    pytest.importorskip("tree_sitter_java")
+    await graph_client.ensure_schema()
+    cnt = await _parse_upsert_count_implements(
+        graph_client,
+        "impl_e2e_java",
+        "src/Example.java",
+        b"interface PaymentHandler {}\npublic class OrderService implements PaymentHandler {}\n",
+        "OrderService",
+        "PaymentHandler",
+    )
+    assert cnt == 1
+
+
+async def test_implements_e2e_csharp(graph_client: GraphClient):
+    pytest.importorskip("tree_sitter_c_sharp")
+    await graph_client.ensure_schema()
+    cnt = await _parse_upsert_count_implements(
+        graph_client,
+        "impl_e2e_cs",
+        "src/Example.cs",
+        b"public interface IStore {}\npublic class Store : IStore {}\n",
+        "Store",
+        "IStore",
+    )
+    assert cnt == 1
+
+
+async def test_implements_e2e_php(graph_client: GraphClient):
+    pytest.importorskip("tree_sitter_php")
+    await graph_client.ensure_schema()
+    cnt = await _parse_upsert_count_implements(
+        graph_client,
+        "impl_e2e_php",
+        "src/example.php",
+        b"<?php\ninterface Cacheable {}\nclass User implements Cacheable {}\n",
+        "User",
+        "Cacheable",
+    )
+    assert cnt == 1
+
+
+async def test_implements_e2e_rust(graph_client: GraphClient):
+    pytest.importorskip("tree_sitter_rust")
+    await graph_client.ensure_schema()
+    cnt = await _parse_upsert_count_implements(
+        graph_client,
+        "impl_e2e_rust",
+        "src/example.rs",
+        b"struct Foo;\ntrait Bar {}\nimpl Bar for Foo {}\n",
+        "Foo",
+        "Bar",
+    )
+    assert cnt == 1
+
+
+# ---------------------------------------------------------------------------
+# Member DEFINES resolution (cross-file parent types)
+# ---------------------------------------------------------------------------
+
+
+def _module_entity(project: str, module_qn: str, fp: str) -> ParsedEntity:
+    """Helper: a Module entity for member-DEFINES tests."""
+    return ParsedEntity(
+        name=module_qn.rsplit(".", 1)[-1],
+        qualified_name=f"{project}:{module_qn}",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=20,
+        file_path=fp,
+        content_hash=f"mod_{module_qn}",
+    )
+
+
+def _typedef_entity(project: str, module_qn: str, name: str, fp: str) -> ParsedEntity:
+    """Helper: a TypeDef entity for member-DEFINES tests."""
+    return ParsedEntity(
+        name=name,
+        qualified_name=f"{project}:{module_qn}.{name}",
+        label=NodeLabel.TYPE_DEF,
+        kind="struct",
+        line_start=2,
+        line_end=5,
+        file_path=fp,
+        content_hash=f"td_{module_qn}.{name}",
+    )
+
+
+def _method_entity(project: str, qualified_name: str, name: str, fp: str) -> ParsedEntity:
+    """Helper: a method Callable entity for member-DEFINES tests."""
+    return ParsedEntity(
+        name=name,
+        qualified_name=qualified_name,
+        label=NodeLabel.CALLABLE,
+        kind="method",
+        line_start=3,
+        line_end=8,
+        file_path=fp,
+        content_hash=f"c_{qualified_name}",
+    )
+
+
+async def test_resolve_member_defines_cross_file(graph_client: GraphClient):
+    """A Go-style method attaches to its receiver TypeDef declared in another same-package file."""
+    await graph_client.ensure_schema()
+
+    project = "member_x"
+
+    server_entities = [
+        _module_entity(project, "pkg.server", "pkg/server.go"),
+        _typedef_entity(project, "pkg.server", "Server", "pkg/server.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/server.go", server_entities, [])
+
+    member_uid = f"{project}:pkg.routes.Server.Routes"
+    routes_entities = [
+        _module_entity(project, "pkg.routes", "pkg/routes.go"),
+        _method_entity(project, member_uid, "Routes", "pkg/routes.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/routes.go", routes_entities, [])
+
+    member_rel = ParsedRelationship(
+        from_qualified_name=f"{project}:pkg.routes",
+        rel_type=RelType.DEFINES,
+        to_name=member_uid,
+        properties={"parent_type_name": "Server", "parent_scope": "package"},
+    )
+    await graph_client.resolve_member_defines(project, [member_rel])
+
+    type_edges = await graph_client.execute(
+        f"MATCH (t:{NodeLabel.TYPE_DEF} {{uid: $t}})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"t": f"{project}:pkg.server.Server", "m": member_uid},
+    )
+    assert type_edges[0]["cnt"] == 1
+
+    module_edges = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"m": member_uid},
+    )
+    assert module_edges[0]["cnt"] == 0
+
+
+async def test_resolve_member_defines_project_wide_unique(graph_client: GraphClient):
+    """C++ header/impl split: a project-wide unique TypeDef wins when no parent_scope restricts it."""
+    await graph_client.ensure_schema()
+
+    project = "member_cpp"
+
+    header_entities = [
+        _module_entity(project, "include.widget", "include/widget.hpp"),
+        _typedef_entity(project, "include.widget", "Widget", "include/widget.hpp"),
+    ]
+    await graph_client.upsert_file_entities(project, "include/widget.hpp", header_entities, [])
+
+    member_uid = f"{project}:src.widget.Widget.draw"
+    impl_entities = [
+        _module_entity(project, "src.widget", "src/widget.cpp"),
+        _method_entity(project, member_uid, "draw", "src/widget.cpp"),
+    ]
+    await graph_client.upsert_file_entities(project, "src/widget.cpp", impl_entities, [])
+
+    member_rel = ParsedRelationship(
+        from_qualified_name=f"{project}:src.widget",
+        rel_type=RelType.DEFINES,
+        to_name=member_uid,
+        properties={"parent_type_name": "Widget"},
+    )
+    await graph_client.resolve_member_defines(project, [member_rel])
+
+    type_edges = await graph_client.execute(
+        f"MATCH (t:{NodeLabel.TYPE_DEF} {{uid: $t}})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"t": f"{project}:include.widget.Widget", "m": member_uid},
+    )
+    assert type_edges[0]["cnt"] == 1
+
+
+async def test_resolve_member_defines_ambiguous_falls_back_to_module(graph_client: GraphClient):
+    """Ambiguous parent names produce a Module fallback edge, never a guessed type edge."""
+    await graph_client.ensure_schema()
+
+    project = "member_amb"
+
+    # Two same-named 'Server' TypeDefs in different directories + a unique 'Router' in a/
+    a_entities = [
+        _module_entity(project, "a.x", "a/x.cpp"),
+        _typedef_entity(project, "a.x", "Server", "a/x.cpp"),
+        _typedef_entity(project, "a.x", "Router", "a/x.cpp"),
+    ]
+    await graph_client.upsert_file_entities(project, "a/x.cpp", a_entities, [])
+    b_entities = [
+        _module_entity(project, "b.y", "b/y.cpp"),
+        _typedef_entity(project, "b.y", "Server", "b/y.cpp"),
+    ]
+    await graph_client.upsert_file_entities(project, "b/y.cpp", b_entities, [])
+
+    member_uid = f"{project}:c.z.Server.draw"
+    member2_uid = f"{project}:c.z.Router.route"
+    c_entities = [
+        _module_entity(project, "c.z", "c/z.cpp"),
+        _method_entity(project, member_uid, "draw", "c/z.cpp"),
+        _method_entity(project, member2_uid, "route", "c/z.cpp"),
+    ]
+    await graph_client.upsert_file_entities(project, "c/z.cpp", c_entities, [])
+
+    rels = [
+        # Ambiguous project-wide (two Servers) — must fall back to the module
+        ParsedRelationship(
+            from_qualified_name=f"{project}:c.z",
+            rel_type=RelType.DEFINES,
+            to_name=member_uid,
+            properties={"parent_type_name": "Server"},
+        ),
+        # Unique project-wide but parent_scope='package' forbids cross-directory guessing
+        ParsedRelationship(
+            from_qualified_name=f"{project}:c.z",
+            rel_type=RelType.DEFINES,
+            to_name=member2_uid,
+            properties={"parent_type_name": "Router", "parent_scope": "package"},
+        ),
+    ]
+    await graph_client.resolve_member_defines(project, rels)
+
+    for uid in (member_uid, member2_uid):
+        type_edges = await graph_client.execute(
+            f"MATCH (:{NodeLabel.TYPE_DEF})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+            {"m": uid},
+        )
+        assert type_edges[0]["cnt"] == 0
+
+        module_edges = await graph_client.execute(
+            f"MATCH (m:{NodeLabel.MODULE} {{uid: $mod}})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+            {"mod": f"{project}:c.z", "m": uid},
+        )
+        assert module_edges[0]["cnt"] == 1
+
+
+async def test_resolve_member_defines_same_dir_wins(graph_client: GraphClient):
+    """The same-directory rung beats project-wide ambiguity (Go package rule)."""
+    await graph_client.ensure_schema()
+
+    project = "member_dir"
+
+    pkg_entities = [
+        _module_entity(project, "pkg.a", "pkg/a.go"),
+        _typedef_entity(project, "pkg.a", "Server", "pkg/a.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/a.go", pkg_entities, [])
+    other_entities = [
+        _module_entity(project, "other.b", "other/b.go"),
+        _typedef_entity(project, "other.b", "Server", "other/b.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "other/b.go", other_entities, [])
+
+    member_uid = f"{project}:pkg.c.Server.Handle"
+    c_entities = [
+        _module_entity(project, "pkg.c", "pkg/c.go"),
+        _method_entity(project, member_uid, "Handle", "pkg/c.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/c.go", c_entities, [])
+
+    member_rel = ParsedRelationship(
+        from_qualified_name=f"{project}:pkg.c",
+        rel_type=RelType.DEFINES,
+        to_name=member_uid,
+        properties={"parent_type_name": "Server", "parent_scope": "package"},
+    )
+    await graph_client.resolve_member_defines(project, [member_rel])
+
+    same_dir = await graph_client.execute(
+        f"MATCH (t:{NodeLabel.TYPE_DEF} {{uid: $t}})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"t": f"{project}:pkg.a.Server", "m": member_uid},
+    )
+    assert same_dir[0]["cnt"] == 1
+
+    other_dir = await graph_client.execute(
+        f"MATCH (t:{NodeLabel.TYPE_DEF} {{uid: $t}})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"t": f"{project}:other.b.Server", "m": member_uid},
+    )
+    assert other_dir[0]["cnt"] == 0
+
+    module_edges = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"m": member_uid},
+    )
+    assert module_edges[0]["cnt"] == 0
+
+
+async def test_member_defines_survives_parent_file_reupsert(graph_client: GraphClient):
+    """Re-upserting the parent type's file must not destroy resolved cross-file member edges."""
+    await graph_client.ensure_schema()
+
+    project = "member_reup"
+
+    server_td = _typedef_entity(project, "pkg.server", "Server", "pkg/server.go")
+    server_entities = [_module_entity(project, "pkg.server", "pkg/server.go"), server_td]
+    server_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:pkg.server",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:pkg.server.Server",
+        )
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/server.go", server_entities, server_rels)
+
+    member_uid = f"{project}:pkg.routes.Server.Routes"
+    routes_entities = [
+        _module_entity(project, "pkg.routes", "pkg/routes.go"),
+        _method_entity(project, member_uid, "Routes", "pkg/routes.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/routes.go", routes_entities, [])
+
+    member_rel = ParsedRelationship(
+        from_qualified_name=f"{project}:pkg.routes",
+        rel_type=RelType.DEFINES,
+        to_name=member_uid,
+        properties={"parent_type_name": "Server", "parent_scope": "package"},
+    )
+    await graph_client.resolve_member_defines(project, [member_rel])
+
+    # Edit server.go (content change) and re-upsert: the file-scoped rel delete
+    # must preserve the cross-file member edge it did not create.
+    server_entities_v2 = [
+        _module_entity(project, "pkg.server", "pkg/server.go"),
+        replace(server_td, content_hash="td_v2"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/server.go", server_entities_v2, server_rels)
+
+    type_edges = await graph_client.execute(
+        f"MATCH (t:{NodeLabel.TYPE_DEF} {{uid: $t}})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"t": f"{project}:pkg.server.Server", "m": member_uid},
+    )
+    assert type_edges[0]["cnt"] == 1
+
+    # The type file's own same-file DEFINES edge is recreated normally
+    own_edges = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE} {{uid: $mod}})-[:{RelType.DEFINES}]->(t {{uid: $t}}) RETURN count(*) AS cnt",
+        {"mod": f"{project}:pkg.server", "t": f"{project}:pkg.server.Server"},
+    )
+    assert own_edges[0]["cnt"] == 1
+
+
+async def test_resolve_member_defines_rerun_replaces_stale_parent(graph_client: GraphClient):
+    """Re-resolution is authoritative: a previously-resolved type edge is dropped on fallback."""
+    await graph_client.ensure_schema()
+
+    project = "member_stale"
+
+    a_entities = [_module_entity(project, "a.x", "a/x.cpp"), _typedef_entity(project, "a.x", "Widget", "a/x.cpp")]
+    await graph_client.upsert_file_entities(project, "a/x.cpp", a_entities, [])
+
+    member_uid = f"{project}:c.z.Widget.draw"
+    c_entities = [_module_entity(project, "c.z", "c/z.cpp"), _method_entity(project, member_uid, "draw", "c/z.cpp")]
+    await graph_client.upsert_file_entities(project, "c/z.cpp", c_entities, [])
+
+    member_rel = ParsedRelationship(
+        from_qualified_name=f"{project}:c.z",
+        rel_type=RelType.DEFINES,
+        to_name=member_uid,
+        properties={"parent_type_name": "Widget"},
+    )
+    # First pass: project-wide unique — resolves to a/x.cpp's Widget
+    await graph_client.resolve_member_defines(project, [member_rel])
+
+    # A second same-named TypeDef appears — re-resolution becomes ambiguous
+    b_entities = [_module_entity(project, "b.y", "b/y.cpp"), _typedef_entity(project, "b.y", "Widget", "b/y.cpp")]
+    await graph_client.upsert_file_entities(project, "b/y.cpp", b_entities, [])
+    await graph_client.resolve_member_defines(project, [member_rel])
+
+    type_edges = await graph_client.execute(
+        f"MATCH (:{NodeLabel.TYPE_DEF})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"m": member_uid},
+    )
+    assert type_edges[0]["cnt"] == 0
+
+    module_edges = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE} {{uid: $mod}})-[:{RelType.DEFINES}]->(c {{uid: $m}}) RETURN count(*) AS cnt",
+        {"mod": f"{project}:c.z", "m": member_uid},
+    )
+    assert module_edges[0]["cnt"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Query timeout
 # ---------------------------------------------------------------------------
 
@@ -1490,3 +2514,48 @@ async def test_execute_write_raises_query_timeout(graph_client: GraphClient):
             await graph_client.execute_write("CREATE (n:_Tmp {x: 1})")
     finally:
         graph_client._write_timeout_s = original
+
+
+# ---------------------------------------------------------------------------
+# Overload uids (S6)
+# ---------------------------------------------------------------------------
+
+
+async def test_upsert_java_overloads_creates_distinct_nodes(graph_client: GraphClient):
+    """S6 e2e: Java overloads survive upsert as distinct Callable nodes.
+
+    Before the parser fix both overloads shared one qualified_name and
+    ``_classify_file``'s qn-keyed dicts collapsed them to a single node.
+    """
+    pytest.importorskip("tree_sitter_java")
+    await graph_client.ensure_schema()
+
+    project = "test_ovl_java"
+    path = "src/Example.java"
+    source = (
+        b"class A {\n"
+        b"    void process(Order o) { helperOne(); }\n"
+        b"    void process(java.util.List<Order> os, String... rest) { helperTwo(); }\n"
+        b"}\n"
+    )
+    parsed = parse_file(path, source, project)
+    assert parsed is not None
+    await graph_client.upsert_file_entities(project, path, parsed.entities, parsed.relationships)
+
+    records = await graph_client.execute(
+        f"MATCH (c:{NodeLabel.CALLABLE} {{project_name: $p, name: 'process'}}) RETURN c.uid AS uid",
+        {"p": project},
+    )
+    uids = {r["uid"] for r in records}
+    assert len(records) == 2
+    assert uids == {
+        f"{project}:src.Example.A.process(Order)",
+        f"{project}:src.Example.A.process(List<Order>,String[])",
+    }
+
+    defines = await graph_client.execute(
+        f"MATCH (:{NodeLabel.TYPE_DEF} {{project_name: $p, name: 'A'}})-[:{RelType.DEFINES}]->"
+        f"(c:{NodeLabel.CALLABLE}) RETURN c.uid AS uid",
+        {"p": project},
+    )
+    assert uids <= {r["uid"] for r in defines}
