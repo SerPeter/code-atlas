@@ -7,18 +7,22 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from code_atlas.events import (
+    EmbedDirty,
+    EntityRef,
     EventBus,
     FileChanged,
     Topic,
     decode_event,
 )
-from code_atlas.indexing.consumers import _MAX_BATCH_FAILURES, ASTConsumer, BatchPolicy
+from code_atlas.indexing.consumers import _MAX_BATCH_FAILURES, ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.indexing.orchestrator import _wait_for_drain
+from code_atlas.search.embeddings import EmbedCache, build_embed_text
 
 if TYPE_CHECKING:
     from code_atlas.events import Event
@@ -776,3 +780,337 @@ async def test_go_cross_file_method_attaches_to_receiver_type(
         {"p": project_name},
     )
     assert rows[0]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Deferred-resolution / hash-write ordering (finding: consumers.py:~694)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_deferred_calls_lost_if_process_dies_before_flush(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """A crash between the file-hash write and the deferred resolution flush
+    must not permanently drop the pending relationship.
+
+    Reindex-mode policy (time_window_s=0) sets resolve_batch_interval=5, so
+    one process_batch call does NOT flush deferred CALLS rels — they sit only
+    in process memory. Before the fix, the file's hash was written
+    unconditionally in that same call; a crash before the (later) flush left
+    the hash gate believing the file unchanged, so a fresh consumer's re-parse
+    of the same event skipped it and the rel was gone forever.
+    """
+    await graph_client.ensure_schema()
+
+    _write_python_file(
+        settings.project_root,
+        "mod.py",
+        "def helper():\n    return 1\n\n\ndef main():\n    return helper()\n",
+    )
+
+    project_name = settings.project_root.resolve().name
+    ev_mod = _file_changed(settings, "mod.py", "created")
+
+    # Reindex-mode policy (time_window_s=0) -> resolve_batch_interval=5: a
+    # batch's deferred rels are NOT flushed within that same call.
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+
+    # Warm-up batch: _last_resolve_time inits to 0.0, and the monotonic clock
+    # (asyncio loop.time()) is NOT epoch-relative, so the very first call's
+    # time-based flush condition is spuriously true regardless of the batch
+    # interval. An empty batch harmlessly "uses up" that spurious flush (there
+    # is nothing pending yet) and resets _last_resolve_time to now.
+    await consumer.process_batch([], "batch-0")
+
+    # Process ONE batch directly — bypasses run()'s guaranteed final-flush
+    # (in its `finally`), which would otherwise mask this exact race.
+    await consumer.process_batch([ev_mod], "batch-1")
+    assert consumer._pending_call_rels  # sanity: the rel is still pending in-memory
+
+    # Simulate a hard crash: drop the instance WITHOUT ever flushing.
+    del consumer
+
+    # "Restart": a fresh consumer instance re-processes the SAME event.
+    c2 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await c2.process_batch([ev_mod], "batch-2")
+    await c2._flush_deferred_resolution()
+
+    rows = await graph_client.execute(
+        "MATCH (a:Callable {project_name: $p, name: 'main'})-[:CALLS]->(b:Callable {name: 'helper'}) "
+        "RETURN count(*) AS n",
+        {"p": project_name},
+    )
+    assert rows[0]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Detector timing (finding: consumers.py:~485)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_same_batch_test_mapping_detector_resolves(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """A TESTS edge resolves even when the subject and its test file land in
+    the SAME batch on a fresh (empty-graph) index.
+
+    Before the fix, TestMappingDetector ran during the parse phase, before
+    this batch's own entities were upserted — its graph lookup for the
+    subject function found nothing (not written yet), so no TESTS edge was
+    ever created for same-batch pairs.
+    """
+    await graph_client.ensure_schema()
+
+    _write_python_file(settings.project_root, "sub.py", "def subject():\n    return 1\n")
+    _write_python_file(settings.project_root, "test_sub.py", "def test_subject():\n    pass\n")
+
+    # Publish both BEFORE starting the consumer so a single read_batch picks
+    # up both messages together — i.e. they land in ONE process_batch call.
+    await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, "sub.py", "created"))
+    await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, "test_sub.py", "created"))
+
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    task = asyncio.create_task(consumer.run())
+    try:
+        await _wait_until(lambda: consumer.stats.files_processed >= 2, timeout_s=10.0)
+    finally:
+        consumer.stop()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    project_name = settings.project_root.resolve().name
+    rows = await graph_client.execute(
+        "MATCH (t:Callable {project_name: $p, name: 'test_subject'})-[:TESTS]->(s:Callable {name: 'subject'}) "
+        "RETURN count(*) AS n",
+        {"p": project_name},
+    )
+    assert rows[0]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Unreadable file retry (finding: consumers.py:~560)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_unreadable_file_is_deferred_not_dropped(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient OSError reading a file (Windows lock/AV) defers the event
+    for retry instead of silently ACKing it with only a warning.
+
+    Before the fix the FileChanged message was ACKed after process_batch
+    returned normally, and the change was lost until another edit fired a
+    fresh event for the same file.
+    """
+    await graph_client.ensure_schema()
+
+    _write_python_file(settings.project_root, "locked.py", "L = 1\n")
+    locked_path = (settings.project_root / "locked.py").resolve()
+
+    real_read_bytes = Path.read_bytes
+    fail_count = 0
+
+    def _flaky_read_bytes(self: Path) -> bytes:
+        nonlocal fail_count
+        if self.resolve() == locked_path and fail_count < 1:
+            fail_count += 1
+            raise PermissionError("simulated Windows file lock")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _flaky_read_bytes)
+
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, "locked.py", "created"))
+
+    task = asyncio.create_task(consumer.run())
+    try:
+        await _wait_until(lambda: consumer.stats.files_processed >= 1, timeout_s=10.0)
+    finally:
+        consumer.stop()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    assert fail_count == 1  # the flaky read actually fired once
+    assert consumer.stats.files_processed >= 1
+    assert await _pel_count(event_bus, Topic.FILE_CHANGED, "ast") == 0
+
+    project_name = settings.project_root.resolve().name
+    rows = await graph_client.execute(
+        "MATCH (v:Value {project_name: $p, name: 'L'}) RETURN count(*) AS n",
+        {"p": project_name},
+    )
+    assert rows[0]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Embed-stage lost update (finding: consumers.py:~944)
+# ---------------------------------------------------------------------------
+
+
+class _StallingEmbedClient:
+    """Fake embed client: stalls on texts containing *stall_marker* until released."""
+
+    def __init__(self, stall_marker: str, dimension: int = 8) -> None:
+        self.max_concurrency = 2
+        self.batch_size = 10
+        self._dimension = dimension
+        self._stall_marker = stall_marker
+        self._release = asyncio.Event()
+        self.calls = 0
+
+    def release(self) -> None:
+        self._release.set()
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        if any(self._stall_marker in t for t in texts):
+            await self._release.wait()
+        return [[0.1] * self._dimension for _ in texts]
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_embed_concurrent_workers_no_lost_update(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """A slow worker holding a stale read must not clobber a fresher vector
+    written by a faster, later-dispatched worker for the same entity.
+
+    Before the fix, EmbedDirty dedup only happened within a single batch — a
+    second concurrent worker for the same uid could write a fresher vector
+    while the first (slow) worker was still embedding; that first worker's
+    unconditional write then landed LAST and overwrote the fresher data with
+    stale data (lost update).
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+    uid = f"{project_name}:mod.f"
+
+    # Seed a Callable entity directly — this test targets the embed stage's
+    # own concurrency, not the AST/parsing stage.
+    await graph_client.execute_write(
+        "CREATE (c:Callable {uid: $uid, project_name: $p, qualified_name: 'mod.f', name: 'f', "
+        "kind: 'function', file_path: 'mod.py', signature: 'def f()', docstring: 'v1', source: ''})",
+        {"uid": uid, "p": project_name},
+    )
+
+    embed = _StallingEmbedClient(stall_marker="v1", dimension=graph_client._dimension)
+    consumer = EmbedConsumer(
+        event_bus,
+        graph_client,
+        embed,  # type: ignore[arg-type]
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+        max_concurrency=2,
+    )
+    ref = EntityRef(qualified_name=uid, node_type="Callable", file_path="mod.py")
+
+    task = asyncio.create_task(consumer.run())
+    try:
+        # Batch 1: triggers the slow ("v1") embed — stalls until released.
+        await event_bus.publish(Topic.EMBED_DIRTY, EmbedDirty(entity=ref, significance="HIGH"))
+        await _wait_until(lambda: embed.calls >= 1, timeout_s=5.0)
+
+        # While worker A is stalled mid-embed, the entity changes to v2 and a
+        # second EmbedDirty fires — simulating the AST consumer's real update.
+        await graph_client.execute_write("MATCH (c:Callable {uid: $uid}) SET c.docstring = 'v2'", {"uid": uid})
+        await event_bus.publish(Topic.EMBED_DIRTY, EmbedDirty(entity=ref, significance="HIGH"))
+
+        # Give a second (un-deferred, pre-fix) worker a chance to race ahead
+        # and write v2 while worker A is still stalled.
+        await asyncio.sleep(1.0)
+
+        embed.release()  # unstall worker A — its write (if unguarded) lands now
+        # Let everything settle: worker A's write, plus the deferred retry's
+        # PEL reclaim + re-read (now sees v2) + its own write.
+        await asyncio.sleep(2.0)
+    finally:
+        consumer.stop()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    rows = await graph_client.execute(
+        "MATCH (c:Callable {uid: $uid}) RETURN c.docstring AS d, c.embed_hash AS h",
+        {"uid": uid},
+    )
+    assert rows
+    expected_hash_v2 = EmbedCache.hash_text(
+        build_embed_text(
+            {
+                "_label": "Callable",
+                "qualified_name": "mod.f",
+                "kind": "function",
+                "signature": "def f()",
+                "docstring": "v2",
+                "source": "",
+            }
+        )
+    )
+    assert rows[0]["h"] == expected_hash_v2
+
+
+# ---------------------------------------------------------------------------
+# Embed-stage retry cap (finding: consumers.py:~845 — "infinite PEL retries")
+# ---------------------------------------------------------------------------
+
+
+class _AlwaysFailEmbedConsumer(EmbedConsumer):
+    """Simulates TEI being permanently down — every batch fails."""
+
+    async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:
+        raise RuntimeError("TEI down")
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_embed_poison_capped_not_infinite(event_bus: EventBus, graph_client: GraphClient) -> None:
+    """Embed-stage retries are bounded by the shared poison cap — a
+    permanently failing embed batch (TEI down) does not retry forever.
+
+    This is already fixed as a side effect of wave 1's poison cap, which is
+    shared across AST/Embed stages via TierConsumer.run()'s PEL reclaim loop
+    (no consumers.py change needed for this sub-claim) — asserted here so a
+    future regression on the shared reclaim path is caught.
+    """
+    consumer = _AlwaysFailEmbedConsumer(
+        event_bus,
+        graph_client,
+        None,  # type: ignore[arg-type]  # never touched — process_batch raises before any embed call
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+        max_concurrency=1,
+    )
+    ref = EntityRef(qualified_name="p:mod.f", node_type="Callable", file_path="mod.py")
+    await event_bus.publish(Topic.EMBED_DIRTY, EmbedDirty(entity=ref, significance="HIGH"))
+
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(3.0)
+    consumer.stop()
+    await asyncio.wait_for(task, timeout=10.0)
+
+    assert await _pel_count(event_bus, Topic.EMBED_DIRTY, "embed") == 0

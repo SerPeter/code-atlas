@@ -30,8 +30,8 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
-from code_atlas.parsing.detectors import PropertyEnrichment, get_enabled_detectors, run_detectors
+from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, parse_file
+from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, run_detectors
 from code_atlas.schema import RelType
 from code_atlas.search.embeddings import EmbedCache, build_embed_text
 from code_atlas.settings import derive_project_name
@@ -393,27 +393,34 @@ class ASTStats:
 
 @dataclass(frozen=True)
 class _ParsedFileData:
-    """Parse + detect results for a single file, ready for batched graph write."""
+    """Parse results for a single file, ready for batched graph write.
+
+    ``parsed_file`` retains the raw tree-sitter parse so graph-querying
+    detectors can run in a SECOND pass, after this batch's entities are
+    upserted (see process_batch) — running them during parsing (before any
+    entity in the batch exists in the graph) silently drops TESTS/OVERRIDES/
+    INJECTED_INTO edges for same-batch subject/reference pairs.
+    """
 
     file_path: str
+    parsed_file: ParsedFile
     entities: list[ParsedEntity]
     non_import_rels: list[ParsedRelationship]
     import_rels: list[ParsedRelationship]
     call_rels: list[ParsedRelationship]
     type_rels: list[ParsedRelationship]
     member_rels: list[ParsedRelationship]
-    enrichments: list[PropertyEnrichment]
 
 
 _SENTINEL_DELETED = _ParsedFileData(
     file_path="",
+    parsed_file=ParsedFile(file_path="", language="", entities=[], relationships=[]),
     entities=[],
     non_import_rels=[],
     import_rels=[],
     call_rels=[],
     type_rels=[],
     member_rels=[],
-    enrichments=[],
 )
 
 
@@ -464,6 +471,12 @@ class ASTConsumer(TierConsumer):
         self._pending_member_rels: list[ParsedRelationship] = []
         self._pending_project_names: set[str] = set()
 
+        # File hashes withheld from the graph until their batch's deferred
+        # IMPORTS/CALLS/USES_TYPE/member-DEFINES rels are actually resolved —
+        # writing the hash any earlier would make a crash before that point
+        # permanently unrecoverable (hash gate would skip the file forever).
+        self._pending_file_hashes: dict[str, dict[str, str]] = {}  # project_name -> {file_path: hash}
+
     async def run(self) -> None:
         try:
             await super().run()
@@ -505,6 +518,15 @@ class ASTConsumer(TierConsumer):
                         project_name, proj_members, lookup=shared_lookup, name_to_typedefs=td_map
                     )
 
+            # Only now — after this project's deferred rels are actually
+            # resolved — persist the file hashes withheld in process_batch.
+            # A crash before this point leaves the stored hash unset, so the
+            # hash gate reprocesses the file (and regenerates the rels) on
+            # the next run instead of silently skipping it forever.
+            pending_hashes = self._pending_file_hashes.pop(project_name, None)
+            if pending_hashes:
+                await self.graph.set_batch_file_hashes(project_name, pending_hashes)
+
         self._pending_import_rels.clear()
         self._pending_call_rels.clear()
         self._pending_type_rels.clear()
@@ -521,10 +543,15 @@ class ASTConsumer(TierConsumer):
         project_root: Path | None = None,
         source: bytes | None = None,
     ) -> _ParsedFileData | None:
-        """Parse and detect a single file without graph writes.
+        """Parse a single file (pure tree-sitter parse; no graph queries, no graph writes).
 
         Returns ``None`` for unreadable/unsupported files, ``_SENTINEL_DELETED``
         for deleted files, or a ``_ParsedFileData`` with parsed results.
+
+        Graph-querying detectors are NOT run here — they run in process_batch,
+        AFTER this batch's entities are upserted, so same-batch cross-file
+        targets (TESTS/OVERRIDES/INJECTED_INTO) are resolvable instead of
+        silently missing.
 
         If *source* is provided, it is used directly (avoids re-reading from disk
         when the hash gate has already read the file).
@@ -545,9 +572,6 @@ class ASTConsumer(TierConsumer):
             logger.debug("AST: unsupported language for {}", file_path)
             return None
 
-        det_result = await run_detectors(self._detectors, parsed, project_name, self.graph)
-        all_rels = parsed.relationships + det_result.relationships
-
         _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE}
 
         def _is_member(r: ParsedRelationship) -> bool:
@@ -557,13 +581,13 @@ class ASTConsumer(TierConsumer):
 
         return _ParsedFileData(
             file_path=file_path,
+            parsed_file=parsed,
             entities=parsed.entities,
-            non_import_rels=[r for r in all_rels if r.rel_type not in _deferred and not _is_member(r)],
-            import_rels=[r for r in all_rels if r.rel_type == RelType.IMPORTS],
-            call_rels=[r for r in all_rels if r.rel_type == RelType.CALLS],
-            type_rels=[r for r in all_rels if r.rel_type == RelType.USES_TYPE],
-            member_rels=[r for r in all_rels if _is_member(r)],
-            enrichments=det_result.enrichments,
+            non_import_rels=[r for r in parsed.relationships if r.rel_type not in _deferred and not _is_member(r)],
+            import_rels=[r for r in parsed.relationships if r.rel_type == RelType.IMPORTS],
+            call_rels=[r for r in parsed.relationships if r.rel_type == RelType.CALLS],
+            type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
+            member_rels=[r for r in parsed.relationships if _is_member(r)],
         )
 
     async def process_batch(self, events: list[Event], batch_id: str) -> set[str]:  # noqa: PLR0912, PLR0915
@@ -625,6 +649,7 @@ class ASTConsumer(TierConsumer):
 
                 # Separate deleted files (always process) and read live files
                 live_paths: list[str] = []
+                unreadable_paths: list[str] = []
                 for fp in unique_paths:
                     full_path = root / fp
                     if not full_path.is_file():
@@ -634,7 +659,16 @@ class ASTConsumer(TierConsumer):
                             file_sources[fp] = full_path.read_bytes()
                             live_paths.append(fp)
                         except OSError:
-                            logger.warning("AST: cannot read {}", fp)
+                            # Transient (editor/AV/indexer lock, sharing violation
+                            # mid-save) — defer instead of dropping so the PEL
+                            # retries it, rather than losing the change silently.
+                            logger.warning("AST: cannot read {}, deferring for retry", fp)
+                            unreadable_paths.append(fp)
+
+                if unreadable_paths:
+                    for fp in unreadable_paths:
+                        deferred_keys.add(f"{event_project_name}:{fp}")
+                    self.stats.files_deferred += len(unreadable_paths)
 
                 # Apply hash gate to live files
                 if use_hash_gate and live_paths:
@@ -689,15 +723,39 @@ class ASTConsumer(TierConsumer):
                     if deleted:
                         batch_max_sig = Significance.HIGH
 
-                # 3. Batched upsert (2 managed transactions)
+                # 3. Batched upsert (2 managed transactions) — entities + parser-only
+                #    rels. Graph-querying detectors run AFTER this write (step 3.5)
+                #    so this batch's own entities are visible for same-batch
+                #    cross-file matches (TESTS/OVERRIDES/INJECTED_INTO would
+                #    otherwise silently miss subjects added in the same batch).
                 if parsed_files:
                     file_data = {fp: (pfd.entities, pfd.non_import_rels) for fp, pfd in parsed_files.items()}
                     results = await self.graph.upsert_batch_entities(project_name, file_data)
 
+                    # 3.5. Graph-querying detectors, now that this batch's entities exist.
+                    det_results: dict[str, DetectorResult] = {}
+                    if self._detectors:
+                        for fp, pfd in parsed_files.items():
+                            det_result = await run_detectors(self._detectors, pfd.parsed_file, project_name, self.graph)
+                            if det_result.relationships or det_result.enrichments:
+                                det_results[fp] = det_result
+
                     # 4. Batched enrichments
-                    all_enrichments = [e for pfd in parsed_files.values() for e in pfd.enrichments]
+                    all_enrichments = [e for det in det_results.values() for e in det.enrichments]
                     if all_enrichments:
                         await self.graph.apply_property_enrichments(all_enrichments)
+
+                    # 4b. Re-write relationships for files with new detector-emitted
+                    #     rels — merged with the original parser rels, since TX2
+                    #     deletes then recreates each file's rel set (a partial
+                    #     rewrite would drop the parser rels just written in step 3).
+                    det_rel_files = {fp: det.relationships for fp, det in det_results.items() if det.relationships}
+                    if det_rel_files:
+                        second_file_data = {
+                            fp: (parsed_files[fp].entities, parsed_files[fp].non_import_rels + rels)
+                            for fp, rels in det_rel_files.items()
+                        }
+                        await self.graph.upsert_batch_entities(project_name, second_file_data)
 
                     # 5. Accumulate stats + entity refs from per-file results
                     for fp, pfd in parsed_files.items():
@@ -763,11 +821,24 @@ class ASTConsumer(TierConsumer):
                                     text_hash = EmbedCache.hash_text(text)
                                     embed_candidates[entity.qualified_name] = (ref, text_hash)
 
-                # 6. Write back file hashes for processed files
+                # 6. Write back file hashes for processed files — immediately for
+                #    files with nothing deferred; withheld for files whose parse
+                #    produced IMPORTS/CALLS/USES_TYPE/member-DEFINES rels, until
+                #    those are actually resolved in _flush_deferred_resolution.
+                #    Writing the hash any earlier would let a crash between this
+                #    write and that (possibly much later) flush permanently drop
+                #    the rels — the hash gate would then skip the file forever.
                 if new_hashes:
-                    hashes_to_write = {fp: new_hashes[fp] for fp in parsed_files if fp in new_hashes}
-                    if hashes_to_write:
-                        await self.graph.set_batch_file_hashes(project_name, hashes_to_write)
+                    immediate_hashes: dict[str, str] = {}
+                    for fp, pfd in parsed_files.items():
+                        if fp not in new_hashes:
+                            continue
+                        if pfd.import_rels or pfd.call_rels or pfd.type_rels or pfd.member_rels:
+                            self._pending_file_hashes.setdefault(project_name, {})[fp] = new_hashes[fp]
+                        else:
+                            immediate_hashes[fp] = new_hashes[fp]
+                    if immediate_hashes:
+                        await self.graph.set_batch_file_hashes(project_name, immediate_hashes)
 
                 # 7. Accumulate rels for deferred resolution
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
@@ -880,6 +951,14 @@ class EmbedConsumer(TierConsumer):
         self._inflight: set[asyncio.Task[None]] = set()
         self._write_lock = asyncio.Lock()
 
+        # Uids currently being read+embedded+written by an in-flight worker.
+        # A second concurrently-dispatched batch for the SAME uid is deferred
+        # (not processed) until the first worker releases it — otherwise a
+        # slow worker holding a stale read can finish writing AFTER a faster,
+        # later-dispatched worker already wrote a newer vector/hash for the
+        # same entity, silently clobbering it with stale data (lost update).
+        self._inflight_uids: set[str] = set()
+
     def dedup_key(self, event: Event) -> str:
         if isinstance(event, EmbedDirty):
             return event.entity.qualified_name
@@ -956,88 +1035,101 @@ class EmbedConsumer(TierConsumer):
             await self.cache.put_many([(th, vec) for _, vec, th in result])
         return result
 
-    async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:
-        with _tracer.start_as_current_span("embed.process_batch", attributes={"batch_id": batch_id}) as span:
-            # Collect and deduplicate entities across all events in the batch
-            seen: dict[str, EntityRef] = {}
-            for e in events:
-                if isinstance(e, EmbedDirty):
-                    seen[e.entity.qualified_name] = e.entity
+    async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:  # noqa: PLR0915
+        # Collect and deduplicate entities across all events in the batch
+        seen: dict[str, EntityRef] = {}
+        for e in events:
+            if isinstance(e, EmbedDirty):
+                seen[e.entity.qualified_name] = e.entity
 
-            entities = list(seen.values())
-            logger.debug("Embed batch {}: {} unique entity(ies)", batch_id, len(entities))
+        # Defer any uid already claimed by another in-flight worker (see
+        # __init__ docstring for _inflight_uids) — the dedup key for EmbedDirty
+        # IS the qualified_name, so this set is returned as-is for the PEL to
+        # retain and redeliver once the earlier worker releases the claim.
+        deferred: set[str] = {uid for uid in seen if uid in self._inflight_uids}
+        entities = [ref for uid, ref in seen.items() if uid not in deferred]
+        claimed = [uid for uid in seen if uid not in deferred]
+        self._inflight_uids.update(claimed)
 
-            if not entities:
-                return
+        try:
+            with _tracer.start_as_current_span("embed.process_batch", attributes={"batch_id": batch_id}) as span:
+                logger.debug("Embed batch {}: {} unique entity(ies)", batch_id, len(entities))
 
-            t0 = asyncio.get_event_loop().time()
+                if not entities:
+                    return deferred or None
 
-            # 1. Read entity properties from graph (includes embed_hash + embedding)
-            #    Pass labels so queries use per-label indices instead of full scans.
-            qns = [e.qualified_name for e in entities]
-            entity_labels = [e.node_type for e in entities]
-            entity_props = await self.graph.read_entity_texts(qns, labels=entity_labels)
+                t0 = asyncio.get_event_loop().time()
 
-            # 2. Build embed texts — graph-check for unchanged content
-            to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
-            uid_to_label: dict[str, str] = {}
-            graph_hits = 0
-            for props in entity_props:
-                text = build_embed_text(props)
-                if not text:
-                    continue
-                uid = props["uid"]
-                text_hash = EmbedCache.hash_text(text)
-                if lbl := props.get("_label"):
-                    uid_to_label[uid] = lbl
-                if props.get("embed_hash") == text_hash and props.get("has_embedding"):
-                    graph_hits += 1
-                else:
-                    to_process.append((uid, text, text_hash))
+                # 1. Read entity properties from graph (includes embed_hash + embedding)
+                #    Pass labels so queries use per-label indices instead of full scans.
+                qns = [e.qualified_name for e in entities]
+                entity_labels = [e.node_type for e in entities]
+                entity_props = await self.graph.read_entity_texts(qns, labels=entity_labels)
 
-            total = graph_hits + len(to_process)
-            if not to_process:
+                # 2. Build embed texts — graph-check for unchanged content
+                to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
+                uid_to_label: dict[str, str] = {}
+                graph_hits = 0
+                for props in entity_props:
+                    text = build_embed_text(props)
+                    if not text:
+                        continue
+                    uid = props["uid"]
+                    text_hash = EmbedCache.hash_text(text)
+                    if lbl := props.get("_label"):
+                        uid_to_label[uid] = lbl
+                    if props.get("embed_hash") == text_hash and props.get("has_embedding"):
+                        graph_hits += 1
+                    else:
+                        to_process.append((uid, text, text_hash))
+
+                total = graph_hits + len(to_process)
+                if not to_process:
+                    elapsed = asyncio.get_event_loop().time() - t0
+                    logger.debug(
+                        "Embed batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
+                        batch_id,
+                        total,
+                        graph_hits,
+                        elapsed,
+                    )
+                    return deferred or None
+
+                # 3. Valkey cache check → 4. API call for misses
+                cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
+                api_vectors = await self._embed_and_store(need_embed)
+
+                # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
+                #    Serialized via _write_lock to avoid Memgraph write-lock contention.
+                all_resolved = cache_resolved + api_vectors
+                if all_resolved:
+                    with _tracer.start_as_current_span("embed.write_lock_wait"):
+                        await self._write_lock.acquire()
+                    try:
+                        with _tracer.start_as_current_span("embed.write_embeddings"):
+                            write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
+                            await self.graph.write_embeddings_and_hashes(all_resolved, labels=write_labels)
+                    finally:
+                        self._write_lock.release()
+
                 elapsed = asyncio.get_event_loop().time() - t0
+                span.set_attribute("entities_count", total)
+                span.set_attribute("graph_hits", graph_hits)
+                span.set_attribute("cache_hits", cache_hits)
+                span.set_attribute("api_embedded", len(api_vectors))
+
+                get_metrics().embedding_latency.record(elapsed)
+
                 logger.debug(
-                    "Embed batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
+                    "Embed batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
                     batch_id,
                     total,
                     graph_hits,
+                    cache_hits,
+                    len(api_vectors),
                     elapsed,
                 )
-                return
 
-            # 3. Valkey cache check → 4. API call for misses
-            cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
-            api_vectors = await self._embed_and_store(need_embed)
-
-            # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
-            #    Serialized via _write_lock to avoid Memgraph write-lock contention.
-            all_resolved = cache_resolved + api_vectors
-            if all_resolved:
-                with _tracer.start_as_current_span("embed.write_lock_wait"):
-                    await self._write_lock.acquire()
-                try:
-                    with _tracer.start_as_current_span("embed.write_embeddings"):
-                        write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
-                        await self.graph.write_embeddings_and_hashes(all_resolved, labels=write_labels)
-                finally:
-                    self._write_lock.release()
-
-            elapsed = asyncio.get_event_loop().time() - t0
-            span.set_attribute("entities_count", total)
-            span.set_attribute("graph_hits", graph_hits)
-            span.set_attribute("cache_hits", cache_hits)
-            span.set_attribute("api_embedded", len(api_vectors))
-
-            get_metrics().embedding_latency.record(elapsed)
-
-            logger.debug(
-                "Embed batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
-                batch_id,
-                total,
-                graph_hits,
-                cache_hits,
-                len(api_vectors),
-                elapsed,
-            )
+                return deferred or None
+        finally:
+            self._inflight_uids.difference_update(claimed)
