@@ -141,6 +141,11 @@ def _visibility_from_name(name: str) -> str:
     return Visibility.PUBLIC
 
 
+# Matches a Python string literal prefix (r/f/b/u, any case, up to 2 chars,
+# e.g. r/f/b/u/rb/br/rf/fr) when immediately followed by a quote character.
+_STRING_PREFIX_RE = re.compile(r"^[A-Za-z]{1,2}(?=['\"])")
+
+
 def _extract_docstring(node: Node, source: bytes) -> str | None:
     """Extract docstring from the first statement of a function/class body."""
     body = node.child_by_field_name("body")
@@ -151,6 +156,10 @@ def _extract_docstring(node: Node, source: bytes) -> str | None:
             for inner in child.children:
                 if inner.type == "string":
                     raw = source[inner.start_byte : inner.end_byte].decode("utf-8", errors="replace")
+                    # Strip string prefix (r"""/f"""/b""" etc.) before quote matching
+                    prefix_match = _STRING_PREFIX_RE.match(raw)
+                    if prefix_match:
+                        raw = raw[prefix_match.end() :]
                     # Strip triple quotes
                     for q in ('"""', "'''", '"', "'"):
                         if raw.startswith(q) and raw.endswith(q):
@@ -180,43 +189,49 @@ def _extract_signature(node: Node, source: bytes) -> str | None:
 
 
 def _is_inside_class(node: Node) -> str | None:
-    """Check if a node is inside a class body. Returns class name or None."""
+    """Check if a node is inside a class body.
+
+    Returns the dotted path of all enclosing class names (outermost first,
+    e.g. ``"Outer.Middle"`` for a member of ``Outer.Middle.Inner``), or None
+    if not nested in a class.
+    """
+    names: list[str] = []
     parent = node.parent
     while parent is not None:
         if parent.type == "class_definition":
             name_node = parent.child_by_field_name("name")
             if name_node is not None:
-                return node_text(name_node)
+                names.append(node_text(name_node))
         parent = parent.parent
-    return None
+    if not names:
+        return None
+    return ".".join(reversed(names))
 
 
 def _is_async(node: Node) -> bool:
-    """Check if a function_definition is async (has 'async' keyword prefix)."""
+    """Check if a function_definition is async ('async' is its first child).
+
+    This holds regardless of whether the function is decorated — the
+    ``async`` keyword is always the first child of the ``function_definition``
+    node itself in tree-sitter-python's grammar.
+    """
     if node.type != "function_definition":
         return False
-    parent = node.parent
-    if parent is not None and parent.type == "decorated_definition":
-        # Check if decorated def's children include async
-        for child in parent.children:
-            if child.type == "function_definition":
-                # Check preceding sibling
-                prev = child.prev_sibling
-                while prev is not None:
-                    if prev.type == "async":
-                        return True
-                    prev = prev.prev_sibling
-                break
-    # Direct check: look for async keyword before the 'def' keyword
-    prev = node.prev_sibling
-    while prev is not None:
-        if prev.type == "async":
-            return True
-        prev = prev.prev_sibling
-    # Also check within the node text itself
-    first_token = node.children[0] if node.children else None
-    if first_token is not None and first_token.type == "async":
-        return False  # tree-sitter doesn't nest this way, already checked
+    first_child = node.children[0] if node.children else None
+    return first_child is not None and first_child.type == "async"
+
+
+def _is_type_checking_condition(condition: Node) -> bool:
+    """Check if an `if` condition node refers to TYPE_CHECKING.
+
+    Matches both the bare-identifier form (``if TYPE_CHECKING:``) and the
+    attribute form (``if typing.TYPE_CHECKING:``).
+    """
+    if condition.type == "identifier":
+        return node_text(condition) == "TYPE_CHECKING"
+    if condition.type == "attribute":
+        attr = condition.child_by_field_name("attribute")
+        return attr is not None and node_text(attr) == "TYPE_CHECKING"
     return False
 
 
@@ -352,7 +367,7 @@ def _walk_python_node(
         # Detect `if TYPE_CHECKING:` blocks and recurse with type_only flag
         if child.type == "if_statement":
             condition = child.child_by_field_name("condition")
-            if condition is not None and condition.type == "identifier" and node_text(condition) == "TYPE_CHECKING":
+            if condition is not None and _is_type_checking_condition(condition):
                 body = child.child_by_field_name("consequence")
                 if body is not None:
                     _walk_python_node(
@@ -732,7 +747,10 @@ def _process_assignment(
         class_name = _is_inside_class(node)
         if class_name is not None:
             qn = f"{module_qn}.{class_name}.{name}"
-            kind = ValueKind.ENUM_MEMBER if class_name in enum_classes else ValueKind.FIELD
+            # enum_classes stores bare (undotted) class names — compare against
+            # the nearest enclosing class, not the full dotted chain.
+            nearest_class_name = class_name.rsplit(".", 1)[-1]
+            kind = ValueKind.ENUM_MEMBER if nearest_class_name in enum_classes else ValueKind.FIELD
         else:
             qn = f"{module_qn}.{name}"
             kind = ValueKind.CONSTANT if name.isupper() else ValueKind.VARIABLE
@@ -1163,7 +1181,7 @@ class ClassOverridesDetector:
     async def detect(
         self,
         parsed: ParsedFile,
-        project_name: str,  # noqa: ARG002
+        project_name: str,
         graph: GraphClient,
     ) -> DetectorResult:
         if graph is None:
@@ -1198,10 +1216,10 @@ class ClassOverridesDetector:
                 continue
             # Query graph for parent method (include tags for abstractmethod detection)
             records = await graph.execute(
-                "MATCH (base:TypeDef)-[:DEFINES]->(m:Callable)"
+                "MATCH (base:TypeDef {project_name: $p})-[:DEFINES]->(m:Callable)"
                 " WHERE base.name IN $bases AND m.name = $method"
                 " RETURN m.uid AS uid, m.tags AS tags LIMIT 1",
-                {"bases": bases, "method": entity.name},
+                {"p": project_name, "bases": bases, "method": entity.name},
             )
             if records:
                 parent_tags = records[0].get("tags") or []
@@ -1402,10 +1420,12 @@ class ModuleExportsDetector:
             return DetectorResult()
 
         # Build name -> qualified_name lookup for entities in this file
+        # (excluding the module/package entity itself and the __all__ value entity)
         name_to_qn: dict[str, str] = {}
         for entity in parsed.entities:
-            if entity.label not in (NodeLabel.MODULE, NodeLabel.PACKAGE, NodeLabel.VALUE) or entity.name != "__all__":
-                name_to_qn.setdefault(entity.name, entity.qualified_name)
+            if entity.label in (NodeLabel.MODULE, NodeLabel.PACKAGE) or entity.name == "__all__":
+                continue
+            name_to_qn.setdefault(entity.name, entity.qualified_name)
 
         enrichments = [
             PropertyEnrichment(

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
-from code_atlas.parsing.ast import ParsedFile, get_language_for_file, parse_file
-from code_atlas.parsing.languages.python import module_qualified_name
+from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, get_language_for_file, parse_file
+from code_atlas.parsing.languages.python import (
+    ClassOverridesDetector,
+    ModuleExportsDetector,
+    module_qualified_name,
+)
 from code_atlas.schema import (
     CallableKind,
     NodeLabel,
@@ -169,6 +175,41 @@ def test_property():
     assert name.kind == CallableKind.PROPERTY
 
 
+def test_async_function_tagged():
+    """A top-level 'async def' function gets the 'async' tag."""
+    parsed = _parse("async def fetch():\n    pass\n")
+    fetch = _entity_by_name(parsed, "fetch")
+    assert "async" in fetch.tags
+
+
+def test_async_method_tagged():
+    """An 'async def' method inside a class gets the 'async' tag."""
+    parsed = _parse("class Foo:\n    async def bar(self):\n        pass\n")
+    bar = _entity_by_name(parsed, "bar")
+    assert "async" in bar.tags
+
+
+def test_async_decorated_method_tagged():
+    """A decorated 'async def' method still gets the 'async' tag."""
+    parsed = _parse(
+        """\
+class Foo:
+    @staticmethod
+    async def bar():
+        pass
+"""
+    )
+    bar = _entity_by_name(parsed, "bar")
+    assert "async" in bar.tags
+
+
+def test_sync_function_not_tagged_async():
+    """A regular 'def' function does NOT get the 'async' tag."""
+    parsed = _parse("def fetch():\n    pass\n")
+    fetch = _entity_by_name(parsed, "fetch")
+    assert "async" not in fetch.tags
+
+
 def test_function_docstring():
     parsed = _parse(
         '''\
@@ -179,6 +220,32 @@ def greet(name):
     )
     func = _entity_by_name(parsed, "greet")
     assert func.docstring == "Say hello."
+
+
+def test_raw_string_docstring_prefix_stripped():
+    """A raw-string docstring (r\"\"\"...\"\"\") has its prefix and quotes stripped."""
+    parsed = _parse(
+        '''\
+def greet(name):
+    r"""Raw docstring."""
+    print(name)
+'''
+    )
+    func = _entity_by_name(parsed, "greet")
+    assert func.docstring == "Raw docstring."
+
+
+def test_bytes_string_docstring_prefix_stripped():
+    """A bytes-string-prefixed docstring (b\"\"\"...\"\"\") has its prefix and quotes stripped."""
+    parsed = _parse(
+        '''\
+def greet(name):
+    b"""Bytes docstring."""
+    print(name)
+'''
+    )
+    func = _entity_by_name(parsed, "greet")
+    assert func.docstring == "Bytes docstring."
 
 
 def test_private_function():
@@ -433,6 +500,48 @@ class Outer:
     )
     inner = _entity_by_name(parsed, "Inner")
     assert "Outer.Inner" in inner.qualified_name
+
+
+def test_deeply_nested_class_qualified_name():
+    """A 3-level nesting must retain the full outer chain, not just the innermost class."""
+    parsed = _parse(
+        """\
+class Outer:
+    class Middle:
+        class Inner:
+            def method(self):
+                pass
+"""
+    )
+    inner = _entity_by_name(parsed, "Inner")
+    assert inner.qualified_name == f"{PROJECT}:example.Outer.Middle.Inner"
+
+    method = _entity_by_name(parsed, "method")
+    assert method.qualified_name == f"{PROJECT}:example.Outer.Middle.Inner.method"
+
+
+def test_nested_classes_same_name_no_uid_collision():
+    """Same-named nested classes under different outer classes must not collide."""
+    parsed = _parse(
+        """\
+class A:
+    class B:
+        class Leaf:
+            pass
+
+class C:
+    class D:
+        class Leaf:
+            pass
+"""
+    )
+    leaves = [e for e in parsed.entities if e.name == "Leaf"]
+    assert len(leaves) == 2
+    qns = {e.qualified_name for e in leaves}
+    assert qns == {
+        f"{PROJECT}:example.A.B.Leaf",
+        f"{PROJECT}:example.C.D.Leaf",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1071,28 @@ class Config:
     assert debug.kind == ValueKind.FIELD
 
 
+def test_nested_enum_member_kind():
+    """Assignments inside an Enum class nested in another class still get kind=enum_member."""
+    parsed = _parse(
+        """\
+from enum import Enum
+
+class Outer:
+    class Color(Enum):
+        RED = 1
+        GREEN = 2
+"""
+    )
+    color = _entity_by_name(parsed, "Color")
+    assert color.kind == TypeDefKind.ENUM
+
+    red = _entity_by_name(parsed, "RED")
+    assert red.kind == ValueKind.ENUM_MEMBER
+
+    green = _entity_by_name(parsed, "GREEN")
+    assert green.kind == ValueKind.ENUM_MEMBER
+
+
 def test_int_flag_detected():
     """IntFlag is recognized as an enum base."""
     parsed = _parse(
@@ -1063,6 +1194,21 @@ def test_regular_imports_not_type_only():
     import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
     for rel in import_rels:
         assert not rel.properties.get("type_only"), f"Expected no type_only for {rel.to_name}"
+
+
+def test_type_checking_attribute_form_marked_type_only():
+    """`if typing.TYPE_CHECKING:` (attribute form) is also detected, not just the bare identifier."""
+    parsed = _parse(
+        """\
+import typing
+
+if typing.TYPE_CHECKING:
+    from os.path import join
+"""
+    )
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    type_only_names = {r.to_name for r in import_rels if r.properties.get("type_only")}
+    assert "os.path.join" in type_only_names
 
 
 # ---------------------------------------------------------------------------
@@ -1201,3 +1347,100 @@ def process(user: typing.Optional[UserModel], items: typing.List[int]) -> typing
     assert "Optional" not in type_names
     assert "List" not in type_names
     assert "Dict" not in type_names
+
+
+# ---------------------------------------------------------------------------
+# Detector project scoping / shadowing regressions
+# ---------------------------------------------------------------------------
+
+
+def _make_entity(
+    name: str,
+    qn: str,
+    label: NodeLabel,
+    kind: str,
+) -> ParsedEntity:
+    return ParsedEntity(
+        name=name,
+        qualified_name=qn,
+        label=label,
+        kind=kind,
+        line_start=1,
+        line_end=5,
+        file_path="src/app.py",
+    )
+
+
+async def test_class_overrides_query_filters_by_project_name():
+    """ClassOverridesDetector's graph query must scope the base-class lookup to project_name
+    to avoid creating cross-project OVERRIDES/IMPLEMENTS edges."""
+    method = _make_entity(
+        name="save",
+        qn="proj:src.app.Child.save",
+        label=NodeLabel.CALLABLE,
+        kind=CallableKind.METHOD,
+    )
+    inherits_rel = ParsedRelationship(
+        from_qualified_name="proj:src.app.Child",
+        rel_type=RelType.INHERITS,
+        to_name="Base",
+    )
+    parsed = ParsedFile(
+        file_path="src/app.py",
+        language="python",
+        entities=[method],
+        relationships=[inherits_rel],
+    )
+
+    graph = AsyncMock()
+    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.base.Base.save", "tags": []}])
+
+    det = ClassOverridesDetector()
+    await det.detect(parsed, "proj", graph)
+
+    # The query must be parameterized with the project name, and the Cypher
+    # text must filter the base TypeDef match by project_name.
+    query_text, params = graph.execute.call_args.args
+    assert "project_name" in query_text
+    assert params.get("p") == "proj"
+
+
+async def test_module_exports_no_shadowing_by_module_entity():
+    """A real exported symbol with the same name as the module must win over
+    the module/package entity itself in the EXPORTS resolution lookup."""
+    module = _make_entity(
+        name="app",
+        qn="proj:src.app",
+        label=NodeLabel.MODULE,
+        kind="module",
+    )
+    # A symbol literally named "app" (e.g. `app = Flask(__name__)`), same
+    # name as the module — a common Flask idiom.
+    app_symbol = _make_entity(
+        name="app",
+        qn="proj:src.app.app",
+        label=NodeLabel.VALUE,
+        kind="variable",
+    )
+    all_val = ParsedEntity(
+        name="__all__",
+        qualified_name="proj:src.app.__all__",
+        label=NodeLabel.VALUE,
+        kind="variable",
+        line_start=1,
+        line_end=1,
+        file_path="src/app.py",
+        source="__all__ = ['app']",
+    )
+    parsed = ParsedFile(
+        file_path="src/app.py",
+        language="python",
+        entities=[module, app_symbol, all_val],
+        relationships=[],
+    )
+
+    det = ModuleExportsDetector()
+    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+
+    assert len(result.relationships) == 1
+    assert result.relationships[0].to_name == "proj:src.app.app"
