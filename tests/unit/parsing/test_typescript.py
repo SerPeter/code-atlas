@@ -149,6 +149,21 @@ interface IUser {
     assert iface.docstring == "User interface"
 
 
+def test_interface_extends_inherits():
+    """interface_declaration's extends_type_clause maps to INHERITS (finding typescript.py:514)."""
+    parsed = _parse("interface AdminUser extends User {}\n")
+    inherits = _rels_from(parsed, "src.example.AdminUser", RelType.INHERITS)
+    assert len(inherits) == 1
+    assert inherits[0].to_name == "User"
+
+
+def test_interface_extends_multiple_inherits():
+    parsed = _parse("interface AdminUser extends User, Named {}\n")
+    inherits = _rels_from(parsed, "src.example.AdminUser", RelType.INHERITS)
+    to_names = {r.to_name for r in inherits}
+    assert to_names == {"User", "Named"}
+
+
 # ---------------------------------------------------------------------------
 # 5. Enum extraction
 # ---------------------------------------------------------------------------
@@ -319,6 +334,28 @@ def test_import_namespace():
     assert import_rels[0].to_name == "path"
 
 
+def test_reexport_named_produces_imports():
+    """'export { x, y } from './mod'' is a barrel re-export — must emit IMPORTS (typescript.py:1093)."""
+    parsed = _parse("export { x, y } from './mod';\n")
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert len(import_rels) == 1
+    assert import_rels[0].to_name == "./mod"
+
+
+def test_reexport_star_produces_imports():
+    parsed = _parse("export * from './mod';\n")
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert len(import_rels) == 1
+    assert import_rels[0].to_name == "./mod"
+
+
+def test_reexport_star_as_produces_imports():
+    parsed = _parse("export * as ns from './mod';\n")
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert len(import_rels) == 1
+    assert import_rels[0].to_name == "./mod"
+
+
 # ---------------------------------------------------------------------------
 # 11. Inheritance -> INHERITS
 # ---------------------------------------------------------------------------
@@ -352,6 +389,30 @@ def test_extends_and_implements():
     assert inherits[0].to_name == "Base"
     assert len(impl_rels) == 1
     assert impl_rels[0].to_name == "IBar"
+
+
+def test_extends_qualified_member_expression():
+    """'extends ns.Base' parses as member_expression — must still yield INHERITS (typescript.py:227)."""
+    parsed = _parse("class Button extends React.Component {}\n")
+    inherits = [r for r in parsed.relationships if r.rel_type == RelType.INHERITS]
+    assert len(inherits) == 1
+    assert inherits[0].to_name == "Component"
+
+
+def test_implements_generic_type():
+    """'implements IRepo<User>' parses as generic_type — must still yield IMPLEMENTS to 'IRepo'."""
+    parsed = _parse("class Foo implements IRepo<User> {}\n")
+    impl_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+    assert len(impl_rels) == 1
+    assert impl_rels[0].to_name == "IRepo"
+
+
+def test_implements_qualified_nested_type_identifier():
+    """'implements ns.IFace' parses as nested_type_identifier — must still yield IMPLEMENTS to 'IFace'."""
+    parsed = _parse("class Foo implements ns.IFace {}\n")
+    impl_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+    assert len(impl_rels) == 1
+    assert impl_rels[0].to_name == "IFace"
 
 
 def test_implements_bare_name_contract():
@@ -599,6 +660,22 @@ class Foo {
     assert "doSomething" in called
 
 
+def test_calls_inside_arrow_callback():
+    """Calls nested inside an arrow-function callback argument are attributed to the enclosing
+    function, not dropped (typescript.py:184)."""
+    parsed = _parse("""\
+function caller() {
+  items.forEach((item) => {
+    doWork(item);
+  });
+}
+""")
+    calls = _rels_from(parsed, "src.example.caller", RelType.CALLS)
+    called = {r.to_name for r in calls}
+    assert "forEach" in called
+    assert "doWork" in called
+
+
 # ---------------------------------------------------------------------------
 # 20. Export handling
 # ---------------------------------------------------------------------------
@@ -643,6 +720,20 @@ def test_export_type_alias():
 def test_export_default_class():
     parsed = _parse("export default class Foo {}\n")
     cls = _entity_by_name(parsed, "Foo")
+    assert "exported" in cls.tags
+
+
+def test_decorator_on_unexported_class():
+    parsed = _parse("@Injectable()\nclass Service {}\n")
+    cls = _entity_by_name(parsed, "Service")
+    assert any(t.startswith("decorator:Injectable") for t in cls.tags)
+
+
+def test_decorator_on_exported_class():
+    """Decorators on exported classes attach to export_statement, not the class (typescript.py:134)."""
+    parsed = _parse("@Injectable()\nexport class Service {}\n")
+    cls = _entity_by_name(parsed, "Service")
+    assert any(t.startswith("decorator:Injectable") for t in cls.tags)
     assert "exported" in cls.tags
 
 

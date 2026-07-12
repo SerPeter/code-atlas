@@ -134,10 +134,14 @@ def _is_exported(node: Node) -> bool:
 def _get_decorator_tags(node: Node) -> list[str]:
     """Extract decorator tags from a class or method declaration.
 
-    TypeScript decorators appear as children of the declaration node itself.
+    TypeScript decorators normally appear as children of the declaration node
+    itself, but for exported classes (``@Injectable()\nexport class X {}``) the
+    grammar attaches them to the wrapping export_statement instead.
     """
+    parent = node.parent
+    decorator_source = parent if parent is not None and parent.type == "export_statement" else node
     tags: list[str] = []
-    for child in node.children:
+    for child in decorator_source.children:
         if child.type == "decorator":
             dec_text = node_text(child).lstrip("@").strip()
             tags.append(f"decorator:{dec_text}")
@@ -180,12 +184,15 @@ def _extract_calls(
                                 to_name=call_name,
                             )
                         )
-        # Recurse but don't descend into nested function/class definitions
+        # Recurse but don't descend into nested function/class definitions —
+        # arrow_function IS recursed into: unlike named function/class
+        # declarations, arrow functions passed as callback arguments are never
+        # processed as their own entities, so their calls must attribute to
+        # the enclosing entity or they are silently dropped.
         if child.type not in (
             "function_declaration",
             "class_declaration",
             "abstract_class_declaration",
-            "arrow_function",
         ):
             _extract_calls(child, source, from_qn, relationships)
 
@@ -222,27 +229,59 @@ def _process_import(
     )
 
 
+def _heritage_type_name(node: Node) -> str | None:
+    """Resolve a heritage clause child to a bare type/interface name.
+
+    Handles plain identifiers, qualified names (``ns.Base``, ``ns.deep.IFace``),
+    and generic instantiations (``IRepo<User>``) by taking the outermost or
+    last-segment name — matching the bare-name IMPLEMENTS/INHERITS contract.
+    """
+    if node.type in ("identifier", "type_identifier"):
+        return node_text(node)
+    if node.type == "member_expression":
+        prop = node.child_by_field_name("property")
+        return node_text(prop) if prop is not None else None
+    if node.type == "nested_type_identifier":
+        for child in node.children:
+            if child.type == "type_identifier":
+                return node_text(child)
+        return None
+    if node.type == "generic_type":
+        name_node = node.child_by_field_name("name")
+        return _heritage_type_name(name_node) if name_node is not None else None
+    return None
+
+
 def _extract_heritage(node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
     """Extract extends/implements relationships from a class_heritage child."""
-    _TYPE_NODES = frozenset({"identifier", "type_identifier"})  # noqa: N806
     for child in node.children:
         if child.type != "class_heritage":
             continue
         for clause in child.children:
             if clause.type == "extends_clause":
                 relationships.extend(
-                    ParsedRelationship(from_qualified_name=from_qn, rel_type=RelType.INHERITS, to_name=node_text(base))
+                    ParsedRelationship(from_qualified_name=from_qn, rel_type=RelType.INHERITS, to_name=name)
                     for base in clause.children
-                    if base.type in _TYPE_NODES
+                    if (name := _heritage_type_name(base)) is not None
                 )
             elif clause.type == "implements_clause":
                 relationships.extend(
-                    ParsedRelationship(
-                        from_qualified_name=from_qn, rel_type=RelType.IMPLEMENTS, to_name=node_text(iface)
-                    )
+                    ParsedRelationship(from_qualified_name=from_qn, rel_type=RelType.IMPLEMENTS, to_name=name)
                     for iface in clause.children
-                    if iface.type in _TYPE_NODES
+                    if (name := _heritage_type_name(iface)) is not None
                 )
+
+
+def _extract_interface_heritage(node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
+    """Extract INHERITS relationships from an interface's extends_type_clause."""
+    for child in node.children:
+        if child.type != "extends_type_clause":
+            continue
+        relationships.extend(
+            ParsedRelationship(from_qualified_name=from_qn, rel_type=RelType.INHERITS, to_name=name)
+            for base in child.children
+            if (name := _heritage_type_name(base)) is not None
+        )
 
 
 def _process_class(
@@ -562,6 +601,8 @@ def _process_interface(
             to_name=f"{project_name}:{qn}",
         )
     )
+
+    _extract_interface_heritage(node, f"{project_name}:{qn}", relationships)
 
 
 def _process_enum(
@@ -1089,20 +1130,34 @@ def _process_export_statement(
             seen,
             is_exported=True,
         )
-    else:
-        for child in node.children:
-            if child.type in _DECLARATION_TYPES:
-                _process_node(
-                    child,
-                    path,
-                    source,
-                    project_name,
-                    module_qn,
-                    entities,
-                    relationships,
-                    seen,
-                    is_exported=True,
-                )
+        return
+
+    # Re-export form: `export { x } from './mod'`, `export * from './mod'`,
+    # `export * as ns from './mod'` — no local declaration, just a source module.
+    source_node = node.child_by_field_name("source")
+    if source_node is not None:
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{module_qn}",
+                rel_type=RelType.IMPORTS,
+                to_name=_get_string_content(source_node),
+            )
+        )
+        return
+
+    for child in node.children:
+        if child.type in _DECLARATION_TYPES:
+            _process_node(
+                child,
+                path,
+                source,
+                project_name,
+                module_qn,
+                entities,
+                relationships,
+                seen,
+                is_exported=True,
+            )
 
 
 def _process_node(
