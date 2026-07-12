@@ -189,6 +189,23 @@ class TestScanFiles:
         assert "a/skip.py" in result
         assert "b/skip.py" not in result
 
+    def test_is_included_discovers_nested_gitignore_without_scan(self, tmp_path):
+        """is_included() must honor nested .gitignore even if scan() was never called.
+
+        Watcher-mode constructs FileScope and calls is_included() directly
+        (DaemonManager.start never calls scan()) — nested-gitignore exclusion
+        must not depend on scan() having run first.
+        """
+        _write(tmp_path, "lib/.gitignore", "generated/\n")
+        _write(tmp_path, "lib/generated/out.py", "z = 3")
+        _write(tmp_path, "lib/core.py", "y = 2")
+
+        scope = FileScope(tmp_path, _make_settings(tmp_path))
+        # Deliberately NOT calling scope.scan() — simulates watcher mode.
+
+        assert scope.is_included("lib/generated/out.py") is False
+        assert scope.is_included("lib/core.py") is True
+
     def test_default_excludes_vendor_and_target(self, tmp_path):
         """vendor/ and target/ are excluded by default."""
         _write(tmp_path, "app.py", "x = 1")

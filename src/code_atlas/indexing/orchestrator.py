@@ -310,8 +310,9 @@ class FileScope:
         self._exclude_spec = self._build_exclude_spec(settings)
         self._include_spec = self._build_include_spec(settings)
         self._include_prefixes = self._build_include_prefixes(scope_paths, settings)
-        # Nested gitignore specs populated during scan()
+        # Nested gitignore specs, discovered lazily (see _check_nested_gitignore)
         self._nested_specs: dict[str, pathspec.PathSpec] = {}
+        self._nested_checked: set[str] = set()
 
     # -- public API ----------------------------------------------------------
 
@@ -330,12 +331,7 @@ class FileScope:
 
             # Discover nested .gitignore (non-root directories only)
             if rel_dir:
-                nested_gi = Path(dirpath) / ".gitignore"
-                if nested_gi.is_file():
-                    patterns = _read_ignore_file(nested_gi)
-                    if patterns:
-                        self._nested_specs[rel_dir] = pathspec.PathSpec.from_lines("gitignore", patterns)
-                        logger.debug("Loaded {} patterns from {}", len(patterns), nested_gi)
+                self._check_nested_gitignore(rel_dir)
 
             # Prune excluded and symlinked directories (modify dirnames in-place)
             dirnames[:] = [
@@ -375,6 +371,7 @@ class FileScope:
         parts = rel_path.split("/")
         for depth in range(1, len(parts)):
             ancestor = "/".join(parts[:depth])
+            self._check_nested_gitignore(ancestor)
             spec = self._nested_specs.get(ancestor)
             if spec is not None:
                 # Match relative to the ancestor directory
@@ -439,6 +436,7 @@ class FileScope:
         parts = rel_dir.split("/")
         for depth in range(1, len(parts)):
             ancestor = "/".join(parts[:depth])
+            self._check_nested_gitignore(ancestor)
             spec = self._nested_specs.get(ancestor)
             if spec is not None:
                 sub_path = "/".join(parts[depth:]) + "/"
@@ -446,6 +444,24 @@ class FileScope:
                     return True
 
         return False
+
+    def _check_nested_gitignore(self, rel_dir: str) -> None:
+        """Discover and cache *rel_dir*'s own ``.gitignore``, if not already checked.
+
+        Populated lazily on first access (from ``scan()``'s walk, or directly
+        from ``is_included()``/``_is_dir_excluded()``) so callers that never
+        call ``scan()`` — e.g. the file watcher, which queries ``is_included()``
+        one path at a time — still see nested ``.gitignore`` exclusions.
+        """
+        if rel_dir in self._nested_checked:
+            return
+        self._nested_checked.add(rel_dir)
+        nested_gi = self._root / rel_dir.replace("/", os.sep) / ".gitignore"
+        if nested_gi.is_file():
+            patterns = _read_ignore_file(nested_gi)
+            if patterns:
+                self._nested_specs[rel_dir] = pathspec.PathSpec.from_lines("gitignore", patterns)
+                logger.debug("Loaded {} patterns from {}", len(patterns), nested_gi)
 
 
 # ---------------------------------------------------------------------------
@@ -486,25 +502,34 @@ def _matches_any_prefix(rel_path: str, prefixes: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _detect_packages(project_root: Path) -> list[tuple[str, str]]:
+def _detect_packages(project_root: Path, *, exclude_dirs: list[str] | None = None) -> list[tuple[str, str]]:
     """Find Python packages (dirs with __init__.py).
 
     Returns list of ``(qualified_name, relative_posix_path)`` sorted by depth.
-    Prunes directories in ``_DETECT_PRUNE_DIRS`` (e.g. .venv, node_modules).
+    Prunes directories in ``_DETECT_PRUNE_DIRS`` (e.g. .venv, node_modules) and,
+    if given, *exclude_dirs* (relative POSIX paths owned by sub-projects — keeps
+    a monorepo root's package hierarchy from reaching into sub-project trees).
     """
     root = project_root.resolve()
     packages: list[tuple[str, str]] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune symlinked and excluded directories
-        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink() and d not in _DETECT_PRUNE_DIRS]
-        if "__init__.py" in filenames:
-            rel = Path(dirpath).relative_to(root).as_posix()
-            if rel == ".":
-                continue
+        rel_dir = Path(dirpath).relative_to(root).as_posix()
+        rel_dir = "" if rel_dir == "." else rel_dir
+
+        # Prune symlinked, excluded, and sub-project directories
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if not Path(dirpath, d).is_symlink()
+            and d not in _DETECT_PRUNE_DIRS
+            and not (exclude_dirs and _matches_any_prefix(f"{rel_dir}/{d}" if rel_dir else d, exclude_dirs))
+        ]
+
+        if "__init__.py" in filenames and rel_dir:
             # Shared parser derivation so Package uids converge with parsed
             # __init__.py entities (strips source roots like 'src/')
-            qn = module_qualified_name(f"{rel}/__init__.py")
-            packages.append((qn, rel))
+            qn = module_qualified_name(f"{rel_dir}/__init__.py")
+            packages.append((qn, rel_dir))
     packages.sort(key=lambda t: t[0].count("."))
     return packages
 
@@ -530,6 +555,32 @@ def _get_git_hash(project_root: Path) -> str | None:
     except FileNotFoundError, subprocess.TimeoutExpired:
         pass
     return None
+
+
+def _git_tracked_files(project_root: Path) -> list[str] | None:
+    """Return git's tracked (index) file list for *project_root*, or None if unavailable.
+
+    Reads from git's index, independent of the atlas scope/.atlasignore filters
+    and of the working tree's current contents — used to corroborate a
+    zero-file scan before trusting it as a genuine full deletion.
+    ``None`` means "no independent signal" (not a git repo, git failed, or
+    *project_root* itself is inaccessible) — callers must NOT treat that as
+    confirmation of anything.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+    except OSError, subprocess.TimeoutExpired:
+        return None
+    return [line for line in result.stdout.splitlines() if line.strip()]
 
 
 _GIT_HEX_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -841,10 +892,12 @@ def _parse_dependency_versions(project_root: Path) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-async def _create_package_hierarchy(graph: GraphClient, project_name: str, project_root: Path) -> int:
+async def _create_package_hierarchy(
+    graph: GraphClient, project_name: str, project_root: Path, *, exclude_dirs: list[str] | None = None
+) -> int:
     """Create Project + Package nodes and CONTAINS edges. Returns package count."""
     await graph.merge_project_node(project_name)
-    packages = _detect_packages(project_root)
+    packages = _detect_packages(project_root, exclude_dirs=exclude_dirs)
     batch = [(qn, qn.rsplit(".", 1)[-1], f"{rel_path}/__init__.py") for qn, rel_path in packages]
     await graph.merge_package_batch(project_name, batch)
     return len(packages)
@@ -935,6 +988,38 @@ class _DeltaDecision:
     files_deleted: set[str]
 
 
+async def _decide_empty_scan_deletion(graph: GraphClient, project_name: str, project_root: Path) -> _DeltaDecision:
+    """Decide the delta outcome when a scan finds zero indexable files.
+
+    Nothing left to scan could mean files were deleted/moved, a scope
+    misconfiguration, or project_root being transiently unavailable —
+    os.walk silently yields nothing rather than raising. Only trust this as
+    a genuine deletion when git independently corroborates it: git's index
+    (unaffected by atlas scope/.atlasignore) must also report zero tracked
+    files. This is deliberately NOT gated by delta_threshold — an empty scan
+    would compute ratio=1.0 regardless of threshold — but it must not be
+    trusted blind, since destructively wiping the entire project's graph
+    data is irreversible.
+    """
+    old_file_paths = await graph.get_project_file_paths(project_name)
+    if not old_file_paths:
+        return _DeltaDecision("full", set(), set(), set())
+
+    tracked = await asyncio.to_thread(_git_tracked_files, project_root)
+    if tracked is not None and not tracked:
+        return _DeltaDecision("delta", set(), set(), old_file_paths)
+
+    logger.warning(
+        "Scan of '{}' found zero indexable files but the graph has {} indexed for "
+        "'{}' — skipping deletion reconciliation this run (not corroborated by git; "
+        "possible transient scan failure or scope misconfiguration)",
+        project_root,
+        len(old_file_paths),
+        project_name,
+    )
+    return _DeltaDecision("full", set(), set(), set())
+
+
 async def _decide_delta_mode(
     settings: AtlasSettings,
     graph: GraphClient,
@@ -943,6 +1028,9 @@ async def _decide_delta_mode(
     current_file_set: set[str],
 ) -> _DeltaDecision:
     """Determine whether to use delta or full mode based on git diff and threshold."""
+    if not current_file_set:
+        return await _decide_empty_scan_deletion(graph, project_name, project_root)
+
     stored_hash = await graph.get_project_git_hash(project_name)
     if stored_hash is None:
         return _DeltaDecision("full", set(), set(), set())
@@ -1204,9 +1292,11 @@ async def _index_project_inner(  # noqa: PLR0915
     # 1. Scan files
     files = scan_files(project_root, settings, scope_paths=scope_paths)
     logger.debug("Scanned {} indexable files", len(files))
-
-    if not files:
-        return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=time.monotonic() - start)
+    # Deliberately no early return on `not files`: an empty scan (all source
+    # files deleted/moved, or a scope misconfiguration) must still flow through
+    # the delta decision below so stale entities are reconciled and Project
+    # metadata is updated — matching the monorepo path (_publish_project),
+    # which has no such early return.
 
     # 2. Embedding setup + model lock check (skipped in lightweight mode)
     embed: EmbedClient | None = None
@@ -1371,8 +1461,13 @@ async def _publish_project(
     files: list[str],
     *,
     full_reindex: bool = False,
+    exclude_package_dirs: list[str] | None = None,
 ) -> _ProjectPublishResult:
     """Scan, decide delta/full, create packages, and publish events for one project.
+
+    *exclude_package_dirs* (relative POSIX paths) are pruned from the package
+    hierarchy walk — used by the monorepo root project so its Package nodes
+    never reach into sub-project directories.
 
     Does NOT create consumers or wait for drain — callers manage the shared pipeline.
     """
@@ -1387,7 +1482,7 @@ async def _publish_project(
         decision = await _decide_delta_mode(settings, graph, project_name, project_root, set(files))
 
     # Create Project + Package hierarchy
-    pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
+    pkg_count = await _create_package_hierarchy(graph, project_name, project_root, exclude_dirs=exclude_package_dirs)
     logger.debug("'{}': {} package node(s)", project_name, pkg_count)
 
     # Sort files for optimal resolution order
@@ -1440,6 +1535,12 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
     logger.info("Detected {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
 
+    # Full set of sub-project paths, captured BEFORE scope filtering — files
+    # under an excluded sub-project still belong to that sub-project, not the
+    # root, and must stay excluded from both root_only_files and the root
+    # project's package hierarchy.
+    all_sub_paths = [sp.path for sp in sub_projects]
+
     # Filter by scope_projects if specified (matches on bare DetectedProject.name)
     if scope_projects:
         filtered: list[DetectedProject] = []
@@ -1459,10 +1560,9 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     root_name = derive_project_name(project_root)
 
     # Pre-scan root files to determine if there's a root project (needed for total count)
-    sub_paths = [sp.path for sp in sub_projects]
     root_scope = FileScope(project_root, settings)
     root_files = root_scope.scan()
-    root_only_files = [f for f in root_files if not any(f == sp or f.startswith(sp + "/") for sp in sub_paths)]
+    root_only_files = [f for f in root_files if not any(f == sp or f.startswith(sp + "/") for sp in all_sub_paths)]
     has_root = bool(root_only_files)
     total = len(sub_projects) + (1 if has_root else 0)
 
@@ -1548,6 +1648,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 project_root,
                 root_only_files,
                 full_reindex=full_reindex,
+                exclude_package_dirs=all_sub_paths,
             )
             publish_results.append(root_pr)
 

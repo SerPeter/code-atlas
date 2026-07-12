@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from code_atlas.events import Topic
-from code_atlas.indexing.orchestrator import StalenessChecker, index_project
+from code_atlas.indexing.orchestrator import StalenessChecker, index_monorepo, index_project
 from code_atlas.schema import NodeLabel
 from code_atlas.settings import AtlasSettings, IndexSettings, derive_project_name
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
@@ -231,6 +231,69 @@ class TestDeltaIndexIntegration:
         # Entity count should have dropped
         assert r2.entities_total < e1
 
+    async def test_reindex_reconciles_when_scan_finds_zero_files(self, git_project, graph_client, event_bus):
+        """All source files removed: the graph must be reconciled, not left stale.
+
+        Before the fix, index_project returned early on an empty scan,
+        silently keeping every previously indexed entity and never updating
+        Project metadata.
+        """
+        settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project_name = derive_project_name(git_project)
+
+        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert r1.entities_total > 0
+
+        # Delete every source file and commit — the next scan finds nothing.
+        for f in (git_project / "src").iterdir():
+            f.unlink()
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "remove all sources")
+
+        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert r2.files_scanned == 0
+        assert r2.mode == "delta"
+        assert r2.delta_stats is not None
+        assert r2.delta_stats.files_deleted == 5
+        # Entities reconciled (dropped), not silently left stale.
+        assert r2.entities_total < r1.entities_total
+
+        # Project metadata must reflect the empty state, not be skipped.
+        projects = await graph_client.execute(
+            f"MATCH (p:{NodeLabel.PROJECT} {{uid: $pn}}) RETURN p.file_count AS fc",
+            {"pn": project_name},
+        )
+        assert len(projects) == 1
+        assert projects[0]["fc"] == 0
+
+    async def test_empty_scan_not_corroborated_by_git_skips_reconciliation(self, git_project, graph_client, event_bus):
+        """A zero-file scan that git does NOT corroborate must not wipe the graph.
+
+        Simulates a transient/misconfiguration scenario (e.g. the CI race of
+        `rm -rf src && git checkout src`, or an unmounted path): the files are
+        gone from disk but git's index still tracks them (nothing was staged
+        or committed). The scan legitimately finds zero files, but this must
+        NOT be treated as a genuine deletion.
+        """
+        settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+
+        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert r1.entities_total > 0
+
+        # Remove every source file from disk WITHOUT staging/committing —
+        # git's index still lists them as tracked.
+        for f in (git_project / "src").iterdir():
+            f.unlink()
+
+        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert r2.files_scanned == 0
+        # No reconciliation happened — entities must be untouched, not wiped.
+        assert r2.entities_total == r1.entities_total
+
     async def test_delta_index_full_fallback_on_threshold(self, git_project, graph_client, event_bus):
         """Exceeding the threshold triggers full mode."""
         # Set a very low threshold so any change exceeds it
@@ -339,6 +402,74 @@ class TestPipelineDurabilityIntegration:
             assert "daemon-sim" in names
         finally:
             await event_bus._redis.xgroup_destroy(key, "daemon-sim")
+
+
+# ---------------------------------------------------------------------------
+# Monorepo scoping/package-hierarchy — integration tests (require Memgraph + Valkey)
+# ---------------------------------------------------------------------------
+
+
+class TestIndexMonorepoScopingIntegration:
+    async def test_scoped_monorepo_excludes_unscoped_project_files_from_root(self, graph_client, event_bus, tmp_path):
+        """scope_projects filtering must not leak an excluded sub-project's files into the root project.
+
+        Before the fix, ``sub_paths`` was computed from the scope-FILTERED
+        sub-project list, so files belonging to an excluded sub-project were
+        misclassified as root-only files and indexed under the bare
+        root project_name — duplicating the excluded sub-project's entities
+        under a different uid namespace.
+        """
+        _write(tmp_path, "services/auth/pyproject.toml", '[project]\nname = "auth"\n')
+        _write(tmp_path, "services/auth/auth/__init__.py", "")
+        _write(tmp_path, "services/auth/auth/service.py", "def authenticate():\n    return True\n")
+
+        _write(tmp_path, "libs/shared/pyproject.toml", '[project]\nname = "shared"\n')
+        _write(tmp_path, "libs/shared/shared/__init__.py", "")
+        _write(tmp_path, "libs/shared/shared/utils.py", "def validate():\n    return True\n")
+
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        root_name = tmp_path.resolve().name
+
+        await index_monorepo(
+            settings, graph_client, event_bus, scope_projects=["auth"], drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+        )
+
+        # The excluded 'shared' sub-project must never be published under the
+        # bare root project_name.
+        root_callables = await graph_client.execute(
+            f"MATCH (c:{NodeLabel.CALLABLE} {{project_name: $pn}}) RETURN c.name AS name",
+            {"pn": root_name},
+        )
+        assert root_callables == []
+
+    async def test_root_package_hierarchy_excludes_sub_project_dirs(self, graph_client, event_bus, tmp_path):
+        """The root project's package hierarchy must not reach into sub-project directories.
+
+        Before the fix, ``_create_package_hierarchy(root_name, project_root)``
+        walked the ENTIRE monorepo tree, creating Package nodes for the
+        sub-project's ``__init__.py`` files under the ROOT project_name —
+        churned (created then deleted every delta run) since the sub-project's
+        own files are never part of the root's current file set.
+        """
+        _write(tmp_path, "libs/shared/pyproject.toml", '[project]\nname = "shared"\n')
+        _write(tmp_path, "libs/shared/shared/__init__.py", "")
+        _write(tmp_path, "libs/shared/shared/utils.py", "def validate():\n    return True\n")
+
+        # A genuine root-level file so the root project actually gets published.
+        _write(tmp_path, "tools/run.py", "def main():\n    pass\n")
+
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        root_name = tmp_path.resolve().name
+
+        await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        root_packages = await graph_client.execute(
+            f"MATCH (p:{NodeLabel.PACKAGE} {{project_name: $pn}}) RETURN p.file_path AS fp",
+            {"pn": root_name},
+        )
+        assert not any(r["fp"].startswith("libs/shared") for r in root_packages)
 
 
 # ---------------------------------------------------------------------------
