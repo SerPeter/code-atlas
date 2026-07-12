@@ -6,6 +6,7 @@ no new dependencies.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from typing import TYPE_CHECKING, Any
@@ -30,8 +31,17 @@ _INSTABILITY_HIGH = 0.9
 
 
 def _sid(name: str) -> str:
-    """Convert a qualified name to a safe Mermaid node ID."""
-    return _MERMAID_UNSAFE.sub("_", name)
+    """Convert a qualified name to a safe, collision-resistant Mermaid node ID.
+
+    Sanitization alone (replacing non-alphanumeric chars with '_') is not
+    injective — e.g. 'pkg.data_utils' and 'pkg.data.utils' both collapse to
+    'pkg_data_utils'. Appending a short hash of the original name keeps IDs
+    deterministic (same name always maps to the same ID) while making
+    distinct names map to distinct IDs.
+    """
+    sanitized = _MERMAID_UNSAFE.sub("_", name)
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}_{digest}"
 
 
 def _slabel(text: str, max_len: int = 40) -> str:
@@ -144,9 +154,11 @@ async def _analyze_structure(graph: GraphClient, project: str, path: str, limit:
     )
 
     # External dependencies
+    ext_w = " WHERE src IS NULL OR src.file_path STARTS WITH $path" if path else ""
     ext_raw = await graph.execute(
         "MATCH (ep:ExternalPackage {project_name: $project}) "
         "OPTIONAL MATCH (ep)<-[:IMPORTS]-(src) "
+        f"{ext_w} "
         "RETURN ep.name AS package, ep.version AS version, count(src) AS imported_by "
         f"ORDER BY imported_by DESC LIMIT {limit}",
         params,
@@ -324,25 +336,20 @@ async def _analyze_dependencies(graph: GraphClient, project: str, path: str, lim
         reverse=True,
     )[:limit]
 
-    # Circular dependencies (mutual imports at module level)
-    seen: set[tuple[str, str]] = set()
-    circular: list[dict[str, str]] = []
-    for from_mod, to_mod in edge_weights:
-        reverse = (to_mod, from_mod)
-        if reverse in edge_weights and from_mod < to_mod and (from_mod, to_mod) not in seen:
-            circular.append({"module_a": from_mod, "module_b": to_mod})
-            seen.add((from_mod, to_mod))
-            if len(circular) >= 10:
-                break
+    # Circular dependencies (any cycle length, via strongly-connected components)
+    circular = _detect_circular(edge_weights)[:10]
 
     # External package import counts
+    pa_src = " AND src.file_path STARTS WITH $path" if path else ""
     ext_pkg_raw = await graph.execute(
         "MATCH (src {project_name: $project})-[:IMPORTS]->(ep:ExternalPackage) "
+        f"WHERE true{pa_src} "
         "RETURN ep.name AS package, count(src) AS cnt",
         params,
     )
     ext_sym_raw = await graph.execute(
         "MATCH (src {project_name: $project})-[:IMPORTS]->(es:ExternalSymbol) "
+        f"WHERE true{pa_src} "
         "RETURN es.package AS package, count(src) AS cnt",
         params,
     )
@@ -522,9 +529,14 @@ def _compute_quality_flags(
     fo_counts = {m: len(fan_out.get(m, set())) for m in all_modules}
     fi_counts = {m: len(fan_in.get(m, set())) for m in all_modules}
 
-    # Modularity ratio
+    # Modularity ratio. Only counts edges sourced from an in-scope module —
+    # when path-scoped, edge_weights also carries inbound edges from
+    # out-of-scope importers (needed for accurate fan-in below), which must
+    # not dilute this module's own intra/cross-package import ratio.
     intra, total = 0, 0
     for (from_mod, to_mod), weight in edge_weights.items():
+        if from_mod not in all_modules:
+            continue
         total += weight
         if _module_package(from_mod) == _module_package(to_mod):
             intra += weight
@@ -541,12 +553,14 @@ def _compute_quality_flags(
         reverse=True,
     )
 
-    # Circular dependencies
-    circular = _detect_circular(edge_weights)
+    # Circular dependencies. Restricted to cycles fully contained in
+    # all_modules — a path-scoped edge whose other endpoint lies outside the
+    # analyzed set must not manufacture a false "cycle" with an out-of-scope
+    # module.
+    circular = [pair for pair in _detect_circular(edge_weights) if all(m in all_modules for m in pair["cycle"])]
     circular_modules: set[str] = set()
     for pair in circular:
-        circular_modules.add(pair["module_a"])
-        circular_modules.add(pair["module_b"])
+        circular_modules.update(pair["cycle"])
 
     # Tangled modules (full list for scoring, sliced for output)
     tangled_all = sorted(
@@ -613,15 +627,78 @@ def _compute_quality_flags(
     }
 
 
-def _detect_circular(edge_weights: dict[tuple[str, str], int]) -> list[dict[str, str]]:
-    """Find mutually-importing module pairs."""
-    seen: set[tuple[str, str]] = set()
-    circular: list[dict[str, str]] = []
+def _find_sccs(adjacency: dict[str, set[str]]) -> list[list[str]]:
+    """Find strongly-connected components via an iterative Tarjan's algorithm.
+
+    Iterative (explicit stack) to avoid Python's recursion limit on large
+    import graphs. Returns components of every size; a component with more
+    than one member is exactly a set of modules mutually reachable from one
+    another — i.e. an import cycle of any length.
+    """
+    index_of: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    scc_stack: list[str] = []
+    components: list[list[str]] = []
+    counter = 0
+
+    for start in adjacency:
+        if start in index_of:
+            continue
+        work: list[tuple[str, Any, str | None]] = [(start, iter(adjacency.get(start, ())), None)]
+        while work:
+            node, neighbors, parent = work[-1]
+            if node not in index_of:
+                index_of[node] = counter
+                lowlink[node] = counter
+                counter += 1
+                scc_stack.append(node)
+                on_stack.add(node)
+
+            pushed = False
+            for neighbor in neighbors:
+                if neighbor not in index_of:
+                    work.append((neighbor, iter(adjacency.get(neighbor, ())), node))
+                    pushed = True
+                    break
+                if neighbor in on_stack:
+                    lowlink[node] = min(lowlink[node], index_of[neighbor])
+            if pushed:
+                continue
+
+            work.pop()
+            if parent is not None:
+                lowlink[parent] = min(lowlink[parent], lowlink[node])
+            if lowlink[node] == index_of[node]:
+                component: list[str] = []
+                while True:
+                    w = scc_stack.pop()
+                    on_stack.discard(w)
+                    component.append(w)
+                    if w == node:
+                        break
+                components.append(component)
+
+    return components
+
+
+def _detect_circular(edge_weights: dict[tuple[str, str], int]) -> list[dict[str, Any]]:
+    """Find modules involved in an import cycle of any length.
+
+    Uses strongly-connected components so cycles longer than a mutual A<->B
+    pair (e.g. A->B->C->A) are detected, not just 2-cycles.
+    """
+    adjacency: dict[str, set[str]] = {}
     for from_mod, to_mod in edge_weights:
-        if (to_mod, from_mod) in edge_weights and from_mod < to_mod and (from_mod, to_mod) not in seen:
-            circular.append({"module_a": from_mod, "module_b": to_mod})
-            seen.add((from_mod, to_mod))
-    return circular
+        adjacency.setdefault(from_mod, set()).add(to_mod)
+
+    circular: list[dict[str, Any]] = []
+    for component in _find_sccs(adjacency):
+        if len(component) < 2:
+            continue
+        cycle = sorted(component)
+        circular.append({"module_a": cycle[0], "module_b": cycle[1], "cycle": cycle})
+    return sorted(circular, key=lambda c: c["cycle"])
 
 
 def _compute_instabilities(modules: set[str], fo_counts: dict[str, int], fi_counts: dict[str, int]) -> dict[str, float]:
@@ -679,7 +756,11 @@ async def _analyze_quality(graph: GraphClient, project: str, path: str, limit: i
     t0 = time.monotonic()
     params: dict[str, Any] = {"project": project, "path": path}
     pa_m = " AND m.file_path STARTS WITH $path" if path else ""
-    pa_m1 = " AND m1.file_path STARTS WITH $path" if path else ""
+    # Match on either side so a scoped module's fan-in from out-of-scope
+    # importers (and fan-out to out-of-scope targets) are both captured.
+    # Filtering on m1 alone (the importer) would undercount fan-in for
+    # in-scope modules imported from outside the path.
+    pa_edge = " AND (m1.file_path STARTS WITH $path OR m2.file_path STARTS WITH $path)" if path else ""
 
     # Query 1: entity counts per module
     entity_raw = await graph.execute(
@@ -699,24 +780,28 @@ async def _analyze_quality(graph: GraphClient, project: str, path: str, limit: i
     direct_raw = await graph.execute(
         "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
         "(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2{pa_m1} "
+        f"WHERE m1 <> m2{pa_edge} "
         "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
         params,
     )
     indirect_raw = await graph.execute(
         "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
         "<-[:DEFINES]-(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2 AND NOT e:Module{pa_m1} "
+        f"WHERE m1 <> m2 AND NOT e:Module{pa_edge} "
         "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
         params,
     )
     edge_weights = _module_imports_from_records(direct_raw, indirect_raw)
 
-    # Collect all modules (including those with no edges)
+    # Collect all modules (including those with no edges). When scoped to a
+    # path, restrict to modules the entity query actually matched — edge
+    # endpoints outside the path (now included above for accurate fan-in)
+    # must not be scored as if they were in-scope modules.
     all_modules: set[str] = set(entity_counts.keys())
-    for from_mod, to_mod in edge_weights:
-        all_modules.add(from_mod)
-        all_modules.add(to_mod)
+    if not path:
+        for from_mod, to_mod in edge_weights:
+            all_modules.add(from_mod)
+            all_modules.add(to_mod)
 
     metrics = _compute_quality_flags(all_modules, entity_counts, file_paths, edge_weights, limit)
 
@@ -732,11 +817,12 @@ async def _analyze_quality(graph: GraphClient, project: str, path: str, limit: i
 async def _diagram_packages(graph: GraphClient, project: str, path: str, max_nodes: int) -> dict[str, Any]:
     t0 = time.monotonic()
     params: dict[str, Any] = {"project": project, "path": path, "limit": max_nodes}
+    pa = " AND child.file_path STARTS WITH $path" if path else ""
 
     # Packages and their contained modules
     records = await graph.execute(
         "MATCH (pkg:Package {project_name: $project})-[:CONTAINS]->(child) "
-        "WHERE child:Package OR child:Module "
+        f"WHERE (child:Package OR child:Module){pa} "
         "RETURN pkg.qualified_name AS parent_qn, pkg.name AS parent_name, "
         "labels(child)[0] AS child_label, child.qualified_name AS child_qn, child.name AS child_name "
         "ORDER BY parent_qn, child_qn LIMIT $limit",
@@ -812,14 +898,17 @@ async def _diagram_imports(graph: GraphClient, project: str, path: str, max_node
         all_nodes.add(to_mod)
 
     # If too many nodes, keep only those in highest-weight edges
+    # Keep scanning past the cap instead of stopping outright: a lower-weight
+    # edge whose two endpoints are already kept adds no new nodes and must
+    # still be included, not dropped just because the cap was hit earlier.
     sorted_edges = sorted(edge_weights.items(), key=lambda x: x[1], reverse=True)
     kept_nodes: set[str] = set()
     kept_edges: list[tuple[tuple[str, str], int]] = []
     for (from_mod, to_mod), weight in sorted_edges:
-        if len(kept_nodes) >= max_nodes:
-            break
-        kept_nodes.add(from_mod)
-        kept_nodes.add(to_mod)
+        new_nodes = {n for n in (from_mod, to_mod) if n not in kept_nodes}
+        if len(kept_nodes) + len(new_nodes) > max_nodes:
+            continue
+        kept_nodes.update(new_nodes)
         kept_edges.append(((from_mod, to_mod), weight))
 
     lines = ["graph LR"]
@@ -891,6 +980,26 @@ async def _diagram_inheritance(graph: GraphClient, project: str, path: str, max_
 # ---------------------------------------------------------------------------
 
 
+def _module_detail_entity_lines(
+    e: dict[str, Any],
+    eid: str,
+    class_methods: dict[str, list[dict[str, Any]]],
+    vis_prefix: dict[str, str],
+) -> list[str]:
+    """Render one entity's Mermaid classDiagram lines (class declaration + members)."""
+    lines = [f'    class {eid}["{_slabel(e["name"])}"]']
+    if e["label"] == "TypeDef":
+        lines.append(f"    <<{e['kind'] or 'class'}>> {eid}")
+        for meth in class_methods.get(e["qn"], []):
+            prefix = vis_prefix.get(meth["vis"] or "public", "+")
+            lines.append(f"    {eid} : {prefix}{meth['name']}()")
+    elif e["label"] == "Callable":
+        lines.append(f"    <<{e['kind'] or 'function'}>> {eid}")
+    elif e["label"] == "Value":
+        lines.append(f"    <<{e['kind'] or 'value'}>> {eid}")
+    return lines
+
+
 async def _diagram_module_detail(graph: GraphClient, project: str, path: str, max_nodes: int) -> dict[str, Any]:
     t0 = time.monotonic()
     params: dict[str, Any] = {"project": project, "path": path}
@@ -927,7 +1036,7 @@ async def _diagram_module_detail(graph: GraphClient, project: str, path: str, ma
         "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:DEFINES]->(method:Callable) "
         "RETURN td.qualified_name AS class_qn, td.name AS class_name, "
         "method.name AS name, method.visibility AS vis, method.kind AS kind "
-        "ORDER BY td.name, method.line_start",
+        f"ORDER BY td.name, method.line_start LIMIT {max_nodes}",
         {"uid": mod["uid"]},
     )
 
@@ -935,7 +1044,8 @@ async def _diagram_module_detail(graph: GraphClient, project: str, path: str, ma
     inherits = await graph.execute(
         "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:INHERITS]->(parent) "
         "RETURN td.qualified_name AS child_qn, td.name AS child_name, "
-        "parent.qualified_name AS parent_qn, parent.name AS parent_name",
+        "parent.qualified_name AS parent_qn, parent.name AS parent_name "
+        f"LIMIT {max_nodes}",
         {"uid": mod["uid"]},
     )
 
@@ -963,25 +1073,15 @@ async def _diagram_module_detail(graph: GraphClient, project: str, path: str, ma
         if eid in nodes:
             continue
         nodes.add(eid)
+        lines.extend(_module_detail_entity_lines(e, eid, class_methods, vis_prefix))
 
-        if e["label"] == "TypeDef":
-            lines.append(f'    class {eid}["{_slabel(e["name"])}"]')
-            kind = e["kind"] or "class"
-            lines.append(f"    <<{kind}>> {eid}")
-            # Add methods
-            for meth in class_methods.get(e["qn"], []):
-                prefix = vis_prefix.get(meth["vis"] or "public", "+")
-                lines.append(f"    {eid} : {prefix}{meth['name']}()")
-        elif e["label"] == "Callable":
-            lines.append(f'    class {eid}["{_slabel(e["name"])}"]')
-            lines.append(f"    <<{e['kind'] or 'function'}>> {eid}")
-        elif e["label"] == "Value":
-            lines.append(f'    class {eid}["{_slabel(e["name"])}"]')
-            lines.append(f"    <<{e['kind'] or 'value'}>> {eid}")
-
-    # Add inheritance edges
+    # Add inheritance edges. Skip children truncated out of the declared
+    # node set by the max_nodes cap on entities — otherwise Mermaid silently
+    # renders an unlabeled node for the dangling reference.
     for inh in inherits:
         child_id = _sid(inh["child_qn"])
+        if child_id not in nodes:
+            continue
         parent_id = _sid(inh["parent_qn"])
         if parent_id not in nodes:
             lines.append(f'    class {parent_id}["{_slabel(inh["parent_name"])}"]')
