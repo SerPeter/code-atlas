@@ -751,3 +751,199 @@ type ReadWriter interface {
     embedded_names = {r.to_name for r in inherits}
     assert "Reader" in embedded_names
     assert "Writer" in embedded_names
+
+
+# ---------------------------------------------------------------------------
+# 21. Multi-name var/const specs
+# ---------------------------------------------------------------------------
+
+
+def test_var_multi_name():
+    """'var a, b, c int' must declare all three names, not just the first."""
+    parsed = _parse("""\
+package main
+
+var a, b, c int
+""")
+    a = _entity_by_name(parsed, "a")
+    b = _entity_by_name(parsed, "b")
+    c = _entity_by_name(parsed, "c")
+    for entity in (a, b, c):
+        assert entity.label == NodeLabel.VALUE
+        assert entity.kind == ValueKind.VARIABLE
+
+    defines = _rels_from(parsed, "src.example", RelType.DEFINES)
+    targets = {r.to_name for r in defines}
+    assert f"{PROJECT}:src.example.a" in targets
+    assert f"{PROJECT}:src.example.b" in targets
+    assert f"{PROJECT}:src.example.c" in targets
+
+
+def test_var_multi_name_with_values():
+    """'var x, y = f()' (no explicit type, initializer expression) must also capture all names."""
+    parsed = _parse("""\
+package main
+
+func f() (int, int) { return 1, 2 }
+
+var x, y = f()
+""")
+    x = _entity_by_name(parsed, "x")
+    y = _entity_by_name(parsed, "y")
+    assert x.kind == ValueKind.VARIABLE
+    assert y.kind == ValueKind.VARIABLE
+
+
+def test_const_multi_name_grouped():
+    """'A, B = 1, 2' inside a grouped const block must declare both names."""
+    parsed = _parse("""\
+package main
+
+const (
+    A, B = 1, 2
+)
+""")
+    a = _entity_by_name(parsed, "A")
+    b = _entity_by_name(parsed, "B")
+    assert a.kind == ValueKind.CONSTANT
+    assert b.kind == ValueKind.CONSTANT
+
+
+# ---------------------------------------------------------------------------
+# 22. Multiple init() functions
+# ---------------------------------------------------------------------------
+
+
+def test_single_init_function_bare_qn():
+    """A single init() keeps the bare qualified_name (no suffix churn for the common case)."""
+    parsed = _parse("""\
+package main
+
+func init() {}
+""")
+    func = _entity_by_name(parsed, "init")
+    assert func.qualified_name == f"{PROJECT}:src.example.init"
+
+
+def test_multiple_init_functions_unique_qns():
+    """Go permits multiple init() per file; each must survive as a distinct entity."""
+    parsed = _parse("""\
+package main
+
+func init() { setupA() }
+
+func init() { setupB() }
+""")
+    inits = [e for e in parsed.entities if e.name == "init"]
+    assert len(inits) == 2, f"Expected 2 init entities, got {len(inits)}"
+    qns = [e.qualified_name for e in inits]
+    assert len(set(qns)) == 2, f"init functions collided on qualified_name: {qns}"
+    for entity in inits:
+        assert "init_func" in entity.tags
+
+    # Each init's own CALLS must be attributed to its own qn, not a merged/shared one.
+    calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+    setup_a_callers = {r.from_qualified_name for r in calls if r.to_name == "setupA"}
+    setup_b_callers = {r.from_qualified_name for r in calls if r.to_name == "setupB"}
+    assert setup_a_callers == {qns[0]}
+    assert setup_b_callers == {qns[1]}
+
+    # Both must have their own DEFINES edge from the module.
+    defines = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name in qns]
+    assert {r.to_name for r in defines} == set(qns)
+
+
+# ---------------------------------------------------------------------------
+# 23. USES_TYPE extraction
+# ---------------------------------------------------------------------------
+
+
+def test_uses_type_function_params_and_return():
+    parsed = _parse("""\
+package main
+
+import "io"
+
+func Handle(r io.Reader, item *Widget) (*Response, error) { return nil, nil }
+""")
+    uses = _rels_from(parsed, "src.example.Handle", RelType.USES_TYPE)
+    used = {r.to_name for r in uses}
+    assert "Reader" in used
+    assert "Widget" in used
+    assert "Response" in used
+    assert "error" not in used
+
+
+def test_uses_type_method():
+    parsed = _parse("""\
+package main
+
+func (s *Server) Process(req *Request) *Result { return nil }
+""")
+    uses = _rels_from(parsed, "src.example.Server.Process", RelType.USES_TYPE)
+    used = {r.to_name for r in uses}
+    assert "Request" in used
+    assert "Result" in used
+
+
+def test_uses_type_builtin_params_excluded():
+    """Predeclared Go types (int, string, error, ...) never produce USES_TYPE."""
+    parsed = _parse("""\
+package main
+
+func Add(a int, b int) int { return a + b }
+""")
+    uses = _rels_from(parsed, "src.example.Add", RelType.USES_TYPE)
+    assert uses == []
+
+
+def test_uses_type_generic_and_slice():
+    parsed = _parse("""\
+package main
+
+func Filter(items []Widget, cache Cache[Widget]) []Widget { return items }
+""")
+    uses = _rels_from(parsed, "src.example.Filter", RelType.USES_TYPE)
+    used = {r.to_name for r in uses}
+    assert "Widget" in used
+    assert "Cache" in used
+
+
+def test_uses_type_no_params_no_return():
+    parsed = _parse("""\
+package main
+
+func DoNothing() {}
+""")
+    uses = _rels_from(parsed, "src.example.DoNothing", RelType.USES_TYPE)
+    assert uses == []
+
+
+def test_uses_type_generic_function_excludes_type_params():
+    """Generic type parameters (K, V) must not leak into USES_TYPE as bogus types."""
+    parsed = _parse("""\
+package main
+
+func Get[K comparable, V any](m map[K]V, extra Widget) V { var v V; return v }
+""")
+    uses = _rels_from(parsed, "src.example.Get", RelType.USES_TYPE)
+    used = {r.to_name for r in uses}
+    assert "K" not in used
+    assert "V" not in used
+    assert "Widget" in used
+
+
+def test_uses_type_generic_method_excludes_receiver_type_params():
+    """A generic receiver's type parameters (K, V) must not leak into USES_TYPE."""
+    parsed = _parse("""\
+package main
+
+type Cache[K comparable, V any] struct{}
+
+func (c *Cache[K, V]) Get(k K, extra Widget) (V, bool) { var v V; return v, false }
+""")
+    uses = _rels_from(parsed, "src.example.Cache.Get", RelType.USES_TYPE)
+    used = {r.to_name for r in uses}
+    assert "K" not in used
+    assert "V" not in used
+    assert "Widget" in used

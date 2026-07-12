@@ -150,6 +150,26 @@ def _detect_build_tags(root: Node, source: bytes) -> list[str]:
     return tags
 
 
+def _init_func_ordinals(root: Node) -> dict[int, int]:
+    """Map ``node.id`` -> 1-based ordinal for each top-level ``func init()`` when 2+ exist.
+
+    Go explicitly permits multiple ``init`` functions per file (and per package); without
+    disambiguation they'd all collapse onto the same qualified_name ``{module_qn}.init``,
+    silently dropping all but one on upsert. Ordinal position is the only content-derived
+    disambiguator available since every ``init`` has an identical (empty) signature.
+    """
+    inits = [
+        child
+        for child in root.children
+        if child.type == "function_declaration"
+        and (name_node := child.child_by_field_name("name")) is not None
+        and node_text(name_node) == "init"
+    ]
+    if len(inits) < 2:
+        return {}
+    return {node.id: i + 1 for i, node in enumerate(inits)}
+
+
 def _is_embedding(field_node: Node) -> str | None:
     """Check if a struct field_declaration is an embedding (anonymous field).
 
@@ -221,6 +241,155 @@ def _extract_calls(
 
 
 # ---------------------------------------------------------------------------
+# Extract type references (USES_TYPE)
+# ---------------------------------------------------------------------------
+
+_GO_BUILTIN_TYPES: frozenset[str] = frozenset(
+    {
+        "bool",
+        "byte",
+        "complex64",
+        "complex128",
+        "error",
+        "float32",
+        "float64",
+        "int",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "rune",
+        "string",
+        "uint",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "uintptr",
+        "any",
+        "comparable",
+    }
+)
+
+
+def _walk_type_node_go(node: Node, names: list[str], seen: set[str]) -> None:
+    """Recursively collect non-builtin ``type_identifier`` names from a Go type node.
+
+    Handles pointer/slice/array/map/channel/generic types by falling through to a
+    generic child walk -- package qualifiers (``io.Reader``) are handled for free
+    since ``qualified_type``'s package half is a ``package_identifier``, not a
+    ``type_identifier``, so only the type's own name is ever collected.
+    """
+    if node.type == "type_identifier":
+        name = node_text(node)
+        if name not in _GO_BUILTIN_TYPES and name not in seen:
+            seen.add(name)
+            names.append(name)
+        return
+    for child in node.named_children:
+        _walk_type_node_go(child, names, seen)
+
+
+def _collect_param_types_go(params: Node, names: list[str], seen: set[str]) -> None:
+    """Walk parameter_declaration/variadic_parameter_declaration children of a parameter_list."""
+    for param in params.children:
+        if param.type in ("parameter_declaration", "variadic_parameter_declaration"):
+            type_node = param.child_by_field_name("type")
+            if type_node is not None:
+                _walk_type_node_go(type_node, names, seen)
+
+
+def _collect_type_param_names_go(node: Node, names: set[str]) -> None:
+    """Collect generic type parameter names from a ``type_parameters`` field.
+
+    Applies to ``function_declaration``/``type_spec`` nodes, e.g. ``[K comparable, V any]``.
+    These are placeholders scoped to the declaration, not real referenced types.
+    """
+    type_params = node.child_by_field_name("type_parameters")
+    if type_params is None:
+        return
+    for child in type_params.children:
+        if child.type == "type_parameter_declaration":
+            for grandchild in child.children:
+                if grandchild.type == "identifier":
+                    names.add(node_text(grandchild))
+
+
+def _collect_receiver_type_param_names_go(node: Node, names: set[str]) -> None:
+    """Collect generic type parameter names from a method's receiver, e.g. ``(c *Cache[K, V])``.
+
+    ``K``/``V`` here are the method's own type parameters (bound by the receiver's
+    generic type declaration), not real referenced types.
+    """
+    if node.type != "method_declaration":
+        return
+    for child in node.children:
+        if child.type == "parameter_list":
+            for param in child.children:
+                if param.type == "parameter_declaration":
+                    type_node = param.child_by_field_name("type")
+                    if type_node is not None:
+                        _collect_generic_type_arg_names_go(type_node, names)
+            break
+
+
+def _collect_generic_type_arg_names_go(type_node: Node, names: set[str]) -> None:
+    """Walk a receiver type down to its ``generic_type`` and collect ``type_arguments`` names."""
+    if type_node.type == "pointer_type":
+        for child in type_node.named_children:
+            _collect_generic_type_arg_names_go(child, names)
+        return
+    if type_node.type == "generic_type":
+        type_args = type_node.child_by_field_name("type_arguments")
+        if type_args is None:
+            return
+        for child in type_args.named_children:
+            if child.type == "type_identifier":
+                names.add(node_text(child))
+            else:
+                for grandchild in child.named_children:
+                    if grandchild.type == "type_identifier":
+                        names.add(node_text(grandchild))
+
+
+def _extract_type_refs_go(
+    node: Node,
+    from_qn: str,
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Extract USES_TYPE relationships from a Go function/method's parameter and result types."""
+    names: list[str] = []
+    seen: set[str] = set()
+
+    # Generic type parameters (K, V, T, ...) are placeholders, not real types -- seed
+    # `seen` with them so `_walk_type_node_go` skips them like it does builtins.
+    _collect_type_param_names_go(node, seen)
+    _collect_receiver_type_param_names_go(node, seen)
+
+    params = node.child_by_field_name("parameters")
+    if params is not None:
+        _collect_param_types_go(params, names, seen)
+
+    # `result` is a parameter_list for grouped/named returns, or a bare type node
+    # for a single unnamed return value (e.g. `func f() *Response`).
+    result = node.child_by_field_name("result")
+    if result is not None:
+        if result.type == "parameter_list":
+            _collect_param_types_go(result, names, seen)
+        else:
+            _walk_type_node_go(result, names, seen)
+
+    relationships.extend(
+        ParsedRelationship(
+            from_qualified_name=from_qn,
+            rel_type=RelType.USES_TYPE,
+            to_name=name,
+        )
+        for name in names
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main parse function
 # ---------------------------------------------------------------------------
 
@@ -238,6 +407,9 @@ def _parse_go(
 
     # Detect file-level build tags from comments before package clause
     file_tags = _detect_build_tags(root, source)
+
+    # Disambiguate multiple `func init()` declarations (Go allows unlimited per file)
+    init_ordinals = _init_func_ordinals(root)
 
     # Module entity
     module_name = module_qn.rsplit(".", 1)[-1] if "." in module_qn else module_qn
@@ -261,7 +433,16 @@ def _parse_go(
         elif child.type == "type_declaration":
             _process_type_declaration(child, path, source, project_name, module_qn, entities, relationships)
         elif child.type == "function_declaration":
-            _process_function(child, path, source, project_name, module_qn, entities, relationships)
+            _process_function(
+                child,
+                path,
+                source,
+                project_name,
+                module_qn,
+                entities,
+                relationships,
+                init_ordinal=init_ordinals.get(child.id),
+            )
         elif child.type == "method_declaration":
             _process_method(child, path, source, project_name, module_qn, entities, relationships)
         elif child.type == "const_declaration":
@@ -563,13 +744,21 @@ def _process_function(
     module_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    *,
+    init_ordinal: int | None = None,
 ) -> None:
-    """Process a function_declaration."""
+    """Process a function_declaration.
+
+    ``init_ordinal`` disambiguates multiple ``func init()`` declarations in the same
+    file (Go allows unlimited); when set, the qualified_name segment becomes
+    ``init(<ordinal>)`` while the entity's bare ``name`` stays ``init``.
+    """
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
     name = node_text(name_node)
-    qn = f"{module_qn}.{name}"
+    qn_name = f"{name}({init_ordinal})" if init_ordinal is not None else name
+    qn = f"{module_qn}.{qn_name}"
     docstring = _extract_doc_comment(node, source)
     signature = _extract_function_signature(node, source)
 
@@ -621,6 +810,9 @@ def _process_function(
             to_name=f"{project_name}:{qn}",
         )
     )
+
+    # Extract USES_TYPE from parameter/result type annotations
+    _extract_type_refs_go(node, f"{project_name}:{qn}", relationships)
 
     # Extract call sites from body
     body = node.child_by_field_name("body")
@@ -694,6 +886,9 @@ def _process_method(
             )
         )
 
+    # Extract USES_TYPE from parameter/result type annotations
+    _extract_type_refs_go(node, f"{project_name}:{qn}", relationships)
+
     # Extract call sites from body
     body = node.child_by_field_name("body")
     if body is not None:
@@ -733,35 +928,43 @@ def _process_const_var_spec(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
 ) -> None:
-    """Process a single const_spec or var_spec."""
-    name_node = spec.child_by_field_name("name")
-    if name_node is None:
+    """Process a single const_spec or var_spec.
+
+    Multi-name specs (``var a, b, c int``, ``const A, B = 1, 2``) declare every name via
+    the ``name`` field, but tree-sitter-go also tags the separating commas with that same
+    field -- so filter direct children by node type (``identifier``) rather than trusting
+    the field alone, mirroring the ``field_identifier`` filter already used for struct fields.
+    """
+    name_nodes = [child for child in spec.children if child.type == "identifier"]
+    if not name_nodes:
         return
-    name = node_text(name_node)
-    qn = f"{module_qn}.{name}"
 
-    entities.append(
-        ParsedEntity(
-            name=name,
-            qualified_name=f"{project_name}:{qn}",
-            label=NodeLabel.VALUE,
-            kind=kind,
-            line_start=spec.start_point[0] + 1,
-            line_end=spec.end_point[0] + 1,
-            file_path=path,
-            source=node_text(spec),
-            visibility=_visibility_from_name(name),
-        )
-    )
+    for name_node in name_nodes:
+        name = node_text(name_node)
+        qn = f"{module_qn}.{name}"
 
-    # DEFINES: module -> const/var
-    relationships.append(
-        ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
-            rel_type=RelType.DEFINES,
-            to_name=f"{project_name}:{qn}",
+        entities.append(
+            ParsedEntity(
+                name=name,
+                qualified_name=f"{project_name}:{qn}",
+                label=NodeLabel.VALUE,
+                kind=kind,
+                line_start=spec.start_point[0] + 1,
+                line_end=spec.end_point[0] + 1,
+                file_path=path,
+                source=node_text(spec),
+                visibility=_visibility_from_name(name),
+            )
         )
-    )
+
+        # DEFINES: module -> const/var
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{module_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qn}",
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
