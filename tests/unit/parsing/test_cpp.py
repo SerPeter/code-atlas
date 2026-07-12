@@ -209,13 +209,17 @@ class TestCIncludes:
         parsed = _parse("#include <stdio.h>\n")
         imports = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
         imported = {r.to_name for r in imports}
-        assert "<stdio.h>" in imported
+        assert "stdio.h" in imported
+        # No angle-bracket delimiters should leak into the import name
+        assert "<stdio.h>" not in imported
 
     def test_local_include(self):
         parsed = _parse('#include "local.h"\n')
         imports = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
         imported = {r.to_name for r in imports}
-        assert '"local.h"' in imported
+        assert "local.h" in imported
+        # No quote delimiters should leak into the import name
+        assert '"local.h"' not in imported
 
 
 # ---------------------------------------------------------------------------
@@ -1005,3 +1009,67 @@ void Widget::draw() { }
         assert len(rels) == 1
         assert rels[0].from_qualified_name == f"{PROJECT}:src.widget"
         assert rels[0].properties["parent_type_name"] == "Widget"
+
+
+# ---------------------------------------------------------------------------
+# 30. Operator overloads
+# ---------------------------------------------------------------------------
+
+
+class TestCppOperatorOverloads:
+    def test_in_class_operator_overload(self):
+        """An in-class operator overload definition must produce a Callable entity."""
+        parsed = _parse(
+            """\
+class Widget {
+public:
+    Widget operator+(const Widget& other) const { return *this; }
+};
+""",
+            path="src/widget.cpp",
+        )
+        op = _entity_by_name(parsed, "operator+")
+        assert op.label == NodeLabel.CALLABLE
+        assert op.kind == CallableKind.METHOD
+        assert op.qualified_name == f"{PROJECT}:src.widget.Widget.operator+"
+
+    def test_out_of_line_operator_overload(self):
+        """Control: out-of-line operator overloads already resolved via qualified_identifier."""
+        parsed = _parse(
+            "Widget Widget::operator+(const Widget& other) const { return *this; }\n",
+            path="src/widget.cpp",
+        )
+        op = _entity_by_name(parsed, "operator+")
+        assert op.label == NodeLabel.CALLABLE
+        assert op.kind == CallableKind.METHOD
+        assert op.qualified_name == f"{PROJECT}:src.widget.Widget.operator+"
+
+
+# ---------------------------------------------------------------------------
+# 31. Nested-scope out-of-line definitions (A::B::f)
+# ---------------------------------------------------------------------------
+
+
+class TestCppNestedScopeOutOfLine:
+    def test_nested_scope_out_of_line_method(self):
+        parsed = _parse("void Outer::Inner::method() {}\n", path="src/nested.cpp")
+        method = _entity_by_name(parsed, "method")
+        assert method.label == NodeLabel.CALLABLE
+        # Qualified name must be dot-joined only — no '::' leaking from the scope chain
+        assert method.qualified_name == f"{PROJECT}:src.nested.Outer.Inner.method"
+        assert "::" not in method.qualified_name
+
+        rels = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name == method.qualified_name]
+        assert len(rels) == 1
+        assert rels[0].from_qualified_name == f"{PROJECT}:src.nested"
+        # parent_type_name must be the bare innermost class name, not 'Inner::method'
+        # or a '::'-qualified chain
+        assert rels[0].properties["parent_type_name"] == "Inner"
+
+    def test_nested_scope_out_of_line_constructor(self):
+        """Constructor detection must use the bare innermost class name."""
+        parsed = _parse("Outer::Inner::Inner() {}\n", path="src/nested.cpp")
+        ctor = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.name == "Inner"]
+        assert len(ctor) == 1
+        assert ctor[0].kind == CallableKind.CONSTRUCTOR
+        assert ctor[0].qualified_name == f"{PROJECT}:src.nested.Outer.Inner.Inner"

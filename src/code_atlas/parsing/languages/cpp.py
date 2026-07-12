@@ -214,6 +214,7 @@ _LEAF_DECLARATOR_TYPES = frozenset(
         "field_identifier",
         "primitive_type",  # tree-sitter-c treats some typedef names (e.g. size_t) as primitive_type
         "destructor_name",  # ~ClassName
+        "operator_name",  # operator+, operator==, etc. — no 'declarator' field, no named children
     }
 )
 
@@ -270,11 +271,16 @@ def _prototype_declarator(declarator: Node) -> Node | None:
     return node
 
 
-def _get_qualified_declarator_name(declarator: Node) -> tuple[str | None, str | None]:
-    """Extract name from declarator, returning (scope, name) for qualified names.
+def _get_qualified_declarator_name(declarator: Node) -> tuple[list[str], str | None]:
+    """Extract name from declarator, returning (scope_parts, name) for qualified names.
 
-    For ``ClassName::method_name``, returns ``("ClassName", "method_name")``.
-    For ``plain_func``, returns ``(None, "plain_func")``.
+    For ``Outer::Inner::method_name``, returns ``(["Outer", "Inner"], "method_name")``
+    — tree-sitter-cpp parses this as ``qualified_identifier(scope: 'Outer', name:
+    qualified_identifier('Inner::method_name'))``, so nested scopes are unwrapped
+    recursively rather than taking the inner qualified_identifier's text verbatim
+    (which would otherwise leak a '::'-joined name like 'Inner::method_name').
+    For ``ClassName::method_name``, returns ``(["ClassName"], "method_name")``.
+    For ``plain_func``, returns ``([], "plain_func")``.
     """
     if declarator.type == "qualified_identifier":
         scope_node = declarator.child_by_field_name("scope")
@@ -283,17 +289,21 @@ def _get_qualified_declarator_name(declarator: Node) -> tuple[str | None, str | 
             # Box<T>::method — strip template arguments from the scope
             scope_node = scope_node.child_by_field_name("name") or scope_node
         scope = node_text(scope_node) if scope_node is not None else None
+        scope_parts = [scope] if scope else []
+        if name_node is not None and name_node.type == "qualified_identifier":
+            inner_scope_parts, name = _get_qualified_declarator_name(name_node)
+            return (scope_parts + inner_scope_parts, name)
         name = node_text(name_node) if name_node is not None else None
-        return (scope, name)
+        return (scope_parts, name)
 
     # function_declarator wrapping a qualified_identifier
     inner = declarator.child_by_field_name("declarator")
     if inner is not None:
         if inner.type == "qualified_identifier":
             return _get_qualified_declarator_name(inner)
-        return (None, _get_declarator_name(inner))
+        return ([], _get_declarator_name(inner))
 
-    return (None, _get_declarator_name(declarator))
+    return ([], _get_declarator_name(declarator))
 
 
 def _is_destructor_name(name: str) -> bool:
@@ -537,6 +547,21 @@ def _walk_translation_unit(  # noqa: PLR0912
             continue
 
 
+def _include_path_text(path_node: Node) -> str:
+    """Strip delimiters from a #include path node's text.
+
+    ``system_lib_string`` (``<vector>``) and ``string_literal`` (``"util.h"``)
+    both include their delimiters in ``node.text`` — strip them so the emitted
+    IMPORTS name is a bare path (``vector``, ``util.h``) instead of garbage
+    like ``<vector>`` or ``"util.h"`` (which corrupts ExternalPackage naming
+    downstream in ``resolve_imports``).
+    """
+    text = node_text(path_node)
+    if len(text) >= 2 and text[0] in '<"' and text[-1] in '>"':
+        return text[1:-1]
+    return text
+
+
 def _process_include(
     node: Node,
     project_name: str,
@@ -549,7 +574,7 @@ def _process_include(
     path_node = node.child_by_field_name("path")
     if path_node is None:
         return
-    include_path = node_text(path_node)
+    include_path = _include_path_text(path_node)
     if not include_path:
         return
 
@@ -886,7 +911,7 @@ def _process_function(
     template_parent = _template_wrapper(node)
     if template_parent is not None:
         tags.append("template")
-    scope, name = _get_qualified_declarator_name(declarator)
+    scope_parts, name = _get_qualified_declarator_name(declarator)
 
     if name is None:
         return
@@ -898,22 +923,25 @@ def _process_function(
     signature = _extract_function_signature(node, source)
 
     # Determine if this is a method (inside class body or qualified with class scope)
-    is_method = bool(class_stack) or (is_cpp and scope is not None)
+    is_method = bool(class_stack) or (is_cpp and bool(scope_parts))
 
     parent_type_name: str | None = None
     if is_method:
-        # Method inside class body or qualified (ClassName::method)
-        actual_class = class_stack[-1] if class_stack else (scope or "")
+        # Method inside class body or qualified (ClassName::method, or
+        # Outer::Inner::method for nested-scope definitions)
+        actual_class = class_stack[-1] if class_stack else (scope_parts[-1] if scope_parts else "")
         kind = _method_callable_kind(name, actual_class, tags)
 
-        if not class_stack and scope is not None:
+        if not class_stack and scope_parts:
             # Out-of-line definition — the class usually lives in another file
             # (header/impl split), so emit its NAME for post-batch resolution
             # (GraphClient.resolve_member_defines).  Fallback parent is this
-            # file's Module (namespaces have no nodes).
-            qn = _build_qn(module_qn, namespace_parts, [scope], name)
+            # file's Module (namespaces have no nodes).  parent_type_name is
+            # the bare innermost class name (last scope part) — the resolver
+            # matches on TypeDef name, not a '::'-qualified chain.
+            qn = _build_qn(module_qn, namespace_parts, scope_parts, name)
             parent_qn_str = f"{project_name}:{module_qn}"
-            parent_type_name = scope
+            parent_type_name = scope_parts[-1]
         else:
             qn = _build_qn(module_qn, namespace_parts, class_stack, name)
             parent_qn_str = _parent_qn(project_name, module_qn, namespace_parts, class_stack)
