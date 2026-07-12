@@ -78,11 +78,16 @@ def _parse_markdown(
     )
     entities.append(doc_file)
 
-    # Walk top-level section nodes
+    # Walk top-level section nodes. seen_qns tracks every DocSection qualified_name
+    # emitted so far in this file so duplicate sibling headings (same breadcrumb)
+    # get disambiguated instead of silently colliding.
     heading_stack: list[tuple[int, str]] = []
+    seen_qns: dict[str, int] = {}
     for child in root.children:
         if child.type == "section":
-            _process_md_section(child, path, source, project_name, file_qn, heading_stack, entities, relationships)
+            _process_md_section(
+                child, path, source, project_name, file_qn, heading_stack, entities, relationships, seen_qns
+            )
 
     return ParsedFile(
         file_path=path,
@@ -199,6 +204,19 @@ def _extract_doc_references(title: str, content: str | None, level: int) -> list
     return list(refs.values())
 
 
+def _dedupe_section_qn(section_qn: str, seen_qns: dict[str, int]) -> str:
+    """Disambiguate a DocSection qualified_name against duplicate sibling headings.
+
+    Two sibling headings sharing the same title (and thus the same breadcrumb)
+    would otherwise produce identical qualified_names, colliding on the same
+    uid downstream. The first occurrence keeps the bare qn; every further
+    occurrence gets a stable ``#N`` suffix so no section is silently dropped.
+    """
+    occurrence = seen_qns.get(section_qn, 0) + 1
+    seen_qns[section_qn] = occurrence
+    return section_qn if occurrence == 1 else f"{section_qn}#{occurrence}"
+
+
 def _emit_md_section(
     *,
     path: str,
@@ -214,6 +232,7 @@ def _emit_md_section(
     section_end_line: int,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    seen_qns: dict[str, int],
 ) -> None:
     """Create a DocSection entity and CONTAINS relationship."""
     # Update heading stack
@@ -244,7 +263,7 @@ def _emit_md_section(
         name = title
         breadcrumb = header_path or title
 
-    section_qn = f"{project_name}:{posix_path} > {breadcrumb}"
+    section_qn = _dedupe_section_qn(f"{project_name}:{posix_path} > {breadcrumb}", seen_qns)
 
     entities.append(
         ParsedEntity(
@@ -333,6 +352,19 @@ def _split_md_section_children(
     return items
 
 
+def _node_end_line(node: Node) -> int:
+    """Convert a node's ``end_point`` into a 1-based, inclusive end line number.
+
+    Block nodes normally consume their trailing newline, so ``end_point`` lands
+    at column 0 of the row *after* the last content line — using the 0-based
+    row directly already yields the correct 1-based line number in that case.
+    When the node ends mid-line (no trailing newline to consume, e.g. EOF),
+    the row must be incremented to get the correct 1-based number.
+    """
+    row, col = node.end_point
+    return row if col == 0 else row + 1
+
+
 def _process_md_section(
     section_node: Node,
     path: str,
@@ -342,6 +374,7 @@ def _process_md_section(
     heading_stack: list[tuple[int, str]],
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    seen_qns: dict[str, int],
 ) -> None:
     """Process a section node, emitting DocSection entities.
 
@@ -351,7 +384,9 @@ def _process_md_section(
     """
     for kind, payload in _split_md_section_children(section_node):
         if kind == "subsection":
-            _process_md_section(payload, path, source, project_name, file_qn, heading_stack, entities, relationships)
+            _process_md_section(
+                payload, path, source, project_name, file_qn, heading_stack, entities, relationships, seen_qns
+            )
             continue
 
         heading_node, content_nodes = payload
@@ -364,9 +399,9 @@ def _process_md_section(
             section_start = content_nodes[0].start_point[0] + 1 if content_nodes else 1
 
         section_end = (
-            content_nodes[-1].end_point[0]
+            _node_end_line(content_nodes[-1])
             if content_nodes
-            else heading_node.end_point[0]
+            else _node_end_line(heading_node)
             if heading_node is not None
             else section_start
         )
@@ -385,6 +420,7 @@ def _process_md_section(
             section_end_line=section_end,
             entities=entities,
             relationships=relationships,
+            seen_qns=seen_qns,
         )
 
     # Restore heading stack for sibling sections
