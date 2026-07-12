@@ -278,6 +278,81 @@ class TestStartupCatchup:
 # ---------------------------------------------------------------------------
 
 
+class TestWatcherScopeScan:
+    """The watcher's FileScope must be scan()ned before it starts filtering.
+
+    FileScope only discovers nested .gitignore files as a side effect of
+    scan() (they're recorded while walking). Building it and handing it
+    straight to the watcher without scanning means nested-.gitignore'd
+    files are never excluded from live watching, even though a full/delta
+    ``atlas index`` run (which does call scan()) excludes them correctly.
+    """
+
+    async def test_scope_scanned_and_known_files_passed_to_watcher(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state: dict[str, Any] = {"scanned": False}
+
+        class FakeScope:
+            def __init__(self, root: object, settings: object) -> None:
+                pass
+
+            def scan(self) -> list[str]:
+                state["scanned"] = True
+                return ["a.py", "b.py"]
+
+            def is_included(self, rel_path: str) -> bool:
+                return True
+
+        captured: dict[str, Any] = {}
+
+        class FakeWatcher:
+            def __init__(
+                self,
+                root: object,
+                bus: object,
+                scope: object,
+                settings: object,
+                *,
+                sub_projects: object = None,
+                root_name: str = "",
+                known_files: list[str] | None = None,
+            ) -> None:
+                captured["known_files"] = known_files
+                self._stop = False
+
+            @property
+            def stopped(self) -> bool:
+                return self._stop
+
+            def stop(self) -> None:
+                self._stop = True
+
+            async def run(self) -> None:
+                return  # clean exit — no crash, nothing to supervise
+
+        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr(daemon_module, "FileScope", FakeScope)
+        monkeypatch.setattr(daemon_module, "FileWatcher", FakeWatcher)
+        monkeypatch.setattr(daemon_module, "detect_sub_projects", lambda root, mono: [])
+        monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
+
+        manager = DaemonManager()
+        started = await manager.start(
+            _make_settings(tmp_path),
+            object(),  # type: ignore[arg-type]
+            include_watcher=True,
+            catchup=False,
+        )
+        assert started is True
+        await asyncio.sleep(0.05)
+
+        assert state["scanned"] is True
+        assert captured["known_files"] == ["a.py", "b.py"]
+
+        await manager.stop()
+
+
 class TestDaemonCliWiring:
     """`atlas daemon start` must start the file watcher (the pipeline's producer)."""
 

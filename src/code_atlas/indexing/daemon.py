@@ -101,6 +101,13 @@ class DaemonManager:
 
         if include_watcher:
             scope = FileScope(settings.project_root, settings)
+            # FileScope only discovers nested .gitignore files as a side effect
+            # of scan() (recorded while walking) — without it, the watcher
+            # would filter live changes without ever loading them, indexing
+            # files the full/delta indexer excludes. The returned file list
+            # also seeds known-files tracking for directory rename/delete
+            # detection (a bare directory path never matches the include spec).
+            known_files = await asyncio.to_thread(scope.scan)
             subs = detect_sub_projects(settings.project_root, settings.monorepo)
             root_name = derive_project_name(settings.project_root)
             self._watcher = FileWatcher(
@@ -110,6 +117,7 @@ class DaemonManager:
                 settings.watcher,
                 sub_projects=subs or None,
                 root_name=root_name,
+                known_files=known_files,
             )
 
         # Spawn the watcher first so no change is missed while catch-up runs;

@@ -340,6 +340,24 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         sub_projects = detect_sub_projects(project_root, settings.monorepo)
         is_monorepo = bool(sub_projects) or bool(projects)
 
+        # A --scope path (explicit or auto-derived from a subdirectory target) must
+        # not be silently discarded when monorepo mode kicks in — translate it into
+        # the sub-project(s) it touches. If it touches none, it's entirely within
+        # root-only territory, so fall back to a plain scoped single-project index
+        # instead of indexing the whole monorepo.
+        if is_monorepo and scope:
+            normalized_scope = [s.replace("\\", "/").rstrip("/") for s in scope]
+            matched = {
+                sp.name
+                for sp in sub_projects
+                for s in normalized_scope
+                if s == sp.path or s.startswith(sp.path + "/") or sp.path.startswith(s + "/")
+            }
+            if matched:
+                projects = sorted(set(projects or []) | matched)
+            else:
+                is_monorepo = False
+
         if is_monorepo:
             results = await _index_monorepo_with_progress(
                 settings, graph, bus, projects=projects, full_reindex=full_reindex

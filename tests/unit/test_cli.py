@@ -201,6 +201,109 @@ class TestVerbose:
 # ---------------------------------------------------------------------------
 
 
+class TestMonorepoScopeDispatch:
+    """--scope (or the auto-derived subdirectory scope) must not be silently
+    discarded when monorepo mode kicks in — regression for the "indexes the
+    entire monorepo" finding: monorepo mode used to ignore ``scope`` entirely
+    and always index every detected sub-project.
+    """
+
+    async def _patch_common(self, monkeypatch, sub_projects) -> dict:
+        from code_atlas import cli
+
+        captured: dict = {}
+
+        class FakeBus:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def ping(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        class FakeGraph:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def ping(self) -> None:
+                return None
+
+            async def ensure_schema(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        async def fake_monorepo_with_progress(settings, graph, bus, *, projects, full_reindex):
+            captured["dispatch"] = "monorepo"
+            captured["projects"] = projects
+            return []
+
+        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex):
+            from code_atlas.indexing.orchestrator import IndexResult
+
+            captured["dispatch"] = "single"
+            captured["scope"] = scope
+            return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=0.0)
+
+        monkeypatch.setattr("code_atlas.events.EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", FakeGraph)
+        monkeypatch.setattr("code_atlas.indexing.orchestrator.detect_sub_projects", lambda root, mono: sub_projects)
+        monkeypatch.setattr(cli, "_index_monorepo_with_progress", fake_monorepo_with_progress)
+        monkeypatch.setattr(cli, "_index_single_with_spinner", fake_single_with_spinner)
+        return captured
+
+    async def test_scope_matching_subproject_narrows_instead_of_full_repo(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.indexing.orchestrator import DetectedProject
+
+        _reset_output()
+        sub_projects = [
+            DetectedProject(name="foo", path="packages/foo", root=tmp_path / "packages" / "foo", marker="x"),
+            DetectedProject(name="bar", path="packages/bar", root=tmp_path / "packages" / "bar", marker="x"),
+        ]
+        captured = await self._patch_common(monkeypatch, sub_projects)
+
+        await cli._run_index(str(tmp_path), ["packages/foo"], False, no_embed=True, no_git_check=True)
+
+        assert captured["dispatch"] == "monorepo"
+        assert captured["projects"] == ["foo"]
+
+    async def test_scope_outside_any_subproject_falls_back_to_single_project(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.indexing.orchestrator import DetectedProject
+
+        _reset_output()
+        sub_projects = [
+            DetectedProject(name="foo", path="packages/foo", root=tmp_path / "packages" / "foo", marker="x"),
+        ]
+        captured = await self._patch_common(monkeypatch, sub_projects)
+
+        await cli._run_index(str(tmp_path), ["docs"], False, no_embed=True, no_git_check=True)
+
+        assert captured["dispatch"] == "single"
+        assert captured["scope"] == ["docs"]
+
+    async def test_explicit_project_flag_without_scope_is_unaffected(self, tmp_path, monkeypatch) -> None:
+        """Regression guard: --project alone (no --scope) keeps working as before."""
+        from code_atlas import cli
+        from code_atlas.indexing.orchestrator import DetectedProject
+
+        _reset_output()
+        sub_projects = [
+            DetectedProject(name="foo", path="packages/foo", root=tmp_path / "packages" / "foo", marker="x"),
+            DetectedProject(name="bar", path="packages/bar", root=tmp_path / "packages" / "bar", marker="x"),
+        ]
+        captured = await self._patch_common(monkeypatch, sub_projects)
+
+        await cli._run_index(str(tmp_path), None, False, projects=["foo"], no_embed=True, no_git_check=True)
+
+        assert captured["dispatch"] == "monorepo"
+        assert captured["projects"] == ["foo"]
+
+
 class TestNoColor:
     def test_no_color_sets_flag(self) -> None:
         _reset_output()
