@@ -883,6 +883,96 @@ pub trait Service {
         assert rel.properties == {}
 
 
+def test_impl_associated_types_do_not_collide_at_module_scope():
+    """Associated types in different impl blocks must not be hoisted to a shared module scope."""
+    parsed = _parse(
+        """\
+struct Foo;
+struct Bar;
+
+impl Foo {
+    type Item = u32;
+}
+
+impl Bar {
+    type Item = String;
+}
+"""
+    )
+    items = [e for e in parsed.entities if e.name == "Item"]
+    assert len(items) == 2
+    qns = {e.qualified_name for e in items}
+    # Before the fix both associated types collapse to the same module-scoped
+    # qualified name (`{PROJECT}:src.example.Item`), silently overwriting one.
+    assert qns == {f"{PROJECT}:src.example.Foo.Item", f"{PROJECT}:src.example.Bar.Item"}
+
+
+def test_impl_associated_type_emits_parent_type_name_defines():
+    """Associated type DEFINES follows the same deferred member contract (S5) as impl methods."""
+    parsed = _parse(
+        """\
+struct Foo;
+
+impl Foo {
+    type Item = u32;
+}
+"""
+    )
+    item = _entity_by_name(parsed, "Item")
+    assert item.qualified_name == f"{PROJECT}:src.example.Foo.Item"
+    defines = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name == item.qualified_name]
+    assert len(defines) == 1
+    assert defines[0].from_qualified_name == f"{PROJECT}:src.example"
+    assert defines[0].properties == {"parent_type_name": "Foo"}
+    assert not any(r.from_qualified_name == f"{PROJECT}:src.example.Foo" for r in parsed.relationships)
+
+
+def test_impl_reference_type_unwraps_to_inner_name():
+    """`impl Trait for &Foo` should scope methods to Foo, not raw '&Foo' text."""
+    parsed = _parse(
+        """\
+struct Foo;
+
+impl std::fmt::Display for &Foo {
+    fn fmt(&self) {}
+}
+"""
+    )
+    fmt = _entity_by_name(parsed, "fmt")
+    assert fmt.qualified_name == f"{PROJECT}:src.example.Foo.fmt"
+    assert "&" not in fmt.qualified_name
+
+
+def test_impl_pointer_type_unwraps_to_inner_name():
+    """`impl Trait for *const Foo` should scope methods to Foo, not raw '*const Foo' text."""
+    parsed = _parse(
+        """\
+struct Foo;
+
+impl std::fmt::Display for *const Foo {
+    fn fmt(&self) {}
+}
+"""
+    )
+    fmt = _entity_by_name(parsed, "fmt")
+    assert fmt.qualified_name == f"{PROJECT}:src.example.Foo.fmt"
+    assert "*" not in fmt.qualified_name
+
+
+def test_impl_tuple_type_skips_entire_block():
+    """No single owning type for `impl Trait for (Foo, Foo)` — skipped, not attributed with garbage text."""
+    parsed = _parse(
+        """\
+struct Foo;
+
+impl std::fmt::Display for (Foo, Foo) {
+    fn fmt(&self) {}
+}
+"""
+    )
+    assert not any(e.name == "fmt" for e in parsed.entities)
+
+
 def test_implements_bare_trait_name_no_colon():
     """S1 contract pin: IMPLEMENTS to_name is a bare trait name — never contains ':'."""
     parsed = _parse(

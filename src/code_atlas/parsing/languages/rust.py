@@ -524,12 +524,26 @@ def _process_type_alias(
     module_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    *,
+    owner_name: str | None = None,
 ) -> None:
+    """Process a ``type_item`` (type alias or impl-block associated type).
+
+    ``owner_name`` scopes an associated type declared inside an ``impl`` block
+    to its implementing type instead of hoisting it to module scope, which
+    would otherwise collide with a module-level type alias of the same name
+    (or with another impl's associated type of the same name).  Like impl
+    methods (see ``_process_function``'s ``from_impl`` branch), the owner
+    type may be defined in another file, so the DEFINES rel carries
+    ``parent_type_name`` for post-batch resolution (S5:
+    ``GraphClient.resolve_member_defines``), with this file's module as the
+    fallback parent.
+    """
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
     name = node_text(name_node)
-    qn = f"{module_qn}.{name}"
+    qn = f"{module_qn}.{owner_name}.{name}" if owner_name is not None else f"{module_qn}.{name}"
     vis = _visibility_from_node(node)
     doc = _extract_doc_comments(node)
     tags = _extract_attributes(node)
@@ -548,11 +562,13 @@ def _process_type_alias(
             tags=tags,
         )
     )
+    properties = {"parent_type_name": owner_name} if owner_name is not None else {}
     relationships.append(
         ParsedRelationship(
             from_qualified_name=f"{project_name}:{module_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
+            properties=properties,
         )
     )
 
@@ -753,7 +769,7 @@ def _process_impl(
             elif child.type == "const_item":
                 _process_const_static(child, path, project_name, module_qn, type_name, entities, relationships)
             elif child.type == "type_item":
-                _process_type_alias(child, path, project_name, module_qn, entities, relationships)
+                _process_type_alias(child, path, project_name, module_qn, entities, relationships, owner_name=type_name)
 
 
 def _impl_type_name(node: Node) -> str | None:
@@ -785,10 +801,14 @@ def _impl_trait_name(node: Node) -> str | None:
     return None
 
 
-def _type_node_name(type_node: Node) -> str | None:
+def _type_node_name(type_node: Node) -> str | None:  # noqa: PLR0911
     """Extract a simple type name from a type node.
 
-    Handles ``type_identifier``, ``generic_type``, and ``scoped_type_identifier``.
+    Handles ``type_identifier``, ``generic_type``, and ``scoped_type_identifier``,
+    and unwraps ``reference_type``/``pointer_type`` (``&Foo``, ``*const Foo``) to
+    the underlying type name. Composite types with no single owning type (e.g.
+    ``tuple_type``) return None rather than a garbage name built from raw node
+    text.
     """
     if type_node.type == "type_identifier":
         return node_text(type_node)
@@ -803,6 +823,13 @@ def _type_node_name(type_node: Node) -> str | None:
             return node_text(name_node)
         text = node_text(type_node)
         return text.rsplit("::", 1)[-1]
+    if type_node.type in ("reference_type", "pointer_type"):
+        # &Foo, &mut Foo, *const Foo, *mut Foo -> Foo
+        inner = type_node.child_by_field_name("type")
+        return _type_node_name(inner) if inner is not None else None
+    if type_node.type == "tuple_type":
+        # No single owning type, e.g. `impl Trait for (Foo, Bar)`.
+        return None
     return node_text(type_node) if type_node.text else None
 
 
