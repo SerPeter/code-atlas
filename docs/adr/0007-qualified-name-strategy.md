@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted — amended by [ADR-0008](./0008-cross-file-relationship-resolution.md) (cross-file
+relationship resolution, source-root stripping, overload disambiguation; base naming scheme
+unchanged)
 
 ## Date
 
