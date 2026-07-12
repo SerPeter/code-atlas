@@ -211,6 +211,59 @@ def _node_project_name(record: dict[str, Any]) -> str:
     return ""
 
 
+def _record_uid(record: dict[str, Any]) -> str | None:
+    """Extract uid from a record containing a neo4j Node."""
+    node = record.get("node") or record.get("n")
+    if node is None or not hasattr(node, "get"):
+        return None
+    return node.get("uid")
+
+
+_BM25_RRF_K = 60
+_BM25_UNSAFE_CHARS = frozenset('(){}[]^":')
+
+
+def _sanitize_bm25_query(query: str) -> str:
+    """Neutralize Tantivy query-syntax characters that make
+    ``text_search.search_all`` raise on syntax-invalid input.
+
+    Parens, brackets, braces, caret, colon, and quote are common in
+    code-shaped queries (``embed_batch(texts)``, ``dict[str, Any]``,
+    ``std::vector``) but are reserved Tantivy query syntax; an unbalanced
+    or nested occurrence raises inside Memgraph. Replaced with spaces
+    (not stripped) to keep word boundaries sane.
+    """
+    return "".join(" " if ch in _BM25_UNSAFE_CHARS else ch for ch in query)
+
+
+def _fuse_bm25_results(
+    results_per_index: list[list[dict[str, Any]]],
+    k: int = _BM25_RRF_K,
+) -> list[dict[str, Any]]:
+    """Fuse per-index BM25 result lists via reciprocal rank fusion.
+
+    Raw BM25 scores from ``text_search.search_all`` are not comparable
+    across different label indices — each label has its own separate
+    Tantivy index with its own corpus statistics (document frequency,
+    average document length). Each index's own ranking (by its own score)
+    is valid, so fusing by rank position avoids the cross-corpus bias of
+    comparing raw scores directly. Returns records sorted by fused score
+    descending, with ``score`` replaced by the fused value.
+    """
+    rrf_scores: dict[str, float] = defaultdict(float)
+    rec_by_uid: dict[str, dict[str, Any]] = {}
+    for batch in results_per_index:
+        for rank, rec in enumerate(batch):
+            uid = _record_uid(rec)
+            if uid is None:
+                continue
+            rrf_scores[uid] += 1.0 / (k + rank + 1)
+            rec_by_uid.setdefault(uid, rec)
+    fused = [{**rec_by_uid[uid], "score": score} for uid, score in rrf_scores.items()]
+    fused.sort(key=lambda r: r["score"], reverse=True)
+    return fused
+
+
 @dataclass(frozen=True)
 class _CallLookup:
     """Pre-built lookup tables for CALLS resolution."""
@@ -651,6 +704,14 @@ class GraphClient:
             for uid, data in old_data.items():
                 uids_by_label[data.label].append(uid)
             await self._batch_delete_entities(dict(uids_by_label))
+        # A Package node for this path (e.g. __init__.py) is intentionally not
+        # deleted — the directory hierarchy may still need it — but its stored
+        # file_hash must be cleared. Otherwise an identically re-created file
+        # is silently skipped forever by the hash gate (get_batch_file_hashes).
+        await self.execute_write(
+            f"MATCH (n:{NodeLabel.PACKAGE} {{project_name: $p, file_path: $f}}) SET n.file_hash = NULL",
+            {"p": project_name, "f": file_path},
+        )
         return [self._strip_uid(uid) for uid in old_data]
 
     async def merge_project_node(self, project_name: str, **metadata: Any) -> None:
@@ -1798,7 +1859,8 @@ class GraphClient:
         """BM25 text search across text indices.
 
         Queries one or all text indices, optionally post-filters by project(s),
-        and returns results sorted by score descending.
+        and fuses per-index result lists by reciprocal rank — raw BM25 scores
+        are not comparable across indices with different corpus statistics.
         """
         with _tracer.start_as_current_span("graph.text_search", attributes={"query": query[:100], "limit": limit}):
             # Backward compat: single project → projects list
@@ -1808,6 +1870,7 @@ class GraphClient:
                 [f"text_{label.lower()}"] if label else [f"text_{lbl.value.lower()}" for lbl in _TEXT_SEARCHABLE_LABELS]
             )
             fetch_limit = limit * 3 if filter_projects else limit
+            safe_query = _sanitize_bm25_query(query)
 
             async def _ts_one(idx: str) -> list[dict[str, Any]]:
                 cypher = (
@@ -1817,21 +1880,19 @@ class GraphClient:
                     f"ORDER BY score DESC LIMIT {fetch_limit}"
                 )
                 try:
-                    return await self.execute(cypher, {"query": query})
+                    return await self.execute(cypher, {"query": safe_query})
                 except Exception as exc:
                     logger.warning("Text search on {} failed: {}", idx, exc)
                     return []
 
             results_per_index = await asyncio.gather(*(_ts_one(idx) for idx in indices))
-            all_results: list[dict[str, Any]] = [r for batch in results_per_index for r in batch]
+            all_results = _fuse_bm25_results(results_per_index)
 
             # Post-filter by project scope
             if filter_projects:
                 project_set = set(filter_projects)
                 all_results = [r for r in all_results if _node_project_name(r) in project_set]
 
-            # Sort by score descending and truncate
-            all_results.sort(key=lambda rec: rec.get("score", 0), reverse=True)
             return all_results[:limit]
 
     async def get_text_index_info(self) -> list[dict[str, Any]]:
@@ -2089,19 +2150,69 @@ class GraphClient:
             )
 
     async def _batch_delete_entities(self, uids_by_label: dict[str, list[str]]) -> None:
-        """Delete entity nodes by uid, grouped by label for index-backed matching."""
+        """Delete entity nodes by uid, grouped by label for index-backed matching.
+
+        A node that still has inbound edges from a DIFFERENT file is preserved
+        (only its own outgoing edges are stripped) instead of being fully
+        DETACH DELETEd — those cross-file edges (e.g. CALLS/INHERITS/DOCUMENTS)
+        come from files that aren't being re-parsed right now, so nothing could
+        recreate them if the entity reappears later (e.g. a brief comment-out
+        edit). Nodes with no such foreign inbound edges are fully removed,
+        matching prior behavior.
+
+        Cross-file DEFINES edges are excluded from this check: they are
+        (re-)created by resolve_member_defines keyed off the MEMBER's own
+        file (Go receiver methods, C++ out-of-line methods — see S5), so they
+        are always re-resolved whenever the member's file is reprocessed,
+        including on reappearance. Treating them as "foreign" here would make
+        a genuinely deleted cross-file member an undeletable zombie.
+        """
+        # Pass 1: read which uids have a foreign inbound edge, across all
+        # labels, before any writes — so an earlier label's delete in this
+        # same call can't affect a later label's read. Referrers that are
+        # themselves being deleted in this same call don't count: whether they
+        # end up DETACH DELETEd or edge-stripped, their edge to `n` is gone by
+        # the time this call completes either way — so if that's `n`'s only
+        # foreign referrer, `n` must be fully removed too, not preserved as an
+        # edge-stripped zombie node still visible to direct uid/search lookups.
+        all_uids = [uid for uids in uids_by_label.values() for uid in uids]
+        preserve_by_label: dict[str, list[str]] = {}
+        remove_by_label: dict[str, list[str]] = {}
         for label, uids in uids_by_label.items():
+            if not uids:
+                continue
             if label:
                 _assert_valid_label(label)
-                await self.execute_write(
-                    f"UNWIND $uids AS uid MATCH (n:{label} {{uid: uid}}) DETACH DELETE n",
-                    {"uids": uids},
-                )
-            else:
-                await self.execute_write(
-                    "UNWIND $uids AS uid MATCH (n {uid: uid}) DETACH DELETE n",
-                    {"uids": uids},
-                )
+            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else "MATCH (n {uid: uid})"
+            referenced = await self.execute(
+                f"UNWIND $uids AS uid {match_n} "
+                "MATCH (other)-[r]->(n) WHERE (other.file_path IS NULL OR other.file_path <> n.file_path) "
+                f"AND NOT type(r) = '{RelType.DEFINES}' "
+                "AND NOT other.uid IN $all_uids "
+                "RETURN DISTINCT uid",
+                {"uids": uids, "all_uids": all_uids},
+            )
+            referenced_uids = {r["uid"] for r in referenced}
+            preserve_by_label[label] = [u for u in uids if u in referenced_uids]
+            remove_by_label[label] = [u for u in uids if u not in referenced_uids]
+
+        # Pass 2: apply deletes/strips.
+        for label, uids in remove_by_label.items():
+            if not uids:
+                continue
+            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else "MATCH (n {uid: uid})"
+            await self.execute_write(
+                f"UNWIND $uids AS uid {match_n} DETACH DELETE n",
+                {"uids": uids},
+            )
+        for label, uids in preserve_by_label.items():
+            if not uids:
+                continue
+            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else "MATCH (n {uid: uid})"
+            await self.execute_write(
+                f"UNWIND $uids AS uid {match_n} OPTIONAL MATCH (n)-[out]->() DELETE out",
+                {"uids": uids},
+            )
 
     async def _recreate_batch_relationships(
         self,
@@ -2205,7 +2316,7 @@ class GraphClient:
             ]
             await self.execute_write(
                 f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                f"CREATE (a)-[e:{rel_type}]->(b) SET e += r.props",
+                f"MERGE (a)-[e:{rel_type}]->(b) SET e += r.props",
                 {"rels": rel_params},
             )
 

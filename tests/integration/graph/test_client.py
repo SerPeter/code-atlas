@@ -550,6 +550,31 @@ async def test_text_search_with_project_filter(graph_client: GraphClient):
             assert node.get("project_name") == "alpha"
 
 
+async def test_text_search_escapes_syntax_special_chars(graph_client: GraphClient):
+    """BM25 queries containing raw Tantivy syntax characters (parens, brackets,
+    colons, quotes) must not crash the text index into an empty result set —
+    common in code-shaped queries like signatures or generics (client.py:1690).
+    """
+    await graph_client.ensure_schema()
+
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        "  uid: 'bm25esc:proj.embed_batch', project_name: 'bm25esc', name: 'embed_batch',"
+        "  qualified_name: 'proj.embed_batch', kind: 'function', file_path: 'f.py',"
+        "  docstring: 'embed_batch(texts) processes a dict[str, Any] of embeddings.'"
+        "})"
+    )
+
+    for query in ["embed_batch(texts)", "dict[str, Any]", 'unbalanced "quote', "std::vector"]:
+        results = await graph_client.text_search(query, project="bm25esc")
+        assert isinstance(results, list), f"query {query!r} should not raise"
+
+    for query in ["embed_batch(texts)", "dict[str, Any]"]:
+        results = await graph_client.text_search(query, project="bm25esc")
+        names = [node.get("name") for r in results if (node := (r.get("node") or r.get("n"))) is not None]
+        assert "embed_batch" in names, f"query {query!r} returned no match: {results}"
+
+
 async def test_get_text_index_info(graph_client: GraphClient):
     """get_text_index_info() returns a list (may be empty without indices)."""
     await graph_client.ensure_schema()
@@ -2549,8 +2574,8 @@ async def test_upsert_java_overloads_creates_distinct_nodes(graph_client: GraphC
     uids = {r["uid"] for r in records}
     assert len(records) == 2
     assert uids == {
-        f"{project}:src.Example.A.process(Order)",
-        f"{project}:src.Example.A.process(List<Order>,String[])",
+        f"{project}:Example.A.process(Order)",
+        f"{project}:Example.A.process(List<Order>,String[])",
     }
 
     defines = await graph_client.execute(
@@ -2559,3 +2584,232 @@ async def test_upsert_java_overloads_creates_distinct_nodes(graph_client: GraphC
         {"p": project},
     )
     assert uids <= {r["uid"] for r in defines}
+
+
+# ---------------------------------------------------------------------------
+# Deletion — foreign inbound edges and Package file_hash staleness
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_file_entities_clears_package_file_hash(graph_client: GraphClient):
+    """Deleting a file's entities also clears its surviving Package node's
+    stale file_hash (client.py:638) — otherwise an identically re-created
+    __init__.py is silently skipped forever by the AST consumer's hash gate.
+    """
+    await graph_client.ensure_schema()
+    project = "pkgdel1"
+    fp = "src/pkg/__init__.py"
+
+    # Package node for __init__.py (created by orchestrator/parser), carrying
+    # a stored file_hash from the last successful parse.
+    await graph_client.merge_package_node(project, "src.pkg", "pkg", fp)
+    await graph_client.execute_write(
+        f"MATCH (n:{NodeLabel.PACKAGE} {{project_name: $p, file_path: $f}}) SET n.file_hash = 'stale_hash'",
+        {"p": project, "f": fp},
+    )
+
+    # A Callable defined in the same __init__.py.
+    entity = _make_entity(project, "helper", fp, content_hash="c1")
+    await graph_client.upsert_file_entities(project, fp, [entity], [])
+
+    deleted = await graph_client.delete_file_entities(project, fp)
+    assert "src.pkg.__init__.helper" in deleted
+
+    # The Package node itself must survive (the directory hierarchy still
+    # needs it) but its stale file_hash must be cleared.
+    pkg = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.PACKAGE} {{project_name: $p, file_path: $f}}) RETURN n.file_hash AS fh",
+        {"p": project, "f": fp},
+    )
+    assert len(pkg) == 1
+    assert pkg[0]["fh"] is None
+
+    # The hash gate must see this file as unseen, so a re-created __init__.py
+    # with identical content is reprocessed instead of silently skipped.
+    hashes = await graph_client.get_batch_file_hashes(project, [fp])
+    assert hashes[fp] is None
+
+
+async def test_recreate_relationships_package_defines_no_duplicate(graph_client: GraphClient):
+    """Re-indexing __init__.py must not accumulate duplicate DEFINES edges
+    from its Package-labeled module entity (client.py:1992) — the relationship
+    delete phase excludes Package-sourced rels, so the create phase must MERGE
+    rather than CREATE to stay idempotent across re-indexes.
+    """
+    await graph_client.ensure_schema()
+    project = "pkgdup1"
+    fp = "src/pkg/__init__.py"
+    pkg_uid = f"{project}:src.pkg"
+    helper_uid = f"{project}:src.pkg.__init__.helper"
+
+    await graph_client.merge_package_node(project, "src.pkg", "pkg", fp)
+
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=pkg_uid,
+            rel_type=RelType.DEFINES,
+            to_name=helper_uid,
+        )
+    ]
+
+    async def _defines_count() -> int:
+        records = await graph_client.execute(
+            f"MATCH (:{NodeLabel.PACKAGE} {{uid: $pkg}})-[:{RelType.DEFINES}]->"
+            f"(:{NodeLabel.CALLABLE} {{uid: $helper}}) RETURN count(*) AS cnt",
+            {"pkg": pkg_uid, "helper": helper_uid},
+        )
+        return records[0]["cnt"]
+
+    helper_v1 = _make_entity(project, "helper", fp, content_hash="v1")
+    await graph_client.upsert_file_entities(project, fp, [helper_v1], rels)
+    assert await _defines_count() == 1
+
+    # Re-index with helper's content changed — forces relationship recreation
+    # (the fast no-op path only triggers when nothing in the file changed).
+    helper_v2 = _make_entity(project, "helper", fp, content_hash="v2")
+    await graph_client.upsert_file_entities(project, fp, [helper_v2], rels)
+    assert await _defines_count() == 1
+
+
+async def test_batch_delete_preserves_foreign_inbound_edges(graph_client: GraphClient):
+    """Deleting an entity that another, untouched file still references must
+    not destroy that cross-file edge (client.py:1967) — if the entity
+    reappears later (e.g. a brief comment-out/comment-back-in edit), the
+    referencing file is never re-parsed and could never recreate it.
+    """
+    await graph_client.ensure_schema()
+    project = "delfk1"
+
+    # File A defines func_b — the entity that will be removed then restored.
+    func_b = _make_entity(project, "func_b", "src/mod_a.py", content_hash="")
+
+    await graph_client.upsert_file_entities(project, "src/mod_a.py", [func_b], [])
+
+    # File B defines func_c, which OVERRIDES func_b — a uid-based cross-file
+    # rel that is never re-derived by re-parsing file A alone.
+    func_c = _make_entity(project, "func_c", "src/mod_b.py", content_hash="")
+    rel = ParsedRelationship(
+        from_qualified_name=func_c.qualified_name,
+        rel_type=RelType.OVERRIDES,
+        to_name=func_b.qualified_name,
+    )
+    await graph_client.upsert_file_entities(project, "src/mod_b.py", [func_c], [rel])
+
+    async def _edge_count() -> int:
+        records = await graph_client.execute(
+            f"MATCH (:{NodeLabel.CALLABLE} {{uid: $c}})-[:{RelType.OVERRIDES}]->"
+            f"(:{NodeLabel.CALLABLE} {{uid: $b}}) RETURN count(*) AS cnt",
+            {"c": func_c.qualified_name, "b": func_b.qualified_name},
+        )
+        return records[0]["cnt"]
+
+    assert await _edge_count() == 1
+
+    # File A is re-parsed without func_b (e.g. temporarily commented out).
+    # File B is never touched, so nothing could recreate the edge if it were
+    # destroyed here.
+    await graph_client.upsert_file_entities(project, "src/mod_a.py", [], [])
+    assert await _edge_count() == 1
+
+    # func_b reappears with identical content.
+    await graph_client.upsert_file_entities(project, "src/mod_a.py", [func_b], [])
+    assert await _edge_count() == 1
+
+
+async def test_batch_delete_removes_member_with_cross_file_defines_edge(graph_client: GraphClient):
+    """A genuinely deleted cross-file member (S5) must still be fully removed.
+
+    Unlike the foreign OVERRIDES case above, a member's own incoming DEFINES
+    edge from its (foreign-file) parent TypeDef is created by
+    resolve_member_defines keyed off the MEMBER's own file — so it is always
+    re-resolved whenever the member reappears, regardless of whether the
+    parent's file is touched. Preserving the node here (as if it were an
+    OVERRIDES-style edge) would make a deleted member an undeletable zombie.
+    """
+    await graph_client.ensure_schema()
+    project = "member_del"
+
+    server_entities = [
+        _module_entity(project, "pkg.server", "pkg/server.go"),
+        _typedef_entity(project, "pkg.server", "Server", "pkg/server.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/server.go", server_entities, [])
+
+    member_uid = f"{project}:pkg.routes.Server.Routes"
+    routes_entities = [
+        _module_entity(project, "pkg.routes", "pkg/routes.go"),
+        _method_entity(project, member_uid, "Routes", "pkg/routes.go"),
+    ]
+    await graph_client.upsert_file_entities(project, "pkg/routes.go", routes_entities, [])
+
+    member_rel = ParsedRelationship(
+        from_qualified_name=f"{project}:pkg.routes",
+        rel_type=RelType.DEFINES,
+        to_name=member_uid,
+        properties={"parent_type_name": "Server", "parent_scope": "package"},
+    )
+    await graph_client.resolve_member_defines(project, [member_rel])
+
+    async def _node_count() -> int:
+        records = await graph_client.execute(
+            f"MATCH (c:{NodeLabel.CALLABLE} {{uid: $m}}) RETURN count(*) AS cnt",
+            {"m": member_uid},
+        )
+        return records[0]["cnt"]
+
+    assert await _node_count() == 1
+
+    # Routes is removed from pkg/routes.go (routes.go itself is reprocessed —
+    # the module entity remains, but the method is gone).
+    await graph_client.upsert_file_entities(
+        project, "pkg/routes.go", [_module_entity(project, "pkg.routes", "pkg/routes.go")], []
+    )
+
+    assert await _node_count() == 0
+
+
+async def test_batch_delete_same_call_mutual_referrer_both_removed(graph_client: GraphClient):
+    """A same-batch mutual reference must not needlessly preserve either side.
+
+    _batch_delete_entities snapshots "foreign inbound edge" once before any
+    deletes. If func_a's only foreign referrer is func_b, and func_b is ALSO
+    being deleted in this same call (both files reprocessed to empty in one
+    upsert_batch_entities call), func_b's edge to func_a is gone by the time
+    the call completes either way (DETACH DELETE of func_b, or func_b's own
+    outgoing edges being stripped) -- so func_a must be fully removed too,
+    not kept around as an edge-stripped zombie node that would still surface
+    in vector/text search and direct uid lookups after both source files are gone.
+    """
+    await graph_client.ensure_schema()
+    project = "delfk2"
+
+    func_a = _make_entity(project, "func_a", "src/mod_a.py", content_hash="")
+    await graph_client.upsert_file_entities(project, "src/mod_a.py", [func_a], [])
+
+    func_b = _make_entity(project, "func_b", "src/mod_b.py", content_hash="")
+    rel = ParsedRelationship(
+        from_qualified_name=func_b.qualified_name,
+        rel_type=RelType.OVERRIDES,
+        to_name=func_a.qualified_name,
+    )
+    await graph_client.upsert_file_entities(project, "src/mod_b.py", [func_b], [rel])
+
+    async def _node_count(uid: str) -> int:
+        records = await graph_client.execute("MATCH (n {uid: $uid}) RETURN count(*) AS cnt", {"uid": uid})
+        return records[0]["cnt"]
+
+    assert await _node_count(func_a.qualified_name) == 1
+    assert await _node_count(func_b.qualified_name) == 1
+
+    # Both files re-processed to empty in ONE batched call: func_a's only
+    # foreign referrer (func_b) is being deleted in this SAME call.
+    await graph_client.upsert_batch_entities(
+        project,
+        {
+            "src/mod_a.py": ([], []),
+            "src/mod_b.py": ([], []),
+        },
+    )
+
+    assert await _node_count(func_a.qualified_name) == 0, "func_a preserved as a zombie node"
+    assert await _node_count(func_b.qualified_name) == 0
