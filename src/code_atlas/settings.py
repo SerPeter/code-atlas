@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, Field, model_validator
@@ -77,13 +78,42 @@ def get_worktree_branch(project_root: Path) -> str | None:
     return git_dir.name
 
 
+def _explicit_project_name(project_root: Path) -> str | None:
+    """Read an explicit ``[project] name`` override from atlas.toml, if set.
+
+    Reads the file directly (rather than going through :class:`AtlasSettings`)
+    because callers of :func:`derive_project_name` only have a bare *project_root*
+    path, not a settings instance.
+    """
+    toml_path = _find_atlas_toml(project_root)
+    if toml_path is None:
+        return None
+    try:
+        with toml_path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except OSError, tomllib.TOMLDecodeError:
+        return None
+    project_section = data.get("project")
+    if not isinstance(project_section, dict):
+        return None
+    name = project_section.get("name")
+    return name if isinstance(name, str) and name.strip() else None
+
+
 def derive_project_name(project_root: Path) -> str:
     """Derive the canonical project name for *project_root*.
 
-    - Base name = resolved directory basename.
+    - Base name = explicit ``[project] name`` override from atlas.toml if set,
+      otherwise the resolved directory basename. Two unrelated repositories
+      checked out under different paths but sharing a folder name (e.g. two
+      "backend" checkouts) will otherwise collide in the graph and event
+      streams — set ``[project] name`` in atlas.toml to disambiguate. This is
+      opt-in by design: auto-hashing names would churn uids for every existing
+      single-project user.
     - If *project_root* is a linked worktree → ``base@branch``.
     """
-    base = project_root.resolve().name
+    root = project_root.resolve()
+    base = _explicit_project_name(root) or root.name
     branch = get_worktree_branch(project_root)
     if branch is not None:
         return f"{base}@{branch}"
@@ -99,9 +129,9 @@ def _default_project_root() -> Path:
     return root
 
 
-def _find_atlas_toml() -> Path | None:
-    """Walk up from cwd looking for ``atlas.toml``."""
-    current = Path.cwd().resolve()
+def _find_atlas_toml(start: Path | None = None) -> Path | None:
+    """Walk up from *start* (default: cwd) looking for ``atlas.toml``."""
+    current = (start or Path.cwd()).resolve()
     while True:
         candidate = current / "atlas.toml"
         if candidate.is_file():
@@ -320,6 +350,17 @@ class RedisSettings(BaseModel):
     )
 
 
+class ProjectSettings(BaseModel):
+    """Project identity overrides."""
+
+    name: str | None = Field(
+        default=None,
+        description="Explicit project name override (see derive_project_name). Set this to "
+        "disambiguate two checkouts that share a directory basename — otherwise they collide "
+        "in the graph and event streams.",
+    )
+
+
 class AtlasSettings(BaseSettings):
     """Root configuration for Code Atlas."""
 
@@ -338,7 +379,12 @@ class AtlasSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        toml_path = _find_atlas_toml()
+        # Discover atlas.toml relative to the target project_root (when explicitly
+        # passed, e.g. `atlas index <other-path>`), not the process cwd — otherwise
+        # indexing a project other than the cwd's own applies the wrong config.
+        init_kwargs = getattr(init_settings, "init_kwargs", {})
+        target_root = init_kwargs.get("project_root")
+        toml_path = _find_atlas_toml(Path(target_root) if target_root else None)
         sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
         if toml_path:
             sources.append(TomlConfigSettingsSource(settings_cls, toml_file=toml_path))
@@ -346,6 +392,7 @@ class AtlasSettings(BaseSettings):
         return tuple(sources)
 
     project_root: Path = Field(default_factory=_default_project_root, description="Project root path.")
+    project: ProjectSettings = Field(default_factory=ProjectSettings)
     scope: ScopeSettings = Field(default_factory=ScopeSettings)
     libraries: LibrarySettings = Field(default_factory=LibrarySettings)
     monorepo: MonorepoSettings = Field(default_factory=MonorepoSettings)
