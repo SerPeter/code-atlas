@@ -599,6 +599,30 @@ def test_binary_content():
 # ---------------------------------------------------------------------------
 
 
+def test_compact_class_path_name_is_bare():
+    """`class Admin::User` should store bare name 'User', matching the nested-form spelling."""
+    parsed = _parse("""\
+class Admin::User
+end
+""")
+    cls = _entity_by_name(parsed, "User")
+    assert cls.label == NodeLabel.TYPE_DEF
+    assert cls.kind == TypeDefKind.CLASS
+    assert cls.qualified_name == f"{PROJECT}:lib.example.Admin.User"
+
+
+def test_compact_module_path_name_is_bare():
+    """`module Admin::Helpers` should store bare name 'Helpers'."""
+    parsed = _parse("""\
+module Admin::Helpers
+end
+""")
+    mod = _entity_by_name(parsed, "Helpers")
+    assert mod.label == NodeLabel.TYPE_DEF
+    assert mod.kind == TypeDefKind.PROTOCOL
+    assert mod.qualified_name == f"{PROJECT}:lib.example.Admin.Helpers"
+
+
 def test_nested_class():
     parsed = _parse("""\
 class Outer

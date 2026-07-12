@@ -364,12 +364,17 @@ def _process_ruby_class(
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
-    name = _resolve_constant_name(name_node)
+    resolved_name = _resolve_constant_name(name_node)
+    # Store the bare (last-segment) name so compact paths (`class Admin::User`)
+    # match the same entity `name` as the equivalent nested form
+    # (`module Admin; class User`), keeping name-based INHERITS resolution
+    # consistent regardless of declaration style.
+    name = resolved_name.rsplit(".", 1)[-1]
     docstring = _extract_ruby_docstring(node, source)
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
 
-    new_scope = [*scope_stack, name]
+    new_scope = [*scope_stack, resolved_name]
     dotted = ".".join(new_scope)
     qn = f"{module_qn}.{dotted}"
 
@@ -433,12 +438,15 @@ def _process_ruby_module(
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
-    name = _resolve_constant_name(name_node)
+    resolved_name = _resolve_constant_name(name_node)
+    # See _process_ruby_class: keep entity `name` bare regardless of
+    # compact (`module Admin::Helpers`) vs nested declaration style.
+    name = resolved_name.rsplit(".", 1)[-1]
     docstring = _extract_ruby_docstring(node, source)
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
 
-    new_scope = [*scope_stack, name]
+    new_scope = [*scope_stack, resolved_name]
     dotted = ".".join(new_scope)
     qn = f"{module_qn}.{dotted}"
 
