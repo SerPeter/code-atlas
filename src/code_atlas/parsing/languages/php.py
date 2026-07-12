@@ -198,8 +198,12 @@ def _parse_php(
         )
     )
 
-    # Walk program children
-    _walk_php_node(root, path, source, project_name, module_qn, entities, relationships, seen)
+    # Walk program children. `module_qn` doubles as both the Module entity's own uid
+    # (used for module-owns-X relationships) and the current qualified-name scope for
+    # nested declarations -- the two only diverge inside a braced namespace body, where
+    # `file_qn` stays fixed to the real Module node while `module_qn` grows a namespace
+    # segment (see the `namespace_definition` branch of `_walk_php_node`).
+    _walk_php_node(root, path, source, project_name, module_qn, module_qn, entities, relationships, seen)
 
     return ParsedFile(
         file_path=path,
@@ -214,12 +218,18 @@ def _walk_php_node(
     path: str,
     source: bytes,
     project_name: str,
+    file_qn: str,
     module_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
 ) -> None:
-    """Walk the parse tree and extract entities and relationships."""
+    """Walk the parse tree and extract entities and relationships.
+
+    ``file_qn`` is the real Module entity's qualified name (constant for the whole
+    file); ``module_qn`` is the current qualified-name scope for nested declarations,
+    which grows a namespace segment inside a braced namespace body.
+    """
     for child in node.children:
         if child.type in (
             "class_declaration",
@@ -233,6 +243,7 @@ def _walk_php_node(
                 path,
                 source,
                 project_name,
+                file_qn,
                 module_qn,
                 entities,
                 relationships,
@@ -245,17 +256,29 @@ def _walk_php_node(
                 path,
                 source,
                 project_name,
+                file_qn,
                 module_qn,
                 entities,
                 relationships,
                 seen,
             )
         elif child.type == "namespace_use_declaration":
-            _process_namespace_use(child, project_name, module_qn, relationships)
+            _process_namespace_use(child, project_name, file_qn, relationships)
         elif child.type == "expression_statement":
-            _process_expression_statement(child, project_name, module_qn, relationships)
+            _process_expression_statement(child, project_name, file_qn, relationships)
         elif child.type in ("if_statement", "else_clause", "else_if_clause"):
-            _walk_php_node(child, path, source, project_name, module_qn, entities, relationships, seen)
+            _walk_php_node(child, path, source, project_name, file_qn, module_qn, entities, relationships, seen)
+        elif child.type == "namespace_definition":
+            # Braced namespace blocks (`namespace App { ... }`) nest their
+            # declarations inside a compound_statement body; the unbraced
+            # form (`namespace App;`) has no body and needs no extra walk.
+            body = child.child_by_field_name("body")
+            if body is not None:
+                name_node = child.child_by_field_name("name")
+                nested_qn = (
+                    f"{module_qn}.{node_text(name_node).replace('\\', '.')}" if name_node is not None else module_qn
+                )
+                _walk_php_node(body, path, source, project_name, file_qn, nested_qn, entities, relationships, seen)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +327,7 @@ def _process_type_def(
     path: str,
     source: bytes,
     project_name: str,
+    file_qn: str,
     module_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
@@ -342,10 +366,11 @@ def _process_type_def(
         )
     )
 
-    # DEFINES from module -> type
+    # DEFINES from module -> type (always the real Module node, even when `qn` is
+    # namespace-scoped from a braced namespace body)
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
+            from_qualified_name=f"{project_name}:{file_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -498,6 +523,7 @@ def _process_function(
     path: str,
     source: bytes,
     project_name: str,
+    file_qn: str,
     module_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
@@ -538,10 +564,10 @@ def _process_function(
         )
     )
 
-    # DEFINES: module -> function
+    # DEFINES: module -> function (always the real Module node)
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
+            from_qualified_name=f"{project_name}:{file_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -750,7 +776,7 @@ def _process_namespace_use(
                 ParsedRelationship(
                     from_qualified_name=f"{project_name}:{module_qn}",
                     rel_type=RelType.IMPORTS,
-                    to_name=import_name,
+                    to_name=import_name.replace("\\", "."),
                 )
             )
         elif child.type == "namespace_use_group":
@@ -767,7 +793,7 @@ def _process_namespace_use(
                         ParsedRelationship(
                             from_qualified_name=f"{project_name}:{module_qn}",
                             rel_type=RelType.IMPORTS,
-                            to_name=full_name,
+                            to_name=full_name.replace("\\", "."),
                         )
                     )
 

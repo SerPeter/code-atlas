@@ -311,6 +311,28 @@ use App\\Models\\{User, Post};
     assert any("Post" in name for name in imported)
 
 
+def test_namespace_use_import_dot_separated():
+    """to_name must use dots (matching internal qualified_names), not backslashes."""
+    parsed = _parse("""\
+<?php
+use App\\Models\\User;
+""")
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert len(import_rels) == 1
+    assert import_rels[0].to_name == "App.Models.User"
+    assert "\\" not in import_rels[0].to_name
+
+
+def test_namespace_use_grouped_dot_separated():
+    parsed = _parse("""\
+<?php
+use App\\Models\\{User, Post};
+""")
+    import_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    imported = {r.to_name for r in import_rels}
+    assert imported == {"App.Models.User", "App.Models.Post"}
+
+
 # ---------------------------------------------------------------------------
 # 12. require/include -> IMPORTS
 # ---------------------------------------------------------------------------
@@ -364,6 +386,22 @@ class User implements Cacheable, Serializable {
     iface_names = {r.to_name for r in impl_rels}
     assert "Cacheable" in iface_names
     assert "Serializable" in iface_names
+
+
+def test_implements_bare_name_no_colon():
+    """IMPLEMENTS to_name must stay a bare type name (no ':') per the S1 contract:
+    client.py routes bare, colon-free to_names through name resolution, while a
+    ':'-containing to_name would be treated as an already-resolved uid.
+    """
+    parsed = _parse("""\
+<?php
+class User implements Cacheable {
+}
+""")
+    impl_rels = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+    assert len(impl_rels) == 1
+    assert impl_rels[0].to_name == "Cacheable"
+    assert ":" not in impl_rels[0].to_name
 
 
 # ---------------------------------------------------------------------------
@@ -854,6 +892,88 @@ def test_binary_content():
     """Binary content shouldn't crash the parser."""
     parsed = parse_file("data.php", b"\x00\x01\x02\xff\xfe", PROJECT)
     assert parsed is not None
+
+
+# ---------------------------------------------------------------------------
+# 27. Braced namespace blocks
+# ---------------------------------------------------------------------------
+
+
+def test_braced_namespace_block_walked():
+    """Declarations inside `namespace App { ... }` must not be dropped."""
+    parsed = _parse("""\
+<?php
+namespace App {
+    class Foo {
+        public function bar() {}
+    }
+    function baz() {}
+}
+""")
+    foo = _entity_by_name(parsed, "Foo")
+    assert foo.label == NodeLabel.TYPE_DEF
+    assert foo.kind == TypeDefKind.CLASS
+
+    bar = _entity_by_name(parsed, "bar")
+    assert bar.label == NodeLabel.CALLABLE
+    assert bar.kind == CallableKind.METHOD
+
+    baz = _entity_by_name(parsed, "baz")
+    assert baz.label == NodeLabel.CALLABLE
+    assert baz.kind == CallableKind.FUNCTION
+
+
+def test_braced_namespace_block_multiple():
+    """Multiple braced namespace blocks in one file are each walked."""
+    parsed = _parse("""\
+<?php
+namespace App {
+    class Foo {}
+}
+namespace Other {
+    class Baz {}
+}
+""")
+    _entity_by_name(parsed, "Foo")
+    _entity_by_name(parsed, "Baz")
+
+
+def test_braced_namespace_distinct_qualified_names():
+    """Same-named classes in different braced namespace blocks must not collide on qualified_name."""
+    parsed = _parse("""\
+<?php
+namespace App {
+    class Foo {
+        public function bar() {}
+    }
+}
+namespace Other {
+    class Foo {
+        public function baz() {}
+    }
+}
+""")
+    foos = [e for e in parsed.entities if e.name == "Foo"]
+    assert len(foos) == 2, f"Expected 2 Foo entities, got {len(foos)}"
+    qns = {e.qualified_name for e in foos}
+    assert len(qns) == 2, f"Foo entities collided on qualified_name: {qns}"
+    assert any("App" in qn for qn in qns)
+    assert any("Other" in qn for qn in qns)
+
+    # Each class's own method must be namespaced consistently with its class.
+    bar = _entity_by_name(parsed, "bar")
+    baz = _entity_by_name(parsed, "baz")
+    app_foo_qn = next(e.qualified_name for e in foos if "App" in e.qualified_name)
+    other_foo_qn = next(e.qualified_name for e in foos if "Other" in e.qualified_name)
+    assert bar.qualified_name == f"{app_foo_qn}.bar"
+    assert baz.qualified_name == f"{other_foo_qn}.baz"
+
+    # DEFINES: module -> each Foo must still resolve to the real module (from-side unnamespaced).
+    module = next(e for e in parsed.entities if e.kind == "module")
+    defines_to_foo = [r for r in parsed.relationships if r.rel_type == RelType.DEFINES and r.to_name in qns]
+    assert len(defines_to_foo) == 2
+    for rel in defines_to_foo:
+        assert rel.from_qualified_name == module.qualified_name
 
 
 # ---------------------------------------------------------------------------
