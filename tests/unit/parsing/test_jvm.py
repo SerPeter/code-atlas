@@ -59,7 +59,7 @@ class TestJavaModule:
         module = _entity_by_name(parsed, "MyClass")
         assert module.label == NodeLabel.MODULE
         assert module.kind == "module"
-        assert module.qualified_name == f"{PROJECT}:src.com.example.MyClass"
+        assert module.qualified_name == f"{PROJECT}:com.example.MyClass"
 
 
 class TestJavaClass:
@@ -76,9 +76,9 @@ class TestJavaClass:
 
     def test_class_defines(self):
         parsed = _parse("public class MyClass {}\n")
-        defines = _rels_from(parsed, "src.Example", RelType.DEFINES)
+        defines = _rels_from(parsed, "Example", RelType.DEFINES)
         targets = {r.to_name for r in defines}
-        assert f"{PROJECT}:src.Example.MyClass" in targets
+        assert f"{PROJECT}:Example.MyClass" in targets
 
 
 class TestJavaInterface:
@@ -180,12 +180,12 @@ class A {
         assert len(overloads) == 2
         assert all(e.label == NodeLabel.CALLABLE for e in overloads)
         assert {e.qualified_name for e in overloads} == {
-            f"{PROJECT}:src.Example.A.process(Order)",
-            f"{PROJECT}:src.Example.A.process(List<Order>,String[])",
+            f"{PROJECT}:Example.A.process(Order)",
+            f"{PROJECT}:Example.A.process(List<Order>,String[])",
         }
         # Non-overloaded sibling keeps today's bare qn
         single = _entity_by_name(parsed, "single")
-        assert single.qualified_name == f"{PROJECT}:src.Example.A.single"
+        assert single.qualified_name == f"{PROJECT}:Example.A.single"
 
     def test_constructor_overloads_distinct(self):
         source = """\
@@ -196,9 +196,9 @@ class A {
 """
         parsed = _parse(source)
         ctors = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.kind == CallableKind.CONSTRUCTOR]
-        expected = {f"{PROJECT}:src.Example.A.A()", f"{PROJECT}:src.Example.A.A(int)"}
+        expected = {f"{PROJECT}:Example.A.A()", f"{PROJECT}:Example.A.A(int)"}
         assert {e.qualified_name for e in ctors} == expected
-        defines = _rels_from(parsed, "src.Example.A", RelType.DEFINES)
+        defines = _rels_from(parsed, "Example.A", RelType.DEFINES)
         assert expected <= {r.to_name for r in defines}
 
     def test_overload_suffix_stable_under_reordering(self):
@@ -213,16 +213,16 @@ class A {
         qns_swapped = {e.qualified_name for e in _parse(swapped).entities if e.name == "process"}
         assert qns_original == qns_swapped
         assert qns_original == {
-            f"{PROJECT}:src.Example.A.process(Order)",
-            f"{PROJECT}:src.Example.A.process(List<Order>,String[])",
+            f"{PROJECT}:Example.A.process(Order)",
+            f"{PROJECT}:Example.A.process(List<Order>,String[])",
         }
 
     def test_calls_attributed_to_correct_overload(self):
         parsed = _parse(self.OVERLOAD_SOURCE)
         calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
         pairs = {(r.from_qualified_name, r.to_name) for r in calls}
-        assert (f"{PROJECT}:src.Example.A.process(Order)", "helperOne") in pairs
-        assert (f"{PROJECT}:src.Example.A.process(List<Order>,String[])", "helperTwo") in pairs
+        assert (f"{PROJECT}:Example.A.process(Order)", "helperOne") in pairs
+        assert (f"{PROJECT}:Example.A.process(List<Order>,String[])", "helperTwo") in pairs
 
     def test_varargs_suffix_is_dot_free(self):
         """Varargs render as 'T[]', never 'T...' — dots in qualified_name separate scope segments only (S6)."""
@@ -279,6 +279,62 @@ public class Foo {}
         imported = {r.to_name for r in imports}
         assert "java.util.List" in imported
         assert "java.io.File" in imported
+
+
+class TestJavaImportNamespaceAlignment:
+    """jvm.py:404 — Java imports emit package-based paths ('com.example.util.Helper'),
+    but stored qualified names were file-path-based ('src...' / 'src.main.java...'),
+    so intra-project imports could never resolve internally. The Module entity's
+    qn must land in the same (source-root-stripped) namespace as import to_names."""
+
+    @pytest.fixture(autouse=True)
+    def _require_java(self):
+        pytest.importorskip("tree_sitter_java")
+
+    @staticmethod
+    def _module_entity(parsed: ParsedFile):
+        modules = [e for e in parsed.entities if e.label == NodeLabel.MODULE]
+        assert len(modules) == 1
+        return modules[0]
+
+    def test_bare_src_layout_module_qn_matches_import_namespace(self):
+        parsed = _parse(
+            "package com.example.util;\npublic class Helper {}\n",
+            path="src/com/example/util/Helper.java",
+        )
+        module = self._module_entity(parsed)
+        assert module.qualified_name == f"{PROJECT}:com.example.util.Helper"
+
+    def test_maven_main_layout_module_qn_matches_import_namespace(self):
+        parsed = _parse(
+            "package com.example.util;\npublic class Helper {}\n",
+            path="src/main/java/com/example/util/Helper.java",
+        )
+        module = self._module_entity(parsed)
+        assert module.qualified_name == f"{PROJECT}:com.example.util.Helper"
+
+    def test_maven_test_layout_module_qn_matches_import_namespace(self):
+        parsed = _parse(
+            "package com.example.util;\npublic class HelperTest {}\n",
+            path="src/test/java/com/example/util/HelperTest.java",
+        )
+        module = self._module_entity(parsed)
+        assert module.qualified_name == f"{PROJECT}:com.example.util.HelperTest"
+
+    def test_flat_layout_unaffected(self):
+        """No 'src' component at all — nothing to strip, qn unchanged."""
+        parsed = _parse(
+            "package com.example;\npublic class Helper {}\n",
+            path="com/example/Helper.java",
+        )
+        module = self._module_entity(parsed)
+        assert module.qualified_name == f"{PROJECT}:com.example.Helper"
+
+    def test_bare_src_file_not_stripped_to_empty(self):
+        """A file literally named 'src.java' at the repo root keeps qn 'src'."""
+        parsed = _parse("public class Foo {}\n", path="src.java")
+        module = self._module_entity(parsed)
+        assert module.qualified_name == f"{PROJECT}:src"
 
 
 class TestJavaInheritance:
@@ -417,9 +473,9 @@ public class Foo {
 }
 """
         parsed = _parse(source)
-        defines = _rels_from(parsed, "src.Example.Foo", RelType.DEFINES)
+        defines = _rels_from(parsed, "Example.Foo", RelType.DEFINES)
         targets = {r.to_name for r in defines}
-        assert f"{PROJECT}:src.Example.Foo.bar" in targets
+        assert f"{PROJECT}:Example.Foo.bar" in targets
 
 
 class TestJavaCalls:
@@ -437,7 +493,7 @@ public class Foo {
 }
 """
         parsed = _parse(source)
-        calls = _rels_from(parsed, "src.Example.Foo.doWork", RelType.CALLS)
+        calls = _rels_from(parsed, "Example.Foo.doWork", RelType.CALLS)
         called = {r.to_name for r in calls}
         assert "helper" in called or "println" in called
 
@@ -987,6 +1043,92 @@ namespace MyApp.Models {
         cls = _entity_by_name(parsed, "User")
         assert cls.label == NodeLabel.TYPE_DEF
         assert cls.kind == TypeDefKind.CLASS
+
+    def test_namespace_included_in_qualified_name(self):
+        """jvm.py:842 — namespace parts must be folded into the qn, not dropped."""
+        source = """\
+namespace MyApp.Models {
+    public class User {}
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        cls = _entity_by_name(parsed, "User")
+        assert cls.qualified_name == f"{PROJECT}:src.Example.MyApp.Models.User"
+
+    def test_same_named_types_in_different_namespaces_do_not_collide(self):
+        """jvm.py:842 — same-named types in different namespaces of one file must
+        get distinct uids (previously both collapsed to the same qn since the
+        namespace name was dropped)."""
+        source = """\
+namespace First {
+    class C { void M1() {} }
+}
+namespace Second {
+    class C { void M2() {} }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        classes = [e for e in parsed.entities if e.name == "C" and e.label == NodeLabel.TYPE_DEF]
+        assert len(classes) == 2
+        qns = {e.qualified_name for e in classes}
+        assert qns == {
+            f"{PROJECT}:src.Example.First.C",
+            f"{PROJECT}:src.Example.Second.C",
+        }
+        methods = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+        assert {"M1", "M2"} <= methods
+
+    def test_file_scoped_namespace_included_in_qualified_name(self):
+        """File-scoped namespace ('namespace Foo;') has no body node — the
+        declarations that follow are siblings, not children — so the namespace
+        must still be folded into their qn."""
+        source = """\
+namespace MyApp.Models;
+
+public class User {}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        cls = _entity_by_name(parsed, "User")
+        assert cls.qualified_name == f"{PROJECT}:src.Example.MyApp.Models.User"
+
+    def test_nested_namespace_included_in_qualified_name(self):
+        source = """\
+namespace Outer {
+    namespace Inner {
+        public class User {}
+    }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        cls = _entity_by_name(parsed, "User")
+        assert cls.qualified_name == f"{PROJECT}:src.Example.Outer.Inner.User"
+
+    def test_namespace_does_not_change_defines_parent(self):
+        """Namespaces have no graph node — DEFINES must still come from the Module
+        (file) entity, not a nonexistent namespace uid."""
+        source = """\
+namespace MyApp.Models {
+    public class User {}
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        defines = _rels_from(parsed, "src.Example", RelType.DEFINES)
+        targets = {r.to_name for r in defines}
+        assert f"{PROJECT}:src.Example.MyApp.Models.User" in targets
+
+    def test_nested_class_inside_namespace(self):
+        """A type nested inside a class inside a namespace must include both the
+        namespace and the outer class in its qn."""
+        source = """\
+namespace MyApp.Models {
+    public class Outer {
+        public class Inner {}
+    }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        inner = _entity_by_name(parsed, "Inner")
+        assert inner.qualified_name == f"{PROJECT}:src.Example.MyApp.Models.Outer.Inner"
 
 
 class TestCSharpRecord:

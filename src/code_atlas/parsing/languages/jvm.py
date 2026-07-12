@@ -69,6 +69,35 @@ def _module_qualified_name(file_path: str) -> str:
     return ".".join(parts)
 
 
+# Conventional Java source-root directory markers (Maven/Gradle 'src/main/java',
+# 'src/test/java', or a bare 'src') that are not part of the package/import
+# namespace. Checked longest-first so 'src/main/java/...' strips as one unit
+# rather than partially matching the bare 'src' marker. Java-only: unlike Python
+# and C#, Java's import path is package-based (not file-path-based), so leaving
+# the source-root prefix in the stored qualified_name makes intra-project imports
+# structurally unable to match (jvm.py finding: Java intra-project imports never
+# resolve internally). Mirrors python.py's leading-component `_SOURCE_ROOTS` strip
+# (S2) — same convention-based, parse-time-only approach.
+_JAVA_SOURCE_ROOT_MARKERS: tuple[tuple[str, ...], ...] = (
+    ("src", "main", "java"),
+    ("src", "test", "java"),
+    ("src",),
+)
+
+
+def _strip_java_source_root(parts: list[str]) -> list[str]:
+    """Strip a leading conventional Java source-root marker from module-qn *parts*.
+
+    Only strips when more components follow (a file literally named ``src.java``
+    at the repo root keeps qn ``src``, never emptied).
+    """
+    for marker in _JAVA_SOURCE_ROOT_MARKERS:
+        n = len(marker)
+        if len(parts) > n and tuple(parts[:n]) == marker:
+            return parts[n:]
+    return parts
+
+
 _VISIBILITY_MAP: dict[str, str] = {
     "public": Visibility.PUBLIC,
     "private": Visibility.PRIVATE,
@@ -432,7 +461,7 @@ def _parse_java(
     project_name: str,
 ) -> ParsedFile:
     """Extract entities and relationships from a Java parse tree."""
-    module_qn = _module_qualified_name(path)
+    module_qn = ".".join(_strip_java_source_root(_module_qualified_name(path).split(".")))
 
     entities: list[ParsedEntity] = []
     relationships: list[ParsedRelationship] = []
@@ -917,24 +946,41 @@ def _walk_csharp_node(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     parent_qn: str | None,
+    namespace_qn: str = "",
 ) -> None:
     """Recursively walk C# AST nodes to extract entities."""
     overloaded = _overloaded_callable_names(node)
+    current_ns_qn = namespace_qn
     for child in node.children:
-        # Namespace declarations — recurse into them
+        # Namespace declarations — fold the namespace name into a naming prefix for
+        # any top-level (non-nested) type declared within. Namespaces have no
+        # graph node of their own (unlike Python packages), so DEFINES/parent_qn
+        # semantics are unaffected — the module (file) entity stays the structural
+        # parent; only the *naming* prefix changes (fixes same-named types in
+        # different namespaces colliding on uid).
         if child.type in ("namespace_declaration", "file_scoped_namespace_declaration"):
-            # Recurse into the namespace body (declaration_list)
+            name_node = child.child_by_field_name("name")
+            ns_name = node_text(name_node) if name_node is not None else None
+            child_ns_qn = f"{current_ns_qn}.{ns_name}" if current_ns_qn and ns_name else (ns_name or current_ns_qn)
             body = child.child_by_field_name("body")
             if body is not None:
-                _walk_csharp_node(body, path, source, project_name, module_qn, entities, relationships, parent_qn)
-            # File-scoped namespace: declarations are direct children
-            if child.type == "file_scoped_namespace_declaration":
-                _walk_csharp_node(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
+                # Braced namespace: recurse into its own scope only.
+                _walk_csharp_node(
+                    body, path, source, project_name, module_qn, entities, relationships, parent_qn, child_ns_qn
+                )
+            else:
+                # File-scoped namespace ('namespace Foo;', no braces): there is no
+                # body node — the declarations it covers are the remaining
+                # siblings in this same node, so extend scope for the rest of
+                # this loop instead of recursing.
+                current_ns_qn = child_ns_qn
             continue
 
         # Type declarations
         if child.type in _CS_TYPE_NODES:
-            _process_csharp_type(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
+            _process_csharp_type(
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn, current_ns_qn
+            )
             continue
 
         # Methods
@@ -973,7 +1019,9 @@ def _walk_csharp_node(
 
         # Recurse into declaration_list and similar containers
         if child.type in ("declaration_list", "global_statement"):
-            _walk_csharp_node(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
+            _walk_csharp_node(
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn, current_ns_qn
+            )
 
 
 def _process_csharp_type(
@@ -985,6 +1033,7 @@ def _process_csharp_type(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     parent_qn: str | None,
+    namespace_qn: str = "",
 ) -> None:
     """Process a C# type declaration."""
     name_node = node.child_by_field_name("name")
@@ -995,7 +1044,8 @@ def _process_csharp_type(
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
 
-    qn = f"{module_qn}.{name}" if parent_qn is None else f"{parent_qn}.{name}"
+    ns_prefix = f"{namespace_qn}." if namespace_qn else ""
+    qn = f"{parent_qn}.{name}" if parent_qn is not None else f"{module_qn}.{ns_prefix}{name}"
     full_qn = f"{project_name}:{qn}"
 
     visibility = _extract_visibility(node, default=Visibility.PRIVATE)
