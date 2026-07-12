@@ -272,9 +272,14 @@ def _check_balanced_brackets(query: str) -> list[ValidationIssue]:
     stack: list[str] = []
     in_string = False
     string_char = ""
+    escape_next = False
     for char in query:
         if in_string:
-            if char == string_char:
+            if escape_next:
+                escape_next = False
+            elif char == "\\":
+                escape_next = True
+            elif char == string_char:
                 in_string = False
             continue
         if char in ("'", '"'):

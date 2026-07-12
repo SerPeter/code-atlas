@@ -95,6 +95,18 @@ class TestValidateCypherStatic:
         errors = [i for i in issues if i.level == "error"]
         assert errors == []
 
+    def test_escaped_quote_in_string_not_falsely_unbalanced(self):
+        """A backslash-escaped quote inside a string literal must not desync the
+        in-string tracker and misclassify the real closing paren that follows it
+        as string content — a valid query must not be flagged 'unbalanced'.
+        """
+        query = "MATCH (n WHERE n.name = 'it\\'s ok') RETURN n LIMIT 10"
+        issues = validate_cypher_static(query)
+        errors = [i for i in issues if i.level == "error"]
+        assert not any("unbalanced" in i.message.lower() for i in errors), (
+            f"False unbalanced-bracket error on valid Cypher with an escaped quote: {[e.message for e in errors]}"
+        )
+
     def test_bound_variable_rel_not_flagged_as_label(self):
         """`[r:IMPORTS]` is a relationship type, not a node label — must not error."""
         issues = validate_cypher_static("MATCH (m:Module {name: $name})-[r:IMPORTS]->(dep) RETURN dep LIMIT 10")

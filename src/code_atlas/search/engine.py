@@ -20,9 +20,40 @@ from code_atlas.schema import NodeLabel, RelType
 from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from code_atlas.graph.client import GraphClient
-    from code_atlas.search.embeddings import EmbedClient
+    from typing import Protocol
+
     from code_atlas.settings import SearchSettings
+
+    class GraphExecutor(Protocol):
+        """Structural subset of GraphClient needed by expand_context (raw query execution)."""
+
+        async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]: ...
+
+    class SearchGraph(Protocol):
+        """Structural subset of GraphClient needed by hybrid_search's three channels.
+
+        ``limit``/``projects`` are keyword-only here since engine.py always calls
+        them by keyword — this keeps the protocol satisfied regardless of where
+        an implementation's own optional params (e.g. GraphClient's ``label``) sit.
+        """
+
+        async def graph_search(
+            self, query: str, *, limit: int, projects: list[str] | None = None
+        ) -> list[dict[str, Any]]: ...
+
+        async def text_search(
+            self, query: str, *, limit: int, projects: list[str] | None = None
+        ) -> list[dict[str, Any]]: ...
+
+        async def vector_search(
+            self, vector: list[float], *, limit: int, projects: list[str] | None = None
+        ) -> list[dict[str, Any]]: ...
+
+    class EmbedOne(Protocol):
+        """Structural subset of EmbedClient needed by hybrid_search's vector channel."""
+
+        async def embed_one(self, text: str) -> list[float]: ...
+
 
 _tracer = get_tracer(__name__)
 _meter = get_meter(__name__)
@@ -311,7 +342,10 @@ def expand_scope(
     - Glob pattern (``services/*``) → matching projects + always_include.
     - Comma-separated → split + always_include.
 
-    Returns ``None`` for no filtering, or a deduplicated list of project names.
+    Returns ``None`` only when *scope* itself is empty (no filtering requested).
+    A non-empty *scope* that matches zero projects (e.g. a glob with no matches
+    and no ``always_include``) returns an empty list — callers MUST treat that
+    as an explicit "match nothing" restriction, not as "no filter".
     """
     if not scope:
         return None
@@ -342,7 +376,7 @@ def expand_scope(
             seen.add(name)
             result.append(name)
 
-    return result or None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +385,7 @@ def expand_scope(
 
 _IDENTIFIER_RE = re.compile(r"^[A-Z][a-zA-Z0-9]+$")  # PascalCase
 _SNAKE_RE = re.compile(r"^[a-z][a-z0-9_]+$")  # snake_case
-_DOTTED_RE = re.compile(r"\.")  # dotted path
+_DOTTED_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")  # dotted path (whole token, e.g. pkg.mod.Class)
 
 
 def rrf_fuse(
@@ -404,8 +438,11 @@ def analyze_query(query: str) -> dict[str, float]:
     is_identifier = (
         _IDENTIFIER_RE.match(stripped)
         or _SNAKE_RE.match(stripped)
-        or _DOTTED_RE.search(stripped)
-        or (len(words) <= 2 and any(_IDENTIFIER_RE.match(w) or ("_" in w and _SNAKE_RE.match(w)) for w in words))
+        or _DOTTED_RE.match(stripped)
+        or (
+            len(words) <= 2
+            and any(_IDENTIFIER_RE.match(w) or _DOTTED_RE.match(w) or ("_" in w and _SNAKE_RE.match(w)) for w in words)
+        )
     )
     if is_identifier:
         return {"graph": 2.0, "vector": 0.5, "bm25": 1.5}
@@ -623,9 +660,9 @@ def _boost_results(results: list[SearchResult]) -> list[SearchResult]:
     )
 
 
-async def hybrid_search(
-    graph: GraphClient,
-    embed: EmbedClient | None,
+async def hybrid_search(  # noqa: PLR0912, PLR0915
+    graph: SearchGraph,
+    embed: EmbedOne | None,
     settings: SearchSettings,
     query: str,
     *,
@@ -639,6 +676,7 @@ async def hybrid_search(
     code_only: bool = False,
     include_patterns: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
+    channel_status: dict[str, str] | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search across selected channels and fuse with RRF.
 
@@ -672,25 +710,40 @@ async def hybrid_search(
         Only include results whose basename matches one of these globs.
     exclude_patterns:
         Exclude results whose basename matches any of these globs.
+    channel_status:
+        Optional dict the caller supplies to receive per-channel outcomes
+        (``"ok"``, ``"unavailable: ..."``, or ``"error: ..."``) keyed by
+        channel name (``graph``/``vector``/``bm25``). Left untouched if
+        ``None``. Lets a caller detect silent channel degradation instead
+        of an empty/partial result set looking like a complete search.
     """
     with _tracer.start_as_current_span(
         "hybrid_search", attributes={"query": query, "limit": limit, "scope": scope}
     ) as span:
         if search_types is None:
             search_types = list(SearchType)
+        requested_types = list(search_types)
 
         span.set_attribute("search_types", ",".join(st.value for st in search_types))
         effective_weights = _compute_weights(settings, query, weights)
 
         # Pre-compute embedding if vector channel is requested
         vector: list[float] | None = None
-        if SearchType.VECTOR in search_types and embed is not None:
-            with _tracer.start_as_current_span("embed_query"):
-                try:
-                    vector = await embed.embed_one(query)
-                except Exception as exc:
-                    logger.warning("Embedding failed, skipping vector channel: {}", exc)
-                    search_types = [st for st in search_types if st != SearchType.VECTOR]
+        if SearchType.VECTOR in search_types:
+            if embed is None:
+                logger.warning("Vector channel requested but no embedding client is configured; skipping.")
+                if channel_status is not None:
+                    channel_status["vector"] = "unavailable: no embedding client configured"
+                search_types = [st for st in search_types if st != SearchType.VECTOR]
+            else:
+                with _tracer.start_as_current_span("embed_query"):
+                    try:
+                        vector = await embed.embed_one(query)
+                    except Exception as exc:
+                        logger.warning("Embedding failed, skipping vector channel: {}", exc)
+                        if channel_status is not None:
+                            channel_status["vector"] = f"error: {exc}"
+                        search_types = [st for st in search_types if st != SearchType.VECTOR]
 
         # Resolve scope to projects list (monorepo-aware)
         if scope:
@@ -720,6 +773,12 @@ async def hybrid_search(
             except Exception as exc:
                 logger.warning("Search channel {} failed: {}", channel, exc)
                 channel_results[channel] = []
+                if channel_status is not None:
+                    channel_status[channel] = f"error: {exc}"
+
+        if channel_status is not None:
+            for st in requested_types:
+                channel_status.setdefault(st.value, "ok")
 
         with _tracer.start_as_current_span("rrf_fuse"):
             ranked_lists, props_by_uid = _build_ranked_lists(channel_results)
@@ -842,7 +901,7 @@ def _prioritize_callers(callers: list[CompactNode], target_qn: str) -> list[Comp
 
 
 async def expand_context(
-    graph: GraphClient,
+    graph: GraphExecutor,
     uid: str,
     *,
     label: str | None = None,
@@ -892,7 +951,7 @@ async def expand_context(
 
 
 async def _expand_context_inner(
-    graph: GraphClient,
+    graph: GraphExecutor,
     uid: str,
     *,
     label: str | None = None,
@@ -932,8 +991,8 @@ async def _expand_context_inner(
             {"uid": uid},
         )
         coros["package_ctx"] = graph.execute(
-            "MATCH (pkg)-[:CONTAINS*1..3]->(target {uid: $uid}) "
-            "WHERE pkg:Package OR pkg:Module RETURN pkg.docstring AS docstring LIMIT 1",
+            f"MATCH (pkg:{NodeLabel.MODULE})-[:{RelType.DEFINES}*1..3]->(target {{uid: $uid}}) "
+            "RETURN pkg.docstring AS docstring LIMIT 1",
             {"uid": uid},
         )
 

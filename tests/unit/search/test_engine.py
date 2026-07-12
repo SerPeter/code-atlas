@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from code_atlas.search.engine import (
     CompactNode,
     ExpandedContext,
     SearchResult,
+    SearchType,
     _apply_filters,
     _boost_results,
     _is_doc_result,
@@ -20,6 +23,9 @@ from code_atlas.search.engine import (
     analyze_query,
     assemble_context,
     count_tokens,
+    expand_context,
+    expand_scope,
+    hybrid_search,
     rrf_fuse,
 )
 from code_atlas.settings import SearchSettings
@@ -103,6 +109,42 @@ class TestAnalyzeQuery:
         # Two generic lowercase words → balanced (not identifier-like)
         weights = analyze_query("user login")
         assert weights["graph"] == weights["vector"]
+
+    def test_sentence_with_trailing_period_not_identifier(self):
+        """A natural-language sentence ending in a period must not be misread as a dotted path."""
+        weights = analyze_query("How do I export the config to disk.")
+        assert weights["vector"] > weights["graph"]
+
+    def test_sentence_with_abbreviation_not_identifier(self):
+        """'e.g.' inside a sentence must not suppress the vector channel."""
+        weights = analyze_query("explain how caching works, e.g. for embeddings")
+        assert weights["vector"] > weights["graph"]
+
+    def test_dotted_path_as_one_of_two_words_still_identifier(self):
+        """A genuine dotted identifier token among <=2 words is still identifier-like."""
+        weights = analyze_query("check GraphClient.process")
+        assert weights["graph"] > weights["vector"]
+
+
+# ---------------------------------------------------------------------------
+# expand_scope
+# ---------------------------------------------------------------------------
+
+
+class TestExpandScope:
+    def test_empty_scope_returns_none(self):
+        """Empty scope means 'no filter' — must stay None."""
+        assert expand_scope("", ["a", "b"]) is None
+
+    def test_glob_zero_match_returns_empty_list_not_none(self):
+        """A glob matching nothing is an explicit zero-project restriction, not 'no filter'."""
+        result = expand_scope("services-*", ["libs-shared", "libs-other"])
+        assert result == []
+        assert result is not None
+
+    def test_glob_match_returns_matched_projects(self):
+        result = expand_scope("services-*", ["services-auth", "libs-shared"])
+        assert result == ["services-auth"]
 
 
 # ---------------------------------------------------------------------------
@@ -755,3 +797,165 @@ class TestAssembleContext:
         ec = ExpandedContext(target=_make_node("mod.target"))
         result = assemble_context(ec, budget=8000, tokenizer="claude")
         assert result.total_tokens > 0
+
+
+# ---------------------------------------------------------------------------
+# expand_context — package_context traversal
+# ---------------------------------------------------------------------------
+
+
+class _FakeGraphForContext:
+    """Fake GraphClient double that mimics real containment: only Module
+    -[:DEFINES]-> entity edges exist; there is no Package/Module -[:CONTAINS]->
+    edge reaching code entities (matching the real indexer's data model).
+    """
+
+    def __init__(self, package_docstring: str | None = "Parses source into entities.") -> None:
+        self._package_docstring = package_docstring
+
+    async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        params = params or {}
+        if query.strip().endswith("RETURN n"):
+            return [
+                {
+                    "n": {
+                        "uid": params["uid"],
+                        "name": "target_fn",
+                        "qualified_name": "pkg.mod.target_fn",
+                        "kind": "function",
+                        "file_path": "pkg/mod.py",
+                    }
+                }
+            ]
+        if "AS docstring" in query:
+            if "DEFINES" in query and self._package_docstring is not None:
+                return [{"docstring": self._package_docstring}]
+            return []
+        # parent / siblings / callers / callees / docs — no data needed here
+        return []
+
+
+class TestExpandContextPackageContext:
+    async def test_package_context_populated_via_defines_chain(self):
+        """package_context must be reachable from a Module via DEFINES (the edges
+        the indexer actually writes) — a CONTAINS-based query always finds nothing.
+        """
+        graph = _FakeGraphForContext(package_docstring="Parses source into entities.")
+        result = await expand_context(
+            graph,
+            "proj:pkg.mod.target_fn",
+            include_calls=False,
+            include_docs=False,
+        )
+        assert result is not None
+        assert result.package_context == "Parses source into entities."
+
+    async def test_package_context_empty_when_no_module_reaches_target(self):
+        graph = _FakeGraphForContext(package_docstring=None)
+        result = await expand_context(
+            graph,
+            "proj:pkg.mod.target_fn",
+            include_calls=False,
+            include_docs=False,
+        )
+        assert result is not None
+        assert result.package_context == ""
+
+
+# ---------------------------------------------------------------------------
+# hybrid_search — channel_status signal
+# ---------------------------------------------------------------------------
+
+
+class _FakeSearchGraph:
+    """Fake GraphClient double exposing only the three search channel methods."""
+
+    def __init__(
+        self,
+        *,
+        graph_result: list[dict[str, Any]] | None = None,
+        text_result: list[dict[str, Any]] | None = None,
+        vector_result: list[dict[str, Any]] | None = None,
+        fail: set[str] | None = None,
+    ) -> None:
+        self._graph_result = graph_result or []
+        self._text_result = text_result or []
+        self._vector_result = vector_result or []
+        self._fail = fail or set()
+
+    async def graph_search(self, query: str, limit: int, projects: list[str] | None = None) -> list[dict[str, Any]]:
+        if "graph" in self._fail:
+            raise RuntimeError("graph channel boom")
+        return self._graph_result
+
+    async def text_search(self, query: str, limit: int, projects: list[str] | None = None) -> list[dict[str, Any]]:
+        if "bm25" in self._fail:
+            raise RuntimeError("bm25 channel boom")
+        return self._text_result
+
+    async def vector_search(
+        self, vector: list[float], limit: int, projects: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        if "vector" in self._fail:
+            raise RuntimeError("vector channel boom")
+        return self._vector_result
+
+
+class _FakeEmbedClient:
+    def __init__(self, vector: list[float] | None = None, *, fail: bool = False) -> None:
+        self._vector = vector or [0.1, 0.2]
+        self._fail = fail
+
+    async def embed_one(self, text: str) -> list[float]:
+        if self._fail:
+            raise RuntimeError("embed boom")
+        return self._vector
+
+
+class TestHybridSearchChannelStatus:
+    async def test_vector_unavailable_without_embed_client(self):
+        """Vector requested but embed=None must be signalled, not silently dropped."""
+        graph = _FakeSearchGraph()
+        status: dict[str, str] = {}
+        await hybrid_search(graph, None, SearchSettings(), "find the auth handler function", channel_status=status)
+        assert status["vector"].startswith("unavailable")
+        assert status["graph"] == "ok"
+        assert status["bm25"] == "ok"
+
+    async def test_vector_error_recorded_on_embed_failure(self):
+        graph = _FakeSearchGraph()
+        embed = _FakeEmbedClient(fail=True)
+        status: dict[str, str] = {}
+        await hybrid_search(graph, embed, SearchSettings(), "find the auth handler function", channel_status=status)
+        assert status["vector"].startswith("error")
+
+    async def test_channel_error_recorded_on_search_failure(self):
+        graph = _FakeSearchGraph(fail={"bm25"})
+        embed = _FakeEmbedClient()
+        status: dict[str, str] = {}
+        await hybrid_search(graph, embed, SearchSettings(), "find the auth handler function", channel_status=status)
+        assert status["bm25"].startswith("error")
+        assert status["graph"] == "ok"
+        assert status["vector"] == "ok"
+
+    async def test_channel_status_omitted_by_default_no_behavior_change(self):
+        """Omitting channel_status must not raise or change search behavior."""
+        graph = _FakeSearchGraph()
+        embed = _FakeEmbedClient()
+        results = await hybrid_search(graph, embed, SearchSettings(), "find the auth handler function")
+        assert results == []
+
+    async def test_vector_requested_only_and_unavailable_yields_no_silent_success(self):
+        """Requesting only the vector channel with no embed client should mark it unavailable."""
+        graph = _FakeSearchGraph()
+        status: dict[str, str] = {}
+        results = await hybrid_search(
+            graph,
+            None,
+            SearchSettings(),
+            "find the auth handler function",
+            search_types=[SearchType.VECTOR],
+            channel_status=status,
+        )
+        assert results == []
+        assert status["vector"].startswith("unavailable")
