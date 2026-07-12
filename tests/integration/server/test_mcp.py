@@ -153,6 +153,86 @@ class TestCypherQuery:
         )
         assert result["count"] <= 2
 
+    async def test_cypher_query_allows_string_literal_matching_write_keyword(self, app_ctx, seeded_graph):
+        """A quoted string literal equal to a write keyword (e.g. 'set') must not be rejected."""
+        result = await _invoke_tool(
+            app_ctx,
+            "cypher_query",
+            query="MATCH (n) WHERE n.name = 'set' RETURN n.name AS name",
+        )
+        assert "error" not in result
+        assert result["count"] == 0  # no entity named 'set' — but the query itself must run
+
+    async def test_cypher_query_still_rejects_real_write_keyword(self, app_ctx, seeded_graph):
+        """An actual (unquoted) write keyword must still be rejected."""
+        result = await _invoke_tool(app_ctx, "cypher_query", query="MATCH (n) WHERE n.name = 'x' SET n.name = 'y'")
+        assert result["code"] == "WRITE_REJECTED"
+
+    async def test_cypher_query_truncated_true_when_more_matches_than_limit(self, app_ctx, graph_client):
+        await graph_client.ensure_schema()
+        await graph_client.execute_write(
+            "UNWIND range(1, 25) AS i "
+            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            "uid: 'trunc-project:foo' + toString(i), project_name: 'trunc-project', name: 'foo', "
+            "qualified_name: 'mod.foo' + toString(i), file_path: 'mod.py', kind: 'function', "
+            "line_start: i, line_end: i})"
+        )
+        result = await _invoke_tool(
+            app_ctx, "cypher_query", query="MATCH (n:Callable {name: 'foo'}) RETURN n.uid AS uid", limit=20
+        )
+        assert result["count"] == 20
+        assert result["truncated"] is True
+
+    async def test_cypher_query_not_truncated_when_matches_fit(self, app_ctx, graph_client):
+        await graph_client.ensure_schema()
+        await graph_client.execute_write(
+            "UNWIND range(1, 5) AS i "
+            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            "uid: 'trunc-project2:foo' + toString(i), project_name: 'trunc-project2', name: 'foo', "
+            "qualified_name: 'mod.foo' + toString(i), file_path: 'mod.py', kind: 'function', "
+            "line_start: i, line_end: i})"
+        )
+        result = await _invoke_tool(
+            app_ctx, "cypher_query", query="MATCH (n:Callable {name: 'foo'}) RETURN n.uid AS uid", limit=20
+        )
+        assert result["count"] == 5
+        assert result["truncated"] is False
+
+    async def test_cypher_query_truncated_unknown_with_explicit_limit(self, app_ctx, graph_client):
+        """When the caller supplies their own LIMIT clause, truncation is not claimed."""
+        await graph_client.ensure_schema()
+        await graph_client.execute_write(
+            "UNWIND range(1, 25) AS i "
+            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            "uid: 'trunc-project3:foo' + toString(i), project_name: 'trunc-project3', name: 'foo', "
+            "qualified_name: 'mod.foo' + toString(i), file_path: 'mod.py', kind: 'function', "
+            "line_start: i, line_end: i})"
+        )
+        result = await _invoke_tool(
+            app_ctx,
+            "cypher_query",
+            query="MATCH (n:Callable {name: 'foo'}) RETURN n.uid AS uid LIMIT 5",
+            limit=20,
+        )
+        assert result["count"] == 5
+        assert result["truncated"] is False
+
+    async def test_cypher_query_serializes_collected_nodes(self, app_ctx, seeded_graph):
+        """Aggregation results (e.g. collect(n)) nest Node objects inside lists — these must
+        be converted to plain dicts, not passed through as raw neo4j Node objects."""
+        result = await _invoke_tool(
+            app_ctx,
+            "cypher_query",
+            query="MATCH (n:Callable) RETURN collect(n) AS nodes, count(n) AS cnt",
+        )
+        assert "error" not in result
+        row = result["results"][0]
+        assert row["cnt"] >= 1
+        assert isinstance(row["nodes"], list)
+        assert isinstance(row["nodes"][0], dict)
+        assert "_labels" in row["nodes"][0]
+        assert "Callable" in row["nodes"][0]["_labels"]
+
 
 class TestGetNode:
     async def test_get_node_exact_name(self, app_ctx, seeded_graph):
@@ -178,6 +258,32 @@ class TestGetNode:
     async def test_get_node_not_found(self, app_ctx, seeded_graph):
         result = await _invoke_tool(app_ctx, "get_node", name="nonexistent_entity_xyz")
         assert result["count"] == 0
+
+    async def test_get_node_truncated_true_when_more_matches_than_limit(self, app_ctx, graph_client):
+        await graph_client.ensure_schema()
+        await graph_client.execute_write(
+            "UNWIND range(1, 25) AS i "
+            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            "uid: 'gn-trunc:foo' + toString(i), project_name: 'gn-trunc', name: 'shared_name', "
+            "qualified_name: 'mod.shared_name' + toString(i), file_path: 'mod.py', kind: 'function', "
+            "line_start: i, line_end: i})"
+        )
+        result = await _invoke_tool(app_ctx, "get_node", name="shared_name", limit=20)
+        assert result["count"] == 20
+        assert result["truncated"] is True
+
+    async def test_get_node_truncated_false_when_matches_fit(self, app_ctx, graph_client):
+        await graph_client.ensure_schema()
+        await graph_client.execute_write(
+            "UNWIND range(1, 5) AS i "
+            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            "uid: 'gn-trunc2:foo' + toString(i), project_name: 'gn-trunc2', name: 'shared_name2', "
+            "qualified_name: 'mod.shared_name2' + toString(i), file_path: 'mod.py', kind: 'function', "
+            "line_start: i, line_end: i})"
+        )
+        result = await _invoke_tool(app_ctx, "get_node", name="shared_name2", limit=20)
+        assert result["count"] == 5
+        assert result["truncated"] is False
 
 
 class TestGetContext:
@@ -297,6 +403,56 @@ class TestTextSearch:
 
         after = await seeded_graph.execute("MATCH (n) RETURN count(n) AS c")
         assert after[0]["c"] == before[0]["c"], "Injection payload must not have deleted any nodes"
+
+
+class TestDefaultScopeMonorepo:
+    """Default (unscoped) search must include monorepo sub-project entities,
+    stored under project_name = '{root}/{sub}' — not just the bare root name."""
+
+    async def test_hybrid_search_default_scope_includes_sub_project_entities(self, app_ctx, graph_client):
+        from code_atlas.settings import derive_project_name
+
+        await graph_client.ensure_schema()
+        root_name = derive_project_name(app_ctx.settings.project_root)
+        sub_name = f"{root_name}/sub"
+
+        await graph_client.merge_project_node(root_name, file_count=1, entity_count=1)
+        await graph_client.merge_project_node(sub_name, file_count=1, entity_count=1)
+
+        await graph_client.execute_write(
+            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            "uid: $uid, project_name: $project_name, name: 'root_only_fn', "
+            "qualified_name: 'root_only_fn', file_path: 'root.py', kind: 'function', "
+            "line_start: 1, line_end: 2})",
+            {"uid": f"{root_name}:root_only_fn", "project_name": root_name},
+        )
+        await graph_client.execute_write(
+            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            "uid: $uid, project_name: $project_name, name: 'sub_only_fn', "
+            "qualified_name: 'sub_only_fn', file_path: 'sub/sub.py', kind: 'function', "
+            "line_start: 1, line_end: 2})",
+            {"uid": f"{sub_name}:sub_only_fn", "project_name": sub_name},
+        )
+
+        # No scope/project passed — must still find the sub-project entity, not just root's.
+        result = await _invoke_tool(app_ctx, "hybrid_search", query="sub_only_fn", search_types="graph")
+        names = {r["name"] for r in result["results"]}
+        assert "sub_only_fn" in names
+
+    async def test_text_search_default_scope_resolves_to_root_and_sub_projects(self, app_ctx, graph_client):
+        """text_search's default (unscoped) project resolution must include sub-projects —
+        verified against the same _default_scope_projects helper hybrid_search relies on."""
+        from code_atlas.server.mcp import _default_scope_projects
+        from code_atlas.settings import derive_project_name
+
+        await graph_client.ensure_schema()
+        root_name = derive_project_name(app_ctx.settings.project_root)
+        sub_name = f"{root_name}/sub"
+        await graph_client.merge_project_node(root_name, file_count=1, entity_count=1)
+        await graph_client.merge_project_node(sub_name, file_count=1, entity_count=1)
+
+        resolved = await _default_scope_projects(app_ctx)
+        assert set(resolved) == {root_name, sub_name}
 
 
 # ---------------------------------------------------------------------------

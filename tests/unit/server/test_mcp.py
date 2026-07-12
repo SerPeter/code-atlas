@@ -29,6 +29,7 @@ from code_atlas.search.embeddings import EmbedClient
 from code_atlas.server.mcp import (
     AppContext,
     _compact_node,
+    _default_scope_projects,
     _file_uri_to_path,
     _maybe_update_root,
     _rank_results,
@@ -39,6 +40,7 @@ from code_atlas.server.mcp import (
     _register_query_tools,
     _register_search_tools,
     _register_subagent_tools,
+    _resolve_hybrid_scope,
     _with_staleness,
 )
 from code_atlas.settings import AtlasSettings, IndexSettings, find_git_root
@@ -307,6 +309,249 @@ class TestSearchLabelValidation:
 
 
 # ---------------------------------------------------------------------------
+# _default_scope_projects — default monorepo scope resolution (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultScopeProjects:
+    async def test_falls_back_to_root_when_get_project_status_fails(self, settings):
+        """DB unreachable/erroring must gracefully degrade to the root project name,
+        not propagate and break search tools that call this helper."""
+        from code_atlas.settings import derive_project_name
+
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(side_effect=RuntimeError("db down"))
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        root_name = derive_project_name(settings.project_root)
+        result = await _default_scope_projects(app)
+        assert result == [root_name]
+
+    async def test_includes_sub_projects_and_excludes_unrelated(self, settings):
+        """Sub-projects stored as '{root}/{sub}' are included; an unrelated project whose
+        name merely shares the root as a substring (no '/' separator) must not match."""
+        from code_atlas.settings import derive_project_name
+
+        root_name = derive_project_name(settings.project_root)
+        rows = [
+            {"n": {"name": root_name}},
+            {"n": {"name": f"{root_name}/sub"}},
+            {"n": {"name": f"{root_name}-unrelated"}},
+        ]
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(return_value=rows)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _default_scope_projects(app)
+        assert set(result) == {root_name, f"{root_name}/sub"}
+
+    async def test_no_sub_projects_returns_root_only(self, settings):
+        from code_atlas.settings import derive_project_name
+
+        root_name = derive_project_name(settings.project_root)
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(return_value=[{"n": {"name": root_name}}])
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _default_scope_projects(app)
+        assert result == [root_name]
+
+
+# ---------------------------------------------------------------------------
+# hybrid_search input validation (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestHybridSearchValidation:
+    async def test_invalid_search_types_returns_error(self, settings):
+        """An unknown channel name must return a clean error envelope, not raise ValueError."""
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "hybrid_search", query="foo", search_types="bogus_channel")
+        assert "error" in result
+        assert result["code"] == "INVALID_SEARCH_TYPES"
+
+    async def test_non_object_weights_returns_error(self, settings):
+        """Valid JSON that isn't an object (e.g. a list) must be rejected cleanly."""
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "hybrid_search", query="foo", weights="[1, 2, 3]")
+        assert "error" in result
+        assert result["code"] == "INVALID_WEIGHTS"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_hybrid_scope / hybrid_search — a scope matching zero projects must
+# be treated as "search nothing", not silently collapse into "no filter"
+# ---------------------------------------------------------------------------
+
+
+class TestResolveHybridScopeZeroMatch:
+    async def test_zero_match_glob_returns_none_not_empty_string(self, settings):
+        """expand_scope's explicit "match nothing" ([]) must not collapse to
+        "" — hybrid_search treats "" exactly like an unset scope (no filter)."""
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "libs-shared"}}])
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        resolved = await _resolve_hybrid_scope(app, "totally-nonexistent-*")
+        assert resolved is None
+
+    async def test_matching_glob_resolves_normally(self, settings):
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(
+            return_value=[{"n": {"name": "libs-shared"}}, {"n": {"name": "libs-other"}}]
+        )
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        resolved = await _resolve_hybrid_scope(app, "libs-*")
+        assert resolved == "libs-shared,libs-other"
+
+
+class TestHybridSearchZeroMatchScope:
+    async def test_zero_match_scope_returns_empty_without_unfiltered_search(self, settings):
+        """A scope glob matching zero indexed projects must return zero results
+        and must NOT fall through to an unrestricted, unfiltered search."""
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "libs-shared"}}])
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        with patch("code_atlas.server.mcp._hybrid_search", new_callable=AsyncMock) as fake_search:
+            result = await _invoke_tool(app, "hybrid_search", query="foo", scope="totally-nonexistent-*")
+
+        fake_search.assert_not_awaited()
+        assert result["results"] == []
+        assert result["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# `truncated` field correctness (no DB needed) — was always False before the fix
+# ---------------------------------------------------------------------------
+
+
+class TestTruncatedField:
+    async def test_text_search_truncated_true_when_more_results_than_limit(self, settings):
+        available = [{"node": {"uid": f"p:e{i}", "name": "e"}, "score": 1.0} for i in range(30)]
+
+        async def _fake_text_search(query, label="", limit=20, project="", projects=None):
+            return available[:limit]
+
+        graph = AsyncMock(spec=GraphClient)
+        graph.text_search = AsyncMock(side_effect=_fake_text_search)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "text_search", query="e", limit=20)
+        assert result["count"] == 20
+        assert result["truncated"] is True
+
+    async def test_text_search_truncated_false_when_results_fit(self, settings):
+        available = [{"node": {"uid": f"p:e{i}", "name": "e"}, "score": 1.0} for i in range(5)]
+
+        async def _fake_text_search(query, label="", limit=20, project="", projects=None):
+            return available[:limit]
+
+        graph = AsyncMock(spec=GraphClient)
+        graph.text_search = AsyncMock(side_effect=_fake_text_search)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "text_search", query="e", limit=20)
+        assert result["count"] == 5
+        assert result["truncated"] is False
+
+    async def test_vector_search_truncated_true_when_more_results_than_limit(self, settings):
+        available = [{"node": {"uid": f"p:e{i}", "name": "e"}, "similarity": 0.9} for i in range(30)]
+
+        async def _fake_vector_search(vector, label="", limit=20, project="", threshold=0.0, projects=None):
+            return available[:limit]
+
+        graph = AsyncMock(spec=GraphClient)
+        graph.vector_search = AsyncMock(side_effect=_fake_vector_search)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed, vector_enabled=True)
+
+        with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=[0.1] * 768):
+            result = await _invoke_tool(app, "vector_search", query="e", limit=20)
+        assert result["count"] == 20
+        assert result["truncated"] is True
+
+    async def test_hybrid_search_truncated_true_when_more_results_than_limit(self, settings):
+        from code_atlas.search.engine import SearchResult
+
+        available = [
+            SearchResult(
+                uid=f"p:e{i}",
+                name="e",
+                qualified_name=f"mod.e{i}",
+                kind="function",
+                file_path="mod.py",
+                line_start=1,
+                line_end=2,
+                signature="",
+                docstring="",
+                labels=["Callable"],
+                rrf_score=1.0,
+            )
+            for i in range(30)
+        ]
+
+        async def _fake_hybrid_search(*, limit, **_kwargs):
+            return available[:limit]
+
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
+            result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
+        assert result["count"] == 20
+        assert result["truncated"] is True
+
+    async def test_hybrid_search_not_truncated_when_results_fit(self, settings):
+        from code_atlas.search.engine import SearchResult
+
+        available = [
+            SearchResult(
+                uid=f"p:e{i}",
+                name="e",
+                qualified_name=f"mod.e{i}",
+                kind="function",
+                file_path="mod.py",
+                line_start=1,
+                line_end=2,
+                signature="",
+                docstring="",
+                labels=["Callable"],
+                rrf_score=1.0,
+            )
+            for i in range(5)
+        ]
+
+        async def _fake_hybrid_search(*, limit, **_kwargs):
+            return available[:limit]
+
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
+            result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
+        assert result["count"] == 5
+        assert result["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
 # Enhanced schema_info (no DB needed)
 # ---------------------------------------------------------------------------
 
@@ -357,6 +602,33 @@ class TestValidateCypher:
         result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Callable)")  # type: ignore[arg-type]
         warnings = [i for i in result["issues"] if i["level"] == "warning"]
         assert any("return" in i["message"].lower() for i in warnings)
+
+
+# ---------------------------------------------------------------------------
+# cypher_query write-keyword guard vs string literals (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestCypherQueryWriteKeywordGuard:
+    async def test_allows_string_literal_matching_write_keyword(self, settings):
+        """A literal value equal to a write keyword (e.g. 'set') must not trigger rejection."""
+        graph = AsyncMock(spec=GraphClient)
+        graph.execute = AsyncMock(return_value=[{"name": "set"}])
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "cypher_query", query="MATCH (n) WHERE n.name = 'set' RETURN n.name AS name")
+        assert "error" not in result
+        graph.execute.assert_awaited_once()
+
+    async def test_still_rejects_unquoted_write_keyword(self, settings):
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "cypher_query", query="MATCH (n) WHERE n.name = 'x' SET n.name = 'y'")
+        assert result["code"] == "WRITE_REJECTED"
+        graph.execute.assert_not_awaited()
 
 
 class TestGetUsageGuide:
@@ -532,6 +804,22 @@ class TestWithStaleness:
             result = {"results": [{"uid": "test:foo"}]}
             annotated = await _with_staleness(app, result, scope="myproject")
             # Timeout fires (5s) — original result returned without stale keys
+            assert "stale" not in annotated
+            assert annotated["results"] == [{"uid": "test:foo"}]
+
+    async def test_staleness_query_timeout_returns_original_result(self, settings):
+        """QueryTimeoutError (raised by checker.check -> graph.execute on a slow DB query)
+        must be caught alongside plain TimeoutError — not propagate and discard results."""
+        from code_atlas.indexing.orchestrator import StalenessChecker
+
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        mock_graph = AsyncMock()
+        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+
+        with patch.object(checker, "check", side_effect=QueryTimeoutError(5.0, "get_project_git_hash")):
+            result = {"results": [{"uid": "test:foo"}]}
+            annotated = await _with_staleness(app, result, scope="myproject")
             assert "stale" not in annotated
             assert annotated["results"] == [{"uid": "test:foo"}]
 

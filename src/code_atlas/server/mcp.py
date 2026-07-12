@@ -72,6 +72,37 @@ _WRITE_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+
+def _strip_cypher_string_literals(query: str) -> str:
+    """Blank out the contents of single/double-quoted string literals.
+
+    Used before write-keyword scanning so a literal value equal to (or
+    containing) a write keyword — e.g. ``WHERE n.name = 'set'`` — doesn't
+    trigger a false-positive write rejection. Handles backslash-escaped
+    quotes inside literals.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for ch in query:
+        if quote is None:
+            out.append(ch)
+            if ch in ("'", '"'):
+                quote = ch
+        elif escaped:
+            out.append(" ")
+            escaped = False
+        elif ch == "\\":
+            out.append(" ")
+            escaped = True
+        elif ch == quote:
+            out.append(ch)
+            quote = None
+        else:
+            out.append(" ")
+    return "".join(out)
+
+
 _LIMIT_RE = re.compile(r"\bLIMIT\s+\d+", re.IGNORECASE)
 
 _DEFAULT_LIMIT = 20
@@ -227,18 +258,33 @@ async def _ensure_root(ctx: Context) -> AppContext:
     return app
 
 
+def _serialize_value(value: Any) -> Any:
+    """Recursively convert neo4j graph objects to plain JSON-serializable values.
+
+    Handles Node and Relationship objects, including when nested inside lists
+    (e.g. ``collect(n)`` results) — not just top-level record values.
+    """
+    if isinstance(value, list):
+        return [_serialize_value(v) for v in value]
+    if hasattr(value, "items") and hasattr(value, "labels"):
+        # neo4j Node object
+        node_dict = dict(value.items())
+        node_dict["_labels"] = sorted(value.labels)
+        return {k: _serialize_value(v) for k, v in node_dict.items()}
+    if hasattr(value, "items") and hasattr(value, "type") and hasattr(value, "nodes"):
+        # neo4j Relationship object
+        rel_dict = dict(value.items())
+        rel_dict["_type"] = value.type
+        return {k: _serialize_value(v) for k, v in rel_dict.items()}
+    if isinstance(value, dict):
+        return {k: _serialize_value(v) for k, v in value.items()}
+    return value
+
+
 def _serialize_node(record: dict[str, Any]) -> dict[str, Any]:
-    """Convert a neo4j record containing Node objects to plain dicts."""
-    out: dict[str, Any] = {}
-    for key, value in record.items():
-        if hasattr(value, "items") and hasattr(value, "labels"):
-            # neo4j Node object
-            node_dict = dict(value.items())
-            node_dict["_labels"] = sorted(value.labels)
-            out[key] = node_dict
-        else:
-            out[key] = value
-    return out
+    """Convert a neo4j record containing Node/Relationship objects (including
+    those nested inside lists from aggregations) to plain JSON-serializable dicts."""
+    return {key: _serialize_value(value) for key, value in record.items()}
 
 
 def _compact_node(record: dict[str, Any], *, detail: str = "summary") -> dict[str, Any]:
@@ -372,7 +418,7 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
             checker.check(app.graph, include_changed=(stale_mode == "warn")),
             timeout=5.0,
         )
-    except TimeoutError:
+    except TimeoutError, QueryTimeoutError:
         logger.warning("Staleness check timed out — skipping annotation")
         return result
 
@@ -443,6 +489,34 @@ async def _enrich_with_calls(graph: GraphClient, results: list[dict[str, Any]], 
             r["callee_count"] = st.callee_count
             r["callers"] = st.caller_names
             r["callees"] = st.callee_names
+
+
+async def _default_scope_projects(app: AppContext) -> list[str]:
+    """Default project scope: the current project plus any monorepo sub-projects.
+
+    Sub-project entities are stored with ``project_name = '{root}/{sub}'``
+    (orchestrator.py, watcher.py). Without this expansion, a search with no
+    explicit scope/project resolves to the bare root name and silently
+    excludes all sub-project code.
+    """
+    root_name = derive_project_name(app.settings.project_root)
+    try:
+        project_rows = await app.graph.get_project_status()
+    except Exception as exc:
+        logger.debug("Could not resolve monorepo sub-projects for default scope: {}", exc)
+        return [root_name]
+
+    all_names: list[str] = []
+    for row in project_rows:
+        node = row.get("n")
+        if node:
+            props = dict(node.items()) if hasattr(node, "items") else node
+            name = props.get("name", "")
+            if name:
+                all_names.append(name)
+
+    siblings = [n for n in all_names if n == root_name or n.startswith(f"{root_name}/")]
+    return siblings or [root_name]
 
 
 # ---------------------------------------------------------------------------
@@ -629,27 +703,32 @@ def _register_node_tools(mcp: FastMCP) -> None:
         label_filter = f":{label}" if label else ""
         t0 = time.monotonic()
         found: list[dict[str, Any]] | None = None
+        total: int | None = None
+        peek = clamped + 1  # fetch one extra row to detect truncation
 
         try:
             # Stage A: Exact matches (uid + exact name) — 1 RTT
             found = await app.graph.execute(
-                f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {clamped} "
+                f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {peek} "
                 f"UNION ALL "
-                f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {clamped}",
+                f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {peek}",
                 {"name": name},
             )
+            if found:
+                total = len(found)
+                found = found[:clamped]
 
             # Stage B: Partial matches (suffix > prefix > contains) — 1 RTT
             if not found:
                 found = await app.graph.execute(
                     f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix "
-                    f"RETURN n, 3 AS _match_score LIMIT {clamped} "
+                    f"RETURN n, 3 AS _match_score LIMIT {peek} "
                     f"UNION ALL "
                     f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix "
-                    f"RETURN n, 2 AS _match_score LIMIT {clamped} "
+                    f"RETURN n, 2 AS _match_score LIMIT {peek} "
                     f"UNION ALL "
                     f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
-                    f"RETURN n, 1 AS _match_score LIMIT {clamped}",
+                    f"RETURN n, 1 AS _match_score LIMIT {peek}",
                     {"name": name, "suffix": f".{name}", "prefix": f"{name}."},
                 )
                 # Deduplicate by uid, keeping highest _match_score
@@ -658,6 +737,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
                     uid = r["n"]["uid"]
                     if r.get("_match_score", 0) > seen.get(uid, {}).get("_match_score", -1):
                         seen[uid] = r
+                total = len(seen)
                 found = sorted(seen.values(), key=lambda rec: rec.get("_match_score", 0), reverse=True)[:clamped]
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
@@ -665,7 +745,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
         elapsed = (time.monotonic() - t0) * 1000
         ranked = _rank_results([_compact_node(r, detail=detail) for r in found])
         await _enrich_with_calls(app.graph, ranked, detail=detail)
-        return await _with_staleness(app, _result(ranked, limit=clamped, query_ms=elapsed))
+        return await _with_staleness(app, _result(ranked, limit=clamped, query_ms=elapsed, total=total))
 
 
 def _register_query_tools(mcp: FastMCP) -> None:
@@ -687,12 +767,14 @@ def _register_query_tools(mcp: FastMCP) -> None:
         app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
-        if _WRITE_KEYWORDS.search(query):
+        if _WRITE_KEYWORDS.search(_strip_cypher_string_literals(query)):
             return _error("Write operations are not allowed via MCP", code="WRITE_REJECTED")
 
-        # Auto-append LIMIT if missing
-        if not _LIMIT_RE.search(query):
-            query = query.rstrip().rstrip(";") + f" LIMIT {clamped}"
+        # Auto-append LIMIT if missing, requesting one extra row to detect truncation.
+        # If the caller supplied their own LIMIT, honor it as-is (truncation unknown).
+        auto_limited = not _LIMIT_RE.search(query)
+        if auto_limited:
+            query = query.rstrip().rstrip(";") + f" LIMIT {clamped + 1}"
 
         t0 = time.monotonic()
         try:
@@ -703,8 +785,12 @@ def _register_query_tools(mcp: FastMCP) -> None:
             return _error(str(exc), code="QUERY_ERROR")
         elapsed = (time.monotonic() - t0) * 1000
 
+        total = len(records) if auto_limited else None
+        if auto_limited:
+            records = records[:clamped]
+
         serialized = [_serialize_node(r) for r in records]
-        return await _with_staleness(app, _result(serialized, limit=clamped, query_ms=elapsed))
+        return await _with_staleness(app, _result(serialized, limit=clamped, query_ms=elapsed, total=total))
 
     _register_node_tools(mcp)
 
@@ -797,18 +883,23 @@ def _register_search_tools(mcp: FastMCP) -> None:
             valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
             return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
         clamped = _clamp_limit(limit)
-        resolved_project = project or derive_project_name(app.settings.project_root)
+        resolved_projects = [project] if project else await _default_scope_projects(app)
+        resolved_scope = ",".join(resolved_projects)
 
         t0 = time.monotonic()
         try:
-            all_results = await app.graph.text_search(query, label=label, limit=clamped, project=resolved_project)
+            all_results = await app.graph.text_search(query, label=label, limit=clamped + 1, projects=resolved_projects)
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
+        total = len(all_results)
+        all_results = all_results[:clamped]
         compacted = [_compact_node(r, detail=detail) for r in all_results]
         await _enrich_with_calls(app.graph, compacted, detail=detail)
-        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=resolved_project)
+        return await _with_staleness(
+            app, _result(compacted, limit=clamped, query_ms=elapsed, total=total), scope=resolved_scope
+        )
 
     @mcp.tool(
         description=(
@@ -856,7 +947,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
                 code="MODEL_MISMATCH",
             )
         clamped = _clamp_limit(limit)
-        resolved_project = project or derive_project_name(app.settings.project_root)
+        resolved_projects = [project] if project else await _default_scope_projects(app)
+        resolved_scope = ",".join(resolved_projects)
 
         # Embed the query
         assert app.embed is not None  # guaranteed by vector_enabled guard above
@@ -868,15 +960,73 @@ def _register_search_tools(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         try:
             all_results = await app.graph.vector_search(
-                vector, label=label, limit=clamped, project=resolved_project, threshold=threshold
+                vector, label=label, limit=clamped + 1, projects=resolved_projects, threshold=threshold
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
+        total = len(all_results)
+        all_results = all_results[:clamped]
         compacted = [_compact_node(r, detail=detail) for r in all_results]
         await _enrich_with_calls(app.graph, compacted, detail=detail)
-        return await _with_staleness(app, _result(compacted, limit=clamped, query_ms=elapsed), scope=resolved_project)
+        return await _with_staleness(
+            app, _result(compacted, limit=clamped, query_ms=elapsed, total=total), scope=resolved_scope
+        )
+
+
+def _parse_search_types(search_types: str) -> tuple[list[SearchType] | None, dict[str, Any] | None]:
+    """Parse the comma-separated ``search_types`` param. Returns ``(types, error)``."""
+    if not search_types:
+        return None, None
+    try:
+        return [SearchType(s.strip()) for s in search_types.split(",") if s.strip()], None
+    except ValueError as exc:
+        valid = ", ".join(st.value for st in SearchType)
+        return None, _error(f"Invalid search_types: {exc}. Valid channels: {valid}", code="INVALID_SEARCH_TYPES")
+
+
+def _parse_weights(weights: str) -> tuple[dict[str, float] | None, dict[str, Any] | None]:
+    """Parse the ``weights`` JSON param. Returns ``(weights, error)``."""
+    if not weights:
+        return None, None
+    try:
+        parsed = orjson.loads(weights)
+    except orjson.JSONDecodeError:
+        return None, _error("Invalid weights JSON", code="INVALID_WEIGHTS")
+    if not isinstance(parsed, dict):
+        return None, _error('weights must be a JSON object, e.g. {"graph": 2.0}', code="INVALID_WEIGHTS")
+    return parsed, None
+
+
+async def _resolve_hybrid_scope(app: AppContext, scope: str) -> str | None:
+    """Resolve hybrid_search's project scope.
+
+    Default (empty scope) expands to include monorepo sub-projects (stored as
+    '{root}/{sub}'); explicit glob/comma scope expands against indexed project names.
+
+    Returns ``None`` when a non-empty scope (glob/comma list) matches zero
+    projects — callers MUST treat that as an explicit "match nothing"
+    restriction (skip searching, return no results), not as "" which
+    hybrid_search treats as "no filter at all".
+    """
+    if not scope:
+        return ",".join(await _default_scope_projects(app))
+    if "*" not in scope and "," not in scope:
+        return scope
+
+    project_rows = await app.graph.get_project_status()
+    all_project_names = []
+    for row in project_rows:
+        node = row.get("n")
+        if node:
+            props = dict(node.items()) if hasattr(node, "items") else node
+            all_project_names.append(props.get("name", ""))
+    expanded = expand_scope(scope, all_project_names, app.settings.monorepo.always_include)
+    if not expanded:
+        return None
+    # Pass expanded projects directly — use empty scope and set projects on search calls
+    return ",".join(expanded)
 
 
 def _register_hybrid_tool(mcp: FastMCP) -> None:
@@ -939,32 +1089,19 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
 
-        # Parse search_types
-        types: list[SearchType] | None = None
-        if search_types:
-            types = [SearchType(s.strip()) for s in search_types.split(",") if s.strip()]
+        types, type_error = _parse_search_types(search_types)
+        if type_error:
+            return type_error
 
-        # Parse weights
-        weight_dict: dict[str, float] | None = None
-        if weights:
-            try:
-                weight_dict = orjson.loads(weights)
-            except orjson.JSONDecodeError:
-                return _error("Invalid weights JSON", code="INVALID_WEIGHTS")
+        weight_dict, weight_error = _parse_weights(weights)
+        if weight_error:
+            return weight_error
 
-        # Resolve scope: default to current project, expand globs/commas for monorepos
-        resolved_scope = scope or derive_project_name(app.settings.project_root)
-        if scope and ("*" in scope or "," in scope):
-            project_rows = await app.graph.get_project_status()
-            all_project_names = []
-            for row in project_rows:
-                node = row.get("n")
-                if node:
-                    props = dict(node.items()) if hasattr(node, "items") else node
-                    all_project_names.append(props.get("name", ""))
-            expanded = expand_scope(scope, all_project_names, app.settings.monorepo.always_include)
-            # Pass expanded projects directly — use empty scope and set projects on search calls
-            resolved_scope = ",".join(expanded) if expanded else ""
+        resolved_scope = await _resolve_hybrid_scope(app, scope)
+        if resolved_scope is None:
+            # scope explicitly matched zero indexed projects — return no
+            # results rather than silently searching every project.
+            return await _with_staleness(app, _result([], limit=clamped, query_ms=0.0, total=0), scope=scope)
 
         t0 = time.monotonic()
         try:
@@ -974,7 +1111,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 settings=app.settings.search,
                 query=query,
                 search_types=types,
-                limit=clamped,
+                limit=clamped + 1,
                 scope=resolved_scope,
                 weights=weight_dict,
                 exclude_tests=exclude_tests,
@@ -985,6 +1122,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
+
+        total = len(results)
+        results = results[:clamped]
 
         serialized = []
         for r in results:
@@ -1015,7 +1155,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             serialized.append(entry)
 
         await _enrich_with_calls(app.graph, serialized, detail=detail)
-        return await _with_staleness(app, _result(serialized, limit=clamped, query_ms=elapsed), scope=scope)
+        return await _with_staleness(
+            app, _result(serialized, limit=clamped, query_ms=elapsed, total=total), scope=scope
+        )
 
 
 def _register_info_tools(mcp: FastMCP) -> None:
