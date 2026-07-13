@@ -363,6 +363,39 @@ class TestIndexStatus:
         assert "text_indices" in result
 
 
+class TestKnowledgeHealth:
+    async def test_knowledge_health_returns_expected_keys(self, app_ctx, graph_client):
+        await graph_client.ensure_schema()
+        result = await _invoke_tool(app_ctx, "knowledge_health")
+        expected_keys = {
+            "inbox_count",
+            "inbox_paths",
+            "orphan_notes",
+            "duplicate_ids",
+            "dangling_links",
+            "similar_pairs",
+            "promotion_candidates",
+            "memory_index_issues",
+            "query_ms",
+        }
+        assert expected_keys == set(result.keys())
+
+    async def test_knowledge_health_flags_orphan_note(self, app_ctx, graph_client):
+        await graph_client.ensure_schema()
+        await graph_client.execute_write(
+            f"CREATE (n:{NodeLabel.NOTE} {{"
+            "uid: 'test-project:note:solo', project_name: 'test-project', "
+            "name: 'Solo', qualified_name: 'note:solo', file_path: 'solo.md', "
+            "kind: 'note', line_start: 1, line_end: 5"
+            "})"
+        )
+
+        result = await _invoke_tool(app_ctx, "knowledge_health")
+
+        orphan_uids = {n["uid"] for n in result["orphan_notes"]}
+        assert "test-project:note:solo" in orphan_uids
+
+
 class TestTextSearch:
     async def test_text_search_finds_entity(self, app_ctx, seeded_graph):
         result = await _invoke_tool(app_ctx, "text_search", query="my_function")

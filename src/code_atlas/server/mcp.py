@@ -24,6 +24,7 @@ from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
+from code_atlas.dream import VaultRoot, build_dream_report, report_to_dict
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
 from code_atlas.indexing.daemon import DaemonManager
 from code_atlas.indexing.orchestrator import StalenessChecker
@@ -648,6 +649,7 @@ def create_mcp_server(  # noqa: PLR0915
     _register_search_tools(mcp)
     _register_hybrid_tool(mcp)
     _register_info_tools(mcp)
+    _register_knowledge_tools(mcp)
     _register_subagent_tools(mcp)
     _register_analysis_tools(mcp)
     return mcp
@@ -1365,6 +1367,43 @@ def _register_info_tools(mcp: FastMCP) -> None:
             ],
             "elapsed_ms": round(report.elapsed_ms, 1),
         }
+
+
+def _register_knowledge_tools(mcp: FastMCP) -> None:
+    """Register knowledge_health (dream-mode deterministic lint report)."""
+
+    @mcp.tool(
+        description=(
+            "Deterministic dream-mode lint report for the knowledge vault: inbox digest, "
+            "orphan notes (no LINKS_TO edges), dangling LINKS_TO/DERIVED_FROM/SUPERSEDES "
+            "references, duplicate-id conflicts across vault files, high-similarity note pairs, "
+            "and cross-project promotion candidates. Spans this project's vault plus any "
+            "configured [knowledge] extra_vaults. Deterministic only — disposition "
+            "(KEEP/MERGE/PROMOTE/DROP) is a separate, agent-side judgment call. "
+            "Returns: {inbox_count, inbox_paths, orphan_notes, duplicate_ids, dangling_links, "
+            "similar_pairs, promotion_candidates, memory_index_issues, query_ms}."
+        ),
+    )
+    async def knowledge_health(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        app = await _ensure_root(ctx)
+        t0 = time.monotonic()
+
+        project_name = derive_project_name(app.settings.project_root)
+        vault_roots = [
+            VaultRoot(path=app.settings.project_root / app.settings.knowledge.vault_path, project_name=project_name)
+        ]
+        vault_roots.extend(
+            VaultRoot(path=Path(v.path).expanduser().resolve(), project_name=v.project_name)
+            for v in app.settings.knowledge.extra_vaults
+        )
+
+        try:
+            report = await build_dream_report(app.graph, vault_roots)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+        elapsed = (time.monotonic() - t0) * 1000
+        return {**report_to_dict(report), "query_ms": round(elapsed, 1)}
 
 
 def _register_subagent_tools(mcp: FastMCP) -> None:

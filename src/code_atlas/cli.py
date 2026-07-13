@@ -236,6 +236,18 @@ def watch(
 
 
 @app.command()
+def dream() -> None:
+    """Deterministic dream-mode report: inbox, orphans, dangling links, duplicates, similarity.
+
+    Scans this project's vault plus any configured extra vaults, refreshes
+    docs/HOME.md, and prints the report (--json for machine-readable output).
+    The disposition step (KEEP/MERGE/PROMOTE/DROP) is agent-side — see the
+    dream-mode command.
+    """
+    asyncio.run(_run_dream())
+
+
+@app.command()
 def mcp(
     transport: str = typer.Option(None, "--transport", "-t", help="Transport: stdio, streamable-http."),
     host: str = typer.Option(None, "--host", help="Bind address for HTTP transports (ignored for stdio)."),
@@ -696,6 +708,59 @@ async def _run_status() -> None:
             )
     finally:
         await graph.close()
+
+
+# ---------------------------------------------------------------------------
+# Dream-mode async helper
+# ---------------------------------------------------------------------------
+
+
+async def _run_dream() -> None:
+    """Async implementation of the ``atlas dream`` command."""
+    from code_atlas.dream import VaultRoot, build_dream_report, render_home_md, report_to_dict
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.settings import derive_project_name
+
+    settings = _load_settings()
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        project_name = derive_project_name(settings.project_root)
+        vault_roots = [VaultRoot(path=settings.project_root / settings.knowledge.vault_path, project_name=project_name)]
+        vault_roots.extend(
+            VaultRoot(path=Path(v.path).expanduser().resolve(), project_name=v.project_name)
+            for v in settings.knowledge.extra_vaults
+        )
+
+        report = await build_dream_report(graph, vault_roots)
+
+        home_path = settings.project_root / settings.knowledge.vault_path / "HOME.md"
+        home_path.parent.mkdir(parents=True, exist_ok=True)
+        home_path.write_text(render_home_md(report), encoding="utf-8")
+
+        if _output.json:
+            _json_output(report_to_dict(report))
+        else:
+            _print_dream_report(report)
+            _echo(f"Wrote {home_path}")
+    finally:
+        await graph.close()
+
+
+def _print_dream_report(report: Any) -> None:
+    _echo(f"Inbox: {report.inbox_count} draft(s)")
+    _echo(f"Orphan notes: {len(report.orphan_notes)}")
+    _echo(f"Dangling links: {len(report.dangling_links)}")
+    _echo(f"Duplicate ids: {len(report.duplicate_ids)}")
+    _echo(f"Similar pairs: {len(report.similar_pairs)}")
+    _echo(f"Promotion candidates: {len(report.promotion_candidates)}")
+    for issue in report.memory_index_issues:
+        _echo(f"MEMORY.md: {issue}")
 
 
 # ---------------------------------------------------------------------------

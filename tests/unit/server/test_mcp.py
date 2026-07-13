@@ -36,6 +36,7 @@ from code_atlas.server.mcp import (
     _register_analysis_tools,
     _register_hybrid_tool,
     _register_info_tools,
+    _register_knowledge_tools,
     _register_node_tools,
     _register_query_tools,
     _register_search_tools,
@@ -73,6 +74,7 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
     _register_search_tools(server)
     _register_hybrid_tool(server)
     _register_info_tools(server)
+    _register_knowledge_tools(server)
     _register_subagent_tools(server)
     _register_analysis_tools(server)
 

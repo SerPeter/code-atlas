@@ -320,3 +320,38 @@ class TestNoColor:
             runner.invoke(app, ["health"], env={"NO_COLOR": "1"})
 
         assert _output.no_color is True
+
+
+class TestDreamCommand:
+    """`atlas dream` builds the report, writes HOME.md, and reports via the graph client."""
+
+    async def test_dream_writes_home_and_closes_graph(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.dream import DreamReport
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = AsyncMock()
+        empty_report = DreamReport(
+            inbox_count=0,
+            inbox_paths=[],
+            orphan_notes=[],
+            duplicate_ids=[],
+            dangling_links=[],
+            similar_pairs=[],
+            promotion_candidates=[],
+            memory_index_issues=[],
+        )
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.dream.build_dream_report", AsyncMock(return_value=empty_report))
+
+        await cli._run_dream()
+
+        home = tmp_path / "docs" / "HOME.md"
+        assert home.is_file()
+        assert "Knowledge Vault" in home.read_text(encoding="utf-8")
+        mock_graph.ping.assert_awaited_once()
+        mock_graph.close.assert_awaited_once()

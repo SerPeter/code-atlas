@@ -17,3 +17,7 @@ migrations/
 testdata/
 fixtures/
 *.sql
+
+# Generated knowledge-vault landing page (atlas dream) — derived, re-rendered
+# every run; indexing it would just be indexing yesterday's dream report.
+docs/HOME.md
