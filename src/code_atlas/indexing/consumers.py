@@ -811,10 +811,12 @@ class ASTConsumer(TierConsumer):
                                 props = {
                                     "_label": entity.label.value,
                                     "qualified_name": qn_bare,
+                                    "name": entity.name,
                                     "kind": entity.kind,
                                     "signature": entity.signature or "",
                                     "docstring": entity.docstring or "",
                                     "source": entity.source or "",
+                                    "tags": entity.tags,
                                 }
                                 text = build_embed_text(props)
                                 if text:

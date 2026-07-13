@@ -392,6 +392,8 @@ def build_embed_text(props: dict[str, Any]) -> str:
     if not qualified_name:
         return ""
 
+    if label == "Note":
+        return _build_note_text(props.get("name", ""), props.get("tags") or [], docstring)
     if label == "DocSection":
         return _build_doc_section_text(qualified_name, docstring)
     if label in _CODE_ENTITY_LABELS:
@@ -475,6 +477,18 @@ def _build_doc_section_text(qualified_name: str, docstring: str) -> str:
     if docstring:
         lines.append(f'"""{docstring}"""')
 
+    return "\n".join(lines)
+
+
+def _build_note_text(name: str, tags: list[str], docstring: str) -> str:
+    """Build embed text for Note nodes (title + tags + full body)."""
+    lines: list[str] = []
+    if name:
+        lines.append(f"Note: {name}")
+    if tags:
+        lines.append(f"Tags: {', '.join(tags)}")
+    if docstring:
+        lines.append(f'"""{docstring}"""')
     return "\n".join(lines)
 
 

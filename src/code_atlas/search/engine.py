@@ -629,7 +629,9 @@ def _apply_filters(
 
 _VIS_BOOST: dict[str, float] = {"public": 1.0, "protected": 0.97, "internal": 0.94, "private": 0.88}
 
-_LABEL_BOOST: dict[str, float] = {
+# "blended" (default): knowledge participates in every query, ranked slightly
+# below code unless the caller asks for knowledge mode explicitly (Q7).
+_LABEL_BOOST_BLENDED: dict[str, float] = {
     "Callable": 1.15,
     "TypeDef": 1.15,
     "Module": 1.10,
@@ -637,24 +639,65 @@ _LABEL_BOOST: dict[str, float] = {
     "Package": 1.05,
     "DocFile": 0.70,
     "DocSection": 0.70,
+    "Note": 0.70,
 }
 
-_DOC_LABELS = frozenset({"DocFile", "DocSection"})
+# "knowledge": invert the boost so notes/docs outrank code — for "why/decision/
+# gotcha"-shaped queries where the answer lives in prose, not in the AST.
+_LABEL_BOOST_KNOWLEDGE: dict[str, float] = {
+    "Callable": 0.85,
+    "TypeDef": 0.85,
+    "Module": 0.90,
+    "Value": 0.90,
+    "Package": 0.95,
+    "DocFile": 1.10,
+    "DocSection": 1.15,
+    "Note": 1.15,
+}
+
+# Results from a secondary (extra-vault: global/memory-dir) project are never
+# excluded, just deprioritized when the current project has an equally
+# relevant answer — a coarse first cut at "current > global > other" (R6).
+_SECONDARY_PROJECT_BOOST = 0.92
+
+_DOC_LABELS = frozenset({"DocFile", "DocSection", "Note"})
+
+
+class SearchMode(StrEnum):
+    """Knowledge-participation mode for hybrid_search's label boosting."""
+
+    CODE = "code"
+    KNOWLEDGE = "knowledge"
+    BLENDED = "blended"
 
 
 def _is_doc_result(result: SearchResult) -> bool:
-    """Return True if *result* is a documentation entity (DocFile or DocSection)."""
+    """Return True if *result* is a documentation entity (DocFile, DocSection, or Note)."""
     return bool(_DOC_LABELS & set(result.labels))
 
 
-def _boost_results(results: list[SearchResult]) -> list[SearchResult]:
-    """Re-rank by RRF score * visibility boost * label boost."""
+def _boost_results(
+    results: list[SearchResult],
+    *,
+    label_boost: dict[str, float] | None = None,
+    secondary_projects: frozenset[str] | None = None,
+) -> list[SearchResult]:
+    """Re-rank by RRF score * visibility boost * label boost * project-scope boost."""
+    boost_table = label_boost if label_boost is not None else _LABEL_BOOST_BLENDED
+
+    def _project_boost(result: SearchResult) -> float:
+        if not secondary_projects:
+            return 1.0
+        project_name = result.uid.split(":", 1)[0] if ":" in result.uid else ""
+        return _SECONDARY_PROJECT_BOOST if project_name in secondary_projects else 1.0
+
     return sorted(
         results,
         key=lambda r: (
             r.rrf_score
             * _VIS_BOOST.get(r.visibility, 1.0)
-            * max((_LABEL_BOOST.get(lbl, 1.0) for lbl in r.labels), default=1.0)
+            * max((boost_table.get(lbl, 1.0) for lbl in r.labels), default=1.0)
+            * _project_boost(r)
         ),
         reverse=True,
     )
@@ -674,6 +717,8 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
     exclude_stubs: bool | None = None,
     exclude_generated: bool | None = None,
     code_only: bool = False,
+    mode: SearchMode | str = SearchMode.BLENDED,
+    secondary_projects: frozenset[str] | None = None,
     include_patterns: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
     channel_status: dict[str, str] | None = None,
@@ -705,7 +750,15 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
     exclude_generated:
         Exclude generated code (None = use settings.generated_filter).
     code_only:
-        Exclude documentation entities (DocSection, DocFile).
+        Exclude documentation entities (DocSection, DocFile, Note).
+    mode:
+        Knowledge-participation mode: "blended" (default, knowledge ranked
+        slightly below code — R6/Q7), "knowledge" (invert — notes/docs
+        outrank code, for why/decision/gotcha-shaped questions), or "code"
+        (equivalent to ``code_only=True`` — knowledge excluded entirely).
+    secondary_projects:
+        Project names (extra vaults: global/memory-dir) to deprioritize
+        without excluding — current project's own results are unaffected.
     include_patterns:
         Only include results whose basename matches one of these globs.
     exclude_patterns:
@@ -806,6 +859,10 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
             for uid, rrf_score in fused_scores.items()
         ]
 
+        mode_value = mode.value if isinstance(mode, SearchMode) else str(mode)
+        effective_code_only = code_only or mode_value == SearchMode.CODE
+        label_boost = _LABEL_BOOST_KNOWLEDGE if mode_value == SearchMode.KNOWLEDGE else _LABEL_BOOST_BLENDED
+
         with _tracer.start_as_current_span("filter_and_boost"):
             filtered = _apply_filters(
                 all_results,
@@ -813,11 +870,11 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
                 exclude_tests=exclude_tests,
                 exclude_stubs=exclude_stubs,
                 exclude_generated=exclude_generated,
-                code_only=code_only,
+                code_only=effective_code_only,
                 include_patterns=include_patterns,
                 exclude_patterns=exclude_patterns,
             )
-            results = _boost_results(filtered)[:limit]
+            results = _boost_results(filtered, label_boost=label_boost, secondary_projects=secondary_projects)[:limit]
 
         span.set_attribute("results_count", len(results))
         m = get_metrics()

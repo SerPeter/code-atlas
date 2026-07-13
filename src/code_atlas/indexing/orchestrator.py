@@ -896,7 +896,9 @@ async def _create_package_hierarchy(
     graph: GraphClient, project_name: str, project_root: Path, *, exclude_dirs: list[str] | None = None
 ) -> int:
     """Create Project + Package nodes and CONTAINS edges. Returns package count."""
-    await graph.merge_project_node(project_name)
+    # root_path enables absolute-path anchor resolution for the knowledge vault
+    # (a note's anchors: entry can point at a file by absolute path).
+    await graph.merge_project_node(project_name, root_path=str(project_root.resolve()).replace("\\", "/"))
     packages = _detect_packages(project_root, exclude_dirs=exclude_dirs)
     batch = [(qn, qn.rsplit(".", 1)[-1], f"{rel_path}/__init__.py") for qn, rel_path in packages]
     await graph.merge_package_batch(project_name, batch)

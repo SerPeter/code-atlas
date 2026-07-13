@@ -361,6 +361,33 @@ class ProjectSettings(BaseModel):
     )
 
 
+class ExtraVaultSettings(BaseModel):
+    """A knowledge vault indexed as a sibling project alongside this repo's own vault.
+
+    Used for the overspanning (cross-project) vault and the Claude Code
+    harness memory directory — both are ordinary projects in the same graph,
+    just rooted outside this repo.
+    """
+
+    path: str = Field(description="Filesystem path to the vault root (absolute, or ~-expanded).")
+    project_name: str = Field(description="Project name this vault indexes under (see derive_project_name).")
+
+
+class KnowledgeSettings(BaseModel):
+    """Knowledge vault settings — the Obsidian-compatible note vault living alongside code."""
+
+    vault_path: str = Field(
+        default="docs",
+        description="Repo-relative path to this project's knowledge vault. docs/ IS the vault — "
+        "frontmatter-triggered note mode lets ordinary docs and vault notes coexist in the same tree.",
+    )
+    extra_vaults: list[ExtraVaultSettings] = Field(
+        default_factory=list,
+        description="Additional vaults (global overspanning vault, harness memory dir) indexed as "
+        "sibling projects in the same graph. Always included in query scope alongside the current project.",
+    )
+
+
 class AtlasSettings(BaseSettings):
     """Root configuration for Code Atlas."""
 
@@ -402,6 +429,7 @@ class AtlasSettings(BaseSettings):
     index: IndexSettings = Field(default_factory=IndexSettings)
     watcher: WatcherSettings = Field(default_factory=WatcherSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)

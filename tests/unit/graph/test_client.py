@@ -5,7 +5,37 @@ No infrastructure required — these test pure functions and data structures.
 
 from __future__ import annotations
 
-from code_atlas.graph.client import _fuse_bm25_results, _sanitize_bm25_query
+from code_atlas.graph.client import (
+    _NAME_ROUTED_REL_TYPES,
+    _OUT_OF_BAND_REL_TYPES,
+    _POST_BATCH_REL_TYPES,
+    _UID_ROUTED_REL_TYPES,
+    _fuse_bm25_results,
+    _sanitize_bm25_query,
+    _validate_relationship_routing,
+)
+from code_atlas.schema import RelType
+
+
+class TestRelationshipRouting:
+    """Every RelType must be routed by exactly one of GraphClient's routing
+    mechanisms — the guard against the silent-drop failure class (a new
+    RelType added to schema.py but never wired up anywhere)."""
+
+    def test_every_rel_type_is_routed_exactly_once(self):
+        groups = [_UID_ROUTED_REL_TYPES, _NAME_ROUTED_REL_TYPES, _POST_BATCH_REL_TYPES, _OUT_OF_BAND_REL_TYPES]
+        seen: set[RelType] = set()
+        for group in groups:
+            overlap = seen & group
+            assert not overlap, f"RelTypes routed by more than one mechanism: {overlap}"
+            seen |= group
+        assert seen == set(RelType), f"RelTypes missing from all routing groups: {set(RelType) - seen}"
+
+    def test_validate_relationship_routing_passes_on_current_schema(self):
+        _validate_relationship_routing()  # must not raise
+
+    def test_note_rel_types_are_uid_routed(self):
+        assert {RelType.LINKS_TO, RelType.DERIVED_FROM, RelType.SUPERSEDES} <= _UID_ROUTED_REL_TYPES
 
 
 class TestSanitizeBm25Query:

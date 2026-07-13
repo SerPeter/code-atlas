@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 3
+SCHEMA_VERSION: int = 4
 
 # ---------------------------------------------------------------------------
 # Node labels
@@ -30,6 +30,8 @@ class NodeLabel(StrEnum):
     # Documentation
     DOC_FILE = "DocFile"
     DOC_SECTION = "DocSection"
+    # Knowledge vault (zettelkasten notes — code-atlas + memory-dir dialects)
+    NOTE = "Note"
     # External dependencies
     EXTERNAL_PACKAGE = "ExternalPackage"
     EXTERNAL_SYMBOL = "ExternalSymbol"
@@ -58,7 +60,6 @@ class RelType(StrEnum):
     DEPENDS_ON = "DEPENDS_ON"
     # Documentation
     DOCUMENTS = "DOCUMENTS"
-    MOTIVATED_BY = "MOTIVATED_BY"
     # Similarity
     SIMILAR_TO = "SIMILAR_TO"
     EXPORTS = "EXPORTS"
@@ -69,6 +70,10 @@ class RelType(StrEnum):
     INJECTED_INTO = "INJECTED_INTO"
     TESTS = "TESTS"
     HANDLES_COMMAND = "HANDLES_COMMAND"
+    # Knowledge vault (Note <-> Note/DocSection)
+    LINKS_TO = "LINKS_TO"
+    DERIVED_FROM = "DERIVED_FROM"
+    SUPERSEDES = "SUPERSEDES"
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +114,14 @@ class ValueKind(StrEnum):
     ENUM_MEMBER = "enum_member"
 
 
+class NoteKind(StrEnum):
+    """Note lifecycle stage — stored in the shared ``kind`` property, like CallableKind."""
+
+    DRAFT = "draft"
+    NOTE = "note"
+    DECISION = "decision"
+
+
 class Visibility(StrEnum):
     PUBLIC = "public"
     PRIVATE = "private"
@@ -135,6 +148,7 @@ _DOC_LABELS: frozenset[NodeLabel] = frozenset(
     {
         NodeLabel.DOC_FILE,
         NodeLabel.DOC_SECTION,
+        NodeLabel.NOTE,
     }
 )
 
@@ -152,6 +166,7 @@ _EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
         NodeLabel.VALUE,
         NodeLabel.MODULE,
         NodeLabel.DOC_SECTION,
+        NodeLabel.NOTE,
     }
 )
 
@@ -162,6 +177,7 @@ _TEXT_SEARCHABLE_LABELS: frozenset[NodeLabel] = frozenset(
         NodeLabel.VALUE,
         NodeLabel.MODULE,
         NodeLabel.DOC_SECTION,
+        NodeLabel.NOTE,
     }
 )
 

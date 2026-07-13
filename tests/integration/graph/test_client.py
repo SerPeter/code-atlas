@@ -122,7 +122,7 @@ async def test_get_embedding_config_reads_canonical_node_across_duplicates(graph
 
 
 async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):
-    """Migrating from v2 clears Module.file_hash and Project.git_hash so the next index re-parses."""
+    """Migrating from v2 (through v3 and v4) clears Module.file_hash and Project.git_hash for a re-parse."""
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
@@ -144,7 +144,7 @@ async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):
     assert mod[0]["fh"] is None
     proj = await graph_client.execute("MATCH (p {uid: 'mig3'}) RETURN p.git_hash AS gh")
     assert proj[0]["gh"] is None
-    assert await graph_client.get_schema_version() == 3
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +806,76 @@ async def test_upsert_with_documents_rels(graph_client: GraphClient):
     assert records[0]["code_name"] == "validate_token"
     assert records[0]["link_type"] == "explicit"
     assert records[0]["confidence"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Note vault round-trip (Phase 1 — knowledge convergence)
+# ---------------------------------------------------------------------------
+
+
+async def test_note_round_trip_links_to_and_derived_from(graph_client: GraphClient):
+    """A vault markdown file parses to a Note node whose LINKS_TO/DERIVED_FROM edges
+    actually materialize in the graph — the RelType-routing fix under test."""
+    await graph_client.ensure_schema()
+    project = "notevault"
+
+    parsed_b = parse_file("docs/notes/b.md", b"---\nid: b\nkind: note\n---\n\nTarget note.\n", project)
+    assert parsed_b is not None
+    await graph_client.upsert_file_entities(project, parsed_b.file_path, parsed_b.entities, parsed_b.relationships)
+
+    parsed_a = parse_file(
+        "docs/notes/a.md",
+        b"---\nid: a\nkind: note\nderived_from: [b]\n---\n\nSee [[b]] for context.\n",
+        project,
+    )
+    assert parsed_a is not None
+    await graph_client.upsert_file_entities(project, parsed_a.file_path, parsed_a.entities, parsed_a.relationships)
+
+    note_records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{project_name: $p}}) RETURN n.uid AS uid ORDER BY uid", {"p": project}
+    )
+    assert {r["uid"] for r in note_records} == {f"{project}:note:a", f"{project}:note:b"}
+
+    links = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.NOTE} {{uid: $a}})-[:{RelType.LINKS_TO}]->"
+        f"(b:{NodeLabel.NOTE} {{uid: $b}}) RETURN count(*) AS cnt",
+        {"a": f"{project}:note:a", "b": f"{project}:note:b"},
+    )
+    assert links[0]["cnt"] == 1
+
+    derived = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.NOTE} {{uid: $a}})-[:{RelType.DERIVED_FROM}]->"
+        f"(b:{NodeLabel.NOTE} {{uid: $b}}) RETURN count(*) AS cnt",
+        {"a": f"{project}:note:a", "b": f"{project}:note:b"},
+    )
+    assert derived[0]["cnt"] == 1
+
+    # Backlinks are queryable in the reverse direction too — the point of the exercise.
+    backlinks = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $b}})<-[:{RelType.LINKS_TO}]-(m:{NodeLabel.NOTE}) RETURN m.uid AS uid",
+        {"b": f"{project}:note:b"},
+    )
+    assert backlinks[0]["uid"] == f"{project}:note:a"
+
+
+async def test_unresolved_wikilink_creates_no_phantom_edge(graph_client: GraphClient):
+    """A wikilink to a note that doesn't exist creates no edge and no phantom node."""
+    await graph_client.ensure_schema()
+    project = "notevault2"
+
+    parsed = parse_file("docs/notes/a.md", b"---\nid: a\nkind: note\n---\n\nSee [[does-not-exist]].\n", project)
+    assert parsed is not None
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, parsed.relationships)
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{project_name: $p}})-[:{RelType.LINKS_TO}]->() RETURN count(*) AS cnt",
+        {"p": project},
+    )
+    assert records[0]["cnt"] == 0
+    phantom = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN count(n) AS cnt", {"uid": f"{project}:note:does-not-exist"}
+    )
+    assert phantom[0]["cnt"] == 0
 
 
 # ---------------------------------------------------------------------------

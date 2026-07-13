@@ -42,7 +42,7 @@ from code_atlas.schema import (
     Visibility,
 )
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError
-from code_atlas.search.engine import CompactNode, SearchType, expand_context, expand_scope
+from code_atlas.search.engine import CompactNode, SearchMode, SearchType, expand_context, expand_scope
 from code_atlas.search.engine import hybrid_search as _hybrid_search
 from code_atlas.search.guidance import (
     _RELATIONSHIP_SUMMARY,
@@ -680,7 +680,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
                 "",
                 description=(
                     "Restrict to a node label: Callable, Module, TypeDef, Value, Package, "
-                    "DocFile, DocSection, ExternalSymbol. Empty = all."
+                    "DocFile, DocSection, Note, ExternalSymbol. Empty = all."
                 ),
             ),
         ] = "",
@@ -1022,7 +1022,14 @@ async def _resolve_hybrid_scope(app: AppContext, scope: str) -> str | None:
         if node:
             props = dict(node.items()) if hasattr(node, "items") else node
             all_project_names.append(props.get("name", ""))
-    expanded = expand_scope(scope, all_project_names, app.settings.monorepo.always_include)
+    # Extra vaults (global overspanning vault, harness memory dir) stay in scope
+    # even when the caller explicitly narrows to one project — a cross-project
+    # tooling gotcha is relevant regardless of what code you're scoped to.
+    always_include = [
+        *app.settings.monorepo.always_include,
+        *(v.project_name for v in app.settings.knowledge.extra_vaults),
+    ]
+    expanded = expand_scope(scope, all_project_names, always_include)
     if not expanded:
         return None
     # Pass expanded projects directly — use empty scope and set projects on search calls
@@ -1037,8 +1044,9 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "Primary search tool — fuses graph name-matching, BM25 keyword, and vector semantic "
             "search via Reciprocal Rank Fusion (RRF). Auto-adjusts weights by query shape. "
             "By default excludes test entities, .pyi stubs, and generated code. "
-            "Code entities (Callable, TypeDef, Module, Value) are boosted over documentation. "
-            "Set code_only=true to exclude DocSection/DocFile entirely. "
+            "Code entities (Callable, TypeDef, Module, Value) are boosted over documentation by default "
+            "(mode='blended'); pass mode='knowledge' for why/decision/gotcha-shaped questions to invert that. "
+            "Set code_only=true (or mode='code') to exclude DocSection/DocFile/Note entirely. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, line_start, "
             "line_end, signature, docstring, visibility, _labels, rrf_score, sources}], "
             "count, truncated, query_ms}. "
@@ -1075,8 +1083,17 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         ] = None,
         code_only: Annotated[
             bool,
-            Field(False, description="Exclude documentation entities (DocSection, DocFile). Return only code."),
+            Field(False, description="Exclude documentation entities (DocSection, DocFile, Note). Return only code."),
         ] = False,
+        mode: Annotated[
+            str,
+            Field(
+                "blended",
+                description="Knowledge-participation mode: 'blended' (default — knowledge ranked slightly "
+                "below code), 'knowledge' (notes/docs outrank code — for why/decision/gotcha questions), "
+                "or 'code' (equivalent to code_only=true).",
+            ),
+        ] = "blended",
         detail: Annotated[
             str,
             Field(
@@ -1096,6 +1113,12 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         weight_dict, weight_error = _parse_weights(weights)
         if weight_error:
             return weight_error
+
+        try:
+            search_mode = SearchMode(mode) if mode else SearchMode.BLENDED
+        except ValueError:
+            valid = ", ".join(m.value for m in SearchMode)
+            return _error(f"Invalid mode: {mode!r}. Valid modes: {valid}", code="INVALID_MODE")
 
         resolved_scope = await _resolve_hybrid_scope(app, scope)
         if resolved_scope is None:
@@ -1118,6 +1141,8 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 exclude_stubs=exclude_stubs,
                 exclude_generated=exclude_generated,
                 code_only=code_only,
+                mode=search_mode,
+                secondary_projects=frozenset(v.project_name for v in app.settings.knowledge.extra_vaults),
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")

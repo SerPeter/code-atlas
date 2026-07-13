@@ -50,6 +50,82 @@ _tracer = get_tracer(__name__)
 
 _VALID_LABELS: frozenset[str] = frozenset(lbl.value for lbl in NodeLabel)
 
+# ---------------------------------------------------------------------------
+# Relationship routing registry
+#
+# Every RelType must be creatable by *some* code path, or entities carrying
+# it are silently dropped with no edges and no error (the exact failure
+# class _validate_relationship_routing guards against — see schema.py's
+# _validate_schema_completeness for the analogous node-label guarantee).
+# ---------------------------------------------------------------------------
+
+# Routed by _create_relationships via a direct uid-to-uid MATCH+MERGE.
+_UID_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
+    {
+        RelType.DEFINES,
+        RelType.CONTAINS,
+        RelType.OVERRIDES,
+        RelType.EXPORTS,
+        RelType.TESTS,
+        RelType.HANDLES_ROUTE,
+        RelType.HANDLES_EVENT,
+        RelType.HANDLES_COMMAND,
+        RelType.REGISTERED_BY,
+        RelType.INJECTED_INTO,
+        RelType.LINKS_TO,
+        RelType.DERIVED_FROM,
+        RelType.SUPERSEDES,
+    }
+)
+
+# Routed by _create_relationships via name/path matching (INHERITS/IMPLEMENTS
+# by type name, DOCUMENTS by symbol or file-path suffix via _create_doc_links).
+# IMPLEMENTS also has a uid-shaped path (detector-emitted target uids), but it
+# always falls back to this name-matched route for parser-emitted bare names.
+_NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
+    {
+        RelType.INHERITS,
+        RelType.IMPLEMENTS,
+        RelType.DOCUMENTS,
+    }
+)
+
+# Resolved post-batch, after all files in a batch are upserted (see
+# GraphClient.resolve_calls / resolve_imports / resolve_uses_type) — not
+# part of _create_relationships at all.
+_POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
+    {
+        RelType.CALLS,
+        RelType.IMPORTS,
+        RelType.USES_TYPE,
+    }
+)
+
+# Created by dedicated, out-of-band methods rather than per-file parsing:
+# DEPENDS_ON is project-to-project (monorepo dependency graph); SIMILAR_TO
+# is materialized by the (future) dream-mode consolidation pass, not parsing.
+_OUT_OF_BAND_REL_TYPES: frozenset[RelType] = frozenset(
+    {
+        RelType.DEPENDS_ON,
+        RelType.SIMILAR_TO,
+    }
+)
+
+
+def _validate_relationship_routing() -> None:
+    """Ensure every RelType is routed by some code path.
+
+    Raises RuntimeError at import time if any RelType is missing — prevents
+    a new relationship type from silently producing zero edges.
+    """
+    routed = _UID_ROUTED_REL_TYPES | _NAME_ROUTED_REL_TYPES | _POST_BATCH_REL_TYPES | _OUT_OF_BAND_REL_TYPES
+    missing = set(RelType) - routed
+    if missing:
+        raise RuntimeError(f"RelTypes not routed anywhere in GraphClient: {missing}")
+
+
+_validate_relationship_routing()
+
 
 def _assert_valid_label(label: str) -> None:
     """Raise ValueError if *label* is not a known NodeLabel value.
@@ -458,6 +534,8 @@ class GraphClient:
             await self._migrate_indices()
             if stored < 3:  # v3 data migration threshold
                 await self._migrate_v3_clear_freshness_markers()
+            if stored < 4:  # v4 data migration threshold
+                await self._migrate_v4_clear_freshness_markers()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -1626,13 +1704,13 @@ class GraphClient:
         query timeouts on large batches.
 
         Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
-        ``signature``, ``docstring``, ``kind``, ``_label``,
+        ``signature``, ``docstring``, ``source``, ``tags``, ``kind``, ``_label``,
         ``embed_hash``, ``has_embedding``.
         """
         ret = (
             "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
-            "n.source AS source, "
+            "n.source AS source, n.tags AS tags, "
             "n.kind AS kind, labels(n)[0] AS _label, "
             "n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding"
         )
@@ -2079,6 +2157,7 @@ class GraphClient:
                     "header_path": e.header_path,
                     "header_level": e.header_level,
                     "content_hash": e.content_hash,
+                    "extra_properties": e.extra_properties,
                 }
                 for e in entity_list
             ]
@@ -2100,7 +2179,8 @@ class GraphClient:
                 f"n.visibility = e.visibility, n.docstring = e.docstring, "
                 f"n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
                 f"n.header_path = e.header_path, n.header_level = e.header_level, "
-                f"n.content_hash = e.content_hash"
+                f"n.content_hash = e.content_hash "
+                f"SET n += e.extra_properties"
             )
             await self.execute_write(query, {"entities": params})
 
@@ -2123,6 +2203,7 @@ class GraphClient:
                     "header_path": e.header_path,
                     "header_level": e.header_level,
                     "content_hash": e.content_hash,
+                    "extra_properties": e.extra_properties,
                 }
                 for e in group
             ]
@@ -2134,7 +2215,8 @@ class GraphClient:
                 "n.visibility = e.visibility, n.docstring = e.docstring, "
                 "n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
                 "n.header_path = e.header_path, n.header_level = e.header_level, "
-                "n.content_hash = e.content_hash",
+                "n.content_hash = e.content_hash, "
+                "n += e.extra_properties",
                 {"entities": params},
             )
 
@@ -2283,18 +2365,6 @@ class GraphClient:
         contain ``:``) follow the uid path; parser-emitted bare type names
         (TS/Java/C#/PHP/Rust) resolve by name like INHERITS.
         """
-        uid_rel_types = {
-            RelType.DEFINES,
-            RelType.CONTAINS,
-            RelType.OVERRIDES,
-            RelType.EXPORTS,
-            RelType.TESTS,
-            RelType.HANDLES_ROUTE,
-            RelType.HANDLES_EVENT,
-            RelType.HANDLES_COMMAND,
-            RelType.REGISTERED_BY,
-            RelType.INJECTED_INTO,
-        }
         # IMPLEMENTS arrives in two shapes: detector-emitted target uids
         # (always contain ':') and parser-emitted bare type names
         # (TS/Java/C#/PHP/Rust) — bare names resolve like INHERITS.
@@ -2303,7 +2373,7 @@ class GraphClient:
         for r in relationships:
             if r.rel_type == RelType.IMPLEMENTS:
                 (uid_rels if ":" in r.to_name else other_rels).append(r)
-            elif r.rel_type in uid_rel_types:
+            elif r.rel_type in _UID_ROUTED_REL_TYPES:
                 if "parent_type_name" not in r.properties:
                     uid_rels.append(r)
             else:
@@ -2346,7 +2416,10 @@ class GraphClient:
         """Create DOCUMENTS edges via batched name/path matching.
 
         Two batched queries: one for symbol-based links (exact name match),
-        one for file-path-based links (suffix match on file_path).
+        one for file-path-based links (suffix match on file_path). The
+        from-side may be a DocSection (heading-level docs) or a Note
+        (frontmatter-triggered vault/memory files) — both emit heuristic
+        DOCUMENTS refs the same way.
         """
         symbol_params = []
         file_params = []
@@ -2367,8 +2440,8 @@ class GraphClient:
         if symbol_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.DOC_SECTION} {{uid: r.from_uid}}), "
-                f"(b {{project_name: $project, name: r.to_name}}) "
+                f"MATCH (a {{uid: r.from_uid}}) WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
+                f"MATCH (b {{project_name: $project, name: r.to_name}}) "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
                 {"rels": symbol_params, "project": project_name},
@@ -2378,8 +2451,8 @@ class GraphClient:
         if file_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.DOC_SECTION} {{uid: r.from_uid}}), (b {{project_name: $project}}) "
-                f"WHERE b.file_path ENDS WITH r.to_name "
+                f"MATCH (a {{uid: r.from_uid}}) WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
+                f"MATCH (b {{project_name: $project}}) WHERE b.file_path ENDS WITH r.to_name "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
                 {"rels": file_params, "project": project_name},
@@ -2449,6 +2522,22 @@ class GraphClient:
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v3: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v3"
+        )
+
+    async def _migrate_v4_clear_freshness_markers(self) -> None:
+        """v4: content_hash now folds in extra_properties (frontmatter), changing every entity's
+        hash value even though most entities' extra_properties is empty (the extra empty list
+        element still shifts the \\0-joined hash input). Clear file/git hashes so the next index
+        run re-parses every file — cheap, since AST diffing then finds no real content changes for
+        anything but the new Note entities.
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v4: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v4"
         )
 
     async def _set_schema_version(self, version: int) -> None:

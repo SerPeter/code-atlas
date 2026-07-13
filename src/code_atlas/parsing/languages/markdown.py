@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import tree_sitter_markdown as tsmarkdown
+import yaml
 from tree_sitter import Language, Query
 
 from code_atlas.parsing.ast import (
@@ -17,7 +18,7 @@ from code_atlas.parsing.ast import (
     ParsedRelationship,
     register_language,
 )
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import NodeLabel, NoteKind, RelType
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -48,6 +49,224 @@ _SETEXT_LEVEL: dict[str, int] = {
     "setext_h2_underline": 2,
 }
 
+# ---------------------------------------------------------------------------
+# Frontmatter + note-mode detection
+# ---------------------------------------------------------------------------
+
+# tree-sitter-markdown emits YAML frontmatter (--- ... ---) as a dedicated
+# top-level node; TOML frontmatter (+++ ... +++) is intentionally unsupported
+# — the vault convention is YAML only.
+_FRONTMATTER_NODE_TYPE = "minus_metadata"
+
+_NOTE_KIND_VALUES = frozenset(k.value for k in NoteKind)
+
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]|]+?)(?:\|([^\[\]]+?))?\]\]")
+_INLINE_TAG_RE = re.compile(r"(?<!\w)#([a-zA-Z][\w-]*)")
+_ATX_HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
+_ATX_H1_RE = re.compile(r"^#[ \t]+(.+?)\s*$", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class _Frontmatter:
+    """Parsed YAML frontmatter plus the byte offset where the body begins."""
+
+    raw: dict[str, Any]
+    body_start: int
+
+
+def _extract_frontmatter(root: Node, source: bytes) -> _Frontmatter | None:
+    """Extract and parse a leading YAML frontmatter block, if present.
+
+    Returns ``None`` for files with no frontmatter, non-YAML-mapping
+    frontmatter, or malformed YAML — callers fall back to ordinary
+    DocFile/DocSection parsing in every such case (no regression for
+    existing docs, which never carry frontmatter today).
+    """
+    for child in root.children:
+        if child.type != _FRONTMATTER_NODE_TYPE:
+            continue
+        raw_text = source[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+        lines = raw_text.splitlines()
+        # Strip the delimiter lines (--- ... ---) themselves before parsing.
+        yaml_lines = lines[1:-1] if len(lines) >= 2 and lines[-1].strip() == "---" else lines[1:]
+        try:
+            parsed = yaml.safe_load("\n".join(yaml_lines))
+        except yaml.YAMLError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return _Frontmatter(raw=parsed, body_start=child.end_byte)
+    return None
+
+
+def _note_mode_kind(fm: dict[str, Any]) -> tuple[str, str] | None:
+    """Return ``(note_kind, subtype)`` if frontmatter triggers note mode, else ``None``.
+
+    Two dialects trigger note mode: the atlas vault (``id`` + ``kind`` in
+    draft|note|decision) and the Claude Code harness memory format (``name``
+    + ``description`` + ``metadata.type``).
+    """
+    kind = fm.get("kind")
+    if isinstance(kind, str) and kind in _NOTE_KIND_VALUES and isinstance(fm.get("id"), str) and fm["id"].strip():
+        return kind, ""
+
+    if isinstance(fm.get("name"), str) and fm["name"].strip() and isinstance(fm.get("description"), str):
+        metadata = fm.get("metadata")
+        note_type = metadata.get("type") if isinstance(metadata, dict) else None
+        if isinstance(note_type, str) and note_type.strip():
+            return NoteKind.NOTE.value, note_type.strip()
+    return None
+
+
+def _note_slug(fm: dict[str, Any], path: str) -> str:
+    """Derive the note's stable slug — frontmatter ``id``/``name``, else filename stem.
+
+    The vault convention is filename == slug == frontmatter id, so this
+    normally agrees with the file's own name; the fallback only matters for
+    malformed frontmatter that still happened to trigger note mode.
+    """
+    explicit_id = fm.get("id")
+    if isinstance(explicit_id, str) and explicit_id.strip():
+        return explicit_id.strip()
+    name = fm.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return PurePosixPath(path.replace("\\", "/")).stem
+
+
+def _first_heading_title(body: str) -> str | None:
+    """Return the first ATX H1 title in *body*, if any."""
+    match = _ATX_H1_RE.search(body)
+    return match.group(1).strip() if match else None
+
+
+def _collect_inline_tags(body: str) -> list[str]:
+    """Collect ``#tag`` mentions from *body*, skipping ATX heading lines."""
+    tags: set[str] = set()
+    for line in body.splitlines():
+        if _ATX_HEADING_LINE_RE.match(line):
+            continue
+        tags.update(match.group(1) for match in _INLINE_TAG_RE.finditer(line))
+    return sorted(tags)
+
+
+def _resolve_note_ref(raw: str, project_name: str) -> str:
+    """Compute the deterministic uid a note-vault reference points to.
+
+    Bare slug -> same-project Note; ``project:slug`` -> cross-project Note
+    (e.g. the global vault). Unresolved targets simply fail to MATCH
+    downstream in ``_create_relationships`` — no phantom edges are created.
+    """
+    raw = raw.strip()
+    if ":" in raw:
+        proj, slug = raw.split(":", 1)
+        return f"{proj}:note:{slug}"
+    return f"{project_name}:note:{raw}"
+
+
+def _extract_wikilinks(content: str, project_name: str, from_qn: str) -> list[ParsedRelationship]:
+    """Extract ``[[target]]``/``[[target|alias]]`` links as LINKS_TO relationships.
+
+    ``[[note#heading]]``/``[[note^block]]`` refs resolve to the target note
+    only (v1) — the heading/block fragment is dropped.
+    """
+    rels: list[ParsedRelationship] = []
+    for match in _WIKILINK_RE.finditer(content):
+        target_raw = match.group(1).split("#", 1)[0].split("^", 1)[0].strip()
+        if not target_raw:
+            continue
+        alias = (match.group(2) or target_raw).strip()
+        rels.append(
+            ParsedRelationship(
+                from_qualified_name=from_qn,
+                rel_type=RelType.LINKS_TO,
+                to_name=_resolve_note_ref(target_raw, project_name),
+                properties={"alias": alias},
+            )
+        )
+    return rels
+
+
+def _extract_frontmatter_refs(fm: dict[str, Any], project_name: str, from_qn: str) -> list[ParsedRelationship]:
+    """Extract ``derived_from``/``supersedes`` frontmatter lists as relationships."""
+    rels: list[ParsedRelationship] = []
+    for key, rel_type in (("derived_from", RelType.DERIVED_FROM), ("supersedes", RelType.SUPERSEDES)):
+        values = fm.get(key)
+        if not isinstance(values, list):
+            continue
+        rels.extend(
+            ParsedRelationship(
+                from_qualified_name=from_qn,
+                rel_type=rel_type,
+                to_name=_resolve_note_ref(v, project_name),
+            )
+            for v in values
+            if isinstance(v, str) and v.strip()
+        )
+    return rels
+
+
+_HARNESS_DIALECT_EXTRA_KEYS = frozenset({"id", "kind", "tags", "derived_from", "supersedes"})
+
+
+def _parse_markdown_note(
+    path: str,
+    source: bytes,
+    project_name: str,
+    fm: dict[str, Any],
+    body_start: int,
+    note_kind: str,
+    subtype: str,
+) -> ParsedFile:
+    """Emit ONE Note entity (atomic-note granularity) for a frontmatter-triggered file."""
+    body = source[body_start:].decode("utf-8", errors="replace").strip()
+    slug = _note_slug(fm, path)
+    full_qn = f"{project_name}:note:{slug}"
+
+    is_harness_dialect = "kind" not in fm
+    if is_harness_dialect:
+        title = str(fm["description"])
+    else:
+        title = _first_heading_title(body) or slug.replace("-", " ").replace("_", " ").strip().title()
+
+    frontmatter_tags = [t.strip() for t in (fm.get("tags") or []) if isinstance(t, str) and t.strip()]
+    tags = sorted(set(frontmatter_tags) | set(_collect_inline_tags(body)))
+
+    extra_properties = {k: v for k, v in fm.items() if k not in _HARNESS_DIALECT_EXTRA_KEYS}
+    if subtype:
+        extra_properties["subtype"] = subtype
+
+    total_lines = source.count(b"\n") + (1 if source and not source.endswith(b"\n") else 0)
+
+    note_entity = ParsedEntity(
+        name=title,
+        qualified_name=full_qn,
+        label=NodeLabel.NOTE,
+        kind=note_kind,
+        line_start=1,
+        line_end=max(total_lines, 1),
+        file_path=path,
+        docstring=body or None,
+        tags=tags,
+        extra_properties=extra_properties,
+    )
+
+    relationships: list[ParsedRelationship] = [
+        *_extract_wikilinks(body, project_name, full_qn),
+        *_extract_frontmatter_refs(fm, project_name, full_qn),
+    ]
+    relationships.extend(
+        ParsedRelationship(
+            from_qualified_name=full_qn,
+            rel_type=RelType.DOCUMENTS,
+            to_name=ref.target_name,
+            properties={"link_type": ref.link_type, "confidence": ref.confidence, "is_file_ref": ref.is_file_ref},
+        )
+        for ref in _extract_doc_references("", body, level=0)
+    )
+
+    return ParsedFile(file_path=path, language="markdown", entities=[note_entity], relationships=relationships)
+
 
 def _parse_markdown(
     path: str,
@@ -55,7 +274,21 @@ def _parse_markdown(
     root: Node,
     project_name: str,
 ) -> ParsedFile:
-    """Extract DocFile/DocSection entities from a markdown parse tree."""
+    """Extract DocFile/DocSection entities from a markdown parse tree.
+
+    A file whose frontmatter triggers note mode (see ``_note_mode_kind``)
+    instead emits a single Note entity via ``_parse_markdown_note`` — vault
+    and harness-memory files skip DocFile/DocSection splitting entirely.
+    """
+    frontmatter = _extract_frontmatter(root, source)
+    if frontmatter is not None:
+        note_mode = _note_mode_kind(frontmatter.raw)
+        if note_mode is not None:
+            note_kind, subtype = note_mode
+            return _parse_markdown_note(
+                path, source, project_name, frontmatter.raw, frontmatter.body_start, note_kind, subtype
+            )
+
     posix_path = path.replace("\\", "/")
     filename = PurePosixPath(posix_path).name
     file_qn = f"{project_name}:{posix_path}"
@@ -303,6 +536,11 @@ def _emit_md_section(
         )
         for ref in _extract_doc_references(title, content_text, level)
     )
+
+    # Extract [[wikilinks]] — ordinary docs coexist with the note vault and
+    # may link into it (or between themselves) using the same syntax.
+    if content_text:
+        relationships.extend(_extract_wikilinks(content_text, project_name, section_qn))
 
 
 _HEADING_TYPES = frozenset({"atx_heading", "setext_heading"})

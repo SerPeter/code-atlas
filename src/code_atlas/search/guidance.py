@@ -39,8 +39,7 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.USES_TYPE: "Callable -> type referenced in parameter/return annotations (auto-extracted from signatures)",
     RelType.OVERRIDES: "Method -> parent method it overrides",
     RelType.DEPENDS_ON: "Project -> project dependency (monorepo)",
-    RelType.DOCUMENTS: "Doc section -> code entity it documents",
-    RelType.MOTIVATED_BY: "Code entity -> ADR/doc that motivated it",
+    RelType.DOCUMENTS: "Doc section/Note -> code entity it documents (or Note anchor)",
     RelType.SIMILAR_TO: "Entity -> semantically similar entity (embedding cosine)",
     RelType.HANDLES_ROUTE: "Callable -> HTTP route it handles (pattern-detected)",
     RelType.HANDLES_EVENT: "Callable -> event it handles (pattern-detected)",
@@ -49,6 +48,9 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.TESTS: "Test function -> entity it tests (pattern-detected)",
     RelType.HANDLES_COMMAND: "Callable -> CLI/bot command it handles (pattern-detected)",
     RelType.EXPORTS: "Module -> entity listed in __all__ (pattern-detected)",
+    RelType.LINKS_TO: "Note -> Note/DocSection it [[wikilinks]] to",
+    RelType.DERIVED_FROM: "Note -> Note it was merged/promoted/summarized from (dream-mode provenance)",
+    RelType.SUPERSEDES: "Note -> Note it replaces (dream-mode contradiction resolution)",
 }
 
 # ---------------------------------------------------------------------------
@@ -156,8 +158,11 @@ _USAGE_GUIDE: dict[str, str] = {
         "**UID format:** `{project_name}:{qualified_name}` — qualified_name mirrors the "
         "source tree path (e.g., `myproj:src.mypackage.module.MyClass`). "
         "Use get_node to discover actual UIDs before writing Cypher with uid filters.\n"
-        "**Labels:** Project, Package, Module, TypeDef, Callable, Value, DocFile, DocSection, "
+        "**Labels:** Project, Package, Module, TypeDef, Callable, Value, DocFile, DocSection, Note, "
         "ExternalPackage, ExternalSymbol. Common mistakes: Function→Callable, Class→TypeDef.\n"
+        "**Note vault:** frontmatter-triggered vault/memory files — uid `{project}:note:{slug}`, "
+        "`kind` in draft|note|decision. Wikilinks/derived_from/supersedes resolve to LINKS_TO/DERIVED_FROM/"
+        "SUPERSEDES edges; explicit `anchors:` resolve to DOCUMENTS edges onto code entities.\n"
         "**Relationships:** Always directed. Check schema_info for full list.\n"
         "**Common patterns:**\n"
         "- `MATCH (n:Callable {name: $name})` — find by name\n"

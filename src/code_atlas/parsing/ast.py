@@ -11,6 +11,7 @@ Language-specific parsers live in ``parsing.languages.*`` and register via
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -48,6 +49,7 @@ class ParsedEntity:
     header_path: str | None = None
     header_level: int | None = None
     content_hash: str = ""
+    extra_properties: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,11 @@ def _compute_content_hash(entity: ParsedEntity) -> str:
     source (the full entity text, hashed before truncation — see _finalize).
     Excludes positional fields (line_start/line_end, file_path) so that
     moving code without changing it produces the same hash.
+
+    ``extra_properties`` (frontmatter, currently Note-only) is folded in only
+    when non-empty, so every pre-existing entity kind — which never
+    populates it — keeps a byte-identical hash input and no spurious
+    re-embed/re-diff is triggered by this field's addition.
     """
     parts = [
         entity.name,
@@ -135,6 +142,7 @@ def _compute_content_hash(entity: ParsedEntity) -> str:
         entity.docstring or "",
         ",".join(sorted(entity.tags)),
         entity.source or "",
+        json.dumps(entity.extra_properties, sort_keys=True, default=str) if entity.extra_properties else "",
     ]
     data = "\0".join(parts).encode("utf-8")
     return hashlib.sha256(data).hexdigest()[:16]
