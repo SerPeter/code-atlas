@@ -10,7 +10,7 @@ import typer
 
 from code_atlas.indexing import daemon as daemon_module
 from code_atlas.indexing.daemon import DaemonManager
-from code_atlas.settings import AtlasSettings
+from code_atlas.settings import AtlasSettings, ExtraVaultSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -350,6 +350,96 @@ class TestWatcherScopeScan:
         assert state["scanned"] is True
         assert captured["known_files"] == ["a.py", "b.py"]
 
+        await manager.stop()
+
+
+class TestVaultPolling:
+    """Extra vaults (global vault, harness memory dir) are polled on a timer."""
+
+    async def test_missing_vault_path_is_skipped(self, tmp_path: Path) -> None:
+        manager = DaemonManager()
+        vault = ExtraVaultSettings(path=str(tmp_path / "does-not-exist"), project_name="ghost-vault")
+        # Returns immediately without looping — nothing to wait/stop.
+        await asyncio.wait_for(manager._run_vault(vault, _make_settings(tmp_path), object()), timeout=2.0)  # type: ignore[arg-type]
+
+    async def test_polls_repeatedly_until_stopped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[str] = []
+
+        async def fake_poll(
+            self: DaemonManager, project_name: str, vault_root: Path, settings: object, graph: object
+        ) -> None:
+            calls.append(project_name)
+
+        monkeypatch.setattr(DaemonManager, "_poll_vault_once", fake_poll)
+
+        manager = DaemonManager()
+        settings = _make_settings(tmp_path)
+        settings.knowledge.vault_poll_interval_s = 0.05
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        vault = ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")
+
+        task = asyncio.create_task(manager._run_vault(vault, settings, object()))  # type: ignore[arg-type]
+        await asyncio.sleep(0.2)
+        manager._vault_stop.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+        assert len(calls) >= 2
+        assert all(name == "test-vault" for name in calls)
+
+    async def test_poll_failure_does_not_kill_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[str] = []
+
+        async def fake_poll(
+            self: DaemonManager, project_name: str, vault_root: Path, settings: object, graph: object
+        ) -> None:
+            calls.append(project_name)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(DaemonManager, "_poll_vault_once", fake_poll)
+
+        manager = DaemonManager()
+        settings = _make_settings(tmp_path)
+        settings.knowledge.vault_poll_interval_s = 0.05
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        vault = ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")
+
+        task = asyncio.create_task(manager._run_vault(vault, settings, object()))  # type: ignore[arg-type]
+        await asyncio.sleep(0.2)
+        manager._vault_stop.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+        assert len(calls) >= 2
+
+
+class TestVaultTaskSpawning:
+    """start() spawns one vault-poll task per configured extra vault."""
+
+    async def test_start_spawns_vault_task_per_extra_vault(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[str] = []
+
+        async def fake_run_vault(
+            self: DaemonManager, vault: ExtraVaultSettings, settings: object, graph: object
+        ) -> None:
+            captured.append(vault.project_name)
+
+        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
+        monkeypatch.setattr(DaemonManager, "_run_vault", fake_run_vault)
+
+        settings = _make_settings(tmp_path)
+        settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(tmp_path), project_name="test-vault")]
+
+        manager = DaemonManager()
+        started = await manager.start(settings, object(), include_watcher=False, catchup=False)  # type: ignore[arg-type]
+        assert started is True
+        await asyncio.sleep(0.05)
+
+        assert captured == ["test-vault"]
         await manager.stop()
 
 

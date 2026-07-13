@@ -386,6 +386,12 @@ class KnowledgeSettings(BaseModel):
         description="Additional vaults (global overspanning vault, harness memory dir) indexed as "
         "sibling projects in the same graph. Always included in query scope alongside the current project.",
     )
+    vault_poll_interval_s: float = Field(
+        default=300.0,
+        description="How often the daemon re-scans each extra vault for changes (seconds). "
+        "Extra vaults live outside the watched project root, so they're polled rather than "
+        "live-watched (see roadmap Phase 5 for multi-root watching).",
+    )
 
 
 class AtlasSettings(BaseSettings):

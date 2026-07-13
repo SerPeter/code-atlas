@@ -8,21 +8,30 @@ and AST/Embed consumers.  Used by both the CLI (``atlas watch``,
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from code_atlas.events import EventBus
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
-from code_atlas.indexing.orchestrator import FileScope, detect_sub_projects, index_monorepo, index_project
+from code_atlas.indexing.orchestrator import (
+    FileScope,
+    detect_sub_projects,
+    index_monorepo,
+    index_project,
+    publish_project_changes,
+    scan_files,
+)
 from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
 from code_atlas.settings import derive_project_name
 
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
-    from code_atlas.settings import AtlasSettings
+    from code_atlas.settings import AtlasSettings, ExtraVaultSettings
 
 
 @dataclass
@@ -37,6 +46,7 @@ class DaemonManager:
     _embed: EmbedClient | None = field(default=None, repr=False)
     _crash_counts: dict[str, int] = field(default_factory=dict, repr=False)
     _last_crash: dict[str, str] = field(default_factory=dict, repr=False)
+    _vault_stop: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def status(self) -> dict[str, Any]:
         """Task liveness + crash state, consumed by the ``pipeline`` health check."""
@@ -82,6 +92,7 @@ class DaemonManager:
             return False
 
         self._bus = bus
+        self._vault_stop = asyncio.Event()
 
         embed: EmbedClient | None = None
         cache: EmbedCache | None = None
@@ -134,6 +145,14 @@ class DaemonManager:
         for consumer in self._consumers:
             self._tasks.append(asyncio.get_running_loop().create_task(self._run_consumer(consumer)))
 
+        # Extra vaults (global vault, harness memory dir) live outside project_root,
+        # so they can't ride the FileWatcher above — poll them on a timer instead.
+        # Publishing reuses the persistent consumers just started (they accept any
+        # project_name/project_root per event, same as monorepo sub-projects), so no
+        # per-vault consumer pair is created here.
+        for vault in settings.knowledge.extra_vaults:
+            self._tasks.append(asyncio.get_running_loop().create_task(self._run_vault(vault, settings, graph)))
+
         return True
 
     async def _catchup(self, settings: AtlasSettings, graph: GraphClient, bus: EventBus) -> None:
@@ -158,6 +177,8 @@ class DaemonManager:
 
         for consumer in self._consumers:
             consumer.stop()
+
+        self._vault_stop.set()
 
         # Let tasks observe the stop flags first — the watcher drains its
         # pending changes and consumers finish their current batch — then
@@ -223,3 +244,52 @@ class DaemonManager:
                 backoff = min(backoff * 2, 60.0)
             else:
                 return  # clean exit via stop()
+
+    async def _run_vault(self, vault: ExtraVaultSettings, settings: AtlasSettings, graph: GraphClient) -> None:
+        """Poll one extra vault on a timer, publishing its changes on the shared bus.
+
+        Extra vaults are never git-tracked as far as this daemon is concerned (even
+        if the directory happens to be a git repo, no git_hash is stored for them —
+        see ``_poll_vault_once``), so every poll runs in "full" delta mode; the AST
+        consumer's per-file content-hash gate is what keeps unchanged files cheap.
+        """
+        vault_root = Path(vault.path).expanduser().resolve()
+        if not vault_root.is_dir():
+            logger.warning("Extra vault '{}' not found at {} — skipping", vault.project_name, vault_root)
+            return
+
+        interval = settings.knowledge.vault_poll_interval_s
+        while True:
+            try:
+                await self._poll_vault_once(vault.project_name, vault_root, settings, graph)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Vault poll failed for '{}' — retrying next cycle", vault.project_name)
+
+            try:
+                await asyncio.wait_for(self._vault_stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+            else:
+                return  # stop() was called
+
+    async def _poll_vault_once(
+        self, project_name: str, vault_root: Path, settings: AtlasSettings, graph: GraphClient
+    ) -> None:
+        """Scan, publish, and record metadata for a single vault poll cycle."""
+        bus = self._bus
+        if bus is None:  # pragma: no cover — only called after start() sets self._bus
+            return
+        files = await asyncio.to_thread(scan_files, vault_root, settings)
+        result = await publish_project_changes(settings, graph, bus, project_name, vault_root, files)
+        entity_count = await graph.count_entities(project_name)
+        await graph.update_project_metadata(
+            project_name,
+            last_indexed_at=time.time(),
+            file_count=result.files_scanned,
+            entity_count=entity_count,
+            index_mode=result.mode,
+        )
+        if result.files_published:
+            logger.info("Vault '{}': {} file(s) published ({})", project_name, result.files_published, result.mode)

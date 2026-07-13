@@ -14,7 +14,7 @@ import pytest
 from code_atlas.events import FileChanged, Topic
 from code_atlas.indexing.daemon import DaemonManager
 from code_atlas.indexing.orchestrator import index_project
-from code_atlas.settings import derive_project_name
+from code_atlas.settings import ExtraVaultSettings, derive_project_name
 
 if TYPE_CHECKING:
     from code_atlas.events import EventBus
@@ -151,5 +151,53 @@ async def test_daemon_start_runs_catchup_delta(
             {"prefix": f"{project_name}:"},
         )
         assert rows, "file added while the daemon was down was not indexed by startup catch-up"
+    finally:
+        await daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# Extra-vault indexing (Phase 2 of the knowledge-convergence roadmap)
+# ---------------------------------------------------------------------------
+
+
+async def test_daemon_indexes_extra_vault(
+    settings: AtlasSettings,
+    graph_client: GraphClient,
+    event_bus: EventBus,
+    tmp_path,
+) -> None:
+    """A note living in a configured extra vault becomes a searchable Note node.
+
+    The vault lives outside project_root and is never live-watched — the
+    daemon's vault-poll loop must scan and publish it on its own, and the
+    daemon's persistent (project-agnostic) AST/Embed consumers must pick up
+    the resulting events with no per-vault consumer pair.
+    """
+    settings.embeddings.enabled = False
+    await graph_client.ensure_schema()
+
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    _write_python_file(
+        vault_dir,
+        "test-vault-note.md",
+        "---\nid: test-vault-note\nkind: note\ntags: [test]\n---\n\n# Test Vault Note\n\nSome content.\n",
+    )
+    settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
+    settings.knowledge.vault_poll_interval_s = 60.0  # only the immediate first poll should matter here
+
+    daemon = DaemonManager()
+    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=False)
+    assert started is True
+    try:
+        rows = await _wait_for_rows(
+            graph_client,
+            "MATCH (n:Note {uid: $uid}) RETURN n.kind AS kind, n.docstring AS docstring",
+            {"uid": "test-vault:note:test-vault-note"},
+            timeout_s=30.0,
+        )
+        assert rows, "vault note never became a Note node — vault poll or consumer wiring is broken"
+        assert rows[0]["kind"] == "note"
+        assert "Some content." in rows[0]["docstring"]
     finally:
         await daemon.stop()

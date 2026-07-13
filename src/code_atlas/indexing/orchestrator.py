@@ -1297,7 +1297,7 @@ async def _index_project_inner(  # noqa: PLR0915
     # Deliberately no early return on `not files`: an empty scan (all source
     # files deleted/moved, or a scope misconfiguration) must still flow through
     # the delta decision below so stale entities are reconciled and Project
-    # metadata is updated — matching the monorepo path (_publish_project),
+    # metadata is updated — matching the monorepo path (publish_project_changes),
     # which has no such early return.
 
     # 2. Embedding setup + model lock check (skipped in lightweight mode)
@@ -1454,7 +1454,7 @@ class _ProjectPublishResult:
     decision: _DeltaDecision
 
 
-async def _publish_project(
+async def publish_project_changes(
     settings: AtlasSettings,
     graph: GraphClient,
     bus: EventBus,
@@ -1619,7 +1619,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 on_progress(prefixed_name, i - 1, total)
 
             sub_files = scan_files(sub.root, settings)
-            pr = await _publish_project(
+            pr = await publish_project_changes(
                 settings,
                 graph,
                 bus,
@@ -1642,7 +1642,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             if on_progress is not None:
                 on_progress(root_name, total - 1, total)
 
-            root_pr = await _publish_project(
+            root_pr = await publish_project_changes(
                 settings,
                 graph,
                 bus,
