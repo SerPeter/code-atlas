@@ -21,6 +21,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0008](./0008-cross-file-relationship-resolution.md) | Cross-File Relationship Resolution & Qualified-Name Extensions | Accepted               | 2026-07-12 |
 | [0009](./0009-event-pipeline-durability-contract.md) | Event Pipeline Durability Contract                             | Accepted               | 2026-07-12 |
 | [0010](./0010-integration-test-isolation.md)         | Integration Test Database Isolation                            | Accepted               | 2026-07-12 |
+| [0011](./0011-note-vault-schema.md)                  | Note Label and the Knowledge Vault Schema                      | Accepted               | 2026-07-13 |
 
 ## Creating a New ADR
 

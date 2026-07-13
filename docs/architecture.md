@@ -174,7 +174,11 @@ When an agent issues a query:
 discriminated by a `kind` property instead of language-specific labels (e.g., `TypeDef {kind: "class"}`,
 `Callable {kind: "method"}`). This is language-agnostic and paradigm-agnostic (OOP, FP, procedural).
 
-**Documentation nodes (3):** DocFile, DocSection, ADR — linked to code via DOCUMENTS and MOTIVATED_BY edges.
+**Documentation & knowledge nodes (3):** DocFile, DocSection — heading-level extraction from ordinary markdown, linked
+to code via DOCUMENTS edges. Note — a frontmatter-triggered atomic zettel (one node per file, not per heading); `docs/`
+is an Obsidian-compatible knowledge vault that coexists with ordinary docs in the same tree (see `docs/SCHEMA.md`).
+Notes link to each other via LINKS_TO (`[[wikilinks]]`) and DERIVED_FROM/SUPERSEDES (dream-mode provenance), and to code
+via the same DOCUMENTS edge (explicit `anchors:` or heuristic symbol/file-path mentions).
 
 **Dependency nodes (2):** ExternalPackage, ExternalSymbol — representing imported libraries and their symbols.
 
@@ -217,7 +221,9 @@ erDiagram
 
     DocSection ||--o{ Callable : DOCUMENTS
     DocSection ||--o{ TypeDef : DOCUMENTS
-    ADR ||--o{ Module : MOTIVATED_BY
+    Note ||--o{ Callable : DOCUMENTS
+    Note ||--o{ Note : LINKS_TO
+    Note ||--o{ Note : DERIVED_FROM
 
     Callable ||--o{ Callable : HANDLES_ROUTE
     Callable ||--o{ Callable : HANDLES_EVENT
