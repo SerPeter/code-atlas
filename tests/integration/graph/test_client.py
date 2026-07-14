@@ -879,6 +879,508 @@ async def test_unresolved_wikilink_creates_no_phantom_edge(graph_client: GraphCl
 
 
 # ---------------------------------------------------------------------------
+# Explicit anchors + staleness (Phase 3 — anchors + staleness)
+# ---------------------------------------------------------------------------
+
+
+def _split_anchor_rels(
+    relationships: list[ParsedRelationship],
+) -> tuple[list[ParsedRelationship], list[ParsedRelationship]]:
+    """Mirror consumers.py's ``_is_anchor`` split — anchor-type DOCUMENTS rels are
+    resolved separately via ``resolve_anchors``, not through the immediate
+    ``_create_relationships``/``_create_doc_links`` path (see indexing/consumers.py)."""
+    anchor_rels = [
+        r for r in relationships if r.rel_type == RelType.DOCUMENTS and r.properties.get("link_type") == "anchor"
+    ]
+    other_rels = [r for r in relationships if r not in anchor_rels]
+    return other_rels, anchor_rels
+
+
+async def test_anchor_uid_form_resolves_with_hash(graph_client: GraphClient):
+    """A uid-form anchor resolves directly and captures the target's content_hash."""
+    await graph_client.ensure_schema()
+    project = "anchor_uid"
+    fp = "src/foo.py"
+    target = _make_entity(project, "Bar", fp, label=NodeLabel.TYPE_DEF, kind="class", content_hash="v1")
+    await graph_client.upsert_file_entities(project, fp, [target], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{project}:src.foo.Bar]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b) "
+        "RETURN r.anchor_hash AS hash, r.stale AS stale, b.name AS name"
+    )
+    assert len(records) == 1
+    assert records[0]["hash"] == "v1"
+    assert records[0]["stale"] is False
+    assert records[0]["name"] == "Bar"
+
+
+async def test_anchor_uid_form_unresolved_records_on_note(graph_client: GraphClient):
+    """A uid anchor with no matching target is recorded unresolved, not a phantom edge."""
+    await graph_client.ensure_schema()
+    project = "anchor_uid_miss"
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{project}:src.foo.Missing]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    note_uid = f"{project}:note:a"
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}}) RETURN n.unresolved_anchors AS unresolved", {"uid": note_uid}
+    )
+    assert records[0]["unresolved"] == [f"{project}:src.foo.Missing"]
+
+    edges = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}})-[:{RelType.DOCUMENTS}]->() RETURN count(*) AS cnt",
+        {"uid": note_uid},
+    )
+    assert edges[0]["cnt"] == 0
+
+
+async def test_anchor_bare_path_form_resolves_to_module(graph_client: GraphClient):
+    """A bare relative path anchor resolves to the file's Module node within the note's own project."""
+    await graph_client.ensure_schema()
+    project = "anchor_path"
+    fp = "src/watcher.py"
+    module = ParsedEntity(
+        name="watcher",
+        qualified_name=f"{project}:src.watcher",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=20,
+        file_path=fp,
+        content_hash="mod_v1",
+    )
+    await graph_client.upsert_file_entities(project, fp, [module], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{fp}]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b:{NodeLabel.MODULE}) "
+        "RETURN r.anchor_hash AS hash"
+    )
+    assert len(records) == 1
+    assert records[0]["hash"] == "mod_v1"
+
+
+async def test_anchor_symbol_refinement_resolves_to_callable(graph_client: GraphClient):
+    """A #Symbol suffix narrows a path anchor to a specific entity within the file."""
+    await graph_client.ensure_schema()
+    project = "anchor_symbol"
+    fp = "src/watcher.py"
+    module = ParsedEntity(
+        name="watcher",
+        qualified_name=f"{project}:src.watcher",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=20,
+        file_path=fp,
+        content_hash="mod_v1",
+    )
+    file_watcher = _make_entity(project, "FileWatcher", fp, label=NodeLabel.TYPE_DEF, kind="class", content_hash="c_v1")
+    await graph_client.upsert_file_entities(project, fp, [module, file_watcher], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{fp}#FileWatcher]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b) "
+        "RETURN b.name AS name, labels(b) AS labels"
+    )
+    assert len(records) == 1
+    assert records[0]["name"] == "FileWatcher"
+    assert NodeLabel.TYPE_DEF.value in records[0]["labels"]
+
+
+async def test_anchor_ambiguous_symbol_falls_back_to_file_level(graph_client: GraphClient):
+    """An ambiguous #Symbol (two same-named entities in one file) falls back to the
+    file-level anchor rather than failing outright or guessing (decision Q9)."""
+    await graph_client.ensure_schema()
+    project = "anchor_amb_sym"
+    fp = "src/dup.py"
+    module = ParsedEntity(
+        name="dup",
+        qualified_name=f"{project}:src.dup",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=20,
+        file_path=fp,
+        content_hash="mod_v1",
+    )
+    dup1 = ParsedEntity(
+        name="Thing",
+        qualified_name=f"{project}:src.dup.Thing#1",
+        label=NodeLabel.TYPE_DEF,
+        kind="class",
+        line_start=2,
+        line_end=5,
+        file_path=fp,
+        content_hash="d1",
+    )
+    dup2 = ParsedEntity(
+        name="Thing",
+        qualified_name=f"{project}:src.dup.Thing#2",
+        label=NodeLabel.TYPE_DEF,
+        kind="class",
+        line_start=7,
+        line_end=10,
+        file_path=fp,
+        content_hash="d2",
+    )
+    await graph_client.upsert_file_entities(project, fp, [module, dup1, dup2], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{fp}#Thing]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b) RETURN labels(b) AS labels"
+    )
+    assert len(records) == 1
+    assert NodeLabel.MODULE.value in records[0]["labels"]
+
+    note_records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}}) RETURN n.unresolved_anchors AS unresolved",
+        {"uid": f"{project}:note:a"},
+    )
+    assert note_records[0]["unresolved"] == []
+
+
+async def test_anchor_project_prefixed_path_cross_project(graph_client: GraphClient):
+    """A project-prefixed path anchor resolves in the NAMED project, not the note's own."""
+    await graph_client.ensure_schema()
+    target_project = "anchor_target_proj"
+    note_project = "anchor_note_proj"
+    fp = "src/shared.py"
+    module = ParsedEntity(
+        name="shared",
+        qualified_name=f"{target_project}:src.shared",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=10,
+        file_path=fp,
+        content_hash="shared_v1",
+    )
+    await graph_client.upsert_file_entities(target_project, fp, [module], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{target_project}:{fp}]\n---\n\nBody.\n".encode(),
+        note_project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(note_project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{project_name: $np}})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->"
+        f"(b:{NodeLabel.MODULE} {{project_name: $tp}}) RETURN r.anchor_hash AS hash",
+        {"np": note_project, "tp": target_project},
+    )
+    assert len(records) == 1
+    assert records[0]["hash"] == "shared_v1"
+
+
+async def test_anchor_absolute_path_via_root_path(graph_client: GraphClient):
+    """An absolute-path anchor resolves via longest-prefix match against Project.root_path."""
+    await graph_client.ensure_schema()
+    project = "anchor_abs"
+    root = "/repo/anchor_abs"
+    await graph_client.merge_project_node(project, root_path=root)
+
+    fp = "src/thing.py"
+    module = ParsedEntity(
+        name="thing",
+        qualified_name=f"{project}:src.thing",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=10,
+        file_path=fp,
+        content_hash="thing_v1",
+    )
+    await graph_client.upsert_file_entities(project, fp, [module], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: ['{root}/{fp}']\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b:{NodeLabel.MODULE}) "
+        "RETURN r.anchor_hash AS hash"
+    )
+    assert len(records) == 1
+    assert records[0]["hash"] == "thing_v1"
+
+
+async def test_anchor_unresolved_cleared_when_target_appears(graph_client: GraphClient):
+    """A note whose anchor now resolves is cleared, not left with a stale failure list."""
+    await graph_client.ensure_schema()
+    project = "anchor_heal"
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{project}:src.foo.Bar]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    note_uid = f"{project}:note:a"
+    before = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}}) RETURN n.unresolved_anchors AS unresolved", {"uid": note_uid}
+    )
+    assert before[0]["unresolved"] == [f"{project}:src.foo.Bar"]
+
+    target = _make_entity(project, "Bar", "src/foo.py", label=NodeLabel.TYPE_DEF, kind="class", content_hash="v1")
+    await graph_client.upsert_file_entities(project, "src/foo.py", [target], [])
+
+    # Re-run resolution for the same anchor rel (mirrors the retry-on-appearance pass).
+    await graph_client.resolve_anchors(anchors)
+
+    after = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}}) RETURN n.unresolved_anchors AS unresolved", {"uid": note_uid}
+    )
+    assert after[0]["unresolved"] == []
+
+    edges = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}})-[:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->() "
+        "RETURN count(*) AS cnt",
+        {"uid": note_uid},
+    )
+    assert edges[0]["cnt"] == 1
+
+
+async def test_invalidate_stale_anchors_marks_stale_on_content_change(graph_client: GraphClient):
+    """Editing an anchored entity's content flags the anchoring note's edge stale."""
+    await graph_client.ensure_schema()
+    project = "anchor_stale"
+    fp = "src/foo.py"
+    target = _make_entity(project, "Bar", fp, label=NodeLabel.TYPE_DEF, kind="class", content_hash="v1")
+    await graph_client.upsert_file_entities(project, fp, [target], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{project}:src.foo.Bar]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    target_uid = f"{project}:src.foo.Bar"
+
+    marked = await graph_client.invalidate_stale_anchors({target_uid})
+    assert marked == 0
+
+    edited = _make_entity(project, "Bar", fp, label=NodeLabel.TYPE_DEF, kind="class", content_hash="v2")
+    await graph_client.upsert_file_entities(project, fp, [edited], [])
+
+    marked = await graph_client.invalidate_stale_anchors({target_uid})
+    assert marked == 1
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b) RETURN r.stale AS stale"
+    )
+    assert records[0]["stale"] is True
+
+
+async def test_invalidate_stale_anchors_empty_input_is_noop(graph_client: GraphClient):
+    """Guard the fast paths: no changed uids and unrelated uids both mark nothing."""
+    await graph_client.ensure_schema()
+    assert await graph_client.invalidate_stale_anchors(set()) == 0
+    assert await graph_client.invalidate_stale_anchors({"nonexistent:uid"}) == 0
+
+
+async def test_delete_anchored_entity_marks_note_broken(graph_client: GraphClient):
+    """Deleting an anchor's target sets has_broken_anchors in the same delete statement."""
+    await graph_client.ensure_schema()
+    project = "anchor_delete"
+    fp = "src/foo.py"
+    target = _make_entity(project, "Bar", fp, label=NodeLabel.TYPE_DEF, kind="class", content_hash="v1")
+    await graph_client.upsert_file_entities(project, fp, [target], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{project}:src.foo.Bar]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    note_uid = f"{project}:note:a"
+    before = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}}) RETURN n.has_broken_anchors AS broken", {"uid": note_uid}
+    )
+    assert not before[0]["broken"]
+
+    await graph_client.delete_file_entities(project, fp)
+
+    after = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}}) RETURN n.has_broken_anchors AS broken", {"uid": note_uid}
+    )
+    assert after[0]["broken"] is True
+
+    gone = await graph_client.execute("MATCH (n {uid: $uid}) RETURN count(n) AS cnt", {"uid": f"{project}:src.foo.Bar"})
+    assert gone[0]["cnt"] == 0
+
+
+async def test_create_doc_links_ambiguous_match_creates_no_edge(graph_client: GraphClient):
+    """Two same-named callables in a project: a heuristic doc ref is left unresolved,
+    not fanned out into one edge per candidate (the multi-link bug this fix closes)."""
+    await graph_client.ensure_schema()
+    project = "doclink_ambiguous"
+    fp1, fp2 = "src/a.py", "src/b.py"
+    dup1 = _make_entity(project, "process", fp1, content_hash="p1")
+    dup2 = _make_entity(project, "process", fp2, content_hash="p2")
+    await graph_client.upsert_file_entities(project, fp1, [dup1], [])
+    await graph_client.upsert_file_entities(project, fp2, [dup2], [])
+
+    doc_fp = "docs/architecture.md"
+    doc_entities = [
+        ParsedEntity(
+            name="architecture.md",
+            qualified_name=f"{project}:docs/architecture.md",
+            label=NodeLabel.DOC_FILE,
+            kind="doc_file",
+            line_start=1,
+            line_end=5,
+            file_path=doc_fp,
+        ),
+        ParsedEntity(
+            name="Overview",
+            qualified_name=f"{project}:docs/architecture.md > Overview",
+            label=NodeLabel.DOC_SECTION,
+            kind="section",
+            line_start=1,
+            line_end=5,
+            file_path=doc_fp,
+        ),
+    ]
+    doc_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:docs/architecture.md > Overview",
+            rel_type=RelType.DOCUMENTS,
+            to_name="process",
+            properties={"link_type": "symbol_mention", "confidence": 0.8},
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, doc_fp, doc_entities, doc_rels)
+
+    records = await graph_client.execute(
+        f"MATCH (:{NodeLabel.DOC_SECTION} {{project_name: $p}})-[:{RelType.DOCUMENTS}]->() RETURN count(*) AS cnt",
+        {"p": project},
+    )
+    assert records[0]["cnt"] == 0
+
+
+async def test_create_doc_links_excludes_note_and_docsection_targets(graph_client: GraphClient):
+    """A heuristic doc ref never lands on another Note, even on an exact name match."""
+    await graph_client.ensure_schema()
+    project = "doclink_excl"
+
+    note = ParsedEntity(
+        name="helper",
+        qualified_name=f"{project}:note:helper-note",
+        label=NodeLabel.NOTE,
+        kind="note",
+        line_start=1,
+        line_end=1,
+        file_path="docs/notes/helper-note.md",
+    )
+    await graph_client.upsert_file_entities(project, "docs/notes/helper-note.md", [note], [])
+
+    doc_fp = "docs/architecture.md"
+    doc_entities = [
+        ParsedEntity(
+            name="architecture.md",
+            qualified_name=f"{project}:docs/architecture.md",
+            label=NodeLabel.DOC_FILE,
+            kind="doc_file",
+            line_start=1,
+            line_end=5,
+            file_path=doc_fp,
+        ),
+        ParsedEntity(
+            name="Overview",
+            qualified_name=f"{project}:docs/architecture.md > Overview",
+            label=NodeLabel.DOC_SECTION,
+            kind="section",
+            line_start=1,
+            line_end=5,
+            file_path=doc_fp,
+        ),
+    ]
+    doc_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:docs/architecture.md > Overview",
+            rel_type=RelType.DOCUMENTS,
+            to_name="helper",
+            properties={"link_type": "symbol_mention", "confidence": 0.8},
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, doc_fp, doc_entities, doc_rels)
+
+    records = await graph_client.execute(
+        f"MATCH (:{NodeLabel.DOC_SECTION} {{project_name: $p}})-[:{RelType.DOCUMENTS}]->() RETURN count(*) AS cnt",
+        {"p": project},
+    )
+    assert records[0]["cnt"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Delta upsert
 # ---------------------------------------------------------------------------
 

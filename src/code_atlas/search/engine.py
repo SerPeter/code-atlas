@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -104,6 +104,10 @@ class CompactNode:
     docstring: str = ""
     source: str = ""
     labels: list[str] = field(default_factory=list)
+    # Anchor staleness (§3.6) — set only for docs linked via an explicit
+    # anchors: DOCUMENTS edge (link_type='anchor'); None for heuristic docs.
+    stale: bool | None = None
+    anchor_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1068,7 +1072,9 @@ async def _expand_context_inner(
 
     if include_docs:
         coros["docs"] = graph.execute(
-            f"MATCH (doc:DocSection)-[:{RelType.DOCUMENTS}]->(n{label_clause} {{uid: $uid}}) RETURN doc AS n LIMIT 10",
+            f"MATCH (doc)-[r:{RelType.DOCUMENTS}]->(n{label_clause} {{uid: $uid}}) "
+            f"WHERE doc:{NodeLabel.DOC_SECTION} OR doc:{NodeLabel.NOTE} "
+            "RETURN doc AS n, r.link_type AS link_type, r.stale AS stale, r.anchor_hash AS anchor_hash LIMIT 10",
             {"uid": uid},
         )
 
@@ -1093,7 +1099,11 @@ async def _expand_context_inner(
     callers = _prioritize_callers(raw_callers, target.qualified_name)[:max_callers]
 
     callees = _records_to_compact(results_map.get("callees", []))
-    docs = _records_to_compact(results_map.get("docs", []))
+    docs = [
+        replace(_node_to_compact(record["n"]), stale=record.get("stale"), anchor_hash=record.get("anchor_hash"))
+        for record in results_map.get("docs", [])
+        if record.get("n") is not None
+    ]
 
     # Package context docstring
     pkg_records = results_map.get("package_ctx", [])

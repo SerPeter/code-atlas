@@ -368,6 +368,10 @@ def _compact_node_to_dict(node: CompactNode, *, include_source: bool = True) -> 
         out["source"] = node.source
     if node.labels:
         out["_labels"] = node.labels
+    if node.stale is not None:
+        out["stale"] = node.stale
+    if node.anchor_hash is not None:
+        out["anchor_hash"] = node.anchor_hash
     return out
 
 
@@ -799,7 +803,9 @@ def _register_query_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Expand a node into its neighborhood: parent, siblings, callers, callees, docs. "
-            "Pass a uid from get_node or hybrid_search results. "
+            "Pass a uid from get_node or hybrid_search results. docs includes both DocSection "
+            "and Note entries; a Note linked via an explicit anchors: frontmatter entry carries "
+            "stale (bool — content changed since the anchor was recorded) and anchor_hash. "
             "Returns: {node, parent, siblings, callers, callees, docs, package_context, query_ms}."
         ),
     )

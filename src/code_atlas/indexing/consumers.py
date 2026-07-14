@@ -410,6 +410,7 @@ class _ParsedFileData:
     call_rels: list[ParsedRelationship]
     type_rels: list[ParsedRelationship]
     member_rels: list[ParsedRelationship]
+    anchor_rels: list[ParsedRelationship]
 
 
 _SENTINEL_DELETED = _ParsedFileData(
@@ -421,6 +422,7 @@ _SENTINEL_DELETED = _ParsedFileData(
     call_rels=[],
     type_rels=[],
     member_rels=[],
+    anchor_rels=[],
 )
 
 
@@ -469,6 +471,7 @@ class ASTConsumer(TierConsumer):
         self._pending_call_rels: list[ParsedRelationship] = []
         self._pending_type_rels: list[ParsedRelationship] = []
         self._pending_member_rels: list[ParsedRelationship] = []
+        self._pending_anchor_rels: list[ParsedRelationship] = []
         self._pending_project_names: set[str] = set()
 
         # File hashes withheld from the graph until their batch's deferred
@@ -487,11 +490,18 @@ class ASTConsumer(TierConsumer):
                 or self._pending_call_rels
                 or self._pending_type_rels
                 or self._pending_member_rels
+                or self._pending_anchor_rels
             ):
                 await self._flush_deferred_resolution()
 
     async def _flush_deferred_resolution(self) -> None:
         """Run resolution for all accumulated rels across batches."""
+        if self._pending_anchor_rels:
+            # Anchors may target code in any project (uid/project-prefixed/
+            # absolute path forms) — resolved once, cross-project, rather
+            # than per-project like CALLS/IMPORTS/USES_TYPE below.
+            await self.graph.resolve_anchors(self._pending_anchor_rels)
+
         for project_name in self._pending_project_names:
             proj_imports = [
                 r for r in self._pending_import_rels if r.from_qualified_name.startswith(project_name + ":")
@@ -531,6 +541,7 @@ class ASTConsumer(TierConsumer):
         self._pending_call_rels.clear()
         self._pending_type_rels.clear()
         self._pending_member_rels.clear()
+        self._pending_anchor_rels.clear()
         self._pending_project_names.clear()
         self._batches_since_resolve = 0
         self._last_resolve_time = asyncio.get_event_loop().time()
@@ -579,14 +590,25 @@ class ASTConsumer(TierConsumer):
             # resolved post-batch via GraphClient.resolve_member_defines.
             return r.rel_type == RelType.DEFINES and "parent_type_name" in r.properties
 
+        def _is_anchor(r: ParsedRelationship) -> bool:
+            # Explicit anchors: frontmatter DOCUMENTS edges — resolved post-batch
+            # via GraphClient.resolve_anchors (path/uid/symbol resolution needs
+            # a cross-project lookup, unlike the immediate heuristic doc-links).
+            return r.rel_type == RelType.DOCUMENTS and r.properties.get("link_type") == "anchor"
+
         return _ParsedFileData(
             file_path=file_path,
             parsed_file=parsed,
             entities=parsed.entities,
-            non_import_rels=[r for r in parsed.relationships if r.rel_type not in _deferred and not _is_member(r)],
+            non_import_rels=[
+                r
+                for r in parsed.relationships
+                if r.rel_type not in _deferred and not _is_member(r) and not _is_anchor(r)
+            ],
             import_rels=[r for r in parsed.relationships if r.rel_type == RelType.IMPORTS],
             call_rels=[r for r in parsed.relationships if r.rel_type == RelType.CALLS],
             type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
+            anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
         )
 
@@ -632,6 +654,7 @@ class ASTConsumer(TierConsumer):
             logger.debug("AST batch {}: {} unique path(s) in {} group(s)", batch_id, total_paths, len(groups))
 
             embed_candidates: dict[str, tuple[EntityRef, str]] = {}  # uid → (ref, text_hash)
+            changed_uids: set[str] = set()  # accumulated across every group in this batch
             skipped_before = self.stats.files_skipped
             total_changed = 0
             batch_max_sig = Significance.NONE
@@ -797,6 +820,7 @@ class ASTConsumer(TierConsumer):
                         for qn in changed_qns:
                             entity = entity_map.get(qn)
                             if entity is not None:
+                                changed_uids.add(entity.qualified_name)
                                 ref = EntityRef(
                                     qualified_name=entity.qualified_name,
                                     node_type=entity.label.value,
@@ -847,11 +871,13 @@ class ASTConsumer(TierConsumer):
                 group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
                 group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
                 group_member_rels = [r for pfd in parsed_files.values() for r in pfd.member_rels]
+                group_anchor_rels = [r for pfd in parsed_files.values() for r in pfd.anchor_rels]
 
                 self._pending_import_rels.extend(group_import_rels)
                 self._pending_call_rels.extend(group_call_rels)
                 self._pending_type_rels.extend(group_type_rels)
                 self._pending_member_rels.extend(group_member_rels)
+                self._pending_anchor_rels.extend(group_anchor_rels)
                 self._pending_project_names.add(project_name)
 
                 # 8. Set per-file cooldown for processed files
@@ -867,6 +893,12 @@ class ASTConsumer(TierConsumer):
                 or (now - self._last_resolve_time) >= self._resolve_time_interval_s
             ):
                 await self._flush_deferred_resolution()
+
+            # Anchor invalidation runs every batch, unlike the deferred-resolution
+            # cadence above — a docstring-only edit that never clears the embed
+            # significance gate should still flag its anchoring notes stale.
+            if changed_uids:
+                await self.graph.invalidate_stale_anchors(changed_uids)
 
             span.set_attribute("files_count", total_paths)
             span.set_attribute("entities_changed", total_changed)

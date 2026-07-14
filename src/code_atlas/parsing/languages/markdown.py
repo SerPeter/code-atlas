@@ -65,6 +65,14 @@ _INLINE_TAG_RE = re.compile(r"(?<!\w)#([a-zA-Z][\w-]*)")
 _ATX_HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
 _ATX_H1_RE = re.compile(r"^#[ \t]+(.+?)\s*$", re.MULTILINE)
 
+# Absolute path: POSIX (leading /) or Windows (drive letter + :/ or :\).
+_ABS_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[/\\])")
+# Known file extensions (mirrors _FILE_REF_RE's set below) — a bare filename
+# anchor (e.g. "foo.py") is path-like even without a "/"; a generic
+# alphanumeric-suffix check would wrongly match a qualified name's last
+# segment (e.g. "...foo.Bar").
+_FILE_EXT_RE = re.compile(r"\.(?:py|pyi|js|ts|jsx|tsx|java|go|rs|rb|cpp|c|h|hpp|md)$")
+
 
 @dataclass(frozen=True)
 class _Frontmatter:
@@ -206,7 +214,80 @@ def _extract_frontmatter_refs(fm: dict[str, Any], project_name: str, from_qn: st
     return rels
 
 
-_HARNESS_DIALECT_EXTRA_KEYS = frozenset({"id", "kind", "tags", "derived_from", "supersedes"})
+def _classify_anchor(raw: str) -> tuple[str, str | None, str, str | None]:
+    """Classify a frontmatter ``anchors:`` entry into ``(form, project_hint, target, symbol)``.
+
+    Forms — ``uid`` (canonical ``project:qualified.name``), ``path`` (bare
+    relative, resolved within the note's own project), ``project_path``
+    (``project:relative/path``), ``absolute_path``. Detection is
+    deterministic (decision Q9): paths contain ``/`` or a file extension;
+    uids are dotted qualified names. An optional ``#Symbol`` suffix refines
+    a path anchor to a specific entity within the resolved file. Resolution
+    against the live graph happens in ``GraphClient.resolve_anchors`` — this
+    only classifies the form.
+    """
+    main, _, symbol_part = raw.strip().partition("#")
+    main = main.strip()
+    symbol = symbol_part.strip() or None
+
+    if _ABS_PATH_RE.match(main):
+        return "absolute_path", None, main.replace("\\", "/"), symbol
+
+    project_hint: str | None = None
+    rest = main
+    if ":" in main:
+        prefix, _, tail = main.partition(":")
+        if prefix and tail:
+            project_hint = prefix
+            rest = tail
+
+    is_path_like = "/" in rest or bool(_FILE_EXT_RE.search(rest))
+    if is_path_like:
+        rest = rest.replace("\\", "/")
+        return ("project_path" if project_hint else "path"), project_hint, rest, symbol
+
+    return "uid", None, main, symbol
+
+
+def _extract_anchors(fm: dict[str, Any], from_qn: str) -> list[ParsedRelationship]:
+    """Extract explicit ``anchors:`` frontmatter as DOCUMENTS relationships.
+
+    Resolution (uid direct match, path/project_path/absolute_path matching,
+    ``#Symbol`` refinement, never multi-linking) happens graph-side in
+    ``GraphClient.resolve_anchors`` — parsing only classifies each anchor's
+    form deterministically.
+    """
+    values = fm.get("anchors")
+    if not isinstance(values, list):
+        return []
+    rels: list[ParsedRelationship] = []
+    for v in values:
+        if not isinstance(v, str) or not v.strip():
+            continue
+        raw = v.strip()
+        form, project_hint, target, symbol = _classify_anchor(raw)
+        props: dict[str, Any] = {
+            "link_type": "anchor",
+            "confidence": 1.0,
+            "anchor_form": form,
+            "anchor_raw": raw,
+        }
+        if project_hint:
+            props["anchor_project"] = project_hint
+        if symbol:
+            props["anchor_symbol"] = symbol
+        rels.append(
+            ParsedRelationship(
+                from_qualified_name=from_qn,
+                rel_type=RelType.DOCUMENTS,
+                to_name=target,
+                properties=props,
+            )
+        )
+    return rels
+
+
+_HARNESS_DIALECT_EXTRA_KEYS = frozenset({"id", "kind", "tags", "derived_from", "supersedes", "anchors"})
 
 
 def _parse_markdown_note(
@@ -254,6 +335,7 @@ def _parse_markdown_note(
     relationships: list[ParsedRelationship] = [
         *_extract_wikilinks(body, project_name, full_qn),
         *_extract_frontmatter_refs(fm, project_name, full_qn),
+        *_extract_anchors(fm, full_qn),
     ]
     relationships.extend(
         ParsedRelationship(

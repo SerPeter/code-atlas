@@ -341,6 +341,93 @@ def _fuse_bm25_results(
 
 
 @dataclass(frozen=True)
+class _AnchorLookup:
+    """Pre-built, cross-project lookup tables for anchor (path-form) resolution.
+
+    Anchors may target code in any project (uid/project-prefixed/absolute
+    path forms), so — unlike CALLS/IMPORTS resolution — this lookup spans
+    the whole graph rather than one project's own entities.
+    """
+
+    file_by_path: dict[str, dict[str, tuple[str, str]]]  # project → {file_path: (uid, content_hash)}
+    # project → file_path → name → [(uid, content_hash)]
+    symbols_by_path: dict[str, dict[str, dict[str, list[tuple[str, str]]]]]
+    project_roots: dict[str, str]  # project → root_path (posix, resolved, no trailing slash)
+
+
+def _resolve_anchor_path(project: str, path: str, lookup: _AnchorLookup) -> tuple[str, str] | None:
+    """Resolve a path anchor to ``(file_uid, file_content_hash)`` within *project*.
+
+    Exact ``file_path`` match first; falls back to a unique-suffix match
+    (mirrors the suffix convention ``_create_doc_links`` uses for file
+    refs). An ambiguous suffix match resolves to nothing rather than guessing.
+    """
+    files = lookup.file_by_path.get(project)
+    if not files:
+        return None
+    exact = files.get(path)
+    if exact is not None:
+        return exact
+    suffix = "/" + path
+    candidates = [v for fp, v in files.items() if fp.endswith(suffix)]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_anchor_symbol(project: str, file_path: str, symbol: str, lookup: _AnchorLookup) -> tuple[str, str] | None:
+    """Resolve a ``#Symbol`` refinement to ``(uid, content_hash)``; ``None`` if missing/ambiguous."""
+    candidates = lookup.symbols_by_path.get(project, {}).get(file_path, {}).get(symbol, [])
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_absolute_anchor(target: str, lookup: _AnchorLookup) -> tuple[str, str] | None:
+    """Resolve an absolute-path anchor to ``(project, relative_path)`` via longest-prefix match."""
+    best_project: str | None = None
+    best_len = -1
+    for project, root in lookup.project_roots.items():
+        prefix = root.rstrip("/") + "/"
+        if target.startswith(prefix) and len(prefix) > best_len:
+            best_project, best_len = project, len(prefix)
+    if best_project is None:
+        return None
+    return best_project, target[best_len:]
+
+
+def _resolve_one_path_anchor(rel: ParsedRelationship, lookup: _AnchorLookup) -> tuple[str, str] | None:
+    """Resolve a single path/project_path/absolute_path anchor to ``(uid, content_hash)``.
+
+    Uid-form anchors are handled separately (a direct batched graph read) —
+    this covers only the three path-shaped forms.
+    """
+    form = rel.properties.get("anchor_form", "")
+    target: tuple[str, str] | None = None
+    project_for_symbol = ""
+
+    if form == "path":
+        project_for_symbol = rel.from_qualified_name.split(":", 1)[0]
+        target = _resolve_anchor_path(project_for_symbol, rel.to_name, lookup)
+    elif form == "project_path":
+        project_for_symbol = rel.properties.get("anchor_project", "")
+        target = _resolve_anchor_path(project_for_symbol, rel.to_name, lookup)
+    elif form == "absolute_path":
+        resolved_loc = _resolve_absolute_anchor(rel.to_name, lookup)
+        if resolved_loc is not None:
+            project_for_symbol, rel_path = resolved_loc
+            target = _resolve_anchor_path(project_for_symbol, rel_path, lookup)
+
+    if target is None:
+        return None
+
+    symbol = rel.properties.get("anchor_symbol")
+    if symbol:
+        # Ambiguous/missing symbol falls back to the file-level anchor
+        # rather than failing outright (decision Q9).
+        sym_target = _resolve_anchor_symbol(project_for_symbol, rel.to_name, symbol, lookup)
+        if sym_target is not None:
+            return sym_target
+    return target
+
+
+@dataclass(frozen=True)
 class _CallLookup:
     """Pre-built lookup tables for CALLS resolution."""
 
@@ -536,6 +623,8 @@ class GraphClient:
                 await self._migrate_v3_clear_freshness_markers()
             if stored < 4:  # v4 data migration threshold
                 await self._migrate_v4_clear_freshness_markers()
+            if stored < 5:  # v5 data migration threshold
+                await self._migrate_v5_clear_freshness_markers()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -1176,6 +1265,132 @@ class GraphClient:
             )
 
         logger.debug("Resolved {} CALLS edges ({} unresolved)", resolved, unresolved)
+
+    async def build_anchor_lookup(self) -> _AnchorLookup:
+        """Build the cross-project lookup tables needed for anchor resolution."""
+        file_records = await self.execute(
+            f"MATCH (n) WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.DOC_FILE} OR n:{NodeLabel.NOTE} "
+            "RETURN n.project_name AS project, n.file_path AS fp, n.uid AS uid, n.content_hash AS hash"
+        )
+        file_by_path: dict[str, dict[str, tuple[str, str]]] = {}
+        for r in file_records:
+            file_by_path.setdefault(r["project"], {})[r["fp"]] = (r["uid"], r["hash"] or "")
+
+        symbol_records = await self.execute(
+            f"MATCH (n) WHERE n:{NodeLabel.CALLABLE} OR n:{NodeLabel.TYPE_DEF} OR n:{NodeLabel.VALUE} "
+            "RETURN n.project_name AS project, n.file_path AS fp, n.name AS name, n.uid AS uid, n.content_hash AS hash"
+        )
+        symbols_by_path: dict[str, dict[str, dict[str, list[tuple[str, str]]]]] = {}
+        for r in symbol_records:
+            proj_map = symbols_by_path.setdefault(r["project"], {})
+            proj_map.setdefault(r["fp"] or "", {}).setdefault(r["name"], []).append((r["uid"], r["hash"] or ""))
+
+        project_records = await self.execute(
+            f"MATCH (p:{NodeLabel.PROJECT}) WHERE p.root_path IS NOT NULL "
+            "RETURN p.project_name AS project, p.root_path AS root"
+        )
+        project_roots = {r["project"]: r["root"] for r in project_records if r["root"]}
+
+        return _AnchorLookup(file_by_path=file_by_path, symbols_by_path=symbols_by_path, project_roots=project_roots)
+
+    async def resolve_anchors(
+        self,
+        anchor_rels: list[ParsedRelationship],
+        *,
+        lookup: _AnchorLookup | None = None,
+    ) -> None:
+        """Resolve explicit ``anchors:`` frontmatter into DOCUMENTS edges after batch upsert.
+
+        Anchors may cross project boundaries (uid/project-prefixed/absolute
+        path forms), so resolution runs against a cross-project lookup
+        rather than one project's own entities. Never multi-links: an
+        ambiguous or missing target is recorded on the note's
+        ``unresolved_anchors`` instead of guessing. ``anchor_hash`` captures
+        the target's content_hash at link time — ``invalidate_stale_anchors``
+        later compares against it to detect drift.
+        """
+        if not anchor_rels:
+            return
+        if lookup is None:
+            lookup = await self.build_anchor_lookup()
+
+        resolved: list[dict[str, str]] = []
+        unresolved_by_note: dict[str, list[str]] = {}
+        uid_form: list[ParsedRelationship] = []
+
+        for rel in anchor_rels:
+            if rel.properties.get("anchor_form", "") == "uid":
+                uid_form.append(rel)
+                continue
+
+            target = _resolve_one_path_anchor(rel, lookup)
+            if target is None:
+                raw = rel.properties.get("anchor_raw", rel.to_name)
+                unresolved_by_note.setdefault(rel.from_qualified_name, []).append(raw)
+                continue
+
+            file_uid, file_hash = target
+            resolved.append({"from_uid": rel.from_qualified_name, "to_uid": file_uid, "to_hash": file_hash})
+
+        if uid_form:
+            records = await self.execute(
+                "UNWIND $uids AS uid MATCH (b {uid: uid}) RETURN b.uid AS uid, b.content_hash AS hash",
+                {"uids": list({r.to_name for r in uid_form})},
+            )
+            hash_by_uid = {r["uid"]: r["hash"] or "" for r in records}
+            for rel in uid_form:
+                found = hash_by_uid.get(rel.to_name)
+                if found is None:
+                    raw = rel.properties.get("anchor_raw", rel.to_name)
+                    unresolved_by_note.setdefault(rel.from_qualified_name, []).append(raw)
+                else:
+                    resolved.append({"from_uid": rel.from_qualified_name, "to_uid": rel.to_name, "to_hash": found})
+
+        if resolved:
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.NOTE} {{uid: r.from_uid}}) "
+                f"MATCH (b {{uid: r.to_uid}}) "
+                f"CREATE (a)-[e:{RelType.DOCUMENTS} "
+                f"{{link_type: 'anchor', confidence: 1.0, anchor_hash: r.to_hash, stale: false}}]->(b)",
+                {"rels": resolved},
+            )
+
+        # Every note with anchors this batch gets its unresolved list recomputed
+        # from scratch — a note whose anchors now all resolve must be cleared,
+        # not left with a stale failure list from a prior parse.
+        all_notes = {rel.from_qualified_name for rel in anchor_rels}
+        note_updates = [{"uid": note_uid, "unresolved": unresolved_by_note.get(note_uid, [])} for note_uid in all_notes]
+        await self.execute_write(
+            f"UNWIND $notes AS item MATCH (n:{NodeLabel.NOTE} {{uid: item.uid}}) "
+            "SET n.unresolved_anchors = item.unresolved",
+            {"notes": note_updates},
+        )
+
+        total_unresolved = sum(len(v) for v in unresolved_by_note.values())
+        logger.debug("Resolved {} anchor edges ({} unresolved)", len(resolved), total_unresolved)
+
+    async def invalidate_stale_anchors(self, changed_uids: set[str]) -> int:
+        """Mark anchor DOCUMENTS edges stale whose target's content_hash has drifted.
+
+        Runs after every upsert batch (not gated by significance) — the
+        moment an anchored function's content changes, the note documenting
+        it is flagged stale in retrieval within seconds.
+        """
+        if not changed_uids:
+            return 0
+        records = await self.execute(
+            f"UNWIND $uids AS uid "
+            f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(e {{uid: uid}}) "
+            "WHERE r.anchor_hash <> e.content_hash "
+            "SET r.stale = true "
+            "RETURN count(r) AS cnt",
+            {"uids": list(changed_uids)},
+        )
+        count = records[0]["cnt"] if records else 0
+        if count:
+            logger.debug("Marked {} anchor edge(s) stale", count)
+        return count
 
     async def resolve_type_refs(  # noqa: PLR0912
         self,
@@ -2248,6 +2463,14 @@ class GraphClient:
         are always re-resolved whenever the member's file is reprocessed,
         including on reappearance. Treating them as "foreign" here would make
         a genuinely deleted cross-file member an undeletable zombie.
+
+        Anchor-type DOCUMENTS edges are also excluded: unlike CALLS/INHERITS/
+        heuristic-DOCUMENTS edges (which preserve the zombie because nothing
+        could recreate them), an explicit anchors: reference is meant to go
+        stale/broken and be surfaced to the user (§3.6), not keep an
+        otherwise-dead entity alive forever. Deletion proceeds normally, and
+        the affected Note's ``has_broken_anchors`` is set in the same
+        statement as the DETACH DELETE below.
         """
         # Pass 1: read which uids have a foreign inbound edge, across all
         # labels, before any writes — so an earlier label's delete in this
@@ -2270,6 +2493,7 @@ class GraphClient:
                 f"UNWIND $uids AS uid {match_n} "
                 "MATCH (other)-[r]->(n) WHERE (other.file_path IS NULL OR other.file_path <> n.file_path) "
                 f"AND NOT type(r) = '{RelType.DEFINES}' "
+                f"AND NOT (type(r) = '{RelType.DOCUMENTS}' AND r.link_type = 'anchor') "
                 "AND NOT other.uid IN $all_uids "
                 "RETURN DISTINCT uid",
                 {"uids": uids, "all_uids": all_uids},
@@ -2283,8 +2507,16 @@ class GraphClient:
             if not uids:
                 continue
             match_n = f"MATCH (n:{label} {{uid: uid}})" if label else "MATCH (n {uid: uid})"
+            # Deletion marking is folded into the same statement as the DETACH
+            # DELETE: a node about to be removed may be an explicit anchor
+            # target, so any Note anchoring into it gets has_broken_anchors
+            # set before the node (and its inbound DOCUMENTS edge) disappears.
             await self.execute_write(
-                f"UNWIND $uids AS uid {match_n} DETACH DELETE n",
+                f"UNWIND $uids AS uid {match_n} "
+                f"OPTIONAL MATCH (note:{NodeLabel.NOTE})-[:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(n) "
+                "FOREACH (_ IN CASE WHEN note IS NOT NULL THEN [1] ELSE [] END | SET note.has_broken_anchors = true) "
+                "WITH DISTINCT n "
+                "DETACH DELETE n",
                 {"uids": uids},
             )
         for label, uids in preserve_by_label.items():
@@ -2419,7 +2651,11 @@ class GraphClient:
         one for file-path-based links (suffix match on file_path). The
         from-side may be a DocSection (heading-level docs) or a Note
         (frontmatter-triggered vault/memory files) — both emit heuristic
-        DOCUMENTS refs the same way.
+        DOCUMENTS refs the same way. The to-side excludes Note/DocSection
+        (heuristic mentions should only land on genuine code/doc-file
+        entities, not other notes or subsections) and never multi-links —
+        an ambiguous match (more than one candidate) is left unresolved
+        rather than fanning out one edge per candidate.
         """
         symbol_params = []
         file_params = []
@@ -2442,6 +2678,9 @@ class GraphClient:
                 f"UNWIND $rels AS r "
                 f"MATCH (a {{uid: r.from_uid}}) WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
                 f"MATCH (b {{project_name: $project, name: r.to_name}}) "
+                f"WHERE NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
+                f"WITH r, a, collect(b) AS candidates WHERE size(candidates) = 1 "
+                f"WITH r, a, candidates[0] AS b "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
                 {"rels": symbol_params, "project": project_name},
@@ -2453,6 +2692,9 @@ class GraphClient:
                 f"UNWIND $rels AS r "
                 f"MATCH (a {{uid: r.from_uid}}) WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
                 f"MATCH (b {{project_name: $project}}) WHERE b.file_path ENDS WITH r.to_name "
+                f"AND NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
+                f"WITH r, a, collect(b) AS candidates WHERE size(candidates) = 1 "
+                f"WITH r, a, candidates[0] AS b "
                 f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
                 {"rels": file_params, "project": project_name},
@@ -2538,6 +2780,21 @@ class GraphClient:
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v4: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v4"
+        )
+
+    async def _migrate_v5_clear_freshness_markers(self) -> None:
+        """v5: markdown.py now excludes ``anchors`` from Note.extra_properties and instead
+        emits DOCUMENTS(link_type='anchor') relationships, changing content_hash for any note
+        with an ``anchors:`` key even though the file's bytes are unchanged. Clear file/git
+        hashes so the next index run re-parses every file and resolves those anchors.
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v5: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v5"
         )
 
     async def _set_schema_version(self, version: int) -> None:

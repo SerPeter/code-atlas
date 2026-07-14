@@ -733,6 +733,108 @@ async def test_body_only_edit_publishes_embed_dirty(
 
 
 # ---------------------------------------------------------------------------
+# Explicit anchors + staleness (Phase 3 — e2e through the real pipeline)
+# ---------------------------------------------------------------------------
+
+
+async def test_anchor_stale_after_edit_and_broken_after_delete(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """Exit criterion: edit an anchored function -> the note is flagged stale within
+    seconds; delete its file entirely -> the note is flagged has_broken_anchors."""
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(settings.project_root, "anchor_target.py", "def bar():\n    return 1\n")
+
+    c1 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, "anchor_target.py", "created"))
+    task = asyncio.create_task(c1.run())
+    await asyncio.sleep(1.0)
+    c1.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    target_records = await graph_client.execute(
+        "MATCH (c:Callable {project_name: $p, name: 'bar'}) RETURN c.uid AS uid", {"p": project_name}
+    )
+    assert target_records
+    target_uid = target_records[0]["uid"]
+
+    _write_python_file(
+        settings.project_root,
+        "docs/notes/anchor-note.md",
+        f"---\nid: anchor-note\nkind: note\nanchors: [{target_uid}]\n---\n\nDocs the bar function.\n",
+    )
+
+    c2 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, "docs/notes/anchor-note.md", "created"))
+    task = asyncio.create_task(c2.run())
+    await asyncio.sleep(1.0)
+    c2.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    note_uid = f"{project_name}:note:anchor-note"
+    records = await graph_client.execute(
+        "MATCH (n:Note {uid: $uid})-[r:DOCUMENTS {link_type: 'anchor'}]->(b) RETURN r.stale AS stale, b.uid AS buid",
+        {"uid": note_uid},
+    )
+    assert len(records) == 1
+    assert records[0]["buid"] == target_uid
+    assert records[0]["stale"] is False
+
+    # Edit the anchored function — content_hash drifts, marked stale within this same batch.
+    _write_python_file(settings.project_root, "anchor_target.py", "def bar():\n    return 2\n")
+    c3 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, "anchor_target.py"))
+    task = asyncio.create_task(c3.run())
+    await asyncio.sleep(1.0)
+    c3.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    records = await graph_client.execute(
+        "MATCH (n:Note {uid: $uid})-[r:DOCUMENTS {link_type: 'anchor'}]->() RETURN r.stale AS stale",
+        {"uid": note_uid},
+    )
+    assert records[0]["stale"] is True
+
+    # Delete the anchored function's file entirely — note flagged has_broken_anchors.
+    (settings.project_root / "anchor_target.py").unlink()
+    c4 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, "anchor_target.py", "deleted"))
+    task = asyncio.create_task(c4.run())
+    await asyncio.sleep(1.0)
+    c4.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    records = await graph_client.execute(
+        "MATCH (n:Note {uid: $uid}) RETURN n.has_broken_anchors AS broken", {"uid": note_uid}
+    )
+    assert records[0]["broken"] is True
+
+
+# ---------------------------------------------------------------------------
 # Cross-file member DEFINES (S5 e2e)
 # ---------------------------------------------------------------------------
 

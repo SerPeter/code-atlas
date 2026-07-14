@@ -250,3 +250,93 @@ def test_note_backtick_symbol_emits_documents_edge():
     parsed = _parse(source, path="docs/notes/a.md")
     doc_rels = [r for r in parsed.relationships if r.rel_type == RelType.DOCUMENTS]
     assert any(r.to_name == "_flush" for r in doc_rels)
+
+
+# ---------------------------------------------------------------------------
+# 6. Explicit anchors: frontmatter (Phase 3 — anchors + staleness)
+# ---------------------------------------------------------------------------
+
+
+def _anchor_rels(parsed: ParsedFile):
+    return [
+        r for r in parsed.relationships if r.rel_type == RelType.DOCUMENTS and r.properties.get("link_type") == "anchor"
+    ]
+
+
+def test_anchor_uid_form():
+    source = "---\nid: a\nkind: note\nanchors: [code-atlas:src.code_atlas.foo.Bar]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert len(rels) == 1
+    assert rels[0].to_name == "code-atlas:src.code_atlas.foo.Bar"
+    assert rels[0].properties["anchor_form"] == "uid"
+    assert rels[0].properties["confidence"] == 1.0
+    assert "anchor_project" not in rels[0].properties
+    assert "anchor_symbol" not in rels[0].properties
+
+
+def test_anchor_bare_relative_path_form():
+    source = "---\nid: a\nkind: note\nanchors: [src/code_atlas/indexing/watcher.py]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert rels[0].to_name == "src/code_atlas/indexing/watcher.py"
+    assert rels[0].properties["anchor_form"] == "path"
+
+
+def test_anchor_project_prefixed_path_form():
+    source = "---\nid: a\nkind: note\nanchors: [code-atlas:src/code_atlas/indexing/watcher.py]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert rels[0].to_name == "src/code_atlas/indexing/watcher.py"
+    assert rels[0].properties["anchor_form"] == "project_path"
+    assert rels[0].properties["anchor_project"] == "code-atlas"
+
+
+def test_anchor_absolute_path_form():
+    source = "---\nid: a\nkind: note\nanchors: ['D:/dev/git/code-atlas/src/code_atlas/foo.py']\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert rels[0].to_name == "D:/dev/git/code-atlas/src/code_atlas/foo.py"
+    assert rels[0].properties["anchor_form"] == "absolute_path"
+
+
+def test_anchor_posix_absolute_path_form():
+    source = "---\nid: a\nkind: note\nanchors: [/home/user/repo/src/foo.py]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert rels[0].properties["anchor_form"] == "absolute_path"
+
+
+def test_anchor_symbol_refinement():
+    source = "---\nid: a\nkind: note\nanchors: [src/code_atlas/foo.py#MyClass]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert rels[0].to_name == "src/code_atlas/foo.py"
+    assert rels[0].properties["anchor_symbol"] == "MyClass"
+
+
+def test_anchor_project_prefixed_uid_not_mistaken_for_path():
+    # No '/' and no file extension after the project prefix -> uid form, not project_path.
+    source = "---\nid: a\nkind: note\nanchors: [code-atlas:src.code_atlas.foo.Bar]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert rels[0].properties["anchor_form"] == "uid"
+
+
+def test_anchors_excluded_from_extra_properties():
+    source = "---\nid: a\nkind: note\nanchors: [foo.py]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    note = _note(parsed)
+    assert "anchors" not in note.extra_properties
+
+
+def test_no_anchors_frontmatter_emits_no_anchor_rels():
+    source = "---\nid: a\nkind: note\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    assert _anchor_rels(parsed) == []
+
+
+def test_anchors_non_list_value_ignored():
+    source = "---\nid: a\nkind: note\nanchors: not-a-list\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    assert _anchor_rels(parsed) == []
