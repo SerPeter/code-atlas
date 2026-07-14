@@ -355,3 +355,82 @@ class TestDreamCommand:
         assert "Knowledge Vault" in home.read_text(encoding="utf-8")
         mock_graph.ping.assert_awaited_once()
         mock_graph.close.assert_awaited_once()
+
+
+class TestProjectRm:
+    """`atlas project rm` deletes a project's graph data, with a confirmation gate."""
+
+    def _mock_graph(self, *, found: bool = True):
+        mock_graph = AsyncMock()
+        mock_graph.ping = AsyncMock()
+        mock_graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "myproject"}}] if found else [])
+        mock_graph.delete_project_data = AsyncMock()
+        mock_graph.close = AsyncMock()
+        return mock_graph
+
+    async def test_yes_flag_deletes_without_prompt(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+
+        await cli._run_project_rm("myproject", skip_confirm=True)
+
+        mock_graph.delete_project_data.assert_awaited_once_with("myproject")
+        mock_graph.close.assert_awaited_once()
+
+    async def test_missing_project_exits_with_error(self, tmp_path, monkeypatch) -> None:
+        import pytest
+        import typer
+
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph(found=False)
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+
+        with pytest.raises(typer.Exit):
+            await cli._run_project_rm("ghost", skip_confirm=True)
+
+        mock_graph.delete_project_data.assert_not_awaited()
+
+    def test_confirmation_prompt_aborts_on_no(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+
+        result = runner.invoke(app, ["project", "rm", "myproject"], input="n\n")
+
+        assert result.exit_code == 1
+        mock_graph.delete_project_data.assert_not_awaited()
+
+    def test_confirmation_prompt_deletes_on_yes(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+
+        result = runner.invoke(app, ["project", "rm", "myproject"], input="y\n")
+
+        assert result.exit_code == 0
+        mock_graph.delete_project_data.assert_awaited_once_with("myproject")

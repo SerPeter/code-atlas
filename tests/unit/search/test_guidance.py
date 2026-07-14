@@ -171,6 +171,26 @@ class TestPlanStrategy:
         assert isinstance(result["alternatives"], list)
         assert len(result["alternatives"]) >= 1
 
+    def test_why_question_recommends_knowledge_mode(self):
+        result = plan_strategy("why does the indexer use a hash gate")
+        assert result["recommended_tool"] == "hybrid_search"
+        assert result["params"]["mode"] == "knowledge"
+
+    def test_decision_question_recommends_knowledge_mode(self):
+        result = plan_strategy("what was the decision behind the schema versioning approach")
+        assert result["params"]["mode"] == "knowledge"
+
+    def test_gotcha_question_recommends_knowledge_mode(self):
+        result = plan_strategy("is there a gotcha with the watcher debounce")
+        assert result["params"]["mode"] == "knowledge"
+
+    def test_knowledge_pattern_overrides_structural_keywords(self):
+        """ "why" signals rationale even when the question also mentions call/test/base —
+        knowledge-shaped intent takes priority over the structural keyword match."""
+        result = plan_strategy("why does the test call the base class")
+        assert result["params"].get("mode") == "knowledge"
+        assert result["recommended_tool"] == "hybrid_search"
+
 
 # ---------------------------------------------------------------------------
 # Usage guide

@@ -394,6 +394,15 @@ _DOC_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Why/decision/gotcha-shaped questions — rationale and context, not structure
+# or plain docs. Checked before _STRUCTURAL_PATTERNS: "why does the test call
+# the base class" is asking for rationale, not a CALLS/INHERITS traversal,
+# even though it contains structural keywords too.
+_KNOWLEDGE_PATTERNS = re.compile(
+    r"\b(why|decision|gotcha|rationale|trade-?off|motivation|learned|lesson)\b",
+    re.IGNORECASE,
+)
+
 
 def plan_strategy(question: str) -> dict[str, Any]:
     """Analyze a question and recommend which search tool to use.
@@ -402,6 +411,21 @@ def plan_strategy(question: str) -> dict[str, Any]:
     """
     stripped = question.strip()
     weights = analyze_query(stripped)
+
+    # Check for why/decision/gotcha-shaped questions first (see _KNOWLEDGE_PATTERNS)
+    if _KNOWLEDGE_PATTERNS.search(stripped):
+        return {
+            "recommended_tool": "hybrid_search",
+            "params": {
+                "mode": "knowledge",
+            },
+            "explanation": "Why/decision/gotcha-shaped question — knowledge-vault search "
+            "(notes, ADRs, gotchas) ranked above code.",
+            "alternatives": [
+                "hybrid_search with mode='blended' — if you also want code ranked equally",
+                "cypher_query — for structural traversals (callers, inheritance)",
+            ],
+        }
 
     # Check if it's a structural/relationship question
     if _STRUCTURAL_PATTERNS.search(stripped):

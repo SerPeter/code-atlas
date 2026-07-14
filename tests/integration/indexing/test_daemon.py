@@ -156,7 +156,7 @@ async def test_daemon_start_runs_catchup_delta(
 
 
 # ---------------------------------------------------------------------------
-# Extra-vault indexing (Phase 2 of the knowledge-convergence roadmap)
+# Extra-vault indexing (Phase 2 catch-up scan + Phase 5 live watching)
 # ---------------------------------------------------------------------------
 
 
@@ -166,13 +166,8 @@ async def test_daemon_indexes_extra_vault(
     event_bus: EventBus,
     tmp_path,
 ) -> None:
-    """A note living in a configured extra vault becomes a searchable Note node.
-
-    The vault lives outside project_root and is never live-watched — the
-    daemon's vault-poll loop must scan and publish it on its own, and the
-    daemon's persistent (project-agnostic) AST/Embed consumers must pick up
-    the resulting events with no per-vault consumer pair.
-    """
+    """A note already in a configured extra vault becomes a searchable Note node
+    via the daemon's one-time startup catch-up scan for that vault."""
     settings.embeddings.enabled = False
     await graph_client.ensure_schema()
 
@@ -184,10 +179,9 @@ async def test_daemon_indexes_extra_vault(
         "---\nid: test-vault-note\nkind: note\ntags: [test]\n---\n\n# Test Vault Note\n\nSome content.\n",
     )
     settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
-    settings.knowledge.vault_poll_interval_s = 60.0  # only the immediate first poll should matter here
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=False)
+    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=True)
     assert started is True
     try:
         rows = await _wait_for_rows(
@@ -196,8 +190,55 @@ async def test_daemon_indexes_extra_vault(
             {"uid": "test-vault:note:test-vault-note"},
             timeout_s=30.0,
         )
-        assert rows, "vault note never became a Note node — vault poll or consumer wiring is broken"
+        assert rows, "vault note never became a Note node — vault catch-up or consumer wiring is broken"
         assert rows[0]["kind"] == "note"
         assert "Some content." in rows[0]["docstring"]
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_live_watches_extra_vault(
+    settings: AtlasSettings,
+    graph_client: GraphClient,
+    event_bus: EventBus,
+    tmp_path,
+) -> None:
+    """A note added to an extra vault AFTER the daemon starts is indexed live —
+    multi-root watching (Phase 5), not a re-scan on the next poll cycle."""
+    settings.embeddings.enabled = False
+    settings.watcher.debounce_s = 0.5
+    settings.watcher.max_wait_s = 10.0
+    await graph_client.ensure_schema()
+
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
+
+    daemon = DaemonManager()
+    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=True)
+    assert started is True
+    try:
+        assert len(daemon._vault_watchers) == 1
+
+        # Let awatch initialize its OS-level watch handle before touching the file
+        # (the same settle window test_live_update.py uses for the main watcher).
+        await asyncio.sleep(1.5)
+
+        # Written after start() returns — only a live watcher (not the one-time
+        # catch-up scan already completed above) can pick this up.
+        _write_python_file(
+            vault_dir,
+            "later-note.md",
+            "---\nid: later-note\nkind: note\ntags: [test]\n---\n\n# Later Note\n\nAppeared after startup.\n",
+        )
+
+        rows = await _wait_for_rows(
+            graph_client,
+            "MATCH (n:Note {uid: $uid}) RETURN n.docstring AS docstring",
+            {"uid": "test-vault:note:later-note"},
+            timeout_s=20.0,
+        )
+        assert rows, "note added after daemon startup was never indexed — vault live-watching is broken"
+        assert "Appeared after startup." in rows[0]["docstring"]
     finally:
         await daemon.stop()

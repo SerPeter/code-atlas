@@ -19,6 +19,7 @@ from code_atlas.indexing.orchestrator import (
     _git_changed_files,
     _read_git_head,
     _wait_for_drain,
+    gc_vanished_worktree_projects,
     scan_files,
 )
 from code_atlas.settings import AtlasSettings, ScopeSettings, derive_project_name, resolve_git_dir
@@ -881,3 +882,67 @@ class TestCheckModelLock:
 
         with pytest.raises(RuntimeError, match="dimension changed"):
             await _check_model_lock(graph, "model-a", 768, reindex=False)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Worktree-project GC (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+class FakeGCGraph:
+    """Records delete_project_data calls made by gc_vanished_worktree_projects."""
+
+    def __init__(self, projects: list[dict]) -> None:
+        self._projects = projects
+        self.deleted: list[str] = []
+
+    async def get_project_status(self):
+        return self._projects
+
+    async def delete_project_data(self, project_name: str) -> None:
+        self.deleted.append(project_name)
+
+
+class TestGcVanishedWorktreeProjects:
+    async def test_removes_worktree_project_whose_root_path_vanished(self, tmp_path: Path):
+        graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path / "gone")}}])
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == ["code-atlas@feature-x"]
+        assert graph.deleted == ["code-atlas@feature-x"]
+
+    async def test_spares_worktree_project_whose_root_path_still_exists(self, tmp_path: Path):
+        graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path)}}])
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []
+
+    async def test_spares_non_worktree_project_regardless_of_root_path(self, tmp_path: Path):
+        """Only '@branch'-shaped names are worktree candidates — a plain project
+        with a vanished root_path (e.g. moved checkout) is not auto-GC'd."""
+        graph = FakeGCGraph([{"n": {"project_name": "code-atlas", "root_path": str(tmp_path / "gone")}}])
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []
+
+    async def test_spares_worktree_project_with_no_stored_root_path(self, tmp_path: Path):
+        """No root_path stored (pre-orchestrator-fix data) — nothing to check against, so skip rather than guess."""
+        graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x"}}])
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []
+
+    async def test_empty_project_list_is_noop(self):
+        graph = FakeGCGraph([])
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []

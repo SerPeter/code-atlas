@@ -1821,3 +1821,38 @@ async def _wait_for_drain(
         t3_remaining,
     )
     return False
+
+
+# ---------------------------------------------------------------------------
+# Worktree-project GC (§3.9)
+# ---------------------------------------------------------------------------
+
+
+async def gc_vanished_worktree_projects(graph: GraphClient) -> list[str]:
+    """Delete graph data for worktree projects whose checkout no longer exists on disk.
+
+    A linked git worktree indexes as its own ``base@branch`` Project
+    (``derive_project_name``); once the worktree is removed
+    (``git worktree remove`` or a manual ``rm``), its ``root_path`` — stored on
+    the Project node by ``_create_package_hierarchy`` — points at a directory
+    that's gone. This sweep finds those ``@branch`` projects and reclaims their
+    graph data via ``delete_project_data`` (DETACH DELETE also clears any
+    cross-project edges from delta nodes). Meant to run once at daemon
+    startup, not on a timer — a removed worktree is a one-time event, not
+    something that needs continuous polling.
+    """
+    removed: list[str] = []
+    records = await graph.get_project_status()
+    for record in records:
+        node = record.get("n")
+        if node is None:
+            continue
+        name = node.get("project_name")
+        root_path = node.get("root_path")
+        if not name or "@" not in name or not root_path:
+            continue
+        if not Path(root_path).is_dir():
+            logger.info("GC: worktree project '{}' checkout vanished ({}) — removing graph data", name, root_path)
+            await graph.delete_project_data(name)
+            removed.append(name)
+    return removed

@@ -20,10 +20,10 @@ from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
     FileScope,
     detect_sub_projects,
+    gc_vanished_worktree_projects,
     index_monorepo,
     index_project,
     publish_project_changes,
-    scan_files,
 )
 from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.search.embeddings import EmbedCache, EmbedClient
@@ -40,13 +40,13 @@ class DaemonManager:
 
     _bus: EventBus | None = field(default=None, repr=False)
     _watcher: FileWatcher | None = field(default=None, repr=False)
+    _vault_watchers: list[FileWatcher] = field(default_factory=list, repr=False)
     _consumers: list[ASTConsumer | EmbedConsumer] = field(default_factory=list, repr=False)
     _tasks: list[asyncio.Task[None]] = field(default_factory=list, repr=False)
     _cache: EmbedCache | None = field(default=None, repr=False)
     _embed: EmbedClient | None = field(default=None, repr=False)
     _crash_counts: dict[str, int] = field(default_factory=dict, repr=False)
     _last_crash: dict[str, str] = field(default_factory=dict, repr=False)
-    _vault_stop: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def status(self) -> dict[str, Any]:
         """Task liveness + crash state, consumed by the ``pipeline`` health check."""
@@ -92,7 +92,13 @@ class DaemonManager:
             return False
 
         self._bus = bus
-        self._vault_stop = asyncio.Event()
+
+        try:
+            removed = await gc_vanished_worktree_projects(graph)
+            if removed:
+                logger.info("GC: removed {} vanished worktree project(s): {}", len(removed), ", ".join(removed))
+        except Exception:
+            logger.exception("Worktree GC sweep failed — continuing startup")
 
         embed: EmbedClient | None = None
         cache: EmbedCache | None = None
@@ -146,14 +152,53 @@ class DaemonManager:
             self._tasks.append(asyncio.get_running_loop().create_task(self._run_consumer(consumer)))
 
         # Extra vaults (global vault, harness memory dir) live outside project_root,
-        # so they can't ride the FileWatcher above — poll them on a timer instead.
-        # Publishing reuses the persistent consumers just started (they accept any
-        # project_name/project_root per event, same as monorepo sub-projects), so no
-        # per-vault consumer pair is created here.
+        # so each gets its own FileWatcher instance rather than riding the main
+        # project's one (FileWatcher itself is single-root — see watcher.py). This
+        # is independent of include_watcher (which only gates the main project's
+        # watcher) — vaults have always indexed regardless of that flag.
         for vault in settings.knowledge.extra_vaults:
-            self._tasks.append(asyncio.get_running_loop().create_task(self._run_vault(vault, settings, graph)))
+            await self._start_vault(vault, settings, graph, bus, catchup=catchup)
 
         return True
+
+    async def _start_vault(
+        self,
+        vault: ExtraVaultSettings,
+        settings: AtlasSettings,
+        graph: GraphClient,
+        bus: EventBus,
+        *,
+        catchup: bool,
+    ) -> None:
+        """Scan, optionally catch up, and spawn a live FileWatcher for one extra vault.
+
+        Publishing reuses the persistent consumers already started in start()
+        (they accept any project_name/project_root per event, same as monorepo
+        sub-projects), so no per-vault consumer pair is created here.
+        """
+        vault_root = Path(vault.path).expanduser().resolve()
+        if not vault_root.is_dir():
+            logger.warning("Extra vault '{}' not found at {} — skipping", vault.project_name, vault_root)
+            return
+
+        scope = FileScope(vault_root, settings)
+        known_files = await asyncio.to_thread(scope.scan)
+
+        if catchup:
+            await self._catchup_vault(vault.project_name, vault_root, known_files, settings, graph)
+
+        vault_watcher = FileWatcher(
+            vault_root,
+            bus,
+            scope,
+            settings.watcher,
+            root_name=vault.project_name,
+            known_files=known_files,
+        )
+        self._vault_watchers.append(vault_watcher)
+        self._tasks.append(
+            asyncio.get_running_loop().create_task(self._run_vault_watcher(vault.project_name, vault_watcher))
+        )
 
     async def _catchup(self, settings: AtlasSettings, graph: GraphClient, bus: EventBus) -> None:
         """One delta index pass so changes made while the daemon was down get indexed."""
@@ -175,10 +220,11 @@ class DaemonManager:
         if self._watcher is not None:
             self._watcher.stop()
 
+        for vault_watcher in self._vault_watchers:
+            vault_watcher.stop()
+
         for consumer in self._consumers:
             consumer.stop()
-
-        self._vault_stop.set()
 
         # Let tasks observe the stop flags first — the watcher drains its
         # pending changes and consumers finish their current batch — then
@@ -245,51 +291,59 @@ class DaemonManager:
             else:
                 return  # clean exit via stop()
 
-    async def _run_vault(self, vault: ExtraVaultSettings, settings: AtlasSettings, graph: GraphClient) -> None:
-        """Poll one extra vault on a timer, publishing its changes on the shared bus.
+    async def _catchup_vault(
+        self,
+        project_name: str,
+        vault_root: Path,
+        files: list[str],
+        settings: AtlasSettings,
+        graph: GraphClient,
+    ) -> None:
+        """One-time scan+publish for an extra vault, mirroring the main project's ``_catchup``.
 
         Extra vaults are never git-tracked as far as this daemon is concerned (even
-        if the directory happens to be a git repo, no git_hash is stored for them —
-        see ``_poll_vault_once``), so every poll runs in "full" delta mode; the AST
-        consumer's per-file content-hash gate is what keeps unchanged files cheap.
+        if the directory happens to be a git repo, no git_hash is stored for them),
+        so this always runs in "full" delta mode; the AST consumer's per-file
+        content-hash gate is what keeps unchanged files cheap. Unlike ``_catchup``,
+        this has no consumer-startup ordering constraint — ``publish_project_changes``
+        only publishes events for the already-running persistent consumers to pick
+        up, it never starts its own.
         """
-        vault_root = Path(vault.path).expanduser().resolve()
-        if not vault_root.is_dir():
-            logger.warning("Extra vault '{}' not found at {} — skipping", vault.project_name, vault_root)
-            return
-
-        interval = settings.knowledge.vault_poll_interval_s
-        while True:
-            try:
-                await self._poll_vault_once(vault.project_name, vault_root, settings, graph)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Vault poll failed for '{}' — retrying next cycle", vault.project_name)
-
-            try:
-                await asyncio.wait_for(self._vault_stop.wait(), timeout=interval)
-            except TimeoutError:
-                continue
-            else:
-                return  # stop() was called
-
-    async def _poll_vault_once(
-        self, project_name: str, vault_root: Path, settings: AtlasSettings, graph: GraphClient
-    ) -> None:
-        """Scan, publish, and record metadata for a single vault poll cycle."""
         bus = self._bus
         if bus is None:  # pragma: no cover — only called after start() sets self._bus
             return
-        files = await asyncio.to_thread(scan_files, vault_root, settings)
-        result = await publish_project_changes(settings, graph, bus, project_name, vault_root, files)
-        entity_count = await graph.count_entities(project_name)
-        await graph.update_project_metadata(
-            project_name,
-            last_indexed_at=time.time(),
-            file_count=result.files_scanned,
-            entity_count=entity_count,
-            index_mode=result.mode,
-        )
-        if result.files_published:
-            logger.info("Vault '{}': {} file(s) published ({})", project_name, result.files_published, result.mode)
+        try:
+            result = await publish_project_changes(settings, graph, bus, project_name, vault_root, files)
+            entity_count = await graph.count_entities(project_name)
+            await graph.update_project_metadata(
+                project_name,
+                last_indexed_at=time.time(),
+                file_count=result.files_scanned,
+                entity_count=entity_count,
+                index_mode=result.mode,
+            )
+            if result.files_published:
+                logger.info("Vault '{}': {} file(s) published ({})", project_name, result.files_published, result.mode)
+        except Exception:
+            logger.exception("Startup catch-up failed for vault '{}' — continuing with live events only", project_name)
+
+    async def _run_vault_watcher(self, label: str, watcher: FileWatcher) -> None:
+        """Run one extra vault's FileWatcher under supervision: crash → log + backoff restart."""
+        crash_key = f"vault:{label}"
+        backoff = 1.0
+        while not watcher.stopped:
+            started = asyncio.get_running_loop().time()
+            try:
+                await watcher.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._crash_counts[crash_key] = self._crash_counts.get(crash_key, 0) + 1
+                self._last_crash[crash_key] = repr(exc)
+                logger.exception("Vault watcher '{}' crashed — restarting in {:.0f}s", label, backoff)
+                if asyncio.get_running_loop().time() - started > 60.0:
+                    backoff = 1.0  # healthy for a while before this crash — reset
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+            else:
+                return  # clean exit via stop()

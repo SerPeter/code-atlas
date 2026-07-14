@@ -353,93 +353,87 @@ class TestWatcherScopeScan:
         await manager.stop()
 
 
-class TestVaultPolling:
-    """Extra vaults (global vault, harness memory dir) are polled on a timer."""
+class TestVaultCatchupAndWatching:
+    """Extra vaults (global vault, harness memory dir) get a one-time catch-up
+    scan plus their own live FileWatcher instance (multi-root watching, Phase 5)."""
 
-    async def test_missing_vault_path_is_skipped(self, tmp_path: Path) -> None:
+    async def test_catchup_vault_swallows_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = DaemonManager()
-        vault = ExtraVaultSettings(path=str(tmp_path / "does-not-exist"), project_name="ghost-vault")
-        # Returns immediately without looping — nothing to wait/stop.
-        await asyncio.wait_for(manager._run_vault(vault, _make_settings(tmp_path), object()), timeout=2.0)  # type: ignore[arg-type]
+        manager._bus = FakeBus(object())  # type: ignore[assignment]
 
-    async def test_polls_repeatedly_until_stopped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[str] = []
+        async def boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("boom")
 
-        async def fake_poll(
-            self: DaemonManager, project_name: str, vault_root: Path, settings: object, graph: object
-        ) -> None:
-            calls.append(project_name)
+        monkeypatch.setattr(daemon_module, "publish_project_changes", boom)
 
-        monkeypatch.setattr(DaemonManager, "_poll_vault_once", fake_poll)
+        # Must not raise — a failed vault catch-up shouldn't take down startup.
+        await manager._catchup_vault("test-vault", tmp_path, [], _make_settings(tmp_path), object())  # type: ignore[arg-type]
 
+    async def test_vault_watcher_restarts_after_crash(self) -> None:
         manager = DaemonManager()
-        settings = _make_settings(tmp_path)
-        settings.knowledge.vault_poll_interval_s = 0.05
-        vault_dir = tmp_path / "vault"
-        vault_dir.mkdir()
-        vault = ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")
+        watcher = FakeWatcher(crashes=1)
 
-        task = asyncio.create_task(manager._run_vault(vault, settings, object()))  # type: ignore[arg-type]
-        await asyncio.sleep(0.2)
-        manager._vault_stop.set()
+        task = asyncio.create_task(manager._run_vault_watcher("test-vault", watcher))  # type: ignore[arg-type]
+        await asyncio.wait_for(watcher.running.wait(), timeout=5.0)
+
+        assert watcher.runs == 2
+        status = manager.status()
+        assert status["crash_counts"] == {"vault:test-vault": 1}
+        assert "watch boom" in status["last_crash"]["vault:test-vault"]
+
+        watcher.stop()
         await asyncio.wait_for(task, timeout=2.0)
-
-        assert len(calls) >= 2
-        assert all(name == "test-vault" for name in calls)
-
-    async def test_poll_failure_does_not_kill_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[str] = []
-
-        async def fake_poll(
-            self: DaemonManager, project_name: str, vault_root: Path, settings: object, graph: object
-        ) -> None:
-            calls.append(project_name)
-            if len(calls) == 1:
-                raise RuntimeError("boom")
-
-        monkeypatch.setattr(DaemonManager, "_poll_vault_once", fake_poll)
-
-        manager = DaemonManager()
-        settings = _make_settings(tmp_path)
-        settings.knowledge.vault_poll_interval_s = 0.05
-        vault_dir = tmp_path / "vault"
-        vault_dir.mkdir()
-        vault = ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")
-
-        task = asyncio.create_task(manager._run_vault(vault, settings, object()))  # type: ignore[arg-type]
-        await asyncio.sleep(0.2)
-        manager._vault_stop.set()
-        await asyncio.wait_for(task, timeout=2.0)
-
-        assert len(calls) >= 2
+        assert watcher.drained
 
 
 class TestVaultTaskSpawning:
-    """start() spawns one vault-poll task per configured extra vault."""
+    """start() spawns a catch-up pass + a live watcher task per configured extra vault."""
 
-    async def test_start_spawns_vault_task_per_extra_vault(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        captured: list[str] = []
+    async def test_start_spawns_watcher_per_extra_vault(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        catchup_calls: list[str] = []
 
-        async def fake_run_vault(
-            self: DaemonManager, vault: ExtraVaultSettings, settings: object, graph: object
+        async def fake_catchup_vault(
+            self: DaemonManager,
+            project_name: str,
+            vault_root: Path,
+            files: list[str],
+            settings: object,
+            graph: object,
         ) -> None:
-            captured.append(vault.project_name)
+            catchup_calls.append(project_name)
 
         monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
         monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
-        monkeypatch.setattr(DaemonManager, "_run_vault", fake_run_vault)
+        monkeypatch.setattr(DaemonManager, "_catchup_vault", fake_catchup_vault)
 
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
         settings = _make_settings(tmp_path)
-        settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(tmp_path), project_name="test-vault")]
+        settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
 
         manager = DaemonManager()
-        started = await manager.start(settings, object(), include_watcher=False, catchup=False)  # type: ignore[arg-type]
+        started = await manager.start(settings, object(), include_watcher=False, catchup=True)  # type: ignore[arg-type]
         assert started is True
         await asyncio.sleep(0.05)
 
-        assert captured == ["test-vault"]
+        assert catchup_calls == ["test-vault"]
+        assert len(manager._vault_watchers) == 1
+        assert manager._vault_watchers[0]._root_name == "test-vault"
+        await manager.stop()
+
+    async def test_missing_vault_path_is_skipped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
+
+        settings = _make_settings(tmp_path)
+        settings.knowledge.extra_vaults = [
+            ExtraVaultSettings(path=str(tmp_path / "does-not-exist"), project_name="ghost-vault")
+        ]
+
+        manager = DaemonManager()
+        started = await manager.start(settings, object(), include_watcher=False, catchup=True)  # type: ignore[arg-type]
+        assert started is True
+        assert manager._vault_watchers == []
         await manager.stop()
 
 

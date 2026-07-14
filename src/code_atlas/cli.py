@@ -118,6 +118,9 @@ def main(
 daemon_app = typer.Typer(name="daemon", help="Manage the Code Atlas indexing daemon.")
 app.add_typer(daemon_app)
 
+project_app = typer.Typer(name="project", help="Manage indexed projects.")
+app.add_typer(project_app)
+
 
 # ---------------------------------------------------------------------------
 # Git root resolution
@@ -706,6 +709,51 @@ async def _run_status() -> None:
             _echo(
                 f"Project: {name} | indexed: {ts} | files: {files} | entities: {entities} | git: {git_hash}{deps_str}"
             )
+    finally:
+        await graph.close()
+
+
+@project_app.command("rm")
+def project_rm(
+    name: str = typer.Argument(..., help="Project name to remove (as shown by 'atlas status')."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Delete a project's graph data (nodes, relationships, embeddings).
+
+    Mainly for worktree-project cleanup: a linked worktree indexes as its own
+    'base@branch' project, and the daemon auto-GCs these once the checkout is
+    gone — this command covers the manual case (immediate cleanup, or a
+    non-worktree project you want to drop).
+    """
+    asyncio.run(_run_project_rm(name, skip_confirm=yes))
+
+
+async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
+    """Async implementation of the ``atlas project rm`` command."""
+    from code_atlas.graph.client import GraphClient
+
+    settings = _load_settings()
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        rows = await graph.get_project_status(name)
+        if not rows:
+            logger.error("No project named '{}' found in the graph.", name)
+            raise typer.Exit(code=1)
+
+        if not skip_confirm and not _output.json and not typer.confirm(f"Delete all graph data for '{name}'?"):
+            _echo("Aborted.")
+            raise typer.Exit(code=1)
+
+        await graph.delete_project_data(name)
+        _echo(f"Removed project '{name}'.")
+        if _output.json:
+            _json_output({"removed": name})
     finally:
         await graph.close()
 

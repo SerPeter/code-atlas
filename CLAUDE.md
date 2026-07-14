@@ -44,6 +44,7 @@ atlas status                     # Check index status
 atlas mcp                        # Start MCP server
 atlas daemon start               # Start indexing daemon (watcher + pipeline)
 atlas dream                      # Knowledge-vault lint report (inbox, orphans, dangling links, duplicates) + docs/HOME.md
+atlas project rm <name>          # Delete a project's graph data (e.g. a stale worktree project)
 ```
 
 ## Architecture
