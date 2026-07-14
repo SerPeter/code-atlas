@@ -2,6 +2,139 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-07-14)
+
+### Bug Fixes
+
+- **analysis**: Derive cross-package coupling from real package names
+  ([`655de39`](https://github.com/SerPeter/code-atlas/commit/655de398f32d30a7f198d3cc6827fd537792fc10))
+
+- **graph**: Detect body-only edits and resolve cross-file references
+  ([`3e417af`](https://github.com/SerPeter/code-atlas/commit/3e417afa92cd6f8a4a4c5176906dc82f1ef4cfcd))
+
+- **graph**: Preserve cross-file edges on delete and stop BM25 crashes
+  ([`6f30442`](https://github.com/SerPeter/code-atlas/commit/6f30442463377a06d4058118b57dce3cc1ad9c45))
+
+- **indexing**: Load nested gitignores for the watcher, honor monorepo scope
+  ([`ab3128b`](https://github.com/SerPeter/code-atlas/commit/ab3128ba06d78f291f947963edcd7b72e95ac830))
+
+- **indexing**: Make the event pipeline durable and path-consistent
+  ([`a8b0246`](https://github.com/SerPeter/code-atlas/commit/a8b02460043e3aaeab38513bfeb1bd47128f1334))
+
+- **indexing**: Scope monorepo indexing and gate empty-scan deletion
+  ([`ba1405d`](https://github.com/SerPeter/code-atlas/commit/ba1405d5d7de281341522cc056c7f96e9bddd7a8))
+
+- **indexing**: Withhold file hashes until deferred edges resolve
+  ([`dcdeecc`](https://github.com/SerPeter/code-atlas/commit/dcdeecc64137589e13765e6c7965cecb273b8f41))
+
+- **infra**: Enable AOF persistence for the production Valkey event bus
+  ([`3751c20`](https://github.com/SerPeter/code-atlas/commit/3751c20b81ce9ef24d64d044a03c0587ab445337))
+
+- **parser**: Attach cross-file Go methods via receiver type name
+  ([`b24b0d3`](https://github.com/SerPeter/code-atlas/commit/b24b0d353cb63de930468af5fd6a415b515808f3))
+
+- **parser**: Capture multi-name Go var/const specs and exclude generics from USES_TYPE
+  ([`81ca9d2`](https://github.com/SerPeter/code-atlas/commit/81ca9d2cf38ea947709e9b84276be1dc3bb1c9d4))
+
+- **parser**: Disambiguate duplicate Markdown headings and fix line_end
+  ([`a5c89c4`](https://github.com/SerPeter/code-atlas/commit/a5c89c4526f6373fb73b70712201b0a985f5fffb))
+
+- **parser**: Disambiguate JVM overload uids with parameter signatures
+  ([`e0fe188`](https://github.com/SerPeter/code-atlas/commit/e0fe188875dd492f7b49b1ee81a05a8b364cdf7c))
+
+- **parser**: Extract C++ operator overloads and out-of-line nested definitions
+  ([`5acea2a`](https://github.com/SerPeter/code-atlas/commit/5acea2a38745535a407558233b8ef01fdd96df8b))
+
+- **parser**: Extract C++ templates, prototypes, and out-of-line methods
+  ([`805ca54`](https://github.com/SerPeter/code-atlas/commit/805ca5447aed09e659630fed941a46e6354e1ef5))
+
+- **parser**: Extract Ruby inline-visibility methods
+  ([`b76f0bd`](https://github.com/SerPeter/code-atlas/commit/b76f0bdd87eb40ce8235c5c2f8b4a865f1696f58))
+
+- **parser**: Extract TS interface heritage, re-exports, and decorators
+  ([`1278201`](https://github.com/SerPeter/code-atlas/commit/1278201731ea058fb5f4a5f5f06e691b1c4a0eb9))
+
+- **parser**: Fold JVM namespaces into qualified names, resolve Java imports
+  ([`6199504`](https://github.com/SerPeter/code-atlas/commit/619950430c739301517154a69f2882cb539a587b))
+
+- **parser**: Parse .tsx files with the TSX grammar
+  ([`82a3db3`](https://github.com/SerPeter/code-atlas/commit/82a3db3acc9ddf458af4afbd3a1e080f988c158b))
+
+- **parser**: Preserve compact Ruby class-path names for INHERITS matching
+  ([`6449af5`](https://github.com/SerPeter/code-atlas/commit/6449af5a97ce6ab089f4b1cba688bb301b96ecd3))
+
+- **parser**: Resolve nested-class names and stop plugin-load lockout
+  ([`136e78c`](https://github.com/SerPeter/code-atlas/commit/136e78cd31e47d7c3c1be40b6df0292b1e1e7872))
+
+- **parser**: Scope Rust associated types to their impl block
+  ([`7cdc801`](https://github.com/SerPeter/code-atlas/commit/7cdc8011edae9b06c8f91fd4c17aaaacf5359011))
+
+- **parser**: Walk braced PHP namespaces and namespace-qualify entity names
+  ([`16efc39`](https://github.com/SerPeter/code-atlas/commit/16efc39b44bed00376d2a37c7a0112d7a3ca1cff))
+
+- **parser**: Walk inline Rust modules and cross-file impl parents
+  ([`a4c1d5e`](https://github.com/SerPeter/code-atlas/commit/a4c1d5eefcf4f4bfce63f0f350aec09d396b274e))
+
+- **search**: Stop suppressing vector search and silently emptying scope filters
+  ([`d78f86d`](https://github.com/SerPeter/code-atlas/commit/d78f86d136fd3f2122991d224b23f32448bd0dc0))
+
+- **server**: Correct diagram scoping, cycle detection, and node-cap edge handling
+  ([`d919f1e`](https://github.com/SerPeter/code-atlas/commit/d919f1e958f8be02220f0fd97c10b6eff6626b8d))
+
+- **server**: Fix cypher_query serialization and scope defaults for monorepos
+  ([`e5a8c7f`](https://github.com/SerPeter/code-atlas/commit/e5a8c7fc5019545c3c63bb7955dfdc998850d215))
+
+- **server**: Validate label params and surface pipeline health honestly
+  ([`5c35cbe`](https://github.com/SerPeter/code-atlas/commit/5c35cbea4f54a87d425030b371e3272bc8222601))
+
+- **settings**: Resolve atlas.toml against project_root, not cwd
+  ([`3c3b21c`](https://github.com/SerPeter/code-atlas/commit/3c3b21cdbf3f1d6e284465e5d157b2f532a34a30))
+
+- **settings**: Scope nested config sections to prefixed env vars
+  ([`f1aa4d9`](https://github.com/SerPeter/code-atlas/commit/f1aa4d9d0f809cc5913969c501d3572edd2bfda1))
+
+### Chores
+
+- Drop unused type-ignore directives
+  ([`0f7b85a`](https://github.com/SerPeter/code-atlas/commit/0f7b85ab3cb8a037093f1eae3c1ab89f92000319))
+
+- Sync uv.lock to the 0.3.1 version bump
+  ([`5b5189b`](https://github.com/SerPeter/code-atlas/commit/5b5189bd4af3055fff224bf616a2d29e9a7e4034))
+
+### Documentation
+
+- Add atlas dream to the CLI commands list
+  ([`b52d921`](https://github.com/SerPeter/code-atlas/commit/b52d921b107a886790fdffea00ec6e80d79c1342))
+
+- **adr**: Record cross-file resolution, pipeline durability, and test isolation decisions
+  ([`ada1ce1`](https://github.com/SerPeter/code-atlas/commit/ada1ce113111ef781b4cf7cbebea64de1f6b053f))
+
+- **adr**: Record the Note vault schema decision
+  ([`d93215c`](https://github.com/SerPeter/code-atlas/commit/d93215cc383e39732648cd4a966978be7095085b))
+
+### Features
+
+- **knowledge**: Add anchors + staleness resolution (Phase 3)
+  ([`c22ebd6`](https://github.com/SerPeter/code-atlas/commit/c22ebd61677f098b5a3c727d9fb0640f98ade272))
+
+- **knowledge**: Add dream-mode deterministic report (Phase 4)
+  ([`47c4a6d`](https://github.com/SerPeter/code-atlas/commit/47c4a6d86851f73c9abcd4535f8e42186cd546ff))
+
+- **knowledge**: Add Note vault foundations to the code graph (Phase 1)
+  ([`1706a0a`](https://github.com/SerPeter/code-atlas/commit/1706a0acfeae3958b82f3f004390a0331f0dea4b))
+
+- **knowledge**: Live global vault + polish (Phase 5)
+  ([`9b40136`](https://github.com/SerPeter/code-atlas/commit/9b40136091ef147deac443c55b06e2e478facac4))
+
+- **knowledge**: Poll and index extra vaults from the daemon (Phase 2)
+  ([`ef750bb`](https://github.com/SerPeter/code-atlas/commit/ef750bbb46d658c0232b4a8f32734169d915969e))
+
+### Testing
+
+- **integration**: Isolate tests from production databases
+  ([`a1bdecd`](https://github.com/SerPeter/code-atlas/commit/a1bdecd4bdfa8225e894442bd62c0facc79e6654))
+
+
 ## v0.3.1 (2026-03-07)
 
 ### Bug Fixes
