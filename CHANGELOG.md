@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.4.1 (2026-07-15)
+
+### Bug Fixes
+
+- Resolve 14 findings from the knowledge-convergence review
+  ([`e500c27`](https://github.com/SerPeter/code-atlas/commit/e500c27a800e5f6eab89859d9d8657750db2a5a1))
+
+
 ## v0.4.0 (2026-07-14)
 
 ### Bug Fixes
