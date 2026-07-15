@@ -40,10 +40,11 @@ async def test_build_dream_report_end_to_end(
 
     vault_dir = tmp_path / "vault"
     # note-a links to note-b (neither is an orphan) and to a nonexistent note (dangling).
+    # It also has an explicit anchors: reference to a nonexistent target (unresolved).
     _write(
         vault_dir,
         "note-a.md",
-        "---\nid: note-a\nkind: note\n---\n\n# A\n\nSee [[note-b]] and [[note-ghost]].\n",
+        "---\nid: note-a\nkind: note\nanchors: [ghost-anchor]\n---\n\n# A\n\nSee [[note-b]] and [[note-ghost]].\n",
     )
     _write(vault_dir, "note-b.md", "---\nid: note-b\nkind: note\n---\n\n# B\n\nNo outgoing links.\n")
     # note-c has no links at all — a true orphan.
@@ -68,6 +69,10 @@ async def test_build_dream_report_end_to_end(
 
     dangling_targets = {d.target_uid for d in report.dangling_links}
     assert "test-vault:note:note-ghost" in dangling_targets
+
+    broken = next((b for b in report.broken_anchors if b.uid == "test-vault:note:note-a"), None)
+    assert broken is not None
+    assert broken.unresolved_anchors == ["ghost-anchor"]
 
     dup = next((d for d in report.duplicate_ids if d.qualified_name == "test-vault:note:note-d"), None)
     assert dup is not None

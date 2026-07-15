@@ -434,3 +434,50 @@ class TestProjectRm:
 
         assert result.exit_code == 0
         mock_graph.delete_project_data.assert_awaited_once_with("myproject")
+
+    async def test_json_without_yes_refuses_without_prompt(self, tmp_path, monkeypatch) -> None:
+        """--json without --yes must refuse immediately — never delete, never prompt."""
+        import pytest
+        import typer
+
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        _output.json = True
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+
+        def _unexpected_confirm(*args, **kwargs):
+            raise AssertionError("typer.confirm should not be called in --json mode")
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr(cli.typer, "confirm", _unexpected_confirm)
+
+        with pytest.raises(typer.Exit):
+            await cli._run_project_rm("myproject", skip_confirm=False)
+
+        mock_graph.delete_project_data.assert_not_awaited()
+
+    async def test_json_with_yes_deletes_without_prompt(self, tmp_path, monkeypatch) -> None:
+        """--json with --yes still deletes, unchanged, and never prompts."""
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        _output.json = True
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+
+        def _unexpected_confirm(*args, **kwargs):
+            raise AssertionError("typer.confirm should not be called when --yes is passed")
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr(cli.typer, "confirm", _unexpected_confirm)
+
+        await cli._run_project_rm("myproject", skip_confirm=True)
+
+        mock_graph.delete_project_data.assert_awaited_once_with("myproject")
+        mock_graph.close.assert_awaited_once()

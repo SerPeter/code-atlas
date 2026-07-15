@@ -5,8 +5,16 @@ from __future__ import annotations
 import os
 
 import pytest
+from pydantic import ValidationError
 
-from code_atlas.settings import AtlasSettings, MemgraphSettings, RedisSettings, derive_project_name
+from code_atlas.settings import (
+    AtlasSettings,
+    ExtraVaultSettings,
+    KnowledgeSettings,
+    MemgraphSettings,
+    RedisSettings,
+    derive_project_name,
+)
 
 
 @pytest.fixture
@@ -168,3 +176,50 @@ class TestProjectNameOverride:
         settings = AtlasSettings(project_root=clean_env)
 
         assert settings.project.name == "acme-backend"
+
+
+class TestExtraVaultsUniqueness:
+    """Duplicate extra_vaults entries would merge unrelated vault data under one project_name,
+    or spin up two independent FileWatcher instances double-watching the same directory.
+    """
+
+    def test_duplicate_project_name_raises(self, tmp_path):
+        vault_a = tmp_path / "vault-a"
+        vault_a.mkdir()
+        vault_b = tmp_path / "vault-b"
+        vault_b.mkdir()
+
+        with pytest.raises(ValidationError, match="project_name"):
+            KnowledgeSettings(
+                extra_vaults=[
+                    ExtraVaultSettings(path=str(vault_a), project_name="shared-vault"),
+                    ExtraVaultSettings(path=str(vault_b), project_name="shared-vault"),
+                ]
+            )
+
+    def test_duplicate_resolved_path_raises(self, tmp_path):
+        vault = tmp_path / "vault"
+        vault.mkdir()
+
+        with pytest.raises(ValidationError, match="path"):
+            KnowledgeSettings(
+                extra_vaults=[
+                    ExtraVaultSettings(path=str(vault), project_name="vault-one"),
+                    ExtraVaultSettings(path=str(vault) + "/", project_name="vault-two"),
+                ]
+            )
+
+    def test_distinct_names_and_paths_do_not_raise(self, tmp_path):
+        vault_a = tmp_path / "vault-a"
+        vault_a.mkdir()
+        vault_b = tmp_path / "vault-b"
+        vault_b.mkdir()
+
+        settings = KnowledgeSettings(
+            extra_vaults=[
+                ExtraVaultSettings(path=str(vault_a), project_name="vault-one"),
+                ExtraVaultSettings(path=str(vault_b), project_name="vault-two"),
+            ]
+        )
+
+        assert len(settings.extra_vaults) == 2

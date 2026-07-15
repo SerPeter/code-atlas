@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -22,6 +23,8 @@ from code_atlas.schema import NodeLabel, NoteKind, RelType
 
 if TYPE_CHECKING:
     from tree_sitter import Node
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,27 @@ _ABS_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[/\\])")
 # alphanumeric-suffix check would wrongly match a qualified name's last
 # segment (e.g. "...foo.Bar").
 _FILE_EXT_RE = re.compile(r"\.(?:py|pyi|js|ts|jsx|tsx|java|go|rs|rb|cpp|c|h|hpp|md)$")
+# Short/ambiguous extensions that collide with a plausible dotted symbol's
+# final segment (e.g. "models.Config.c", "physics.Model.h") — trusted as a
+# path signal only when the anchor also contains a "/" (e.g. "src/foo.c").
+_AMBIGUOUS_SHORT_EXTS = frozenset({"c", "h", "go", "rs", "rb"})
+# Conventional extensionless filenames — no "/" and no recognized extension,
+# so they'd otherwise fall through to uid-form classification.
+_CONVENTIONAL_FILENAMES = frozenset(
+    {
+        "Dockerfile",
+        "Makefile",
+        "Rakefile",
+        "Gemfile",
+        "Procfile",
+        "Vagrantfile",
+        "Jenkinsfile",
+        "LICENSE",
+        "README",
+        "CHANGELOG",
+        "CONTRIBUTING",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -221,10 +245,15 @@ def _classify_anchor(raw: str) -> tuple[str, str | None, str, str | None]:
     relative, resolved within the note's own project), ``project_path``
     (``project:relative/path``), ``absolute_path``. Detection is
     deterministic (decision Q9): paths contain ``/`` or a file extension;
-    uids are dotted qualified names. An optional ``#Symbol`` suffix refines
-    a path anchor to a specific entity within the resolved file. Resolution
-    against the live graph happens in ``GraphClient.resolve_anchors`` — this
-    only classifies the form.
+    uids are dotted qualified names. A short/ambiguous extension
+    (``_AMBIGUOUS_SHORT_EXTS``) only counts as a path signal alongside a
+    ``/``, since alone it's equally plausible as a dotted symbol's final
+    segment (e.g. ``models.Config.c``); a curated allowlist of conventional
+    extensionless filenames (``_CONVENTIONAL_FILENAMES``, e.g.
+    ``Dockerfile``) is also treated as path-form. An optional ``#Symbol``
+    suffix refines a path anchor to a specific entity within the resolved
+    file. Resolution against the live graph happens in
+    ``GraphClient.resolve_anchors`` — this only classifies the form.
     """
     main, _, symbol_part = raw.strip().partition("#")
     main = main.strip()
@@ -241,7 +270,13 @@ def _classify_anchor(raw: str) -> tuple[str, str | None, str, str | None]:
             project_hint = prefix
             rest = tail
 
-    is_path_like = "/" in rest or bool(_FILE_EXT_RE.search(rest))
+    has_slash = "/" in rest
+    ext_match = _FILE_EXT_RE.search(rest)
+    # A short/ambiguous extension (see _AMBIGUOUS_SHORT_EXTS) only counts as a
+    # path signal when paired with a "/" — on its own it's equally plausible
+    # as a dotted symbol name's final segment.
+    is_ambiguous_ext = ext_match is not None and ext_match.group(0)[1:] in _AMBIGUOUS_SHORT_EXTS
+    is_path_like = has_slash or (ext_match is not None and not is_ambiguous_ext) or rest in _CONVENTIONAL_FILENAMES
     if is_path_like:
         rest = rest.replace("\\", "/")
         return ("project_path" if project_hint else "path"), project_hint, rest, symbol
@@ -266,6 +301,9 @@ def _extract_anchors(fm: dict[str, Any], from_qn: str) -> list[ParsedRelationshi
             continue
         raw = v.strip()
         form, project_hint, target, symbol = _classify_anchor(raw)
+        if not target:
+            _log.debug("Skipping malformed anchors: entry with empty target: %r", raw)
+            continue
         props: dict[str, Any] = {
             "link_type": "anchor",
             "confidence": 1.0,

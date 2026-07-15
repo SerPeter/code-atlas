@@ -990,6 +990,35 @@ class _DeltaDecision:
     files_deleted: set[str]
 
 
+def _git_worktree_list(base_root: Path) -> list[Path] | None:
+    """Return the list of worktree paths git knows about for the repo at *base_root*, or None if unavailable.
+
+    Used to corroborate that a vanished ``base@branch`` project's checkout was
+    actually removed (``git worktree remove`` drops it from this list) rather
+    than merely being transiently unavailable — a directory that's still
+    unmounted or otherwise inaccessible but was never properly removed still
+    shows up here, often marked "prunable". ``None`` means "no independent
+    signal" — callers must NOT treat that as confirmation of anything, same
+    contract as _git_tracked_files.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=base_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+    except OSError, subprocess.TimeoutExpired:
+        return None
+    return [
+        Path(line[len("worktree ") :]).resolve() for line in result.stdout.splitlines() if line.startswith("worktree ")
+    ]
+
+
 async def _decide_empty_scan_deletion(graph: GraphClient, project_name: str, project_root: Path) -> _DeltaDecision:
     """Decide the delta outcome when a scan finds zero indexable files.
 
@@ -1835,14 +1864,34 @@ async def gc_vanished_worktree_projects(graph: GraphClient) -> list[str]:
     (``derive_project_name``); once the worktree is removed
     (``git worktree remove`` or a manual ``rm``), its ``root_path`` — stored on
     the Project node by ``_create_package_hierarchy`` — points at a directory
-    that's gone. This sweep finds those ``@branch`` projects and reclaims their
-    graph data via ``delete_project_data`` (DETACH DELETE also clears any
-    cross-project edges from delta nodes). Meant to run once at daemon
-    startup, not on a timer — a removed worktree is a one-time event, not
-    something that needs continuous polling.
+    that's gone. This runs at the startup of *every* daemon for *any* project
+    sharing the Memgraph instance, so a directory that merely looks gone
+    (transient mount hiccup, unmounted drive) must not be trusted blind —
+    destructively wiping a project's graph data is irreversible. A vanished
+    root_path is therefore only a candidate; it must be corroborated against
+    the base project's own ``git worktree list`` (via ``_git_worktree_list``)
+    before deletion proceeds — a real ``git worktree remove`` drops the entry
+    from that list, while a merely-unavailable checkout still shows up there.
+    If the base project can't be found in the graph, its root_path also isn't
+    a live directory, or git is unavailable, the candidate is skipped this
+    run rather than guessed at — same "skip, don't guess" behavior as
+    ``_decide_empty_scan_deletion``. Meant to run once at daemon startup, not
+    on a timer — a removed worktree is a one-time event, not something that
+    needs continuous polling.
     """
     removed: list[str] = []
     records = await graph.get_project_status()
+
+    roots_by_name: dict[str, str] = {}
+    for record in records:
+        node = record.get("n")
+        if node is None:
+            continue
+        name = node.get("project_name")
+        root_path = node.get("root_path")
+        if name and root_path:
+            roots_by_name[name] = root_path
+
     for record in records:
         node = record.get("n")
         if node is None:
@@ -1851,8 +1900,42 @@ async def gc_vanished_worktree_projects(graph: GraphClient) -> list[str]:
         root_path = node.get("root_path")
         if not name or "@" not in name or not root_path:
             continue
-        if not Path(root_path).is_dir():
-            logger.info("GC: worktree project '{}' checkout vanished ({}) — removing graph data", name, root_path)
-            await graph.delete_project_data(name)
-            removed.append(name)
+        if Path(root_path).is_dir():
+            continue
+
+        base = name.rpartition("@")[0]
+        base_root = roots_by_name.get(base)
+        if not base_root or not Path(base_root).is_dir():
+            logger.warning(
+                "GC: worktree project '{}' checkout vanished ({}) but base project '{}' has no live root_path "
+                "to corroborate against — skipping deletion this run",
+                name,
+                root_path,
+                base,
+            )
+            continue
+
+        worktrees = await asyncio.to_thread(_git_worktree_list, Path(base_root))
+        if worktrees is None:
+            logger.warning(
+                "GC: worktree project '{}' checkout vanished ({}) but 'git worktree list' is unavailable for "
+                "base '{}' — skipping deletion this run (not corroborated)",
+                name,
+                root_path,
+                base,
+            )
+            continue
+
+        if Path(root_path).resolve() in worktrees:
+            logger.warning(
+                "GC: worktree project '{}' checkout looks vanished ({}) but git still lists it as a live "
+                "worktree — skipping deletion this run (likely transient unavailability, not a real removal)",
+                name,
+                root_path,
+            )
+            continue
+
+        logger.info("GC: worktree project '{}' checkout vanished ({}) — removing graph data", name, root_path)
+        await graph.delete_project_data(name)
+        removed.append(name)
     return removed

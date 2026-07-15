@@ -389,6 +389,23 @@ class KnowledgeSettings(BaseModel):
         "catch-up scan — see DaemonManager.start().",
     )
 
+    @model_validator(mode="after")
+    def _validate_extra_vaults_unique(self) -> KnowledgeSettings:
+        seen_names: set[str] = set()
+        seen_paths: set[Path] = set()
+        for vault in self.extra_vaults:
+            if vault.project_name in seen_names:
+                msg = f"Duplicate [knowledge] extra_vaults project_name: '{vault.project_name}'"
+                raise ValueError(msg)
+            seen_names.add(vault.project_name)
+
+            resolved_path = Path(vault.path).expanduser().resolve()
+            if resolved_path in seen_paths:
+                msg = f"Duplicate [knowledge] extra_vaults path (resolves to {resolved_path}): '{vault.path}'"
+                raise ValueError(msg)
+            seen_paths.add(resolved_path)
+        return self
+
 
 class AtlasSettings(BaseSettings):
     """Root configuration for Code Atlas."""

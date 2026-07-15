@@ -376,6 +376,7 @@ class TestKnowledgeHealth:
             "similar_pairs",
             "promotion_candidates",
             "memory_index_issues",
+            "broken_anchors",
             "query_ms",
         }
         assert expected_keys == set(result.keys())

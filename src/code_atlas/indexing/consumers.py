@@ -859,7 +859,7 @@ class ASTConsumer(TierConsumer):
                     for fp, pfd in parsed_files.items():
                         if fp not in new_hashes:
                             continue
-                        if pfd.import_rels or pfd.call_rels or pfd.type_rels or pfd.member_rels:
+                        if pfd.import_rels or pfd.call_rels or pfd.type_rels or pfd.member_rels or pfd.anchor_rels:
                             self._pending_file_hashes.setdefault(project_name, {})[fp] = new_hashes[fp]
                         else:
                             immediate_hashes[fp] = new_hashes[fp]

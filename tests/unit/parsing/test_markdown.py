@@ -340,3 +340,36 @@ def test_anchors_non_list_value_ignored():
     source = "---\nid: a\nkind: note\nanchors: not-a-list\n---\n\nBody.\n"
     parsed = _parse(source, path="docs/notes/a.md")
     assert _anchor_rels(parsed) == []
+
+
+def test_anchor_short_ambiguous_extension_without_slash_is_uid():
+    # "c"/"h" collide with plausible dotted symbol final segments — without a
+    # "/" they must NOT be classified as path-form.
+    source = "---\nid: a\nkind: note\nanchors: [models.Config.c, physics.Model.h]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = {r.to_name: r.properties["anchor_form"] for r in _anchor_rels(parsed)}
+    assert rels["models.Config.c"] == "uid"
+    assert rels["physics.Model.h"] == "uid"
+
+
+def test_anchor_short_extension_with_slash_still_path():
+    # Regression guard: a "/" makes the short extension unambiguous again.
+    source = "---\nid: a\nkind: note\nanchors: [src/foo.c]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = _anchor_rels(parsed)
+    assert rels[0].to_name == "src/foo.c"
+    assert rels[0].properties["anchor_form"] == "path"
+
+
+def test_anchor_conventional_filenames_are_path_form():
+    source = "---\nid: a\nkind: note\nanchors: [Dockerfile, Makefile]\n---\n\nBody.\n"
+    parsed = _parse(source, path="docs/notes/a.md")
+    rels = {r.to_name: r.properties["anchor_form"] for r in _anchor_rels(parsed)}
+    assert rels["Dockerfile"] == "path"
+    assert rels["Makefile"] == "path"
+
+
+def test_anchor_bare_symbol_fragment_skipped():
+    source = '---\nid: a\nkind: note\nanchors: ["#OrphanSymbol"]\n---\n\nBody.\n'
+    parsed = _parse(source, path="docs/notes/a.md")
+    assert _anchor_rels(parsed) == []

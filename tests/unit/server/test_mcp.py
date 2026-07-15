@@ -361,6 +361,46 @@ class TestDefaultScopeProjects:
         result = await _default_scope_projects(app)
         assert result == [root_name]
 
+    async def test_includes_extra_vaults_deduped(self, settings, tmp_path):
+        """Configured extra_vaults (global vault, harness memory dir) must be appended to the
+        default scope — otherwise a user's configured vaults are invisible to no-scope searches.
+        A vault name that coincides with an existing root/sibling name must not be duplicated."""
+        from code_atlas.settings import ExtraVaultSettings, derive_project_name
+
+        root_name = derive_project_name(settings.project_root)
+        settings.knowledge.extra_vaults = [
+            ExtraVaultSettings(path=str(tmp_path / "vault"), project_name="global-vault"),
+            ExtraVaultSettings(path=str(tmp_path / "vault2"), project_name=root_name),
+        ]
+        rows = [
+            {"n": {"name": root_name}},
+            {"n": {"name": f"{root_name}/sub"}},
+        ]
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(return_value=rows)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _default_scope_projects(app)
+        assert result == [root_name, f"{root_name}/sub", "global-vault"]
+
+    async def test_falls_back_to_root_and_extra_vaults_when_get_project_status_fails(self, settings, tmp_path):
+        """The DB-unreachable fallback must also include extra_vaults, for consistency with the
+        successful-lookup path."""
+        from code_atlas.settings import ExtraVaultSettings, derive_project_name
+
+        root_name = derive_project_name(settings.project_root)
+        settings.knowledge.extra_vaults = [
+            ExtraVaultSettings(path=str(tmp_path / "vault"), project_name="global-vault")
+        ]
+        graph = AsyncMock(spec=GraphClient)
+        graph.get_project_status = AsyncMock(side_effect=RuntimeError("db down"))
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _default_scope_projects(app)
+        assert result == [root_name, "global-vault"]
+
 
 # ---------------------------------------------------------------------------
 # hybrid_search input validation (no DB needed)

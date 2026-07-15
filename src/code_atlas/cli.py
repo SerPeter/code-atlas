@@ -746,9 +746,15 @@ async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
             logger.error("No project named '{}' found in the graph.", name)
             raise typer.Exit(code=1)
 
-        if not skip_confirm and not _output.json and not typer.confirm(f"Delete all graph data for '{name}'?"):
-            _echo("Aborted.")
-            raise typer.Exit(code=1)
+        if not skip_confirm:
+            if _output.json:
+                logger.error(
+                    "Refusing to delete '{}' without confirmation in --json mode — pass --yes to confirm.", name
+                )
+                raise typer.Exit(code=1)
+            if not typer.confirm(f"Delete all graph data for '{name}'?"):
+                _echo("Aborted.")
+                raise typer.Exit(code=1)
 
         await graph.delete_project_data(name)
         _echo(f"Removed project '{name}'.")

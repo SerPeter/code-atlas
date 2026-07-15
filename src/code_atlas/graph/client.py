@@ -349,7 +349,8 @@ class _AnchorLookup:
     the whole graph rather than one project's own entities.
     """
 
-    file_by_path: dict[str, dict[str, tuple[str, str]]]  # project → {file_path: (uid, content_hash)}
+    # project → file_path → [(uid, content_hash)]
+    file_by_path: dict[str, dict[str, list[tuple[str, str]]]]
     # project → file_path → name → [(uid, content_hash)]
     symbols_by_path: dict[str, dict[str, dict[str, list[tuple[str, str]]]]]
     project_roots: dict[str, str]  # project → root_path (posix, resolved, no trailing slash)
@@ -360,16 +361,17 @@ def _resolve_anchor_path(project: str, path: str, lookup: _AnchorLookup) -> tupl
 
     Exact ``file_path`` match first; falls back to a unique-suffix match
     (mirrors the suffix convention ``_create_doc_links`` uses for file
-    refs). An ambiguous suffix match resolves to nothing rather than guessing.
+    refs). An ambiguous exact or suffix match resolves to nothing rather
+    than guessing.
     """
     files = lookup.file_by_path.get(project)
     if not files:
         return None
     exact = files.get(path)
     if exact is not None:
-        return exact
+        return exact[0] if len(exact) == 1 else None
     suffix = "/" + path
-    candidates = [v for fp, v in files.items() if fp.endswith(suffix)]
+    candidates = [v for fp, vs in files.items() if fp.endswith(suffix) for v in vs]
     return candidates[0] if len(candidates) == 1 else None
 
 
@@ -1272,9 +1274,9 @@ class GraphClient:
             f"MATCH (n) WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.DOC_FILE} OR n:{NodeLabel.NOTE} "
             "RETURN n.project_name AS project, n.file_path AS fp, n.uid AS uid, n.content_hash AS hash"
         )
-        file_by_path: dict[str, dict[str, tuple[str, str]]] = {}
+        file_by_path: dict[str, dict[str, list[tuple[str, str]]]] = {}
         for r in file_records:
-            file_by_path.setdefault(r["project"], {})[r["fp"]] = (r["uid"], r["hash"] or "")
+            file_by_path.setdefault(r["project"], {}).setdefault(r["fp"], []).append((r["uid"], r["hash"] or ""))
 
         symbol_records = await self.execute(
             f"MATCH (n) WHERE n:{NodeLabel.CALLABLE} OR n:{NodeLabel.TYPE_DEF} OR n:{NodeLabel.VALUE} "
@@ -1351,8 +1353,8 @@ class GraphClient:
                 f"UNWIND $rels AS r "
                 f"MATCH (a:{NodeLabel.NOTE} {{uid: r.from_uid}}) "
                 f"MATCH (b {{uid: r.to_uid}}) "
-                f"CREATE (a)-[e:{RelType.DOCUMENTS} "
-                f"{{link_type: 'anchor', confidence: 1.0, anchor_hash: r.to_hash, stale: false}}]->(b)",
+                f"MERGE (a)-[e:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b) "
+                f"SET e.confidence = 1.0, e.anchor_hash = r.to_hash, e.stale = false",
                 {"rels": resolved},
             )
 

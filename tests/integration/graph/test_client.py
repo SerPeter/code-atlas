@@ -1160,6 +1160,91 @@ async def test_anchor_absolute_path_via_root_path(graph_client: GraphClient):
     assert records[0]["hash"] == "thing_v1"
 
 
+async def test_anchor_resolve_is_idempotent_on_replay(graph_client: GraphClient):
+    """Calling resolve_anchors twice with the same rels list must not create a
+    duplicate DOCUMENTS edge — mirrors the deferred-resolution retry path in
+    indexing/consumers.py's ``_flush_deferred_resolution``, where a later
+    resolver failing (e.g. resolve_imports for another project) re-raises
+    before the pending-rels accumulator is cleared, so a batch retry replays
+    the same anchor rels through resolve_anchors again."""
+    await graph_client.ensure_schema()
+    project = "anchor_idempotent"
+    fp = "src/foo.py"
+    target = _make_entity(project, "Bar", fp, label=NodeLabel.TYPE_DEF, kind="class", content_hash="v1")
+    await graph_client.upsert_file_entities(project, fp, [target], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{project}:src.foo.Bar]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+
+    await graph_client.resolve_anchors(anchors)
+    await graph_client.resolve_anchors(anchors)  # replay, e.g. after a batch retry
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b) "
+        "RETURN count(r) AS cnt, r.anchor_hash AS hash, r.stale AS stale"
+    )
+    assert records[0]["cnt"] == 1
+    assert records[0]["hash"] == "v1"
+    assert records[0]["stale"] is False
+
+
+async def test_anchor_ambiguous_file_path_stays_unresolved(graph_client: GraphClient):
+    """Two nodes sharing the same file_path within a project make a bare path
+    anchor ambiguous — it must stay unresolved rather than arbitrarily
+    linking to one of the two (mirrors the symbol-ambiguity refusal above)."""
+    await graph_client.ensure_schema()
+    project = "anchor_amb_file"
+    fp = "src/dup.py"
+    module_a = ParsedEntity(
+        name="dup_a",
+        qualified_name=f"{project}:src.dup_a",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=5,
+        file_path=fp,
+        content_hash="a_v1",
+    )
+    module_b = ParsedEntity(
+        name="dup_b",
+        qualified_name=f"{project}:src.dup_b",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=5,
+        file_path=fp,
+        content_hash="b_v1",
+    )
+    await graph_client.upsert_file_entities(project, fp, [module_a, module_b], [])
+
+    parsed = parse_file(
+        "docs/notes/a.md",
+        f"---\nid: a\nkind: note\nanchors: [{fp}]\n---\n\nBody.\n".encode(),
+        project,
+    )
+    assert parsed is not None
+    other, anchors = _split_anchor_rels(parsed.relationships)
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, other)
+    await graph_client.resolve_anchors(anchors)
+
+    edges = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE})-[:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->() RETURN count(*) AS cnt"
+    )
+    assert edges[0]["cnt"] == 0
+
+    note_records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.NOTE} {{uid: $uid}}) RETURN n.unresolved_anchors AS unresolved",
+        {"uid": f"{project}:note:a"},
+    )
+    assert note_records[0]["unresolved"] == [fp]
+
+
 async def test_anchor_unresolved_cleared_when_target_appears(graph_client: GraphClient):
     """A note whose anchor now resolves is cleared, not left with a stale failure list."""
     await graph_client.ensure_schema()

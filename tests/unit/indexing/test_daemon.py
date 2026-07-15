@@ -437,6 +437,54 @@ class TestVaultTaskSpawning:
         await manager.stop()
 
 
+class TestVaultStartupIsolation:
+    """A failing vault must not abort startup or the remaining vaults (Bug A regression).
+
+    Mirrors the GC sweep's ``try/except Exception: logger.exception(...)`` pattern
+    already used elsewhere in start() — a bad vault (malformed pathspec, permission
+    error, bad path) should be logged and skipped, not propagate out of start().
+    """
+
+    async def test_one_bad_vault_does_not_abort_others(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        bad_dir = tmp_path / "bad-vault"
+        bad_dir.mkdir()
+        good_dir = tmp_path / "good-vault"
+        good_dir.mkdir()
+        bad_resolved = bad_dir.resolve()
+
+        class FakeScope:
+            def __init__(self, root: Path, settings: object) -> None:
+                self._root = root
+
+            def scan(self) -> list[str]:
+                if self._root == bad_resolved:
+                    raise RuntimeError("malformed pathspec")
+                return []
+
+            def is_included(self, rel_path: str) -> bool:
+                return True
+
+        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
+        monkeypatch.setattr(daemon_module, "FileScope", FakeScope)
+
+        settings = _make_settings(tmp_path)
+        settings.knowledge.extra_vaults = [
+            ExtraVaultSettings(path=str(bad_dir), project_name="bad-vault"),
+            ExtraVaultSettings(path=str(good_dir), project_name="good-vault"),
+        ]
+
+        manager = DaemonManager()
+        started = await manager.start(settings, object(), include_watcher=False, catchup=True)  # type: ignore[arg-type]
+        assert started is True
+
+        # The bad vault must not have produced a watcher; the good vault still gets one.
+        assert len(manager._vault_watchers) == 1
+        assert manager._vault_watchers[0]._root_name == "good-vault"
+
+        await manager.stop()
+
+
 class TestDaemonCliWiring:
     """`atlas daemon start` must start the file watcher (the pipeline's producer)."""
 

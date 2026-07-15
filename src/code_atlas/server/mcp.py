@@ -497,19 +497,23 @@ async def _enrich_with_calls(graph: GraphClient, results: list[dict[str, Any]], 
 
 
 async def _default_scope_projects(app: AppContext) -> list[str]:
-    """Default project scope: the current project plus any monorepo sub-projects.
+    """Default project scope: the current project, any monorepo sub-projects, and extra vaults.
 
     Sub-project entities are stored with ``project_name = '{root}/{sub}'``
     (orchestrator.py, watcher.py). Without this expansion, a search with no
     explicit scope/project resolves to the bare root name and silently
-    excludes all sub-project code.
+    excludes all sub-project code. ``knowledge.extra_vaults`` projects are
+    always appended too, matching ``_resolve_hybrid_scope``'s explicit-scope
+    branch.
     """
     root_name = derive_project_name(app.settings.project_root)
+    extra_vault_names = [v.project_name for v in app.settings.knowledge.extra_vaults]
     try:
         project_rows = await app.graph.get_project_status()
     except Exception as exc:
         logger.debug("Could not resolve monorepo sub-projects for default scope: {}", exc)
-        return [root_name]
+        result = [root_name]
+        return result + [n for n in extra_vault_names if n not in result]
 
     all_names: list[str] = []
     for row in project_rows:
@@ -521,7 +525,8 @@ async def _default_scope_projects(app: AppContext) -> list[str]:
                 all_names.append(name)
 
     siblings = [n for n in all_names if n == root_name or n.startswith(f"{root_name}/")]
-    return siblings or [root_name]
+    result = siblings or [root_name]
+    return result + [n for n in extra_vault_names if n not in result]
 
 
 # ---------------------------------------------------------------------------
@@ -1387,7 +1392,7 @@ def _register_knowledge_tools(mcp: FastMCP) -> None:
             "configured [knowledge] extra_vaults. Deterministic only — disposition "
             "(KEEP/MERGE/PROMOTE/DROP) is a separate, agent-side judgment call. "
             "Returns: {inbox_count, inbox_paths, orphan_notes, duplicate_ids, dangling_links, "
-            "similar_pairs, promotion_candidates, memory_index_issues, query_ms}."
+            "similar_pairs, promotion_candidates, memory_index_issues, broken_anchors, query_ms}."
         ),
     )
     async def knowledge_health(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]

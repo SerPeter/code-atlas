@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from code_atlas.dream import (
+    BrokenAnchor,
     DanglingLink,
     DreamReport,
     DuplicateIdConflict,
@@ -15,6 +16,7 @@ from code_atlas.dream import (
     VaultRoot,
     _check_memory_index,
     _cosine_similarity,
+    _find_broken_anchors,
     _find_similar_pairs,
     _scan_vault_for_notes,
     render_home_md,
@@ -152,6 +154,58 @@ async def test_find_similar_pairs_empty_when_no_rows() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _find_broken_anchors (fake graph — query-row-to-dataclass mapping)
+# ---------------------------------------------------------------------------
+
+
+async def test_find_broken_anchors_maps_rows_to_dataclass() -> None:
+    graph = _FakeGraph(
+        [
+            {
+                "uid": "p:note:a",
+                "name": "A",
+                "project_name": "p",
+                "file_path": "a.md",
+                "unresolved_anchors": ["missing-target"],
+            },
+        ]
+    )
+
+    broken = await _find_broken_anchors(graph)  # type: ignore[arg-type]
+
+    assert broken == [
+        BrokenAnchor(
+            uid="p:note:a", name="A", project_name="p", file_path="a.md", unresolved_anchors=["missing-target"]
+        )
+    ]
+
+
+async def test_find_broken_anchors_defaults_null_unresolved_to_empty_list() -> None:
+    """A note with has_broken_anchors=true (deleted target) but no unresolved_anchors list."""
+    graph = _FakeGraph(
+        [
+            {
+                "uid": "p:note:b",
+                "name": "B",
+                "project_name": "p",
+                "file_path": "b.md",
+                "unresolved_anchors": None,
+            },
+        ]
+    )
+
+    broken = await _find_broken_anchors(graph)  # type: ignore[arg-type]
+
+    assert broken == [BrokenAnchor(uid="p:note:b", name="B", project_name="p", file_path="b.md", unresolved_anchors=[])]
+
+
+async def test_find_broken_anchors_empty_when_no_rows() -> None:
+    graph = _FakeGraph([])
+    broken = await _find_broken_anchors(graph)  # type: ignore[arg-type]
+    assert broken == []
+
+
+# ---------------------------------------------------------------------------
 # render_home_md / report_to_dict
 # ---------------------------------------------------------------------------
 
@@ -165,6 +219,9 @@ def _sample_report() -> DreamReport:
         dangling_links=[DanglingLink(from_uid="p:note:a", rel_type="LINKS_TO", target_uid="p:note:missing")],
         similar_pairs=[SimilarPair(uid_a="p:note:a", uid_b="p:note:b", project_a="p", project_b="p", similarity=0.95)],
         promotion_candidates=[],
+        broken_anchors=[
+            BrokenAnchor(uid="p:note:x", name="X", project_name="p", file_path="x.md", unresolved_anchors=["ghost"])
+        ],
         memory_index_issues=["p: MEMORY.md references missing file(s): ['ghost.md']"],
     )
 
@@ -177,6 +234,9 @@ def test_render_home_md_includes_counts() -> None:
     assert "## Orphan notes (1)" in home
     assert "## Duplicate ids (1)" in home
     assert "## Dangling links (1)" in home
+    assert "## Broken anchors (1)" in home
+    assert "p:note:x" in home
+    assert "ghost" in home
     assert "ghost.md" in home
 
 
@@ -189,3 +249,5 @@ def test_report_to_dict_is_json_safe() -> None:
     decoded = orjson.loads(encoded)
     assert decoded["inbox_count"] == 1
     assert decoded["duplicate_ids"][0]["qualified_name"] == "p:note:dup"
+    assert decoded["broken_anchors"][0]["uid"] == "p:note:x"
+    assert decoded["broken_anchors"][0]["unresolved_anchors"] == ["ghost"]

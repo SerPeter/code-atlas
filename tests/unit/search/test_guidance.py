@@ -191,6 +191,34 @@ class TestPlanStrategy:
         assert result["params"].get("mode") == "knowledge"
         assert result["recommended_tool"] == "hybrid_search"
 
+    def test_plural_decisions_question_recommends_knowledge_mode(self):
+        result = plan_strategy("What decisions were made about the schema?")
+        assert result["params"]["mode"] == "knowledge"
+
+    def test_plural_gotchas_question_recommends_knowledge_mode(self):
+        result = plan_strategy("List the gotchas in this module")
+        assert result["params"]["mode"] == "knowledge"
+
+    def test_lessons_learned_question_recommends_knowledge_mode(self):
+        result = plan_strategy("What lessons did we learn")
+        assert result["params"]["mode"] == "knowledge"
+
+    def test_plural_tradeoffs_question_recommends_knowledge_mode(self):
+        result = plan_strategy("What tradeoffs did we make")
+        assert result["params"]["mode"] == "knowledge"
+
+    def test_tests_question_not_misrouted_to_knowledge_mode(self):
+        """Widening the knowledge-pattern inflections must not cause false positives
+        on ordinary structural questions already handled by _STRUCTURAL_PATTERNS."""
+        result = plan_strategy("what tests cover the parser module")
+        assert result["params"].get("mode") != "knowledge"
+        assert result["recommended_tool"] == "cypher_query"
+
+    def test_calls_question_not_misrouted_to_knowledge_mode(self):
+        result = plan_strategy("what calls the process_order function")
+        assert result["params"].get("mode") != "knowledge"
+        assert result["recommended_tool"] == "cypher_query"
+
 
 # ---------------------------------------------------------------------------
 # Usage guide

@@ -71,6 +71,17 @@ class OrphanNote:
 
 
 @dataclass(frozen=True)
+class BrokenAnchor:
+    """A Note whose explicit ``anchors:`` reference is broken (deleted target) or unresolved."""
+
+    uid: str
+    name: str
+    project_name: str
+    file_path: str
+    unresolved_anchors: list[str]
+
+
+@dataclass(frozen=True)
 class SimilarPair:
     """Two notes whose embeddings are highly similar — merge/dup candidates."""
 
@@ -92,6 +103,7 @@ class DreamReport:
     dangling_links: list[DanglingLink]
     similar_pairs: list[SimilarPair]
     promotion_candidates: list[SimilarPair]
+    broken_anchors: list[BrokenAnchor] = field(default_factory=list)
     memory_index_issues: list[str] = field(default_factory=list)
 
 
@@ -191,6 +203,26 @@ async def _find_orphan_notes(graph: GraphClient) -> list[OrphanNote]:
     return [OrphanNote(**row) for row in rows]
 
 
+async def _find_broken_anchors(graph: GraphClient) -> list[BrokenAnchor]:
+    """Notes whose explicit ``anchors:`` are broken (deleted target) or unresolved (no match)."""
+    rows = await graph.execute(
+        f"MATCH (n:{NodeLabel.NOTE}) "
+        "WHERE n.has_broken_anchors = true OR (n.unresolved_anchors IS NOT NULL AND size(n.unresolved_anchors) > 0) "
+        "RETURN n.uid AS uid, n.name AS name, n.project_name AS project_name, n.file_path AS file_path, "
+        "n.unresolved_anchors AS unresolved_anchors"
+    )
+    return [
+        BrokenAnchor(
+            uid=row["uid"],
+            name=row["name"],
+            project_name=row["project_name"],
+            file_path=row["file_path"],
+            unresolved_anchors=row["unresolved_anchors"] or [],
+        )
+        for row in rows
+    ]
+
+
 async def _find_inbox_notes(graph: GraphClient) -> tuple[int, list[str]]:
     rows = await graph.execute(
         f"MATCH (n:{NodeLabel.NOTE}) WHERE n.kind = $draft OR n.file_path CONTAINS '/inbox/' "
@@ -274,6 +306,7 @@ async def build_dream_report(
 
     dangling_links = await _find_dangling_links(graph, link_targets)
     orphan_notes = await _find_orphan_notes(graph)
+    broken_anchors = await _find_broken_anchors(graph)
     inbox_count, inbox_paths = await _find_inbox_notes(graph)
     similar_pairs = await _find_similar_pairs(graph, similarity_threshold)
     promotion_candidates = [p for p in similar_pairs if p.project_a != p.project_b]
@@ -286,6 +319,7 @@ async def build_dream_report(
         dangling_links=dangling_links,
         similar_pairs=similar_pairs,
         promotion_candidates=promotion_candidates,
+        broken_anchors=broken_anchors,
         memory_index_issues=memory_index_issues,
     )
 
@@ -324,6 +358,12 @@ def render_home_md(report: DreamReport) -> str:
         "",
         _render_list([f"{d.from_uid} --{d.rel_type}--> {d.target_uid}" for d in report.dangling_links]),
         "",
+        f"## Broken anchors ({len(report.broken_anchors)})",
+        "",
+        _render_list(
+            [f"{b.uid} ({b.file_path}): {b.unresolved_anchors or 'target deleted'}" for b in report.broken_anchors]
+        ),
+        "",
         f"## Duplicate ids ({len(report.duplicate_ids)})",
         "",
         _render_list([f"{d.qualified_name}: {d.file_paths}" for d in report.duplicate_ids]),
@@ -352,6 +392,7 @@ def report_to_dict(report: DreamReport) -> dict[str, Any]:
         "orphan_notes": [vars(n) for n in report.orphan_notes],
         "duplicate_ids": [vars(d) for d in report.duplicate_ids],
         "dangling_links": [vars(d) for d in report.dangling_links],
+        "broken_anchors": [vars(b) for b in report.broken_anchors],
         "similar_pairs": [vars(p) for p in report.similar_pairs],
         "promotion_candidates": [vars(p) for p in report.promotion_candidates],
         "memory_index_issues": report.memory_index_issues,

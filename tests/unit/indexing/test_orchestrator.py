@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from code_atlas.indexing import orchestrator as orchestrator_module
 from code_atlas.indexing.orchestrator import (
     _DEFAULT_EXCLUDE,
     _DEFAULT_INCLUDE,
@@ -904,8 +905,16 @@ class FakeGCGraph:
 
 
 class TestGcVanishedWorktreeProjects:
-    async def test_removes_worktree_project_whose_root_path_vanished(self, tmp_path: Path):
-        graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path / "gone")}}])
+    async def test_removes_worktree_project_whose_root_path_vanished(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        graph = FakeGCGraph(
+            [
+                {"n": {"project_name": "code-atlas", "root_path": str(tmp_path)}},
+                {"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path / "gone")}},
+            ]
+        )
+        monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: [tmp_path.resolve()])
 
         removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
 
@@ -933,6 +942,76 @@ class TestGcVanishedWorktreeProjects:
     async def test_spares_worktree_project_with_no_stored_root_path(self, tmp_path: Path):
         """No root_path stored (pre-orchestrator-fix data) — nothing to check against, so skip rather than guess."""
         graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x"}}])
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []
+
+    async def test_spares_worktree_project_when_base_project_not_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """No base-project record in the graph to corroborate against — skip rather than guess."""
+        graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path / "gone")}}])
+        calls: list[Path] = []
+        monkeypatch.setattr(orchestrator_module, "_git_worktree_list", calls.append)
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []
+        assert calls == []  # git shouldn't even be consulted without a base root_path to run it against
+
+    async def test_spares_worktree_project_when_base_root_path_not_a_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Base project's own root_path also isn't a live directory — no independent signal, skip."""
+        graph = FakeGCGraph(
+            [
+                {"n": {"project_name": "code-atlas", "root_path": str(tmp_path / "base-gone")}},
+                {"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path / "gone")}},
+            ]
+        )
+        calls: list[Path] = []
+        monkeypatch.setattr(orchestrator_module, "_git_worktree_list", calls.append)
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []
+        assert calls == []
+
+    async def test_spares_worktree_project_when_git_worktree_list_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """'git worktree list' fails or git is unavailable (returns None) — not corroborated, skip."""
+        graph = FakeGCGraph(
+            [
+                {"n": {"project_name": "code-atlas", "root_path": str(tmp_path)}},
+                {"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path / "gone")}},
+            ]
+        )
+        monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: None)
+
+        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+
+        assert removed == []
+        assert graph.deleted == []
+
+    async def test_spares_worktree_project_when_git_still_lists_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """git still lists the vanished path as a live worktree — transient unavailability, not a real removal."""
+        vanished = tmp_path / "gone"
+        graph = FakeGCGraph(
+            [
+                {"n": {"project_name": "code-atlas", "root_path": str(tmp_path)}},
+                {"n": {"project_name": "code-atlas@feature-x", "root_path": str(vanished)}},
+            ]
+        )
+        monkeypatch.setattr(
+            orchestrator_module, "_git_worktree_list", lambda base_root: [tmp_path.resolve(), vanished.resolve()]
+        )
 
         removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
 

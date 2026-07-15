@@ -958,6 +958,60 @@ async def test_deferred_calls_lost_if_process_dies_before_flush(
     assert rows[0]["n"] == 1
 
 
+@pytest.mark.usefixtures("_clean_streams")
+async def test_anchor_only_file_hash_withheld_until_flush(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """A markdown file whose ONLY deferred rel is an anchor must follow the
+    same withhold path as import/call/type/member rels — its file_hash must
+    NOT be written immediately, only staged in _pending_file_hashes until
+    _flush_deferred_resolution actually resolves the anchor.
+
+    Regression test for a copy/paste gap: the withhold condition listed
+    import_rels/call_rels/type_rels/member_rels but omitted anchor_rels, so
+    a note's hash was written immediately even though its anchor rel was
+    still sitting unresolved in memory — a crash before the next flush would
+    silently drop the anchor forever while the hash gate believed the file
+    unchanged.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(settings.project_root, "anchor_target2.py", "def baz():\n    return 1\n")
+
+    c1 = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await c1.process_batch([_file_changed(settings, "anchor_target2.py", "created")], "batch-0")
+
+    target_records = await graph_client.execute(
+        "MATCH (c:Callable {project_name: $p, name: 'baz'}) RETURN c.uid AS uid", {"p": project_name}
+    )
+    assert target_records
+    target_uid = target_records[0]["uid"]
+
+    _write_python_file(
+        settings.project_root,
+        "docs/notes/anchor-only-note.md",
+        f"---\nid: anchor-only-note\nkind: note\nanchors: [{target_uid}]\n---\n\nAnchors baz.\n",
+    )
+    note_rel_path = "docs/notes/anchor-only-note.md"
+    ev_note = _file_changed(settings, note_rel_path, "created")
+
+    # Reindex-mode policy (time_window_s=0) -> resolve_batch_interval=5: this
+    # batch's deferred anchor rel is NOT flushed within this same call, so the
+    # note's hash must be withheld rather than written immediately.
+    await c1.process_batch([ev_note], "batch-1")
+
+    assert c1._pending_anchor_rels  # sanity: the anchor rel is pending in-memory
+    assert note_rel_path in c1._pending_file_hashes.get(project_name, {})
+
+
 # ---------------------------------------------------------------------------
 # Detector timing (finding: consumers.py:~485)
 # ---------------------------------------------------------------------------

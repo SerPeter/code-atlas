@@ -157,7 +157,10 @@ class DaemonManager:
         # is independent of include_watcher (which only gates the main project's
         # watcher) — vaults have always indexed regardless of that flag.
         for vault in settings.knowledge.extra_vaults:
-            await self._start_vault(vault, settings, graph, bus, catchup=catchup)
+            try:
+                await self._start_vault(vault, settings, graph, bus, catchup=catchup)
+            except Exception:
+                logger.exception("Failed to start extra vault '{}' — continuing without it", vault.project_name)
 
         return True
 
@@ -170,11 +173,16 @@ class DaemonManager:
         *,
         catchup: bool,
     ) -> None:
-        """Scan, optionally catch up, and spawn a live FileWatcher for one extra vault.
+        """Scan, spawn a live FileWatcher, then optionally catch up for one extra vault.
 
         Publishing reuses the persistent consumers already started in start()
         (they accept any project_name/project_root per event, same as monorepo
         sub-projects), so no per-vault consumer pair is created here.
+
+        The watcher is spawned before catch-up runs — same ordering (and
+        rationale) as the main project above: no change is missed while
+        catch-up runs; its events wait in the stream until the consumers
+        start.
         """
         vault_root = Path(vault.path).expanduser().resolve()
         if not vault_root.is_dir():
@@ -183,9 +191,6 @@ class DaemonManager:
 
         scope = FileScope(vault_root, settings)
         known_files = await asyncio.to_thread(scope.scan)
-
-        if catchup:
-            await self._catchup_vault(vault.project_name, vault_root, known_files, settings, graph)
 
         vault_watcher = FileWatcher(
             vault_root,
@@ -199,6 +204,9 @@ class DaemonManager:
         self._tasks.append(
             asyncio.get_running_loop().create_task(self._run_vault_watcher(vault.project_name, vault_watcher))
         )
+
+        if catchup:
+            await self._catchup_vault(vault.project_name, vault_root, known_files, settings, graph)
 
     async def _catchup(self, settings: AtlasSettings, graph: GraphClient, bus: EventBus) -> None:
         """One delta index pass so changes made while the daemon was down get indexed."""

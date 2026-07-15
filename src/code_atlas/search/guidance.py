@@ -399,7 +399,7 @@ _DOC_PATTERNS = re.compile(
 # the base class" is asking for rationale, not a CALLS/INHERITS traversal,
 # even though it contains structural keywords too.
 _KNOWLEDGE_PATTERNS = re.compile(
-    r"\b(why|decision|gotcha|rationale|trade-?off|motivation|learned|lesson)\b",
+    r"\b(why|decisions?|gotchas?|rationale|trade-?offs?|motivation|learn(?:s|ed|t|ing)?|lessons?)\b",
     re.IGNORECASE,
 )
 
