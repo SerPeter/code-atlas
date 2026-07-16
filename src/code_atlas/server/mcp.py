@@ -623,17 +623,34 @@ def create_mcp_server(  # noqa: PLR0915
         except Exception:
             logger.debug("Could not register roots/list_changed handler — root updates via notification disabled")
 
-        # Auto-start watcher + pipeline if Valkey is reachable.
-        # catchup runs one blocking delta index pass before consumers start.
-        daemon_running = await daemon.start(settings, graph, catchup=catchup)
-        if daemon_running:
-            logger.info("Auto-indexing active (watching {})", settings.project_root)
-        else:
-            logger.info("Query-only mode (no Valkey)")
+        # Auto-start watcher + pipeline if Valkey is reachable. catchup runs one
+        # blocking delta index pass before consumers start — on a repo that's
+        # drifted this can take well over a minute (real embedding calls per
+        # changed entity), which would hold the MCP stdio handshake past most
+        # clients' connect timeout. Run daemon startup in the background instead
+        # so tools are reachable immediately; health_check reports pipeline state
+        # and result staleness already surfaces an index that's still catching up.
+        daemon_start_task = asyncio.get_running_loop().create_task(daemon.start(settings, graph, catchup=catchup))
+
+        def _on_daemon_started(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.exception("Daemon startup failed", exc_info=exc)
+            elif task.result():
+                logger.info("Auto-indexing active (watching {})", settings.project_root)
+            else:
+                logger.info("Query-only mode (no Valkey)")
+
+        daemon_start_task.add_done_callback(_on_daemon_started)
 
         try:
             yield app_ctx
         finally:
+            daemon_start_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await daemon_start_task
             await app_ctx.daemon.stop()
             await graph.close()
             shutdown_telemetry()
