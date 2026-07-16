@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import litellm
 import redis.asyncio as aioredis
 from loguru import logger
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from code_atlas.telemetry import get_tracer
 
@@ -22,6 +23,17 @@ if TYPE_CHECKING:
     from code_atlas.settings import EmbeddingSettings, RedisSettings
 
 _tracer = get_tracer(__name__)
+
+# Transient provider errors worth retrying — rate limits, connection issues,
+# timeouts, 5xx. Deliberately excludes non-retryable errors (bad request, auth
+# failure) so those still fail fast.
+_RETRYABLE_ERRORS = (
+    litellm.RateLimitError,
+    litellm.APIConnectionError,
+    litellm.Timeout,
+    litellm.ServiceUnavailableError,
+    litellm.InternalServerError,
+)
 
 
 class EmbeddingError(Exception):
@@ -128,6 +140,25 @@ class EmbedClient:
                 result.append(truncated)
         return result
 
+    @retry(
+        retry=retry_if_exception_type(_RETRYABLE_ERRORS),
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=20),
+        before_sleep=lambda rs: logger.warning(
+            "Embedding call transient error, retrying in {:.1f}s (attempt {}): {}",
+            rs.next_action.sleep,
+            rs.attempt_number,
+            rs.outcome.exception(),
+        ),
+        reraise=True,
+    )
+    async def _embed_call(self, kwargs: dict[str, Any]) -> Any:
+        """``litellm.aembedding`` with retry on transient provider errors (rate limits,
+        connection issues, timeouts, 5xx) — a burst of embedding calls during a large
+        index/catchup is exactly the pattern that trips cloud provider rate limits.
+        """
+        return await litellm.aembedding(**kwargs)
+
     def _build_kwargs(self, chunk: list[str]) -> dict[str, Any]:
         """Build keyword arguments for a single litellm.aembedding call."""
         kwargs: dict[str, Any] = {
@@ -164,7 +195,7 @@ class EmbedClient:
                 async with sem:
                     try:
                         kwargs = self._build_kwargs(chunk)
-                        response = await litellm.aembedding(**kwargs)
+                        response = await self._embed_call(kwargs)
                     except Exception as exc:
                         offset = chunk_idx * self._batch_size
                         msg = f"Embedding failed for batch [{offset}:{offset + len(chunk)}]: {exc}"

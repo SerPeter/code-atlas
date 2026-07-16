@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import litellm
 import pytest
 
 from code_atlas.events import EmbedDirty, EntityRef
@@ -267,6 +268,45 @@ class TestEmbedClient:
             pytest.raises(EmbeddingError, match="Connection refused"),
         ):
             await client.embed_one("test")
+
+    async def test_embed_transient_error_retries_then_succeeds(self):
+        """A transient provider error (rate limit) is retried, not raised immediately."""
+        client = EmbedClient(_make_settings())
+        fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1, 0.2, 0.3])])
+
+        call_count = 0
+
+        async def flaky_aembedding(**kwargs: Any) -> FakeEmbeddingResponse:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise litellm.RateLimitError(message="rate limited", llm_provider="openai", model="test-model")
+            return fake_response
+
+        with patch("code_atlas.search.embeddings.litellm.aembedding", side_effect=flaky_aembedding):
+            result = await client.embed_one("hello")
+
+        assert result == [0.1, 0.2, 0.3]
+        assert call_count == 3
+
+    async def test_embed_non_retryable_error_fails_immediately(self):
+        """A non-retryable error (e.g. bad request) is not retried."""
+        client = EmbedClient(_make_settings())
+
+        call_count = 0
+
+        async def failing_aembedding(**kwargs: Any) -> FakeEmbeddingResponse:
+            nonlocal call_count
+            call_count += 1
+            raise litellm.BadRequestError(message="invalid input", llm_provider="openai", model="test-model")
+
+        with (
+            patch("code_atlas.search.embeddings.litellm.aembedding", side_effect=failing_aembedding),
+            pytest.raises(EmbeddingError),
+        ):
+            await client.embed_one("hello")
+
+        assert call_count == 1
 
     async def test_concurrent_ordering_preserved(self):
         """Results maintain correct ordering despite concurrent execution with varying delays."""
