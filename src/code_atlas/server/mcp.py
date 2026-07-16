@@ -1538,8 +1538,11 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         app = await _ensure_root(ctx)
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
+        test_patterns = tuple(app.settings.search.test_patterns) if app.settings.search.test_filter else ()
         try:
-            return await _analyze_repo(app.graph, analysis, project_name, path=path, limit=clamped)
+            return await _analyze_repo(
+                app.graph, analysis, project_name, path=path, limit=clamped, test_patterns=test_patterns
+            )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 

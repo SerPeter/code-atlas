@@ -11,6 +11,8 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
+from code_atlas.search.engine import matches_test_pattern
+
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
 
@@ -68,19 +70,26 @@ async def analyze_repo(
     project: str,
     path: str = "",
     limit: int = 20,
+    test_patterns: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Dispatch to the requested sub-analysis."""
+    """Dispatch to the requested sub-analysis.
+
+    *test_patterns* excludes test modules from quality scoring (god-module,
+    circular, tangled, rigid, unstable) — unused by the other sub-analyses, so
+    only the ``quality`` dispatch receives it.
+    """
     if analysis not in _VALID_ANALYSES:
         return {
             "error": f"Unknown analysis '{analysis}'. Valid: {sorted(_VALID_ANALYSES)}",
             "code": "INVALID_ANALYSIS",
         }
+    if analysis == "quality":
+        return await _analyze_quality(graph, project, path, limit, test_patterns)
     dispatch = {
         "structure": _analyze_structure,
         "centrality": _analyze_centrality,
         "dependencies": _analyze_dependencies,
         "patterns": _analyze_patterns,
-        "quality": _analyze_quality,
     }
     return await dispatch[analysis](graph, project, path, limit)
 
@@ -752,7 +761,9 @@ def _aggregate_worst_modules(
     )[:limit]
 
 
-async def _analyze_quality(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_quality(
+    graph: GraphClient, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     t0 = time.monotonic()
     params: dict[str, Any] = {"project": project, "path": path}
     pa_m = " AND m.file_path STARTS WITH $path" if path else ""
@@ -802,6 +813,22 @@ async def _analyze_quality(graph: GraphClient, project: str, path: str, limit: i
         for from_mod, to_mod in edge_weights:
             all_modules.add(from_mod)
             all_modules.add(to_mod)
+
+    # Test modules are architecture-quality noise (god/circular/tangled/rigid/unstable
+    # flags on test files aren't actionable) — drop them before scoring, not just from
+    # the god-module list, so they don't skew fan-in/fan-out or instability either.
+    if test_patterns:
+        patterns = list(test_patterns)
+        test_modules = {
+            m for m in all_modules if matches_test_pattern(file_paths.get(m, ""), m.rsplit(".", 1)[-1], patterns)
+        }
+        if test_modules:
+            all_modules -= test_modules
+            entity_counts = {m: c for m, c in entity_counts.items() if m not in test_modules}
+            file_paths = {m: p for m, p in file_paths.items() if m not in test_modules}
+            edge_weights = {
+                (f, t): w for (f, t), w in edge_weights.items() if f not in test_modules and t not in test_modules
+            }
 
     metrics = _compute_quality_flags(all_modules, entity_counts, file_paths, edge_weights, limit)
 
