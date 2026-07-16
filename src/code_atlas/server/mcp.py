@@ -413,6 +413,11 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
 
     When staleness is indeterminate (project never indexed or index in progress),
     ``stale`` is set to ``None`` rather than ``True``.
+
+    Also adds ``indexing_pending`` (``{"file-changed": N, "embed-dirty": M}``) when the
+    daemon is running and has a non-trivial backlog — lets a caller tell a stale index
+    that's actively catching up (e.g. right after MCP startup) apart from one where
+    nothing is happening.
     """
     stale_mode = app.settings.index.stale_mode
     if stale_mode == "ignore" or app.staleness is None:
@@ -451,6 +456,18 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
         result["stale_since"] = info.last_indexed_commit
         if info.changed_files:
             result["changed_files"] = info.changed_files
+
+    # Surface live catchup/watch backlog when non-trivial — lets a caller tell
+    # "stale, but actively catching up" apart from "stale, nothing is happening".
+    # Guarded by the same short timeout as the staleness check above so a slow
+    # backlog read can never hold up a query response.
+    try:
+        pending = await asyncio.wait_for(app.daemon.pending_event_counts(), timeout=5.0)
+    except Exception:
+        pending = None
+    if pending and any(v > 0 for v in pending.values()):
+        result["indexing_pending"] = pending
+
     return result
 
 

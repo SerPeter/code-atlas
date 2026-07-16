@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from code_atlas.events import EventBus
+from code_atlas.events import EventBus, Topic
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
     FileScope,
@@ -222,6 +222,25 @@ class DaemonManager:
         """Block until all background tasks finish (or are cancelled)."""
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def pending_event_counts(self) -> dict[str, int] | None:
+        """Current backlog size per topic (file_changed, embed_dirty), or ``None`` if not running.
+
+        A one-shot read of the same pending+lag figures ``_wait_for_drain`` polls during
+        catchup (``pending + lag``, or just ``pending`` when ``lag`` is unknown) — lets a
+        caller surface "how much indexing work is left" without duplicating that polling loop.
+        """
+        if self._bus is None:
+            return None
+        queries: list[tuple[Topic, str]] = [(Topic.FILE_CHANGED, "ast")]
+        if self._embed is not None:
+            queries.append((Topic.EMBED_DIRTY, "embed"))
+        infos = await self._bus.stream_group_info_multi(queries)
+        counts: dict[str, int] = {}
+        for (topic, _group), info in zip(queries, infos, strict=True):
+            pending, lag = info["pending"], info["lag"]
+            counts[topic.value] = pending if lag is None else pending + lag
+        return counts
 
     async def stop(self) -> None:
         """Graceful shutdown: stop watcher, consumers, close connections."""

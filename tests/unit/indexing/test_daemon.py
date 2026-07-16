@@ -80,12 +80,16 @@ class FakeBus:
 
     def __init__(self, settings: object, *, project_name: str = "") -> None:
         self.project_name = project_name
+        self.group_info: dict[str, dict[str, int | None]] = {}
 
     async def ping(self) -> bool:
         return True
 
     async def close(self) -> None:
         return None
+
+    async def stream_group_info_multi(self, queries: list[tuple[Any, str]]) -> list[dict[str, int | None]]:
+        return [self.group_info.get(group, {"pending": 0, "lag": 0}) for _topic, group in queries]
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +167,33 @@ class TestStatus:
         consumer.stop()
         await asyncio.wait_for(task, timeout=2.0)
         assert manager.status()["tasks_running"] == 0
+
+
+class TestPendingEventCounts:
+    """pending_event_counts() surfaces backlog size, or None when not running."""
+
+    async def test_returns_none_when_bus_not_set(self) -> None:
+        manager = DaemonManager()
+        assert await manager.pending_event_counts() is None
+
+    async def test_returns_counts_from_bus(self) -> None:
+        manager = DaemonManager()
+        bus = FakeBus(object())
+        bus.group_info = {"ast": {"pending": 2, "lag": 3}, "embed": {"pending": 1, "lag": 0}}
+        manager._bus = bus  # type: ignore[assignment]
+        manager._embed = object()  # type: ignore[assignment]  # non-None signals embed consumer active
+
+        counts = await manager.pending_event_counts()
+        assert counts == {"file-changed": 5, "embed-dirty": 1}
+
+    async def test_unknown_lag_falls_back_to_pending_only(self) -> None:
+        manager = DaemonManager()
+        bus = FakeBus(object())
+        bus.group_info = {"ast": {"pending": 4, "lag": None}}
+        manager._bus = bus  # type: ignore[assignment]
+
+        counts = await manager.pending_event_counts()
+        assert counts == {"file-changed": 4}
 
 
 # ---------------------------------------------------------------------------
