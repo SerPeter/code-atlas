@@ -518,7 +518,9 @@ class ASTConsumer(TierConsumer):
             if proj_calls or proj_types or proj_members:
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
                 if proj_calls:
-                    await self.graph.resolve_calls(project_name, proj_calls, lookup=shared_lookup)
+                    await self.graph.resolve_calls(
+                        project_name, proj_calls, lookup=shared_lookup, name_to_typedefs=td_map
+                    )
                 if proj_types:
                     await self.graph.resolve_type_refs(
                         project_name, proj_types, lookup=shared_lookup, name_to_typedefs=td_map

@@ -440,7 +440,21 @@ class _CallLookup:
     uid_to_info: dict[str, tuple[str, str]]  # uid → (name, file_path)
 
 
-def _resolve_one_call(project_name: str, rel: ParsedRelationship, lk: _CallLookup) -> str | None:
+def _typedef_init_uid(typedef_uid: str, lk: _CallLookup) -> str | None:
+    """Return the uid of *typedef_uid*'s ``__init__`` Callable child, if any."""
+    for child_uid in lk.parent_children.get(typedef_uid, []):
+        child_info = lk.uid_to_info.get(child_uid)
+        if child_info and child_info[0] == "__init__":
+            return child_uid
+    return None
+
+
+def _resolve_one_call(  # noqa: PLR0911, PLR0912
+    project_name: str,
+    rel: ParsedRelationship,
+    lk: _CallLookup,
+    name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
+) -> str | None:
     """Resolve a single CALLS relationship to a target uid (or ``None``)."""
     caller_uid = rel.from_qualified_name
     bare_name = rel.to_name
@@ -455,9 +469,19 @@ def _resolve_one_call(project_name: str, rel: ParsedRelationship, lk: _CallLooku
             module_uid = candidate
             break
 
-    # Strategy 1: Import match
+    # Strategy 1: Import match. import_map is shared with USES_TYPE resolution
+    # (client.py:resolve_type_refs), so its targets aren't Callable-scoped — an
+    # imported class resolves here to the TypeDef's own uid, which the CALLS
+    # edge-creation Cypher (:Callable-scoped) would silently drop. Redirect a
+    # non-Callable import target to its __init__ (constructor call) before
+    # falling through to the remaining strategies.
     if module_uid and bare_name in lk.import_map.get(module_uid, {}):
-        return lk.import_map[module_uid][bare_name]
+        target_uid = lk.import_map[module_uid][bare_name]
+        if target_uid in lk.uid_to_info:
+            return target_uid
+        init_uid = _typedef_init_uid(target_uid, lk)
+        if init_uid is not None:
+            return init_uid
 
     # Strategy 2: Same-class sibling
     if caller_uid in lk.caller_to_parent:
@@ -482,7 +506,21 @@ def _resolve_one_call(project_name: str, rel: ParsedRelationship, lk: _CallLooku
     # from external attribute calls like asyncio.run(), session.run(), etc.
     candidates = lk.name_to_callables.get(bare_name, [])
     non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
-    return non_self[0] if len(non_self) == 1 else None
+    if len(non_self) == 1:
+        return non_self[0]
+
+    # Strategy 5: Constructor call (bare_name is a class, not a function) — a
+    # `ClassName(...)` call's bare name is the class name, but the constructor
+    # itself is named `__init__`, so it never matches any strategy above. Runs
+    # last so it never steals priority from a real function-name match. Same
+    # "only when unambiguous" discipline as Strategy 4: multiple classes
+    # sharing the bare name are left unresolved rather than guessed.
+    if name_to_typedefs is not None:
+        typedef_candidates = name_to_typedefs.get(bare_name, [])
+        if len(typedef_candidates) == 1:
+            return _typedef_init_uid(typedef_candidates[0][0], lk)
+
+    return None
 
 
 @dataclass(frozen=True)
@@ -1227,6 +1265,7 @@ class GraphClient:
         call_rels: list[ParsedRelationship],
         *,
         lookup: _CallLookup | None = None,
+        name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
     ) -> None:
         """Resolve CALLS relationships after all files in a batch have been upserted.
 
@@ -1236,7 +1275,8 @@ class GraphClient:
         2. **Same-class sibling** — if caller is a method, check siblings in same TypeDef.
         3. **Same-file match** — any Callable with that name in the same file.
         4. **Project-wide match** — any Callable with that name (prefer public).
-        5. **Unresolved** — skip silently (builtins, dynamic calls).
+        5. **Constructor call** — bare_name is a unique class name; resolves to its `__init__`.
+        6. **Unresolved** — skip silently (builtins, dynamic calls).
         """
         if not call_rels:
             return
@@ -1244,12 +1284,22 @@ class GraphClient:
         if lookup is None:
             lookup = await self._build_call_lookup(project_name)
 
+        if name_to_typedefs is None:
+            td_records = await self.execute(
+                f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) "
+                "RETURN n.name AS name, n.uid AS uid, n.file_path AS fp",
+                {"p": project_name},
+            )
+            name_to_typedefs = {}
+            for r in td_records:
+                name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
+
         # Resolve each call
         edges: set[tuple[str, str]] = set()
         resolved = 0
         unresolved = 0
         for rel in call_rels:
-            target_uid = _resolve_one_call(project_name, rel, lookup)
+            target_uid = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
             if target_uid is not None:
                 edges.add((rel.from_qualified_name, target_uid))
                 resolved += 1

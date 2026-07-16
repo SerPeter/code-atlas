@@ -2482,6 +2482,204 @@ async def test_resolve_calls_same_class(graph_client: GraphClient):
     assert records[0]["callee"] == "validate"
 
 
+async def test_resolve_calls_constructor(graph_client: GraphClient):
+    """Constructor call (bare name is a class, not a function) → resolves to its __init__."""
+    await graph_client.ensure_schema()
+
+    project = "call_ctor"
+    fp = "src/mod.py"
+
+    entities = [
+        ParsedEntity(
+            name="mod",
+            qualified_name=f"{project}:src.mod",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=20,
+            file_path=fp,
+            content_hash="mod_hash",
+        ),
+        ParsedEntity(
+            name="Widget",
+            qualified_name=f"{project}:src.mod.Widget",
+            label=NodeLabel.TYPE_DEF,
+            kind="class",
+            line_start=2,
+            line_end=10,
+            file_path=fp,
+            content_hash="cls_hash",
+        ),
+        ParsedEntity(
+            name="__init__",
+            qualified_name=f"{project}:src.mod.Widget.__init__",
+            label=NodeLabel.CALLABLE,
+            kind="method",
+            line_start=3,
+            line_end=5,
+            file_path=fp,
+            content_hash="init_hash",
+        ),
+        ParsedEntity(
+            name="build",
+            qualified_name=f"{project}:src.mod.build",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=12,
+            line_end=15,
+            file_path=fp,
+            content_hash="build_hash",
+        ),
+    ]
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.mod.Widget",
+        ),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.Widget",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.mod.Widget.__init__",
+        ),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.mod.build",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities, rels)
+
+    # build() calls Widget(...)
+    call_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod.build",
+            rel_type=RelType.CALLS,
+            to_name="Widget",
+        ),
+    ]
+    await graph_client.resolve_calls(project, call_rels)
+
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE})-[:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
+        "RETURN a.name AS caller, b.name AS callee",
+    )
+    assert len(records) == 1
+    assert records[0]["caller"] == "build"
+    assert records[0]["callee"] == "__init__"
+
+
+async def test_resolve_calls_constructor_via_import(graph_client: GraphClient):
+    """Constructor call to an imported class → resolves to its __init__, not the TypeDef.
+
+    import_map is shared with USES_TYPE resolution, so an imported class's entry
+    points at the TypeDef's own uid — the CALLS strategy must redirect that to the
+    TypeDef's __init__ rather than returning a non-Callable uid the edge-creation
+    Cypher would silently drop.
+    """
+    await graph_client.ensure_schema()
+
+    project = "call_ctor_imp"
+
+    fp_widget = "src/widget.py"
+    widget_entities = [
+        ParsedEntity(
+            name="widget",
+            qualified_name=f"{project}:src.widget",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp_widget,
+            content_hash="w_hash",
+        ),
+        ParsedEntity(
+            name="Widget",
+            qualified_name=f"{project}:src.widget.Widget",
+            label=NodeLabel.TYPE_DEF,
+            kind="class",
+            line_start=2,
+            line_end=8,
+            file_path=fp_widget,
+            content_hash="cls_hash",
+        ),
+        ParsedEntity(
+            name="__init__",
+            qualified_name=f"{project}:src.widget.Widget.__init__",
+            label=NodeLabel.CALLABLE,
+            kind="method",
+            line_start=3,
+            line_end=5,
+            file_path=fp_widget,
+            content_hash="init_hash",
+        ),
+    ]
+    widget_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.widget",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.widget.Widget",
+        ),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.widget.Widget",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project}:src.widget.Widget.__init__",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_widget, widget_entities, widget_rels)
+
+    fp_app = "src/app.py"
+    app_entities = [
+        ParsedEntity(
+            name="app",
+            qualified_name=f"{project}:src.app",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp_app,
+            content_hash="a_hash",
+        ),
+        ParsedEntity(
+            name="build",
+            qualified_name=f"{project}:src.app.build",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=3,
+            line_end=8,
+            file_path=fp_app,
+            content_hash="b_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_app, app_entities, [])
+
+    import_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.app",
+            rel_type=RelType.IMPORTS,
+            to_name="src.widget.Widget",
+        ),
+    ]
+    await graph_client.resolve_imports(project, import_rels)
+
+    call_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.app.build",
+            rel_type=RelType.CALLS,
+            to_name="Widget",
+        ),
+    ]
+    await graph_client.resolve_calls(project, call_rels)
+
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE})-[:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
+        "RETURN a.name AS caller, b.name AS callee",
+    )
+    assert len(records) == 1
+    assert records[0]["caller"] == "build"
+    assert records[0]["callee"] == "__init__"
+
+
 async def test_resolve_calls_unresolved_skipped(graph_client: GraphClient):
     """Call to builtin (e.g. 'print') → no edge created, no crash."""
     await graph_client.ensure_schema()
