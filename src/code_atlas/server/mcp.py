@@ -743,19 +743,26 @@ def _register_node_tools(mcp: FastMCP) -> None:
 
         try:
             # Stage A: Exact matches (uid + exact name) — 1 RTT
-            found = await app.graph.execute(
+            exact = await app.graph.execute(
                 f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {peek} "
                 f"UNION ALL "
                 f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {peek}",
                 {"name": name},
             )
-            if found:
-                total = len(found)
-                found = found[:clamped]
+            seen: dict[str, dict[str, Any]] = {}
+            ordered_uids: list[str] = []
+            for r in exact:
+                uid = r["n"]["uid"]
+                if uid not in seen:
+                    seen[uid] = r
+                    ordered_uids.append(uid)
 
-            # Stage B: Partial matches (suffix > prefix > contains) — 1 RTT
-            if not found:
-                found = await app.graph.execute(
+            # Stage B: Partial matches (suffix > prefix > contains) — 1 RTT. Runs
+            # whenever Stage A didn't fill the requested budget, not only when it
+            # found nothing — otherwise a single exact hit silently hides
+            # same-named siblings (e.g. "_catchup" hiding "_catchup_vault").
+            if len(seen) < clamped:
+                partial = await app.graph.execute(
                     f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix "
                     f"RETURN n, 3 AS _match_score LIMIT {peek} "
                     f"UNION ALL "
@@ -766,14 +773,20 @@ def _register_node_tools(mcp: FastMCP) -> None:
                     f"RETURN n, 1 AS _match_score LIMIT {peek}",
                     {"name": name, "suffix": f".{name}", "prefix": f"{name}."},
                 )
-                # Deduplicate by uid, keeping highest _match_score
-                seen: dict[str, dict[str, Any]] = {}
-                for r in found:
+                # Deduplicate by uid (keeping highest _match_score), skipping anything Stage A already has
+                partial_best: dict[str, dict[str, Any]] = {}
+                for r in partial:
                     uid = r["n"]["uid"]
-                    if r.get("_match_score", 0) > seen.get(uid, {}).get("_match_score", -1):
-                        seen[uid] = r
-                total = len(seen)
-                found = sorted(seen.values(), key=lambda rec: rec.get("_match_score", 0), reverse=True)[:clamped]
+                    if uid in seen:
+                        continue
+                    if r.get("_match_score", 0) > partial_best.get(uid, {}).get("_match_score", -1):
+                        partial_best[uid] = r
+                for uid in sorted(partial_best, key=lambda u: partial_best[u].get("_match_score", 0), reverse=True):
+                    seen[uid] = partial_best[uid]
+                    ordered_uids.append(uid)
+
+            total = len(seen)
+            found = [seen[uid] for uid in ordered_uids[:clamped]]
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 
