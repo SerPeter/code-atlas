@@ -699,12 +699,13 @@ def _register_node_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Find code entities by name. "
-            "Cascade: exact (uid + name) → partial (suffix > prefix > contains). "
-            "First stage with results wins. Results ranked by relevance. "
-            "Use get_context to expand a result. "
+            "Cascade: exact (uid + name) → partial (suffix > prefix > contains), filling any "
+            "remaining slots in the result budget rather than stopping at the first match. "
+            "Results ranked by relevance. Use get_context to expand a result. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
             "line_start, line_end, signature, docstring}], count, truncated, query_ms}. "
-            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info. "
+            "Use offset to page beyond the first `limit` results."
         ),
     )
     async def get_node(
@@ -720,6 +721,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
             ),
         ] = "",
         limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        offset: Annotated[int, Field(0, description="Skip this many results (for paging beyond limit).", ge=0)] = 0,
         detail: Annotated[
             str,
             Field(
@@ -739,7 +741,8 @@ def _register_node_tools(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         found: list[dict[str, Any]] | None = None
         total: int | None = None
-        peek = clamped + 1  # fetch one extra row to detect truncation
+        page_end = offset + clamped
+        peek = page_end + 1  # fetch one extra row to detect truncation past this page
 
         try:
             # Stage A: Exact matches (uid + exact name) — 1 RTT
@@ -761,7 +764,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
             # whenever Stage A didn't fill the requested budget, not only when it
             # found nothing — otherwise a single exact hit silently hides
             # same-named siblings (e.g. "_catchup" hiding "_catchup_vault").
-            if len(seen) < clamped:
+            if len(seen) < page_end:
                 partial = await app.graph.execute(
                     f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix "
                     f"RETURN n, 3 AS _match_score LIMIT {peek} "
@@ -786,14 +789,14 @@ def _register_node_tools(mcp: FastMCP) -> None:
                     ordered_uids.append(uid)
 
             total = len(seen)
-            found = [seen[uid] for uid in ordered_uids[:clamped]]
+            found = [seen[uid] for uid in ordered_uids[offset:page_end]]
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 
         elapsed = (time.monotonic() - t0) * 1000
         ranked = _rank_results([_compact_node(r, detail=detail) for r in found])
         await _enrich_with_calls(app.graph, ranked, detail=detail)
-        return await _with_staleness(app, _result(ranked, limit=clamped, query_ms=elapsed, total=total))
+        return await _with_staleness(app, _result(ranked, limit=page_end, query_ms=elapsed, total=total))
 
 
 def _register_query_tools(mcp: FastMCP) -> None:
@@ -906,7 +909,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
             "and boolean operators (AND, OR). "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
             "line_start, line_end, signature, docstring, score}], count, truncated, query_ms}. "
-            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info. "
+            "Use offset to page beyond the first `limit` results."
         ),
     )
     async def text_search(
@@ -916,6 +920,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
             Field("", description="Restrict to one label: Callable, Module, TypeDef, Value, DocSection. Empty = all."),
         ] = "",
         limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        offset: Annotated[int, Field(0, description="Skip this many results (for paging beyond limit).", ge=0)] = 0,
         project: Annotated[
             str, Field("", description="Filter by project name. Empty = auto-detect from workspace.")
         ] = "",
@@ -933,13 +938,14 @@ def _register_search_tools(mcp: FastMCP) -> None:
             valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
             return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
         clamped = _clamp_limit(limit)
+        page_end = offset + clamped
         resolved_projects = [project] if project else await _default_scope_projects(app)
         resolved_scope = ",".join(resolved_projects)
 
         t0 = time.monotonic()
         try:
             all_results = await app.graph.text_search(
-                query, label=label, limit=clamped * 3 + 1, projects=resolved_projects
+                query, label=label, limit=page_end * 3 + 1, projects=resolved_projects
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
@@ -947,11 +953,11 @@ def _register_search_tools(mcp: FastMCP) -> None:
         elapsed = (time.monotonic() - t0) * 1000
 
         total = len(all_results)
-        all_results = all_results[:clamped]
+        all_results = all_results[offset:page_end]
         compacted = [_compact_node(r, detail=detail) for r in all_results]
         await _enrich_with_calls(app.graph, compacted, detail=detail)
         return await _with_staleness(
-            app, _result(compacted, limit=clamped, query_ms=elapsed, total=total), scope=resolved_scope
+            app, _result(compacted, limit=page_end, query_ms=elapsed, total=total), scope=resolved_scope
         )
 
     @mcp.tool(
@@ -960,7 +966,8 @@ def _register_search_tools(mcp: FastMCP) -> None:
             "Finds code by meaning, not just name. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
             "line_start, line_end, signature, docstring, similarity}], count, truncated, query_ms}. "
-            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info. "
+            "Use offset to page beyond the first `limit` results."
         ),
     )
     async def vector_search(
@@ -970,6 +977,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
             Field("", description="Restrict to one label: Callable, Module, TypeDef, Value, DocSection. Empty = all."),
         ] = "",
         limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        offset: Annotated[int, Field(0, description="Skip this many results (for paging beyond limit).", ge=0)] = 0,
         project: Annotated[
             str, Field("", description="Filter by project name. Empty = auto-detect from workspace.")
         ] = "",
@@ -1000,6 +1008,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
                 code="MODEL_MISMATCH",
             )
         clamped = _clamp_limit(limit)
+        page_end = offset + clamped
         resolved_projects = [project] if project else await _default_scope_projects(app)
         resolved_scope = ",".join(resolved_projects)
 
@@ -1013,7 +1022,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         try:
             all_results = await app.graph.vector_search(
-                vector, label=label, limit=clamped * 3 + 1, projects=resolved_projects, threshold=threshold
+                vector, label=label, limit=page_end * 3 + 1, projects=resolved_projects, threshold=threshold
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
@@ -1021,11 +1030,11 @@ def _register_search_tools(mcp: FastMCP) -> None:
         elapsed = (time.monotonic() - t0) * 1000
 
         total = len(all_results)
-        all_results = all_results[:clamped]
+        all_results = all_results[offset:page_end]
         compacted = [_compact_node(r, detail=detail) for r in all_results]
         await _enrich_with_calls(app.graph, compacted, detail=detail)
         return await _with_staleness(
-            app, _result(compacted, limit=clamped, query_ms=elapsed, total=total), scope=resolved_scope
+            app, _result(compacted, limit=page_end, query_ms=elapsed, total=total), scope=resolved_scope
         )
 
 
@@ -1104,12 +1113,14 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, line_start, "
             "line_end, signature, docstring, visibility, _labels, rrf_score, sources}], "
             "count, truncated, query_ms}. "
-            "Pass detail='full' to include source code, full docstrings, and caller/callee info."
+            "Pass detail='full' to include source code, full docstrings, and caller/callee info. "
+            "Use offset to page beyond the first `limit` results."
         ),
     )
     async def hybrid_search(
         query: Annotated[str, Field(description="Search query — identifier names, natural language, or mixed.")],
         limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
+        offset: Annotated[int, Field(0, description="Skip this many results (for paging beyond limit).", ge=0)] = 0,
         search_types: Annotated[
             str, Field("", description="Comma-separated channels to use: graph,vector,bm25. Empty = all.")
         ] = "",
@@ -1159,6 +1170,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         app = await _ensure_root(ctx)
         clamped = _clamp_limit(limit)
+        page_end = offset + clamped
 
         types, type_error = _parse_search_types(search_types)
         if type_error:
@@ -1178,7 +1190,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         if resolved_scope is None:
             # scope explicitly matched zero indexed projects — return no
             # results rather than silently searching every project.
-            return await _with_staleness(app, _result([], limit=clamped, query_ms=0.0, total=0), scope=scope)
+            return await _with_staleness(app, _result([], limit=page_end, query_ms=0.0, total=0), scope=scope)
 
         t0 = time.monotonic()
         try:
@@ -1188,7 +1200,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 settings=app.settings.search,
                 query=query,
                 search_types=types,
-                limit=clamped + 1,
+                limit=page_end + 1,
                 scope=resolved_scope,
                 weights=weight_dict,
                 exclude_tests=exclude_tests,
@@ -1203,7 +1215,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         elapsed = (time.monotonic() - t0) * 1000
 
         total = len(results)
-        results = results[:clamped]
+        results = results[offset:page_end]
 
         serialized = []
         for r in results:
@@ -1235,7 +1247,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
 
         await _enrich_with_calls(app.graph, serialized, detail=detail)
         return await _with_staleness(
-            app, _result(serialized, limit=clamped, query_ms=elapsed, total=total), scope=scope
+            app, _result(serialized, limit=page_end, query_ms=elapsed, total=total), scope=scope
         )
 
 
