@@ -543,9 +543,13 @@ def _normalize_path(path: str) -> str:
     return path.replace("\\", "/").lower()
 
 
-def _is_test_result(result: SearchResult, patterns: list[str]) -> bool:
-    """Return True if *result* matches test file/entity patterns."""
-    fp = _normalize_path(result.file_path)
+def matches_test_pattern(file_path: str, name: str, patterns: list[str]) -> bool:
+    """Return True if *file_path*/*name* matches configured test file/entity patterns.
+
+    Primitive-typed so callers that don't have a full ``SearchResult`` (e.g. raw
+    graph.text_search()/vector_search() records) can reuse the same rule.
+    """
+    fp = _normalize_path(file_path)
     basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
 
     for pat in patterns:
@@ -558,8 +562,13 @@ def _is_test_result(result: SearchResult, patterns: list[str]) -> bool:
             return True
 
     # Also check entity name for test_* / *_test patterns
-    name = result.name.lower()
-    return name.startswith("test_") or name.endswith("_test")
+    name_lower = name.lower()
+    return name_lower.startswith("test_") or name_lower.endswith("_test")
+
+
+def _is_test_result(result: SearchResult, patterns: list[str]) -> bool:
+    """Return True if *result* matches test file/entity patterns."""
+    return matches_test_pattern(result.file_path, result.name, patterns)
 
 
 def _is_stub_result(result: SearchResult) -> bool:
@@ -628,6 +637,48 @@ def _apply_filters(
     if excluded:
         logger.debug("Result filtering excluded {} of {} results", excluded, len(results))
 
+    return filtered
+
+
+def _record_file_path_and_name(record: dict[str, Any]) -> tuple[str, str]:
+    """Extract (file_path, name) from a raw graph.text_search()/vector_search() record."""
+    node = record.get("node") or record.get("n")
+    props = dict(node.items()) if hasattr(node, "items") else (node if isinstance(node, dict) else {})
+    return props.get("file_path", ""), props.get("name", "")
+
+
+def filter_raw_records(
+    records: list[dict[str, Any]],
+    settings: SearchSettings,
+    *,
+    exclude_tests: bool | None = None,
+    exclude_stubs: bool | None = None,
+    exclude_generated: bool | None = None,
+) -> list[dict[str, Any]]:
+    """Apply the same test/stub/generated exclusion ``_apply_filters`` uses, directly on raw
+    ``{"node": ..., ...}`` records — for callers (text_search/vector_search MCP tools) that
+    query the graph directly rather than going through the full hybrid_search/SearchResult
+    pipeline. ``None`` values fall back to settings defaults, same as ``_apply_filters``.
+    """
+    do_tests = settings.test_filter if exclude_tests is None else exclude_tests
+    do_stubs = settings.stub_filter if exclude_stubs is None else exclude_stubs
+    do_generated = settings.generated_filter if exclude_generated is None else exclude_generated
+    if not (do_tests or do_stubs or do_generated):
+        return records
+
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        file_path, name = _record_file_path_and_name(record)
+        if do_tests and matches_test_pattern(file_path, name, settings.test_patterns):
+            continue
+        if do_stubs and _normalize_path(file_path).endswith((".pyi", ".d.ts")):
+            continue
+        if do_generated:
+            fp = _normalize_path(file_path)
+            basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+            if any(fnmatch.fnmatch(basename, pat.lower()) for pat in settings.generated_patterns):
+                continue
+        filtered.append(record)
     return filtered
 
 

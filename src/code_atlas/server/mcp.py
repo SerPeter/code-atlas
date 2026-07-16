@@ -43,7 +43,14 @@ from code_atlas.schema import (
     Visibility,
 )
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError
-from code_atlas.search.engine import CompactNode, SearchMode, SearchType, expand_context, expand_scope
+from code_atlas.search.engine import (
+    CompactNode,
+    SearchMode,
+    SearchType,
+    expand_context,
+    expand_scope,
+    filter_raw_records,
+)
 from code_atlas.search.engine import hybrid_search as _hybrid_search
 from code_atlas.search.guidance import (
     _RELATIONSHIP_SUMMARY,
@@ -918,9 +925,12 @@ def _register_search_tools(mcp: FastMCP) -> None:
 
         t0 = time.monotonic()
         try:
-            all_results = await app.graph.text_search(query, label=label, limit=clamped + 1, projects=resolved_projects)
+            all_results = await app.graph.text_search(
+                query, label=label, limit=clamped * 3 + 1, projects=resolved_projects
+            )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
+        all_results = filter_raw_records(all_results, app.settings.search)
         elapsed = (time.monotonic() - t0) * 1000
 
         total = len(all_results)
@@ -990,10 +1000,11 @@ def _register_search_tools(mcp: FastMCP) -> None:
         t0 = time.monotonic()
         try:
             all_results = await app.graph.vector_search(
-                vector, label=label, limit=clamped + 1, projects=resolved_projects, threshold=threshold
+                vector, label=label, limit=clamped * 3 + 1, projects=resolved_projects, threshold=threshold
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
+        all_results = filter_raw_records(all_results, app.settings.search)
         elapsed = (time.monotonic() - t0) * 1000
 
         total = len(all_results)
