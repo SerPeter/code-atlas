@@ -44,7 +44,7 @@ dependencies = [
     "pydantic-settings~=2.12",
     "mcp~=1.26",
     "neo4j~=6.1",            # Bolt protocol driver (works with Memgraph)
-    "litellm~=1.81",
+    "litellm~=1.81,<1.92",    # >=1.92 dropped prebuilt wheels for Windows/Python 3.14 (Rust ext, no py314 PyO3 support yet)
     "tree-sitter~=0.25",
     "tree-sitter-python~=0.23",
     "tree-sitter-markdown~=0.5",
@@ -98,7 +98,7 @@ dev = [
     "pytest-xdist~=3.8",
     "pre-commit~=4.5",
     "ruff~=0.15",
-    "ty~=0.0.15",
+    "ty==0.0.15",             # pinned exact: 0.0.60 stopped honoring existing `# type: ignore[...]` comments and got much stricter about dict variance, surfacing 182 diagnostics across ~25 unrelated files — pre-1.0 tool, revisit deliberately
     "psutil~=7.2",
     "testcontainers>=4.10",
 ]

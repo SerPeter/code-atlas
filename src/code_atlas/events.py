@@ -133,7 +133,7 @@ class EventBus:
 
     async def ping(self) -> bool:
         """Health check — returns True if Redis is reachable."""
-        return await self._redis.ping()
+        return await self._redis.ping()  # type: ignore[invalid-await]  # stub widened to Awaitable[bool] | bool
 
     async def ensure_group(self, topic: Topic, group: str) -> None:
         """Idempotently create a consumer group (starts reading new messages)."""
@@ -151,7 +151,10 @@ class EventBus:
         """
         with _tracer.start_as_current_span("eventbus.publish", attributes={"topic": topic.value}):
             return await self._redis.xadd(
-                self._stream_key(topic), encode_event(event), maxlen=self._maxlen, approximate=True
+                self._stream_key(topic),
+                encode_event(event),  # type: ignore[invalid-argument-type]  # dict[bytes,bytes] is invariant-incompatible with the stub's broader byte-like union
+                maxlen=self._maxlen,
+                approximate=True,
             )
 
     async def publish_many(self, topic: Topic, events: list[Event]) -> list[bytes]:
@@ -164,7 +167,12 @@ class EventBus:
             key = self._stream_key(topic)
             async with self._redis.pipeline(transaction=False) as pipe:
                 for event in events:
-                    pipe.xadd(key, encode_event(event), maxlen=self._maxlen, approximate=True)
+                    pipe.xadd(
+                        key,
+                        encode_event(event),  # type: ignore[invalid-argument-type]  # see publish()
+                        maxlen=self._maxlen,
+                        approximate=True,
+                    )
                 return await pipe.execute()
 
     async def read_batch(
