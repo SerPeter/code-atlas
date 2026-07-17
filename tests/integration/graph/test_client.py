@@ -2385,14 +2385,16 @@ async def test_resolve_calls_via_import(graph_client: GraphClient):
     ]
     await graph_client.resolve_calls(project, call_rels)
 
-    # Verify CALLS edge: main → helper
+    # Verify CALLS edge: main → helper, tagged resolved/import
     records = await graph_client.execute(
-        f"MATCH (a:{NodeLabel.CALLABLE})-[:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
-        "RETURN a.name AS caller, b.name AS callee",
+        f"MATCH (a:{NodeLabel.CALLABLE})-[r:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
+        "RETURN a.name AS caller, b.name AS callee, r.confidence AS confidence, r.strategy AS strategy",
     )
     assert len(records) == 1
     assert records[0]["caller"] == "main"
     assert records[0]["callee"] == "helper"
+    assert records[0]["confidence"] == "resolved"
+    assert records[0]["strategy"] == "import"
 
 
 async def test_resolve_calls_same_class(graph_client: GraphClient):
@@ -2790,6 +2792,110 @@ async def test_resolve_calls_deduplication(graph_client: GraphClient):
     assert len(records) == 1
     assert records[0]["caller"] == "caller_func"
     assert records[0]["callee"] == "target_func"
+
+
+async def test_resolve_calls_ambiguous_project_wide(graph_client: GraphClient):
+    """Bare name matches >1 project-wide candidate → an edge to each, tagged ambiguous (ADR-0014)."""
+    await graph_client.ensure_schema()
+
+    project = "call_ambig"
+
+    fp_a = "src/mod_a.py"
+    mod_a_entities = [
+        ParsedEntity(
+            name="mod_a",
+            qualified_name=f"{project}:src.mod_a",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp_a,
+            content_hash="a_hash",
+        ),
+        ParsedEntity(
+            name="run",
+            qualified_name=f"{project}:src.mod_a.run",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=2,
+            line_end=5,
+            file_path=fp_a,
+            content_hash="run_a_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_a, mod_a_entities, [])
+
+    fp_b = "src/mod_b.py"
+    mod_b_entities = [
+        ParsedEntity(
+            name="mod_b",
+            qualified_name=f"{project}:src.mod_b",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp_b,
+            content_hash="b_hash",
+        ),
+        ParsedEntity(
+            name="run",
+            qualified_name=f"{project}:src.mod_b.run",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=2,
+            line_end=5,
+            file_path=fp_b,
+            content_hash="run_b_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_b, mod_b_entities, [])
+
+    fp_c = "src/mod_c.py"
+    mod_c_entities = [
+        ParsedEntity(
+            name="mod_c",
+            qualified_name=f"{project}:src.mod_c",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=10,
+            file_path=fp_c,
+            content_hash="c_hash",
+        ),
+        ParsedEntity(
+            name="caller",
+            qualified_name=f"{project}:src.mod_c.caller",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=2,
+            line_end=5,
+            file_path=fp_c,
+            content_hash="caller_hash",
+        ),
+    ]
+    await graph_client.upsert_file_entities(project, fp_c, mod_c_entities, [])
+
+    # caller() calls run() — no import, no shared class/file with either candidate.
+    call_rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{project}:src.mod_c.caller",
+            rel_type=RelType.CALLS,
+            to_name="run",
+        ),
+    ]
+    await graph_client.resolve_calls(project, call_rels)
+
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE})-[r:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
+        "RETURN b.name AS callee, b.file_path AS callee_fp, r.confidence AS confidence, r.strategy AS strategy",
+    )
+    assert len(records) == 2
+    callee_fps = {r["callee_fp"] for r in records}
+    assert callee_fps == {fp_a, fp_b}
+    for record in records:
+        assert record["callee"] == "run"
+        assert record["confidence"] == "ambiguous"
+        assert record["strategy"] == "project_wide"
 
 
 # ---------------------------------------------------------------------------

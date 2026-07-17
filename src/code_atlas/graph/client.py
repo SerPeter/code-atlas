@@ -103,11 +103,15 @@ _POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
 
 # Created by dedicated, out-of-band methods rather than per-file parsing:
 # DEPENDS_ON is project-to-project (monorepo dependency graph); SIMILAR_TO
-# is materialized by the (future) dream-mode consolidation pass, not parsing.
+# is materialized by the (future) dream-mode consolidation pass, not parsing;
+# CO_CHANGES_WITH is written by indexing/git_signals.py's write_git_signals,
+# triggered by the one-shot `atlas mine-git-history` CLI command, not by the
+# parsing/indexing pipeline.
 _OUT_OF_BAND_REL_TYPES: frozenset[RelType] = frozenset(
     {
         RelType.DEPENDS_ON,
         RelType.SIMILAR_TO,
+        RelType.CO_CHANGES_WITH,
     }
 )
 
@@ -454,8 +458,16 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     rel: ParsedRelationship,
     lk: _CallLookup,
     name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
-) -> str | None:
-    """Resolve a single CALLS relationship to a target uid (or ``None``)."""
+) -> tuple[list[str], str] | None:
+    """Resolve a single CALLS relationship to one or more candidate target uids.
+
+    Returns ``(candidate_uids, strategy)``, or ``None`` if nothing matched at all.
+    A single-element ``candidate_uids`` is an unambiguous match (the caller tags
+    the edge ``confidence: "resolved"``); more than one element means the bare
+    name matched multiple candidates that could not be disambiguated (the caller
+    tags every resulting edge ``confidence: "ambiguous"`` instead of discarding
+    them, per ADR-0014).
+    """
     caller_uid = rel.from_qualified_name
     bare_name = rel.to_name
 
@@ -478,10 +490,10 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     if module_uid and bare_name in lk.import_map.get(module_uid, {}):
         target_uid = lk.import_map[module_uid][bare_name]
         if target_uid in lk.uid_to_info:
-            return target_uid
+            return ([target_uid], "import")
         init_uid = _typedef_init_uid(target_uid, lk)
         if init_uid is not None:
-            return init_uid
+            return ([init_uid], "import")
 
     # Strategy 2: Same-class sibling
     if caller_uid in lk.caller_to_parent:
@@ -491,7 +503,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
                 continue
             sib_info = lk.uid_to_info.get(sibling_uid)
             if sib_info and sib_info[0] == bare_name:
-                return sibling_uid
+                return ([sibling_uid], "sibling")
 
     # Strategy 3: Same-file match
     caller_info = lk.uid_to_info.get(caller_uid)
@@ -499,26 +511,36 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     if caller_fp:
         for uid, fp, _vis in lk.name_to_callables.get(bare_name, []):
             if fp == caller_fp and uid != caller_uid:
-                return uid
+                return ([uid], "same_file")
 
-    # Strategy 4: Project-wide unique match — only when exactly 1 candidate exists.
-    # Ambiguous names (run, close, get) are left unresolved to avoid false positives
-    # from external attribute calls like asyncio.run(), session.run(), etc.
+    # Strategy 4: Project-wide match. Previously only fired when exactly 1
+    # candidate existed (ambiguous names like run/close/get were left
+    # unresolved to avoid false positives from external attribute calls such
+    # as asyncio.run(), session.run()). Now every candidate is returned —
+    # unambiguous (len==1) resolves normally; ambiguous (len>1) still
+    # materializes an edge to each candidate, tagged confidence:"ambiguous"
+    # by the caller instead of being discarded (ADR-0014).
     candidates = lk.name_to_callables.get(bare_name, [])
     non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
     if len(non_self) == 1:
-        return non_self[0]
+        return (non_self, "project_unique")
+    if len(non_self) > 1:
+        return (non_self, "project_wide")
 
     # Strategy 5: Constructor call (bare_name is a class, not a function) — a
     # `ClassName(...)` call's bare name is the class name, but the constructor
     # itself is named `__init__`, so it never matches any strategy above. Runs
     # last so it never steals priority from a real function-name match. Same
-    # "only when unambiguous" discipline as Strategy 4: multiple classes
-    # sharing the bare name are left unresolved rather than guessed.
+    # "return every candidate" discipline as Strategy 4: multiple classes
+    # sharing the bare name now all resolve (ambiguously) instead of being
+    # dropped.
     if name_to_typedefs is not None:
         typedef_candidates = name_to_typedefs.get(bare_name, [])
-        if len(typedef_candidates) == 1:
-            return _typedef_init_uid(typedef_candidates[0][0], lk)
+        init_uids = [
+            init_uid for td_uid, _fp in typedef_candidates if (init_uid := _typedef_init_uid(td_uid, lk)) is not None
+        ]
+        if init_uids:
+            return (init_uids, "constructor")
 
     return None
 
@@ -1274,9 +1296,14 @@ class GraphClient:
         1. **Import match** — caller's module imports something with that name.
         2. **Same-class sibling** — if caller is a method, check siblings in same TypeDef.
         3. **Same-file match** — any Callable with that name in the same file.
-        4. **Project-wide match** — any Callable with that name (prefer public).
-        5. **Constructor call** — bare_name is a unique class name; resolves to its `__init__`.
+        4. **Project-wide match** — every Callable with that name.
+        5. **Constructor call** — bare_name is a class name; resolves to its `__init__`(s).
         6. **Unresolved** — skip silently (builtins, dynamic calls).
+
+        Every created edge is tagged ``confidence`` (``"resolved"`` for a single
+        candidate, ``"ambiguous"`` when strategy 4/5 matched more than one — see
+        ADR-0014) and ``strategy`` (``"import"|"sibling"|"same_file"|"project_unique"|
+        "project_wide"|"constructor"``).
         """
         if not call_rels:
             return
@@ -1295,28 +1322,38 @@ class GraphClient:
                 name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
 
         # Resolve each call
-        edges: set[tuple[str, str]] = set()
+        edges: dict[tuple[str, str], tuple[str, str]] = {}  # (from,to) -> (confidence, strategy)
         resolved = 0
+        ambiguous = 0
         unresolved = 0
         for rel in call_rels:
-            target_uid = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
-            if target_uid is not None:
-                edges.add((rel.from_qualified_name, target_uid))
+            result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
+            if result is None:
+                unresolved += 1
+                continue
+            candidate_uids, strategy = result
+            confidence = "resolved" if len(candidate_uids) == 1 else "ambiguous"
+            if confidence == "resolved":
                 resolved += 1
             else:
-                unresolved += 1
+                ambiguous += 1
+            for target_uid in candidate_uids:
+                edges[(rel.from_qualified_name, target_uid)] = (confidence, strategy)
 
         # Batch-create CALLS edges
         if edges:
-            edge_params = [{"f": f, "t": t} for f, t in edges]
+            edge_params = [
+                {"f": f, "t": t, "confidence": conf, "strategy": strat} for (f, t), (conf, strat) in edges.items()
+            ]
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 f"MATCH (a:{NodeLabel.CALLABLE} {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
-                f"MERGE (a)-[:{RelType.CALLS}]->(b)",
+                f"MERGE (a)-[e:{RelType.CALLS}]->(b) "
+                f"SET e.confidence = r.confidence, e.strategy = r.strategy",
                 {"rels": edge_params},
             )
 
-        logger.debug("Resolved {} CALLS edges ({} unresolved)", resolved, unresolved)
+        logger.debug("Resolved {} CALLS edges ({} ambiguous, {} unresolved)", resolved, ambiguous, unresolved)
 
     async def build_anchor_lookup(self) -> _AnchorLookup:
         """Build the cross-project lookup tables needed for anchor resolution."""

@@ -10,10 +10,13 @@ from code_atlas.graph.client import (
     _OUT_OF_BAND_REL_TYPES,
     _POST_BATCH_REL_TYPES,
     _UID_ROUTED_REL_TYPES,
+    _CallLookup,
     _fuse_bm25_results,
+    _resolve_one_call,
     _sanitize_bm25_query,
     _validate_relationship_routing,
 )
+from code_atlas.parsing.ast import ParsedRelationship
 from code_atlas.schema import RelType
 
 
@@ -110,3 +113,127 @@ class TestFuseBm25Results:
         index_a = [{"node": None, "score": 5.0}, {"node": {"uid": "p:ok"}, "score": 1.0}]
         fused = _fuse_bm25_results([index_a])
         assert [r["node"]["uid"] for r in fused] == ["p:ok"]
+
+
+class TestResolveOneCall:
+    """_resolve_one_call (client.py) — CALLS resolution strategies.
+
+    Strategies 4 (project-wide match) and 5 (constructor call) now return every
+    candidate instead of only firing when exactly one exists (ADR-0014): the
+    caller (resolve_calls) derives confidence from the returned list's length —
+    a single candidate is "resolved", more than one is "ambiguous" — rather than
+    the resolver silently discarding ambiguous matches.
+    """
+
+    PROJECT = "proj"
+
+    def _rel(self, from_uid: str, to_name: str) -> ParsedRelationship:
+        return ParsedRelationship(from_qualified_name=from_uid, rel_type=RelType.CALLS, to_name=to_name)
+
+    def test_project_wide_unique_match_resolves(self):
+        """Strategy 4, exactly 1 candidate → resolved, strategy=project_unique."""
+        lookup = _CallLookup(
+            name_to_callables={"helper": [(f"{self.PROJECT}:mod.helper", "mod.py", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={f"{self.PROJECT}:mod.helper": ("helper", "mod.py")},
+        )
+        rel = self._rel(f"{self.PROJECT}:mod.caller", "helper")
+        result = _resolve_one_call(self.PROJECT, rel, lookup)
+        assert result == ([f"{self.PROJECT}:mod.helper"], "project_unique")
+
+    def test_project_wide_ambiguous_match_returns_all_candidates(self):
+        """Strategy 4, >1 candidate → every candidate returned, strategy=project_wide."""
+        lookup = _CallLookup(
+            name_to_callables={
+                "run": [
+                    (f"{self.PROJECT}:mod_a.run", "mod_a.py", "public"),
+                    (f"{self.PROJECT}:mod_b.run", "mod_b.py", "public"),
+                ]
+            },
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={
+                f"{self.PROJECT}:mod_a.run": ("run", "mod_a.py"),
+                f"{self.PROJECT}:mod_b.run": ("run", "mod_b.py"),
+            },
+        )
+        rel = self._rel(f"{self.PROJECT}:mod_c.caller", "run")
+        result = _resolve_one_call(self.PROJECT, rel, lookup)
+        assert result is not None
+        candidates, strategy = result
+        assert strategy == "project_wide"
+        assert set(candidates) == {f"{self.PROJECT}:mod_a.run", f"{self.PROJECT}:mod_b.run"}
+
+    def test_constructor_unique_match_resolves(self):
+        """Strategy 5, exactly 1 same-named TypeDef → resolved, strategy=constructor."""
+        lookup = _CallLookup(
+            name_to_callables={},
+            import_map={},
+            caller_to_parent={},
+            parent_children={f"{self.PROJECT}:mod.Widget": [f"{self.PROJECT}:mod.Widget.__init__"]},
+            uid_to_info={f"{self.PROJECT}:mod.Widget.__init__": ("__init__", "mod.py")},
+        )
+        name_to_typedefs = {"Widget": [(f"{self.PROJECT}:mod.Widget", "mod.py")]}
+        rel = self._rel(f"{self.PROJECT}:mod.build", "Widget")
+        result = _resolve_one_call(self.PROJECT, rel, lookup, name_to_typedefs)
+        assert result == ([f"{self.PROJECT}:mod.Widget.__init__"], "constructor")
+
+    def test_constructor_ambiguous_match_returns_all_init_candidates(self):
+        """Strategy 5, >1 same-named TypeDef → every __init__ candidate returned, still tagged constructor."""
+        lookup = _CallLookup(
+            name_to_callables={},
+            import_map={},
+            caller_to_parent={},
+            parent_children={
+                f"{self.PROJECT}:mod_a.Widget": [f"{self.PROJECT}:mod_a.Widget.__init__"],
+                f"{self.PROJECT}:mod_b.Widget": [f"{self.PROJECT}:mod_b.Widget.__init__"],
+            },
+            uid_to_info={
+                f"{self.PROJECT}:mod_a.Widget.__init__": ("__init__", "mod_a.py"),
+                f"{self.PROJECT}:mod_b.Widget.__init__": ("__init__", "mod_b.py"),
+            },
+        )
+        name_to_typedefs = {
+            "Widget": [
+                (f"{self.PROJECT}:mod_a.Widget", "mod_a.py"),
+                (f"{self.PROJECT}:mod_b.Widget", "mod_b.py"),
+            ]
+        }
+        rel = self._rel(f"{self.PROJECT}:mod_c.build", "Widget")
+        result = _resolve_one_call(self.PROJECT, rel, lookup, name_to_typedefs)
+        assert result is not None
+        candidates, strategy = result
+        assert strategy == "constructor"
+        assert set(candidates) == {
+            f"{self.PROJECT}:mod_a.Widget.__init__",
+            f"{self.PROJECT}:mod_b.Widget.__init__",
+        }
+
+    def test_constructor_candidates_without_init_are_excluded(self):
+        """A same-named TypeDef with no __init__ child contributes no candidate."""
+        lookup = _CallLookup(
+            name_to_callables={},
+            import_map={},
+            caller_to_parent={},
+            parent_children={f"{self.PROJECT}:mod.Widget": []},
+            uid_to_info={},
+        )
+        name_to_typedefs = {"Widget": [(f"{self.PROJECT}:mod.Widget", "mod.py")]}
+        rel = self._rel(f"{self.PROJECT}:mod.build", "Widget")
+        result = _resolve_one_call(self.PROJECT, rel, lookup, name_to_typedefs)
+        assert result is None
+
+    def test_no_match_returns_none(self):
+        lookup = _CallLookup(
+            name_to_callables={},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={},
+        )
+        rel = self._rel(f"{self.PROJECT}:mod.func", "print")
+        result = _resolve_one_call(self.PROJECT, rel, lookup, {})
+        assert result is None

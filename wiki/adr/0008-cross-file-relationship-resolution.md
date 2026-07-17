@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted — amends [ADR-0007](./0007-qualified-name-strategy.md)
+Accepted — amends [ADR-0007](./0007-qualified-name-strategy.md); amended by [ADR-0014](./0014-calls-edge-confidence.md)
+(ambiguous CALLS matches now materialize as `confidence:"ambiguous"` edges instead of being discarded)
 
 ## Date
 
