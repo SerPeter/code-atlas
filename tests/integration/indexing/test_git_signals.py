@@ -1,0 +1,100 @@
+"""Integration tests for git-signal mining (find_hotspots) against a real Memgraph instance.
+
+Mines *this repo's own real git history* (read-only `git log`-equivalent
+operations via GitPython — never mutates anything) and confirms the mined
+signals land on seeded Module nodes, both via the pure write_git_signals path
+and via the `atlas mine-git-history` CLI command end-to-end.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock
+
+import pytest
+
+from code_atlas import cli
+from code_atlas.graph.client import GraphClient
+from code_atlas.indexing.git_signals import mine_git_signals, write_git_signals
+from code_atlas.schema import RelType
+from code_atlas.settings import derive_project_name, find_git_root
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+pytestmark = pytest.mark.integration
+
+_found_root = find_git_root()
+if _found_root is None:
+    raise RuntimeError("tests must run inside the code-atlas git repo")
+_REPO_ROOT: Path = _found_root
+_PROJECT = derive_project_name(_REPO_ROOT)
+
+# Two files with a long, well-established co-change history in this repo
+# (cli.py and settings.py both change together across most CLI-facing commits).
+_FILE_A = "src/code_atlas/cli.py"
+_FILE_B = "src/code_atlas/settings.py"
+
+
+async def _seed_modules(graph_client: GraphClient) -> None:
+    await graph_client.merge_project_node(_PROJECT)
+    for fp in (_FILE_A, _FILE_B):
+        uid = f"{_PROJECT}:{fp}"
+        await graph_client.execute_write(
+            "CREATE (n:Module {uid: $uid, project_name: $p, name: $fp, qualified_name: $uid, "
+            "file_path: $fp, kind: 'module', line_start: 1, line_end: 1})",
+            {"uid": uid, "p": _PROJECT, "fp": fp},
+        )
+
+
+class TestWriteGitSignals:
+    async def test_writes_per_file_signals_and_co_change_edge(self, graph_client):
+        await _seed_modules(graph_client)
+
+        result = mine_git_signals(_REPO_ROOT, co_change_threshold=3)
+        stats = await write_git_signals(graph_client, _PROJECT, result)
+
+        assert stats["commits_scanned"] > 0
+        assert stats["files_matched"] == 2
+
+        rows = await graph_client.execute(
+            "MATCH (n:Module {project_name: $p}) WHERE n.git_commit_count IS NOT NULL "
+            "RETURN n.file_path AS fp, n.git_commit_count AS cc, n.git_author_count AS ac, "
+            "n.git_days_since_last_commit AS days ORDER BY fp",
+            {"p": _PROJECT},
+        )
+        by_path = {r["fp"]: r for r in rows}
+        assert set(by_path) == {_FILE_A, _FILE_B}
+        assert by_path[_FILE_A]["cc"] > 0
+        assert by_path[_FILE_A]["ac"] >= 1
+        assert by_path[_FILE_A]["days"] >= 0
+
+        edge_rows = await graph_client.execute(
+            f"MATCH (a:Module {{project_name: $p, file_path: $fa}})"
+            f"-[r:{RelType.CO_CHANGES_WITH}]->(b:Module {{project_name: $p, file_path: $fb}}) "
+            "RETURN r.count AS count",
+            {"p": _PROJECT, "fa": _FILE_A, "fb": _FILE_B},
+        )
+        assert edge_rows, "expected a CO_CHANGES_WITH edge between cli.py and settings.py"
+        assert edge_rows[0]["count"] >= 3
+
+
+class TestMineGitHistoryCliCommand:
+    """`atlas mine-git-history` end-to-end: real git history in, graph writes out."""
+
+    async def test_cli_command_mines_and_writes_signals(self, graph_client, monkeypatch):
+        await _seed_modules(graph_client)
+
+        # Reuse the fixture's already-connected client instead of opening a
+        # second driver connection; keep the shared connection open past the
+        # CLI helper's own `finally: await graph.close()`.
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda settings: graph_client)
+        monkeypatch.setattr(GraphClient, "close", AsyncMock())
+
+        await cli._run_mine_git_history(str(_REPO_ROOT), 3, no_git_check=False)
+
+        rows = await graph_client.execute(
+            "MATCH (n:Module {project_name: $p}) WHERE n.git_commit_count IS NOT NULL RETURN count(n) AS cnt",
+            {"p": _PROJECT},
+        )
+        assert rows[0]["cnt"] == 2

@@ -74,6 +74,8 @@ class RelType(StrEnum):
     LINKS_TO = "LINKS_TO"
     DERIVED_FROM = "DERIVED_FROM"
     SUPERSEDES = "SUPERSEDES"
+    # Git-derived signals (Module <-> Module, out-of-band — see git_signals.py)
+    CO_CHANGES_WITH = "CO_CHANGES_WITH"
 
 
 # ---------------------------------------------------------------------------

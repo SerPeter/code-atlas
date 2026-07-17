@@ -238,6 +238,24 @@ def watch(
         logger.info("Interrupted — shutting down")
 
 
+@app.command("mine-git-history")
+def mine_git_history(
+    path: str = typer.Argument(".", help="Path to the project root to mine git history for."),
+    co_change_threshold: int = typer.Option(
+        3, "--co-change-threshold", help="Minimum shared commits for a CO_CHANGES_WITH edge."
+    ),
+    no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow running outside a git repository."),
+) -> None:
+    """Mine git history for hotspot/bus-factor/co-change signals (see find_hotspots).
+
+    One-shot batch job over the full commit history — not part of the
+    continuous indexing pipeline. Re-run periodically (e.g. from CI) to
+    refresh the mined signals; results are written onto existing Module/
+    DocFile nodes, so index the project first.
+    """
+    asyncio.run(_run_mine_git_history(path, co_change_threshold, no_git_check=no_git_check))
+
+
 @app.command()
 def dream() -> None:
     """Deterministic dream-mode report: inbox, orphans, dangling links, duplicates, similarity.
@@ -760,6 +778,52 @@ async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
         _echo(f"Removed project '{name}'.")
         if _output.json:
             _json_output({"removed": name})
+    finally:
+        await graph.close()
+
+
+# ---------------------------------------------------------------------------
+# Git signals mining async helper
+# ---------------------------------------------------------------------------
+
+
+async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_check: bool) -> None:
+    """Async implementation of the ``atlas mine-git-history`` command."""
+    from git.exc import InvalidGitRepositoryError, NoSuchPathError
+
+    from code_atlas.graph.client import GraphClient
+    from code_atlas.indexing.git_signals import mine_git_signals, write_git_signals
+    from code_atlas.settings import AtlasSettings, derive_project_name
+
+    project_root, _auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
+    settings = AtlasSettings(project_root=project_root)
+    project_name = derive_project_name(settings.project_root)
+
+    graph = GraphClient(settings)
+    try:
+        await graph.ping()
+    except Exception as exc:
+        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        _echo(f"Mining git history for '{project_name}'...")
+        try:
+            result = mine_git_signals(project_root, co_change_threshold=co_change_threshold)
+        except (InvalidGitRepositoryError, NoSuchPathError) as exc:
+            logger.error("Not a git repository: {} — {}", project_root, exc)
+            raise typer.Exit(code=1) from exc
+
+        stats = await write_git_signals(graph, project_name, result)
+        if _output.json:
+            _json_output(stats)
+        else:
+            _echo(
+                f"Scanned {stats['commits_scanned']} commits — "
+                f"{stats['files_matched']}/{stats['files_mined']} files matched, "
+                f"{stats['co_change_edges']} co-change edges ({stats['co_change_pairs_mined']} pairs mined, "
+                f"threshold={co_change_threshold})"
+            )
     finally:
         await graph.close()
 

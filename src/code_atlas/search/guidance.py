@@ -51,6 +51,7 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.LINKS_TO: "Note -> Note/DocSection it [[wikilinks]] to",
     RelType.DERIVED_FROM: "Note -> Note it was merged/promoted/summarized from (dream-mode provenance)",
     RelType.SUPERSEDES: "Note -> Note it replaces (dream-mode contradiction resolution)",
+    RelType.CO_CHANGES_WITH: "Module -> Module frequently committed together (git history, `count` property)",
 }
 
 # ---------------------------------------------------------------------------
