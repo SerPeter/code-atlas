@@ -3,7 +3,12 @@ services:
   # Memgraph — graph database with BM25 + vector search
   # ---------------------------------------------------------------------------
   memgraph:
-    image: memgraph/memgraph:3.7.2
+    # MAGE-enabled image (not the plain community image) — required for the
+    # leiden_community_detection.get()/community_detection.get() procedures
+    # backing analyze_repo(analysis="communities")/find_communities. Breaking
+    # infra change for existing deployments: `docker compose pull && docker
+    # compose up -d` to pick up the new image.
+    image: memgraph/memgraph-mage:3.7.2
     restart: unless-stopped
     ports:
       - "7687:7687" # Bolt protocol
@@ -52,7 +57,9 @@ services:
   # ---------------------------------------------------------------------------
   memgraph-test:
     profiles: [test]
-    image: memgraph/memgraph:3.7.2
+    # Same MAGE-enabled image as `memgraph` — integration tests exercising
+    # community detection need the query module available here too.
+    image: memgraph/memgraph-mage:3.7.2
     restart: unless-stopped
     ports:
       - "7688:7687" # Bolt protocol (test)

@@ -95,6 +95,10 @@ curl -O https://raw.githubusercontent.com/SerPeter/code-atlas/main/docker-compos
 docker compose up -d
 ```
 
+> `docker-compose.yml` runs the MAGE-enabled `memgraph/memgraph-mage` image (needed for
+> `find_communities`/community detection). Existing deployments on an older compose file:
+> `docker compose pull && docker compose up -d` to switch over.
+
 Optional — add local embeddings (no API keys needed):
 
 ```bash
