@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted — amended by [ADR-0012](./0012-rename-vault-to-wiki.md) (default vault directory renamed `docs/` → `wiki/`; the
+single-merged-directory decision below is unchanged)
 
 ## Date
 

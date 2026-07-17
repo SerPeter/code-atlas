@@ -175,8 +175,8 @@ discriminated by a `kind` property instead of language-specific labels (e.g., `T
 `Callable {kind: "method"}`). This is language-agnostic and paradigm-agnostic (OOP, FP, procedural).
 
 **Documentation & knowledge nodes (3):** DocFile, DocSection — heading-level extraction from ordinary markdown, linked
-to code via DOCUMENTS edges. Note — a frontmatter-triggered atomic zettel (one node per file, not per heading); `docs/`
-is an Obsidian-compatible knowledge vault that coexists with ordinary docs in the same tree (see `docs/SCHEMA.md`).
+to code via DOCUMENTS edges. Note — a frontmatter-triggered atomic zettel (one node per file, not per heading); `wiki/`
+is an Obsidian-compatible knowledge vault that coexists with ordinary docs in the same tree (see `wiki/SCHEMA.md`).
 Notes link to each other via LINKS_TO (`[[wikilinks]]`) and DERIVED_FROM/SUPERSEDES (dream-mode provenance), and to code
 via the same DOCUMENTS edge (explicit `anchors:` or heuristic symbol/file-path mentions).
 

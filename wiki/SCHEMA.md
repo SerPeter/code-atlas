@@ -1,6 +1,6 @@
 # Knowledge Vault — SCHEMA.md
 
-This directory (`docs/`) is the knowledge vault: an Obsidian-compatible, zettelkasten-style note collection that lives
+This directory (`wiki/`) is the knowledge vault: an Obsidian-compatible, zettelkasten-style note collection that lives
 in the same graph as the code it documents. Ordinary prose docs and ADRs coexist here with vault notes — a file becomes
 a `Note` node the moment it carries vault frontmatter; everything else keeps today's heading-level
 `DocFile`/`DocSection` behavior. This file itself carries no frontmatter, so it's indexed as an ordinary doc.
@@ -10,7 +10,7 @@ Architecture and roadmap: see `.tasks/research/2026-07-11-knowledge-convergence-
 ## Directory layout
 
 ```
-docs/
+wiki/
 ├── SCHEMA.md          # this file
 ├── HOME.md             # generated landing page (Phase 4 — not built yet)
 ├── inbox/              # quick-capture drafts — committed, travel with the branch
@@ -77,7 +77,7 @@ Two files sharing an `id` will silently merge into one graph node — don't do t
 ## Workflow
 
 - **Capture** — write a draft to `inbox/` (via the `remember` MCP tool, once built in Phase 2, or by hand).
-  Zero-decision, append-only, never read existing files first. Both `docs/inbox/` and the Claude Code memory dir are
+  Zero-decision, append-only, never read existing files first. Both `wiki/inbox/` and the Claude Code memory dir are
   equivalent draft piles — write wherever is cheapest; consolidation is the authoritative router, not capture-time
   judgment.
 - **Consolidate** — `atlas dream --report` (Phase 4 — not built yet) plus the `dream-mode` skill turns drafts into

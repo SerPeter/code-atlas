@@ -13,7 +13,7 @@ venues and archive convention that code-atlas's unified graph makes possible.
 
 ## Why this repo needs its own version
 
-In code-atlas, repo-inbox drafts (`docs/inbox/`), the harness memory dir, and (if configured) the global vault are **all
+In code-atlas, repo-inbox drafts (`wiki/inbox/`), the harness memory dir, and (if configured) the global vault are **all
 Notes in the same Memgraph graph** — one `atlas dream` (or the `knowledge_health` MCP tool) call produces a single
 deterministic report spanning all three, instead of three separate manual audits. Capture-time routing is best-effort
 (write wherever's cheapest mid-session); this command is the authoritative consolidation pass across all of them, same
@@ -22,7 +22,7 @@ as the global command's philosophy — just with a graph-backed inventory instea
 ## 1. Inventory (replaces the global command's step 1)
 
 - Run `atlas dream --json` (or call the `knowledge_health` MCP tool) instead of manually listing memory-dir files. It
-  returns, across every configured vault (this repo's `docs/`, the harness memory dir, and any
+  returns, across every configured vault (this repo's `wiki/`, the harness memory dir, and any
   `[knowledge] extra_vaults`):
   - `inbox_count` / `inbox_paths` — draft notes awaiting disposition
   - `orphan_notes` — notes with no `[[wikilinks]]` in or out (disconnected from the note graph)
@@ -37,8 +37,8 @@ as the global command's philosophy — just with a graph-backed inventory instea
 - Still read `MEMORY.md` directly for the human-facing index (byte size, entry count) — the report's
   `memory_index_issues` only flags _consistency_, not size.
 - List promotion venues exactly as the global command does (skills, rules, CLAUDE.md, inline comments, docs/) **plus**:
-  - **`docs/notes/` / `docs/decisions/`** — durable zettels in this repo's own vault (`kind: note` / `kind: decision`
-    frontmatter, per `docs/SCHEMA.md`)
+  - **`wiki/notes/` / `wiki/decisions/`** — durable zettels in this repo's own vault (`kind: note` / `kind: decision`
+    frontmatter, per `wiki/SCHEMA.md`)
   - **The global vault** — cross-project generalizations (`promotion_candidates` above is the mechanical signal for this
     venue)
 - Do not modify anything yet.

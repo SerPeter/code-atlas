@@ -82,7 +82,7 @@ atlas = "code_atlas.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/SerPeter/code-atlas"
-Documentation = "https://github.com/SerPeter/code-atlas/tree/main/docs"
+Documentation = "https://github.com/SerPeter/code-atlas/tree/main/wiki"
 Repository = "https://github.com/SerPeter/code-atlas"
 Issues = "https://github.com/SerPeter/code-atlas/issues"
 Changelog = "https://github.com/SerPeter/code-atlas/blob/main/CHANGELOG.md"

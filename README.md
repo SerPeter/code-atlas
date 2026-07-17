@@ -48,7 +48,7 @@ All powered by [Memgraph](https://memgraph.com/) as a single backend.
 
 Several excellent tools exist in this space — graph-based analyzers, semantic search engines, wiki generators, and IDE-integrated indexers. Code Atlas builds on their ideas while addressing a gap: no single tool combines graph traversal, semantic search, and BM25 keyword search with documentation intelligence and MCP exposure.
 
-For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code-graph-rag, codegraph-rust, and more, see [docs/landscape.md](docs/landscape.md).
+For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code-graph-rag, codegraph-rust, and more, see [wiki/landscape.md](wiki/landscape.md).
 
 ## MCP Tools
 
@@ -129,7 +129,7 @@ claude mcp add code-atlas -- uvx --from code-atlas-mcp atlas mcp
 }
 ```
 
-See [CLI usage guide](docs/guides/usage.md) for more commands and options.
+See [CLI usage guide](wiki/guides/usage.md) for more commands and options.
 
 ### Development
 
@@ -152,16 +152,16 @@ uv run pre-commit install
 | `vector_search`            | 102 ms                |
 | Concurrent QPS             | **238** (zero errors) |
 
-Full index includes parsing, graph upserts, and embedding via local TEI (8 concurrent workers). Parse-only is raw tree-sitter CPU time without I/O. Query latencies are averages from `scripts/profile_query.py`. Full benchmark tables: [docs/benchmarks.md](docs/benchmarks.md)
+Full index includes parsing, graph upserts, and embedding via local TEI (8 concurrent workers). Parse-only is raw tree-sitter CPU time without I/O. Query latencies are averages from `scripts/profile_query.py`. Full benchmark tables: [wiki/benchmarks.md](wiki/benchmarks.md)
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — system design, pipelines, deployment model
-- [Landscape](docs/landscape.md) — code intelligence tools comparison and design rationale
-- [Configuration](docs/guides/configuration.md) — atlas.toml, .atlasignore, environment variables
-- [CLI Usage](docs/guides/usage.md) — indexing, searching, daemon mode
-- [Benchmarks](docs/benchmarks.md) — parsing, query latency, concurrency
-- [Repository Guidelines](docs/guides/repo-guidelines.md) — structure your code for better indexing
+- [Architecture](wiki/architecture.md) — system design, pipelines, deployment model
+- [Landscape](wiki/landscape.md) — code intelligence tools comparison and design rationale
+- [Configuration](wiki/guides/configuration.md) — atlas.toml, .atlasignore, environment variables
+- [CLI Usage](wiki/guides/usage.md) — indexing, searching, daemon mode
+- [Benchmarks](wiki/benchmarks.md) — parsing, query latency, concurrency
+- [Repository Guidelines](wiki/guides/repo-guidelines.md) — structure your code for better indexing
 
 ## Supporting Code Atlas
 

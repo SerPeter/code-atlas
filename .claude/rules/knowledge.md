@@ -1,7 +1,9 @@
 # Knowledge Vault Pointer
 
-This repo's `docs/` directory is a knowledge vault indexed into the code-atlas graph alongside the code — a `Note` node
-per frontmattered file, linked to code entities and to each other. Full conventions: `docs/SCHEMA.md`.
+This repo's `wiki/` directory is a knowledge vault indexed into the code-atlas graph alongside the code — a `Note` node
+per frontmattered file, linked to code entities and to each other. Full conventions: `wiki/SCHEMA.md`. The directory
+name is configurable per project (`[knowledge] vault_path` in `atlas.toml`, default `"wiki"`) — this repo uses the
+default.
 
 This file is a stable pointer, not a status digest — it doesn't change as notes are added; look the state up when you
 need it instead of reading it here.
@@ -16,11 +18,11 @@ need it instead of reading it here.
 
 ## Writing things
 
-- Quick findings mid-session: drop a frontmattered file in `docs/inbox/` (see SCHEMA.md for the frontmatter shape) — or
+- Quick findings mid-session: drop a frontmattered file in `wiki/inbox/` (see SCHEMA.md for the frontmatter shape) — or
   the Claude Code memory dir if it's a private/machine-local observation, not something the repo should carry. Both are
   equivalent draft piles; don't agonize over which.
 - A `remember` MCP write tool for this is planned (Phase 2) but not built yet.
-- Durable notes in `docs/notes/`/`docs/decisions/` are produced by dream-mode consolidation only — don't write there
+- Durable notes in `wiki/notes/`/`wiki/decisions/` are produced by dream-mode consolidation only — don't write there
   directly.
 
 ## Status

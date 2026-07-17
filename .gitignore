@@ -67,7 +67,7 @@ data/tei/
 atlas.local.toml
 
 # Generated knowledge-vault landing page (atlas dream) — derived, not authored
-docs/HOME.md
+wiki/HOME.md
 
 # Environment files (secrets) — .env.dist is tracked
 .env
