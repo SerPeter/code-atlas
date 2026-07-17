@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from code_atlas.server.analysis import _sid, analyze_repo, generate_diagram
+from code_atlas.server.analysis import _format_path_hops, _sid, analyze_repo, blast_radius, generate_diagram, trace_path
 
 # ---------------------------------------------------------------------------
 # Dependencies: cross-package coupling
@@ -174,6 +174,490 @@ async def test_diagram_packages_applies_path_filter():
     query, params = graph.execute.call_args[0]
     assert "$path" in query
     assert params["path"] == "src/foo"
+
+
+# ---------------------------------------------------------------------------
+# trace_path / blast_radius (information-retrieval family, ADR-0013)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRel(dict):
+    """Minimal stand-in for a neo4j Relationship object: dict props + .type."""
+
+    def __init__(self, type_: str, **props: object) -> None:
+        super().__init__(**props)
+        self.type = type_
+
+
+def test_format_path_hops_includes_confidence_and_strategy():
+    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
+    rels = [_FakeRel("CALLS", confidence="resolved", strategy="import")]
+
+    hops = _format_path_hops(nodes, rels)
+
+    assert hops == [
+        {
+            "from": {"uid": "p:a", "name": "a"},
+            "to": {"uid": "p:b", "name": "b"},
+            "edge_type": "CALLS",
+            "confidence": "resolved",
+            "strategy": "import",
+        }
+    ]
+
+
+def test_format_path_hops_omits_confidence_when_absent():
+    """A non-CALLS edge (e.g. IMPORTS) has no confidence/strategy property to surface."""
+    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
+    rels = [_FakeRel("IMPORTS")]
+
+    hops = _format_path_hops(nodes, rels)
+
+    assert "confidence" not in hops[0]
+    assert "strategy" not in hops[0]
+    assert hops[0]["edge_type"] == "IMPORTS"
+
+
+def test_format_path_hops_multi_hop():
+    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}, {"uid": "p:c", "name": "c"}]
+    rels = [_FakeRel("CALLS"), _FakeRel("CALLS")]
+
+    hops = _format_path_hops(nodes, rels)
+
+    assert len(hops) == 2
+    assert hops[0]["to"]["uid"] == "p:b"
+    assert hops[1]["from"]["uid"] == "p:b"
+
+
+async def test_trace_path_missing_from_node_returns_not_found():
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[{"from_exists": False, "to_exists": True}])
+
+    result = await trace_path(graph, "p:missing", "p:b")
+
+    assert result["code"] == "NOT_FOUND"
+    assert "p:missing" in result["error"]
+
+
+async def test_trace_path_missing_to_node_returns_not_found():
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[{"from_exists": True, "to_exists": False}])
+
+    result = await trace_path(graph, "p:a", "p:missing")
+
+    assert result["code"] == "NOT_FOUND"
+    assert "p:missing" in result["error"]
+
+
+async def test_trace_path_no_path_within_depth():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        side_effect=[
+            [{"from_exists": True, "to_exists": True}],
+            [],
+        ]
+    )
+
+    result = await trace_path(graph, "p:a", "p:b", max_depth=3)
+
+    assert result["found"] is False
+    assert result["max_depth"] == 3
+    assert "message" in result
+
+
+async def test_trace_path_found_builds_hops_with_confidence():
+    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
+    rels = [_FakeRel("CALLS", confidence="resolved", strategy="import")]
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        side_effect=[
+            [{"from_exists": True, "to_exists": True}],
+            [{"path_nodes": nodes, "path_rels": rels, "hops": 1}],
+        ]
+    )
+
+    result = await trace_path(graph, "p:a", "p:b", max_depth=6)
+
+    assert result["found"] is True
+    assert result["hop_count"] == 1
+    assert result["hops"][0]["confidence"] == "resolved"
+    assert result["hops"][0]["edge_type"] == "CALLS"
+
+
+async def test_blast_radius_not_found():
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[{"exists": False}])
+
+    result = await blast_radius(graph, "p:missing")
+
+    assert result["code"] == "NOT_FOUND"
+
+
+async def test_blast_radius_invalid_direction():
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[{"exists": True}])
+
+    result = await blast_radius(graph, "p:a", direction="sideways")
+
+    assert result["code"] == "INVALID_DIRECTION"
+
+
+async def test_blast_radius_flags_ambiguous_only():
+    """An affected entity with no fully-resolved-edge path is flagged ambiguous_only."""
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        side_effect=[
+            [{"exists": True}],
+            [
+                {"uid": "p:x", "name": "x", "qn": "mod.x", "label": "Callable", "file_path": "mod.py", "min_depth": 1},
+                {"uid": "p:y", "name": "y", "qn": "mod.y", "label": "Callable", "file_path": "mod.py", "min_depth": 2},
+            ],
+            [{"uid": "p:x"}],  # only x is reachable via an all-resolved path
+        ]
+    )
+
+    result = await blast_radius(graph, "p:a", direction="callees", max_depth=3)
+
+    affected = {a["uid"]: a for a in result["affected"]}
+    assert affected["p:x"]["ambiguous_only"] is False
+    assert affected["p:y"]["ambiguous_only"] is True
+    assert result["affected_count"] == 2
+
+
+async def test_blast_radius_respects_limit_and_reports_truncated():
+    graph = MagicMock()
+    all_raw = [
+        {
+            "uid": f"p:{i}",
+            "name": f"n{i}",
+            "qn": f"mod.n{i}",
+            "label": "Callable",
+            "file_path": "mod.py",
+            "min_depth": 1,
+        }
+        for i in range(3)
+    ]
+    graph.execute = AsyncMock(side_effect=[[{"exists": True}], all_raw, []])
+
+    result = await blast_radius(graph, "p:a", direction="callees", limit=2)
+
+    assert result["affected_count"] == 3
+    assert len(result["affected"]) == 2
+    assert result["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# Dead code (ADR-0013 shortcut: find_dead_code)
+# ---------------------------------------------------------------------------
+
+
+async def test_dead_code_returns_zero_incoming_calls_entities():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[
+            {
+                "name": "orphan_fn",
+                "qn": "pkg.mod.orphan_fn",
+                "label": "Callable",
+                "kind": "function",
+                "file_path": "pkg/mod.py",
+                "line_start": 10,
+            }
+        ]
+    )
+
+    result = await analyze_repo(graph, "dead_code", "code-atlas")
+
+    assert result["analysis"] == "dead_code"
+    assert result["dead_code_count"] == 1
+    assert result["dead_code"][0]["qualified_name"] == "pkg.mod.orphan_fn"
+    query = graph.execute.call_args[0][0]
+    assert "NOT ()-[:CALLS]->(n)" in query
+    assert "NOT n.name STARTS WITH '__'" in query
+
+
+async def test_dead_code_excludes_test_pattern_matches():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[
+            {
+                "name": "test_something",
+                "qn": "tests.test_mod.test_something",
+                "label": "Callable",
+                "kind": "function",
+                "file_path": "tests/test_mod.py",
+                "line_start": 1,
+            },
+            {
+                "name": "real_orphan",
+                "qn": "pkg.mod.real_orphan",
+                "label": "Callable",
+                "kind": "function",
+                "file_path": "pkg/mod.py",
+                "line_start": 5,
+            },
+        ]
+    )
+
+    result = await analyze_repo(graph, "dead_code", "code-atlas", test_patterns=("test_*.py",))
+
+    names = {c["name"] for c in result["dead_code"]}
+    assert names == {"real_orphan"}
+
+
+async def test_dead_code_respects_limit_and_reports_truncated():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[
+            {
+                "name": f"orphan_{i}",
+                "qn": f"pkg.mod.orphan_{i}",
+                "label": "Callable",
+                "kind": "function",
+                "file_path": "pkg/mod.py",
+                "line_start": i,
+            }
+            for i in range(3)
+        ]
+    )
+
+    result = await analyze_repo(graph, "dead_code", "code-atlas", limit=2)
+
+    assert result["dead_code_count"] == 3
+    assert len(result["dead_code"]) == 2
+    assert result["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# Complexity (ADR-0013 shortcut: find_complexity_hotspots)
+# ---------------------------------------------------------------------------
+
+
+async def test_complexity_returns_loc_span_sorted_hotspots():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[
+            {
+                "name": "big_fn",
+                "qn": "pkg.mod.big_fn",
+                "kind": "function",
+                "file_path": "pkg/mod.py",
+                "line_start": 10,
+                "line_end": 210,
+                "loc_span": 200,
+            }
+        ]
+    )
+
+    result = await analyze_repo(graph, "complexity", "code-atlas")
+
+    assert result["analysis"] == "complexity"
+    assert result["hotspots"][0]["loc_span"] == 200
+    query = graph.execute.call_args[0][0]
+    assert "line_end - n.line_start" in query
+    assert "ORDER BY loc_span DESC" in query
+
+
+async def test_complexity_respects_path_scope():
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[])
+
+    await analyze_repo(graph, "complexity", "code-atlas", path="src/foo")
+
+    query, params = graph.execute.call_args[0]
+    assert "$path" in query
+    assert params["path"] == "src/foo"
+
+
+# ---------------------------------------------------------------------------
+# Communities (ADR-0013 shortcut: find_communities, MAGE leiden_community_detection)
+# ---------------------------------------------------------------------------
+
+
+def _community_row(uid: str, community_id: int, name: str = "", label: str = "Callable") -> dict[str, object]:
+    return {
+        "uid": uid,
+        "name": name or uid,
+        "qn": uid,
+        "label": label,
+        "file_path": "pkg/mod.py",
+        "community_id": community_id,
+    }
+
+
+async def test_communities_groups_and_sorts_by_size_descending():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[
+            _community_row("p:a", 0),
+            _community_row("p:b", 0),
+            _community_row("p:c", 1),
+            _community_row("p:d", 1),
+            _community_row("p:e", 1),
+        ]
+    )
+
+    result = await analyze_repo(graph, "communities", "code-atlas")
+
+    assert result["analysis"] == "communities"
+    assert result["community_count"] == 2
+    assert [c["community_id"] for c in result["communities"]] == [1, 0]
+    assert [c["size"] for c in result["communities"]] == [3, 2]
+    query = graph.execute.call_args[0][0]
+    assert "leiden_community_detection.get" in query
+    assert "project(p)" in query
+
+
+async def test_communities_drops_singleton_noise():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[
+            _community_row("p:solo", 0),
+            _community_row("p:a", 1),
+            _community_row("p:b", 1),
+        ]
+    )
+
+    result = await analyze_repo(graph, "communities", "code-atlas")
+
+    assert result["community_count"] == 1
+    assert result["communities"][0]["community_id"] == 1
+    assert result["noise_threshold"] == 2
+
+
+async def test_communities_caps_members_and_communities_by_limit():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[_community_row(f"p:c1_{i}", 0) for i in range(5)]
+        + [_community_row(f"p:c2_{i}", 1) for i in range(3)]
+    )
+
+    result = await analyze_repo(graph, "communities", "code-atlas", limit=1)
+
+    assert len(result["communities"]) == 1
+    assert result["communities"][0]["community_id"] == 0
+    assert len(result["communities"][0]["members"]) == 1
+
+
+async def test_communities_returns_procedure_unavailable_error_when_mage_missing():
+    graph = MagicMock()
+    graph.execute = AsyncMock(side_effect=Exception("Unknown procedure 'leiden_community_detection.get'"))
+
+    result = await analyze_repo(graph, "communities", "code-atlas")
+
+    assert result["code"] == "PROCEDURE_UNAVAILABLE"
+    assert "error" in result
+
+
+async def test_communities_respects_path_scope():
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[])
+
+    await analyze_repo(graph, "communities", "code-atlas", path="src/foo")
+
+    query, params = graph.execute.call_args[0]
+    assert "$path" in query
+    assert params["path"] == "src/foo"
+
+
+# ---------------------------------------------------------------------------
+# Git signals (ADR-0013 shortcut: find_hotspots, mined by atlas mine-git-history)
+# ---------------------------------------------------------------------------
+
+
+def _hotspot_row(qn: str, commit_count: int, author_count: int = 2, days: float = 1.0) -> dict[str, object]:
+    return {
+        "name": qn,
+        "qn": qn,
+        "file_path": f"pkg/{qn}.py",
+        "commit_count": commit_count,
+        "author_count": author_count,
+        "days_since_last_commit": days,
+    }
+
+
+async def test_git_signals_returns_hotspots():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        side_effect=[
+            [_hotspot_row("hot", 42), _hotspot_row("cold", 3)],
+            [],
+            [],
+        ]
+    )
+
+    result = await analyze_repo(graph, "git_signals", "code-atlas")
+
+    assert result["analysis"] == "git_signals"
+    assert result["mined"] is True
+    assert [h["qualified_name"] for h in result["hotspots"]] == ["hot", "cold"]
+    query = graph.execute.call_args_list[0][0][0]
+    assert "git_commit_count" in query
+
+
+async def test_git_signals_bus_factor_risks():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        side_effect=[
+            [_hotspot_row("solo", 10, author_count=1)],
+            [_hotspot_row("solo", 10, author_count=1)],
+            [],
+        ]
+    )
+
+    result = await analyze_repo(graph, "git_signals", "code-atlas")
+
+    assert len(result["bus_factor_risks"]) == 1
+    assert result["bus_factor_risks"][0]["author_count"] == 1
+    query = graph.execute.call_args_list[1][0][0]
+    assert "git_author_count" in query
+
+
+async def test_git_signals_co_change_pairs():
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        side_effect=[
+            [],
+            [],
+            [{"a_qn": "pkg.a", "a_path": "pkg/a.py", "b_qn": "pkg.b", "b_path": "pkg/b.py", "count": 5}],
+        ]
+    )
+
+    result = await analyze_repo(graph, "git_signals", "code-atlas")
+
+    assert result["co_change_pairs"] == [
+        {"a": "pkg.a", "a_file_path": "pkg/a.py", "b": "pkg.b", "b_file_path": "pkg/b.py", "count": 5}
+    ]
+    query = graph.execute.call_args_list[2][0][0]
+    assert "CO_CHANGES_WITH" in query
+
+
+async def test_git_signals_not_mined_when_no_data():
+    """No hotspots at all means 'atlas mine-git-history' was never run — mined=False,
+    not an error, so a caller can distinguish 'never mined' from 'mined, found nothing'.
+    """
+    graph = MagicMock()
+    graph.execute = AsyncMock(side_effect=[[], [], []])
+
+    result = await analyze_repo(graph, "git_signals", "code-atlas")
+
+    assert result["mined"] is False
+    assert result["hotspots"] == []
+    assert result["bus_factor_risks"] == []
+    assert result["co_change_pairs"] == []
+
+
+async def test_git_signals_respects_path_scope():
+    graph = MagicMock()
+    graph.execute = AsyncMock(side_effect=[[], [], []])
+
+    await analyze_repo(graph, "git_signals", "code-atlas", path="src/foo")
+
+    hotspot_query, hotspot_params = graph.execute.call_args_list[0][0]
+    assert "$path" in hotspot_query
+    assert hotspot_params["path"] == "src/foo"
+    co_change_query = graph.execute.call_args_list[2][0][0]
+    assert "$path" in co_change_query
 
 
 # ---------------------------------------------------------------------------

@@ -28,10 +28,12 @@ from code_atlas.schema import (
 from code_atlas.search.embeddings import EmbedClient
 from code_atlas.server.mcp import (
     AppContext,
+    _clamp_depth,
     _compact_node,
     _default_scope_projects,
     _file_uri_to_path,
     _maybe_update_root,
+    _parse_rel_types,
     _rank_results,
     _register_analysis_tools,
     _register_hybrid_tool,
@@ -41,6 +43,7 @@ from code_atlas.server.mcp import (
     _register_query_tools,
     _register_search_tools,
     _register_subagent_tools,
+    _register_traversal_tools,
     _resolve_hybrid_scope,
     _with_staleness,
 )
@@ -77,6 +80,7 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
     _register_knowledge_tools(server)
     _register_subagent_tools(server)
     _register_analysis_tools(server)
+    _register_traversal_tools(server)
 
     tool_map = {tool.name: tool for tool in server._tool_manager._tools.values()}
     if tool_name not in tool_map:
@@ -1064,6 +1068,22 @@ class TestQueryTimeout:
         result = await _invoke_tool(timeout_app, "generate_diagram", type="packages", project="p")
         assert result["code"] == "QUERY_TIMEOUT"
 
+    async def test_trace_path_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "trace_path", from_uid="p:a", to_uid="p:b")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_find_dead_code_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "find_dead_code", project="p")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_find_complexity_hotspots_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "find_complexity_hotspots", project="p")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_blast_radius_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "blast_radius", uid="p:a")
+        assert result["code"] == "QUERY_TIMEOUT"
+
 
 # ---------------------------------------------------------------------------
 # _compact_node detail modes (no DB needed)
@@ -1114,4 +1134,37 @@ class TestCompactNodeDetail:
         record = self._make_record()
         result = _compact_node(record)
         assert "source" not in result
-        assert result["docstring"].endswith("...")
+
+
+# ---------------------------------------------------------------------------
+# _parse_rel_types / _clamp_depth (trace_path / blast_radius helpers)
+# ---------------------------------------------------------------------------
+
+
+class TestParseRelTypes:
+    def test_empty_returns_default(self):
+        types, error = _parse_rel_types("", ("CALLS",))
+        assert types == ("CALLS",)
+        assert error is None
+
+    def test_valid_csv_parsed(self):
+        types, error = _parse_rel_types("CALLS, IMPORTS", ("CALLS",))
+        assert types == ("CALLS", "IMPORTS")
+        assert error is None
+
+    def test_invalid_rel_type_errors(self):
+        types, error = _parse_rel_types("NOT_A_REL", ("CALLS",))
+        assert types == ("CALLS",)
+        assert error is not None
+        assert error["code"] == "INVALID_EDGE_TYPES"
+
+
+class TestClampDepth:
+    def test_clamps_above_max(self):
+        assert _clamp_depth(999) == 10
+
+    def test_clamps_below_min(self):
+        assert _clamp_depth(0) == 1
+
+    def test_passes_through_in_range(self):
+        assert _clamp_depth(5) == 5

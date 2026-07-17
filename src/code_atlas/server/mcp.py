@@ -60,8 +60,11 @@ from code_atlas.search.guidance import (
     validate_cypher_explain,
     validate_cypher_static,
 )
+from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES, _DEFAULT_TRACE_EDGE_TYPES
 from code_atlas.server.analysis import analyze_repo as _analyze_repo
+from code_atlas.server.analysis import blast_radius as _blast_radius
 from code_atlas.server.analysis import generate_diagram as _generate_diagram
+from code_atlas.server.analysis import trace_path as _trace_path
 from code_atlas.server.health import run_health_checks
 from code_atlas.settings import AtlasSettings, derive_project_name, find_git_root
 from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
@@ -404,6 +407,26 @@ def _clamp_limit(limit: int | None) -> int:
     return max(1, min(limit, _MAX_LIMIT))
 
 
+_MAX_TRAVERSAL_DEPTH = 10
+
+
+def _clamp_depth(depth: int) -> int:
+    """Clamp a trace_path/blast_radius traversal depth to [1, 10]."""
+    return max(1, min(depth, _MAX_TRAVERSAL_DEPTH))
+
+
+def _parse_rel_types(rel_types: str, default: tuple[str, ...]) -> tuple[tuple[str, ...], dict[str, Any] | None]:
+    """Parse the comma-separated ``edge_types`` param against RelType. Empty = *default*."""
+    if not rel_types:
+        return default, None
+    parsed = tuple(t.strip() for t in rel_types.split(",") if t.strip())
+    invalid = [t for t in parsed if t not in RelType]
+    if invalid:
+        valid = ", ".join(sorted(r.value for r in RelType))
+        return default, _error(f"Invalid edge_types: {invalid}. Valid: {valid}", code="INVALID_EDGE_TYPES")
+    return parsed, None
+
+
 async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str = "") -> dict[str, Any]:
     """Annotate a query result envelope with staleness info.
 
@@ -702,6 +725,7 @@ def create_mcp_server(  # noqa: PLR0915
     _register_knowledge_tools(mcp)
     _register_subagent_tools(mcp)
     _register_analysis_tools(mcp)
+    _register_traversal_tools(mcp)
     return mcp
 
 
@@ -1553,20 +1577,37 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         description=(
-            "Analyze repository structure, centrality, dependencies, patterns, or quality. "
+            "Analyze repository structure, centrality, dependencies, patterns, quality, dead code, "
+            "complexity hotspots, communities, or git-derived signals. "
             "Returns: {analysis, project, ...analysis-specific keys, query_ms}."
         ),
     )
     async def analyze_repo(
         analysis: Annotated[
-            Literal["structure", "centrality", "dependencies", "patterns", "quality"],
+            Literal[
+                "structure",
+                "centrality",
+                "dependencies",
+                "patterns",
+                "quality",
+                "dead_code",
+                "complexity",
+                "communities",
+                "git_signals",
+            ],
             Field(
                 description=(
                     "Sub-analysis: structure (entity counts, packages, largest modules), "
                     "centrality (hub entities/modules, leaves), "
                     "dependencies (imports, cross-package coupling, circular deps), "
                     "patterns (inheritance, enums, visibility, docstring coverage), "
-                    "quality (health score, god modules, circular deps, tangled modules, coupling, instability)."
+                    "quality (health score, god modules, circular deps, tangled modules, coupling, instability), "
+                    "dead_code (Callables/TypeDefs with zero incoming CALLS edges), "
+                    "complexity (top Callables by LOC-span proxy, not true cyclomatic complexity), "
+                    "communities (Leiden clustering over the CALLS+IMPORTS subgraph — requires the "
+                    "memgraph-mage Docker image), "
+                    "git_signals (commit-count hotspots, bus-factor risks, co-change pairs — requires "
+                    "'atlas mine-git-history' to have been run; empty lists otherwise)."
                 ),
             ),
         ],
@@ -1614,5 +1655,197 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         max_nodes = max(1, min(max_nodes, _MAX_LIMIT))
         try:
             return await _generate_diagram(app.graph, type, project_name, path=path, max_nodes=max_nodes)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+    # Shortcut tools (ADR-0013): thin top-level wrappers delegating to
+    # analyze_repo with the analysis pre-set — no duplicated query logic.
+
+    @mcp.tool(
+        description=(
+            "Shortcut for analyze_repo(analysis='dead_code'). Callables/TypeDefs with zero incoming "
+            "CALLS edges, excluding dunder methods and test files. Caveat: dynamic dispatch and "
+            "framework entry points (CLI commands, route handlers) can still false-positive as dead. "
+            "Returns: {analysis, project, dead_code_count, dead_code: [{name, qualified_name, label, "
+            "kind, file_path, line_start}], truncated, query_ms}."
+        ),
+    )
+    async def find_dead_code(
+        project: Annotated[str, Field("", description="Project name. Empty = auto-detect from workspace.")] = "",
+        path: Annotated[
+            str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max items to return.", ge=1, le=100)] = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        project_name = project or derive_project_name(app.settings.project_root)
+        clamped = _clamp_limit(limit)
+        test_patterns = tuple(app.settings.search.test_patterns) if app.settings.search.test_filter else ()
+        try:
+            return await _analyze_repo(
+                app.graph, "dead_code", project_name, path=path, limit=clamped, test_patterns=test_patterns
+            )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+    @mcp.tool(
+        description=(
+            "Shortcut for analyze_repo(analysis='complexity'). Top Callables by LOC-span "
+            "(line_end - line_start) — a crude proxy, not true cyclomatic complexity. "
+            "Returns: {analysis, project, hotspots: [{name, qualified_name, kind, file_path, "
+            "line_start, line_end, loc_span}], query_ms}."
+        ),
+    )
+    async def find_complexity_hotspots(
+        project: Annotated[str, Field("", description="Project name. Empty = auto-detect from workspace.")] = "",
+        path: Annotated[
+            str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max items to return.", ge=1, le=100)] = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        project_name = project or derive_project_name(app.settings.project_root)
+        clamped = _clamp_limit(limit)
+        try:
+            return await _analyze_repo(app.graph, "complexity", project_name, path=path, limit=clamped)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+    @mcp.tool(
+        description=(
+            "Shortcut for analyze_repo(analysis='communities'). Clusters the project's CALLS+IMPORTS "
+            "subgraph via Leiden community detection — requires the memgraph-mage Docker image (see "
+            "docker-compose.yml; the plain memgraph image doesn't have this procedure). Communities "
+            "of size < 2 (isolated/near-isolated nodes) are dropped as noise; returned largest first. "
+            "Returns: {analysis, project, community_count, communities: [{community_id, size, "
+            "members: [{uid, name, qualified_name, label, file_path}]}], noise_threshold, query_ms}, "
+            "or {error, code: 'PROCEDURE_UNAVAILABLE'} if the MAGE module isn't installed."
+        ),
+    )
+    async def find_communities(
+        project: Annotated[str, Field("", description="Project name. Empty = auto-detect from workspace.")] = "",
+        path: Annotated[
+            str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
+        ] = "",
+        limit: Annotated[
+            int,
+            Field(20, description="Max communities to return (also caps members shown per community).", ge=1, le=100),
+        ] = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        project_name = project or derive_project_name(app.settings.project_root)
+        clamped = _clamp_limit(limit)
+        try:
+            return await _analyze_repo(app.graph, "communities", project_name, path=path, limit=clamped)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+    @mcp.tool(
+        description=(
+            "Shortcut for analyze_repo(analysis='git_signals'). Commit-count hotspots, bus-factor risks "
+            "(files with <=1 distinct author), and top co-change pairs (files frequently committed together) "
+            "mined from git history. Requires 'atlas mine-git-history' to have been run first — otherwise "
+            "returns empty lists with mined=false, not an error. "
+            "Returns: {analysis, project, mined, hotspots: [{name, qualified_name, file_path, commit_count, "
+            "author_count, days_since_last_commit}], bus_factor_risks: [{name, qualified_name, file_path, "
+            "commit_count, author_count}], co_change_pairs: [{a, a_file_path, b, b_file_path, count}], query_ms}."
+        ),
+    )
+    async def find_hotspots(
+        project: Annotated[str, Field("", description="Project name. Empty = auto-detect from workspace.")] = "",
+        path: Annotated[
+            str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max items per list to return.", ge=1, le=100)] = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        project_name = project or derive_project_name(app.settings.project_root)
+        clamped = _clamp_limit(limit)
+        try:
+            return await _analyze_repo(app.graph, "git_signals", project_name, path=path, limit=clamped)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+
+def _register_traversal_tools(mcp: FastMCP) -> None:
+    """Register trace_path and blast_radius — information-retrieval family (ADR-0013).
+
+    Unlike analyze_repo/generate_diagram's project+path+limit signature, these
+    are anchored at specific entity uid(s), matching get_node/get_context.
+    """
+
+    @mcp.tool(
+        description=(
+            "Find the shortest path between two entities, bounded by max_depth hops. "
+            "Traverses CALLS|IMPORTS|USES_TYPE edges by default (override with edge_types). "
+            "Each hop reports its edge type and endpoints; CALLS hops also carry "
+            "confidence ('resolved'/'ambiguous') and strategy (see ADR-0014). "
+            "Returns: {found, from_uid, to_uid, hop_count, hops: [{from, to, edge_type, "
+            "confidence, strategy}], query_ms}, or {found: false, message} if no path "
+            "exists within max_depth."
+        ),
+    )
+    async def trace_path(
+        from_uid: Annotated[str, Field(description="uid of the starting entity (from get_node/hybrid_search).")],
+        to_uid: Annotated[str, Field(description="uid of the target entity.")],
+        max_depth: Annotated[int, Field(6, description="Maximum hops to search.", ge=1, le=10)] = 6,
+        edge_types: Annotated[
+            str,
+            Field("", description="Comma-separated relationship types to traverse. Empty = CALLS,IMPORTS,USES_TYPE."),
+        ] = "",
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        types, type_error = _parse_rel_types(edge_types, _DEFAULT_TRACE_EDGE_TYPES)
+        if type_error:
+            return type_error
+        depth = _clamp_depth(max_depth)
+        try:
+            return await _trace_path(app.graph, from_uid, to_uid, max_depth=depth, edge_types=types)
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+    @mcp.tool(
+        description=(
+            "Depth-limited transitive closure of callers/callees/both from an entity — "
+            "'what would be affected if I change this'. Traverses CALLS edges by default "
+            "(override with edge_types). Flags entities reachable only via an ambiguous "
+            "CALLS edge as ambiguous_only=true — a heuristic, not a guarantee (see ADR-0014): "
+            "no path made entirely of confidence:'resolved' edges reaches it within max_depth. "
+            "Returns: {uid, direction, max_depth, affected_count, affected: [{uid, name, "
+            "qualified_name, label, file_path, min_depth, direction, ambiguous_only}], "
+            "truncated, query_ms}."
+        ),
+    )
+    async def blast_radius(
+        uid: Annotated[str, Field(description="uid of the entity to analyze (from get_node/hybrid_search).")],
+        direction: Annotated[
+            Literal["callers", "callees", "both"],
+            Field(
+                "callers",
+                description="callers (who transitively depends on this), callees (what this depends on), or both.",
+            ),
+        ] = "callers",
+        max_depth: Annotated[int, Field(3, description="Maximum hops to traverse.", ge=1, le=10)] = 3,
+        edge_types: Annotated[
+            str, Field("", description="Comma-separated relationship types to traverse. Empty = CALLS.")
+        ] = "",
+        limit: Annotated[int, Field(20, description="Max affected entities to return.", ge=1, le=100)] = 20,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        app = await _ensure_root(ctx)
+        types, type_error = _parse_rel_types(edge_types, _DEFAULT_BLAST_EDGE_TYPES)
+        if type_error:
+            return type_error
+        depth = _clamp_depth(max_depth)
+        clamped_limit = _clamp_limit(limit)
+        try:
+            return await _blast_radius(
+                app.graph, uid, direction=direction, max_depth=depth, edge_types=types, limit=clamped_limit
+            )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")

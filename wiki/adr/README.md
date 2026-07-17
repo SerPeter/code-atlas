@@ -18,11 +18,13 @@ An ADR is a document that captures an important architectural decision made alon
 | [0005](./0005-deployment-process-model.md)           | Deployment & Process Model                                     | Accepted               | 2026-02-07 |
 | [0006](./0006-pure-python-tree-sitter.md)            | Pure Python with In-Process Tree-sitter                        | Accepted               | 2026-02-08 |
 | [0007](./0007-qualified-name-strategy.md)            | Qualified Name Resolution Strategy                             | Amended by ADR-0008    | 2026-02-08 |
-| [0008](./0008-cross-file-relationship-resolution.md) | Cross-File Relationship Resolution & Qualified-Name Extensions | Accepted               | 2026-07-12 |
+| [0008](./0008-cross-file-relationship-resolution.md) | Cross-File Relationship Resolution & Qualified-Name Extensions | Amended by ADR-0014    | 2026-07-12 |
 | [0009](./0009-event-pipeline-durability-contract.md) | Event Pipeline Durability Contract                             | Accepted               | 2026-07-12 |
 | [0010](./0010-integration-test-isolation.md)         | Integration Test Database Isolation                            | Accepted               | 2026-07-12 |
 | [0011](./0011-note-vault-schema.md)                  | Note Label and the Knowledge Vault Schema                      | Amended by ADR-0012    | 2026-07-13 |
 | [0012](./0012-rename-vault-to-wiki.md)               | Rename the Default Knowledge Vault Directory to wiki/          | Accepted               | 2026-07-17 |
+| [0013](./0013-mcp-tool-taxonomy.md)                  | MCP Tool Taxonomy — Static Analysis vs. Information Retrieval  | Accepted               | 2026-07-17 |
+| [0014](./0014-calls-edge-confidence.md)              | CALLS Edge Confidence                                          | Accepted               | 2026-07-17 |
 
 ## Creating a New ADR
 

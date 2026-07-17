@@ -11,6 +11,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
+from code_atlas.schema import RelType
 from code_atlas.search.engine import matches_test_pattern
 
 if TYPE_CHECKING:
@@ -22,14 +23,40 @@ if TYPE_CHECKING:
 
 _MERMAID_UNSAFE = re.compile(r"[^a-zA-Z0-9_]")
 
-_VALID_ANALYSES = frozenset({"structure", "centrality", "dependencies", "patterns", "quality"})
+_VALID_ANALYSES = frozenset(
+    {
+        "structure",
+        "centrality",
+        "dependencies",
+        "patterns",
+        "quality",
+        "dead_code",
+        "complexity",
+        "communities",
+        "git_signals",
+    }
+)
 _VALID_DIAGRAM_TYPES = frozenset({"packages", "imports", "inheritance", "module_detail"})
+
+# trace_path / blast_radius (information-retrieval family, see ADR-0013) default
+# edge sets — trace_path follows any structural/call relationship, blast_radius
+# is specifically about call impact so it defaults to CALLS only.
+_DEFAULT_TRACE_EDGE_TYPES = ("CALLS", "IMPORTS", "USES_TYPE")
+_DEFAULT_BLAST_EDGE_TYPES = ("CALLS",)
 
 # Quality analysis thresholds (v1 — hardcoded for medium Python projects)
 _GOD_MODULE_ENTITY_THRESHOLD = 30
 _TANGLED_FAN_THRESHOLD = 8
 _INSTABILITY_LOW = 0.1
 _INSTABILITY_HIGH = 0.9
+
+# Communities noise threshold — singleton/near-singleton clusters aren't
+# actionable groupings, drop them before ranking by size.
+_COMMUNITY_NOISE_THRESHOLD = 2
+
+# Bus-factor risk: a file with only this many distinct authors (and at least
+# one commit) is a single/double-owner risk worth flagging.
+_BUS_FACTOR_AUTHOR_THRESHOLD = 1
 
 
 def _sid(name: str) -> str:
@@ -85,11 +112,16 @@ async def analyze_repo(
         }
     if analysis == "quality":
         return await _analyze_quality(graph, project, path, limit, test_patterns)
+    if analysis == "dead_code":
+        return await _analyze_dead_code(graph, project, path, limit, test_patterns)
     dispatch = {
         "structure": _analyze_structure,
         "centrality": _analyze_centrality,
         "dependencies": _analyze_dependencies,
         "patterns": _analyze_patterns,
+        "complexity": _analyze_complexity,
+        "communities": _analyze_communities,
+        "git_signals": _analyze_git_signals,
     }
     return await dispatch[analysis](graph, project, path, limit)
 
@@ -114,6 +146,174 @@ async def generate_diagram(
         "module_detail": _diagram_module_detail,
     }
     return await dispatch[diagram_type](graph, project, path, max_nodes)
+
+
+# ---------------------------------------------------------------------------
+# trace_path / blast_radius (information-retrieval family, ADR-0013)
+# ---------------------------------------------------------------------------
+
+
+def _format_path_hops(path_nodes: list[Any], path_rels: list[Any]) -> list[dict[str, Any]]:
+    """Render a Cypher path's nodes/relationships into per-hop dicts.
+
+    Includes CALLS ``confidence``/``strategy`` edge properties (ADR-0014) when
+    present on the traversed edge.
+    """
+    hops: list[dict[str, Any]] = []
+    for i, rel in enumerate(path_rels):
+        from_props = dict(path_nodes[i].items()) if hasattr(path_nodes[i], "items") else {}
+        to_props = dict(path_nodes[i + 1].items()) if hasattr(path_nodes[i + 1], "items") else {}
+        rel_props = dict(rel.items()) if hasattr(rel, "items") else {}
+        hop: dict[str, Any] = {
+            "from": {"uid": from_props.get("uid"), "name": from_props.get("name")},
+            "to": {"uid": to_props.get("uid"), "name": to_props.get("name")},
+            "edge_type": getattr(rel, "type", None),
+        }
+        if "confidence" in rel_props:
+            hop["confidence"] = rel_props["confidence"]
+        if "strategy" in rel_props:
+            hop["strategy"] = rel_props["strategy"]
+        hops.append(hop)
+    return hops
+
+
+async def trace_path(
+    graph: GraphClient,
+    from_uid: str,
+    to_uid: str,
+    max_depth: int = 6,
+    edge_types: tuple[str, ...] = _DEFAULT_TRACE_EDGE_TYPES,
+) -> dict[str, Any]:
+    """Find the shortest path between two entities, bounded by ``max_depth`` hops.
+
+    Traverses *edge_types* (default CALLS|IMPORTS|USES_TYPE). Returns the
+    hop-by-hop path — edge type, endpoint uid/name, and CALLS confidence/
+    strategy when present (ADR-0014) — or a ``found: false`` result when no
+    path exists within ``max_depth``.
+    """
+    t0 = time.monotonic()
+    params: dict[str, Any] = {"from_uid": from_uid, "to_uid": to_uid}
+
+    exist_raw = await graph.execute(
+        "OPTIONAL MATCH (a {uid: $from_uid}) OPTIONAL MATCH (b {uid: $to_uid}) "
+        "RETURN a IS NOT NULL AS from_exists, b IS NOT NULL AS to_exists",
+        params,
+    )
+    exists = exist_raw[0] if exist_raw else {"from_exists": False, "to_exists": False}
+    if not exists["from_exists"]:
+        return {"error": f"Node not found: {from_uid}", "code": "NOT_FOUND"}
+    if not exists["to_exists"]:
+        return {"error": f"Node not found: {to_uid}", "code": "NOT_FOUND"}
+
+    rel_pattern = "|".join(edge_types)
+    records = await graph.execute(
+        f"MATCH p=(a {{uid: $from_uid}})-[:{rel_pattern}*1..{max_depth}]->(b {{uid: $to_uid}}) "
+        "RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels, length(p) AS hops "
+        "ORDER BY hops LIMIT 1",
+        params,
+    )
+    elapsed = (time.monotonic() - t0) * 1000
+
+    if not records:
+        return {
+            "found": False,
+            "from_uid": from_uid,
+            "to_uid": to_uid,
+            "max_depth": max_depth,
+            "message": f"No path found within {max_depth} hops",
+            "query_ms": round(elapsed, 1),
+        }
+
+    record = records[0]
+    return {
+        "found": True,
+        "from_uid": from_uid,
+        "to_uid": to_uid,
+        "hop_count": record["hops"],
+        "hops": _format_path_hops(record["path_nodes"], record["path_rels"]),
+        "query_ms": round(elapsed, 1),
+    }
+
+
+_BLAST_DIRECTIONS = {"callers": ("in",), "callees": ("out",), "both": ("out", "in")}
+
+
+async def blast_radius(
+    graph: GraphClient,
+    uid: str,
+    direction: str = "callers",
+    max_depth: int = 3,
+    edge_types: tuple[str, ...] = _DEFAULT_BLAST_EDGE_TYPES,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Depth-limited transitive closure of callers/callees/both from *uid*.
+
+    "callers" traverses incoming edges (who transitively depends on *uid*),
+    "callees" traverses outgoing edges (what *uid* transitively depends on).
+    Each affected entity is flagged ``ambiguous_only: true`` when no path made
+    entirely of ``confidence: "resolved"`` CALLS edges (ADR-0014) reaches it
+    within ``max_depth`` — a heuristic signal, not a guarantee (e.g. an
+    out-of-scope edge_types override without a confidence property always
+    counts as not-resolved).
+    """
+    t0 = time.monotonic()
+
+    exist_raw = await graph.execute("OPTIONAL MATCH (n {uid: $uid}) RETURN n IS NOT NULL AS exists", {"uid": uid})
+    if not exist_raw or not exist_raw[0]["exists"]:
+        return {"error": f"Node not found: {uid}", "code": "NOT_FOUND"}
+
+    dir_kinds = _BLAST_DIRECTIONS.get(direction)
+    if dir_kinds is None:
+        return {
+            "error": f"Invalid direction '{direction}'. Valid: callers, callees, both",
+            "code": "INVALID_DIRECTION",
+        }
+
+    rel_pattern = "|".join(edge_types)
+    affected: dict[str, dict[str, Any]] = {}
+    for dir_kind in dir_kinds:
+        pattern = f"-[:{rel_pattern}*1..{max_depth}]->" if dir_kind == "out" else f"<-[:{rel_pattern}*1..{max_depth}]-"
+        all_raw = await graph.execute(
+            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
+            "WHERE affected.uid <> $uid "
+            "RETURN affected.uid AS uid, affected.name AS name, affected.qualified_name AS qn, "
+            "labels(affected)[0] AS label, affected.file_path AS file_path, "
+            "min(length(p)) AS min_depth",
+            {"uid": uid},
+        )
+        resolved_raw = await graph.execute(
+            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
+            "WHERE affected.uid <> $uid AND all(r IN relationships(p) WHERE r.confidence = 'resolved') "
+            "RETURN DISTINCT affected.uid AS uid",
+            {"uid": uid},
+        )
+        resolved_uids = {r["uid"] for r in resolved_raw}
+        for r in all_raw:
+            entry = affected.get(r["uid"])
+            if entry is None or r["min_depth"] < entry["min_depth"]:
+                affected[r["uid"]] = {
+                    "uid": r["uid"],
+                    "name": r["name"],
+                    "qualified_name": r["qn"],
+                    "label": r["label"],
+                    "file_path": r["file_path"],
+                    "min_depth": r["min_depth"],
+                    "direction": dir_kind,
+                    "ambiguous_only": r["uid"] not in resolved_uids,
+                }
+
+    elapsed = (time.monotonic() - t0) * 1000
+    results = sorted(affected.values(), key=lambda x: (x["min_depth"], x["qualified_name"] or ""))
+    total = len(results)
+    return {
+        "uid": uid,
+        "direction": direction,
+        "max_depth": max_depth,
+        "affected_count": total,
+        "affected": results[:limit],
+        "truncated": total > limit,
+        "query_ms": round(elapsed, 1),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +1034,282 @@ async def _analyze_quality(
 
     elapsed = (time.monotonic() - t0) * 1000
     return {"analysis": "quality", "project": project, **metrics, "query_ms": round(elapsed, 1)}
+
+
+# ---------------------------------------------------------------------------
+# Dead code
+# ---------------------------------------------------------------------------
+
+
+async def _analyze_dead_code(
+    graph: GraphClient, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """Callables/TypeDefs with zero incoming CALLS edges (any confidence).
+
+    Excludes dunder methods (``__init__``, ``__new__``, etc. — name STARTS WITH
+    '__') and entries matching *test_patterns*. An entity reached only by an
+    ``confidence: "ambiguous"`` CALLS edge (ADR-0014) still counts as "not
+    dead" here — an ambiguous edge is still some evidence of a call site, even
+    if the exact target is uncertain, and treating it as dead would be a worse
+    false positive than leaving it out.
+
+    Caveat (same style as the "quality" analysis): dynamic dispatch,
+    reflection, and framework entry points (CLI commands, route handlers,
+    test fixtures invoked by name) are invisible to static CALLS resolution
+    and can still false-positive as dead code.
+    """
+    t0 = time.monotonic()
+    params: dict[str, Any] = {"project": project, "path": path}
+    pa = " AND n.file_path STARTS WITH $path" if path else ""
+
+    raw = await graph.execute(
+        "MATCH (n {project_name: $project}) "
+        f"WHERE (n:Callable OR n:TypeDef) AND NOT n.name STARTS WITH '__'{pa} "
+        "AND NOT ()-[:CALLS]->(n) "
+        "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
+        "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
+        "ORDER BY n.file_path, n.line_start",
+        params,
+    )
+
+    candidates = [
+        {
+            "name": r["name"],
+            "qualified_name": r["qn"],
+            "label": r["label"],
+            "kind": r["kind"],
+            "file_path": r["file_path"],
+            "line_start": r["line_start"],
+        }
+        for r in raw
+    ]
+    if test_patterns:
+        patterns = list(test_patterns)
+        candidates = [c for c in candidates if not matches_test_pattern(c["file_path"] or "", c["name"], patterns)]
+
+    elapsed = (time.monotonic() - t0) * 1000
+    total = len(candidates)
+    return {
+        "analysis": "dead_code",
+        "project": project,
+        "dead_code_count": total,
+        "dead_code": candidates[:limit],
+        "truncated": total > limit,
+        "query_ms": round(elapsed, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Complexity (LOC-span proxy)
+# ---------------------------------------------------------------------------
+
+
+async def _analyze_complexity(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+    """Top-N Callables by ``line_end - line_start``.
+
+    This is a crude LOC-span proxy, not true cyclomatic complexity (branch-
+    node counting) — no new parsing work was needed since line_start/line_end
+    already persist on every Callable.
+    """
+    t0 = time.monotonic()
+    params: dict[str, Any] = {"project": project, "path": path}
+    pa = " AND n.file_path STARTS WITH $path" if path else ""
+
+    raw = await graph.execute(
+        "MATCH (n:Callable {project_name: $project}) "
+        f"WHERE n.line_start IS NOT NULL AND n.line_end IS NOT NULL{pa} "
+        "RETURN n.name AS name, n.qualified_name AS qn, n.kind AS kind, n.file_path AS file_path, "
+        "n.line_start AS line_start, n.line_end AS line_end, (n.line_end - n.line_start) AS loc_span "
+        f"ORDER BY loc_span DESC LIMIT {limit}",
+        params,
+    )
+
+    elapsed = (time.monotonic() - t0) * 1000
+    return {
+        "analysis": "complexity",
+        "project": project,
+        "hotspots": [
+            {
+                "name": r["name"],
+                "qualified_name": r["qn"],
+                "kind": r["kind"],
+                "file_path": r["file_path"],
+                "line_start": r["line_start"],
+                "line_end": r["line_end"],
+                "loc_span": r["loc_span"],
+            }
+            for r in raw
+        ],
+        "query_ms": round(elapsed, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Communities (Leiden clustering over the CALLS+IMPORTS subgraph, ADR-0013/MAGE)
+# ---------------------------------------------------------------------------
+
+
+async def _analyze_communities(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+    """Cluster the project's CALLS+IMPORTS subgraph via Leiden community detection.
+
+    Requires a MAGE-enabled Memgraph image (``memgraph/memgraph-mage``, not the
+    plain community ``memgraph/memgraph`` image) — ``leiden_community_detection.get()``
+    is a MAGE query module, not core Cypher (same procedure-call pattern already
+    used for ``text_search.search_all``/``vector_search.search``). Returns a
+    clear ``PROCEDURE_UNAVAILABLE`` error instead of raising when the module
+    isn't installed.
+
+    Communities of size < ``_COMMUNITY_NOISE_THRESHOLD`` (isolated/near-isolated
+    nodes) are dropped as noise; the remaining communities are returned
+    largest-first, capped at *limit* (which also caps members shown per
+    community — full membership can be large at scale).
+    """
+    t0 = time.monotonic()
+    params: dict[str, Any] = {"project": project, "path": path}
+    pa = " AND a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path" if path else ""
+
+    query = (
+        "MATCH p=(a {project_name: $project})-[:CALLS|IMPORTS]->(b {project_name: $project}) "
+        f"WHERE true{pa} "
+        "WITH project(p) AS subgraph "
+        "CALL leiden_community_detection.get(subgraph) YIELD node, community_id "
+        "RETURN node.uid AS uid, node.name AS name, node.qualified_name AS qn, "
+        "labels(node)[0] AS label, node.file_path AS file_path, community_id AS community_id"
+    )
+    try:
+        raw = await graph.execute(query, params)
+    except Exception as exc:
+        return {
+            "error": (
+                "Community detection unavailable: leiden_community_detection.get() is a MAGE query "
+                f"module — confirm Memgraph is running the memgraph-mage image, not memgraph. ({exc})"
+            ),
+            "code": "PROCEDURE_UNAVAILABLE",
+        }
+
+    # community_id < 0 means "unassigned" (per MAGE docs) — drop before grouping.
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for r in raw:
+        if r["community_id"] < 0:
+            continue
+        groups.setdefault(r["community_id"], []).append(
+            {
+                "uid": r["uid"],
+                "name": r["name"],
+                "qualified_name": r["qn"],
+                "label": r["label"],
+                "file_path": r["file_path"],
+            }
+        )
+
+    sized: list[dict[str, Any]] = sorted(
+        (
+            {"community_id": cid, "size": len(members), "members": members}
+            for cid, members in groups.items()
+            if len(members) >= _COMMUNITY_NOISE_THRESHOLD
+        ),
+        key=lambda c: c["size"],
+        reverse=True,
+    )
+
+    elapsed = (time.monotonic() - t0) * 1000
+    return {
+        "analysis": "communities",
+        "project": project,
+        "community_count": len(sized),
+        "communities": [{**c, "members": c["members"][:limit]} for c in sized[:limit]],
+        "noise_threshold": _COMMUNITY_NOISE_THRESHOLD,
+        "query_ms": round(elapsed, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Git signals (hotspots, bus-factor risks, co-change pairs — ADR-0013 find_hotspots)
+# ---------------------------------------------------------------------------
+
+
+async def _analyze_git_signals(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+    """Surface git-mined signals: commit-count hotspots, bus-factor risks, top co-change pairs.
+
+    Reads properties/edges written by ``indexing/git_signals.py``'s
+    ``write_git_signals`` — populated by the one-shot ``atlas mine-git-history``
+    CLI command, not the continuous indexing pipeline. If that command has
+    never been run for this project, all three lists come back empty (not an
+    error) — ``mined`` is ``False`` in that case so callers can tell "no signal"
+    apart from "ran, found nothing".
+    """
+    t0 = time.monotonic()
+    params: dict[str, Any] = {"project": project, "path": path}
+    pa = " AND n.file_path STARTS WITH $path" if path else ""
+
+    hotspots_raw = await graph.execute(
+        "MATCH (n {project_name: $project}) "
+        f"WHERE n.git_commit_count IS NOT NULL{pa} "
+        "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
+        "n.git_commit_count AS commit_count, n.git_author_count AS author_count, "
+        "n.git_days_since_last_commit AS days_since_last_commit "
+        f"ORDER BY commit_count DESC LIMIT {limit}",
+        params,
+    )
+
+    bus_factor_raw = await graph.execute(
+        "MATCH (n {project_name: $project}) "
+        f"WHERE n.git_commit_count IS NOT NULL AND n.git_author_count <= {_BUS_FACTOR_AUTHOR_THRESHOLD}{pa} "
+        "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
+        "n.git_commit_count AS commit_count, n.git_author_count AS author_count "
+        f"ORDER BY commit_count DESC LIMIT {limit}",
+        params,
+    )
+
+    pa_edge = " AND (a.file_path STARTS WITH $path OR b.file_path STARTS WITH $path)" if path else ""
+    co_change_raw = await graph.execute(
+        f"MATCH (a {{project_name: $project}})-[r:{RelType.CO_CHANGES_WITH}]->(b {{project_name: $project}}) "
+        f"WHERE true{pa_edge} "
+        "RETURN a.qualified_name AS a_qn, a.file_path AS a_path, "
+        "b.qualified_name AS b_qn, b.file_path AS b_path, r.count AS count "
+        f"ORDER BY count DESC LIMIT {limit}",
+        params,
+    )
+
+    elapsed = (time.monotonic() - t0) * 1000
+    mined = bool(hotspots_raw)
+    return {
+        "analysis": "git_signals",
+        "project": project,
+        "mined": mined,
+        "hotspots": [
+            {
+                "name": r["name"],
+                "qualified_name": r["qn"],
+                "file_path": r["file_path"],
+                "commit_count": r["commit_count"],
+                "author_count": r["author_count"],
+                "days_since_last_commit": r["days_since_last_commit"],
+            }
+            for r in hotspots_raw
+        ],
+        "bus_factor_risks": [
+            {
+                "name": r["name"],
+                "qualified_name": r["qn"],
+                "file_path": r["file_path"],
+                "commit_count": r["commit_count"],
+                "author_count": r["author_count"],
+            }
+            for r in bus_factor_raw
+        ],
+        "co_change_pairs": [
+            {
+                "a": r["a_qn"],
+                "a_file_path": r["a_path"],
+                "b": r["b_qn"],
+                "b_file_path": r["b_path"],
+                "count": r["count"],
+            }
+            for r in co_change_raw
+        ],
+        "query_ms": round(elapsed, 1),
+    }
 
 
 # ---------------------------------------------------------------------------

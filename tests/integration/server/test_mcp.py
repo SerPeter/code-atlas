@@ -839,6 +839,105 @@ class TestAnalyzeRepo:
         result = await _invoke_tool(app_ctx, "analyze_repo", analysis="nonexistent", project=_PROJECT)
         assert result["code"] == "INVALID_ANALYSIS"
 
+    async def test_dead_code_finds_uncalled_entities(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="dead_code", project=_PROJECT)
+        assert result["analysis"] == "dead_code"
+        # Only handle_request -> helper is a CALLS edge in the fixture, so
+        # save/handle_request/Base/User all have zero incoming CALLS edges.
+        names = {c["name"] for c in result["dead_code"]}
+        assert "helper" not in names  # helper IS called, by handle_request
+        assert "save" in names
+        assert "handle_request" in names
+
+    async def test_complexity_top_hotspot(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="complexity", project=_PROJECT)
+        assert result["analysis"] == "complexity"
+        # handle_request spans lines 5-30 (loc_span=25), the largest in the fixture.
+        assert result["hotspots"][0]["name"] == "handle_request"
+        assert result["hotspots"][0]["loc_span"] == 25
+
+    async def test_communities_clusters_connected_entities(self, app_ctx, seeded_analysis_graph):
+        """Requires the memgraph-mage image (leiden_community_detection.get()) — see docker-compose.yml.
+
+        The fixture's CALLS+IMPORTS edges connect handle_request, helper, models,
+        utils, User, and Base into one component, so they should land in the
+        same community.
+        """
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
+        assert result["analysis"] == "communities"
+        assert "error" not in result
+        assert result["community_count"] >= 1
+        all_names = {m["name"] for c in result["communities"] for m in c["members"]}
+        assert {"handle_request", "helper"} <= all_names
+        # handle_request and helper are directly CALLS-connected — must share a community.
+        owning_communities = {
+            c["community_id"]
+            for c in result["communities"]
+            for m in c["members"]
+            if m["name"] in {"handle_request", "helper"}
+        }
+        assert len(owning_communities) == 1
+
+
+# ---------------------------------------------------------------------------
+# find_dead_code / find_complexity_hotspots / find_communities shortcut tools (ADR-0013)
+# ---------------------------------------------------------------------------
+
+
+class TestShortcutTools:
+    async def test_find_dead_code_matches_analyze_repo(self, app_ctx, seeded_analysis_graph):
+        shortcut = await _invoke_tool(app_ctx, "find_dead_code", project=_PROJECT)
+        direct = await _invoke_tool(app_ctx, "analyze_repo", analysis="dead_code", project=_PROJECT)
+        del shortcut["query_ms"]
+        del direct["query_ms"]
+        assert shortcut == direct
+
+    async def test_find_complexity_hotspots_matches_analyze_repo(self, app_ctx, seeded_analysis_graph):
+        shortcut = await _invoke_tool(app_ctx, "find_complexity_hotspots", project=_PROJECT)
+        direct = await _invoke_tool(app_ctx, "analyze_repo", analysis="complexity", project=_PROJECT)
+        del shortcut["query_ms"]
+        del direct["query_ms"]
+        assert shortcut == direct
+
+    async def test_find_communities_matches_analyze_repo(self, app_ctx, seeded_analysis_graph):
+        """community_id is an arbitrary label Leiden reassigns per run — compare
+        membership sets, not the raw ids, so two separate calls stay comparable.
+        """
+        shortcut = await _invoke_tool(app_ctx, "find_communities", project=_PROJECT)
+        direct = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
+        del shortcut["query_ms"]
+        del direct["query_ms"]
+
+        def member_sets(result: dict) -> list[tuple[str, ...]]:
+            return sorted(tuple(sorted(m["uid"] for m in c["members"])) for c in result["communities"])
+
+        assert shortcut["analysis"] == direct["analysis"] == "communities"
+        assert shortcut["community_count"] == direct["community_count"]
+        assert member_sets(shortcut) == member_sets(direct)
+
+    async def test_find_hotspots_matches_analyze_repo(self, app_ctx, seeded_analysis_graph):
+        from code_atlas.indexing.git_signals import CoChangePair, FileSignal, GitSignalsResult, write_git_signals
+
+        result = GitSignalsResult(
+            file_signals=(
+                FileSignal(file_path="mypkg/models.py", commit_count=20, author_count=1, days_since_last_commit=2.0),
+                FileSignal(file_path="mypkg/utils.py", commit_count=5, author_count=3, days_since_last_commit=10.0),
+            ),
+            co_change_pairs=(CoChangePair(file_a="mypkg/models.py", file_b="mypkg/utils.py", count=4),),
+            commits_scanned=20,
+        )
+        await write_git_signals(app_ctx.graph, _PROJECT, result)
+
+        shortcut = await _invoke_tool(app_ctx, "find_hotspots", project=_PROJECT)
+        direct = await _invoke_tool(app_ctx, "analyze_repo", analysis="git_signals", project=_PROJECT)
+        del shortcut["query_ms"]
+        del direct["query_ms"]
+        assert shortcut == direct
+        assert direct["mined"] is True
+        assert direct["hotspots"][0]["file_path"] == "mypkg/models.py"
+        assert any(r["file_path"] == "mypkg/models.py" for r in direct["bus_factor_risks"])
+        assert direct["co_change_pairs"][0]["count"] == 4
+
 
 # ---------------------------------------------------------------------------
 # generate_diagram integration tests
@@ -1000,3 +1099,159 @@ class TestDetailParameter:
         # Siblings should NOT have source
         for sibling in result["siblings"]:
             assert "source" not in sibling
+
+
+# ---------------------------------------------------------------------------
+# trace_path / blast_radius integration tests (information-retrieval family, ADR-0013)
+# ---------------------------------------------------------------------------
+
+_TRAVERSAL_PROJECT = "traversal-project"
+
+
+@pytest.fixture
+async def seeded_traversal_graph(graph_client):
+    """Seed a CALLS chain + an ambiguous fan-out for trace_path/blast_radius tests.
+
+    Chain: a -> b -> c (both resolved). Fan-out: entry -> amb1, entry -> amb2
+    (both confidence='ambiguous', strategy='project_wide' — Phase 2/ADR-0014
+    materializes every candidate instead of discarding ambiguous matches) and
+    entry -> resolved_target (confidence='resolved'). d is unreachable from a.
+    """
+    await graph_client.ensure_schema()
+    await graph_client.merge_project_node(_TRAVERSAL_PROJECT, file_count=1, entity_count=7)
+
+    for name in ("a", "b", "c", "d", "entry", "amb1", "amb2", "resolved_target"):
+        await graph_client.execute_write(
+            f"CREATE (n:{NodeLabel.CALLABLE} {{uid: $uid, project_name: $p, name: $name, "
+            "qualified_name: $qn, file_path: 'mod.py', kind: 'function', line_start: 1, line_end: 5})",
+            {
+                "uid": f"{_TRAVERSAL_PROJECT}:mod.{name}",
+                "p": _TRAVERSAL_PROJECT,
+                "name": name,
+                "qn": f"mod.{name}",
+            },
+        )
+
+    # a -> b -> c, both resolved (single unambiguous candidate)
+    for from_name, to_name in (("a", "b"), ("b", "c")):
+        await graph_client.execute_write(
+            f"MATCH (x {{uid: $f}}), (y {{uid: $t}}) "
+            f"CREATE (x)-[:{RelType.CALLS} {{confidence: 'resolved', strategy: 'same_file'}}]->(y)",
+            {"f": f"{_TRAVERSAL_PROJECT}:mod.{from_name}", "t": f"{_TRAVERSAL_PROJECT}:mod.{to_name}"},
+        )
+
+    # entry -> amb1, entry -> amb2: ambiguous fan-out (Strategy 4, >1 candidate)
+    for target in ("amb1", "amb2"):
+        await graph_client.execute_write(
+            f"MATCH (x {{uid: $f}}), (y {{uid: $t}}) "
+            f"CREATE (x)-[:{RelType.CALLS} {{confidence: 'ambiguous', strategy: 'project_wide'}}]->(y)",
+            {"f": f"{_TRAVERSAL_PROJECT}:mod.entry", "t": f"{_TRAVERSAL_PROJECT}:mod.{target}"},
+        )
+
+    # entry -> resolved_target: unambiguous
+    await graph_client.execute_write(
+        f"MATCH (x {{uid: $f}}), (y {{uid: $t}}) "
+        f"CREATE (x)-[:{RelType.CALLS} {{confidence: 'resolved', strategy: 'import'}}]->(y)",
+        {"f": f"{_TRAVERSAL_PROJECT}:mod.entry", "t": f"{_TRAVERSAL_PROJECT}:mod.resolved_target"},
+    )
+
+    return graph_client
+
+
+class TestTracePath:
+    async def test_finds_multi_hop_path(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(
+            app_ctx,
+            "trace_path",
+            from_uid=f"{_TRAVERSAL_PROJECT}:mod.a",
+            to_uid=f"{_TRAVERSAL_PROJECT}:mod.c",
+        )
+        assert result["found"] is True
+        assert result["hop_count"] == 2
+        assert [h["edge_type"] for h in result["hops"]] == ["CALLS", "CALLS"]
+        assert result["hops"][0]["confidence"] == "resolved"
+
+    async def test_no_path_within_max_depth(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(
+            app_ctx,
+            "trace_path",
+            from_uid=f"{_TRAVERSAL_PROJECT}:mod.a",
+            to_uid=f"{_TRAVERSAL_PROJECT}:mod.d",
+            max_depth=6,
+        )
+        assert result["found"] is False
+        assert "message" in result
+
+    async def test_no_path_when_depth_too_shallow(self, app_ctx, seeded_traversal_graph):
+        """a -> b -> c is 2 hops; max_depth=1 must not find it."""
+        result = await _invoke_tool(
+            app_ctx,
+            "trace_path",
+            from_uid=f"{_TRAVERSAL_PROJECT}:mod.a",
+            to_uid=f"{_TRAVERSAL_PROJECT}:mod.c",
+            max_depth=1,
+        )
+        assert result["found"] is False
+
+    async def test_from_uid_not_found(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(
+            app_ctx,
+            "trace_path",
+            from_uid=f"{_TRAVERSAL_PROJECT}:mod.nonexistent",
+            to_uid=f"{_TRAVERSAL_PROJECT}:mod.c",
+        )
+        assert result["code"] == "NOT_FOUND"
+
+    async def test_invalid_edge_types(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(
+            app_ctx,
+            "trace_path",
+            from_uid=f"{_TRAVERSAL_PROJECT}:mod.a",
+            to_uid=f"{_TRAVERSAL_PROJECT}:mod.c",
+            edge_types="NOT_A_REL",
+        )
+        assert result["code"] == "INVALID_EDGE_TYPES"
+
+
+class TestBlastRadius:
+    async def test_callees_direction_finds_downstream(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(
+            app_ctx, "blast_radius", uid=f"{_TRAVERSAL_PROJECT}:mod.a", direction="callees", max_depth=3
+        )
+        affected_names = {a["name"] for a in result["affected"]}
+        assert affected_names == {"b", "c"}
+        by_name = {a["name"]: a for a in result["affected"]}
+        assert by_name["b"]["min_depth"] == 1
+        assert by_name["c"]["min_depth"] == 2
+
+    async def test_callers_direction_finds_upstream(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(
+            app_ctx, "blast_radius", uid=f"{_TRAVERSAL_PROJECT}:mod.c", direction="callers", max_depth=3
+        )
+        affected_names = {a["name"] for a in result["affected"]}
+        assert affected_names == {"a", "b"}
+
+    async def test_both_directions_combined(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(
+            app_ctx, "blast_radius", uid=f"{_TRAVERSAL_PROJECT}:mod.b", direction="both", max_depth=3
+        )
+        affected_names = {a["name"] for a in result["affected"]}
+        assert affected_names == {"a", "c"}
+
+    async def test_ambiguous_only_flag(self, app_ctx, seeded_traversal_graph):
+        """amb1/amb2 are reachable only via an ambiguous CALLS edge; resolved_target is not."""
+        result = await _invoke_tool(
+            app_ctx, "blast_radius", uid=f"{_TRAVERSAL_PROJECT}:mod.entry", direction="callees", max_depth=1
+        )
+        by_name = {a["name"]: a for a in result["affected"]}
+        assert by_name["amb1"]["ambiguous_only"] is True
+        assert by_name["amb2"]["ambiguous_only"] is True
+        assert by_name["resolved_target"]["ambiguous_only"] is False
+
+    async def test_node_not_found(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(app_ctx, "blast_radius", uid=f"{_TRAVERSAL_PROJECT}:mod.nonexistent")
+        assert result["code"] == "NOT_FOUND"
+
+    async def test_invalid_direction(self, app_ctx, seeded_traversal_graph):
+        result = await _invoke_tool(app_ctx, "blast_radius", uid=f"{_TRAVERSAL_PROJECT}:mod.a", direction="sideways")
+        assert result["code"] == "INVALID_DIRECTION"
