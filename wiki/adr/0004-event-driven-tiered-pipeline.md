@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted — amended by [ADR-0009](./0009-event-pipeline-durability-contract.md) (significance
-gating and durability guarantees superseded; tiered pipeline shape unchanged)
+Accepted — amended by [ADR-0009](./0009-event-pipeline-durability-contract.md) (significance gating and durability
+guarantees superseded; tiered pipeline shape unchanged)
 
 ## Date
 
