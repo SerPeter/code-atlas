@@ -377,9 +377,9 @@ class KnowledgeSettings(BaseModel):
     """Knowledge vault settings — the Obsidian-compatible note vault living alongside code."""
 
     vault_path: str = Field(
-        default="docs",
-        description="Repo-relative path to this project's knowledge vault. docs/ IS the vault — "
-        "frontmatter-triggered note mode lets ordinary docs and vault notes coexist in the same tree.",
+        default="wiki",
+        description="Repo-relative path to this project's knowledge vault. This directory IS the "
+        "vault — frontmatter-triggered note mode lets ordinary docs and vault notes coexist in the same tree.",
     )
     extra_vaults: list[ExtraVaultSettings] = Field(
         default_factory=list,

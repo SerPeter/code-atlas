@@ -213,7 +213,7 @@ _USAGE_GUIDE: dict[str, str] = {
         "- **Small functions** — each is a separately searchable, delta-tracked entity\n"
         "- **Test naming** mirrors source (`test_graph_search_*` → `graph_search`) — enables TESTS edges\n"
         "\n"
-        "Full reference with code examples: docs/guides/repo-guidelines.md"
+        "Full reference with code examples: wiki/guides/repo-guidelines.md"
     ),
 }
 

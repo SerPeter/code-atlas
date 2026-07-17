@@ -350,7 +350,7 @@ class TestDreamCommand:
 
         await cli._run_dream()
 
-        home = tmp_path / "docs" / "HOME.md"
+        home = tmp_path / settings.knowledge.vault_path / "HOME.md"
         assert home.is_file()
         assert "Knowledge Vault" in home.read_text(encoding="utf-8")
         mock_graph.ping.assert_awaited_once()

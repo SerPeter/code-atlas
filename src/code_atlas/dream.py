@@ -2,8 +2,8 @@
 
 Computes inbox digest, orphan notes, dangling links, duplicate-id conflicts,
 and cross-note similarity (including cross-project promotion candidates)
-across every configured vault (repo ``docs/`` + any ``[knowledge] extra_vaults``),
-regardless of which project a Note lives in. The disposition step
+across every configured vault (this project's own vault, see ``[knowledge] vault_path``,
+plus any ``[knowledge] extra_vaults``), regardless of which project a Note lives in. The disposition step
 (KEEP/MERGE/PROMOTE/DROP) is agent-side — see the ``dream-mode`` command —
 this module only produces the deterministic inputs it consumes.
 """

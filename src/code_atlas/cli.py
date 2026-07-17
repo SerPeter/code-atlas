@@ -243,7 +243,7 @@ def dream() -> None:
     """Deterministic dream-mode report: inbox, orphans, dangling links, duplicates, similarity.
 
     Scans this project's vault plus any configured extra vaults, refreshes
-    docs/HOME.md, and prints the report (--json for machine-readable output).
+    HOME.md inside the vault, and prints the report (--json for machine-readable output).
     The disposition step (KEEP/MERGE/PROMOTE/DROP) is agent-side — see the
     dream-mode command.
     """
