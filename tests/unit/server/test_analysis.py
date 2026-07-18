@@ -1733,7 +1733,9 @@ async def test_module_summary_reports_fan_in_and_fan_out_boundary():
     assert "    api < other.cli.main" in result["outline"]
     assert "FAN-OUT" in result["outline"]
     # External targets are marked so an agent does not hunt for them in the repo.
-    assert "    api > requests*" in result["outline"]
+    # No trailing marker: the "ext/" prefix on an external qualified name already says
+    # it, so the star was redundant. Here the fake has a bare name and no prefix.
+    assert "    api > requests" in result["outline"]
     assert (result["fan_in_count"], result["fan_out_count"]) == (1, 1)
 
 
@@ -1986,7 +1988,7 @@ async def test_module_summary_sqlite_backend_end_to_end(tmp_path):
     assert "Widget.draw > _hidden[confidence=ambiguous]" in outline
     # Boundary: an external caller in, an external package out.
     assert "Widget.draw < other.cli.main" in outline
-    assert "Widget.draw > requests*" in outline
+    assert "Widget.draw > requests" in outline
     assert (result["fan_in_count"], result["fan_out_count"]) == (1, 1)
     await client.close()
 

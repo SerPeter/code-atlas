@@ -1517,23 +1517,29 @@ def _render_grouped_adjacency(nodes: set[str], edges: list[tuple[tuple[str, str]
     for (a, b), w in edges:
         out_edges.setdefault(a, []).append(target(a, b, w))
 
+    # In-degree is stated per node because every line is out-edges only, which makes the
+    # most-depended-on modules render as the emptiest lines — a blind reader called this
+    # the format's biggest blind spot, and it is one integer per node to fix.
+    in_deg = Counter(b for (_a, b), _w in edges)
     lines = [
         f"IMPORTS {len(nodes)} modules, {len(edges)} edges, {len(communities)} clusters",
-        "LEGEND 'a > b, c': a imports b and c | Cn: prefix = target in cluster n | *N edge weight",
+        "LEGEND 'a > b, c': a imports b and c | Cn: target is in cluster n | *N: N import "
+        "statements | '(<-N)': imported by N of these modules | a bare name imports none of them",
+        "CLUSTERS are computed by greedy modularity over this import graph, not by directory.",
     ]
+
+    def node_line(qn: str) -> str:
+        head = label[qn] + (f"(<-{in_deg[qn]})" if in_deg.get(qn) else "")
+        targets = out_edges.get(qn)
+        return f"  {head} > {', '.join(sorted(targets))}" if targets else f"  {head}"
+
     for i, members in enumerate(communities):
-        lines.append("")
-        lines.append(f"[C{i}] {len(members)} modules")
-        for qn in sorted(members):
-            targets = out_edges.get(qn)
-            lines.append(f"  {label[qn]} > {', '.join(sorted(targets))}" if targets else f"  {label[qn]}")
+        lines.extend(["", f"[C{i}] {len(members)} modules"])
+        lines.extend(node_line(qn) for qn in sorted(members))
     loose = sorted(n for n in nodes if n not in community_of)
     if loose:
         lines.extend(["", f"[unclustered] {len(loose)} modules"])
-        lines.extend(
-            f"  {label[qn]} > {', '.join(sorted(out_edges[qn]))}" if out_edges.get(qn) else f"  {label[qn]}"
-            for qn in loose
-        )
+        lines.extend(node_line(qn) for qn in loose)
     return "\n".join(lines)
 
 
@@ -1772,7 +1778,7 @@ _MODULE_SUMMARY_DOC_MAX = 100
 _MODULE_SUMMARY_OUTLINE_MAX = 60_000
 _MODULE_SUMMARY_LEGEND = (
     "LEGEND no marker=public -private #protected ~internal | L<start>[-<end> when >=20 lines] | "
-    "'# ' first docstring line | a > b: a uses b | a < b: a used by b | trailing * external | "
+    "'# ' first docstring line | a > b: a uses b | a < b: a used by b | 'ext/' outside this project | "
     "[k=v] non-default edge props"
 )
 # T1 and T0 render different bodies, so they get different legends — an entry describing
@@ -1906,7 +1912,6 @@ def _adjacency_lines(
     src_key: str,
     dst_key: str,
     arrow: str,
-    external_qns: frozenset[str] | set[str] = frozenset(),
 ) -> list[str]:
     """Collapse edge rows to one line per (rel_type, source): ``src > a, b, c``.
 
@@ -1916,9 +1921,11 @@ def _adjacency_lines(
     grouped: dict[str, dict[str, list[str]]] = {}
     for row in rows:
         by_src = grouped.setdefault(row["rel_type"], {})
+        # No external marker: every external node's qualified name already begins
+        # "ext/" (verified across all 585 in the index), so a trailing * was exactly
+        # redundant with the prefix. A blind reader of this format called it out as
+        # carrying no information.
         target = _rel_name(row[dst_key], prefix)
-        if row[dst_key] in external_qns:
-            target += "*"
         by_src.setdefault(_rel_name(row[src_key], prefix), []).append(target + _edge_annotation(row.get("props")))
     lines: list[str] = []
     for rel_type in sorted(grouped):
@@ -1962,6 +1969,20 @@ def _skeleton_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]
     for e in entities:
         by_path.setdefault(e["file_path"] or "", []).append(e)
 
+    def parent_of(e: dict[str, Any]) -> str | None:
+        """Owning TypeDef, falling back to the qualified name.
+
+        Dataclass fields and enum members arrive with ``parent_qn`` unset — they have
+        no DEFINES edge, unlike methods — so indenting on that alone left ~50 of this
+        scope's entities looking like module-level globals. Their qualified name still
+        carries the owner, so derive it rather than requiring a re-index.
+        """
+        if e["parent_qn"]:
+            return str(e["parent_qn"])
+        qn = e["qn"] or ""
+        head = qn.rsplit(".", 1)[0] if "." in qn else ""
+        return head if head in typedef_qns else None
+
     lines: list[str] = []
     for file_path in sorted(set(mod_by_path) | set(by_path)):
         mod = mod_by_path.get(file_path)
@@ -1974,7 +1995,7 @@ def _skeleton_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]
         if mod_doc:
             lines.append(f" # {mod_doc}")
         for e in by_path.get(file_path, []):
-            indent = "    " if e["parent_qn"] in typedef_qns else "  "
+            indent = "    " if parent_of(e) in typedef_qns else "  "
             # Absent marker means public (stated in the LEGEND). Not derived from the
             # leading underscore: that rule is exact for Python but wrong for the jvm/
             # cpp/php grammars, where visibility is a keyword.
@@ -2028,7 +2049,6 @@ class _OutlineInputs:
     fan_out: list[dict[str, Any]]
     docs: list[dict[str, Any]]
     prefix: str
-    external_qns: frozenset[str]
     qn_to_module: dict[str, str]
     truncated: bool
 
@@ -2040,7 +2060,11 @@ def _render_outline(src: _OutlineInputs, tier: str) -> str:
     # agent reads, so the shortfall has to be visible there, not only in the JSON field.
     n_shown, n_total = len(shown), len(src.entities)
     counted = f"{n_shown} entities" if n_shown == n_total else f"{n_shown} of {n_total} entities"
-    header = f"SCOPE {src.path} | {len(src.modules)} module(s) | {counted} | DETAIL {tier}"
+    # Count the file blocks actually rendered, not the Module rows. A package __init__ is
+    # a Package node with no Module row, so "3 module(s)" sat above four file blocks —
+    # every blind reader of this format flagged the contradiction.
+    n_files = len({m["file_path"] for m in src.modules} | {e["file_path"] or "" for e in src.entities})
+    header = f"SCOPE {src.path} | {n_files} file(s) | {counted} | DETAIL {tier}"
     lines = [header + ("  |  TRUNCATED (raise limit for more)" if src.truncated else "")]
     if src.prefix:
         lines.append(f"NAMES below are relative to {src.prefix} unless fully qualified")
@@ -2058,7 +2082,7 @@ def _render_outline(src: _OutlineInputs, tier: str) -> str:
     if tier == _TIER_DETAIL:
         internal = _adjacency_lines(src.internal_edges, p, "from_qn", "to_qn", ">")
         inbound = _adjacency_lines(src.fan_in, p, "to_qn", "from_qn", "<")
-        outbound = _adjacency_lines(src.fan_out, p, "from_qn", "to_qn", ">", src.external_qns)
+        outbound = _adjacency_lines(src.fan_out, p, "from_qn", "to_qn", ">")
     else:
         internal = _aggregated_boundary_lines(src.internal_edges, p, "from_qn", "", "to_qn", ">", q)
         inbound = _aggregated_boundary_lines(src.fan_in, p, "to_qn", "from_path", "from_qn", "<", q)
@@ -2197,7 +2221,6 @@ async def _analyze_module_summary(
         }
 
     prefix = _common_dotted_prefix([m["qn"] for m in modules if m["qn"]])
-    external_qns = {r["to_qn"] for r in fan_out if r["to_label"] in _MODULE_SUMMARY_EXTERNAL_LABELS}
     truncated = (
         len(raw["entities"]) >= entity_limit
         or len(raw["internal_edges"]) >= edge_limit
@@ -2220,7 +2243,6 @@ async def _analyze_module_summary(
         fan_out=fan_out,
         docs=raw["docs"],
         prefix=prefix,
-        external_qns=frozenset(external_qns),
         qn_to_module=qn_to_module,
         truncated=truncated,
     )

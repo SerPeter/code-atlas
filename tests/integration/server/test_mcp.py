@@ -1416,8 +1416,12 @@ class TestModuleSummary:
         assert "Base < mypkg.utils" in outline
         assert "FAN-OUT" in outline
         assert "mypkg.utils.helper" in outline
-        # External targets carry the * marker (ExternalSymbol has no file_path).
-        assert "ext/dataclasses.dataclass*" in outline
+        # External targets are marked by the "ext/" prefix their qualified name already
+        # carries. The trailing "*" that used to follow it was pure redundancy — this
+        # assertion carried both — and a blind reader of the format flagged it as
+        # information-free before it was removed.
+        assert "ext/dataclasses.dataclass" in outline
+        assert "ext/dataclasses.dataclass*" not in outline
         assert result["fan_in_count"] >= 1
         assert result["fan_out_count"] >= 2
 
