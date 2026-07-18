@@ -25,6 +25,7 @@ from code_atlas.schema import (
     _TEXT_SEARCHABLE_LABELS,
     SCHEMA_VERSION,
     NodeLabel,
+    NoteKind,
     RelType,
     generate_composite_index_ddl,
     generate_drop_text_index_ddl,
@@ -162,6 +163,30 @@ def _build_graph_search_query(
         f"MATCH (n{label_filter}) WHERE (n.qualified_name CONTAINS $query OR n.name CONTAINS $query)"
         f"{project_clause} RETURN n AS node, 1.0 AS score LIMIT {fetch_limit}"
     )
+
+
+def _format_path_hops(path_nodes: list[Any], path_rels: list[Any]) -> list[dict[str, Any]]:
+    """Render a Cypher path's nodes/relationships into per-hop dicts for ``trace_path_between``.
+
+    Includes CALLS ``confidence``/``strategy`` edge properties (ADR-0014) when
+    present on the traversed edge.
+    """
+    hops: list[dict[str, Any]] = []
+    for i, rel in enumerate(path_rels):
+        from_props = dict(path_nodes[i].items()) if hasattr(path_nodes[i], "items") else {}
+        to_props = dict(path_nodes[i + 1].items()) if hasattr(path_nodes[i + 1], "items") else {}
+        rel_props = dict(rel.items()) if hasattr(rel, "items") else {}
+        hop: dict[str, Any] = {
+            "from": {"uid": from_props.get("uid"), "name": from_props.get("name")},
+            "to": {"uid": to_props.get("uid"), "name": to_props.get("name")},
+            "edge_type": getattr(rel, "type", None),
+        }
+        if "confidence" in rel_props:
+            hop["confidence"] = rel_props["confidence"]
+        if "strategy" in rel_props:
+            hop["strategy"] = rel_props["strategy"]
+        hops.append(hop)
+    return hops
 
 
 class QueryTimeoutError(Exception):
@@ -567,11 +592,11 @@ class GraphClient:
     Follows the same lifecycle pattern as EventBus: construct → ping → use → close.
     """
 
-    def __init__(self, settings: AtlasSettings) -> None:
+    def __init__(self, settings: AtlasSettings, *, driver: AsyncDriver | None = None) -> None:
         mg = settings.memgraph
         self._uri = f"bolt://{mg.host}:{mg.port}"
         auth = (mg.username, mg.password) if mg.username else None
-        self._driver: AsyncDriver = AsyncGraphDatabase.driver(self._uri, auth=auth)
+        self._driver: AsyncDriver = driver if driver is not None else AsyncGraphDatabase.driver(self._uri, auth=auth)
         self._dimension = settings.embeddings.dimension or 768
         self._embeddings_enabled = settings.embeddings.enabled
         self._query_timeout_s = mg.query_timeout_s
@@ -1963,6 +1988,42 @@ class GraphClient:
                 {"items": items},
             )
 
+    # -- Detector lookups (parsing/languages/*.py) -----------------------------
+
+    async def find_entity_uid(self, project_name: str, label: str, name: str) -> str | None:
+        """Exact ``(project_name, name)`` -> uid lookup scoped to *label*.
+
+        Used by parsing/languages detectors (test_mapping, di_injection) to
+        cross-reference an entity by name during indexing — a plain point
+        lookup, distinct from ``get_node_exact_matches`` (which also matches
+        by uid and searches every label for the interactive ``get_node`` tool).
+        """
+        records = await self.execute(
+            f"MATCH (n:{label} {{project_name: $p, name: $n}}) RETURN n.uid AS uid LIMIT 1",
+            {"p": project_name, "n": name},
+        )
+        return records[0]["uid"] if records else None
+
+    async def find_overridden_method(
+        self, project_name: str, bases: list[str], method_name: str
+    ) -> tuple[str, list[str]] | None:
+        """First same-named method defined on any of *bases* — parsing/languages/
+        python.py's ``ClassOverridesDetector`` (OVERRIDES/IMPLEMENTS detection).
+
+        Returns ``(uid, tags)``; *tags* carries decorator info (e.g.
+        ``decorator:abstractmethod``) the detector uses to distinguish
+        IMPLEMENTS from OVERRIDES.
+        """
+        records = await self.execute(
+            "MATCH (base:TypeDef {project_name: $p})-[:DEFINES]->(m:Callable) "
+            "WHERE base.name IN $bases AND m.name = $method "
+            "RETURN m.uid AS uid, m.tags AS tags LIMIT 1",
+            {"p": project_name, "bases": bases, "method": method_name},
+        )
+        if not records:
+            return None
+        return records[0]["uid"], records[0].get("tags") or []
+
     # -- Embedding helpers -----------------------------------------------------
 
     async def get_embedding_config(self) -> tuple[str, int] | None:
@@ -2429,6 +2490,597 @@ class GraphClient:
                 )
                 for r in records
             }
+
+    # -- Analysis / diagram queries (server/analysis.py) ----------------------
+    #
+    # Query construction for analyze_repo's sub-analyses, generate_diagram's
+    # diagram types, and trace_path/blast_radius — moved here from
+    # server/analysis.py so callers never build Cypher directly (see
+    # GraphBackend in graph/protocol.py). Each method returns plain dicts;
+    # the Python-side shaping/aggregation stays in analysis.py, unchanged.
+
+    async def node_exists(self, uid: str) -> bool:
+        """Single-node existence check, used by ``server.analysis.blast_radius``."""
+        exist_raw = await self.execute("OPTIONAL MATCH (n {uid: $uid}) RETURN n IS NOT NULL AS exists", {"uid": uid})
+        return bool(exist_raw and exist_raw[0]["exists"])
+
+    async def trace_path_between(
+        self, from_uid: str, to_uid: str, max_depth: int, edge_types: tuple[str, ...]
+    ) -> dict[str, Any]:
+        """Existence check + shortest-path traversal for ``server.analysis.trace_path``.
+
+        Returns ``from_exists``/``to_exists`` booleans plus (when both exist
+        and a path is found) the shortest path's ``hop_count`` and formatted
+        ``hops`` (endpoint uid/name, edge type, and CALLS confidence/strategy
+        when present — ADR-0014).
+        """
+        params: dict[str, Any] = {"from_uid": from_uid, "to_uid": to_uid}
+        exist_raw = await self.execute(
+            "OPTIONAL MATCH (a {uid: $from_uid}) OPTIONAL MATCH (b {uid: $to_uid}) "
+            "RETURN a IS NOT NULL AS from_exists, b IS NOT NULL AS to_exists",
+            params,
+        )
+        exists = exist_raw[0] if exist_raw else {"from_exists": False, "to_exists": False}
+        if not exists["from_exists"] or not exists["to_exists"]:
+            return {
+                "from_exists": exists["from_exists"],
+                "to_exists": exists["to_exists"],
+                "found": False,
+                "hop_count": None,
+                "hops": [],
+            }
+
+        rel_pattern = "|".join(edge_types)
+        records = await self.execute(
+            f"MATCH p=(a {{uid: $from_uid}})-[:{rel_pattern}*1..{max_depth}]->(b {{uid: $to_uid}}) "
+            "RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels, length(p) AS hops "
+            "ORDER BY hops LIMIT 1",
+            params,
+        )
+        if not records:
+            return {"from_exists": True, "to_exists": True, "found": False, "hop_count": None, "hops": []}
+
+        record = records[0]
+        return {
+            "from_exists": True,
+            "to_exists": True,
+            "found": True,
+            "hop_count": record["hops"],
+            "hops": _format_path_hops(record["path_nodes"], record["path_rels"]),
+        }
+
+    async def compute_blast_radius(
+        self, uid: str, direction_kind: str, edge_types: tuple[str, ...], max_depth: int
+    ) -> list[dict[str, Any]]:
+        """One directional (``"out"``/``"in"``) traversal for ``server.analysis.blast_radius``.
+
+        Returns affected-entity dicts with ``min_depth`` (shortest hop count
+        to *uid*) and ``ambiguous_only`` (True unless some path made entirely
+        of ``confidence: "resolved"`` edges reaches the entity — ADR-0014).
+        """
+        rel_pattern = "|".join(edge_types)
+        pattern = (
+            f"-[:{rel_pattern}*1..{max_depth}]->" if direction_kind == "out" else f"<-[:{rel_pattern}*1..{max_depth}]-"
+        )
+        all_raw = await self.execute(
+            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
+            "WHERE affected.uid <> $uid "
+            "RETURN affected.uid AS uid, affected.name AS name, affected.qualified_name AS qn, "
+            "labels(affected)[0] AS label, affected.file_path AS file_path, "
+            "min(length(p)) AS min_depth",
+            {"uid": uid},
+        )
+        resolved_raw = await self.execute(
+            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
+            "WHERE affected.uid <> $uid AND all(r IN relationships(p) WHERE r.confidence = 'resolved') "
+            "RETURN DISTINCT affected.uid AS uid",
+            {"uid": uid},
+        )
+        resolved_uids = {r["uid"] for r in resolved_raw}
+        return [
+            {
+                "uid": r["uid"],
+                "name": r["name"],
+                "qualified_name": r["qn"],
+                "label": r["label"],
+                "file_path": r["file_path"],
+                "min_depth": r["min_depth"],
+                "direction": direction_kind,
+                "ambiguous_only": r["uid"] not in resolved_uids,
+            }
+            for r in all_raw
+        ]
+
+    async def get_structure_overview(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
+        """Entity counts, package breakdown, largest modules, external deps —
+        ``analyze_repo(analysis="structure")``.
+        """
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa = " AND n.file_path STARTS WITH $path" if path else ""
+        counts_raw = await self.execute(
+            f"MATCH (n {{project_name: $project}}) "
+            f"WHERE NOT n:Project AND NOT n:SchemaVersion{pa} "
+            "RETURN labels(n)[0] AS label, n.kind AS kind, count(n) AS cnt "
+            "ORDER BY cnt DESC",
+            params,
+        )
+        pa_m = " WHERE m.file_path STARTS WITH $path" if path else ""
+        pkg_raw = await self.execute(
+            "MATCH (pkg:Package {project_name: $project})-[:CONTAINS]->(m:Module)"
+            f"{pa_m} "
+            "RETURN pkg.name AS package, pkg.qualified_name AS qn, count(m) AS modules "
+            f"ORDER BY modules DESC LIMIT {limit}",
+            params,
+        )
+        lm_w = " WHERE m.file_path STARTS WITH $path" if path else ""
+        largest_raw = await self.execute(
+            "MATCH (m:Module {project_name: $project})-[:DEFINES]->(e)"
+            f"{lm_w} "
+            "RETURN m.name AS module, m.qualified_name AS qn, m.file_path AS file_path, "
+            f"count(e) AS entities ORDER BY entities DESC LIMIT {limit}",
+            params,
+        )
+        ext_w = " WHERE src IS NULL OR src.file_path STARTS WITH $path" if path else ""
+        ext_raw = await self.execute(
+            "MATCH (ep:ExternalPackage {project_name: $project}) "
+            "OPTIONAL MATCH (ep)<-[:IMPORTS]-(src) "
+            f"{ext_w} "
+            "RETURN ep.name AS package, ep.version AS version, count(src) AS imported_by "
+            f"ORDER BY imported_by DESC LIMIT {limit}",
+            params,
+        )
+        return {"counts": counts_raw, "packages": pkg_raw, "largest_modules": largest_raw, "external_deps": ext_raw}
+
+    async def get_centrality_data(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
+        """Hub entities, hub modules, and leaf entities — ``analyze_repo(analysis="centrality")``."""
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa = " AND n.file_path STARTS WITH $path" if path else ""
+        hubs_raw = await self.execute(
+            "MATCH (n {project_name: $project})<-[r:IMPORTS|INHERITS|CALLS]-(src) "
+            f"WHERE NOT n:ExternalPackage AND NOT n:ExternalSymbol{pa} "
+            "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
+            "n.kind AS kind, n.file_path AS file_path, "
+            "count(r) AS in_degree, "
+            "sum(CASE WHEN type(r) = 'IMPORTS' THEN 1 ELSE 0 END) AS imported_by, "
+            "sum(CASE WHEN type(r) = 'INHERITS' THEN 1 ELSE 0 END) AS inherited_by, "
+            "sum(CASE WHEN type(r) = 'CALLS' THEN 1 ELSE 0 END) AS called_by "
+            f"ORDER BY in_degree DESC LIMIT {limit}",
+            params,
+        )
+        pa_m = " AND m.file_path STARTS WITH $path" if path else ""
+        hub_modules_raw = await self.execute(
+            "MATCH (m:Module {project_name: $project})<-[:IMPORTS]-(src) "
+            f"WHERE true{pa_m} "
+            "RETURN m.name AS name, m.qualified_name AS qn, m.file_path AS file_path, "
+            f"count(src) AS imported_by ORDER BY imported_by DESC LIMIT {limit}",
+            params,
+        )
+        pa_leaf = " AND n.file_path STARTS WITH $path" if path else ""
+        leaf_raw = await self.execute(
+            "MATCH (n {project_name: $project}) "
+            "WHERE NOT n:Project AND NOT n:SchemaVersion AND NOT n:Package "
+            f"AND NOT n:ExternalPackage AND NOT n:ExternalSymbol{pa_leaf} "
+            "AND NOT ()-[:IMPORTS|INHERITS|CALLS]->(n) "
+            "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
+            f"n.kind AS kind, n.file_path AS file_path LIMIT {limit}",
+            params,
+        )
+        return {"hubs": hubs_raw, "hub_modules": hub_modules_raw, "leaves": leaf_raw}
+
+    async def get_module_import_edges(self, project: str, path: str) -> dict[str, list[dict[str, Any]]]:
+        """Direct module-to-module and entity-level import edges.
+
+        Shared by ``analyze_repo(analysis="dependencies")`` and
+        ``generate_diagram(diagram_type="imports")`` — identical query, only
+        the downstream aggregation/rendering differs.
+        """
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa_m1 = " AND m1.file_path STARTS WITH $path" if path else ""
+        direct_raw = await self.execute(
+            "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
+            "(m2:Module {project_name: $project}) "
+            f"WHERE m1 <> m2{pa_m1} "
+            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+            params,
+        )
+        indirect_raw = await self.execute(
+            "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
+            "<-[:DEFINES]-(m2:Module {project_name: $project}) "
+            f"WHERE m1 <> m2 AND NOT e:Module{pa_m1} "
+            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+            params,
+        )
+        return {"direct": direct_raw, "indirect": indirect_raw}
+
+    async def get_dependency_external_counts(self, project: str, path: str) -> dict[str, list[dict[str, Any]]]:
+        """External package/symbol import counts — ``analyze_repo(analysis="dependencies")``."""
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa_src = " AND src.file_path STARTS WITH $path" if path else ""
+        ext_pkg_raw = await self.execute(
+            "MATCH (src {project_name: $project})-[:IMPORTS]->(ep:ExternalPackage) "
+            f"WHERE true{pa_src} "
+            "RETURN ep.name AS package, count(src) AS cnt",
+            params,
+        )
+        ext_sym_raw = await self.execute(
+            "MATCH (src {project_name: $project})-[:IMPORTS]->(es:ExternalSymbol) "
+            f"WHERE true{pa_src} "
+            "RETURN es.package AS package, count(src) AS cnt",
+            params,
+        )
+        return {"ext_packages": ext_pkg_raw, "ext_symbols": ext_sym_raw}
+
+    async def get_quality_data(self, project: str, path: str) -> dict[str, list[dict[str, Any]]]:
+        """Per-module entity counts and fan-in-inclusive import edges —
+        ``analyze_repo(analysis="quality")``.
+        """
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa_m = " AND m.file_path STARTS WITH $path" if path else ""
+        # Match on either side so a scoped module's fan-in from out-of-scope
+        # importers (and fan-out to out-of-scope targets) are both captured —
+        # see server.analysis._analyze_quality's docstring-level comment.
+        pa_edge = " AND (m1.file_path STARTS WITH $path OR m2.file_path STARTS WITH $path)" if path else ""
+        entity_raw = await self.execute(
+            "MATCH (m:Module {project_name: $project})-[:DEFINES]->(e) "
+            f"WHERE NOT e:Module{pa_m} "
+            "RETURN m.qualified_name AS module, m.file_path AS file_path, count(e) AS entity_count "
+            "ORDER BY entity_count DESC",
+            params,
+        )
+        direct_raw = await self.execute(
+            "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
+            "(m2:Module {project_name: $project}) "
+            f"WHERE m1 <> m2{pa_edge} "
+            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+            params,
+        )
+        indirect_raw = await self.execute(
+            "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
+            "<-[:DEFINES]-(m2:Module {project_name: $project}) "
+            f"WHERE m1 <> m2 AND NOT e:Module{pa_edge} "
+            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+            params,
+        )
+        return {"entities": entity_raw, "direct": direct_raw, "indirect": indirect_raw}
+
+    async def get_patterns_data(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
+        """Inheritance, enums, visibility distribution, docstring coverage, and
+        detected patterns — ``analyze_repo(analysis="patterns")``.
+        """
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa = " AND child.file_path STARTS WITH $path" if path else ""
+        inherit_raw = await self.execute(
+            "MATCH (child:TypeDef {project_name: $project})-[:INHERITS]->(parent) "
+            f"WHERE true{pa} "
+            "RETURN child.name AS child, child.qualified_name AS child_qn, "
+            f"parent.name AS parent, parent.qualified_name AS parent_qn LIMIT {limit}",
+            params,
+        )
+        pa_n = " AND n.file_path STARTS WITH $path" if path else ""
+        enum_raw = await self.execute(
+            "MATCH (n:TypeDef {project_name: $project, kind: 'enum'})"
+            f" WHERE true{pa_n} "
+            "OPTIONAL MATCH (n)-[:DEFINES]->(m:Value) "
+            "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
+            f"count(m) AS members ORDER BY name LIMIT {limit}",
+            params,
+        )
+        vis_raw = await self.execute(
+            "MATCH (n {project_name: $project}) "
+            f"WHERE n.visibility IS NOT NULL{pa_n} "
+            "RETURN n.visibility AS visibility, count(n) AS cnt "
+            "ORDER BY cnt DESC",
+            params,
+        )
+        doc_raw = await self.execute(
+            "MATCH (n {project_name: $project}) "
+            f"WHERE (n:Callable OR n:TypeDef OR n:Value){pa_n} "
+            "WITH count(n) AS total, "
+            "sum(CASE WHEN n.docstring IS NOT NULL AND n.docstring <> '' THEN 1 ELSE 0 END) AS documented "
+            "RETURN total, documented",
+            params,
+        )
+        pattern_raw = await self.execute(
+            "MATCH (n {project_name: $project})-[r:HANDLES_COMMAND|HANDLES_ROUTE|HANDLES_EVENT]->(target) "
+            f"WHERE true{pa_n} "
+            "RETURN type(r) AS pattern_type, n.name AS name, n.qualified_name AS qn, "
+            f"target.name AS target_name ORDER BY pattern_type, name LIMIT {limit}",
+            params,
+        )
+        return {
+            "inheritance": inherit_raw,
+            "enums": enum_raw,
+            "visibility": vis_raw,
+            "docstring": doc_raw,
+            "detected_patterns": pattern_raw,
+        }
+
+    async def get_dead_code_candidates(self, project: str, path: str) -> list[dict[str, Any]]:
+        """Callables/TypeDefs with zero incoming CALLS edges — ``analyze_repo(analysis="dead_code")``."""
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa = " AND n.file_path STARTS WITH $path" if path else ""
+        return await self.execute(
+            "MATCH (n {project_name: $project}) "
+            f"WHERE (n:Callable OR n:TypeDef) AND NOT n.name STARTS WITH '__'{pa} "
+            "AND NOT ()-[:CALLS]->(n) "
+            "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
+            "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
+            "ORDER BY n.file_path, n.line_start",
+            params,
+        )
+
+    async def get_complexity_hotspots(self, project: str, path: str, limit: int) -> list[dict[str, Any]]:
+        """Top-N Callables by LOC span — ``analyze_repo(analysis="complexity")``."""
+        params: dict[str, Any] = {"project": project, "path": path}
+        pa = " AND n.file_path STARTS WITH $path" if path else ""
+        return await self.execute(
+            "MATCH (n:Callable {project_name: $project}) "
+            f"WHERE n.line_start IS NOT NULL AND n.line_end IS NOT NULL{pa} "
+            "RETURN n.name AS name, n.qualified_name AS qn, n.kind AS kind, n.file_path AS file_path, "
+            "n.line_start AS line_start, n.line_end AS line_end, (n.line_end - n.line_start) AS loc_span "
+            f"ORDER BY loc_span DESC LIMIT {limit}",
+            params,
+        )
+
+    async def get_git_signals_data(
+        self, project: str, path: str, limit: int, bus_factor_threshold: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Commit-count hotspots, bus-factor risks, and co-change pairs —
+        ``analyze_repo(analysis="git_signals")``.
+        """
+        params: dict[str, Any] = {"project": project, "path": path, "max_authors": bus_factor_threshold}
+        pa = " AND n.file_path STARTS WITH $path" if path else ""
+        hotspots_raw = await self.execute(
+            "MATCH (n {project_name: $project}) "
+            f"WHERE n.git_commit_count IS NOT NULL{pa} "
+            "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
+            "n.git_commit_count AS commit_count, n.git_author_count AS author_count, "
+            "n.git_days_since_last_commit AS days_since_last_commit "
+            f"ORDER BY commit_count DESC LIMIT {limit}",
+            params,
+        )
+        bus_factor_raw = await self.execute(
+            "MATCH (n {project_name: $project}) "
+            f"WHERE n.git_commit_count IS NOT NULL AND n.git_author_count <= $max_authors{pa} "
+            "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
+            "n.git_commit_count AS commit_count, n.git_author_count AS author_count "
+            f"ORDER BY commit_count DESC LIMIT {limit}",
+            params,
+        )
+        pa_edge = " AND (a.file_path STARTS WITH $path OR b.file_path STARTS WITH $path)" if path else ""
+        co_change_raw = await self.execute(
+            f"MATCH (a {{project_name: $project}})-[r:{RelType.CO_CHANGES_WITH}]->(b {{project_name: $project}}) "
+            f"WHERE true{pa_edge} "
+            "RETURN a.qualified_name AS a_qn, a.file_path AS a_path, "
+            "b.qualified_name AS b_qn, b.file_path AS b_path, r.count AS count "
+            f"ORDER BY count DESC LIMIT {limit}",
+            params,
+        )
+        return {"hotspots": hotspots_raw, "bus_factor": bus_factor_raw, "co_change": co_change_raw}
+
+    async def get_diagram_packages(self, project: str, path: str, max_nodes: int) -> list[dict[str, Any]]:
+        """Package→child (Package|Module) CONTAINS edges — ``generate_diagram(diagram_type="packages")``."""
+        params: dict[str, Any] = {"project": project, "path": path, "limit": max_nodes}
+        pa = " AND child.file_path STARTS WITH $path" if path else ""
+        return await self.execute(
+            "MATCH (pkg:Package {project_name: $project})-[:CONTAINS]->(child) "
+            f"WHERE (child:Package OR child:Module){pa} "
+            "RETURN pkg.qualified_name AS parent_qn, pkg.name AS parent_name, "
+            "labels(child)[0] AS child_label, child.qualified_name AS child_qn, child.name AS child_name "
+            "ORDER BY parent_qn, child_qn LIMIT $limit",
+            params,
+        )
+
+    async def get_diagram_inheritance(self, project: str, path: str, max_nodes: int) -> list[dict[str, Any]]:
+        """Child→parent TypeDef INHERITS edges — ``generate_diagram(diagram_type="inheritance")``."""
+        params: dict[str, Any] = {"project": project, "path": path, "limit": max_nodes}
+        pa = " AND child.file_path STARTS WITH $path" if path else ""
+        return await self.execute(
+            "MATCH (child:TypeDef {project_name: $project})-[:INHERITS]->(parent) "
+            f"WHERE true{pa} "
+            "RETURN child.name AS child_name, child.qualified_name AS child_qn, "
+            "child.kind AS child_kind, "
+            "parent.name AS parent_name, parent.qualified_name AS parent_qn "
+            "ORDER BY parent_qn, child_qn LIMIT $limit",
+            params,
+        )
+
+    async def get_diagram_module_detail(self, project: str, path: str, max_nodes: int) -> dict[str, Any] | None:
+        """Module lookup + its top-level entities/methods/inheritance —
+        ``generate_diagram(diagram_type="module_detail")``. Returns ``None``
+        when no module matches *path*.
+        """
+        params: dict[str, Any] = {"project": project, "path": path}
+        modules = await self.execute(
+            "MATCH (m:Module {project_name: $project}) "
+            "WHERE m.file_path STARTS WITH $path "
+            "RETURN m.name AS name, m.qualified_name AS qn, m.uid AS uid "
+            "ORDER BY m.qualified_name LIMIT 1",
+            params,
+        )
+        if not modules:
+            return None
+        mod = modules[0]
+        entities = await self.execute(
+            "MATCH (m {uid: $uid})-[:DEFINES]->(e) "
+            "RETURN e.name AS name, e.qualified_name AS qn, labels(e)[0] AS label, "
+            f"e.kind AS kind, e.visibility AS vis, e.signature AS sig ORDER BY e.line_start LIMIT {max_nodes}",
+            {"uid": mod["uid"]},
+        )
+        methods = await self.execute(
+            "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:DEFINES]->(method:Callable) "
+            "RETURN td.qualified_name AS class_qn, td.name AS class_name, "
+            "method.name AS name, method.visibility AS vis, method.kind AS kind "
+            f"ORDER BY td.name, method.line_start LIMIT {max_nodes}",
+            {"uid": mod["uid"]},
+        )
+        inherits = await self.execute(
+            "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:INHERITS]->(parent) "
+            "RETURN td.qualified_name AS child_qn, td.name AS child_name, "
+            "parent.qualified_name AS parent_qn, parent.name AS parent_name "
+            f"LIMIT {max_nodes}",
+            {"uid": mod["uid"]},
+        )
+        return {"module": mod, "entities": entities, "methods": methods, "inherits": inherits}
+
+    # -- Context expansion / navigation (search/engine.py's expand_context) ---
+
+    async def get_entity_by_uid(self, uid: str, label: str = "") -> dict[str, Any] | None:
+        """Single node fetch by uid (optionally label-scoped) — ``expand_context``'s target lookup."""
+        label_clause = f":{label}" if label else ""
+        records = await self.execute(f"MATCH (n{label_clause} {{uid: $uid}}) RETURN n", {"uid": uid})
+        return records[0].get("n") if records else None
+
+    async def get_defining_parent(self, uid: str) -> dict[str, Any] | None:
+        """The entity that DEFINES *uid* (its enclosing class/module) — ``expand_context``'s parent."""
+        records = await self.execute(
+            f"MATCH (p)-[:{RelType.DEFINES}]->(n {{uid: $uid}}) RETURN p AS n LIMIT 1", {"uid": uid}
+        )
+        return records[0].get("n") if records else None
+
+    async def get_sibling_entities(self, uid: str, limit: int) -> list[dict[str, Any]]:
+        """Other entities DEFINEd by *uid*'s same parent — ``expand_context``'s siblings."""
+        records = await self.execute(
+            f"MATCH (p)-[:{RelType.DEFINES}]->(n {{uid: $uid}}), (p)-[:{RelType.DEFINES}]->(s) "
+            f"WHERE s.uid <> $uid RETURN s AS n LIMIT {limit}",
+            {"uid": uid},
+        )
+        return [r["n"] for r in records]
+
+    async def get_package_docstring(self, uid: str) -> str | None:
+        """Docstring of the nearest enclosing Module (1-3 DEFINES hops) — ``expand_context``'s package context."""
+        records = await self.execute(
+            f"MATCH (pkg:{NodeLabel.MODULE})-[:{RelType.DEFINES}*1..3]->(target {{uid: $uid}}) "
+            "RETURN pkg.docstring AS docstring LIMIT 1",
+            {"uid": uid},
+        )
+        return records[0].get("docstring") if records else None
+
+    async def get_callers(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
+        """Callables reaching *uid* via 1..call_depth CALLS hops — ``expand_context``'s callers."""
+        label_clause = f":{label}" if label else ""
+        records = await self.execute(
+            f"MATCH (caller:Callable)-[:{RelType.CALLS}*1..{call_depth}]->"
+            f"(n{label_clause} {{uid: $uid}}) "
+            f"RETURN DISTINCT caller AS n LIMIT {limit}",
+            {"uid": uid},
+        )
+        return [r["n"] for r in records]
+
+    async def get_callees(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
+        """Callables reached from *uid* via 1..call_depth CALLS hops — ``expand_context``'s callees."""
+        label_clause = f":{label}" if label else ""
+        records = await self.execute(
+            f"MATCH (n{label_clause} {{uid: $uid}})-[:{RelType.CALLS}*1..{call_depth}]->"
+            f"(callee:Callable) RETURN DISTINCT callee AS n LIMIT {limit}",
+            {"uid": uid},
+        )
+        return [r["n"] for r in records]
+
+    async def get_linked_docs(self, uid: str, label: str, limit: int) -> list[dict[str, Any]]:
+        """DocSection/Note entities documenting *uid* — ``expand_context``'s docs.
+
+        Each item is ``{"node": ..., "link_type": ..., "stale": ..., "anchor_hash": ...}``;
+        ``stale``/``anchor_hash`` are only populated for explicit ``anchors:`` links (§3.6).
+        """
+        label_clause = f":{label}" if label else ""
+        records = await self.execute(
+            f"MATCH (doc)-[r:{RelType.DOCUMENTS}]->(n{label_clause} {{uid: $uid}}) "
+            f"WHERE doc:{NodeLabel.DOC_SECTION} OR doc:{NodeLabel.NOTE} "
+            "RETURN doc AS n, r.link_type AS link_type, r.stale AS stale, r.anchor_hash AS anchor_hash "
+            f"LIMIT {limit}",
+            {"uid": uid},
+        )
+        return [
+            {
+                "node": r["n"],
+                "link_type": r.get("link_type"),
+                "stale": r.get("stale"),
+                "anchor_hash": r.get("anchor_hash"),
+            }
+            for r in records
+        ]
+
+    # -- get_node cascade / status queries (server/mcp.py, cli.py) ------------
+
+    async def get_node_exact_matches(self, name: str, label: str, limit: int) -> list[dict[str, Any]]:
+        """Exact match cascade (uid + exact name) — ``get_node`` stage A."""
+        label_filter = f":{label}" if label else ""
+        return await self.execute(
+            f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {limit} "
+            f"UNION ALL "
+            f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {limit}",
+            {"name": name},
+        )
+
+    async def get_node_partial_matches(self, name: str, label: str, limit: int) -> list[dict[str, Any]]:
+        """Partial match cascade (suffix > prefix > contains) — ``get_node`` stage B."""
+        label_filter = f":{label}" if label else ""
+        return await self.execute(
+            f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix "
+            f"RETURN n, 3 AS _match_score LIMIT {limit} "
+            f"UNION ALL "
+            f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix "
+            f"RETURN n, 2 AS _match_score LIMIT {limit} "
+            f"UNION ALL "
+            f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
+            f"RETURN n, 1 AS _match_score LIMIT {limit}",
+            {"name": name, "suffix": f".{name}", "prefix": f"{name}."},
+        )
+
+    async def get_label_counts(self) -> dict[str, int]:
+        """Per-label node counts across the whole graph — ``index_status``."""
+        records = await self.execute("MATCH (n) RETURN labels(n)[0] AS label, count(n) AS count ORDER BY count DESC")
+        return {r["label"]: r["count"] for r in records}
+
+    async def get_project_dependency_edges(self) -> list[dict[str, Any]]:
+        """Project-to-project DEPENDS_ON edges — ``atlas status`` and ``list_projects``."""
+        return await self.execute(
+            f"MATCH (a:{NodeLabel.PROJECT})-[:{RelType.DEPENDS_ON}]->(b:{NodeLabel.PROJECT}) "
+            "RETURN a.name AS from_proj, b.name AS to_proj"
+        )
+
+    # -- Dream-mode lint queries (dream.py) ------------------------------------
+
+    async def get_existing_uids(self, uids: list[str]) -> set[str]:
+        """Which of *uids* exist in the graph — dream-mode dangling-link check."""
+        if not uids:
+            return set()
+        records = await self.execute("UNWIND $uids AS uid MATCH (n {uid: uid}) RETURN uid", {"uids": uids})
+        return {r["uid"] for r in records}
+
+    async def get_orphan_notes(self) -> list[dict[str, Any]]:
+        """Notes with no LINKS_TO edges in or out — dream-mode orphan check."""
+        return await self.execute(
+            f"MATCH (n:{NodeLabel.NOTE}) WHERE NOT (n)-[:{RelType.LINKS_TO}]-() "
+            "RETURN n.uid AS uid, n.name AS name, n.project_name AS project_name, n.file_path AS file_path"
+        )
+
+    async def get_broken_anchor_notes(self) -> list[dict[str, Any]]:
+        """Notes with broken/unresolved explicit ``anchors:`` — dream-mode lint check."""
+        return await self.execute(
+            f"MATCH (n:{NodeLabel.NOTE}) "
+            "WHERE n.has_broken_anchors = true "
+            "OR (n.unresolved_anchors IS NOT NULL AND size(n.unresolved_anchors) > 0) "
+            "RETURN n.uid AS uid, n.name AS name, n.project_name AS project_name, n.file_path AS file_path, "
+            "n.unresolved_anchors AS unresolved_anchors"
+        )
+
+    async def get_inbox_note_paths(self) -> list[str]:
+        """Draft/inbox-path Note file paths, sorted — dream-mode inbox digest."""
+        records = await self.execute(
+            f"MATCH (n:{NodeLabel.NOTE}) WHERE n.kind = $draft OR n.file_path CONTAINS '/inbox/' "
+            "RETURN n.file_path AS file_path ORDER BY file_path",
+            {"draft": NoteKind.DRAFT.value},
+        )
+        return [r["file_path"] for r in records]
+
+    async def get_note_embeddings(self) -> list[dict[str, Any]]:
+        """uid/project_name/embedding for every Note with a stored vector — dream-mode similarity scan."""
+        return await self.execute(
+            f"MATCH (n:{NodeLabel.NOTE}) WHERE n.embedding IS NOT NULL "
+            "RETURN n.uid AS uid, n.project_name AS project_name, n.embedding AS embedding"
+        )
 
     async def close(self) -> None:
         """Close the driver and release connections."""

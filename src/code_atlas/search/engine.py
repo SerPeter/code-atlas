@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import tiktoken
 from loguru import logger
 
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import NodeLabel
 from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 
 if TYPE_CHECKING:
@@ -25,9 +25,21 @@ if TYPE_CHECKING:
     from code_atlas.settings import SearchSettings
 
     class GraphExecutor(Protocol):
-        """Structural subset of GraphClient needed by expand_context (raw query execution)."""
+        """Structural subset of GraphClient needed by expand_context (neighborhood navigation)."""
 
-        async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]: ...
+        async def get_entity_by_uid(self, uid: str, label: str = "") -> dict[str, Any] | None: ...
+
+        async def get_defining_parent(self, uid: str) -> dict[str, Any] | None: ...
+
+        async def get_sibling_entities(self, uid: str, limit: int) -> list[dict[str, Any]]: ...
+
+        async def get_package_docstring(self, uid: str) -> str | None: ...
+
+        async def get_callers(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]: ...
+
+        async def get_callees(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]: ...
+
+        async def get_linked_docs(self, uid: str, label: str, limit: int) -> list[dict[str, Any]]: ...
 
     class SearchGraph(Protocol):
         """Structural subset of GraphClient needed by hybrid_search's three channels.
@@ -644,7 +656,7 @@ def _record_file_path_and_name(record: dict[str, Any]) -> tuple[str, str]:
     """Extract (file_path, name) from a raw graph.text_search()/vector_search() record."""
     node = record.get("node") or record.get("n")
     props = dict(node.items()) if hasattr(node, "items") else (node if isinstance(node, dict) else {})
-    return props.get("file_path", ""), props.get("name", "")
+    return props.get("file_path", "") or "", props.get("name", "") or ""
 
 
 def filter_raw_records(
@@ -900,7 +912,7 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
                 name=props_by_uid.get(uid, {}).get("name", ""),
                 qualified_name=props_by_uid.get(uid, {}).get("qualified_name", ""),
                 kind=props_by_uid.get(uid, {}).get("kind", ""),
-                file_path=props_by_uid.get(uid, {}).get("file_path", ""),
+                file_path=props_by_uid.get(uid, {}).get("file_path", "") or "",
                 line_start=props_by_uid.get(uid, {}).get("line_start"),
                 line_end=props_by_uid.get(uid, {}).get("line_end"),
                 signature=props_by_uid.get(uid, {}).get("signature", ""),
@@ -967,16 +979,6 @@ def _node_to_compact(node: Any) -> CompactNode:
         source=props.get("source", "") or "",
         labels=labels,
     )
-
-
-def _records_to_compact(records: list[dict[str, Any]], key: str = "n") -> list[CompactNode]:
-    """Convert a list of query records to CompactNode list."""
-    result: list[CompactNode] = []
-    for record in records:
-        node = record.get(key)
-        if node is not None:
-            result.append(_node_to_compact(node))
-    return result
 
 
 def _prioritize_callers(callers: list[CompactNode], target_qn: str) -> list[CompactNode]:
@@ -1080,87 +1082,61 @@ async def _expand_context_inner(
     if label and label not in NodeLabel:
         msg = f"Invalid node label: {label!r}"
         raise ValueError(msg)
-    label_clause = f":{label}" if label else ""
+    label_value = label or ""
 
     # Always fetch the target node
-    target_records = await graph.execute(f"MATCH (n{label_clause} {{uid: $uid}}) RETURN n", {"uid": uid})
-    if not target_records:
+    target_node = await graph.get_entity_by_uid(uid, label_value)
+    if target_node is None:
         return None
 
-    target = _node_to_compact(target_records[0].get("n"))
+    target = _node_to_compact(target_node)
 
-    # Build parallel sub-queries
-    coros: dict[str, Any] = {}
+    # Build parallel sub-queries, each paired with the fallback value used if
+    # it raises — preserves the previous per-key exception isolation (one
+    # sub-query failing doesn't blank out the others).
+    coros: dict[str, tuple[Any, Any]] = {}
 
     if include_hierarchy:
-        coros["parent"] = graph.execute(
-            f"MATCH (p)-[:{RelType.DEFINES}]->(n {{uid: $uid}}) RETURN p AS n LIMIT 1",
-            {"uid": uid},
-        )
-        coros["siblings"] = graph.execute(
-            f"MATCH (p)-[:{RelType.DEFINES}]->(n {{uid: $uid}}), (p)-[:{RelType.DEFINES}]->(s) "
-            f"WHERE s.uid <> $uid RETURN s AS n LIMIT {max_siblings}",
-            {"uid": uid},
-        )
-        coros["package_ctx"] = graph.execute(
-            f"MATCH (pkg:{NodeLabel.MODULE})-[:{RelType.DEFINES}*1..3]->(target {{uid: $uid}}) "
-            "RETURN pkg.docstring AS docstring LIMIT 1",
-            {"uid": uid},
-        )
+        coros["parent"] = (graph.get_defining_parent(uid), None)
+        coros["siblings"] = (graph.get_sibling_entities(uid, max_siblings), [])
+        coros["package_ctx"] = (graph.get_package_docstring(uid), None)
 
     if include_calls:
-        coros["callers"] = graph.execute(
-            f"MATCH (caller:Callable)-[:{RelType.CALLS}*1..{call_depth}]->"
-            f"(n{label_clause} {{uid: $uid}}) "
-            f"RETURN DISTINCT caller AS n LIMIT {max_callers * 2}",
-            {"uid": uid},
-        )
-        coros["callees"] = graph.execute(
-            f"MATCH (n{label_clause} {{uid: $uid}})-[:{RelType.CALLS}*1..{call_depth}]->"
-            f"(callee:Callable) RETURN DISTINCT callee AS n LIMIT 20",
-            {"uid": uid},
-        )
+        coros["callers"] = (graph.get_callers(uid, label_value, call_depth, max_callers * 2), [])
+        coros["callees"] = (graph.get_callees(uid, label_value, call_depth, 20), [])
 
     if include_docs:
-        coros["docs"] = graph.execute(
-            f"MATCH (doc)-[r:{RelType.DOCUMENTS}]->(n{label_clause} {{uid: $uid}}) "
-            f"WHERE doc:{NodeLabel.DOC_SECTION} OR doc:{NodeLabel.NOTE} "
-            "RETURN doc AS n, r.link_type AS link_type, r.stale AS stale, r.anchor_hash AS anchor_hash LIMIT 10",
-            {"uid": uid},
-        )
+        coros["docs"] = (graph.get_linked_docs(uid, label_value, 10), [])
 
     # Fire all sub-queries in parallel
     keys = list(coros.keys())
-    results_list = await asyncio.gather(*coros.values(), return_exceptions=True)
-    results_map: dict[str, list[dict[str, Any]]] = {}
+    results_list = await asyncio.gather(*(coro for coro, _default in coros.values()), return_exceptions=True)
+    results_map: dict[str, Any] = {}
     for key, result in zip(keys, results_list, strict=True):
         if isinstance(result, BaseException):
             logger.warning("Context sub-query '{}' failed: {}", key, result)
-            results_map[key] = []
+            results_map[key] = coros[key][1]
         else:
             results_map[key] = result
 
     # Extract results
-    parent_nodes = _records_to_compact(results_map.get("parent", []))
-    parent = parent_nodes[0] if parent_nodes else None
+    parent_node = results_map.get("parent")
+    parent = _node_to_compact(parent_node) if parent_node is not None else None
 
-    siblings = _records_to_compact(results_map.get("siblings", []))
+    siblings = [_node_to_compact(n) for n in results_map.get("siblings", [])]
 
-    raw_callers = _records_to_compact(results_map.get("callers", []))
+    raw_callers = [_node_to_compact(n) for n in results_map.get("callers", [])]
     callers = _prioritize_callers(raw_callers, target.qualified_name)[:max_callers]
 
-    callees = _records_to_compact(results_map.get("callees", []))
+    callees = [_node_to_compact(n) for n in results_map.get("callees", [])]
     docs = [
-        replace(_node_to_compact(record["n"]), stale=record.get("stale"), anchor_hash=record.get("anchor_hash"))
-        for record in results_map.get("docs", [])
-        if record.get("n") is not None
+        replace(_node_to_compact(rec["node"]), stale=rec.get("stale"), anchor_hash=rec.get("anchor_hash"))
+        for rec in results_map.get("docs", [])
+        if rec.get("node") is not None
     ]
 
     # Package context docstring
-    pkg_records = results_map.get("package_ctx", [])
-    package_context = ""
-    if pkg_records:
-        package_context = pkg_records[0].get("docstring", "") or ""
+    package_context = results_map.get("package_ctx") or ""
 
     span.set_attribute("callers_count", len(callers))
     span.set_attribute("callees_count", len(callees))

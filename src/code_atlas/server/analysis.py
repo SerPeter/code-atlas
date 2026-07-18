@@ -1,7 +1,8 @@
 """Repository analysis and diagram generation for Code Atlas MCP server.
 
-Pure Cypher queries + Python formatting — no LLM calls, no file reads,
-no new dependencies.
+Pure Python formatting/aggregation over backend-provided records — no raw
+Cypher/SQL here (see ``GraphBackend`` in ``graph/protocol.py``), no LLM
+calls, no file reads, no new dependencies.
 """
 
 from __future__ import annotations
@@ -11,11 +12,11 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
-from code_atlas.schema import RelType
+from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.search.engine import matches_test_pattern
 
 if TYPE_CHECKING:
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.graph.protocol import GraphBackend
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -92,7 +93,7 @@ def _module_package(qn: str) -> str:
 
 
 async def analyze_repo(
-    graph: GraphClient,
+    graph: GraphBackend,
     analysis: str,
     project: str,
     path: str = "",
@@ -127,7 +128,7 @@ async def analyze_repo(
 
 
 async def generate_diagram(
-    graph: GraphClient,
+    graph: GraphBackend,
     diagram_type: str,
     project: str,
     path: str = "",
@@ -153,32 +154,8 @@ async def generate_diagram(
 # ---------------------------------------------------------------------------
 
 
-def _format_path_hops(path_nodes: list[Any], path_rels: list[Any]) -> list[dict[str, Any]]:
-    """Render a Cypher path's nodes/relationships into per-hop dicts.
-
-    Includes CALLS ``confidence``/``strategy`` edge properties (ADR-0014) when
-    present on the traversed edge.
-    """
-    hops: list[dict[str, Any]] = []
-    for i, rel in enumerate(path_rels):
-        from_props = dict(path_nodes[i].items()) if hasattr(path_nodes[i], "items") else {}
-        to_props = dict(path_nodes[i + 1].items()) if hasattr(path_nodes[i + 1], "items") else {}
-        rel_props = dict(rel.items()) if hasattr(rel, "items") else {}
-        hop: dict[str, Any] = {
-            "from": {"uid": from_props.get("uid"), "name": from_props.get("name")},
-            "to": {"uid": to_props.get("uid"), "name": to_props.get("name")},
-            "edge_type": getattr(rel, "type", None),
-        }
-        if "confidence" in rel_props:
-            hop["confidence"] = rel_props["confidence"]
-        if "strategy" in rel_props:
-            hop["strategy"] = rel_props["strategy"]
-        hops.append(hop)
-    return hops
-
-
 async def trace_path(
-    graph: GraphClient,
+    graph: GraphBackend,
     from_uid: str,
     to_uid: str,
     max_depth: int = 6,
@@ -192,29 +169,15 @@ async def trace_path(
     path exists within ``max_depth``.
     """
     t0 = time.monotonic()
-    params: dict[str, Any] = {"from_uid": from_uid, "to_uid": to_uid}
-
-    exist_raw = await graph.execute(
-        "OPTIONAL MATCH (a {uid: $from_uid}) OPTIONAL MATCH (b {uid: $to_uid}) "
-        "RETURN a IS NOT NULL AS from_exists, b IS NOT NULL AS to_exists",
-        params,
-    )
-    exists = exist_raw[0] if exist_raw else {"from_exists": False, "to_exists": False}
-    if not exists["from_exists"]:
-        return {"error": f"Node not found: {from_uid}", "code": "NOT_FOUND"}
-    if not exists["to_exists"]:
-        return {"error": f"Node not found: {to_uid}", "code": "NOT_FOUND"}
-
-    rel_pattern = "|".join(edge_types)
-    records = await graph.execute(
-        f"MATCH p=(a {{uid: $from_uid}})-[:{rel_pattern}*1..{max_depth}]->(b {{uid: $to_uid}}) "
-        "RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels, length(p) AS hops "
-        "ORDER BY hops LIMIT 1",
-        params,
-    )
+    result = await graph.trace_path_between(from_uid, to_uid, max_depth, edge_types)
     elapsed = (time.monotonic() - t0) * 1000
 
-    if not records:
+    if not result["from_exists"]:
+        return {"error": f"Node not found: {from_uid}", "code": "NOT_FOUND"}
+    if not result["to_exists"]:
+        return {"error": f"Node not found: {to_uid}", "code": "NOT_FOUND"}
+
+    if not result["found"]:
         return {
             "found": False,
             "from_uid": from_uid,
@@ -224,13 +187,12 @@ async def trace_path(
             "query_ms": round(elapsed, 1),
         }
 
-    record = records[0]
     return {
         "found": True,
         "from_uid": from_uid,
         "to_uid": to_uid,
-        "hop_count": record["hops"],
-        "hops": _format_path_hops(record["path_nodes"], record["path_rels"]),
+        "hop_count": result["hop_count"],
+        "hops": result["hops"],
         "query_ms": round(elapsed, 1),
     }
 
@@ -239,7 +201,7 @@ _BLAST_DIRECTIONS = {"callers": ("in",), "callees": ("out",), "both": ("out", "i
 
 
 async def blast_radius(
-    graph: GraphClient,
+    graph: GraphBackend,
     uid: str,
     direction: str = "callers",
     max_depth: int = 3,
@@ -258,8 +220,7 @@ async def blast_radius(
     """
     t0 = time.monotonic()
 
-    exist_raw = await graph.execute("OPTIONAL MATCH (n {uid: $uid}) RETURN n IS NOT NULL AS exists", {"uid": uid})
-    if not exist_raw or not exist_raw[0]["exists"]:
+    if not await graph.node_exists(uid):
         return {"error": f"Node not found: {uid}", "code": "NOT_FOUND"}
 
     dir_kinds = _BLAST_DIRECTIONS.get(direction)
@@ -269,38 +230,13 @@ async def blast_radius(
             "code": "INVALID_DIRECTION",
         }
 
-    rel_pattern = "|".join(edge_types)
     affected: dict[str, dict[str, Any]] = {}
     for dir_kind in dir_kinds:
-        pattern = f"-[:{rel_pattern}*1..{max_depth}]->" if dir_kind == "out" else f"<-[:{rel_pattern}*1..{max_depth}]-"
-        all_raw = await graph.execute(
-            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
-            "WHERE affected.uid <> $uid "
-            "RETURN affected.uid AS uid, affected.name AS name, affected.qualified_name AS qn, "
-            "labels(affected)[0] AS label, affected.file_path AS file_path, "
-            "min(length(p)) AS min_depth",
-            {"uid": uid},
-        )
-        resolved_raw = await graph.execute(
-            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
-            "WHERE affected.uid <> $uid AND all(r IN relationships(p) WHERE r.confidence = 'resolved') "
-            "RETURN DISTINCT affected.uid AS uid",
-            {"uid": uid},
-        )
-        resolved_uids = {r["uid"] for r in resolved_raw}
-        for r in all_raw:
-            entry = affected.get(r["uid"])
-            if entry is None or r["min_depth"] < entry["min_depth"]:
-                affected[r["uid"]] = {
-                    "uid": r["uid"],
-                    "name": r["name"],
-                    "qualified_name": r["qn"],
-                    "label": r["label"],
-                    "file_path": r["file_path"],
-                    "min_depth": r["min_depth"],
-                    "direction": dir_kind,
-                    "ambiguous_only": r["uid"] not in resolved_uids,
-                }
+        entries = await graph.compute_blast_radius(uid, dir_kind, edge_types, max_depth)
+        for entry in entries:
+            existing = affected.get(entry["uid"])
+            if existing is None or entry["min_depth"] < existing["min_depth"]:
+                affected[entry["uid"]] = entry
 
     elapsed = (time.monotonic() - t0) * 1000
     results = sorted(affected.values(), key=lambda x: (x["min_depth"], x["qualified_name"] or ""))
@@ -321,57 +257,18 @@ async def blast_radius(
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_structure(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_structure(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa = " AND n.file_path STARTS WITH $path" if path else ""
+    data = await graph.get_structure_overview(project, path, limit)
 
     # Entity counts by label + kind
-    counts_raw = await graph.execute(
-        f"MATCH (n {{project_name: $project}}) "
-        f"WHERE NOT n:Project AND NOT n:SchemaVersion{pa} "
-        "RETURN labels(n)[0] AS label, n.kind AS kind, count(n) AS cnt "
-        "ORDER BY cnt DESC",
-        params,
-    )
     label_counts: dict[str, int] = {}
     kind_counts: dict[str, dict[str, int]] = {}
-    for r in counts_raw:
+    for r in data["counts"]:
         lbl = r["label"]
         label_counts[lbl] = label_counts.get(lbl, 0) + r["cnt"]
         if r["kind"]:
             kind_counts.setdefault(lbl, {})[r["kind"]] = r["cnt"]
-
-    # Package breakdown — modules per package
-    pa_m = " WHERE m.file_path STARTS WITH $path" if path else ""
-    pkg_raw = await graph.execute(
-        "MATCH (pkg:Package {project_name: $project})-[:CONTAINS]->(m:Module)"
-        f"{pa_m} "
-        "RETURN pkg.name AS package, pkg.qualified_name AS qn, count(m) AS modules "
-        f"ORDER BY modules DESC LIMIT {limit}",
-        params,
-    )
-
-    # Largest modules by defined entity count
-    lm_w = " WHERE m.file_path STARTS WITH $path" if path else ""
-    largest_raw = await graph.execute(
-        "MATCH (m:Module {project_name: $project})-[:DEFINES]->(e)"
-        f"{lm_w} "
-        "RETURN m.name AS module, m.qualified_name AS qn, m.file_path AS file_path, "
-        f"count(e) AS entities ORDER BY entities DESC LIMIT {limit}",
-        params,
-    )
-
-    # External dependencies
-    ext_w = " WHERE src IS NULL OR src.file_path STARTS WITH $path" if path else ""
-    ext_raw = await graph.execute(
-        "MATCH (ep:ExternalPackage {project_name: $project}) "
-        "OPTIONAL MATCH (ep)<-[:IMPORTS]-(src) "
-        f"{ext_w} "
-        "RETURN ep.name AS package, ep.version AS version, count(src) AS imported_by "
-        f"ORDER BY imported_by DESC LIMIT {limit}",
-        params,
-    )
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -379,7 +276,9 @@ async def _analyze_structure(graph: GraphClient, project: str, path: str, limit:
         "project": project,
         "label_counts": label_counts,
         "kind_breakdown": kind_counts,
-        "packages": [{"name": r["package"], "qualified_name": r["qn"], "module_count": r["modules"]} for r in pkg_raw],
+        "packages": [
+            {"name": r["package"], "qualified_name": r["qn"], "module_count": r["modules"]} for r in data["packages"]
+        ],
         "largest_modules": [
             {
                 "name": r["module"],
@@ -387,10 +286,11 @@ async def _analyze_structure(graph: GraphClient, project: str, path: str, limit:
                 "file_path": r["file_path"],
                 "entity_count": r["entities"],
             }
-            for r in largest_raw
+            for r in data["largest_modules"]
         ],
         "external_dependencies": [
-            {"package": r["package"], "version": r["version"], "imported_by": r["imported_by"]} for r in ext_raw
+            {"package": r["package"], "version": r["version"], "imported_by": r["imported_by"]}
+            for r in data["external_deps"]
         ],
         "query_ms": round(elapsed, 1),
     }
@@ -401,46 +301,9 @@ async def _analyze_structure(graph: GraphClient, project: str, path: str, limit:
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_centrality(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_centrality(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa = " AND n.file_path STARTS WITH $path" if path else ""
-
-    # Hub entities — most referenced (inbound IMPORTS|INHERITS|CALLS)
-    hubs_raw = await graph.execute(
-        "MATCH (n {project_name: $project})<-[r:IMPORTS|INHERITS|CALLS]-(src) "
-        f"WHERE NOT n:ExternalPackage AND NOT n:ExternalSymbol{pa} "
-        "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
-        "n.kind AS kind, n.file_path AS file_path, "
-        "count(r) AS in_degree, "
-        "sum(CASE WHEN type(r) = 'IMPORTS' THEN 1 ELSE 0 END) AS imported_by, "
-        "sum(CASE WHEN type(r) = 'INHERITS' THEN 1 ELSE 0 END) AS inherited_by, "
-        "sum(CASE WHEN type(r) = 'CALLS' THEN 1 ELSE 0 END) AS called_by "
-        f"ORDER BY in_degree DESC LIMIT {limit}",
-        params,
-    )
-
-    # Hub modules — most imported
-    pa_m = " AND m.file_path STARTS WITH $path" if path else ""
-    hub_modules_raw = await graph.execute(
-        "MATCH (m:Module {project_name: $project})<-[:IMPORTS]-(src) "
-        f"WHERE true{pa_m} "
-        "RETURN m.name AS name, m.qualified_name AS qn, m.file_path AS file_path, "
-        f"count(src) AS imported_by ORDER BY imported_by DESC LIMIT {limit}",
-        params,
-    )
-
-    # Leaf entities — no inbound IMPORTS|INHERITS|CALLS
-    pa_leaf = " AND n.file_path STARTS WITH $path" if path else ""
-    leaf_raw = await graph.execute(
-        "MATCH (n {project_name: $project}) "
-        "WHERE NOT n:Project AND NOT n:SchemaVersion AND NOT n:Package "
-        f"AND NOT n:ExternalPackage AND NOT n:ExternalSymbol{pa_leaf} "
-        "AND NOT ()-[:IMPORTS|INHERITS|CALLS]->(n) "
-        "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
-        f"n.kind AS kind, n.file_path AS file_path LIMIT {limit}",
-        params,
-    )
+    data = await graph.get_centrality_data(project, path, limit)
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -458,7 +321,7 @@ async def _analyze_centrality(graph: GraphClient, project: str, path: str, limit
                 "inherited_by": r["inherited_by"],
                 "called_by": r["called_by"],
             }
-            for r in hubs_raw
+            for r in data["hubs"]
         ],
         "hub_modules": [
             {
@@ -467,7 +330,7 @@ async def _analyze_centrality(graph: GraphClient, project: str, path: str, limit
                 "file_path": r["file_path"],
                 "imported_by": r["imported_by"],
             }
-            for r in hub_modules_raw
+            for r in data["hub_modules"]
         ],
         "leaf_entities": [
             {
@@ -477,7 +340,7 @@ async def _analyze_centrality(graph: GraphClient, project: str, path: str, limit
                 "kind": r["kind"],
                 "file_path": r["file_path"],
             }
-            for r in leaf_raw
+            for r in data["leaves"]
         ],
         "query_ms": round(elapsed, 1),
     }
@@ -499,30 +362,11 @@ def _module_imports_from_records(
     return edges
 
 
-async def _analyze_dependencies(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_dependencies(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa_m1 = " AND m1.file_path STARTS WITH $path" if path else ""
 
-    # Direct module-to-module imports
-    direct_raw = await graph.execute(
-        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
-        "(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2{pa_m1} "
-        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
-        params,
-    )
-
-    # Entity imports → parent module
-    indirect_raw = await graph.execute(
-        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
-        "<-[:DEFINES]-(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2 AND NOT e:Module{pa_m1} "
-        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
-        params,
-    )
-
-    edge_weights = _module_imports_from_records(direct_raw, indirect_raw)
+    module_edges = await graph.get_module_import_edges(project, path)
+    edge_weights = _module_imports_from_records(module_edges["direct"], module_edges["indirect"])
 
     # Sort by weight descending
     internal_imports = sorted(
@@ -549,23 +393,11 @@ async def _analyze_dependencies(graph: GraphClient, project: str, path: str, lim
     circular = _detect_circular(edge_weights)[:10]
 
     # External package import counts
-    pa_src = " AND src.file_path STARTS WITH $path" if path else ""
-    ext_pkg_raw = await graph.execute(
-        "MATCH (src {project_name: $project})-[:IMPORTS]->(ep:ExternalPackage) "
-        f"WHERE true{pa_src} "
-        "RETURN ep.name AS package, count(src) AS cnt",
-        params,
-    )
-    ext_sym_raw = await graph.execute(
-        "MATCH (src {project_name: $project})-[:IMPORTS]->(es:ExternalSymbol) "
-        f"WHERE true{pa_src} "
-        "RETURN es.package AS package, count(src) AS cnt",
-        params,
-    )
+    ext_data = await graph.get_dependency_external_counts(project, path)
     ext_counts: dict[str, int] = {}
-    for r in ext_pkg_raw:
+    for r in ext_data["ext_packages"]:
         ext_counts[r["package"]] = ext_counts.get(r["package"], 0) + r["cnt"]
-    for r in ext_sym_raw:
+    for r in ext_data["ext_symbols"]:
         if r["package"]:
             ext_counts[r["package"]] = ext_counts.get(r["package"], 0) + r["cnt"]
     external_imports = sorted(
@@ -591,59 +423,11 @@ async def _analyze_dependencies(graph: GraphClient, project: str, path: str, lim
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_patterns(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_patterns(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa = " AND child.file_path STARTS WITH $path" if path else ""
-
-    # Inheritance hierarchies
-    inherit_raw = await graph.execute(
-        "MATCH (child:TypeDef {project_name: $project})-[:INHERITS]->(parent) "
-        f"WHERE true{pa} "
-        "RETURN child.name AS child, child.qualified_name AS child_qn, "
-        f"parent.name AS parent, parent.qualified_name AS parent_qn LIMIT {limit}",
-        params,
-    )
-
-    # Enums
-    pa_n = " AND n.file_path STARTS WITH $path" if path else ""
-    enum_raw = await graph.execute(
-        "MATCH (n:TypeDef {project_name: $project, kind: 'enum'})"
-        f" WHERE true{pa_n} "
-        "OPTIONAL MATCH (n)-[:DEFINES]->(m:Value) "
-        "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
-        f"count(m) AS members ORDER BY name LIMIT {limit}",
-        params,
-    )
-
-    # Visibility distribution
-    vis_raw = await graph.execute(
-        "MATCH (n {project_name: $project}) "
-        f"WHERE n.visibility IS NOT NULL{pa_n} "
-        "RETURN n.visibility AS visibility, count(n) AS cnt "
-        "ORDER BY cnt DESC",
-        params,
-    )
-
-    # Docstring coverage
-    doc_raw = await graph.execute(
-        "MATCH (n {project_name: $project}) "
-        f"WHERE (n:Callable OR n:TypeDef OR n:Value){pa_n} "
-        "WITH count(n) AS total, "
-        "sum(CASE WHEN n.docstring IS NOT NULL AND n.docstring <> '' THEN 1 ELSE 0 END) AS documented "
-        "RETURN total, documented",
-        params,
-    )
+    data = await graph.get_patterns_data(project, path, limit)
+    doc_raw = data["docstring"]
     doc_stats = doc_raw[0] if doc_raw else {"total": 0, "documented": 0}
-
-    # Pattern-detected relationships (routes, events, commands)
-    pattern_raw = await graph.execute(
-        "MATCH (n {project_name: $project})-[r:HANDLES_COMMAND|HANDLES_ROUTE|HANDLES_EVENT]->(target) "
-        f"WHERE true{pa_n} "
-        "RETURN type(r) AS pattern_type, n.name AS name, n.qualified_name AS qn, "
-        f"target.name AS target_name ORDER BY pattern_type, name LIMIT {limit}",
-        params,
-    )
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -656,13 +440,13 @@ async def _analyze_patterns(graph: GraphClient, project: str, path: str, limit: 
                 "parent": r["parent"],
                 "parent_qualified_name": r["parent_qn"],
             }
-            for r in inherit_raw
+            for r in data["inheritance"]
         ],
         "enums": [
             {"name": r["name"], "qualified_name": r["qn"], "file_path": r["file_path"], "members": r["members"]}
-            for r in enum_raw
+            for r in data["enums"]
         ],
-        "visibility_distribution": {r["visibility"]: r["cnt"] for r in vis_raw},
+        "visibility_distribution": {r["visibility"]: r["cnt"] for r in data["visibility"]},
         "docstring_coverage": {
             "total": doc_stats["total"],
             "documented": doc_stats["documented"],
@@ -670,7 +454,7 @@ async def _analyze_patterns(graph: GraphClient, project: str, path: str, limit: 
         },
         "detected_patterns": [
             {"type": r["pattern_type"], "name": r["name"], "qualified_name": r["qn"], "target": r["target_name"]}
-            for r in pattern_raw
+            for r in data["detected_patterns"]
         ],
         "query_ms": round(elapsed, 1),
     }
@@ -962,47 +746,18 @@ def _aggregate_worst_modules(
 
 
 async def _analyze_quality(
-    graph: GraphClient, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
 ) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa_m = " AND m.file_path STARTS WITH $path" if path else ""
-    # Match on either side so a scoped module's fan-in from out-of-scope
-    # importers (and fan-out to out-of-scope targets) are both captured.
-    # Filtering on m1 alone (the importer) would undercount fan-in for
-    # in-scope modules imported from outside the path.
-    pa_edge = " AND (m1.file_path STARTS WITH $path OR m2.file_path STARTS WITH $path)" if path else ""
+    data = await graph.get_quality_data(project, path)
 
-    # Query 1: entity counts per module
-    entity_raw = await graph.execute(
-        "MATCH (m:Module {project_name: $project})-[:DEFINES]->(e) "
-        f"WHERE NOT e:Module{pa_m} "
-        "RETURN m.qualified_name AS module, m.file_path AS file_path, count(e) AS entity_count "
-        "ORDER BY entity_count DESC",
-        params,
-    )
     entity_counts: dict[str, int] = {}
     file_paths: dict[str, str] = {}
-    for r in entity_raw:
+    for r in data["entities"]:
         entity_counts[r["module"]] = r["entity_count"]
         file_paths[r["module"]] = r["file_path"]
 
-    # Query 2 & 3: module-level import edges (reuse existing pattern)
-    direct_raw = await graph.execute(
-        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
-        "(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2{pa_edge} "
-        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
-        params,
-    )
-    indirect_raw = await graph.execute(
-        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
-        "<-[:DEFINES]-(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2 AND NOT e:Module{pa_edge} "
-        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
-        params,
-    )
-    edge_weights = _module_imports_from_records(direct_raw, indirect_raw)
+    edge_weights = _module_imports_from_records(data["direct"], data["indirect"])
 
     # Collect all modules (including those with no edges). When scoped to a
     # path, restrict to modules the entity query actually matched — edge
@@ -1042,7 +797,7 @@ async def _analyze_quality(
 
 
 async def _analyze_dead_code(
-    graph: GraphClient, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
 ) -> dict[str, Any]:
     """Callables/TypeDefs with zero incoming CALLS edges (any confidence).
 
@@ -1059,18 +814,7 @@ async def _analyze_dead_code(
     and can still false-positive as dead code.
     """
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa = " AND n.file_path STARTS WITH $path" if path else ""
-
-    raw = await graph.execute(
-        "MATCH (n {project_name: $project}) "
-        f"WHERE (n:Callable OR n:TypeDef) AND NOT n.name STARTS WITH '__'{pa} "
-        "AND NOT ()-[:CALLS]->(n) "
-        "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
-        "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
-        "ORDER BY n.file_path, n.line_start",
-        params,
-    )
+    raw = await graph.get_dead_code_candidates(project, path)
 
     candidates = [
         {
@@ -1104,7 +848,7 @@ async def _analyze_dead_code(
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_complexity(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_complexity(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
     """Top-N Callables by ``line_end - line_start``.
 
     This is a crude LOC-span proxy, not true cyclomatic complexity (branch-
@@ -1112,17 +856,7 @@ async def _analyze_complexity(graph: GraphClient, project: str, path: str, limit
     already persist on every Callable.
     """
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa = " AND n.file_path STARTS WITH $path" if path else ""
-
-    raw = await graph.execute(
-        "MATCH (n:Callable {project_name: $project}) "
-        f"WHERE n.line_start IS NOT NULL AND n.line_end IS NOT NULL{pa} "
-        "RETURN n.name AS name, n.qualified_name AS qn, n.kind AS kind, n.file_path AS file_path, "
-        "n.line_start AS line_start, n.line_end AS line_end, (n.line_end - n.line_start) AS loc_span "
-        f"ORDER BY loc_span DESC LIMIT {limit}",
-        params,
-    )
+    raw = await graph.get_complexity_hotspots(project, path, limit)
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -1149,7 +883,7 @@ async def _analyze_complexity(graph: GraphClient, project: str, path: str, limit
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_communities(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_communities(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
     """Cluster the project's CALLS+IMPORTS subgraph via Leiden community detection.
 
     Requires a MAGE-enabled Memgraph image (``memgraph/memgraph-mage``, not the
@@ -1158,6 +892,13 @@ async def _analyze_communities(graph: GraphClient, project: str, path: str, limi
     used for ``text_search.search_all``/``vector_search.search``). Returns a
     clear ``PROCEDURE_UNAVAILABLE`` error instead of raising when the module
     isn't installed.
+
+    Deliberately calls ``graph.execute()`` directly rather than a
+    ``GraphBackend`` method — Leiden clustering has no SQL translation, so
+    there is nothing to put behind a shared contract (same "no meaningful
+    translation" exception documented for ``cypher_query``/``validate_cypher``).
+    The isinstance guard below narrows *graph* to ``GraphClient`` for the rest
+    of this function before ``execute()`` is ever called.
 
     ExternalPackage/ExternalSymbol nodes are excluded from both edge endpoints —
     otherwise dozens of unrelated modules that merely reference the same external
@@ -1171,7 +912,18 @@ async def _analyze_communities(graph: GraphClient, project: str, path: str, limi
     nodes) are dropped as noise; the remaining communities are returned
     largest-first, capped at *limit* (which also caps members shown per
     community — full membership can be large at scale).
+
+    Unsupported on the embedded SQLite backend — Leiden clustering has no
+    SQLite equivalent (community detection is explicitly out of scope for
+    the embedded backend, see ADR-0015) — returns a clear error instead of
+    attempting a Cypher query the backend can't run.
     """
+    if isinstance(graph, SqliteGraphClient):
+        return {
+            "analysis": "communities",
+            "error": "unsupported on the sqlite backend — requires Memgraph+MAGE",
+        }
+
     t0 = time.monotonic()
     params: dict[str, Any] = {"project": project, "path": path}
     # Exclude ExternalPackage/ExternalSymbol from both endpoints — dozens of unrelated
@@ -1240,7 +992,7 @@ async def _analyze_communities(graph: GraphClient, project: str, path: str, limi
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_git_signals(graph: GraphClient, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_git_signals(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
     """Surface git-mined signals: commit-count hotspots, bus-factor risks, top co-change pairs.
 
     Reads properties/edges written by ``indexing/git_signals.py``'s
@@ -1251,37 +1003,8 @@ async def _analyze_git_signals(graph: GraphClient, project: str, path: str, limi
     apart from "ran, found nothing".
     """
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa = " AND n.file_path STARTS WITH $path" if path else ""
-
-    hotspots_raw = await graph.execute(
-        "MATCH (n {project_name: $project}) "
-        f"WHERE n.git_commit_count IS NOT NULL{pa} "
-        "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
-        "n.git_commit_count AS commit_count, n.git_author_count AS author_count, "
-        "n.git_days_since_last_commit AS days_since_last_commit "
-        f"ORDER BY commit_count DESC LIMIT {limit}",
-        params,
-    )
-
-    bus_factor_raw = await graph.execute(
-        "MATCH (n {project_name: $project}) "
-        f"WHERE n.git_commit_count IS NOT NULL AND n.git_author_count <= {_BUS_FACTOR_AUTHOR_THRESHOLD}{pa} "
-        "RETURN n.name AS name, n.qualified_name AS qn, n.file_path AS file_path, "
-        "n.git_commit_count AS commit_count, n.git_author_count AS author_count "
-        f"ORDER BY commit_count DESC LIMIT {limit}",
-        params,
-    )
-
-    pa_edge = " AND (a.file_path STARTS WITH $path OR b.file_path STARTS WITH $path)" if path else ""
-    co_change_raw = await graph.execute(
-        f"MATCH (a {{project_name: $project}})-[r:{RelType.CO_CHANGES_WITH}]->(b {{project_name: $project}}) "
-        f"WHERE true{pa_edge} "
-        "RETURN a.qualified_name AS a_qn, a.file_path AS a_path, "
-        "b.qualified_name AS b_qn, b.file_path AS b_path, r.count AS count "
-        f"ORDER BY count DESC LIMIT {limit}",
-        params,
-    )
+    data = await graph.get_git_signals_data(project, path, limit, _BUS_FACTOR_AUTHOR_THRESHOLD)
+    hotspots_raw = data["hotspots"]
 
     elapsed = (time.monotonic() - t0) * 1000
     mined = bool(hotspots_raw)
@@ -1308,7 +1031,7 @@ async def _analyze_git_signals(graph: GraphClient, project: str, path: str, limi
                 "commit_count": r["commit_count"],
                 "author_count": r["author_count"],
             }
-            for r in bus_factor_raw
+            for r in data["bus_factor"]
         ],
         "co_change_pairs": [
             {
@@ -1318,7 +1041,7 @@ async def _analyze_git_signals(graph: GraphClient, project: str, path: str, limi
                 "b_file_path": r["b_path"],
                 "count": r["count"],
             }
-            for r in co_change_raw
+            for r in data["co_change"]
         ],
         "query_ms": round(elapsed, 1),
     }
@@ -1329,20 +1052,9 @@ async def _analyze_git_signals(graph: GraphClient, project: str, path: str, limi
 # ---------------------------------------------------------------------------
 
 
-async def _diagram_packages(graph: GraphClient, project: str, path: str, max_nodes: int) -> dict[str, Any]:
+async def _diagram_packages(graph: GraphBackend, project: str, path: str, max_nodes: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path, "limit": max_nodes}
-    pa = " AND child.file_path STARTS WITH $path" if path else ""
-
-    # Packages and their contained modules
-    records = await graph.execute(
-        "MATCH (pkg:Package {project_name: $project})-[:CONTAINS]->(child) "
-        f"WHERE (child:Package OR child:Module){pa} "
-        "RETURN pkg.qualified_name AS parent_qn, pkg.name AS parent_name, "
-        "labels(child)[0] AS child_label, child.qualified_name AS child_qn, child.name AS child_name "
-        "ORDER BY parent_qn, child_qn LIMIT $limit",
-        params,
-    )
+    records = await graph.get_diagram_packages(project, path, max_nodes)
 
     if not records:
         elapsed = (time.monotonic() - t0) * 1000
@@ -1377,29 +1089,10 @@ async def _diagram_packages(graph: GraphClient, project: str, path: str, max_nod
 # ---------------------------------------------------------------------------
 
 
-async def _diagram_imports(graph: GraphClient, project: str, path: str, max_nodes: int) -> dict[str, Any]:
+async def _diagram_imports(graph: GraphBackend, project: str, path: str, max_nodes: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    pa_m1 = " AND m1.file_path STARTS WITH $path" if path else ""
-
-    # Direct module imports
-    direct_raw = await graph.execute(
-        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
-        "(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2{pa_m1} "
-        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
-        params,
-    )
-    # Entity imports → parent module
-    indirect_raw = await graph.execute(
-        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
-        "<-[:DEFINES]-(m2:Module {project_name: $project}) "
-        f"WHERE m1 <> m2 AND NOT e:Module{pa_m1} "
-        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
-        params,
-    )
-
-    edge_weights = _module_imports_from_records(direct_raw, indirect_raw)
+    module_edges = await graph.get_module_import_edges(project, path)
+    edge_weights = _module_imports_from_records(module_edges["direct"], module_edges["indirect"])
 
     if not edge_weights:
         elapsed = (time.monotonic() - t0) * 1000
@@ -1446,20 +1139,9 @@ async def _diagram_imports(graph: GraphClient, project: str, path: str, max_node
 # ---------------------------------------------------------------------------
 
 
-async def _diagram_inheritance(graph: GraphClient, project: str, path: str, max_nodes: int) -> dict[str, Any]:
+async def _diagram_inheritance(graph: GraphBackend, project: str, path: str, max_nodes: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path, "limit": max_nodes}
-    pa = " AND child.file_path STARTS WITH $path" if path else ""
-
-    records = await graph.execute(
-        "MATCH (child:TypeDef {project_name: $project})-[:INHERITS]->(parent) "
-        f"WHERE true{pa} "
-        "RETURN child.name AS child_name, child.qualified_name AS child_qn, "
-        "child.kind AS child_kind, "
-        "parent.name AS parent_name, parent.qualified_name AS parent_qn "
-        "ORDER BY parent_qn, child_qn LIMIT $limit",
-        params,
-    )
+    records = await graph.get_diagram_inheritance(project, path, max_nodes)
 
     if not records:
         elapsed = (time.monotonic() - t0) * 1000
@@ -1515,9 +1197,8 @@ def _module_detail_entity_lines(
     return lines
 
 
-async def _diagram_module_detail(graph: GraphClient, project: str, path: str, max_nodes: int) -> dict[str, Any]:
+async def _diagram_module_detail(graph: GraphBackend, project: str, path: str, max_nodes: int) -> dict[str, Any]:
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
 
     if not path:
         return {
@@ -1525,44 +1206,14 @@ async def _diagram_module_detail(graph: GraphClient, project: str, path: str, ma
             "code": "PATH_REQUIRED",
         }
 
-    # Find the module
-    modules = await graph.execute(
-        "MATCH (m:Module {project_name: $project}) "
-        "WHERE m.file_path STARTS WITH $path "
-        "RETURN m.name AS name, m.qualified_name AS qn, m.uid AS uid "
-        "ORDER BY m.qualified_name LIMIT 1",
-        params,
-    )
-    if not modules:
+    detail = await graph.get_diagram_module_detail(project, path, max_nodes)
+    if detail is None:
         return {"error": f"No module found matching path '{path}'", "code": "NOT_FOUND"}
 
-    mod = modules[0]
-
-    # Top-level entities defined by this module
-    entities = await graph.execute(
-        "MATCH (m {uid: $uid})-[:DEFINES]->(e) "
-        "RETURN e.name AS name, e.qualified_name AS qn, labels(e)[0] AS label, "
-        f"e.kind AS kind, e.visibility AS vis, e.signature AS sig ORDER BY e.line_start LIMIT {max_nodes}",
-        {"uid": mod["uid"]},
-    )
-
-    # Methods defined by TypeDefs in this module
-    methods = await graph.execute(
-        "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:DEFINES]->(method:Callable) "
-        "RETURN td.qualified_name AS class_qn, td.name AS class_name, "
-        "method.name AS name, method.visibility AS vis, method.kind AS kind "
-        f"ORDER BY td.name, method.line_start LIMIT {max_nodes}",
-        {"uid": mod["uid"]},
-    )
-
-    # Inheritance for TypeDefs in this module
-    inherits = await graph.execute(
-        "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:INHERITS]->(parent) "
-        "RETURN td.qualified_name AS child_qn, td.name AS child_name, "
-        "parent.qualified_name AS parent_qn, parent.name AS parent_name "
-        f"LIMIT {max_nodes}",
-        {"uid": mod["uid"]},
-    )
+    mod = detail["module"]
+    entities = detail["entities"]
+    methods = detail["methods"]
+    inherits = detail["inherits"]
 
     if not entities:
         elapsed = (time.monotonic() - t0) * 1000

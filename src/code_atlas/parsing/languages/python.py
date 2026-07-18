@@ -1164,11 +1164,7 @@ class TestMappingDetector:
             return None
         # TypeDef test -> look for TypeDef; Callable test -> look for Callable
         label = "TypeDef" if source.label == NodeLabel.TYPE_DEF else "Callable"
-        records = await graph.execute(
-            f"MATCH (n:{label} {{project_name: $p, name: $n}}) RETURN n.uid AS uid LIMIT 1",
-            {"p": project_name, "n": target_name},
-        )
-        return records[0]["uid"] if records else None
+        return await graph.find_entity_uid(project_name, label, target_name)
 
 
 class ClassOverridesDetector:
@@ -1215,21 +1211,16 @@ class ClassOverridesDetector:
             if not bases:
                 continue
             # Query graph for parent method (include tags for abstractmethod detection)
-            records = await graph.execute(
-                "MATCH (base:TypeDef {project_name: $p})-[:DEFINES]->(m:Callable)"
-                " WHERE base.name IN $bases AND m.name = $method"
-                " RETURN m.uid AS uid, m.tags AS tags LIMIT 1",
-                {"p": project_name, "bases": bases, "method": entity.name},
-            )
-            if records:
-                parent_tags = records[0].get("tags") or []
+            found = await graph.find_overridden_method(project_name, bases, entity.name)
+            if found is not None:
+                parent_uid, parent_tags = found
                 is_abstract = any(t == "decorator:abstractmethod" for t in parent_tags)
                 rel_type = RelType.IMPLEMENTS if is_abstract else RelType.OVERRIDES
                 relationships.append(
                     ParsedRelationship(
                         from_qualified_name=entity.qualified_name,
                         rel_type=rel_type,
-                        to_name=records[0]["uid"],
+                        to_name=parent_uid,
                     )
                 )
         return DetectorResult(relationships=relationships)
@@ -1261,14 +1252,11 @@ class DIInjectionDetector:
             if graph is None:
                 continue
             for dep_name in dep_names:
-                records = await graph.execute(
-                    "MATCH (n:Callable {project_name: $p, name: $n}) RETURN n.uid AS uid LIMIT 1",
-                    {"p": project_name, "n": dep_name},
-                )
-                if records:
+                dep_uid = await graph.find_entity_uid(project_name, "Callable", dep_name)
+                if dep_uid:
                     relationships.append(
                         ParsedRelationship(
-                            from_qualified_name=records[0]["uid"],
+                            from_qualified_name=dep_uid,
                             rel_type=RelType.INJECTED_INTO,
                             to_name=entity.qualified_name,
                         )

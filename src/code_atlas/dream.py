@@ -18,12 +18,12 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from code_atlas.parsing.ast import parse_file
-from code_atlas.schema import NodeLabel, NoteKind, RelType
+from code_atlas.schema import NodeLabel, RelType
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.graph.protocol import GraphBackend
 
 # LINKS_TO/DERIVED_FROM/SUPERSEDES targets are deterministic note uids (see
 # markdown.py's _resolve_note_ref) — an exact-uid miss means the link is
@@ -182,12 +182,11 @@ def _check_memory_index(vault: VaultRoot) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-async def _find_dangling_links(graph: GraphClient, links: list[tuple[str, str, str]]) -> list[DanglingLink]:
+async def _find_dangling_links(graph: GraphBackend, links: list[tuple[str, str, str]]) -> list[DanglingLink]:
     if not links:
         return []
     target_uids = sorted({to_uid for _, _, to_uid in links})
-    rows = await graph.execute("UNWIND $uids AS uid MATCH (n {uid: uid}) RETURN uid", {"uids": target_uids})
-    existing = {r["uid"] for r in rows}
+    existing = await graph.get_existing_uids(target_uids)
     return [
         DanglingLink(from_uid=from_uid, rel_type=rel_type, target_uid=to_uid)
         for from_uid, rel_type, to_uid in links
@@ -195,22 +194,14 @@ async def _find_dangling_links(graph: GraphClient, links: list[tuple[str, str, s
     ]
 
 
-async def _find_orphan_notes(graph: GraphClient) -> list[OrphanNote]:
-    rows = await graph.execute(
-        f"MATCH (n:{NodeLabel.NOTE}) WHERE NOT (n)-[:{RelType.LINKS_TO}]-() "
-        "RETURN n.uid AS uid, n.name AS name, n.project_name AS project_name, n.file_path AS file_path"
-    )
+async def _find_orphan_notes(graph: GraphBackend) -> list[OrphanNote]:
+    rows = await graph.get_orphan_notes()
     return [OrphanNote(**row) for row in rows]
 
 
-async def _find_broken_anchors(graph: GraphClient) -> list[BrokenAnchor]:
+async def _find_broken_anchors(graph: GraphBackend) -> list[BrokenAnchor]:
     """Notes whose explicit ``anchors:`` are broken (deleted target) or unresolved (no match)."""
-    rows = await graph.execute(
-        f"MATCH (n:{NodeLabel.NOTE}) "
-        "WHERE n.has_broken_anchors = true OR (n.unresolved_anchors IS NOT NULL AND size(n.unresolved_anchors) > 0) "
-        "RETURN n.uid AS uid, n.name AS name, n.project_name AS project_name, n.file_path AS file_path, "
-        "n.unresolved_anchors AS unresolved_anchors"
-    )
+    rows = await graph.get_broken_anchor_notes()
     return [
         BrokenAnchor(
             uid=row["uid"],
@@ -223,13 +214,8 @@ async def _find_broken_anchors(graph: GraphClient) -> list[BrokenAnchor]:
     ]
 
 
-async def _find_inbox_notes(graph: GraphClient) -> tuple[int, list[str]]:
-    rows = await graph.execute(
-        f"MATCH (n:{NodeLabel.NOTE}) WHERE n.kind = $draft OR n.file_path CONTAINS '/inbox/' "
-        "RETURN n.file_path AS file_path ORDER BY file_path",
-        {"draft": NoteKind.DRAFT.value},
-    )
-    paths = [r["file_path"] for r in rows]
+async def _find_inbox_notes(graph: GraphBackend) -> tuple[int, list[str]]:
+    paths = await graph.get_inbox_note_paths()
     return len(paths), paths
 
 
@@ -242,7 +228,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-async def _find_similar_pairs(graph: GraphClient, threshold: float) -> list[SimilarPair]:
+async def _find_similar_pairs(graph: GraphBackend, threshold: float) -> list[SimilarPair]:
     """All-pairs cosine similarity over Note embeddings.
 
     O(N^2) in note count — acceptable for a periodic lint report over a
@@ -250,10 +236,7 @@ async def _find_similar_pairs(graph: GraphClient, threshold: float) -> list[Simi
     KNN-for-one-query-vector primitive, not an all-pairs one, so pulling
     every embedding once and comparing in Python is the simpler v1 approach.
     """
-    rows = await graph.execute(
-        f"MATCH (n:{NodeLabel.NOTE}) WHERE n.embedding IS NOT NULL "
-        "RETURN n.uid AS uid, n.project_name AS project_name, n.embedding AS embedding"
-    )
+    rows = await graph.get_note_embeddings()
     pairs: list[SimilarPair] = []
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
@@ -279,7 +262,7 @@ async def _find_similar_pairs(graph: GraphClient, threshold: float) -> list[Simi
 
 
 async def build_dream_report(
-    graph: GraphClient,
+    graph: GraphBackend,
     vault_roots: list[VaultRoot],
     *,
     similarity_threshold: float = _DEFAULT_SIMILARITY_THRESHOLD,

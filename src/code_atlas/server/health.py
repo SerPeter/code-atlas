@@ -8,14 +8,17 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from code_atlas.events import EventBus
-from code_atlas.graph.client import GraphClient
+from code_atlas.backends import create_event_bus, create_graph_client
+from code_atlas.backends.sqlite_graph import SqliteGraphClient
+from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import SCHEMA_VERSION
 from code_atlas.search.embeddings import EmbedClient
 from code_atlas.settings import _find_atlas_toml, find_git_root
 
 if TYPE_CHECKING:
+    from code_atlas.events import EventBus
+    from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
 
@@ -72,10 +75,15 @@ class HealthReport:
 
 
 async def check_memgraph(
-    graph: GraphClient | None,
+    graph: GraphClient | SqliteGraphClient | None,
     mg_settings: MemgraphSettings,
 ) -> CheckResult:
-    """Verify Memgraph connectivity."""
+    """Verify connectivity of the active graph backend, honestly naming which one it is.
+
+    *graph* may be a real ``GraphClient`` (Memgraph) or the ``SqliteGraphClient``
+    embedded fallback — whichever ``create_graph_client`` actually returned. The
+    reported message always names the real backend instead of assuming Memgraph.
+    """
     name = "memgraph"
     addr = f"{mg_settings.host}:{mg_settings.port}"
     if graph is None:
@@ -83,16 +91,20 @@ async def check_memgraph(
             name, CheckStatus.FAIL, f"No client ({addr})", suggestion="Check Memgraph connection settings."
         )
 
+    backend = "SQLite (embedded)" if isinstance(graph, SqliteGraphClient) else f"Memgraph ({addr})"
+
     try:
         ok = await asyncio.wait_for(graph.ping(), timeout=_CHECK_TIMEOUT)
         if ok:
-            return CheckResult(name, CheckStatus.OK, f"Connected ({addr})")
-        return CheckResult(name, CheckStatus.FAIL, f"Ping failed ({addr})", suggestion="docker compose up -d memgraph")
+            return CheckResult(name, CheckStatus.OK, f"Connected — {backend}")
+        return CheckResult(
+            name, CheckStatus.FAIL, f"Ping failed — {backend}", suggestion="docker compose up -d memgraph"
+        )
     except Exception as exc:
         return CheckResult(
             name,
             CheckStatus.FAIL,
-            f"Unreachable ({addr})",
+            f"Unreachable — {backend}",
             detail=str(exc),
             suggestion="docker compose up -d memgraph",
         )
@@ -166,32 +178,50 @@ async def check_embeddings(
         return CheckResult(name, CheckStatus.WARN, f"Unreachable ({info})", detail=str(exc), suggestion=suggestion)
 
 
-async def check_valkey(redis_settings: RedisSettings) -> CheckResult:
-    """Verify Valkey/Redis connectivity."""
+async def check_valkey(
+    bus: EventBus | SqliteEventBus | None,
+    redis_settings: RedisSettings,
+) -> CheckResult:
+    """Verify connectivity of the active queue backend, honestly naming which one it is.
+
+    *bus* may be a real ``EventBus`` (Valkey) or the ``SqliteEventBus`` embedded
+    fallback — whichever ``create_event_bus`` actually returned (or the daemon's
+    live bus, when one is running). The reported message always names the real
+    backend instead of assuming Valkey. Ownership (construction/closing) is the
+    caller's responsibility — mirrors ``check_memgraph``.
+    """
     name = "valkey"
     addr = f"{redis_settings.host}:{redis_settings.port}"
-    bus = EventBus(redis_settings)
-    _indexing_disabled = "auto-indexing disabled — file changes will NOT be indexed until Valkey is reachable"
+    if bus is None:
+        return CheckResult(
+            name, CheckStatus.WARN, f"No client ({addr})", suggestion="Check Valkey connection settings."
+        )
+
+    is_sqlite = isinstance(bus, SqliteEventBus)
+    backend = "SQLite (embedded)" if is_sqlite else f"Valkey ({addr})"
+    indexing_disabled = (
+        "auto-indexing disabled — file changes will NOT be indexed until the embedded queue is available"
+        if is_sqlite
+        else "auto-indexing disabled — file changes will NOT be indexed until Valkey is reachable"
+    )
     try:
         ok = await asyncio.wait_for(bus.ping(), timeout=_CHECK_TIMEOUT)
         if ok:
-            return CheckResult(name, CheckStatus.OK, f"Connected ({addr})")
+            return CheckResult(name, CheckStatus.OK, f"Connected — {backend}")
         return CheckResult(
             name,
             CheckStatus.WARN,
-            f"Ping failed ({addr}) — {_indexing_disabled}",
+            f"Ping failed — {backend} — {indexing_disabled}",
             suggestion="docker compose up -d valkey",
         )
     except Exception as exc:
         return CheckResult(
             name,
             CheckStatus.WARN,
-            f"Unreachable ({addr}) — {_indexing_disabled}",
+            f"Unreachable — {backend} — {indexing_disabled}",
             detail=str(exc),
             suggestion="docker compose up -d valkey",
         )
-    finally:
-        await bus.close()
 
 
 async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> CheckResult:
@@ -208,9 +238,9 @@ async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> Che
         )
 
     # Build detail string showing which config files were loaded
-    toml_path = _find_atlas_toml()
+    config_match = _find_atlas_toml()
     detail_parts: list[str] = []
-    detail_parts.append(f"atlas.toml: {toml_path or 'not found'}")
+    detail_parts.append(f"config: {config_match.path if config_match else 'not found'}")
     detail_parts.append(f".env: {dotenv_path or 'not found'}")
     detail = " | ".join(detail_parts)
 
@@ -325,27 +355,36 @@ _SKIPPED_DETAIL = "Skipped — Memgraph unreachable"
 async def run_health_checks(
     settings: AtlasSettings,
     *,
-    graph: GraphClient | None = None,
+    graph: GraphClient | SqliteGraphClient | None = None,
     embed: EmbedClient | None = None,
     daemon: DaemonManager | None = None,
+    bus: EventBus | SqliteEventBus | None = None,
     dotenv_path: str = "",
 ) -> HealthReport:
     """Run all health checks and return an aggregated report.
 
     Independent checks (config, memgraph, embeddings, valkey) run concurrently.
-    Dependent checks (schema, index) only run if Memgraph is reachable.
+    Dependent checks (schema, index) only run if the graph backend is reachable.
 
-    When called from CLI, *graph* and *embed* are ``None`` — temporary clients
-    are created and closed.  MCP passes existing clients from AppContext.
+    When called from CLI, *graph*/*embed*/*bus* are ``None`` — temporary clients
+    are created (via the same backend-selection factories used everywhere else)
+    and closed.  MCP passes existing clients from AppContext; if *bus* isn't
+    passed explicitly but *daemon* is, the daemon's own live bus is used instead
+    of opening a redundant connection.
     """
     t0 = time.monotonic()
 
     # Create temporary clients if not provided
     own_graph = graph is None
     if own_graph:
-        graph = GraphClient(settings)
+        graph = await create_graph_client(settings)
     if embed is None and settings.embeddings.enabled:
         embed = EmbedClient(settings.embeddings)
+    if bus is None and daemon is not None:
+        bus = daemon.bus
+    own_bus = bus is None
+    if own_bus:
+        bus = await create_event_bus(settings)
 
     try:
         # Mode indicator
@@ -357,7 +396,7 @@ async def run_health_checks(
             check_config(settings, dotenv_path=dotenv_path),
             check_memgraph(graph, settings.memgraph),
             check_embeddings(embed, settings.embeddings),
-            check_valkey(settings.redis),
+            check_valkey(bus, settings.redis),
         )
 
         results = [mode_res, config_res, mg_res, embed_res, valkey_res]
@@ -369,10 +408,13 @@ async def run_health_checks(
             results.append(CheckResult("index", CheckStatus.FAIL, _SKIPPED_DETAIL))
         else:
             assert graph is not None
+            # check_schema/check_embedding_model/check_index stay declared as GraphClient-only
+            # (same "deferred retyping" convention as the ~10 construction call sites elsewhere) —
+            # they only call methods both backends implement, so the SqliteGraphClient case is safe.
             schema_res, model_res, index_res = await asyncio.gather(
-                check_schema(graph),
-                check_embedding_model(graph, settings.embeddings),
-                check_index(graph, settings),
+                check_schema(graph),  # type: ignore[invalid-argument-type]
+                check_embedding_model(graph, settings.embeddings),  # type: ignore[invalid-argument-type]
+                check_index(graph, settings),  # type: ignore[invalid-argument-type]
             )
             results.append(schema_res)
             results.append(model_res)
@@ -385,6 +427,9 @@ async def run_health_checks(
         if own_graph:
             assert graph is not None
             await graph.close()
+        if own_bus:
+            assert bus is not None
+            await bus.close()
 
     elapsed = (time.monotonic() - t0) * 1000
     return HealthReport(checks=results, elapsed_ms=elapsed)

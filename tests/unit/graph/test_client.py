@@ -5,12 +5,17 @@ No infrastructure required — these test pure functions and data structures.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
 from code_atlas.graph.client import (
     _NAME_ROUTED_REL_TYPES,
     _OUT_OF_BAND_REL_TYPES,
     _POST_BATCH_REL_TYPES,
     _UID_ROUTED_REL_TYPES,
+    GraphClient,
     _CallLookup,
+    _format_path_hops,
     _fuse_bm25_results,
     _resolve_one_call,
     _sanitize_bm25_query,
@@ -18,6 +23,10 @@ from code_atlas.graph.client import (
 )
 from code_atlas.parsing.ast import ParsedRelationship
 from code_atlas.schema import RelType
+from code_atlas.settings import AtlasSettings
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestRelationshipRouting:
@@ -237,3 +246,179 @@ class TestResolveOneCall:
         rel = self._rel(f"{self.PROJECT}:mod.func", "print")
         result = _resolve_one_call(self.PROJECT, rel, lookup, {})
         assert result is None
+
+
+class TestConstructorInjection:
+    """GraphClient accepts a pre-built driver, bypassing AsyncGraphDatabase.driver()."""
+
+    def test_injected_driver_is_used_directly(self, tmp_path: Path):
+        settings = AtlasSettings(project_root=tmp_path)
+        fake_driver = MagicMock()
+
+        with patch("code_atlas.graph.client.AsyncGraphDatabase.driver") as mock_driver_factory:
+            client = GraphClient(settings, driver=fake_driver)
+
+        assert client._driver is fake_driver
+        mock_driver_factory.assert_not_called()
+
+    def test_no_injected_driver_falls_back_to_settings_based_construction(self, tmp_path: Path):
+        settings = AtlasSettings(project_root=tmp_path)
+        sentinel_driver = MagicMock()
+
+        with patch(
+            "code_atlas.graph.client.AsyncGraphDatabase.driver", return_value=sentinel_driver
+        ) as mock_driver_factory:
+            client = GraphClient(settings)
+
+        mock_driver_factory.assert_called_once()
+        assert client._driver is sentinel_driver
+
+
+class _FakeRel(dict):
+    """Minimal stand-in for a neo4j Relationship object: dict props + .type."""
+
+    def __init__(self, type_: str, **props: object) -> None:
+        super().__init__(**props)
+        self.type = type_
+
+
+class TestFormatPathHops:
+    """_format_path_hops (client.py) — renders a Cypher path into per-hop dicts for trace_path_between."""
+
+    def test_includes_confidence_and_strategy(self):
+        nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
+        rels = [_FakeRel("CALLS", confidence="resolved", strategy="import")]
+
+        hops = _format_path_hops(nodes, rels)
+
+        assert hops == [
+            {
+                "from": {"uid": "p:a", "name": "a"},
+                "to": {"uid": "p:b", "name": "b"},
+                "edge_type": "CALLS",
+                "confidence": "resolved",
+                "strategy": "import",
+            }
+        ]
+
+    def test_omits_confidence_when_absent(self):
+        """A non-CALLS edge (e.g. IMPORTS) has no confidence/strategy property to surface."""
+        nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
+        rels = [_FakeRel("IMPORTS")]
+
+        hops = _format_path_hops(nodes, rels)
+
+        assert "confidence" not in hops[0]
+        assert "strategy" not in hops[0]
+        assert hops[0]["edge_type"] == "IMPORTS"
+
+    def test_multi_hop(self):
+        nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}, {"uid": "p:c", "name": "c"}]
+        rels = [_FakeRel("CALLS"), _FakeRel("CALLS")]
+
+        hops = _format_path_hops(nodes, rels)
+
+        assert len(hops) == 2
+        assert hops[0]["to"]["uid"] == "p:b"
+        assert hops[1]["from"]["uid"] == "p:b"
+
+
+def _client_with_fake_execute(tmp_path: Path) -> Any:
+    """A GraphClient with a fake driver (never touched) and ``.execute`` overridden
+    as an AsyncMock — for asserting the Cypher text/params a query-construction
+    method produces, without a real Memgraph connection.
+
+    Returns ``Any`` (not ``GraphClient``) deliberately: ``.execute`` is
+    monkey-patched to an ``AsyncMock``, which the real ``GraphClient.execute``
+    signature doesn't structurally support — callers use ``.execute.side_effect``/
+    ``.call_args_list`` the same way tests elsewhere mock a ``MagicMock()`` stand-in.
+    """
+    settings = AtlasSettings(project_root=tmp_path)
+    client = GraphClient(settings, driver=MagicMock())
+    client.execute = AsyncMock()  # type: ignore[invalid-assignment]  # query-text capture, not a real DB call
+    return client
+
+
+class TestAnalysisQueryConstruction:
+    """Query-text regression coverage for the analysis/diagram methods (graph/protocol.py's
+    GraphBackend) — moved here from tests/unit/server/test_analysis.py now that query
+    construction lives in GraphClient rather than server/analysis.py.
+    """
+
+    async def test_dependency_external_counts_query_includes_path_scope(self, tmp_path: Path):
+        """external_imports must be scoped like internal_imports, not report whole-project counts."""
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [[], []]
+
+        await client.get_dependency_external_counts("code-atlas", "src/foo")
+
+        ext_pkg_query = client.execute.call_args_list[0][0][0]
+        ext_sym_query = client.execute.call_args_list[1][0][0]
+        assert "$path" in ext_pkg_query
+        assert "$path" in ext_sym_query
+
+    async def test_structure_overview_external_deps_query_includes_path_scope(self, tmp_path: Path):
+        """_analyze_structure has the same inconsistency as external_imports: fix both."""
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [[], [], [], []]
+
+        await client.get_structure_overview("code-atlas", "src/foo", 20)
+
+        ext_query = client.execute.call_args_list[3][0][0]
+        assert "$path" in ext_query
+
+    async def test_dead_code_query_excludes_calls_and_dunders(self, tmp_path: Path):
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.return_value = []
+
+        await client.get_dead_code_candidates("code-atlas", "")
+
+        query = client.execute.call_args[0][0]
+        assert "NOT ()-[:CALLS]->(n)" in query
+        assert "NOT n.name STARTS WITH '__'" in query
+
+    async def test_complexity_hotspots_query_computes_and_sorts_loc_span(self, tmp_path: Path):
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.return_value = []
+
+        await client.get_complexity_hotspots("code-atlas", "", 20)
+
+        query = client.execute.call_args[0][0]
+        assert "line_end - n.line_start" in query
+        assert "ORDER BY loc_span DESC" in query
+
+    async def test_git_signals_queries_target_the_right_properties(self, tmp_path: Path):
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [[], [], []]
+
+        await client.get_git_signals_data("code-atlas", "src/foo", 20, 1)
+
+        hotspot_query, hotspot_params = client.execute.call_args_list[0][0]
+        assert "git_commit_count" in hotspot_query
+        assert "$path" in hotspot_query
+        assert hotspot_params["path"] == "src/foo"
+        bus_factor_query = client.execute.call_args_list[1][0][0]
+        assert "git_author_count" in bus_factor_query
+        co_change_query = client.execute.call_args_list[2][0][0]
+        assert "CO_CHANGES_WITH" in co_change_query
+        assert "$path" in co_change_query
+
+    async def test_module_detail_methods_and_inherits_queries_are_bounded(self, tmp_path: Path):
+        """Both the methods and inheritance queries must be bounded by max_nodes,
+        not just the top-level entities query, so a module with large classes
+        can't blow past the requested output size.
+        """
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [
+            [{"name": "mod", "qn": "pkg.mod", "uid": "proj:pkg.mod"}],
+            [],
+            [],
+            [],
+        ]
+
+        await client.get_diagram_module_detail("code-atlas", "pkg/mod", 5)
+
+        methods_query = client.execute.call_args_list[2][0][0]
+        inherits_query = client.execute.call_args_list[3][0][0]
+        assert "LIMIT" in methods_query.upper()
+        assert "LIMIT" in inherits_query.upper()

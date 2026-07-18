@@ -127,7 +127,10 @@ class _FakeGraph:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    async def get_note_embeddings(self) -> list[dict[str, Any]]:
+        return self._rows
+
+    async def get_broken_anchor_notes(self) -> list[dict[str, Any]]:
         return self._rows
 
 

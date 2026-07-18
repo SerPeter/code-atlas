@@ -1393,16 +1393,15 @@ async def test_class_overrides_query_filters_by_project_name():
     )
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.base.Base.save", "tags": []}])
+    graph.find_overridden_method = AsyncMock(return_value=("proj:src.base.Base.save", []))
 
     det = ClassOverridesDetector()
     await det.detect(parsed, "proj", graph)
 
-    # The query must be parameterized with the project name, and the Cypher
-    # text must filter the base TypeDef match by project_name.
-    query_text, params = graph.execute.call_args.args
-    assert "project_name" in query_text
-    assert params.get("p") == "proj"
+    # The base-class lookup must be scoped to the entity's own project_name
+    # (GraphBackend.find_overridden_method's job — see graph/client.py and
+    # backends/sqlite_graph.py — to avoid cross-project OVERRIDES/IMPLEMENTS edges).
+    graph.find_overridden_method.assert_awaited_once_with("proj", ["Base"], "save")
 
 
 async def test_module_exports_no_shadowing_by_module_entity():

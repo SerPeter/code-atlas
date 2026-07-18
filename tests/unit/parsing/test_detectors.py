@@ -417,7 +417,7 @@ async def test_test_mapping_class():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.app.Foo"}])
+    graph.find_entity_uid = AsyncMock(return_value="proj:src.app.Foo")
 
     det = TestMappingDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -437,7 +437,7 @@ async def test_test_mapping_function():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.app.create_user"}])
+    graph.find_entity_uid = AsyncMock(return_value="proj:src.app.create_user")
 
     det = TestMappingDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -456,7 +456,7 @@ async def test_test_mapping_not_found():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[])
+    graph.find_entity_uid = AsyncMock(return_value=None)
 
     det = TestMappingDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -479,7 +479,7 @@ async def test_overrides_found():
     parsed = _make_parsed(entities=[method], relationships=[inherits_rel])
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.base.Base.save"}])
+    graph.find_overridden_method = AsyncMock(return_value=("proj:src.base.Base.save", []))
 
     det = ClassOverridesDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -510,7 +510,7 @@ async def test_di_injection_relationship():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.deps.get_db"}])
+    graph.find_entity_uid = AsyncMock(return_value="proj:src.deps.get_db")
 
     det = DIInjectionDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -704,7 +704,7 @@ async def test_overrides_abstractmethod_becomes_implements():
     parsed = _make_parsed(entities=[method], relationships=[inherits_rel])
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.base.Base.save", "tags": ["decorator:abstractmethod"]}])
+    graph.find_overridden_method = AsyncMock(return_value=("proj:src.base.Base.save", ["decorator:abstractmethod"]))
 
     det = ClassOverridesDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -729,7 +729,7 @@ async def test_overrides_non_abstract_stays_overrides():
     parsed = _make_parsed(entities=[method], relationships=[inherits_rel])
 
     graph = AsyncMock()
-    graph.execute = AsyncMock(return_value=[{"uid": "proj:src.base.Base.save", "tags": []}])
+    graph.find_overridden_method = AsyncMock(return_value=("proj:src.base.Base.save", []))
 
     det = ClassOverridesDetector()
     result = await det.detect(parsed, "proj", graph)

@@ -1,10 +1,19 @@
-"""Unit tests for repository analysis module (mocked graph client — no infrastructure needed)."""
+"""Unit tests for repository analysis module (mocked GraphBackend — no infrastructure needed).
+
+Query construction now lives on the backend (``GraphClient``/``SqliteGraphClient`` —
+see ``graph/protocol.py``'s ``GraphBackend``), so these tests mock the named
+backend methods analysis.py calls rather than raw ``graph.execute()``. Query-text
+correctness (e.g. "path scoping actually appears in the Cypher") is covered by
+``tests/unit/graph/test_client.py`` instead — this file covers analysis.py's own
+responsibility: forwarding arguments correctly and shaping/aggregating the
+records a backend returns.
+"""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from code_atlas.server.analysis import _format_path_hops, _sid, analyze_repo, blast_radius, generate_diagram, trace_path
+from code_atlas.server.analysis import _sid, analyze_repo, blast_radius, generate_diagram, trace_path
 
 # ---------------------------------------------------------------------------
 # Dependencies: cross-package coupling
@@ -15,9 +24,10 @@ def _graph_with_imports(
     direct: list[dict[str, str]],
     indirect: list[dict[str, str]] | None = None,
 ) -> MagicMock:
-    """Fake GraphClient whose execute() returns the four _analyze_dependencies result sets in call order."""
+    """Fake GraphBackend for _analyze_dependencies: module import edges + (empty) external counts."""
     graph = MagicMock()
-    graph.execute = AsyncMock(side_effect=[direct, indirect or [], [], []])
+    graph.get_module_import_edges = AsyncMock(return_value={"direct": direct, "indirect": indirect or []})
+    graph.get_dependency_external_counts = AsyncMock(return_value={"ext_packages": [], "ext_symbols": []})
     return graph
 
 
@@ -88,31 +98,30 @@ async def test_circular_dependencies_detects_cycles_longer_than_two():
 
 
 # ---------------------------------------------------------------------------
-# Dependencies / structure: external import counts must honor path scope
+# Dependencies / structure: path scope must be forwarded to the backend
 # ---------------------------------------------------------------------------
 
 
-async def test_external_imports_respects_path_scope():
-    """external_imports must be scoped like internal_imports, not report whole-project counts."""
+async def test_external_imports_forwards_path_scope():
+    """external_imports must forward path scoping to get_dependency_external_counts,
+    not report whole-project counts."""
     graph = _graph_with_imports(direct=[])
 
     await analyze_repo(graph, "dependencies", "code-atlas", path="src/foo")
 
-    ext_pkg_query = graph.execute.call_args_list[2][0][0]
-    ext_sym_query = graph.execute.call_args_list[3][0][0]
-    assert "$path" in ext_pkg_query
-    assert "$path" in ext_sym_query
+    assert graph.get_dependency_external_counts.call_args[0] == ("code-atlas", "src/foo")
 
 
-async def test_structure_external_dependencies_respects_path_scope():
+async def test_structure_external_dependencies_forwards_path_scope():
     """_analyze_structure has the same inconsistency as external_imports: fix both."""
     graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[])
+    graph.get_structure_overview = AsyncMock(
+        return_value={"counts": [], "packages": [], "largest_modules": [], "external_deps": []}
+    )
 
     await analyze_repo(graph, "structure", "code-atlas", path="src/foo")
 
-    ext_query = graph.execute.call_args_list[3][0][0]
-    assert "$path" in ext_query
+    assert graph.get_structure_overview.call_args[0] == ("code-atlas", "src/foo", 20)
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +131,9 @@ async def test_structure_external_dependencies_respects_path_scope():
 
 
 def _graph_for_quality(entities: list[dict[str, object]], direct: list[dict[str, str]]) -> MagicMock:
-    """Fake GraphClient for _analyze_quality's 3 execute() calls: entities, direct, indirect."""
+    """Fake GraphBackend for _analyze_quality's get_quality_data call."""
     graph = MagicMock()
-    graph.execute = AsyncMock(side_effect=[entities, direct, []])
+    graph.get_quality_data = AsyncMock(return_value={"entities": entities, "direct": direct, "indirect": []})
     return graph
 
 
@@ -160,20 +169,18 @@ async def test_quality_path_scope_does_not_score_out_of_scope_edge_endpoints():
 
 
 # ---------------------------------------------------------------------------
-# Diagrams: packages must honor path scope
+# Diagrams: packages must forward path scope
 # ---------------------------------------------------------------------------
 
 
-async def test_diagram_packages_applies_path_filter():
-    """generate_diagram('packages', path=...) must scope the query, not just accept the param."""
+async def test_diagram_packages_forwards_path_scope():
+    """generate_diagram('packages', path=...) must forward path scoping to get_diagram_packages."""
     graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[])
+    graph.get_diagram_packages = AsyncMock(return_value=[])
 
     await generate_diagram(graph, "packages", "code-atlas", path="src/foo")
 
-    query, params = graph.execute.call_args[0]
-    assert "$path" in query
-    assert params["path"] == "src/foo"
+    assert graph.get_diagram_packages.call_args[0] == ("code-atlas", "src/foo", 30)
 
 
 # ---------------------------------------------------------------------------
@@ -181,57 +188,11 @@ async def test_diagram_packages_applies_path_filter():
 # ---------------------------------------------------------------------------
 
 
-class _FakeRel(dict):
-    """Minimal stand-in for a neo4j Relationship object: dict props + .type."""
-
-    def __init__(self, type_: str, **props: object) -> None:
-        super().__init__(**props)
-        self.type = type_
-
-
-def test_format_path_hops_includes_confidence_and_strategy():
-    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
-    rels = [_FakeRel("CALLS", confidence="resolved", strategy="import")]
-
-    hops = _format_path_hops(nodes, rels)
-
-    assert hops == [
-        {
-            "from": {"uid": "p:a", "name": "a"},
-            "to": {"uid": "p:b", "name": "b"},
-            "edge_type": "CALLS",
-            "confidence": "resolved",
-            "strategy": "import",
-        }
-    ]
-
-
-def test_format_path_hops_omits_confidence_when_absent():
-    """A non-CALLS edge (e.g. IMPORTS) has no confidence/strategy property to surface."""
-    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
-    rels = [_FakeRel("IMPORTS")]
-
-    hops = _format_path_hops(nodes, rels)
-
-    assert "confidence" not in hops[0]
-    assert "strategy" not in hops[0]
-    assert hops[0]["edge_type"] == "IMPORTS"
-
-
-def test_format_path_hops_multi_hop():
-    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}, {"uid": "p:c", "name": "c"}]
-    rels = [_FakeRel("CALLS"), _FakeRel("CALLS")]
-
-    hops = _format_path_hops(nodes, rels)
-
-    assert len(hops) == 2
-    assert hops[0]["to"]["uid"] == "p:b"
-    assert hops[1]["from"]["uid"] == "p:b"
-
-
 async def test_trace_path_missing_from_node_returns_not_found():
     graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[{"from_exists": False, "to_exists": True}])
+    graph.trace_path_between = AsyncMock(
+        return_value={"from_exists": False, "to_exists": True, "found": False, "hop_count": None, "hops": []}
+    )
 
     result = await trace_path(graph, "p:missing", "p:b")
 
@@ -241,7 +202,9 @@ async def test_trace_path_missing_from_node_returns_not_found():
 
 async def test_trace_path_missing_to_node_returns_not_found():
     graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[{"from_exists": True, "to_exists": False}])
+    graph.trace_path_between = AsyncMock(
+        return_value={"from_exists": True, "to_exists": False, "found": False, "hop_count": None, "hops": []}
+    )
 
     result = await trace_path(graph, "p:a", "p:missing")
 
@@ -251,11 +214,8 @@ async def test_trace_path_missing_to_node_returns_not_found():
 
 async def test_trace_path_no_path_within_depth():
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [{"from_exists": True, "to_exists": True}],
-            [],
-        ]
+    graph.trace_path_between = AsyncMock(
+        return_value={"from_exists": True, "to_exists": True, "found": False, "hop_count": None, "hops": []}
     )
 
     result = await trace_path(graph, "p:a", "p:b", max_depth=3)
@@ -266,14 +226,23 @@ async def test_trace_path_no_path_within_depth():
 
 
 async def test_trace_path_found_builds_hops_with_confidence():
-    nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
-    rels = [_FakeRel("CALLS", confidence="resolved", strategy="import")]
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [{"from_exists": True, "to_exists": True}],
-            [{"path_nodes": nodes, "path_rels": rels, "hops": 1}],
-        ]
+    graph.trace_path_between = AsyncMock(
+        return_value={
+            "from_exists": True,
+            "to_exists": True,
+            "found": True,
+            "hop_count": 1,
+            "hops": [
+                {
+                    "from": {"uid": "p:a", "name": "a"},
+                    "to": {"uid": "p:b", "name": "b"},
+                    "edge_type": "CALLS",
+                    "confidence": "resolved",
+                    "strategy": "import",
+                }
+            ],
+        }
     )
 
     result = await trace_path(graph, "p:a", "p:b", max_depth=6)
@@ -286,7 +255,7 @@ async def test_trace_path_found_builds_hops_with_confidence():
 
 async def test_blast_radius_not_found():
     graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[{"exists": False}])
+    graph.node_exists = AsyncMock(return_value=False)
 
     result = await blast_radius(graph, "p:missing")
 
@@ -295,7 +264,7 @@ async def test_blast_radius_not_found():
 
 async def test_blast_radius_invalid_direction():
     graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[{"exists": True}])
+    graph.node_exists = AsyncMock(return_value=True)
 
     result = await blast_radius(graph, "p:a", direction="sideways")
 
@@ -305,14 +274,29 @@ async def test_blast_radius_invalid_direction():
 async def test_blast_radius_flags_ambiguous_only():
     """An affected entity with no fully-resolved-edge path is flagged ambiguous_only."""
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [{"exists": True}],
-            [
-                {"uid": "p:x", "name": "x", "qn": "mod.x", "label": "Callable", "file_path": "mod.py", "min_depth": 1},
-                {"uid": "p:y", "name": "y", "qn": "mod.y", "label": "Callable", "file_path": "mod.py", "min_depth": 2},
-            ],
-            [{"uid": "p:x"}],  # only x is reachable via an all-resolved path
+    graph.node_exists = AsyncMock(return_value=True)
+    graph.compute_blast_radius = AsyncMock(
+        return_value=[
+            {
+                "uid": "p:x",
+                "name": "x",
+                "qualified_name": "mod.x",
+                "label": "Callable",
+                "file_path": "mod.py",
+                "min_depth": 1,
+                "direction": "out",
+                "ambiguous_only": False,
+            },
+            {
+                "uid": "p:y",
+                "name": "y",
+                "qualified_name": "mod.y",
+                "label": "Callable",
+                "file_path": "mod.py",
+                "min_depth": 2,
+                "direction": "out",
+                "ambiguous_only": True,
+            },
         ]
     )
 
@@ -326,18 +310,22 @@ async def test_blast_radius_flags_ambiguous_only():
 
 async def test_blast_radius_respects_limit_and_reports_truncated():
     graph = MagicMock()
-    all_raw = [
-        {
-            "uid": f"p:{i}",
-            "name": f"n{i}",
-            "qn": f"mod.n{i}",
-            "label": "Callable",
-            "file_path": "mod.py",
-            "min_depth": 1,
-        }
-        for i in range(3)
-    ]
-    graph.execute = AsyncMock(side_effect=[[{"exists": True}], all_raw, []])
+    graph.node_exists = AsyncMock(return_value=True)
+    graph.compute_blast_radius = AsyncMock(
+        return_value=[
+            {
+                "uid": f"p:{i}",
+                "name": f"n{i}",
+                "qualified_name": f"mod.n{i}",
+                "label": "Callable",
+                "file_path": "mod.py",
+                "min_depth": 1,
+                "direction": "out",
+                "ambiguous_only": False,
+            }
+            for i in range(3)
+        ]
+    )
 
     result = await blast_radius(graph, "p:a", direction="callees", limit=2)
 
@@ -353,7 +341,7 @@ async def test_blast_radius_respects_limit_and_reports_truncated():
 
 async def test_dead_code_returns_zero_incoming_calls_entities():
     graph = MagicMock()
-    graph.execute = AsyncMock(
+    graph.get_dead_code_candidates = AsyncMock(
         return_value=[
             {
                 "name": "orphan_fn",
@@ -371,14 +359,11 @@ async def test_dead_code_returns_zero_incoming_calls_entities():
     assert result["analysis"] == "dead_code"
     assert result["dead_code_count"] == 1
     assert result["dead_code"][0]["qualified_name"] == "pkg.mod.orphan_fn"
-    query = graph.execute.call_args[0][0]
-    assert "NOT ()-[:CALLS]->(n)" in query
-    assert "NOT n.name STARTS WITH '__'" in query
 
 
 async def test_dead_code_excludes_test_pattern_matches():
     graph = MagicMock()
-    graph.execute = AsyncMock(
+    graph.get_dead_code_candidates = AsyncMock(
         return_value=[
             {
                 "name": "test_something",
@@ -407,7 +392,7 @@ async def test_dead_code_excludes_test_pattern_matches():
 
 async def test_dead_code_respects_limit_and_reports_truncated():
     graph = MagicMock()
-    graph.execute = AsyncMock(
+    graph.get_dead_code_candidates = AsyncMock(
         return_value=[
             {
                 "name": f"orphan_{i}",
@@ -435,7 +420,7 @@ async def test_dead_code_respects_limit_and_reports_truncated():
 
 async def test_complexity_returns_loc_span_sorted_hotspots():
     graph = MagicMock()
-    graph.execute = AsyncMock(
+    graph.get_complexity_hotspots = AsyncMock(
         return_value=[
             {
                 "name": "big_fn",
@@ -453,24 +438,22 @@ async def test_complexity_returns_loc_span_sorted_hotspots():
 
     assert result["analysis"] == "complexity"
     assert result["hotspots"][0]["loc_span"] == 200
-    query = graph.execute.call_args[0][0]
-    assert "line_end - n.line_start" in query
-    assert "ORDER BY loc_span DESC" in query
 
 
-async def test_complexity_respects_path_scope():
+async def test_complexity_forwards_path_scope():
     graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[])
+    graph.get_complexity_hotspots = AsyncMock(return_value=[])
 
     await analyze_repo(graph, "complexity", "code-atlas", path="src/foo")
 
-    query, params = graph.execute.call_args[0]
-    assert "$path" in query
-    assert params["path"] == "src/foo"
+    assert graph.get_complexity_hotspots.call_args[0] == ("code-atlas", "src/foo", 20)
 
 
 # ---------------------------------------------------------------------------
 # Communities (ADR-0013 shortcut: find_communities, MAGE leiden_community_detection)
+#
+# _analyze_communities still calls graph.execute() directly (deliberate — see
+# its docstring), so these tests are unchanged from before the encapsulation.
 # ---------------------------------------------------------------------------
 
 
@@ -594,12 +577,12 @@ def _hotspot_row(qn: str, commit_count: int, author_count: int = 2, days: float 
 
 async def test_git_signals_returns_hotspots():
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [_hotspot_row("hot", 42), _hotspot_row("cold", 3)],
-            [],
-            [],
-        ]
+    graph.get_git_signals_data = AsyncMock(
+        return_value={
+            "hotspots": [_hotspot_row("hot", 42), _hotspot_row("cold", 3)],
+            "bus_factor": [],
+            "co_change": [],
+        }
     )
 
     result = await analyze_repo(graph, "git_signals", "code-atlas")
@@ -607,36 +590,32 @@ async def test_git_signals_returns_hotspots():
     assert result["analysis"] == "git_signals"
     assert result["mined"] is True
     assert [h["qualified_name"] for h in result["hotspots"]] == ["hot", "cold"]
-    query = graph.execute.call_args_list[0][0][0]
-    assert "git_commit_count" in query
 
 
 async def test_git_signals_bus_factor_risks():
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [_hotspot_row("solo", 10, author_count=1)],
-            [_hotspot_row("solo", 10, author_count=1)],
-            [],
-        ]
+    graph.get_git_signals_data = AsyncMock(
+        return_value={
+            "hotspots": [_hotspot_row("solo", 10, author_count=1)],
+            "bus_factor": [_hotspot_row("solo", 10, author_count=1)],
+            "co_change": [],
+        }
     )
 
     result = await analyze_repo(graph, "git_signals", "code-atlas")
 
     assert len(result["bus_factor_risks"]) == 1
     assert result["bus_factor_risks"][0]["author_count"] == 1
-    query = graph.execute.call_args_list[1][0][0]
-    assert "git_author_count" in query
 
 
 async def test_git_signals_co_change_pairs():
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [],
-            [],
-            [{"a_qn": "pkg.a", "a_path": "pkg/a.py", "b_qn": "pkg.b", "b_path": "pkg/b.py", "count": 5}],
-        ]
+    graph.get_git_signals_data = AsyncMock(
+        return_value={
+            "hotspots": [],
+            "bus_factor": [],
+            "co_change": [{"a_qn": "pkg.a", "a_path": "pkg/a.py", "b_qn": "pkg.b", "b_path": "pkg/b.py", "count": 5}],
+        }
     )
 
     result = await analyze_repo(graph, "git_signals", "code-atlas")
@@ -644,8 +623,6 @@ async def test_git_signals_co_change_pairs():
     assert result["co_change_pairs"] == [
         {"a": "pkg.a", "a_file_path": "pkg/a.py", "b": "pkg.b", "b_file_path": "pkg/b.py", "count": 5}
     ]
-    query = graph.execute.call_args_list[2][0][0]
-    assert "CO_CHANGES_WITH" in query
 
 
 async def test_git_signals_not_mined_when_no_data():
@@ -653,7 +630,7 @@ async def test_git_signals_not_mined_when_no_data():
     not an error, so a caller can distinguish 'never mined' from 'mined, found nothing'.
     """
     graph = MagicMock()
-    graph.execute = AsyncMock(side_effect=[[], [], []])
+    graph.get_git_signals_data = AsyncMock(return_value={"hotspots": [], "bus_factor": [], "co_change": []})
 
     result = await analyze_repo(graph, "git_signals", "code-atlas")
 
@@ -663,17 +640,13 @@ async def test_git_signals_not_mined_when_no_data():
     assert result["co_change_pairs"] == []
 
 
-async def test_git_signals_respects_path_scope():
+async def test_git_signals_forwards_path_scope():
     graph = MagicMock()
-    graph.execute = AsyncMock(side_effect=[[], [], []])
+    graph.get_git_signals_data = AsyncMock(return_value={"hotspots": [], "bus_factor": [], "co_change": []})
 
     await analyze_repo(graph, "git_signals", "code-atlas", path="src/foo")
 
-    hotspot_query, hotspot_params = graph.execute.call_args_list[0][0]
-    assert "$path" in hotspot_query
-    assert hotspot_params["path"] == "src/foo"
-    co_change_query = graph.execute.call_args_list[2][0][0]
-    assert "$path" in co_change_query
+    assert graph.get_git_signals_data.call_args[0] == ("code-atlas", "src/foo", 20, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -688,17 +661,17 @@ async def test_imports_diagram_keeps_low_weight_edge_between_already_kept_nodes(
     no reason.
     """
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [
+    graph.get_module_import_edges = AsyncMock(
+        return_value={
+            "direct": [
                 {"from_mod": "pkg.a", "to_mod": "pkg.b"},
                 {"from_mod": "pkg.a", "to_mod": "pkg.b"},
                 {"from_mod": "pkg.a", "to_mod": "pkg.b"},
                 {"from_mod": "pkg.c", "to_mod": "pkg.d"},
                 {"from_mod": "pkg.c", "to_mod": "pkg.d"},
             ],
-            [{"from_mod": "pkg.b", "to_mod": "pkg.a"}],
-        ]
+            "indirect": [{"from_mod": "pkg.b", "to_mod": "pkg.a"}],
+        }
     )
 
     result = await generate_diagram(graph, "imports", "code-atlas", max_nodes=2)
@@ -725,28 +698,28 @@ def test_sid_is_deterministic_per_name():
 
 
 # ---------------------------------------------------------------------------
-# Diagrams: module_detail must bound methods/inheritance queries by max_nodes
-# and never reference a class truncated out of the declared node set
+# Diagrams: module_detail must forward max_nodes and never reference a class
+# truncated out of the declared node set
 # ---------------------------------------------------------------------------
 
 
 def _graph_for_module_detail(entities: list[dict[str, object]], inherits: list[dict[str, str]]) -> MagicMock:
-    """Fake GraphClient for _diagram_module_detail's 4 execute() calls: module, entities, methods, inherits."""
+    """Fake GraphBackend for _diagram_module_detail's get_diagram_module_detail call."""
     graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [{"name": "mod", "qn": "pkg.mod", "uid": "proj:pkg.mod"}],
-            entities,
-            [],
-            inherits,
-        ]
+    graph.get_diagram_module_detail = AsyncMock(
+        return_value={
+            "module": {"name": "mod", "qn": "pkg.mod", "uid": "proj:pkg.mod"},
+            "entities": entities,
+            "methods": [],
+            "inherits": inherits,
+        }
     )
     return graph
 
 
-async def test_module_detail_methods_and_inherits_respect_max_nodes():
-    """Both the methods and inheritance queries must be bounded by max_nodes,
-    not just the top-level entities query, so a module with large classes
+async def test_module_detail_forwards_max_nodes():
+    """max_nodes must reach get_diagram_module_detail — it bounds the entities/
+    methods/inheritance queries backend-side, so a module with large classes
     can't blow past the requested output size.
     """
     graph = _graph_for_module_detail(
@@ -758,10 +731,7 @@ async def test_module_detail_methods_and_inherits_respect_max_nodes():
 
     await generate_diagram(graph, "module_detail", "code-atlas", path="pkg/mod", max_nodes=5)
 
-    methods_query = graph.execute.call_args_list[2][0][0]
-    inherits_query = graph.execute.call_args_list[3][0][0]
-    assert "LIMIT" in methods_query.upper()
-    assert "LIMIT" in inherits_query.upper()
+    assert graph.get_diagram_module_detail.call_args[0] == ("code-atlas", "pkg/mod", 5)
 
 
 async def test_module_detail_skips_inheritance_edge_for_truncated_child():

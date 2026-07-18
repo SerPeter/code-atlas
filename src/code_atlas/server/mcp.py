@@ -24,6 +24,8 @@ from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
+from code_atlas.backends import create_graph_client, graph_backend_label
+from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.dream import VaultRoot, build_dream_report, report_to_dict
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
 from code_atlas.indexing.daemon import DaemonManager
@@ -55,6 +57,7 @@ from code_atlas.search.engine import hybrid_search as _hybrid_search
 from code_atlas.search.guidance import (
     _RELATIONSHIP_SUMMARY,
     CYPHER_EXAMPLES,
+    ValidationIssue,
     get_guide,
     plan_strategy,
     validate_cypher_explain,
@@ -121,6 +124,18 @@ _MAX_LIMIT = 100
 _DOCSTRING_TRUNCATE = 200
 
 
+def _ready_event() -> asyncio.Event:
+    """Default ``first_index_ready`` — already set.
+
+    Ordinary restarts against an already-provisioned backend (the common
+    case, and every existing caller that builds an ``AppContext`` without
+    passing this explicitly) must never block on it.
+    """
+    event = asyncio.Event()
+    event.set()
+    return event
+
+
 @dataclass
 class AppContext:
     graph: GraphClient
@@ -131,6 +146,8 @@ class AppContext:
     resolved_root: Path | None = field(default=None, repr=False)
     roots_checked: bool = field(default=False, repr=False)
     vector_enabled: bool = field(default=True, repr=False)
+    needs_first_index: bool = field(default=False, repr=False)
+    first_index_ready: asyncio.Event = field(default_factory=_ready_event, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -262,10 +279,34 @@ def _get_app_ctx(ctx: Context) -> AppContext:
     return ctx.request_context.lifespan_context
 
 
-async def _ensure_root(ctx: Context) -> AppContext:
-    """Extract AppContext and ensure MCP roots have been checked."""
+_INDEX_READY_TIMEOUT_S = 600.0  # bounded wait for first-index catch-up before failing loudly
+
+
+class IndexNotReadyError(Exception):
+    """Raised by :func:`_ensure_root` when a genuinely fresh backend's first-index
+    catch-up doesn't complete within the bounded wait — see ``INDEX_REQUIRED``."""
+
+
+async def _ensure_root(ctx: Context, *, require_index: bool = True) -> AppContext:
+    """Extract AppContext, ensure MCP roots have been checked, and gate on first-index readiness.
+
+    On a genuinely fresh backend (``needs_first_index``), tool calls block until the
+    daemon's startup catch-up index completes (``first_index_ready``), bounded by
+    ``_INDEX_READY_TIMEOUT_S`` so an unreachable queue fails fast instead of hanging
+    forever. *require_index=False* (health_check, index_status) skips the wait so a
+    caller can still see why other tools are blocked.
+    """
     app: AppContext = ctx.request_context.lifespan_context
     await _maybe_update_root(app, ctx)
+    if require_index and app.needs_first_index and not app.first_index_ready.is_set():
+        try:
+            await asyncio.wait_for(app.first_index_ready.wait(), timeout=_INDEX_READY_TIMEOUT_S)
+        except TimeoutError as exc:
+            msg = (
+                "Backend has never been indexed and the first-index catch-up did not "
+                "complete in time. Check health_check/index_status for pipeline state."
+            )
+            raise IndexNotReadyError(msg) from exc
     return app
 
 
@@ -600,14 +641,27 @@ def create_mcp_server(  # noqa: PLR0915
     async def app_lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: PLR0915
         init_telemetry(settings.observability)
 
-        graph = GraphClient(settings)
+        # Declared type stays GraphClient (the network backend) — SqliteGraphClient
+        # is a structurally-compatible fallback, but full retyping of every
+        # downstream signature to the union is an explicitly deferred, mechanical
+        # follow-up (see backends/__init__.py factory docstring).
+        graph: GraphClient = await create_graph_client(settings)  # type: ignore[invalid-assignment]
         try:
             await graph.ping()
         except Exception as exc:
-            logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+            logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
             raise
 
-        logger.info("MCP connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+        logger.info("MCP connected to {}", graph_backend_label(graph, settings))
+
+        # "Never bootstrapped" must be read BEFORE ensure_schema() — ensure_schema()
+        # sets the version as part of applying a fresh schema, so checking after
+        # would always see a version and needs_first_index would never be True.
+        needs_first_index = await graph.get_schema_version() is None
+        await graph.ensure_schema()
+        first_index_ready = asyncio.Event()
+        if not needs_first_index:
+            first_index_ready.set()
 
         # Embedding setup — skipped entirely in lightweight mode
         vector_enabled = True
@@ -654,6 +708,8 @@ def create_mcp_server(  # noqa: PLR0915
             daemon=daemon,
             resolved_root=settings.project_root,
             vector_enabled=vector_enabled,
+            needs_first_index=needs_first_index,
+            first_index_ready=first_index_ready,
         )
 
         # Register handler for roots/list_changed notification so we re-probe
@@ -677,7 +733,9 @@ def create_mcp_server(  # noqa: PLR0915
         # clients' connect timeout. Run daemon startup in the background instead
         # so tools are reachable immediately; health_check reports pipeline state
         # and result staleness already surfaces an index that's still catching up.
-        daemon_start_task = asyncio.get_running_loop().create_task(daemon.start(settings, graph, catchup=catchup))
+        daemon_start_task = asyncio.get_running_loop().create_task(
+            daemon.start(settings, graph, catchup=catchup, first_index_ready=first_index_ready)
+        )
 
         def _on_daemon_started(task: asyncio.Task) -> None:
             if task.cancelled():
@@ -772,13 +830,15 @@ def _register_node_tools(mcp: FastMCP) -> None:
         ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         clamped = _clamp_limit(limit)
 
         if label and label not in NodeLabel:
             valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
             return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
-        label_filter = f":{label}" if label else ""
         t0 = time.monotonic()
         found: list[dict[str, Any]] | None = None
         total: int | None = None
@@ -787,12 +847,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
 
         try:
             # Stage A: Exact matches (uid + exact name) — 1 RTT
-            exact = await app.graph.execute(
-                f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {peek} "
-                f"UNION ALL "
-                f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {peek}",
-                {"name": name},
-            )
+            exact = await app.graph.get_node_exact_matches(name, label, peek)
             seen: dict[str, dict[str, Any]] = {}
             ordered_uids: list[str] = []
             for r in exact:
@@ -806,17 +861,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
             # found nothing — otherwise a single exact hit silently hides
             # same-named siblings (e.g. "_catchup" hiding "_catchup_vault").
             if len(seen) < page_end:
-                partial = await app.graph.execute(
-                    f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix "
-                    f"RETURN n, 3 AS _match_score LIMIT {peek} "
-                    f"UNION ALL "
-                    f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix "
-                    f"RETURN n, 2 AS _match_score LIMIT {peek} "
-                    f"UNION ALL "
-                    f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
-                    f"RETURN n, 1 AS _match_score LIMIT {peek}",
-                    {"name": name, "suffix": f".{name}", "prefix": f"{name}."},
-                )
+                partial = await app.graph.get_node_partial_matches(name, label, peek)
                 # Deduplicate by uid (keeping highest _match_score), skipping anything Stage A already has
                 partial_best: dict[str, dict[str, Any]] = {}
                 for r in partial:
@@ -856,11 +901,24 @@ def _register_query_tools(mcp: FastMCP) -> None:
         limit: Annotated[int, Field(20, description="Max results (auto-appended as LIMIT clause).", ge=1, le=100)] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         clamped = _clamp_limit(limit)
 
         if _WRITE_KEYWORDS.search(_strip_cypher_string_literals(query)):
             return _error("Write operations are not allowed via MCP", code="WRITE_REJECTED")
+
+        # Deliberate exception (see graph/protocol.py, ADR-0015): arbitrary agent-authored
+        # Cypher has no SQL translation, so this is the one place that still calls
+        # graph.execute() directly. Guard explicitly instead of letting SqliteGraphClient's
+        # NotImplementedError surface as a generic QUERY_ERROR.
+        if isinstance(app.graph, SqliteGraphClient):
+            return _error(
+                "cypher_query requires the Memgraph backend — the sqlite backend has no Cypher translation layer.",
+                code="UNSUPPORTED_BACKEND",
+            )
 
         # Auto-append LIMIT if missing, requesting one extra row to detect truncation.
         # If the caller supplied their own LIMIT, honor it as-is (truncation unknown).
@@ -905,7 +963,10 @@ def _register_query_tools(mcp: FastMCP) -> None:
         include_docs: Annotated[bool, Field(True, description="Include linked documentation sections.")] = True,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         t0 = time.monotonic()
 
         try:
@@ -974,7 +1035,10 @@ def _register_search_tools(mcp: FastMCP) -> None:
         ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         if label and label not in NodeLabel:
             valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
             return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
@@ -1011,7 +1075,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
             "Use offset to page beyond the first `limit` results."
         ),
     )
-    async def vector_search(
+    async def vector_search(  # noqa: PLR0911
         query: Annotated[str, Field(description="Natural language query — describes what the code does.")],
         label: Annotated[
             str,
@@ -1034,7 +1098,10 @@ def _register_search_tools(mcp: FastMCP) -> None:
         ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         if label and label not in NodeLabel:
             valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
             return {"error": f"Invalid label: {label!r}. Valid labels: {valid}"}
@@ -1158,7 +1225,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "Use offset to page beyond the first `limit` results."
         ),
     )
-    async def hybrid_search(
+    async def hybrid_search(  # noqa: PLR0911
         query: Annotated[str, Field(description="Search query — identifier names, natural language, or mixed.")],
         limit: Annotated[int, Field(20, description="Max results to return.", ge=1, le=100)] = 20,
         offset: Annotated[int, Field(0, description="Skip this many results (for paging beyond limit).", ge=0)] = 0,
@@ -1209,7 +1276,10 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
         ] = "summary",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         clamped = _clamp_limit(limit)
         page_end = offset + clamped
 
@@ -1304,7 +1374,9 @@ def _register_info_tools(mcp: FastMCP) -> None:
         ),
     )
     async def index_status(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = await _ensure_root(ctx)
+        # Exempted from the first-index gate — must stay reachable so a blocked
+        # caller can see the pipeline state that's blocking the other tools.
+        app = await _ensure_root(ctx, require_index=False)
         t0 = time.monotonic()
 
         try:
@@ -1328,10 +1400,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
                 )
 
             # Per-label counts
-            label_counts_raw = await app.graph.execute(
-                "MATCH (n) RETURN labels(n)[0] AS label, count(n) AS count ORDER BY count DESC"
-            )
-            label_counts = {r["label"]: r["count"] for r in label_counts_raw}
+            label_counts = await app.graph.get_label_counts()
 
             # Vector and text index info
             vec_index_info = await app.graph.get_vector_index_info()
@@ -1358,7 +1427,10 @@ def _register_info_tools(mcp: FastMCP) -> None:
         ),
     )
     async def list_projects(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         t0 = time.monotonic()
 
         try:
@@ -1367,9 +1439,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
                 return _result([], limit=0, query_ms=0)
 
             # Collect DEPENDS_ON relationships
-            depends_records = await app.graph.execute(
-                "MATCH (a:Project)-[:DEPENDS_ON]->(b:Project) RETURN a.name AS from_proj, b.name AS to_proj"
-            )
+            depends_records = await app.graph.get_project_dependency_edges()
             depends_on_map: dict[str, list[str]] = {}
             depended_by_map: dict[str, list[str]] = {}
             for r in depends_records:
@@ -1455,7 +1525,9 @@ def _register_info_tools(mcp: FastMCP) -> None:
         ),
     )
     async def health_check(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = await _ensure_root(ctx)
+        # Exempted from the first-index gate — must stay reachable so a blocked
+        # caller can see the pipeline state that's blocking the other tools.
+        app = await _ensure_root(ctx, require_index=False)
         report = await run_health_checks(app.settings, graph=app.graph, embed=app.embed, daemon=app.daemon)
         return {
             "ok": report.ok,
@@ -1490,7 +1562,10 @@ def _register_knowledge_tools(mcp: FastMCP) -> None:
         ),
     )
     async def knowledge_health(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         t0 = time.monotonic()
 
         project_name = derive_project_name(app.settings.project_root)
@@ -1530,9 +1605,21 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
         # Try EXPLAIN against live DB if available
         try:
             app = await _ensure_root(ctx)
-            explain_issue = await validate_cypher_explain(app.graph, query)
-            if explain_issue is not None:
-                issues.append(explain_issue)
+            if isinstance(app.graph, SqliteGraphClient):
+                # Deliberate exception (see graph/protocol.py, ADR-0015): no SQL translation
+                # for arbitrary Cypher — say so explicitly rather than routing through
+                # validate_cypher_explain's generic "EXPLAIN failed: ..." exception message.
+                issues.append(
+                    ValidationIssue(
+                        "info",
+                        "Live EXPLAIN check skipped — the active backend (sqlite) has no Cypher "
+                        "engine; only static checks ran.",
+                    )
+                )
+            else:
+                explain_issue = await validate_cypher_explain(app.graph, query)
+                if explain_issue is not None:
+                    issues.append(explain_issue)
         except Exception:
             pass  # No DB context — static checks only
 
@@ -1572,7 +1659,7 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
         return plan_strategy(question)
 
 
-def _register_analysis_tools(mcp: FastMCP) -> None:
+def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
     """Register repository analysis and diagram generation tools."""
 
     @mcp.tool(
@@ -1618,7 +1705,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         limit: Annotated[int, Field(20, description="Max items per sub-section.", ge=1, le=100)] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
         test_patterns = tuple(app.settings.search.test_patterns) if app.settings.search.test_filter else ()
@@ -1650,7 +1740,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         max_nodes: Annotated[int, Field(30, description="Maximum nodes in the diagram.", ge=1, le=100)] = 30,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         max_nodes = max(1, min(max_nodes, _MAX_LIMIT))
         try:
@@ -1678,7 +1771,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         limit: Annotated[int, Field(20, description="Max items to return.", ge=1, le=100)] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
         test_patterns = tuple(app.settings.search.test_patterns) if app.settings.search.test_filter else ()
@@ -1705,7 +1801,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         limit: Annotated[int, Field(20, description="Max items to return.", ge=1, le=100)] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
         try:
@@ -1735,7 +1834,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         ] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
         try:
@@ -1762,7 +1864,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:
         limit: Annotated[int, Field(20, description="Max items per list to return.", ge=1, le=100)] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
         try:
@@ -1799,7 +1904,10 @@ def _register_traversal_tools(mcp: FastMCP) -> None:
         ] = "",
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         types, type_error = _parse_rel_types(edge_types, _DEFAULT_TRACE_EDGE_TYPES)
         if type_error:
             return type_error
@@ -1837,7 +1945,10 @@ def _register_traversal_tools(mcp: FastMCP) -> None:
         limit: Annotated[int, Field(20, description="Max affected entities to return.", ge=1, le=100)] = 20,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
-        app = await _ensure_root(ctx)
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
         types, type_error = _parse_rel_types(edge_types, _DEFAULT_BLAST_EDGE_TYPES)
         if type_error:
             return type_error

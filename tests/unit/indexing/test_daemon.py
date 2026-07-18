@@ -248,7 +248,7 @@ class TestStartupCatchup:
         async def fake_index_monorepo(settings: object, graph: object, bus: object) -> None:
             state["order"].append("catchup-monorepo")
 
-        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
         monkeypatch.setattr(
             daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: OrderedConsumer(name="ast-0")
         )
@@ -362,7 +362,7 @@ class TestWatcherScopeScan:
             async def run(self) -> None:
                 return  # clean exit — no crash, nothing to supervise
 
-        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
         monkeypatch.setattr(daemon_module, "FileScope", FakeScope)
         monkeypatch.setattr(daemon_module, "FileWatcher", FakeWatcher)
         monkeypatch.setattr(daemon_module, "detect_sub_projects", lambda root, mono: [])
@@ -433,7 +433,7 @@ class TestVaultTaskSpawning:
         ) -> None:
             catchup_calls.append(project_name)
 
-        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
         monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
         monkeypatch.setattr(DaemonManager, "_catchup_vault", fake_catchup_vault)
 
@@ -453,7 +453,7 @@ class TestVaultTaskSpawning:
         await manager.stop()
 
     async def test_missing_vault_path_is_skipped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
         monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
 
         settings = _make_settings(tmp_path)
@@ -495,7 +495,7 @@ class TestVaultStartupIsolation:
             def is_included(self, rel_path: str) -> bool:
                 return True
 
-        monkeypatch.setattr(daemon_module, "EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
         monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer(name="ast-0"))
         monkeypatch.setattr(daemon_module, "FileScope", FakeScope)
 

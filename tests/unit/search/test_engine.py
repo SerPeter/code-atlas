@@ -813,25 +813,31 @@ class _FakeGraphForContext:
     def __init__(self, package_docstring: str | None = "Parses source into entities.") -> None:
         self._package_docstring = package_docstring
 
-    async def execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        params = params or {}
-        if query.strip().endswith("RETURN n"):
-            return [
-                {
-                    "n": {
-                        "uid": params["uid"],
-                        "name": "target_fn",
-                        "qualified_name": "pkg.mod.target_fn",
-                        "kind": "function",
-                        "file_path": "pkg/mod.py",
-                    }
-                }
-            ]
-        if "AS docstring" in query:
-            if "DEFINES" in query and self._package_docstring is not None:
-                return [{"docstring": self._package_docstring}]
-            return []
-        # parent / siblings / callers / callees / docs — no data needed here
+    async def get_entity_by_uid(self, uid: str, label: str = "") -> dict[str, Any] | None:
+        return {
+            "uid": uid,
+            "name": "target_fn",
+            "qualified_name": "pkg.mod.target_fn",
+            "kind": "function",
+            "file_path": "pkg/mod.py",
+        }
+
+    async def get_defining_parent(self, uid: str) -> dict[str, Any] | None:
+        return None
+
+    async def get_sibling_entities(self, uid: str, limit: int) -> list[dict[str, Any]]:
+        return []
+
+    async def get_package_docstring(self, uid: str) -> str | None:
+        return self._package_docstring
+
+    async def get_callers(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
+        return []
+
+    async def get_callees(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
+        return []
+
+    async def get_linked_docs(self, uid: str, label: str, limit: int) -> list[dict[str, Any]]:
         return []
 
 

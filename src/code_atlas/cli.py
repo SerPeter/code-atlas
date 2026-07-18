@@ -332,8 +332,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     co_change_threshold: int = 3,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
-    from code_atlas.events import EventBus
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.backends import create_event_bus, create_graph_client, graph_backend_label, queue_backend_label
     from code_atlas.indexing.orchestrator import detect_sub_projects
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -350,14 +349,14 @@ async def _run_index(  # noqa: PLR0912, PLR0915
 
     project_name = derive_project_name(settings.project_root)
 
-    # Connect to Valkey
-    bus = EventBus(settings.redis, project_name=project_name)
+    # Connect to the event queue backend (Valkey or the SQLite fallback)
+    bus = await create_event_bus(settings)
     try:
         await bus.ping()
     except Exception as exc:
-        logger.error("Cannot reach Valkey at {}:{} — {}", settings.redis.host, settings.redis.port, exc)
+        logger.error("Cannot reach {} — {}", queue_backend_label(bus, settings), exc)
         raise typer.Exit(code=1) from exc
-    logger.info("Connected to Valkey at {}:{}", settings.redis.host, settings.redis.port)
+    logger.info("Connected to {}", queue_backend_label(bus, settings))
 
     # Resolve embedding dimension before graph construction (vector indices need it)
     if settings.embeddings.enabled and settings.embeddings.dimension is None:
@@ -377,15 +376,15 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     if not settings.embeddings.enabled:
         logger.info("Lightweight mode: embeddings disabled, using graph + BM25 only")
 
-    # Connect to Memgraph
-    graph = GraphClient(settings)
+    # Connect to the graph backend (Memgraph or the SQLite fallback)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         await bus.close()
         raise typer.Exit(code=1) from exc
-    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+    logger.info("Connected to {}", graph_backend_label(graph, settings))
 
     await graph.ensure_schema()
 
@@ -597,7 +596,7 @@ async def _run_search(  # noqa: PLR0912, PLR0915
     exclude_generated: bool | None = None,
 ) -> None:
     """Async implementation of the ``atlas search`` command."""
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.backends import create_graph_client, graph_backend_label
     from code_atlas.indexing.orchestrator import StalenessChecker
     from code_atlas.search.embeddings import EmbedClient
     from code_atlas.search.engine import SearchType, hybrid_search
@@ -605,11 +604,11 @@ async def _run_search(  # noqa: PLR0912, PLR0915
 
     settings = _load_settings()
     init_telemetry(settings.observability)
-    graph = GraphClient(settings)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         raise typer.Exit(code=1) from exc
 
     # Map CLI type names to SearchType lists
@@ -671,7 +670,7 @@ async def _run_search(  # noqa: PLR0912, PLR0915
 
         # Staleness check (before output so JSON can include it)
         checker = StalenessChecker(settings.project_root)
-        info = await checker.check(graph, include_changed=True)
+        info = await checker.check(graph, include_changed=True)  # type: ignore[invalid-argument-type]
 
         if _output.json:
             _json_output(
@@ -705,14 +704,14 @@ async def _run_search(  # noqa: PLR0912, PLR0915
 
 async def _run_status() -> None:
     """Async implementation of the ``atlas status`` command."""
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.backends import create_graph_client, graph_backend_label
 
     settings = _load_settings()
-    graph = GraphClient(settings)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         raise typer.Exit(code=1) from exc
 
     try:
@@ -721,9 +720,7 @@ async def _run_status() -> None:
         import datetime
 
         # Collect DEPENDS_ON relationships
-        depends_on = await graph.execute(
-            "MATCH (a:Project)-[:DEPENDS_ON]->(b:Project) RETURN a.name AS from_proj, b.name AS to_proj"
-        )
+        depends_on = await graph.get_project_dependency_edges()
         deps_by_project: dict[str, list[str]] = {}
         for row in depends_on:
             deps_by_project.setdefault(row["from_proj"], []).append(row["to_proj"])
@@ -791,14 +788,14 @@ def project_rm(
 
 async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
     """Async implementation of the ``atlas project rm`` command."""
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.backends import create_graph_client, graph_backend_label
 
     settings = _load_settings()
-    graph = GraphClient(settings)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         raise typer.Exit(code=1) from exc
 
     try:
@@ -834,7 +831,7 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
     """Async implementation of the ``atlas mine-git-history`` command."""
     from git.exc import InvalidGitRepositoryError, NoSuchPathError
 
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.backends import create_graph_client, graph_backend_label
     from code_atlas.indexing.git_signals import mine_git_signals, write_git_signals
     from code_atlas.settings import AtlasSettings, derive_project_name
 
@@ -842,11 +839,11 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
     settings = AtlasSettings(project_root=project_root)
     project_name = derive_project_name(settings.project_root)
 
-    graph = GraphClient(settings)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         raise typer.Exit(code=1) from exc
 
     try:
@@ -857,7 +854,7 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
             logger.error("Not a git repository: {} — {}", project_root, exc)
             raise typer.Exit(code=1) from exc
 
-        stats = await write_git_signals(graph, project_name, result)
+        stats = await write_git_signals(graph, project_name, result)  # type: ignore[invalid-argument-type]
         if _output.json:
             _json_output(stats)
         else:
@@ -911,16 +908,16 @@ async def _mine_and_write_git_signals(
 
 async def _run_dream() -> None:
     """Async implementation of the ``atlas dream`` command."""
+    from code_atlas.backends import create_graph_client, graph_backend_label
     from code_atlas.dream import VaultRoot, build_dream_report, render_home_md, report_to_dict
-    from code_atlas.graph.client import GraphClient
     from code_atlas.settings import derive_project_name
 
     settings = _load_settings()
-    graph = GraphClient(settings)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         raise typer.Exit(code=1) from exc
 
     try:
@@ -1033,7 +1030,7 @@ def _print_report(report: object, *, detailed: bool) -> None:
 
 async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None, no_git_check: bool = False) -> None:
     """Async implementation of the ``atlas watch`` command."""
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.backends import create_graph_client, graph_backend_label
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -1046,17 +1043,17 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     if max_wait is not None:
         settings.watcher.max_wait_s = max_wait
 
-    graph = GraphClient(settings)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         raise typer.Exit(code=1) from exc
-    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+    logger.info("Connected to {}", graph_backend_label(graph, settings))
     await graph.ensure_schema()
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph)
+    started = await daemon.start(settings, graph)  # type: ignore[invalid-argument-type]
     if not started:
         logger.error("Valkey required for watch mode")
         await graph.close()
@@ -1080,7 +1077,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 
 async def _run_daemon(*, no_embed: bool = False) -> None:
     """Start the EventBus, file watcher, and all tier consumers, run until interrupted."""
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.backends import create_graph_client, graph_backend_label
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -1089,17 +1086,17 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
         settings.embeddings.enabled = False
     init_telemetry(settings.observability)
 
-    graph = GraphClient(settings)
+    graph = await create_graph_client(settings)
     try:
         await graph.ping()
     except Exception as exc:
-        logger.error("Cannot reach Memgraph at {}:{} — {}", settings.memgraph.host, settings.memgraph.port, exc)
+        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
         raise typer.Exit(code=1) from exc
-    logger.info("Connected to Memgraph at {}:{}", settings.memgraph.host, settings.memgraph.port)
+    logger.info("Connected to {}", graph_backend_label(graph, settings))
     await graph.ensure_schema()
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph, include_watcher=True)
+    started = await daemon.start(settings, graph, include_watcher=True)  # type: ignore[invalid-argument-type]
     if not started:
         logger.error("Valkey required for daemon mode")
         await graph.close()

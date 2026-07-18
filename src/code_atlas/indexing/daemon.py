@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from code_atlas.backends import create_event_bus
 from code_atlas.events import EventBus, Topic
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
@@ -48,6 +49,17 @@ class DaemonManager:
     _crash_counts: dict[str, int] = field(default_factory=dict, repr=False)
     _last_crash: dict[str, str] = field(default_factory=dict, repr=False)
 
+    @property
+    def bus(self) -> EventBus | None:
+        """The event bus this manager is actually running on (``None`` before ``start()``).
+
+        Declared type stays ``EventBus`` per the same structurally-compatible-fallback
+        convention as ``start()``'s ``bus`` local — it may hold a ``SqliteEventBus`` at
+        runtime. Lets the health-check honesty fix report the real active queue backend
+        instead of probing a disconnected one.
+        """
+        return self._bus
+
     def status(self) -> dict[str, Any]:
         """Task liveness + crash state, consumed by the ``pipeline`` health check."""
         return {
@@ -57,13 +69,14 @@ class DaemonManager:
             "last_crash": dict(self._last_crash),
         }
 
-    async def start(
+    async def start(  # noqa: PLR0912
         self,
         settings: AtlasSettings,
         graph: GraphClient,
         *,
         include_watcher: bool = True,
         catchup: bool = True,
+        first_index_ready: asyncio.Event | None = None,
     ) -> bool:
         """Try to start watcher + pipeline.
 
@@ -82,8 +95,17 @@ class DaemonManager:
             If ``True``, run one delta index pass before consuming so edits
             made while the daemon was down are indexed. Failures are logged
             and non-fatal.
+        first_index_ready:
+            Set once startup catch-up has run (success or swallowed failure)
+            or is skipped — lets a caller (MCP's first-index readiness gate)
+            block tool calls against a genuinely fresh backend without hanging
+            forever. ``None`` (default) means no one is waiting on it.
         """
-        bus = EventBus(settings.redis, project_name=derive_project_name(settings.project_root))
+        # Declared type stays EventBus (the network backend) — SqliteEventBus is a
+        # structurally-compatible fallback, but full retyping of every downstream
+        # consumer/watcher signature to the union is an explicitly deferred,
+        # mechanical follow-up (see backends/__init__.py factory docstring).
+        bus: EventBus = await create_event_bus(settings)  # type: ignore[invalid-assignment]
         try:
             await bus.ping()
         except Exception:
@@ -146,7 +168,9 @@ class DaemonManager:
         # pipeline uses the same consumer names, so the two must never coexist
         # in this process.
         if catchup:
-            await self._catchup(settings, graph, bus)
+            await self._catchup(settings, graph, bus, first_index_ready)
+        elif first_index_ready is not None:
+            first_index_ready.set()
 
         for consumer in self._consumers:
             self._tasks.append(asyncio.get_running_loop().create_task(self._run_consumer(consumer)))
@@ -208,8 +232,19 @@ class DaemonManager:
         if catchup:
             await self._catchup_vault(vault.project_name, vault_root, known_files, settings, graph)
 
-    async def _catchup(self, settings: AtlasSettings, graph: GraphClient, bus: EventBus) -> None:
-        """One delta index pass so changes made while the daemon was down get indexed."""
+    async def _catchup(
+        self,
+        settings: AtlasSettings,
+        graph: GraphClient,
+        bus: EventBus,
+        first_index_ready: asyncio.Event | None = None,
+    ) -> None:
+        """One delta index pass so changes made while the daemon was down get indexed.
+
+        *first_index_ready* (if given) is set in the ``finally`` block regardless of
+        outcome — both success and the swallowed-failure path below must unblock a
+        caller waiting on it (MCP's first-index readiness gate), never hang forever.
+        """
         try:
             if detect_sub_projects(settings.project_root, settings.monorepo):
                 await index_monorepo(settings, graph, bus)
@@ -217,6 +252,9 @@ class DaemonManager:
                 await index_project(settings, graph, bus)
         except Exception:
             logger.exception("Startup catch-up index failed — continuing with live events only")
+        finally:
+            if first_index_ready is not None:
+                first_index_ready.set()
 
     async def wait(self) -> None:
         """Block until all background tasks finish (or are cancelled)."""

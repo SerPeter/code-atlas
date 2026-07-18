@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Any, ClassVar
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
 from code_atlas.schema import (
     _CODE_LABELS,
@@ -28,9 +30,11 @@ from code_atlas.schema import (
 from code_atlas.search.embeddings import EmbedClient
 from code_atlas.server.mcp import (
     AppContext,
+    IndexNotReadyError,
     _clamp_depth,
     _compact_node,
     _default_scope_projects,
+    _ensure_root,
     _file_uri_to_path,
     _maybe_update_root,
     _parse_rel_types,
@@ -677,6 +681,37 @@ class TestCypherQueryWriteKeywordGuard:
         graph.execute.assert_not_awaited()
 
 
+# ---------------------------------------------------------------------------
+# cypher_query/validate_cypher on the sqlite backend — deliberate exception
+# (see graph/protocol.py, ADR-0015): arbitrary agent-authored Cypher has no
+# SQL translation, so these must return a clean structured error, not crash.
+# ---------------------------------------------------------------------------
+
+
+class TestCypherToolsSqliteBackendGuard:
+    async def test_cypher_query_returns_unsupported_backend_error(self, settings, tmp_path):
+        graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
+
+        result = await _invoke_tool(app, "cypher_query", query="MATCH (n:Callable) RETURN n LIMIT 10")
+
+        assert result["code"] == "UNSUPPORTED_BACKEND"
+        assert "error" in result
+        await graph.close()
+
+    async def test_validate_cypher_skips_explain_with_info_issue_not_crash(self, settings, tmp_path):
+        graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
+
+        result = await _invoke_tool(app, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")
+
+        assert result["valid"] is True  # static checks alone still pass
+        assert any("sqlite" in i["message"].lower() for i in result["issues"])
+        await graph.close()
+
+
 class TestGetUsageGuide:
     async def test_default_guide(self, settings):
         result = await _invoke_tool(None, "get_usage_guide")  # type: ignore[arg-type]
@@ -1026,6 +1061,26 @@ class TestQueryTimeout:
         mock_graph.graph_search = AsyncMock(side_effect=QueryTimeoutError(10.0, "graph_search"))
         mock_graph.get_project_status = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_project_status"))
         mock_graph.count_entities = AsyncMock(side_effect=QueryTimeoutError(10.0, "count_entities"))
+        # analyze_repo/generate_diagram/trace_path/find_dead_code/find_complexity_hotspots/
+        # blast_radius now call named GraphBackend methods (query construction moved into
+        # GraphClient — see graph/protocol.py) instead of graph.execute() directly, so the
+        # mock needs those entry points configured too, not just .execute().
+        mock_graph.get_structure_overview = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_structure_overview"))
+        mock_graph.get_diagram_packages = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_diagram_packages"))
+        mock_graph.trace_path_between = AsyncMock(side_effect=QueryTimeoutError(10.0, "trace_path_between"))
+        mock_graph.get_dead_code_candidates = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_dead_code_candidates"))
+        mock_graph.get_complexity_hotspots = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_complexity_hotspots"))
+        mock_graph.node_exists = AsyncMock(side_effect=QueryTimeoutError(10.0, "node_exists"))
+        # get_node/get_context/index_status/list_projects now call named GraphBackend methods
+        # (query construction moved into GraphClient — see graph/protocol.py) instead of
+        # graph.execute() directly, so the mock needs those entry points configured too.
+        mock_graph.get_node_exact_matches = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_node_exact_matches"))
+        mock_graph.get_node_partial_matches = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_node_partial_matches"))
+        mock_graph.get_entity_by_uid = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_entity_by_uid"))
+        mock_graph.get_label_counts = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_label_counts"))
+        mock_graph.get_project_dependency_edges = AsyncMock(
+            side_effect=QueryTimeoutError(10.0, "get_project_dependency_edges")
+        )
         embed = EmbedClient(settings.embeddings)
         return AppContext(graph=mock_graph, settings=settings, embed=embed)
 
@@ -1168,3 +1223,165 @@ class TestClampDepth:
 
     def test_passes_through_in_range(self):
         assert _clamp_depth(5) == 5
+
+
+# ---------------------------------------------------------------------------
+# First-index readiness gate (Phase 4) — _ensure_root() wait/timeout, and
+# app_lifespan's needs_first_index/first_index_ready computation
+# ---------------------------------------------------------------------------
+
+
+class _FakeSchemaGraph:
+    """Stateful graph.get_schema_version()/ensure_schema() double.
+
+    ensure_schema() flips the stored version from *initial_version* to the
+    current SCHEMA_VERSION, mirroring GraphClient's real behavior — a
+    regression guard for computing needs_first_index from the version
+    BEFORE calling ensure_schema() (calling ensure_schema() first would
+    always observe a non-None version afterward).
+    """
+
+    def __init__(self, initial_version: int | None) -> None:
+        self._version = initial_version
+        self.ping = AsyncMock(return_value=True)
+        self.close = AsyncMock()
+        self.get_embedding_config = AsyncMock(return_value=None)
+
+    async def get_schema_version(self) -> int | None:
+        return self._version
+
+    async def ensure_schema(self) -> None:
+        self._version = SCHEMA_VERSION
+
+
+class _FakeDaemonManager:
+    """DaemonManager stand-in for app_lifespan tests — never runs real catch-up,
+    so first_index_ready is left exactly as app_lifespan itself set it."""
+
+    def __init__(self) -> None:
+        self.start = AsyncMock(return_value=True)
+        self.stop = AsyncMock()
+
+
+class TestAppLifespanNeedsFirstIndex:
+    """needs_first_index/first_index_ready computed in app_lifespan (mcp.py)."""
+
+    async def test_already_provisioned_backend_never_waits(self, settings, monkeypatch):
+        from code_atlas.server.mcp import create_mcp_server
+
+        settings.embeddings.enabled = False
+        graph = _FakeSchemaGraph(initial_version=SCHEMA_VERSION)
+        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
+
+        mcp = create_mcp_server(settings, catchup=False)
+        lifespan = mcp.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(mcp) as app_ctx:
+            assert app_ctx.needs_first_index is False
+            assert app_ctx.first_index_ready.is_set() is True
+
+    async def test_fresh_backend_needs_first_index_and_starts_unready(self, settings, monkeypatch):
+        from code_atlas.server.mcp import create_mcp_server
+
+        settings.embeddings.enabled = False
+        graph = _FakeSchemaGraph(initial_version=None)
+        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
+
+        mcp = create_mcp_server(settings, catchup=False)
+        lifespan = mcp.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(mcp) as app_ctx:
+            assert app_ctx.needs_first_index is True
+            assert app_ctx.first_index_ready.is_set() is False
+
+
+class TestEnsureRootGate:
+    """_ensure_root()'s bounded wait/timeout enforcement (mcp.py)."""
+
+    async def test_blocks_then_proceeds_once_ready(self, settings):
+        """A tool call against a fresh backend blocks until first_index_ready fires,
+        then proceeds normally — mirrors what every gated @mcp.tool call does."""
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        ready = asyncio.Event()
+        app = AppContext(graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=ready)
+        ctx = _FakeCtx(app)
+
+        async def _unblock_shortly():
+            await asyncio.sleep(0.05)
+            ready.set()
+
+        asyncio.get_running_loop().create_task(_unblock_shortly())
+
+        result = await asyncio.wait_for(_ensure_root(ctx), timeout=2.0)  # type: ignore[arg-type]
+        assert result is app
+
+    async def test_never_unblocked_raises_index_not_ready_within_bounded_time(self, settings, monkeypatch):
+        """Simulates daemon.start() returning False (queue unreachable, catch-up
+        never runs) — the gate must fail fast with a bounded wait, never hang."""
+        monkeypatch.setattr("code_atlas.server.mcp._INDEX_READY_TIMEOUT_S", 0.05)
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(
+            graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=asyncio.Event()
+        )
+        ctx = _FakeCtx(app)
+
+        with pytest.raises(IndexNotReadyError):
+            await asyncio.wait_for(_ensure_root(ctx), timeout=2.0)  # type: ignore[arg-type]
+
+    async def test_require_index_false_bypasses_wait(self, settings):
+        """health_check/index_status pass require_index=False — must return
+        immediately even though first_index_ready is never set."""
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(
+            graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=asyncio.Event()
+        )
+        ctx = _FakeCtx(app)
+
+        result = await asyncio.wait_for(_ensure_root(ctx, require_index=False), timeout=1.0)  # type: ignore[arg-type]
+        assert result is app
+
+
+class TestGatedToolsSurfaceIndexRequired:
+    """End-to-end (via _invoke_tool): gated tools return INDEX_REQUIRED;
+    health_check bypasses the gate entirely."""
+
+    async def test_get_node_surfaces_index_required(self, settings, monkeypatch):
+        monkeypatch.setattr("code_atlas.server.mcp._INDEX_READY_TIMEOUT_S", 0.05)
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(
+            graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=asyncio.Event()
+        )
+
+        result = await asyncio.wait_for(_invoke_tool(app, "get_node", name="Foo"), timeout=2.0)
+        assert result["code"] == "INDEX_REQUIRED"
+        graph.execute.assert_not_awaited()
+
+    async def test_health_check_bypasses_gate(self, settings):
+        from code_atlas.server.health import CheckResult, CheckStatus, HealthReport
+
+        report = HealthReport(
+            checks=[CheckResult(name="memgraph", status=CheckStatus.OK, message="Connected")],
+            elapsed_ms=1.0,
+        )
+        graph = AsyncMock(spec=GraphClient)
+        embed = EmbedClient(settings.embeddings)
+        daemon = AsyncMock()
+        app = AppContext(
+            graph=graph,
+            settings=settings,
+            embed=embed,
+            daemon=daemon,
+            needs_first_index=True,
+            first_index_ready=asyncio.Event(),  # never set
+        )
+
+        with patch("code_atlas.server.mcp.run_health_checks", new_callable=AsyncMock, return_value=report):
+            result = await asyncio.wait_for(_invoke_tool(app, "health_check"), timeout=1.0)
+
+        assert result["ok"] is True

@@ -86,8 +86,9 @@ def test_report_degraded_when_fail():
 
 
 class _FakeDaemon:
-    def __init__(self, status: dict) -> None:
+    def __init__(self, status: dict, bus: object | None = None) -> None:
         self._status = status
+        self.bus = bus
 
     def status(self) -> dict:
         return self._status
@@ -129,6 +130,7 @@ async def test_check_memgraph_success():
     result = await check_memgraph(graph, mg_settings)
     assert result.status == CheckStatus.OK
     assert "Connected" in result.message
+    assert "Memgraph" in result.message
 
 
 async def test_check_memgraph_failure():
@@ -146,6 +148,20 @@ async def test_check_memgraph_none():
     result = await check_memgraph(None, mg_settings)
     assert result.status == CheckStatus.FAIL
     assert "No client" in result.message
+
+
+async def test_check_memgraph_names_sqlite_backend_when_active(tmp_path):
+    """Health-check honesty: a SqliteGraphClient must be reported as SQLite, never Memgraph."""
+    from code_atlas.backends.sqlite_graph import SqliteGraphClient
+
+    graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    mg_settings = MemgraphSettings()
+
+    result = await check_memgraph(graph, mg_settings)
+    assert result.status == CheckStatus.OK
+    assert "SQLite" in result.message
+    assert "Memgraph" not in result.message
+    await graph.close()
 
 
 # ---------------------------------------------------------------------------
@@ -199,44 +215,55 @@ async def test_check_embeddings_unreachable_names_provider():
 
 async def test_check_valkey_success():
     redis_settings = RedisSettings()
-    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
-        bus_instance = AsyncMock()
-        bus_instance.ping = AsyncMock(return_value=True)
-        bus_instance.close = AsyncMock()
-        mock_bus_cls.return_value = bus_instance
+    bus = AsyncMock()
+    bus.ping = AsyncMock(return_value=True)
 
-        result = await check_valkey(redis_settings)
-        assert result.status == CheckStatus.OK
-        assert "Connected" in result.message
-        bus_instance.close.assert_awaited_once()
+    result = await check_valkey(bus, redis_settings)
+    assert result.status == CheckStatus.OK
+    assert "Connected" in result.message
+    assert "Valkey" in result.message
 
 
 async def test_check_valkey_failure():
     redis_settings = RedisSettings()
-    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
-        bus_instance = AsyncMock()
-        bus_instance.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
-        bus_instance.close = AsyncMock()
-        mock_bus_cls.return_value = bus_instance
+    bus = AsyncMock()
+    bus.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
 
-        result = await check_valkey(redis_settings)
-        assert result.status == CheckStatus.WARN
-        assert "Unreachable" in result.message
-        bus_instance.close.assert_awaited_once()
+    result = await check_valkey(bus, redis_settings)
+    assert result.status == CheckStatus.WARN
+    assert "Unreachable" in result.message
 
 
 async def test_check_valkey_down_names_indexing_disabled():
     """Valkey down must loudly state that indexing is disabled (not a silent WARN)."""
     redis_settings = RedisSettings()
-    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
-        bus_instance = AsyncMock()
-        bus_instance.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
-        bus_instance.close = AsyncMock()
-        mock_bus_cls.return_value = bus_instance
+    bus = AsyncMock()
+    bus.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
 
-        result = await check_valkey(redis_settings)
-        assert result.status == CheckStatus.WARN
-        assert "indexing" in (result.message + " " + result.detail).lower()
+    result = await check_valkey(bus, redis_settings)
+    assert result.status == CheckStatus.WARN
+    assert "indexing" in (result.message + " " + result.detail).lower()
+
+
+async def test_check_valkey_none():
+    redis_settings = RedisSettings()
+    result = await check_valkey(None, redis_settings)
+    assert result.status == CheckStatus.WARN
+    assert "No client" in result.message
+
+
+async def test_check_valkey_names_sqlite_backend_when_active(tmp_path):
+    """Health-check honesty: a SqliteEventBus must be reported as SQLite, never Valkey."""
+    from code_atlas.backends.sqlite_queue import SqliteEventBus
+
+    bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    redis_settings = RedisSettings()
+
+    result = await check_valkey(bus, redis_settings)
+    assert result.status == CheckStatus.OK
+    assert "SQLite" in result.message
+    assert "Valkey" not in result.message
+    await bus.close()
 
 
 # ---------------------------------------------------------------------------
@@ -345,13 +372,10 @@ async def test_skips_db_checks_when_memgraph_down(tmp_path):
     embed = AsyncMock()
     embed.health_check = AsyncMock(return_value=True)
 
-    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
-        bus_instance = AsyncMock()
-        bus_instance.ping = AsyncMock(return_value=True)
-        bus_instance.close = AsyncMock()
-        mock_bus_cls.return_value = bus_instance
+    bus = AsyncMock()
+    bus.ping = AsyncMock(return_value=True)
 
-        report = await run_health_checks(settings, graph=graph, embed=embed)
+    report = await run_health_checks(settings, graph=graph, embed=embed, bus=bus)
 
     # Should have 8 checks total (mode, config, memgraph, embeddings, valkey, schema, embedding_model, index)
     assert len(report.checks) == 8
@@ -392,20 +416,15 @@ async def test_all_pass_when_healthy(tmp_path):
     embed = AsyncMock()
     embed.health_check = AsyncMock(return_value=True)
 
-    with (
-        patch("code_atlas.server.health.EventBus") as mock_bus_cls,
-        patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls,
-    ):
-        bus_instance = AsyncMock()
-        bus_instance.ping = AsyncMock(return_value=True)
-        bus_instance.close = AsyncMock()
-        mock_bus_cls.return_value = bus_instance
+    bus = AsyncMock()
+    bus.ping = AsyncMock(return_value=True)
 
+    with patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls:
         checker = MagicMock()
         checker.check = AsyncMock(return_value=StalenessInfo(stale=False))
         mock_checker_cls.return_value = checker
 
-        report = await run_health_checks(settings, graph=graph, embed=embed)
+        report = await run_health_checks(settings, graph=graph, embed=embed, bus=bus)
 
     assert report.ok is True
     assert len(report.checks) == 8
@@ -437,20 +456,21 @@ async def test_pipeline_check_appended_when_daemon_passed(tmp_path):
 
     daemon = _FakeDaemon({"tasks_running": 2, "tasks_total": 2, "crash_counts": {}, "last_crash": {}})
 
-    with (
-        patch("code_atlas.server.health.EventBus") as mock_bus_cls,
-        patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls,
-    ):
-        bus_instance = AsyncMock()
-        bus_instance.ping = AsyncMock(return_value=True)
-        bus_instance.close = AsyncMock()
-        mock_bus_cls.return_value = bus_instance
+    bus = AsyncMock()
+    bus.ping = AsyncMock(return_value=True)
 
+    with patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls:
         checker = MagicMock()
         checker.check = AsyncMock(return_value=StalenessInfo(stale=False))
         mock_checker_cls.return_value = checker
 
-        report = await run_health_checks(settings, graph=graph, embed=embed, daemon=daemon)  # type: ignore[arg-type]
+        report = await run_health_checks(
+            settings,
+            graph=graph,
+            embed=embed,
+            daemon=daemon,  # type: ignore[arg-type]
+            bus=bus,
+        )
 
     by_name = {c.name: c for c in report.checks}
     assert "pipeline" in by_name
@@ -468,12 +488,60 @@ async def test_no_pipeline_check_without_daemon(tmp_path):
     embed = AsyncMock()
     embed.health_check = AsyncMock(return_value=True)
 
-    with patch("code_atlas.server.health.EventBus") as mock_bus_cls:
-        bus_instance = AsyncMock()
-        bus_instance.ping = AsyncMock(return_value=True)
-        bus_instance.close = AsyncMock()
-        mock_bus_cls.return_value = bus_instance
+    bus = AsyncMock()
+    bus.ping = AsyncMock(return_value=True)
 
-        report = await run_health_checks(settings, graph=graph, embed=embed)
+    report = await run_health_checks(settings, graph=graph, embed=embed, bus=bus)
 
     assert "pipeline" not in {c.name for c in report.checks}
+
+
+async def test_run_health_checks_uses_daemon_bus_when_not_explicitly_passed(tmp_path):
+    """No explicit *bus* is passed, but *daemon* has a live one — that live bus must be
+    probed (and left open) instead of opening a redundant new connection.
+    """
+    (tmp_path / ".git").mkdir()
+    settings = AtlasSettings(project_root=tmp_path)
+
+    graph = AsyncMock()
+    graph.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
+    graph.close = AsyncMock()
+    embed = AsyncMock()
+    embed.health_check = AsyncMock(return_value=True)
+
+    daemon_bus = AsyncMock()
+    daemon_bus.ping = AsyncMock(return_value=True)
+    daemon = _FakeDaemon({"tasks_running": 1, "tasks_total": 1, "crash_counts": {}, "last_crash": {}}, bus=daemon_bus)
+
+    report = await run_health_checks(settings, graph=graph, embed=embed, daemon=daemon)  # type: ignore[arg-type]
+
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["valkey"].status == CheckStatus.OK
+    daemon_bus.ping.assert_awaited_once()
+    daemon_bus.close.assert_not_called()  # not owned by run_health_checks — must not be closed
+
+
+async def test_run_health_checks_builds_own_bus_when_none_available(tmp_path):
+    """Neither *bus* nor a daemon-provided one is available — run_health_checks falls
+    back to the same ``create_event_bus`` factory used everywhere else, and closes
+    what it opened.
+    """
+    (tmp_path / ".git").mkdir()
+    settings = AtlasSettings(project_root=tmp_path)
+
+    graph = AsyncMock()
+    graph.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
+    graph.close = AsyncMock()
+    embed = AsyncMock()
+    embed.health_check = AsyncMock(return_value=True)
+
+    own_bus = AsyncMock()
+    own_bus.ping = AsyncMock(return_value=True)
+
+    with patch("code_atlas.server.health.create_event_bus", AsyncMock(return_value=own_bus)) as mock_factory:
+        report = await run_health_checks(settings, graph=graph, embed=embed)
+
+    mock_factory.assert_awaited_once_with(settings)
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["valkey"].status == CheckStatus.OK
+    own_bus.close.assert_awaited_once()  # owned by run_health_checks — must be closed

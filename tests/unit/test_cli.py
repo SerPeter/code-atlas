@@ -100,7 +100,7 @@ class TestJsonStatus:
         mock_graph = AsyncMock()
         mock_graph.ping = AsyncMock()
         mock_graph.get_project_status = AsyncMock(return_value=projects)
-        mock_graph.execute = AsyncMock(return_value=deps or [])
+        mock_graph.get_project_dependency_edges = AsyncMock(return_value=deps or [])
         mock_graph.close = AsyncMock()
         return mock_graph
 
@@ -120,7 +120,7 @@ class TestJsonStatus:
         mock_graph = self._make_mock_graph(mock_projects)
 
         with (
-            patch("code_atlas.graph.client.GraphClient", return_value=mock_graph),
+            patch("code_atlas.backends.GraphClient", return_value=mock_graph),
             patch("code_atlas.settings.AtlasSettings"),
         ):
             result = runner.invoke(app, ["--json", "status"])
@@ -136,7 +136,7 @@ class TestJsonStatus:
         mock_graph = self._make_mock_graph([])
 
         with (
-            patch("code_atlas.graph.client.GraphClient", return_value=mock_graph),
+            patch("code_atlas.backends.GraphClient", return_value=mock_graph),
             patch("code_atlas.settings.AtlasSettings"),
         ):
             result = runner.invoke(app, ["--json", "status"])
@@ -248,8 +248,8 @@ class TestMonorepoScopeDispatch:
             captured["scope"] = scope
             return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=0.0)
 
-        monkeypatch.setattr("code_atlas.events.EventBus", FakeBus)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", FakeGraph)
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", FakeGraph)
         monkeypatch.setattr("code_atlas.indexing.orchestrator.detect_sub_projects", lambda root, mono: sub_projects)
         monkeypatch.setattr(cli, "_index_monorepo_with_progress", fake_monorepo_with_progress)
         monkeypatch.setattr(cli, "_index_single_with_spinner", fake_single_with_spinner)
@@ -355,8 +355,8 @@ class TestIndexWithGitSignals:
 
         write_mock = AsyncMock(side_effect=fake_write_git_signals)
 
-        monkeypatch.setattr("code_atlas.events.EventBus", FakeBus)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", FakeGraph)
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", FakeGraph)
         monkeypatch.setattr("code_atlas.indexing.orchestrator.detect_sub_projects", lambda root, mono: [])
         monkeypatch.setattr(cli, "_index_single_with_spinner", fake_single_with_spinner)
         monkeypatch.setattr("code_atlas.indexing.git_signals.mine_git_signals", mine_mock)
@@ -445,7 +445,7 @@ class TestDreamCommand:
         )
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
         monkeypatch.setattr("code_atlas.dream.build_dream_report", AsyncMock(return_value=empty_report))
 
         await cli._run_dream()
@@ -453,7 +453,9 @@ class TestDreamCommand:
         home = tmp_path / settings.knowledge.vault_path / "HOME.md"
         assert home.is_file()
         assert "Knowledge Vault" in home.read_text(encoding="utf-8")
-        mock_graph.ping.assert_awaited_once()
+        # create_graph_client's "auto" resolution probes ping() once itself before
+        # _run_dream's own explicit check pings again — awaited, not exactly-once.
+        mock_graph.ping.assert_awaited()
         mock_graph.close.assert_awaited_once()
 
 
@@ -477,7 +479,7 @@ class TestProjectRm:
         mock_graph = self._mock_graph()
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
 
         await cli._run_project_rm("myproject", skip_confirm=True)
 
@@ -496,7 +498,7 @@ class TestProjectRm:
         mock_graph = self._mock_graph(found=False)
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
 
         with pytest.raises(typer.Exit):
             await cli._run_project_rm("ghost", skip_confirm=True)
@@ -512,7 +514,7 @@ class TestProjectRm:
         mock_graph = self._mock_graph()
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
 
         result = runner.invoke(app, ["project", "rm", "myproject"], input="n\n")
 
@@ -528,7 +530,7 @@ class TestProjectRm:
         mock_graph = self._mock_graph()
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
 
         result = runner.invoke(app, ["project", "rm", "myproject"], input="y\n")
 
@@ -552,7 +554,7 @@ class TestProjectRm:
             raise AssertionError("typer.confirm should not be called in --json mode")
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
         monkeypatch.setattr(cli.typer, "confirm", _unexpected_confirm)
 
         with pytest.raises(typer.Exit):
@@ -574,7 +576,7 @@ class TestProjectRm:
             raise AssertionError("typer.confirm should not be called when --yes is passed")
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
         monkeypatch.setattr(cli.typer, "confirm", _unexpected_confirm)
 
         await cli._run_project_rm("myproject", skip_confirm=True)
