@@ -2895,3 +2895,61 @@ class SqliteGraphClient:
             vector = list(struct.unpack(f"<{count}f", blob))
             result.append({"uid": uid, "project_name": project_name, "embedding": vector})
         return result
+
+    # -- Git signals write path (indexing/git_signals.py) -------------------------
+
+    async def write_git_file_signals(self, project_name: str, label: str, items: list[dict[str, Any]]) -> int:
+        if not items:
+            return 0
+        conn = await self._get_conn()
+        matched = 0
+        for item in items:
+            cur = await conn.execute(
+                "UPDATE nodes SET props_json = json_patch(props_json, ?) "
+                "WHERE project_name = ? AND file_path = ? AND labels = ?",
+                (
+                    json.dumps(
+                        {
+                            "git_commit_count": item["cc"],
+                            "git_author_count": item["ac"],
+                            "git_days_since_last_commit": item["days"],
+                        }
+                    ),
+                    project_name,
+                    item["fp"],
+                    label,
+                ),
+            )
+            matched += cur.rowcount
+            await cur.close()
+        await conn.commit()
+        return matched
+
+    async def write_co_change_edges(self, project_name: str, pairs: list[dict[str, Any]]) -> int:
+        if not pairs:
+            return 0
+        conn = await self._get_conn()
+        rows: list[tuple[str, str, str, str]] = []
+        for pair in pairs:
+            cur_a = await conn.execute(
+                "SELECT uid FROM nodes WHERE labels = 'Module' AND project_name = ? AND file_path = ?",
+                (project_name, pair["a"]),
+            )
+            a_row = await cur_a.fetchone()
+            await cur_a.close()
+            cur_b = await conn.execute(
+                "SELECT uid FROM nodes WHERE labels = 'Module' AND project_name = ? AND file_path = ?",
+                (project_name, pair["b"]),
+            )
+            b_row = await cur_b.fetchone()
+            await cur_b.close()
+            if a_row and b_row:
+                rows.append((a_row[0], b_row[0], "CO_CHANGES_WITH", json.dumps({"count": pair["cnt"]})))
+        if rows:
+            await conn.executemany(
+                "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(from_uid, to_uid, rel_type) DO UPDATE SET props_json = excluded.props_json",
+                rows,
+            )
+            await conn.commit()
+        return len(rows)

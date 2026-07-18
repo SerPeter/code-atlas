@@ -1,10 +1,11 @@
 """Git history mining for hotspot/bus-factor/co-change signals (ADR-0013 git_signals).
 
 Mining (`mine_git_signals`) is pure Python over GitPython's structured commit
-data — no Memgraph dependency, so it's testable against a throwaway git repo
-with no mocking. Writing the mined signals into the graph (`write_git_signals`)
-is the only piece that touches Memgraph, via the generic ``GraphClient.execute``/
-``execute_write`` methods (no new GraphClient methods needed).
+data — no graph-backend dependency, so it's testable against a throwaway git
+repo with no mocking. Writing the mined signals into the graph
+(`write_git_signals`) goes through ``GraphBackend.write_git_file_signals``/
+``write_co_change_edges`` (graph/protocol.py) — backend-agnostic, works
+against both ``GraphClient`` (Memgraph) and ``SqliteGraphClient``.
 
 Not wired into the continuous file-watcher pipeline — full git-log history
 mining doesn't map to a single file-changed event and is too expensive to run
@@ -21,12 +22,12 @@ from typing import TYPE_CHECKING
 
 from git import Repo
 
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import NodeLabel
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from code_atlas.graph.client import GraphClient
+    from code_atlas.graph.protocol import GraphBackend
 
 # Co-change pairs sharing fewer commits than this are dropped as graph noise.
 DEFAULT_CO_CHANGE_THRESHOLD = 3
@@ -109,7 +110,7 @@ def mine_git_signals(repo_root: Path, *, co_change_threshold: int = DEFAULT_CO_C
     return GitSignalsResult(file_signals=file_signals, co_change_pairs=co_change_pairs, commits_scanned=commits_scanned)
 
 
-async def write_git_signals(graph: GraphClient, project_name: str, result: GitSignalsResult) -> dict[str, int]:
+async def write_git_signals(graph: GraphBackend, project_name: str, result: GitSignalsResult) -> dict[str, int]:
     """Write mined per-file signals onto Module/DocFile nodes and CO_CHANGES_WITH edges.
 
     Matches nodes by ``(project_name, file_path)``. Files with no matching
@@ -129,51 +130,16 @@ async def write_git_signals(graph: GraphClient, project_name: str, result: GitSi
             }
             for sig in result.file_signals
         ]
-        # Matched per-label (inline on the node pattern), not via a post-MATCH
-        # `WHERE n:Module OR n:DocFile` filter: Memgraph 3.7.2's planner
-        # mishandles `UNWIND ... MATCH (n {prop: unwind_var}) WHERE ...` once
-        # an earlier UNWIND row fails to match anything — it can return zero
-        # rows for the *whole* UNWIND instead of just skipping that row.
-        # Matching the label inline (no WHERE) avoids the bug (verified
-        # against a real Memgraph 3.7.2 instance — see [[git-signals-memgraph-unwind-match-where-bug]]).
         for label in (NodeLabel.MODULE, NodeLabel.DOC_FILE):
-            await graph.execute_write(
-                "UNWIND $items AS item "
-                f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
-                "SET n.git_commit_count = item.cc, n.git_author_count = item.ac, "
-                "n.git_days_since_last_commit = item.days",
-                {"p": project_name, "items": items},
-            )
-            matched_rows = await graph.execute(
-                "UNWIND $items AS item "
-                f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
-                "RETURN count(n) AS matched",
-                {"p": project_name, "items": items},
-            )
-            files_matched += matched_rows[0]["matched"] if matched_rows else 0
+            files_matched += await graph.write_git_file_signals(project_name, label, items)
 
     co_change_edges = 0
     if result.co_change_pairs:
         # file_a < file_b always (mine_git_signals sorts before combinations) —
         # a single directed edge per pair is enough; readers treat it as
-        # symmetric and don't care which side matched which. Label is inline
-        # here too, for the same reason as above — no post-MATCH WHERE.
+        # symmetric and don't care which side matched which.
         pairs = [{"a": p.file_a, "b": p.file_b, "cnt": p.count} for p in result.co_change_pairs]
-        await graph.execute_write(
-            "UNWIND $pairs AS pair "
-            f"MATCH (a:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.a}}) "
-            f"MATCH (b:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.b}}) "
-            f"MERGE (a)-[r:{RelType.CO_CHANGES_WITH}]->(b) SET r.count = pair.cnt",
-            {"p": project_name, "pairs": pairs},
-        )
-        edge_rows = await graph.execute(
-            "UNWIND $pairs AS pair "
-            f"MATCH (a:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.a}})"
-            f"-[r:{RelType.CO_CHANGES_WITH}]->(b:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.b}}) "
-            "RETURN count(r) AS created",
-            {"p": project_name, "pairs": pairs},
-        )
-        co_change_edges = edge_rows[0]["created"] if edge_rows else 0
+        co_change_edges = await graph.write_co_change_edges(project_name, pairs)
 
     return {
         "commits_scanned": result.commits_scanned,

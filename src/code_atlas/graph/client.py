@@ -3082,6 +3082,57 @@ class GraphClient:
             "RETURN n.uid AS uid, n.project_name AS project_name, n.embedding AS embedding"
         )
 
+    async def write_git_file_signals(self, project_name: str, label: str, items: list[dict[str, Any]]) -> int:
+        """Write commit-count/author-count/days-since-last-commit onto Module/DocFile nodes.
+
+        Matched per-label (inline on the node pattern), not via a post-MATCH
+        ``WHERE n:Module OR n:DocFile`` filter: Memgraph 3.7.2's planner
+        mishandles ``UNWIND ... MATCH (n {prop: unwind_var}) WHERE ...`` once
+        an earlier UNWIND row fails to match anything. Matching the label
+        inline avoids the bug. ``atlas mine-git-history``.
+        """
+        if not items:
+            return 0
+        await self.execute_write(
+            "UNWIND $items AS item "
+            f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
+            "SET n.git_commit_count = item.cc, n.git_author_count = item.ac, "
+            "n.git_days_since_last_commit = item.days",
+            {"p": project_name, "items": items},
+        )
+        matched_rows = await self.execute(
+            "UNWIND $items AS item "
+            f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
+            "RETURN count(n) AS matched",
+            {"p": project_name, "items": items},
+        )
+        return matched_rows[0]["matched"] if matched_rows else 0
+
+    async def write_co_change_edges(self, project_name: str, pairs: list[dict[str, Any]]) -> int:
+        """Create/update CO_CHANGES_WITH edges between co-changed Module files.
+
+        ``file_a < file_b`` always (the caller sorts before pairing) — a
+        single directed edge per pair is enough; readers treat it as
+        symmetric. ``atlas mine-git-history``.
+        """
+        if not pairs:
+            return 0
+        await self.execute_write(
+            "UNWIND $pairs AS pair "
+            f"MATCH (a:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.a}}) "
+            f"MATCH (b:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.b}}) "
+            f"MERGE (a)-[r:{RelType.CO_CHANGES_WITH}]->(b) SET r.count = pair.cnt",
+            {"p": project_name, "pairs": pairs},
+        )
+        edge_rows = await self.execute(
+            "UNWIND $pairs AS pair "
+            f"MATCH (a:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.a}})"
+            f"-[r:{RelType.CO_CHANGES_WITH}]->(b:{NodeLabel.MODULE} {{project_name: $p, file_path: pair.b}}) "
+            "RETURN count(r) AS created",
+            {"p": project_name, "pairs": pairs},
+        )
+        return edge_rows[0]["created"] if edge_rows else 0
+
     async def close(self) -> None:
         """Close the driver and release connections."""
         await self._driver.close()

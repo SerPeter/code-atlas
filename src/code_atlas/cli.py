@@ -14,6 +14,7 @@ from loguru import logger
 from rich.console import Console
 
 if TYPE_CHECKING:
+    from code_atlas.graph.protocol import GraphBackend
     from code_atlas.settings import AtlasSettings
 
 _dotenv_path = find_dotenv(usecwd=True)  # '' when not found
@@ -854,7 +855,7 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
             logger.error("Not a git repository: {} — {}", project_root, exc)
             raise typer.Exit(code=1) from exc
 
-        stats = await write_git_signals(graph, project_name, result)  # type: ignore[invalid-argument-type]
+        stats = await write_git_signals(graph, project_name, result)
         if _output.json:
             _json_output(stats)
         else:
@@ -879,7 +880,7 @@ def _git_signals_summary_line(stats: dict[str, int], co_change_threshold: int) -
 
 
 async def _mine_and_write_git_signals(
-    project_root: Path, project_name: str, graph: Any, co_change_threshold: int
+    project_root: Path, project_name: str, graph: GraphBackend, co_change_threshold: int
 ) -> dict[str, int]:
     """Mine git history and write the resulting signals, for ``atlas index --with-git-signals``.
 

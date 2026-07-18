@@ -676,6 +676,90 @@ class TestGetGitSignalsData:
         await client.close()
 
 
+class TestWriteGitFileSignals:
+    async def test_writes_signal_properties_and_returns_matched_count(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
+        mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
+        await client.upsert_file_entities("proj", "pkg/a.py", [mod_a], [])
+        await client.upsert_file_entities("proj", "pkg/b.py", [mod_b], [])
+
+        matched = await client.write_git_file_signals(
+            "proj",
+            "Module",
+            [
+                {"fp": "pkg/a.py", "cc": 10, "ac": 2, "days": 1.5},
+                {"fp": "pkg/b.py", "cc": 3, "ac": 1, "days": 4.0},
+                {"fp": "pkg/deleted.py", "cc": 1, "ac": 1, "days": 9.0},  # no matching node
+            ],
+        )
+
+        assert matched == 2
+        data = await client.get_git_signals_data("proj", "", 20, 5)
+        by_qn = {r["qn"]: r for r in data["hotspots"]}
+        assert by_qn["pkg.a"]["commit_count"] == 10
+        assert by_qn["pkg.a"]["author_count"] == 2
+        assert by_qn["pkg.b"]["commit_count"] == 3
+        await client.close()
+
+    async def test_empty_items_returns_zero_without_touching_db(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+
+        assert await client.write_git_file_signals("proj", "Module", []) == 0
+        await client.close()
+
+
+class TestWriteCoChangeEdges:
+    async def test_creates_edge_between_matched_files_and_returns_count(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
+        mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
+        await client.upsert_file_entities("proj", "pkg/a.py", [mod_a], [])
+        await client.upsert_file_entities("proj", "pkg/b.py", [mod_b], [])
+
+        created = await client.write_co_change_edges(
+            "proj",
+            [
+                {"a": "pkg/a.py", "b": "pkg/b.py", "cnt": 4},
+                {"a": "pkg/a.py", "b": "pkg/deleted.py", "cnt": 3},  # one side unmatched — skipped
+            ],
+        )
+
+        assert created == 1
+        data = await client.get_git_signals_data("proj", "", 20, 5)
+        assert data["co_change"] == [
+            {"a_qn": "pkg.a", "a_path": "pkg/a.py", "b_qn": "pkg.b", "b_path": "pkg/b.py", "count": 4}
+        ]
+        await client.close()
+
+    async def test_rewriting_a_pair_updates_count_not_a_duplicate_edge(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
+        mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
+        await client.upsert_file_entities("proj", "pkg/a.py", [mod_a], [])
+        await client.upsert_file_entities("proj", "pkg/b.py", [mod_b], [])
+
+        await client.write_co_change_edges("proj", [{"a": "pkg/a.py", "b": "pkg/b.py", "cnt": 4}])
+        created_again = await client.write_co_change_edges("proj", [{"a": "pkg/a.py", "b": "pkg/b.py", "cnt": 9}])
+
+        assert created_again == 1
+        data = await client.get_git_signals_data("proj", "", 20, 5)
+        assert len(data["co_change"]) == 1
+        assert data["co_change"][0]["count"] == 9
+        await client.close()
+
+    async def test_empty_pairs_returns_zero_without_touching_db(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+
+        assert await client.write_co_change_edges("proj", []) == 0
+        await client.close()
+
+
 class TestGetDiagramPackages:
     async def test_package_to_module_edge(self, tmp_path: Path) -> None:
         client = SqliteGraphClient(tmp_path / "graph.sqlite3")
