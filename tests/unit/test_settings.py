@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from code_atlas.settings import (
     AtlasSettings,
+    BackendSettings,
     ExtraVaultSettings,
     KnowledgeSettings,
     MemgraphSettings,
@@ -131,6 +133,65 @@ class TestAtlasTomlDiscovery:
         settings = AtlasSettings(project_root=project_dir)
 
         assert settings.memgraph.port == 7687  # default, not cwd's 6666
+
+
+class TestBackendSettings:
+    def test_defaults(self):
+        settings = BackendSettings()
+
+        assert settings.graph == "auto"
+        assert settings.queue == "auto"
+        assert settings.sqlite_data_dir == Path(".atlas")
+
+
+class TestBackendConfigDiscovery:
+    """Backend selection is config-driven via the same atlas.toml / pyproject.toml
+    [tool.atlas] dual-file discovery as the rest of AtlasSettings.
+    """
+
+    def test_atlas_toml_overrides_backend_settings(self, clean_env):
+        (clean_env / "atlas.toml").write_text('[backend]\ngraph = "sqlite"\nqueue = "sqlite"\n', encoding="utf-8")
+
+        settings = AtlasSettings(project_root=clean_env)
+
+        assert settings.backend.graph == "sqlite"
+        assert settings.backend.queue == "sqlite"
+
+    def test_pyproject_tool_atlas_fallback_picked_up_when_no_atlas_toml(self, clean_env):
+        (clean_env / "pyproject.toml").write_text('[tool.atlas.backend]\ngraph = "sqlite"\n', encoding="utf-8")
+
+        settings = AtlasSettings(project_root=clean_env)
+
+        assert settings.backend.graph == "sqlite"
+
+    def test_pyproject_without_tool_atlas_table_is_skipped(self, clean_env):
+        """A pyproject.toml with no [tool.atlas] table is transparent — the walk
+        continues up to a parent directory's atlas.toml instead of stopping there.
+        """
+        (clean_env / "atlas.toml").write_text('[backend]\ngraph = "sqlite"\n', encoding="utf-8")
+        project_dir = clean_env / "project"
+        project_dir.mkdir()
+        (project_dir / "pyproject.toml").write_text('[project]\nname = "some-pkg"\n', encoding="utf-8")
+
+        settings = AtlasSettings(project_root=project_dir)
+
+        assert settings.backend.graph == "sqlite"
+
+    def test_env_var_overrides_atlas_toml_backend(self, clean_env, monkeypatch):
+        (clean_env / "atlas.toml").write_text('[backend]\ngraph = "sqlite"\n', encoding="utf-8")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH", "memgraph")
+
+        settings = AtlasSettings(project_root=clean_env)
+
+        assert settings.backend.graph == "memgraph"
+
+    def test_env_var_overrides_pyproject_fallback_backend(self, clean_env, monkeypatch):
+        (clean_env / "pyproject.toml").write_text('[tool.atlas.backend]\ngraph = "sqlite"\n', encoding="utf-8")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH", "memgraph")
+
+        settings = AtlasSettings(project_root=clean_env)
+
+        assert settings.backend.graph == "memgraph"
 
 
 class TestProjectNameOverride:

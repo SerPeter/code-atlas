@@ -57,6 +57,9 @@ CLAUDE.local.md
 # =============================================================================
 # Project-specific
 # =============================================================================
+# Embedded SQLite backend data (graph.sqlite3 + queue.sqlite3)
+.atlas/
+
 # Memgraph data persistence
 data/memgraph/
 

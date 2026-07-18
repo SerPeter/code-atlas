@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict, TomlConfigSettingsSource
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    PyprojectTomlConfigSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -85,11 +93,18 @@ def _explicit_project_name(project_root: Path) -> str | None:
     because callers of :func:`derive_project_name` only have a bare *project_root*
     path, not a settings instance.
     """
-    toml_path = _find_atlas_toml(project_root)
-    if toml_path is None:
+    match = _find_atlas_toml(project_root)
+    if match is None:
+        return None
+    if match.table_header:
+        # GAP: match is a pyproject.toml [tool.atlas] fallback. Its own top-level
+        # [project] table is PEP 621 package metadata (name/version/...), not an
+        # atlas override — reading it here would silently pick up the wrong name.
+        # A [tool.atlas] project-name override isn't read from this fallback yet;
+        # left out of scope for this change.
         return None
     try:
-        with toml_path.open("rb") as fh:
+        with match.path.open("rb") as fh:
             data = tomllib.load(fh)
     except OSError, tomllib.TOMLDecodeError:
         return None
@@ -129,13 +144,51 @@ def _default_project_root() -> Path:
     return root
 
 
-def _find_atlas_toml(start: Path | None = None) -> Path | None:
-    """Walk up from *start* (default: cwd) looking for ``atlas.toml``."""
+@dataclass(frozen=True)
+class _ConfigFileMatch:
+    """The config file :func:`_find_atlas_toml` discovered, and where AtlasSettings'
+    table lives within it.
+
+    ``table_header`` is empty for a standalone ``atlas.toml`` (settings live at the
+    file's root, matching today's behavior) and ``("tool", "atlas")`` for a
+    ``pyproject.toml`` ``[tool.atlas]`` fallback match.
+    """
+
+    path: Path
+    table_header: tuple[str, ...] = ()
+
+
+def _has_tool_atlas_table(pyproject_path: Path) -> bool:
+    """Check whether *pyproject_path* has a ``[tool.atlas]`` table."""
+    try:
+        with pyproject_path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except OSError, tomllib.TOMLDecodeError:
+        return False
+    tool_section = data.get("tool")
+    return isinstance(tool_section, dict) and isinstance(tool_section.get("atlas"), dict)
+
+
+def _find_atlas_toml(start: Path | None = None) -> _ConfigFileMatch | None:
+    """Walk up from *start* (default: cwd) looking for Atlas config.
+
+    Ruff-style dual-file discovery: at each directory level, a standalone
+    ``atlas.toml`` always wins. Only when absent is ``pyproject.toml`` considered,
+    and only if it has a ``[tool.atlas]`` table — a ``pyproject.toml`` without one
+    is transparent to the search and the walk continues past it. The first
+    directory level where either resolves wins; there is no cross-directory
+    merging.
+    """
     current = (start or Path.cwd()).resolve()
     while True:
-        candidate = current / "atlas.toml"
-        if candidate.is_file():
-            return candidate
+        atlas_candidate = current / "atlas.toml"
+        if atlas_candidate.is_file():
+            return _ConfigFileMatch(path=atlas_candidate)
+
+        pyproject_candidate = current / "pyproject.toml"
+        if pyproject_candidate.is_file() and _has_tool_atlas_table(pyproject_candidate):
+            return _ConfigFileMatch(path=pyproject_candidate, table_header=("tool", "atlas"))
+
         parent = current.parent
         if parent == current:
             return None
@@ -235,6 +288,27 @@ class EmbeddingSettings(BaseModel):
         if self.max_concurrency is None:
             self.max_concurrency = defaults["max_concurrency"]
         return self
+
+
+class BackendSettings(BaseModel):
+    """Backend selection for the graph store and event queue.
+
+    ``"auto"`` probes the network backend at startup (``GraphClient.ping()`` /
+    ``EventBus.ping()``) and falls back to the in-process SQLite backend if
+    unreachable. An explicit ``"memgraph"``/``"valkey"`` fails loudly if
+    unreachable rather than silently falling back.
+    """
+
+    graph: Literal["memgraph", "sqlite", "auto"] = Field(
+        default="auto", description="Graph backend: 'memgraph', 'sqlite', or 'auto'."
+    )
+    queue: Literal["valkey", "sqlite", "auto"] = Field(
+        default="auto", description="Event queue backend: 'valkey', 'sqlite', or 'auto'."
+    )
+    sqlite_data_dir: Path = Field(
+        default=Path(".atlas"),
+        description="Directory (relative to project_root) holding graph.sqlite3 and queue.sqlite3.",
+    )
 
 
 class MemgraphSettings(BaseModel):
@@ -412,6 +486,7 @@ class AtlasSettings(BaseSettings):
 
     model_config = SettingsConfigDict(
         toml_file="atlas.toml",
+        pyproject_toml_table_header=("tool", "atlas"),
         env_prefix="ATLAS_",
         env_nested_delimiter="__",
     )
@@ -425,15 +500,23 @@ class AtlasSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Discover atlas.toml relative to the target project_root (when explicitly
-        # passed, e.g. `atlas index <other-path>`), not the process cwd — otherwise
-        # indexing a project other than the cwd's own applies the wrong config.
+        # Discover atlas.toml (or a pyproject.toml [tool.atlas] fallback) relative to
+        # the target project_root (when explicitly passed, e.g. `atlas index <other-path>`),
+        # not the process cwd — otherwise indexing a project other than the cwd's own
+        # applies the wrong config.
         init_kwargs = getattr(init_settings, "init_kwargs", {})
         target_root = init_kwargs.get("project_root")
-        toml_path = _find_atlas_toml(Path(target_root) if target_root else None)
+        config_match = _find_atlas_toml(Path(target_root) if target_root else None)
         sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
-        if toml_path:
-            sources.append(TomlConfigSettingsSource(settings_cls, toml_file=toml_path))
+        if config_match is not None:
+            if config_match.table_header:
+                # pyproject.toml [tool.atlas] fallback — PyprojectTomlConfigSettingsSource
+                # drills into model_config's pyproject_toml_table_header before matching
+                # fields, unlike plain TomlConfigSettingsSource which has no table-header
+                # concept at all (root-level keys only).
+                sources.append(PyprojectTomlConfigSettingsSource(settings_cls, toml_file=config_match.path))
+            else:
+                sources.append(TomlConfigSettingsSource(settings_cls, toml_file=config_match.path))
         sources.append(file_secret_settings)
         return tuple(sources)
 
@@ -443,6 +526,7 @@ class AtlasSettings(BaseSettings):
     libraries: LibrarySettings = Field(default_factory=LibrarySettings)
     monorepo: MonorepoSettings = Field(default_factory=MonorepoSettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    backend: BackendSettings = Field(default_factory=BackendSettings)
     memgraph: MemgraphSettings = Field(default_factory=MemgraphSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     index: IndexSettings = Field(default_factory=IndexSettings)
