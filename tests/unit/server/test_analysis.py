@@ -508,6 +508,22 @@ async def test_communities_groups_and_sorts_by_size_descending():
     assert "project(p)" in query
 
 
+async def test_communities_query_excludes_external_labels():
+    """ExternalPackage/ExternalSymbol must be excluded from both edge endpoints —
+    otherwise a widely-referenced external symbol (e.g. collections.abc.Coroutine)
+    becomes a false hub that glues unrelated modules into one giant community."""
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[])
+
+    await analyze_repo(graph, "communities", "code-atlas")
+
+    query = graph.execute.call_args[0][0]
+    assert "NOT a:ExternalPackage" in query
+    assert "NOT a:ExternalSymbol" in query
+    assert "NOT b:ExternalPackage" in query
+    assert "NOT b:ExternalSymbol" in query
+
+
 async def test_communities_drops_singleton_noise():
     graph = MagicMock()
     graph.execute = AsyncMock(

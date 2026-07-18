@@ -1159,6 +1159,14 @@ async def _analyze_communities(graph: GraphClient, project: str, path: str, limi
     clear ``PROCEDURE_UNAVAILABLE`` error instead of raising when the module
     isn't installed.
 
+    ExternalPackage/ExternalSymbol nodes are excluded from both edge endpoints —
+    otherwise dozens of unrelated modules that merely reference the same external
+    type (e.g. many modules' return-type annotations pointing at
+    ``collections.abc.Coroutine``) turn that external node into a false hub that
+    glues most of the project into one meaningless giant community. Communities
+    are meant to reflect cohesive *project* subsystems, not "everything that
+    happens to import the same stdlib/third-party symbol".
+
     Communities of size < ``_COMMUNITY_NOISE_THRESHOLD`` (isolated/near-isolated
     nodes) are dropped as noise; the remaining communities are returned
     largest-first, capped at *limit* (which also caps members shown per
@@ -1166,11 +1174,15 @@ async def _analyze_communities(graph: GraphClient, project: str, path: str, limi
     """
     t0 = time.monotonic()
     params: dict[str, Any] = {"project": project, "path": path}
+    # Exclude ExternalPackage/ExternalSymbol from both endpoints — dozens of unrelated
+    # modules referencing the same external type (e.g. collections.abc.Coroutine) would
+    # otherwise act as false hub nodes gluing the whole project into one giant community.
+    excl = "NOT a:ExternalPackage AND NOT a:ExternalSymbol AND NOT b:ExternalPackage AND NOT b:ExternalSymbol"
     pa = " AND a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path" if path else ""
 
     query = (
         "MATCH p=(a {project_name: $project})-[:CALLS|IMPORTS]->(b {project_name: $project}) "
-        f"WHERE true{pa} "
+        f"WHERE {excl}{pa} "
         "WITH project(p) AS subgraph "
         "CALL leiden_community_detection.get(subgraph) YIELD node, community_id "
         "RETURN node.uid AS uid, node.name AS name, node.qualified_name AS qn, "

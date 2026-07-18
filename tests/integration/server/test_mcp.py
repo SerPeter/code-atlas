@@ -696,6 +696,69 @@ async def seeded_analysis_graph(graph_client):
     return graph_client
 
 
+@pytest.fixture
+async def seeded_communities_bridge_graph(seeded_analysis_graph):
+    """Extends seeded_analysis_graph with two mutually-disconnected clusters that
+    share a single ExternalSymbol, plus filler modules importing only that symbol —
+    reproduces the false-hub bug (an external node with high fan-in gluing unrelated
+    project code into one community) at a scale where it's actually observable
+    (verified manually: a handful of bridging edges isn't enough to trip Leiden's
+    modularity optimization; ~15-30 shared importers is)."""
+    graph_client = seeded_analysis_graph
+
+    # Cluster x: two disconnected CALLS pairs (x1->x2, x3->x4) — no path between
+    # the pairs except through the shared external symbol below.
+    # Cluster y: same shape, entirely separate from cluster x.
+    for name in ("x1", "x2", "x3", "x4", "y1", "y2", "y3", "y4"):
+        await graph_client.execute_write(
+            "CREATE (n:Callable {uid: $uid, project_name: $p, name: $name, "
+            "qualified_name: $name, file_path: $fp, kind: 'function', line_start: 1, line_end: 2})",
+            {"uid": f"{_PROJECT}:{name}", "p": _PROJECT, "name": name, "fp": f"bridge/{name}.py"},
+        )
+    for f, t in [("x1", "x2"), ("x3", "x4"), ("y1", "y2"), ("y3", "y4")]:
+        await graph_client.execute_write(
+            "MATCH (a {uid: $f}), (b {uid: $t}) CREATE (a)-[:CALLS]->(b)",
+            {"f": f"{_PROJECT}:{f}", "t": f"{_PROJECT}:{t}"},
+        )
+
+    # Shared external symbol — imported by every x/y node plus filler leaves.
+    await graph_client.execute_write(
+        "CREATE (ep:ExternalPackage {uid: $uid, project_name: $p, "
+        "name: 'collections.abc', qualified_name: 'ext/collections.abc'})",
+        {"uid": f"{_PROJECT}:ext/collections.abc", "p": _PROJECT},
+    )
+    await graph_client.execute_write(
+        "CREATE (es:ExternalSymbol {uid: $uid, project_name: $p, name: 'Coroutine', "
+        "qualified_name: 'ext/collections.abc.Coroutine', package: 'collections.abc'})",
+        {"uid": f"{_PROJECT}:ext/collections.abc.Coroutine", "p": _PROJECT},
+    )
+    await graph_client.execute_write(
+        "MATCH (ep {uid: $ep}), (es {uid: $es}) CREATE (ep)-[:CONTAINS]->(es)",
+        {"ep": f"{_PROJECT}:ext/collections.abc", "es": f"{_PROJECT}:ext/collections.abc.Coroutine"},
+    )
+    for name in ("x1", "x2", "x3", "x4", "y1", "y2", "y3", "y4"):
+        await graph_client.execute_write(
+            "MATCH (a {uid: $f}), (es {uid: $es}) CREATE (a)-[:IMPORTS]->(es)",
+            {"f": f"{_PROJECT}:{name}", "es": f"{_PROJECT}:ext/collections.abc.Coroutine"},
+        )
+
+    # Filler modules whose only edge is importing the same external symbol — mirrors
+    # the real bug ("dozens of unrelated modules" reference the same external type),
+    # needed for the shared node's fan-in to actually distort community boundaries.
+    leaf_uids = [f"{_PROJECT}:bridge_leaf{i}" for i in range(20)]
+    await graph_client.execute_write(
+        "UNWIND $uids AS uid CREATE (n:Callable {uid: uid, project_name: $p, name: uid, "
+        "qualified_name: uid, file_path: 'bridge/leaf.py', kind: 'function', line_start: 1, line_end: 2})",
+        {"uids": leaf_uids, "p": _PROJECT},
+    )
+    await graph_client.execute_write(
+        "UNWIND $uids AS uid MATCH (a {uid: uid}), (es {uid: $es}) CREATE (a)-[:IMPORTS]->(es)",
+        {"uids": leaf_uids, "es": f"{_PROJECT}:ext/collections.abc.Coroutine"},
+    )
+
+    return graph_client
+
+
 # ---------------------------------------------------------------------------
 # analyze_repo integration tests
 # ---------------------------------------------------------------------------
@@ -877,6 +940,39 @@ class TestAnalyzeRepo:
             if m["name"] in {"handle_request", "helper"}
         }
         assert len(owning_communities) == 1
+
+    async def test_communities_shared_external_symbol_does_not_merge_unrelated_clusters(
+        self, app_ctx, seeded_communities_bridge_graph
+    ):
+        """Regression test for the false-hub bug: an ExternalSymbol/ExternalPackage
+        referenced by many otherwise-unrelated modules (e.g. dozens of files whose
+        return-type annotation points at collections.abc.Coroutine) must not glue
+        them into one giant community. seeded_communities_bridge_graph adds two
+        internally-connected clusters (x1-x2/x3-x4 and y1-y2/y3-y4) that share no
+        real CALLS/IMPORTS edge with each other — their only common neighbor is an
+        ExternalSymbol imported by both, plus filler modules that import nothing
+        else. Pre-fix this reproduces the reported bug (verified manually: parts of
+        the x/y clusters land in one community together with the external node);
+        post-fix they must stay apart.
+        """
+        result = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
+        assert result["analysis"] == "communities"
+        assert "error" not in result
+
+        # External nodes must never surface as community members.
+        for c in result["communities"]:
+            labels = {m["label"] for m in c["members"]}
+            assert "ExternalPackage" not in labels
+            assert "ExternalSymbol" not in labels
+
+        # The x-cluster and y-cluster share no real edge — only the (now-excluded)
+        # external symbol connected them before the fix. No community may contain
+        # members from both.
+        x_names = {"x1", "x2", "x3", "x4"}
+        y_names = {"y1", "y2", "y3", "y4"}
+        for c in result["communities"]:
+            names = {m["name"] for m in c["members"]}
+            assert not (names & x_names and names & y_names), f"x/y clusters merged: {names}"
 
 
 # ---------------------------------------------------------------------------
