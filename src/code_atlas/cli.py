@@ -177,9 +177,28 @@ def index(
     full_reindex: bool = typer.Option(False, "--full", help="Force full re-index, ignoring delta cache."),
     no_embed: bool = typer.Option(False, "--no-embed", help="Disable embeddings (lightweight mode)."),
     no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow indexing outside a git repository."),
+    with_git_signals: bool = typer.Option(
+        False, "--with-git-signals", help="Mine git history for hotspot/co-change signals after indexing."
+    ),
+    co_change_threshold: int = typer.Option(
+        3,
+        "--co-change-threshold",
+        help="Minimum shared commits for a CO_CHANGES_WITH edge (used with --with-git-signals).",
+    ),
 ) -> None:
     """Index a codebase into the graph."""
-    asyncio.run(_run_index(path, scope, full_reindex, projects=project, no_embed=no_embed, no_git_check=no_git_check))
+    asyncio.run(
+        _run_index(
+            path,
+            scope,
+            full_reindex,
+            projects=project,
+            no_embed=no_embed,
+            no_git_check=no_git_check,
+            with_git_signals=with_git_signals,
+            co_change_threshold=co_change_threshold,
+        )
+    )
 
 
 @app.command()
@@ -309,6 +328,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     projects: list[str] | None = None,
     no_embed: bool = False,
     no_git_check: bool = False,
+    with_git_signals: bool = False,
+    co_change_threshold: int = 3,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
     from code_atlas.events import EventBus
@@ -398,15 +419,23 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             total_files = sum(r.files_scanned for r in results)
             total_entities = sum(r.entities_total for r in results)
             total_duration = max((r.duration_s for r in results), default=0.0)
+
+            git_signals_stats = (
+                await _mine_and_write_git_signals(project_root, project_name, graph, co_change_threshold)
+                if with_git_signals
+                else None
+            )
+
             if _output.json:
-                _json_output(
-                    {
-                        "projects": [asdict(r) for r in results],
-                        "total_files": total_files,
-                        "total_entities": total_entities,
-                        "total_duration_s": round(total_duration, 1),
-                    }
-                )
+                payload = {
+                    "projects": [asdict(r) for r in results],
+                    "total_files": total_files,
+                    "total_entities": total_entities,
+                    "total_duration_s": round(total_duration, 1),
+                }
+                if git_signals_stats is not None:
+                    payload["git_signals"] = git_signals_stats
+                _json_output(payload)
             else:
                 _echo(
                     f"Done — {len(results)} projects, {total_files} files,"
@@ -414,10 +443,22 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                 )
                 if any(not r.drained for r in results):
                     _echo("WARNING: pipeline did not drain — index incomplete; re-run 'atlas index' to retry")
+                if git_signals_stats is not None:
+                    _echo(_git_signals_summary_line(git_signals_stats, co_change_threshold))
         else:
             result = await _index_single_with_spinner(settings, graph, bus, scope=scope, full_reindex=full_reindex)
+
+            git_signals_stats = (
+                await _mine_and_write_git_signals(project_root, project_name, graph, co_change_threshold)
+                if with_git_signals
+                else None
+            )
+
             if _output.json:
-                _json_output(asdict(result))
+                payload = asdict(result)
+                if git_signals_stats is not None:
+                    payload["git_signals"] = git_signals_stats
+                _json_output(payload)
             else:
                 _echo(
                     f"Done ({result.mode}) — {result.files_scanned} files,"
@@ -432,6 +473,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                     )
                 if not result.drained:
                     _echo("WARNING: pipeline did not drain — index incomplete; re-run 'atlas index' to retry")
+                if git_signals_stats is not None:
+                    _echo(_git_signals_summary_line(git_signals_stats, co_change_threshold))
     finally:
         await graph.close()
         await bus.close()
@@ -826,6 +869,39 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
             )
     finally:
         await graph.close()
+
+
+def _git_signals_summary_line(stats: dict[str, int], co_change_threshold: int) -> str:
+    """Format the git-signals mining summary line for ``atlas index --with-git-signals``."""
+    return (
+        f"Scanned {stats['commits_scanned']} commits — "
+        f"{stats['files_matched']}/{stats['files_mined']} files matched, "
+        f"{stats['co_change_edges']} co-change edges ({stats['co_change_pairs_mined']} pairs mined, "
+        f"threshold={co_change_threshold})"
+    )
+
+
+async def _mine_and_write_git_signals(
+    project_root: Path, project_name: str, graph: Any, co_change_threshold: int
+) -> dict[str, int]:
+    """Mine git history and write the resulting signals, for ``atlas index --with-git-signals``.
+
+    Runs the same ``mine_git_signals``/``write_git_signals`` pair that ``atlas
+    mine-git-history`` uses (see ``_run_mine_git_history``), invoked here after
+    an ``atlas index`` pass completes so signals land on the just-indexed nodes.
+    """
+    from git.exc import InvalidGitRepositoryError, NoSuchPathError
+
+    from code_atlas.indexing.git_signals import mine_git_signals, write_git_signals
+
+    _echo(f"Mining git history for '{project_name}'...")
+    try:
+        result = mine_git_signals(project_root, co_change_threshold=co_change_threshold)
+    except (InvalidGitRepositoryError, NoSuchPathError) as exc:
+        logger.error("Not a git repository: {} — {}", project_root, exc)
+        raise typer.Exit(code=1) from exc
+
+    return await write_git_signals(graph, project_name, result)
 
 
 # ---------------------------------------------------------------------------

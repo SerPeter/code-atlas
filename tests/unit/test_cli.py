@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from typer.testing import CliRunner
 
@@ -302,6 +302,106 @@ class TestMonorepoScopeDispatch:
 
         assert captured["dispatch"] == "monorepo"
         assert captured["projects"] == ["foo"]
+
+
+class TestIndexWithGitSignals:
+    """--with-git-signals reuses mine_git_signals/write_git_signals after indexing succeeds."""
+
+    async def _patch_common(self, monkeypatch) -> dict:
+        from code_atlas import cli
+        from code_atlas.indexing.git_signals import GitSignalsResult
+        from code_atlas.indexing.orchestrator import IndexResult
+
+        captured: dict = {"order": []}
+
+        class FakeBus:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def ping(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        class FakeGraph:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def ping(self) -> None:
+                return None
+
+            async def ensure_schema(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex):
+            captured["order"].append("index")
+            return IndexResult(files_scanned=1, files_published=1, entities_total=2, duration_s=0.1)
+
+        mine_mock = MagicMock(return_value=GitSignalsResult(file_signals=(), co_change_pairs=(), commits_scanned=5))
+
+        async def fake_write_git_signals(graph, project_name, result):
+            captured["order"].append("write")
+            return {
+                "commits_scanned": 5,
+                "files_mined": 0,
+                "files_matched": 0,
+                "co_change_pairs_mined": 0,
+                "co_change_edges": 0,
+            }
+
+        write_mock = AsyncMock(side_effect=fake_write_git_signals)
+
+        monkeypatch.setattr("code_atlas.events.EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", FakeGraph)
+        monkeypatch.setattr("code_atlas.indexing.orchestrator.detect_sub_projects", lambda root, mono: [])
+        monkeypatch.setattr(cli, "_index_single_with_spinner", fake_single_with_spinner)
+        monkeypatch.setattr("code_atlas.indexing.git_signals.mine_git_signals", mine_mock)
+        monkeypatch.setattr("code_atlas.indexing.git_signals.write_git_signals", write_mock)
+
+        captured["mine_mock"] = mine_mock
+        captured["write_mock"] = write_mock
+        return captured
+
+    async def test_flag_off_skips_git_signals_mining(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+
+        _reset_output()
+        captured = await self._patch_common(monkeypatch)
+
+        await cli._run_index(str(tmp_path), None, False, no_embed=True, no_git_check=True)
+
+        captured["mine_mock"].assert_not_called()
+        captured["write_mock"].assert_not_awaited()
+
+    async def test_flag_on_mines_and_writes_git_signals_after_indexing(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+
+        _reset_output()
+        captured = await self._patch_common(monkeypatch)
+
+        await cli._run_index(
+            str(tmp_path),
+            None,
+            False,
+            no_embed=True,
+            no_git_check=True,
+            with_git_signals=True,
+            co_change_threshold=5,
+        )
+
+        captured["mine_mock"].assert_called_once()
+        mine_args, mine_kwargs = captured["mine_mock"].call_args
+        assert mine_args[0] == tmp_path.resolve()
+        assert mine_kwargs["co_change_threshold"] == 5
+
+        captured["write_mock"].assert_awaited_once()
+
+        # Indexing must complete before mining runs.
+        assert captured["order"] == ["index", "write"]
 
 
 class TestNoColor:

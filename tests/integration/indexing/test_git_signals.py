@@ -98,3 +98,58 @@ class TestMineGitHistoryCliCommand:
             {"p": _PROJECT},
         )
         assert rows[0]["cnt"] == 2
+
+
+class TestIndexCommandWithGitSignals:
+    """`atlas index --with-git-signals` end-to-end: mining runs against real git
+    history/Memgraph right after the (stubbed) indexing pass completes.
+
+    The indexing dispatch itself (AST parse + embed pipeline) is stubbed out —
+    that flow is already covered by the orchestrator/live-update integration
+    tests — so this test isolates the new wiring: does `atlas index` actually
+    invoke `mine_git_signals`/`write_git_signals` against real infra afterward.
+    """
+
+    async def test_cli_index_with_git_signals_mines_after_indexing(self, graph_client, monkeypatch):
+        from code_atlas.indexing.orchestrator import IndexResult
+
+        await _seed_modules(graph_client)
+
+        calls: list[str] = []
+
+        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex):
+            calls.append("index")
+            return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=0.0)
+
+        # Reuse the fixture's already-connected client instead of opening a
+        # second driver connection (same pattern as TestMineGitHistoryCliCommand).
+        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda settings: graph_client)
+        monkeypatch.setattr(GraphClient, "close", AsyncMock())
+        monkeypatch.setattr("code_atlas.indexing.orchestrator.detect_sub_projects", lambda root, mono: [])
+        monkeypatch.setattr(cli, "_index_single_with_spinner", fake_single_with_spinner)
+
+        await cli._run_index(
+            str(_REPO_ROOT),
+            None,
+            False,
+            no_embed=True,
+            no_git_check=False,
+            with_git_signals=True,
+            co_change_threshold=3,
+        )
+
+        assert calls == ["index"]
+
+        rows = await graph_client.execute(
+            "MATCH (n:Module {project_name: $p}) WHERE n.git_commit_count IS NOT NULL RETURN count(n) AS cnt",
+            {"p": _PROJECT},
+        )
+        assert rows[0]["cnt"] == 2
+
+        edge_rows = await graph_client.execute(
+            f"MATCH (a:Module {{project_name: $p, file_path: $fa}})"
+            f"-[r:{RelType.CO_CHANGES_WITH}]->(b:Module {{project_name: $p, file_path: $fb}}) "
+            "RETURN r.count AS count",
+            {"p": _PROJECT, "fa": _FILE_A, "fb": _FILE_B},
+        )
+        assert edge_rows, "expected a CO_CHANGES_WITH edge between cli.py and settings.py"
