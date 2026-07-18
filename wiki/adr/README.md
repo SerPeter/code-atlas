@@ -25,6 +25,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0012](./0012-rename-vault-to-wiki.md)               | Rename the Default Knowledge Vault Directory to wiki/          | Accepted               | 2026-07-17 |
 | [0013](./0013-mcp-tool-taxonomy.md)                  | MCP Tool Taxonomy — Static Analysis vs. Information Retrieval  | Accepted               | 2026-07-17 |
 | [0014](./0014-calls-edge-confidence.md)              | CALLS Edge Confidence                                          | Accepted               | 2026-07-17 |
+| [0015](./0015-embedded-backend-option.md)            | Embedded Backend Option (SQLite Graph + Queue)                 | Accepted               | 2026-07-18 |
 
 ## Creating a New ADR
 
