@@ -1297,6 +1297,42 @@ class TestAppLifespanNeedsFirstIndex:
             assert app_ctx.first_index_ready.is_set() is False
 
 
+class TestFindCommunitiesBackendVisibility:
+    """find_communities has no SQL translation (Leiden is MAGE-only) — hidden from
+    tools/list entirely on the embedded SQLite backend, present on Memgraph."""
+
+    async def test_hidden_on_sqlite_backend(self, settings, tmp_path, monkeypatch):
+        from code_atlas.server.mcp import create_mcp_server
+
+        settings.embeddings.enabled = False
+        graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
+
+        mcp = create_mcp_server(settings, catchup=False)
+        lifespan = mcp.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(mcp):
+            tool_names = {t.name for t in await mcp.list_tools()}
+            assert "find_communities" not in tool_names
+            assert "find_dead_code" in tool_names  # sanity: other shortcut tools stay
+
+    async def test_present_on_memgraph_backend(self, settings, monkeypatch):
+        from code_atlas.server.mcp import create_mcp_server
+
+        settings.embeddings.enabled = False
+        graph = _FakeSchemaGraph(initial_version=SCHEMA_VERSION)
+        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
+
+        mcp = create_mcp_server(settings, catchup=False)
+        lifespan = mcp.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(mcp):
+            tool_names = {t.name for t in await mcp.list_tools()}
+            assert "find_communities" in tool_names
+
+
 class TestEnsureRootGate:
     """_ensure_root()'s bounded wait/timeout enforcement (mcp.py)."""
 

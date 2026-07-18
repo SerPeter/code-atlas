@@ -638,7 +638,7 @@ def create_mcp_server(  # noqa: PLR0915
     """
 
     @asynccontextmanager
-    async def app_lifespan(_server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: PLR0915
+    async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: PLR0915
         init_telemetry(settings.observability)
 
         # Declared type stays GraphClient (the network backend) — SqliteGraphClient
@@ -662,6 +662,16 @@ def create_mcp_server(  # noqa: PLR0915
         first_index_ready = asyncio.Event()
         if not needs_first_index:
             first_index_ready.set()
+
+        # find_communities has no SQL translation (Leiden clustering is MAGE-only) — on the
+        # embedded backend it's not just non-functional, it's unreachable, so drop it from
+        # tools/list entirely rather than leaving it listed with a guaranteed-error response.
+        # Safe to remove here: FastMCP's lifespan setup fully completes (Server.run enters the
+        # lifespan context before creating the ServerSession) before any client request —
+        # including tools/list — is processed, so there's no race with a caller listing tools
+        # mid-startup.
+        if isinstance(graph, SqliteGraphClient):
+            server.remove_tool("find_communities")
 
         # Embedding setup — skipped entirely in lightweight mode
         vector_enabled = True
@@ -716,7 +726,7 @@ def create_mcp_server(  # noqa: PLR0915
         # on next tool call.  _mcp_server.notification_handlers is private API
         # in FastMCP — the only way to register notification handlers today.
         try:
-            raw = _server._mcp_server  # noqa: SLF001
+            raw = server._mcp_server  # noqa: SLF001
 
             async def _on_roots_changed(*_args: object, **_kwargs: object) -> None:
                 app_ctx.roots_checked = False

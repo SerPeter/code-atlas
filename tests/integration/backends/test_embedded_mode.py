@@ -239,6 +239,18 @@ class TestReadinessGate:
             assert app_ctx.first_index_ready.is_set() is True
             assert isinstance(app_ctx.graph, SqliteGraphClient)
 
+    async def test_find_communities_hidden_from_tools_list(self, embedded_settings: AtlasSettings) -> None:
+        """find_communities has no SQL translation (Leiden is MAGE-only) — on the
+        embedded backend it's dropped from tools/list entirely rather than left
+        listed with a guaranteed-error response."""
+        mcp = create_mcp_server(embedded_settings, catchup=False)
+        lifespan = mcp.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(mcp):
+            tool_names = {t.name for t in await mcp.list_tools()}
+            assert "find_communities" not in tool_names
+            assert "find_dead_code" in tool_names
+
 
 # ---------------------------------------------------------------------------
 # Core lookup / navigation tools
