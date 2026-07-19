@@ -1016,16 +1016,17 @@ async def _analyze_communities(
     the embedded backend, see ADR-0015) — returns a clear error instead of
     attempting a Cypher query the backend can't run.
 
-    *test_patterns*, when non-empty, drops matching entities from membership
-    lists before grouping/sizing (a community whose only members were test
-    scaffolding drops below the noise threshold and disappears; a mixed
-    community shrinks to its real members). Caveat: filtering happens after
-    Leiden already clustered the full graph, so it hides test members from
-    already-computed communities rather than preventing test-node connectivity
-    from influencing which entities got grouped together in the first place —
-    a full fix would exclude test entities at the Cypher WHERE-clause level
-    (same technique already used for ExternalPackage/ExternalSymbol above),
-    which is a real follow-up if post-hoc filtering isn't enough in practice.
+    *test_patterns*, when non-empty, excludes matching entities from the
+    ``a``/``b`` edge endpoints Leiden clusters on — the same "exclude before
+    projecting the subgraph" technique already used for ExternalPackage/
+    ExternalSymbol above, not a post-hoc filter of already-computed
+    communities. Test-node connectivity can no longer act as a bridge gluing
+    otherwise-unrelated production communities together. Since Cypher has no
+    glob/fnmatch operator, the excluded uid set is computed in Python via the
+    same ``matches_test_pattern`` used everywhere else (one canonical
+    implementation, not a second Cypher-regex-translated one that could
+    silently drift from it) and passed in as a parameterized uid list — one
+    extra cheap node-listing query, only when filtering is actually active.
     """
     if isinstance(graph, SqliteGraphClient):
         return {
@@ -1041,9 +1042,24 @@ async def _analyze_communities(
     excl = "NOT a:ExternalPackage AND NOT a:ExternalSymbol AND NOT b:ExternalPackage AND NOT b:ExternalSymbol"
     pa = " AND a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path" if path else ""
 
+    excluded_clause = ""
+    if test_patterns:
+        patterns = list(test_patterns)
+        node_pa = " AND n.file_path STARTS WITH $path" if path else ""
+        node_rows = await graph.execute(
+            "MATCH (n {project_name: $project}) "
+            f"WHERE NOT n:ExternalPackage AND NOT n:ExternalSymbol{node_pa} "
+            "RETURN n.uid AS uid, n.name AS name, n.file_path AS file_path",
+            params,
+        )
+        excluded_uids = [r["uid"] for r in node_rows if matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+        if excluded_uids:
+            params["excluded_uids"] = excluded_uids
+            excluded_clause = " AND NOT a.uid IN $excluded_uids AND NOT b.uid IN $excluded_uids"
+
     query = (
         "MATCH p=(a {project_name: $project})-[:CALLS|IMPORTS]->(b {project_name: $project}) "
-        f"WHERE {excl}{pa} "
+        f"WHERE {excl}{pa}{excluded_clause} "
         "WITH project(p) AS subgraph "
         "CALL leiden_community_detection.get(subgraph) YIELD node, community_id "
         "RETURN node.uid AS uid, node.name AS name, node.qualified_name AS qn, "
@@ -1060,16 +1076,11 @@ async def _analyze_communities(
             "code": "PROCEDURE_UNAVAILABLE",
         }
 
-    # community_id < 0 means "unassigned" (per MAGE docs) — drop before grouping.
-    # test_patterns entities are also dropped here, before grouping/sizing, so a
-    # community that's entirely test scaffolding correctly falls below the noise
-    # threshold instead of surviving with only its test members shown.
-    patterns = list(test_patterns)
+    # community_id < 0 means "unassigned" (per MAGE docs) — drop before grouping. Test
+    # entities are already excluded from the query itself above, not filtered here.
     groups: dict[int, list[dict[str, Any]]] = {}
     for r in raw:
         if r["community_id"] < 0:
-            continue
-        if patterns and matches_test_pattern(r["file_path"] or "", r["name"], patterns):
             continue
         groups.setdefault(r["community_id"], []).append(
             {

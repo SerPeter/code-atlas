@@ -734,44 +734,94 @@ async def test_communities_caps_members_and_communities_by_limit():
     assert len(result["communities"][0]["members"]) == 1
 
 
+async def test_communities_excludes_test_uids_from_the_leiden_query_itself():
+    """Test entities must be excluded from the a/b edge endpoints Leiden clusters
+    on (query-level), not filtered from already-computed communities afterward.
+
+    Simulates the two-phase flow: a cheap node-listing pre-query (used to compute
+    which uids match test_patterns via the canonical matches_test_pattern), then
+    the actual Leiden query — which, in the mock, already omits the test uids,
+    matching what Memgraph would do once the NOT a.uid IN $excluded_uids clause
+    is applied. If excluded_uids weren't actually computed/passed, the assertion
+    on the second call's params below would fail.
+    """
+    graph = MagicMock()
+    node_listing_rows = [
+        {"uid": "p:t1", "name": "test_a", "file_path": "tests/test_a.py"},
+        {"uid": "p:t2", "name": "test_b", "file_path": "tests/test_b.py"},
+        {"uid": "p:r1", "name": "real_a", "file_path": "pkg/real_a.py"},
+        {"uid": "p:r2", "name": "real_b", "file_path": "pkg/real_b.py"},
+    ]
+    leiden_rows = [
+        {
+            "uid": "p:r1",
+            "name": "real_a",
+            "qn": "pkg.real_a",
+            "label": "Callable",
+            "file_path": "pkg/real_a.py",
+            "community_id": 1,
+        },
+        {
+            "uid": "p:r2",
+            "name": "real_b",
+            "qn": "pkg.real_b",
+            "label": "Callable",
+            "file_path": "pkg/real_b.py",
+            "community_id": 1,
+        },
+    ]
+    graph.execute = AsyncMock(side_effect=[node_listing_rows, leiden_rows])
+
+    result = await analyze_repo(graph, "communities", "code-atlas", test_patterns=("tests/",))
+
+    assert graph.execute.call_count == 2
+    leiden_call_params = graph.execute.call_args_list[1][0][1]
+    assert set(leiden_call_params["excluded_uids"]) == {"p:t1", "p:t2"}
+    assert result["community_count"] == 1
+    assert {m["name"] for m in result["communities"][0]["members"]} == {"real_a", "real_b"}
+
+
+async def test_communities_skips_node_listing_query_when_no_test_patterns():
+    """No test_patterns means no filtering is needed — must not pay for the
+    extra node-listing pre-query when it can't change anything."""
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[])
+
+    await analyze_repo(graph, "communities", "code-atlas")
+
+    assert graph.execute.call_count == 1
+
+
 async def test_communities_drops_test_only_community_below_noise_threshold():
     """A community whose only members are test scaffolding must disappear
     entirely once filtered, not survive with an empty/tiny member list."""
     graph = MagicMock()
     graph.execute = AsyncMock(
-        return_value=[
-            {
-                "uid": "p:t1",
-                "name": "test_a",
-                "qn": "tests.test_a",
-                "label": "Callable",
-                "file_path": "tests/test_a.py",
-                "community_id": 0,
-            },
-            {
-                "uid": "p:t2",
-                "name": "test_b",
-                "qn": "tests.test_b",
-                "label": "Callable",
-                "file_path": "tests/test_b.py",
-                "community_id": 0,
-            },
-            {
-                "uid": "p:r1",
-                "name": "real_a",
-                "qn": "pkg.real_a",
-                "label": "Callable",
-                "file_path": "pkg/real_a.py",
-                "community_id": 1,
-            },
-            {
-                "uid": "p:r2",
-                "name": "real_b",
-                "qn": "pkg.real_b",
-                "label": "Callable",
-                "file_path": "pkg/real_b.py",
-                "community_id": 1,
-            },
+        side_effect=[
+            [
+                {"uid": "p:t1", "name": "test_a", "file_path": "tests/test_a.py"},
+                {"uid": "p:t2", "name": "test_b", "file_path": "tests/test_b.py"},
+                {"uid": "p:r1", "name": "real_a", "file_path": "pkg/real_a.py"},
+                {"uid": "p:r2", "name": "real_b", "file_path": "pkg/real_b.py"},
+            ],
+            [
+                {
+                    "uid": "p:r1",
+                    "name": "real_a",
+                    "qn": "pkg.real_a",
+                    "label": "Callable",
+                    "file_path": "pkg/real_a.py",
+                    "community_id": 1,
+                },
+                {
+                    "uid": "p:r2",
+                    "name": "real_b",
+                    "qn": "pkg.real_b",
+                    "label": "Callable",
+                    "file_path": "pkg/real_b.py",
+                    "community_id": 1,
+                },
+            ],
         ]
     )
 
