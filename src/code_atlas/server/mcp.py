@@ -69,7 +69,7 @@ from code_atlas.server.analysis import blast_radius as _blast_radius
 from code_atlas.server.analysis import generate_diagram as _generate_diagram
 from code_atlas.server.analysis import trace_path as _trace_path
 from code_atlas.server.health import run_health_checks
-from code_atlas.settings import AtlasSettings, derive_project_name, find_git_root
+from code_atlas.settings import AtlasSettings, SearchSettings, derive_project_name, find_git_root
 from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
 
 if TYPE_CHECKING:
@@ -446,6 +446,16 @@ def _clamp_limit(limit: int | None) -> int:
     if limit is None:
         return _DEFAULT_LIMIT
     return max(1, min(limit, _MAX_LIMIT))
+
+
+def _resolve_test_patterns(search_settings: SearchSettings, exclude_tests: bool | None) -> tuple[str, ...]:
+    """Resolve an analyze_repo-family tool's test_patterns tuple.
+
+    Mirrors hybrid_search's exclude_tests resolution: an explicit True/False
+    overrides the settings default; None defers to search.test_filter.
+    """
+    do_tests = search_settings.test_filter if exclude_tests is None else exclude_tests
+    return tuple(search_settings.test_patterns) if do_tests else ()
 
 
 _MAX_TRAVERSAL_DEPTH = 10
@@ -1713,6 +1723,14 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
         ] = "",
         limit: Annotated[int, Field(20, description="Max items per sub-section.", ge=1, le=100)] = 20,
+        exclude_tests: Annotated[
+            bool | None,
+            Field(
+                None,
+                description="Exclude test files/entities from ranked/listed results (hub entities, largest "
+                "modules, hotspots, community members, etc.). Default true — override to include tests.",
+            ),
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -1721,7 +1739,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
-        test_patterns = tuple(app.settings.search.test_patterns) if app.settings.search.test_filter else ()
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
             return await _analyze_repo(
                 app.graph, analysis, project_name, path=path, limit=clamped, test_patterns=test_patterns
@@ -1779,6 +1797,9 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
         ] = "",
         limit: Annotated[int, Field(20, description="Max items to return.", ge=1, le=100)] = 20,
+        exclude_tests: Annotated[
+            bool | None, Field(None, description="Exclude test files/entities. Default true — override to include.")
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -1787,7 +1808,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
-        test_patterns = tuple(app.settings.search.test_patterns) if app.settings.search.test_filter else ()
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
             return await _analyze_repo(
                 app.graph, "dead_code", project_name, path=path, limit=clamped, test_patterns=test_patterns
@@ -1809,6 +1830,9 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
         ] = "",
         limit: Annotated[int, Field(20, description="Max items to return.", ge=1, le=100)] = 20,
+        exclude_tests: Annotated[
+            bool | None, Field(None, description="Exclude test files/entities. Default true — override to include.")
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -1817,8 +1841,11 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
-            return await _analyze_repo(app.graph, "complexity", project_name, path=path, limit=clamped)
+            return await _analyze_repo(
+                app.graph, "complexity", project_name, path=path, limit=clamped, test_patterns=test_patterns
+            )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 
@@ -1842,6 +1869,15 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             int,
             Field(20, description="Max communities to return (also caps members shown per community).", ge=1, le=100),
         ] = 20,
+        exclude_tests: Annotated[
+            bool | None,
+            Field(
+                None,
+                description="Exclude test files/entities from community membership. Default true — override to "
+                "include. Filtering happens after clustering runs, so it hides test members from already-computed "
+                "communities rather than preventing test-node connectivity from shaping them.",
+            ),
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -1850,8 +1886,11 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
-            return await _analyze_repo(app.graph, "communities", project_name, path=path, limit=clamped)
+            return await _analyze_repo(
+                app.graph, "communities", project_name, path=path, limit=clamped, test_patterns=test_patterns
+            )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 
@@ -1872,6 +1911,9 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
         ] = "",
         limit: Annotated[int, Field(20, description="Max items per list to return.", ge=1, le=100)] = 20,
+        exclude_tests: Annotated[
+            bool | None, Field(None, description="Exclude test files/entities. Default true — override to include.")
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -1880,8 +1922,11 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         clamped = _clamp_limit(limit)
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
-            return await _analyze_repo(app.graph, "git_signals", project_name, path=path, limit=clamped)
+            return await _analyze_repo(
+                app.graph, "git_signals", project_name, path=path, limit=clamped, test_patterns=test_patterns
+            )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 

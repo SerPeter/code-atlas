@@ -80,6 +80,22 @@ async def test_cross_package_coupling_excludes_intra_package_imports():
 # ---------------------------------------------------------------------------
 
 
+async def test_dependencies_excludes_edges_touching_test_modules():
+    """No file_path on module-edge records — filtering matches on the dotted
+    qualified module name (e.g. 'tests.unit.foo' -> pseudo-path 'tests/unit/foo')."""
+    graph = _graph_with_imports(
+        direct=[
+            {"from_mod": "tests.unit.test_consumers", "to_mod": "code_atlas.indexing.consumers"},
+            {"from_mod": "code_atlas.search.engine", "to_mod": "code_atlas.graph.client"},
+        ],
+    )
+
+    result = await analyze_repo(graph, "dependencies", "code-atlas", test_patterns=("tests/",))
+
+    edges = {(e["from"], e["to"]) for e in result["internal_imports"]}
+    assert edges == {("code_atlas.search.engine", "code_atlas.graph.client")}
+
+
 async def test_circular_dependencies_detects_cycles_longer_than_two():
     """A->B->C->A is a cycle even though no pair mutually imports each other."""
     graph = _graph_with_imports(
@@ -124,6 +140,112 @@ async def test_structure_external_dependencies_forwards_path_scope():
     assert graph.get_structure_overview.call_args[0] == ("code-atlas", "src/foo", 20)
 
 
+async def test_structure_excludes_test_modules_from_largest_modules():
+    graph = MagicMock()
+    graph.get_structure_overview = AsyncMock(
+        return_value={
+            "counts": [],
+            "packages": [],
+            "largest_modules": [
+                {
+                    "module": "tests.unit.test_big",
+                    "qn": "tests.unit.test_big",
+                    "file_path": "tests/test_big.py",
+                    "entities": 100,
+                },
+                {"module": "pkg.real_mod", "qn": "pkg.real_mod", "file_path": "pkg/real_mod.py", "entities": 50},
+            ],
+            "external_deps": [],
+        }
+    )
+
+    result = await analyze_repo(graph, "structure", "code-atlas", test_patterns=("test_*.py", "tests/"))
+
+    names = {m["name"] for m in result["largest_modules"]}
+    assert names == {"pkg.real_mod"}
+
+
+async def test_structure_test_filtering_pads_query_limit_and_backfills():
+    """A naive limit=2 fetch that's 2/2 test modules would return zero real
+    results; padding the query-level limit must backfill a real 3rd candidate."""
+    graph = MagicMock()
+    graph.get_structure_overview = AsyncMock(
+        return_value={
+            "counts": [],
+            "packages": [],
+            "largest_modules": [
+                {"module": "tests.a", "qn": "tests.a", "file_path": "tests/a.py", "entities": 100},
+                {"module": "tests.b", "qn": "tests.b", "file_path": "tests/b.py", "entities": 90},
+                {"module": "pkg.real", "qn": "pkg.real", "file_path": "pkg/real.py", "entities": 80},
+            ],
+            "external_deps": [],
+        }
+    )
+
+    result = await analyze_repo(graph, "structure", "code-atlas", limit=2, test_patterns=("tests/",))
+
+    # Query was padded beyond 2 so the 3rd (real) candidate was actually fetched.
+    assert graph.get_structure_overview.call_args[0][2] > 2
+    assert [m["name"] for m in result["largest_modules"]] == ["pkg.real"]
+
+
+# ---------------------------------------------------------------------------
+# Centrality
+# ---------------------------------------------------------------------------
+
+
+def _centrality_row(name: str, file_path: str, in_degree: int = 1) -> dict[str, object]:
+    return {
+        "name": name,
+        "qn": name,
+        "label": "Callable",
+        "kind": "function",
+        "file_path": file_path,
+        "in_degree": in_degree,
+        "imported_by": 0,
+        "inherited_by": 0,
+        "called_by": in_degree,
+    }
+
+
+async def test_centrality_excludes_test_modules_from_hubs_and_leaves():
+    graph = MagicMock()
+    graph.get_centrality_data = AsyncMock(
+        return_value={
+            "hubs": [_centrality_row("_invoke_tool", "tests/unit/server/test_mcp.py", in_degree=135)],
+            "hub_modules": [
+                {"name": "tests.conftest", "qn": "tests.conftest", "file_path": "tests/conftest.py", "imported_by": 50}
+            ],
+            "leaves": [_centrality_row("test_helper", "tests/helpers.py")],
+        }
+    )
+
+    result = await analyze_repo(graph, "centrality", "code-atlas", test_patterns=("test_*", "tests/"))
+
+    assert result["hub_entities"] == []
+    assert result["hub_modules"] == []
+    assert result["leaf_entities"] == []
+
+
+async def test_centrality_test_filtering_pads_query_limit_and_backfills():
+    graph = MagicMock()
+    graph.get_centrality_data = AsyncMock(
+        return_value={
+            "hubs": [
+                _centrality_row("test_a", "tests/a.py", in_degree=100),
+                _centrality_row("real_hub", "pkg/real.py", in_degree=50),
+            ],
+            "hub_modules": [],
+            "leaves": [],
+        }
+    )
+
+    result = await analyze_repo(graph, "centrality", "code-atlas", limit=1, test_patterns=("test_*", "tests/"))
+
+    assert graph.get_centrality_data.call_args[0][2] > 1
+    assert [h["name"] for h in result["hub_entities"]] == ["real_hub"]
+
+
 # ---------------------------------------------------------------------------
 # Quality: path-scoped fan-in/fan-out must not misclassify out-of-scope
 # modules that are only ever edge endpoints
@@ -166,6 +288,46 @@ async def test_quality_path_scope_does_not_score_out_of_scope_edge_endpoints():
     # The in-scope module sees both its outbound and inbound edge -> balanced
     assert "pkg.in_scope.a" not in rigid_modules
     assert "pkg.in_scope.a" not in unstable_modules
+
+
+# ---------------------------------------------------------------------------
+# Patterns
+# ---------------------------------------------------------------------------
+
+
+def _graph_for_patterns(
+    inheritance: list[dict[str, str]], enums: list[dict[str, object]], detected: list[dict[str, str]]
+) -> MagicMock:
+    graph = MagicMock()
+    graph.get_patterns_data = AsyncMock(
+        return_value={
+            "inheritance": inheritance,
+            "enums": enums,
+            "visibility": [],
+            "docstring": [],
+            "detected_patterns": detected,
+        }
+    )
+    return graph
+
+
+async def test_patterns_excludes_test_modules_from_all_three_lists():
+    graph = _graph_for_patterns(
+        inheritance=[
+            {"child": "TestBase", "child_qn": "tests.unit.TestBase", "parent": "Base", "parent_qn": "pkg.Base"},
+            {"child": "Real", "child_qn": "pkg.Real", "parent": "Base", "parent_qn": "pkg.Base"},
+        ],
+        enums=[{"name": "TestEnum", "qn": "tests.unit.TestEnum", "file_path": "tests/unit/foo.py", "members": 3}],
+        detected=[
+            {"pattern_type": "HANDLES_ROUTE", "name": "test_route", "qn": "tests.unit.test_route", "target_name": "x"}
+        ],
+    )
+
+    result = await analyze_repo(graph, "patterns", "code-atlas", test_patterns=("test_*", "tests/"))
+
+    assert [i["child"] for i in result["inheritance"]] == ["Real"]
+    assert result["enums"] == []
+    assert result["detected_patterns"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +611,40 @@ async def test_complexity_forwards_path_scope():
     assert graph.get_complexity_hotspots.call_args[0] == ("code-atlas", "src/foo", 20)
 
 
+async def test_complexity_excludes_test_modules_and_backfills_real_hotspot():
+    """Regression: a naive fetch=limit would have returned only 1 hotspot (the
+    real one buried past the requested limit) after filtering — same failure
+    mode observed live where a test fixture ranked in the top-5 hotspots."""
+    graph = MagicMock()
+    graph.get_complexity_hotspots = AsyncMock(
+        return_value=[
+            {
+                "name": "seeded_analysis_graph",
+                "qn": "tests.integration.seeded_analysis_graph",
+                "kind": "function",
+                "file_path": "tests/integration/test_mcp.py",
+                "line_start": 1,
+                "line_end": 180,
+                "loc_span": 180,
+            },
+            {
+                "name": "real_fn",
+                "qn": "pkg.real_fn",
+                "kind": "function",
+                "file_path": "pkg/mod.py",
+                "line_start": 1,
+                "line_end": 50,
+                "loc_span": 50,
+            },
+        ]
+    )
+
+    result = await analyze_repo(graph, "complexity", "code-atlas", limit=1, test_patterns=("tests/",))
+
+    assert graph.get_complexity_hotspots.call_args[0][2] > 1
+    assert [h["name"] for h in result["hotspots"]] == ["real_fn"]
+
+
 # ---------------------------------------------------------------------------
 # Communities (ADR-0013 shortcut: find_communities, MAGE leiden_community_detection)
 #
@@ -536,6 +732,54 @@ async def test_communities_caps_members_and_communities_by_limit():
     assert len(result["communities"]) == 1
     assert result["communities"][0]["community_id"] == 0
     assert len(result["communities"][0]["members"]) == 1
+
+
+async def test_communities_drops_test_only_community_below_noise_threshold():
+    """A community whose only members are test scaffolding must disappear
+    entirely once filtered, not survive with an empty/tiny member list."""
+    graph = MagicMock()
+    graph.execute = AsyncMock(
+        return_value=[
+            {
+                "uid": "p:t1",
+                "name": "test_a",
+                "qn": "tests.test_a",
+                "label": "Callable",
+                "file_path": "tests/test_a.py",
+                "community_id": 0,
+            },
+            {
+                "uid": "p:t2",
+                "name": "test_b",
+                "qn": "tests.test_b",
+                "label": "Callable",
+                "file_path": "tests/test_b.py",
+                "community_id": 0,
+            },
+            {
+                "uid": "p:r1",
+                "name": "real_a",
+                "qn": "pkg.real_a",
+                "label": "Callable",
+                "file_path": "pkg/real_a.py",
+                "community_id": 1,
+            },
+            {
+                "uid": "p:r2",
+                "name": "real_b",
+                "qn": "pkg.real_b",
+                "label": "Callable",
+                "file_path": "pkg/real_b.py",
+                "community_id": 1,
+            },
+        ]
+    )
+
+    result = await analyze_repo(graph, "communities", "code-atlas", test_patterns=("tests/",))
+
+    assert result["community_count"] == 1
+    assert result["communities"][0]["community_id"] == 1
+    assert {m["name"] for m in result["communities"][0]["members"]} == {"real_a", "real_b"}
 
 
 async def test_communities_returns_procedure_unavailable_error_when_mage_missing():
@@ -647,6 +891,119 @@ async def test_git_signals_forwards_path_scope():
     await analyze_repo(graph, "git_signals", "code-atlas", path="src/foo")
 
     assert graph.get_git_signals_data.call_args[0] == ("code-atlas", "src/foo", 20, 1)
+
+
+async def test_git_signals_excludes_test_files_from_all_three_lists():
+    graph = MagicMock()
+    graph.get_git_signals_data = AsyncMock(
+        return_value={
+            "hotspots": [
+                {
+                    "name": "test_hot",
+                    "qn": "tests.test_hot",
+                    "file_path": "tests/test_hot.py",
+                    "commit_count": 40,
+                    "author_count": 2,
+                    "days_since_last_commit": 1.0,
+                },
+                {
+                    "name": "real_hot",
+                    "qn": "pkg.real_hot",
+                    "file_path": "pkg/real_hot.py",
+                    "commit_count": 30,
+                    "author_count": 2,
+                    "days_since_last_commit": 1.0,
+                },
+            ],
+            "bus_factor": [
+                {
+                    "name": "test_solo",
+                    "qn": "tests.test_solo",
+                    "file_path": "tests/test_solo.py",
+                    "commit_count": 5,
+                    "author_count": 1,
+                },
+            ],
+            "co_change": [
+                {
+                    "a_qn": "tests.test_a",
+                    "a_path": "tests/test_a.py",
+                    "b_qn": "pkg.b",
+                    "b_path": "pkg/b.py",
+                    "count": 3,
+                },
+                {"a_qn": "pkg.c", "a_path": "pkg/c.py", "b_qn": "pkg.d", "b_path": "pkg/d.py", "count": 2},
+            ],
+        }
+    )
+
+    result = await analyze_repo(graph, "git_signals", "code-atlas", test_patterns=("test_*", "tests/"))
+
+    assert [h["qualified_name"] for h in result["hotspots"]] == ["pkg.real_hot"]
+    assert result["bus_factor_risks"] == []
+    assert result["co_change_pairs"] == [
+        {"a": "pkg.c", "a_file_path": "pkg/c.py", "b": "pkg.d", "b_file_path": "pkg/d.py", "count": 2}
+    ]
+
+
+async def test_git_signals_mined_flag_computed_before_filtering():
+    """mined signals 'did mine-git-history ever run', not 'are there non-test
+    hotspots' — must stay True even if every hotspot happens to be a test file."""
+    graph = MagicMock()
+    graph.get_git_signals_data = AsyncMock(
+        return_value={
+            "hotspots": [
+                {
+                    "name": "test_only",
+                    "qn": "tests.test_only",
+                    "file_path": "tests/test_only.py",
+                    "commit_count": 10,
+                    "author_count": 2,
+                    "days_since_last_commit": 1.0,
+                }
+            ],
+            "bus_factor": [],
+            "co_change": [],
+        }
+    )
+
+    result = await analyze_repo(graph, "git_signals", "code-atlas", test_patterns=("tests/",))
+
+    assert result["mined"] is True
+    assert result["hotspots"] == []
+
+
+async def test_git_signals_test_filtering_pads_query_limit_and_backfills():
+    graph = MagicMock()
+    graph.get_git_signals_data = AsyncMock(
+        return_value={
+            "hotspots": [
+                {
+                    "name": "test_hot",
+                    "qn": "tests.test_hot",
+                    "file_path": "tests/test_hot.py",
+                    "commit_count": 40,
+                    "author_count": 2,
+                    "days_since_last_commit": 1.0,
+                },
+                {
+                    "name": "real_hot",
+                    "qn": "pkg.real_hot",
+                    "file_path": "pkg/real_hot.py",
+                    "commit_count": 30,
+                    "author_count": 2,
+                    "days_since_last_commit": 1.0,
+                },
+            ],
+            "bus_factor": [],
+            "co_change": [],
+        }
+    )
+
+    result = await analyze_repo(graph, "git_signals", "code-atlas", limit=1, test_patterns=("tests/",))
+
+    assert graph.get_git_signals_data.call_args[0][2] > 1
+    assert [h["qualified_name"] for h in result["hotspots"]] == ["pkg.real_hot"]
 
 
 # ---------------------------------------------------------------------------

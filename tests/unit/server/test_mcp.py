@@ -49,9 +49,10 @@ from code_atlas.server.mcp import (
     _register_subagent_tools,
     _register_traversal_tools,
     _resolve_hybrid_scope,
+    _resolve_test_patterns,
     _with_staleness,
 )
-from code_atlas.settings import AtlasSettings, IndexSettings, find_git_root
+from code_atlas.settings import AtlasSettings, IndexSettings, SearchSettings, find_git_root
 
 # ---------------------------------------------------------------------------
 # Fake context for direct tool invocation
@@ -101,6 +102,28 @@ async def _invoke_tool(app_ctx: AppContext, tool_name: str, **kwargs: Any) -> di
 # ---------------------------------------------------------------------------
 # _rank_results (no DB needed)
 # ---------------------------------------------------------------------------
+
+
+class TestResolveTestPatterns:
+    """_resolve_test_patterns backs analyze_repo/find_dead_code/find_complexity_hotspots/
+    find_communities/find_hotspots's exclude_tests param — same override semantics as
+    hybrid_search's own exclude_tests."""
+
+    def test_none_defers_to_settings_default_true(self):
+        settings = SearchSettings(test_filter=True)
+        assert _resolve_test_patterns(settings, None) == tuple(settings.test_patterns)
+
+    def test_none_defers_to_settings_default_false(self):
+        settings = SearchSettings(test_filter=False)
+        assert _resolve_test_patterns(settings, None) == ()
+
+    def test_explicit_true_overrides_settings_default_false(self):
+        settings = SearchSettings(test_filter=False)
+        assert _resolve_test_patterns(settings, True) == tuple(settings.test_patterns)
+
+    def test_explicit_false_overrides_settings_default_true(self):
+        settings = SearchSettings(test_filter=True)
+        assert _resolve_test_patterns(settings, False) == ()
 
 
 class TestRankResults:

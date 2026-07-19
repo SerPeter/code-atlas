@@ -87,6 +87,31 @@ def _module_package(qn: str) -> str:
     return qn.rsplit(".", 1)[0] if "." in qn else ""
 
 
+def _matches_test_qn(qn: str, patterns: list[str]) -> bool:
+    """Like ``matches_test_pattern``, for records that only carry a qualified name (no file_path).
+
+    Converts dots to slashes so directory-style patterns (``tests/``) still match
+    (e.g. ``tests.unit.foo`` -> ``tests/unit/foo``).
+    """
+    return matches_test_pattern(qn.replace(".", "/"), qn.rsplit(".", 1)[-1], patterns)
+
+
+_TEST_FILTER_FETCH_CAP = 200
+
+
+def _padded_limit(limit: int, test_patterns: tuple[str, ...]) -> int:
+    """Query-level fetch size when test_patterns filtering is active.
+
+    Several graph methods apply LIMIT at the Cypher/SQL level, before Python-side
+    test_patterns filtering runs. Fetching only *limit* rows and filtering afterward
+    would silently return fewer than *limit* results whenever a filtered-out entity
+    occupied one of those slots, instead of backfilling from real candidates beyond
+    the original cutoff. Padding the query-level fetch (then truncating to *limit*
+    after filtering) avoids that under-delivery.
+    """
+    return min(limit * 5, _TEST_FILTER_FETCH_CAP) if test_patterns else limit
+
+
 # ---------------------------------------------------------------------------
 # Public dispatchers
 # ---------------------------------------------------------------------------
@@ -102,29 +127,32 @@ async def analyze_repo(
 ) -> dict[str, Any]:
     """Dispatch to the requested sub-analysis.
 
-    *test_patterns* excludes test modules from quality scoring (god-module,
-    circular, tangled, rigid, unstable) — unused by the other sub-analyses, so
-    only the ``quality`` dispatch receives it.
+    *test_patterns*, when non-empty, drops entities/modules matching those glob
+    patterns from every sub-analysis's ranked/listed output (hub entities, largest
+    modules, complexity hotspots, community members, git-signal hotspots, etc.) —
+    test scaffolding otherwise dominates these rankings purely by volume (see
+    ADR-0016). Whole-repo aggregate counts that don't rank individual entities
+    (structure's label_counts/kind_counts, patterns' visibility_distribution/
+    docstring_coverage) are intentionally left unfiltered — those describe total
+    repo composition, not "notable" entities.
     """
     if analysis not in _VALID_ANALYSES:
         return {
             "error": f"Unknown analysis '{analysis}'. Valid: {sorted(_VALID_ANALYSES)}",
             "code": "INVALID_ANALYSIS",
         }
-    if analysis == "quality":
-        return await _analyze_quality(graph, project, path, limit, test_patterns)
-    if analysis == "dead_code":
-        return await _analyze_dead_code(graph, project, path, limit, test_patterns)
     dispatch = {
         "structure": _analyze_structure,
         "centrality": _analyze_centrality,
         "dependencies": _analyze_dependencies,
         "patterns": _analyze_patterns,
+        "quality": _analyze_quality,
+        "dead_code": _analyze_dead_code,
         "complexity": _analyze_complexity,
         "communities": _analyze_communities,
         "git_signals": _analyze_git_signals,
     }
-    return await dispatch[analysis](graph, project, path, limit)
+    return await dispatch[analysis](graph, project, path, limit, test_patterns)
 
 
 async def generate_diagram(
@@ -257,9 +285,11 @@ async def blast_radius(
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_structure(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_structure(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     t0 = time.monotonic()
-    data = await graph.get_structure_overview(project, path, limit)
+    data = await graph.get_structure_overview(project, path, _padded_limit(limit, test_patterns))
 
     # Entity counts by label + kind
     label_counts: dict[str, int] = {}
@@ -270,6 +300,18 @@ async def _analyze_structure(graph: GraphBackend, project: str, path: str, limit
         if r["kind"]:
             kind_counts.setdefault(lbl, {})[r["kind"]] = r["cnt"]
 
+    largest_modules_raw = data["largest_modules"]
+    if test_patterns:
+        patterns = list(test_patterns)
+        largest_modules_raw = [
+            r for r in largest_modules_raw if not matches_test_pattern(r["file_path"] or "", r["module"], patterns)
+        ]
+    # Query was padded above for filtering headroom — re-truncate every list (filtered
+    # or not) back to the caller-requested limit.
+    largest_modules_raw = largest_modules_raw[:limit]
+    packages_raw = data["packages"][:limit]
+    external_deps_raw = data["external_deps"][:limit]
+
     elapsed = (time.monotonic() - t0) * 1000
     return {
         "analysis": "structure",
@@ -277,7 +319,7 @@ async def _analyze_structure(graph: GraphBackend, project: str, path: str, limit
         "label_counts": label_counts,
         "kind_breakdown": kind_counts,
         "packages": [
-            {"name": r["package"], "qualified_name": r["qn"], "module_count": r["modules"]} for r in data["packages"]
+            {"name": r["package"], "qualified_name": r["qn"], "module_count": r["modules"]} for r in packages_raw
         ],
         "largest_modules": [
             {
@@ -286,11 +328,11 @@ async def _analyze_structure(graph: GraphBackend, project: str, path: str, limit
                 "file_path": r["file_path"],
                 "entity_count": r["entities"],
             }
-            for r in data["largest_modules"]
+            for r in largest_modules_raw
         ],
         "external_dependencies": [
             {"package": r["package"], "version": r["version"], "imported_by": r["imported_by"]}
-            for r in data["external_deps"]
+            for r in external_deps_raw
         ],
         "query_ms": round(elapsed, 1),
     }
@@ -301,9 +343,21 @@ async def _analyze_structure(graph: GraphBackend, project: str, path: str, limit
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_centrality(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_centrality(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     t0 = time.monotonic()
-    data = await graph.get_centrality_data(project, path, limit)
+    data = await graph.get_centrality_data(project, path, _padded_limit(limit, test_patterns))
+
+    hubs, hub_modules, leaves = data["hubs"], data["hub_modules"], data["leaves"]
+    if test_patterns:
+        patterns = list(test_patterns)
+        hubs = [r for r in hubs if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+        hub_modules = [r for r in hub_modules if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+        leaves = [r for r in leaves if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+    # Query was padded above for filtering headroom — re-truncate back to the
+    # caller-requested limit.
+    hubs, hub_modules, leaves = hubs[:limit], hub_modules[:limit], leaves[:limit]
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -321,7 +375,7 @@ async def _analyze_centrality(graph: GraphBackend, project: str, path: str, limi
                 "inherited_by": r["inherited_by"],
                 "called_by": r["called_by"],
             }
-            for r in data["hubs"]
+            for r in hubs
         ],
         "hub_modules": [
             {
@@ -330,7 +384,7 @@ async def _analyze_centrality(graph: GraphBackend, project: str, path: str, limi
                 "file_path": r["file_path"],
                 "imported_by": r["imported_by"],
             }
-            for r in data["hub_modules"]
+            for r in hub_modules
         ],
         "leaf_entities": [
             {
@@ -340,7 +394,7 @@ async def _analyze_centrality(graph: GraphBackend, project: str, path: str, limi
                 "kind": r["kind"],
                 "file_path": r["file_path"],
             }
-            for r in data["leaves"]
+            for r in leaves
         ],
         "query_ms": round(elapsed, 1),
     }
@@ -362,11 +416,24 @@ def _module_imports_from_records(
     return edges
 
 
-async def _analyze_dependencies(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_dependencies(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     t0 = time.monotonic()
 
     module_edges = await graph.get_module_import_edges(project, path)
     edge_weights = _module_imports_from_records(module_edges["direct"], module_edges["indirect"])
+
+    # Drop edges touching a test module before deriving internal/cross-package/circular
+    # views — same "filter the shared graph once" approach as _analyze_quality. No
+    # per-edge file_path here (module-qualified-name keys only), so match on qn.
+    if test_patterns:
+        patterns = list(test_patterns)
+        edge_weights = {
+            (f, t): w
+            for (f, t), w in edge_weights.items()
+            if not _matches_test_qn(f, patterns) and not _matches_test_qn(t, patterns)
+        }
 
     # Sort by weight descending
     internal_imports = sorted(
@@ -392,7 +459,8 @@ async def _analyze_dependencies(graph: GraphBackend, project: str, path: str, li
     # Circular dependencies (any cycle length, via strongly-connected components)
     circular = _detect_circular(edge_weights)[:10]
 
-    # External package import counts
+    # External package import counts — not test_patterns-filtered: aggregated purely
+    # by imported package name with no per-importer identity to filter on.
     ext_data = await graph.get_dependency_external_counts(project, path)
     ext_counts: dict[str, int] = {}
     for r in ext_data["ext_packages"]:
@@ -423,11 +491,28 @@ async def _analyze_dependencies(graph: GraphBackend, project: str, path: str, li
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_patterns(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_patterns(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     t0 = time.monotonic()
-    data = await graph.get_patterns_data(project, path, limit)
+    data = await graph.get_patterns_data(project, path, _padded_limit(limit, test_patterns))
     doc_raw = data["docstring"]
     doc_stats = doc_raw[0] if doc_raw else {"total": 0, "documented": 0}
+
+    inheritance_raw, enums_raw, detected_raw = data["inheritance"], data["enums"], data["detected_patterns"]
+    if test_patterns:
+        patterns = list(test_patterns)
+        # No file_path on inheritance/detected_patterns records — match on qualified name.
+        inheritance_raw = [
+            r
+            for r in inheritance_raw
+            if not _matches_test_qn(r["child_qn"], patterns) and not _matches_test_qn(r["parent_qn"], patterns)
+        ]
+        enums_raw = [r for r in enums_raw if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+        detected_raw = [r for r in detected_raw if not _matches_test_qn(r["qn"], patterns)]
+    # Query was padded above for filtering headroom — re-truncate back to the
+    # caller-requested limit.
+    inheritance_raw, enums_raw, detected_raw = inheritance_raw[:limit], enums_raw[:limit], detected_raw[:limit]
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -440,12 +525,15 @@ async def _analyze_patterns(graph: GraphBackend, project: str, path: str, limit:
                 "parent": r["parent"],
                 "parent_qualified_name": r["parent_qn"],
             }
-            for r in data["inheritance"]
+            for r in inheritance_raw
         ],
         "enums": [
             {"name": r["name"], "qualified_name": r["qn"], "file_path": r["file_path"], "members": r["members"]}
-            for r in data["enums"]
+            for r in enums_raw
         ],
+        # visibility_distribution/docstring_coverage are whole-repo aggregates (not
+        # per-entity lists) — intentionally not test_patterns-filtered, see analyze_repo's
+        # docstring.
         "visibility_distribution": {r["visibility"]: r["cnt"] for r in data["visibility"]},
         "docstring_coverage": {
             "total": doc_stats["total"],
@@ -454,7 +542,7 @@ async def _analyze_patterns(graph: GraphBackend, project: str, path: str, limit:
         },
         "detected_patterns": [
             {"type": r["pattern_type"], "name": r["name"], "qualified_name": r["qn"], "target": r["target_name"]}
-            for r in data["detected_patterns"]
+            for r in detected_raw
         ],
         "query_ms": round(elapsed, 1),
     }
@@ -848,7 +936,9 @@ async def _analyze_dead_code(
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_complexity(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_complexity(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """Top-N Callables by ``line_end - line_start``.
 
     This is a crude LOC-span proxy, not true cyclomatic complexity (branch-
@@ -856,7 +946,13 @@ async def _analyze_complexity(graph: GraphBackend, project: str, path: str, limi
     already persist on every Callable.
     """
     t0 = time.monotonic()
-    raw = await graph.get_complexity_hotspots(project, path, limit)
+    raw = await graph.get_complexity_hotspots(project, path, _padded_limit(limit, test_patterns))
+    if test_patterns:
+        patterns = list(test_patterns)
+        raw = [r for r in raw if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+    # Query was padded above for filtering headroom — re-truncate back to the
+    # caller-requested limit.
+    raw = raw[:limit]
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -883,7 +979,9 @@ async def _analyze_complexity(graph: GraphBackend, project: str, path: str, limi
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_communities(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_communities(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """Cluster the project's CALLS+IMPORTS subgraph via Leiden community detection.
 
     Requires a MAGE-enabled Memgraph image (``memgraph/memgraph-mage``, not the
@@ -917,6 +1015,17 @@ async def _analyze_communities(graph: GraphBackend, project: str, path: str, lim
     SQLite equivalent (community detection is explicitly out of scope for
     the embedded backend, see ADR-0015) — returns a clear error instead of
     attempting a Cypher query the backend can't run.
+
+    *test_patterns*, when non-empty, drops matching entities from membership
+    lists before grouping/sizing (a community whose only members were test
+    scaffolding drops below the noise threshold and disappears; a mixed
+    community shrinks to its real members). Caveat: filtering happens after
+    Leiden already clustered the full graph, so it hides test members from
+    already-computed communities rather than preventing test-node connectivity
+    from influencing which entities got grouped together in the first place —
+    a full fix would exclude test entities at the Cypher WHERE-clause level
+    (same technique already used for ExternalPackage/ExternalSymbol above),
+    which is a real follow-up if post-hoc filtering isn't enough in practice.
     """
     if isinstance(graph, SqliteGraphClient):
         return {
@@ -952,9 +1061,15 @@ async def _analyze_communities(graph: GraphBackend, project: str, path: str, lim
         }
 
     # community_id < 0 means "unassigned" (per MAGE docs) — drop before grouping.
+    # test_patterns entities are also dropped here, before grouping/sizing, so a
+    # community that's entirely test scaffolding correctly falls below the noise
+    # threshold instead of surviving with only its test members shown.
+    patterns = list(test_patterns)
     groups: dict[int, list[dict[str, Any]]] = {}
     for r in raw:
         if r["community_id"] < 0:
+            continue
+        if patterns and matches_test_pattern(r["file_path"] or "", r["name"], patterns):
             continue
         groups.setdefault(r["community_id"], []).append(
             {
@@ -992,7 +1107,9 @@ async def _analyze_communities(graph: GraphBackend, project: str, path: str, lim
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_git_signals(graph: GraphBackend, project: str, path: str, limit: int) -> dict[str, Any]:
+async def _analyze_git_signals(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """Surface git-mined signals: commit-count hotspots, bus-factor risks, top co-change pairs.
 
     Reads properties/edges written by ``indexing/git_signals.py``'s
@@ -1003,11 +1120,32 @@ async def _analyze_git_signals(graph: GraphBackend, project: str, path: str, lim
     apart from "ran, found nothing".
     """
     t0 = time.monotonic()
-    data = await graph.get_git_signals_data(project, path, limit, _BUS_FACTOR_AUTHOR_THRESHOLD)
+    data = await graph.get_git_signals_data(
+        project, path, _padded_limit(limit, test_patterns), _BUS_FACTOR_AUTHOR_THRESHOLD
+    )
     hotspots_raw = data["hotspots"]
+    # mined reflects whether mine-git-history has ever run at all, independent of
+    # test_patterns filtering — compute it from the pre-filter list.
+    mined = bool(hotspots_raw)
+
+    bus_factor_raw, co_change_raw = data["bus_factor"], data["co_change"]
+    if test_patterns:
+        patterns = list(test_patterns)
+        hotspots_raw = [r for r in hotspots_raw if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+        bus_factor_raw = [
+            r for r in bus_factor_raw if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)
+        ]
+        co_change_raw = [
+            r
+            for r in co_change_raw
+            if not matches_test_pattern(r["a_path"] or "", r["a_qn"], patterns)
+            and not matches_test_pattern(r["b_path"] or "", r["b_qn"], patterns)
+        ]
+    # Query was padded above for filtering headroom — re-truncate back to the
+    # caller-requested limit.
+    hotspots_raw, bus_factor_raw, co_change_raw = hotspots_raw[:limit], bus_factor_raw[:limit], co_change_raw[:limit]
 
     elapsed = (time.monotonic() - t0) * 1000
-    mined = bool(hotspots_raw)
     return {
         "analysis": "git_signals",
         "project": project,
@@ -1031,7 +1169,7 @@ async def _analyze_git_signals(graph: GraphBackend, project: str, path: str, lim
                 "commit_count": r["commit_count"],
                 "author_count": r["author_count"],
             }
-            for r in data["bus_factor"]
+            for r in bus_factor_raw
         ],
         "co_change_pairs": [
             {
@@ -1041,7 +1179,7 @@ async def _analyze_git_signals(graph: GraphBackend, project: str, path: str, lim
                 "b_file_path": r["b_path"],
                 "count": r["count"],
             }
-            for r in data["co_change"]
+            for r in co_change_raw
         ],
         "query_ms": round(elapsed, 1),
     }
