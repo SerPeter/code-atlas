@@ -917,6 +917,12 @@ async def _analyze_dead_code(
 ) -> dict[str, Any]:
     """Callables/TypeDefs with zero incoming CALLS edges (any confidence).
 
+    Scoped to *invocable* entities — the backend gates on
+    ``graph.client._CODE_ENTITY_KINDS``, so config/infra declarations parsed out
+    of Terraform, SQL, Kubernetes/Compose/CI YAML, XML and Dockerfiles are not
+    reported. They share the Callable/TypeDef labels with real code but can
+    never be the target of a CALLS edge, so listing them says nothing.
+
     Excludes dunder methods (``__init__``, ``__new__``, etc. — name STARTS WITH
     '__') and entries matching *test_patterns*. An entity reached only by an
     ``confidence: "ambiguous"`` CALLS edge (ADR-0014) still counts as "not

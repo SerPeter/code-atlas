@@ -51,6 +51,7 @@ import sqlite_vec
 from loguru import logger
 
 from code_atlas.graph.client import (
+    _CODE_ENTITY_KINDS,
     _DEFAULT_EDGE_WEIGHT,
     _DEFAULT_TEST_PATTERNS,
     SCHEMA_VERSION,
@@ -2546,13 +2547,18 @@ class SqliteGraphClient:
     async def get_dead_code_candidates(self, project: str, path: str) -> list[dict[str, Any]]:
         conn = await self._get_conn()
         clause, extra = _prefix_clause("file_path", path)
+        # Mirrors GraphClient.get_dead_code_candidates: the kind gate keeps
+        # config/infra declarations (which can never be a CALLS target) out.
+        code_kinds = sorted(_CODE_ENTITY_KINDS)
+        kind_placeholders = ", ".join("?" * len(code_kinds))
         cur = await conn.execute(
             "SELECT name, qualified_name, labels, kind, file_path, "
             "json_extract(props_json, '$.line_start') FROM nodes n "
-            f"WHERE project_name = ? AND labels IN ('Callable', 'TypeDef') AND substr(name, 1, 2) != '__'{clause} "
+            "WHERE project_name = ? AND labels IN ('Callable', 'TypeDef') "
+            f"AND kind IN ({kind_placeholders}) AND substr(name, 1, 2) != '__'{clause} "
             "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = n.uid AND e.rel_type = 'CALLS') "
             "ORDER BY file_path, json_extract(props_json, '$.line_start')",
-            [project, *extra],
+            [project, *code_kinds, *extra],
         )
         rows = await cur.fetchall()
         await cur.close()

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from code_atlas.graph.client import (
+    _CODE_ENTITY_KINDS,
     _NAME_ROUTED_REL_TYPES,
     _OUT_OF_BAND_REL_TYPES,
     _POST_BATCH_REL_TYPES,
@@ -25,7 +26,12 @@ from code_atlas.graph.client import (
     _validate_relationship_routing,
 )
 from code_atlas.parsing.ast import ParsedRelationship
-from code_atlas.schema import RelType
+from code_atlas.parsing.languages.config import _MODULE_KINDS as _CONFIG_MODULE_KINDS
+from code_atlas.parsing.languages.containerfile import _STAGE_KIND
+from code_atlas.parsing.languages.hcl import _BLOCK_SPECS
+from code_atlas.parsing.languages.hcl import _KINDS as _HCL_FILE_KINDS
+from code_atlas.parsing.languages.sql import _KIND_COLUMN, _KIND_INDEX, _KIND_TABLE, _KIND_VIEW
+from code_atlas.schema import CallableKind, RelType, TypeDefKind
 from code_atlas.settings import AtlasSettings
 
 if TYPE_CHECKING:
@@ -51,6 +57,47 @@ class TestRelationshipRouting:
 
     def test_note_rel_types_are_uid_routed(self):
         assert {RelType.LINKS_TO, RelType.DERIVED_FROM, RelType.SUPERSEDES} <= _UID_ROUTED_REL_TYPES
+
+
+class TestCodeEntityKinds:
+    """``_CODE_ENTITY_KINDS`` separates invocable code from config/infra
+    declarations for the dead-code analysis. It has to stay *derived* from the
+    schema enums: a hand-maintained list would need editing per new language,
+    which is the drift trap `_DEFAULT_INCLUDE` already demonstrates."""
+
+    def test_is_exactly_the_union_of_the_schema_kind_enums(self):
+        assert frozenset(CallableKind) | frozenset(TypeDefKind) == _CODE_ENTITY_KINDS
+
+    def test_excludes_every_terraform_block_kind(self):
+        """Sourced from the parser's own table, so a new Terraform block type is
+        covered without touching this test."""
+        terraform_kinds = {spec[0] for spec in _BLOCK_SPECS.values()} | set(_HCL_FILE_KINDS.values())
+        assert not (terraform_kinds & _CODE_ENTITY_KINDS)
+
+    def test_excludes_config_and_infra_declaration_kinds(self):
+        infra_kinds = {
+            _STAGE_KIND,
+            _KIND_TABLE,
+            _KIND_VIEW,
+            _KIND_COLUMN,
+            _KIND_INDEX,
+            "sql_function",
+            "terraform_local",
+            "k8s_resource",
+            "compose_service",
+            "ci_job",
+            "ansible_play",
+            "ansible_task",
+            "ansible_handler",
+            "xml_element",
+            "xml_setting",
+        } | set(_CONFIG_MODULE_KINDS.values())
+        assert not (infra_kinds & _CODE_ENTITY_KINDS)
+
+    def test_includes_the_shell_parsers_real_functions(self):
+        """Shell is the one new-parser language that emits genuinely invocable
+        entities (and same-file CALLS edges) — it must not be filtered out."""
+        assert CallableKind.FUNCTION in _CODE_ENTITY_KINDS
 
 
 class TestSanitizeBm25Query:
@@ -465,6 +512,19 @@ class TestAnalysisQueryConstruction:
         query = client.execute.call_args[0][0]
         assert "NOT ()-[:CALLS]->(n)" in query
         assert "NOT n.name STARTS WITH '__'" in query
+
+    async def test_dead_code_query_gates_on_invocable_kinds(self, tmp_path: Path):
+        """Config/infra declarations share the Callable/TypeDef labels with real code
+        but can never receive a CALLS edge — without the kind gate every Terraform
+        resource and k8s object is reported as dead."""
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.return_value = []
+
+        await client.get_dead_code_candidates("code-atlas", "")
+
+        query, params = client.execute.call_args[0]
+        assert "n.kind IN $code_kinds" in query
+        assert set(params["code_kinds"]) == _CODE_ENTITY_KINDS
 
     async def test_complexity_hotspots_query_computes_and_sorts_loc_span(self, tmp_path: Path):
         client = _client_with_fake_execute(tmp_path)

@@ -24,9 +24,11 @@ from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     SCHEMA_VERSION,
+    CallableKind,
     NodeLabel,
     NoteKind,
     RelType,
+    TypeDefKind,
     generate_composite_index_ddl,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
@@ -624,6 +626,30 @@ _DEFAULT_TEST_PATTERNS: tuple[str, ...] = tuple(SearchSettings().test_patterns)
 
 # Both weight numbers above are heuristics, not measurements — they are
 # expected to be retuned once there is evidence about what ranks well.
+
+# Callable/TypeDef kinds that denote *invocable code*, i.e. entities for which
+# "nothing calls this" is evidence rather than a tautology.
+#
+# Derived from the schema enums rather than listed by hand, because the two
+# families of parsers already differ exactly along that line:
+#   - Code parsers (python, typescript, go, rust, jvm, cpp, ruby, php, shell)
+#     assign every Callable/TypeDef a CallableKind/TypeDefKind member.
+#   - Infra/config parsers (hcl, sql, config, containerfile) mint free-form
+#     kind strings for things that are declarations, not code —
+#     'terraform_resource', 'k8s_resource', 'sql_table', 'docker_stage',
+#     'ci_job', 'ansible_task', 'xml_element', ...
+# Those declarations can never be the target of a resolved CALLS edge, so a
+# label-only dead-code filter reports every last one of them as dead.
+#
+# A kind deny-list or a file-extension/language allow-list would both have to
+# grow with every language added — the same drift trap as `_DEFAULT_INCLUDE`
+# in indexing/orchestrator.py. This set instead grows automatically: a new code
+# parser reuses the enums and is included for free, while a new infra parser
+# inventing its own kind vocabulary is excluded for free.
+#
+# Plain ``str`` values, not enum members: this set is handed to the Bolt driver
+# and to sqlite3 as a query parameter.
+_CODE_ENTITY_KINDS: frozenset[str] = frozenset(str(k) for k in (*CallableKind, *TypeDefKind))
 
 
 def _call_edge_weight(candidate_count: int, from_test: bool) -> float:
@@ -2976,12 +3002,20 @@ class GraphClient:
         }
 
     async def get_dead_code_candidates(self, project: str, path: str) -> list[dict[str, Any]]:
-        """Callables/TypeDefs with zero incoming CALLS edges — ``analyze_repo(analysis="dead_code")``."""
-        params: dict[str, Any] = {"project": project, "path": path}
+        """Invocable Callables/TypeDefs with zero incoming CALLS edges — ``analyze_repo(analysis="dead_code")``.
+
+        Restricted to ``_CODE_ENTITY_KINDS`` so that config/infra declarations
+        (Terraform resources, k8s objects, SQL tables, Dockerfile stages, CI
+        jobs, ...) do not swamp the result: they carry the same Callable/TypeDef
+        labels as real code but can never receive a CALLS edge, so a label-only
+        filter reports every one of them as dead.
+        """
+        params: dict[str, Any] = {"project": project, "path": path, "code_kinds": sorted(_CODE_ENTITY_KINDS)}
         pa = " AND n.file_path STARTS WITH $path" if path else ""
         return await self.execute(
             "MATCH (n {project_name: $project}) "
-            f"WHERE (n:Callable OR n:TypeDef) AND NOT n.name STARTS WITH '__'{pa} "
+            f"WHERE (n:Callable OR n:TypeDef) AND n.kind IN $code_kinds "
+            f"AND NOT n.name STARTS WITH '__'{pa} "
             "AND NOT ()-[:CALLS]->(n) "
             "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
             "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
