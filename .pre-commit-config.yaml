@@ -47,7 +47,15 @@ repos:
       - id: ty-check
         name: ty check
         language: system
-        entry: uv run ty check
+        # --no-sync is required, not cosmetic. A bare `uv run` re-syncs the
+        # environment as a side effect, which (a) makes a lint hook mutate the
+        # venv mid-commit, and (b) hard-fails whenever the project's own
+        # console script is locked by a running process — `atlas mcp` or
+        # `atlas daemon` holding Scripts/atlas.exe gives
+        # "failed to remove file ... (os error 32)" and the commit dies with
+        # the sync half-applied. A stale venv is a far better failure mode than
+        # a corrupted one; run `uv sync` deliberately, with the daemon stopped.
+        entry: uv run --no-sync ty check
         types: [python]
         pass_filenames: false
 
