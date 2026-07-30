@@ -1125,6 +1125,21 @@ async def _analyze_communities(
     try:
         raw = await graph.execute(query, params)
     except Exception as exc:
+        # MAGE raises rather than returning an empty result when Leiden partitions
+        # nothing — a sparse or tiny subgraph, not a deployment problem. Sending that
+        # user off to check their Docker image is a misleading diagnostic, so split
+        # the two cases on the procedure's own message.
+        if "no communities detected" in str(exc).lower():
+            return {
+                "analysis": "communities",
+                "project": project,
+                "communities": [],
+                "note": (
+                    "No communities detected — the subgraph has too little internal structure to "
+                    "partition (try a broader `path`, or check the project is fully indexed)."
+                ),
+                "query_ms": round((time.monotonic() - t0) * 1000, 1),
+            }
         return {
             "error": (
                 "Community detection unavailable: leiden_community_detection.get() is a MAGE query "

@@ -802,6 +802,33 @@ async def test_communities_groups_and_sorts_by_size_descending():
     assert "project(p)" in query
 
 
+async def test_communities_reports_an_unpartitionable_subgraph_as_empty_not_a_deployment_error():
+    """MAGE raises rather than returning empty when Leiden cannot partition.
+
+    Verified live against memgraph-mage:3.7.2 (see ADR-0017's Empirical Validation).
+    Reporting that as PROCEDURE_UNAVAILABLE sends the caller off to check their Docker
+    image when the real cause is a sparse subgraph, so the two must stay distinguished.
+    """
+    graph = MagicMock()
+    graph.execute = AsyncMock(side_effect=RuntimeError("leiden_community_detection.get: No communities detected."))
+
+    result = await analyze_repo(graph, "communities", "code-atlas")
+
+    assert result["communities"] == []
+    assert "code" not in result, "an unpartitionable subgraph is not an error condition"
+    assert "no communities detected" in result["note"].lower()
+
+
+async def test_communities_still_reports_a_missing_mage_procedure_as_an_error():
+    graph = MagicMock()
+    graph.execute = AsyncMock(side_effect=RuntimeError("Unknown procedure leiden_community_detection.get"))
+
+    result = await analyze_repo(graph, "communities", "code-atlas")
+
+    assert result["code"] == "PROCEDURE_UNAVAILABLE"
+    assert "memgraph-mage" in result["error"]
+
+
 async def test_communities_passes_the_numeric_weight_property_to_leiden():
     """MAGE reads a missing or non-numeric weight_property as 1.0 with no error, so
     an unweighted call and a mis-named one are indistinguishable from the result.

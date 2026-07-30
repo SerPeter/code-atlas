@@ -101,6 +101,35 @@ uniform 1.0.
 - Reciprocal CALLS pairs (`a→b` and `b→a`) still collapse under Leiden's undirected view, and which of the two weights
   survives is now observable where before both were 1.0.
 
+## Empirical Validation
+
+Verified live against `memgraph/memgraph-mage:3.7.2` rather than reasoned about, because every failure mode here is
+silent. A synthetic barbell graph (two 4-cliques joined by one bridge) was clustered four ways:
+
+| `weight_property` | communities | reads our weight? |
+| ----------------- | ----------- | ----------------- |
+| omitted           | 7           | **yes**           |
+| `"weight"`        | 7           | yes               |
+| `"confidence"`    | 2           | no — string       |
+| `"no_such_prop"`  | 2           | no — absent       |
+
+Two findings, one of which corrects a natural misreading of the Decision above:
+
+1. **The weighting genuinely takes effect.** Naming `weight` yields a different partition than naming a string or a
+   nonexistent property, which is the only way to prove the numeric value is read at all given the silent 1.0 fallback.
+   On a realistic graph (three 5-cliques joined by test-only edges at 0.25 against 1.0 intra-cluster) the weighted run
+   recovers exactly the three clusters, stably across repeated runs.
+2. **Passing `"weight"` explicitly is not what enabled this.** MAGE _defaults_ `weight_property` to the literal string
+   `"weight"`, so the pre-change `get(subgraph)` call was already reading a property of that name — it simply did not
+   exist, so every edge fell back to 1.0. The behavior change came from **writing** the property, not from passing the
+   argument. The explicit argument is retained for readability and because it documents the dependency, but it is
+   functionally redundant. The corollary is worth remembering: **any** numeric edge property named `weight` in this graph
+   is silently consumed by Leiden, whatever wrote it and whatever it was meant for.
+
+Also observed: `leiden_community_detection.get` **raises** `No communities detected` rather than returning an empty
+result when it cannot partition the subgraph (reproduced on the degenerate 0.01-vs-500 weight spread). `_analyze_communities`
+now distinguishes that from a genuinely missing procedure instead of advising the caller to check their Docker image.
+
 ## Alternatives Considered
 
 ### Reuse `confidence` as the weight property
