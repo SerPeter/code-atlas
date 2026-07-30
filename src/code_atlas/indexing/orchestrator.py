@@ -104,6 +104,69 @@ _DEFAULT_EXCLUDE: list[str] = [
     ".copilot/",
     # Code Atlas
     ".atlas/",
+    # Terraform provider cache — the .tf equivalent of node_modules, and now
+    # reachable because *.tf/*.hcl are indexable.
+    ".terraform/",
+    # Lock / generated manifests. Machine-written, enormous, and semantically
+    # empty; they exist here rather than being left to .gitignore because
+    # lockfiles are deliberately *committed*, so .gitignore never covers them.
+    # Only the ones whose suffix is now indexable can actually reach the
+    # scanner (package-lock.json, pnpm-lock.yaml, .terraform.lock.hcl); the
+    # rest are listed defensively so a future *.lock include cannot regress.
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "Cargo.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    ".terraform.lock.hcl",
+    "*.min.json",
+    # Secret-bearing files. This deny-list is a HARD BACKSTOP, not a convenience:
+    # widening the include list to *.yaml/*.json/*.toml/*.tfvars made files like
+    # secrets.yaml and gcp-key.json reachable by the scanner for the first time,
+    # and an indexed entity is also an *embedded* one — its content leaves the
+    # machine for the embedding API. Verified before this list existed:
+    # secrets.yaml, gcp-key.json, service-account.json, local.settings.json,
+    # terraform.tfvars and credentials.toml all passed is_included().
+    #
+    # .gitignore is NOT an adequate substitute. It is the usual place these are
+    # hidden, but atlas never reads .git/info/exclude or core.excludesFile, drops
+    # the repo-root .gitignore entirely when a monorepo sub-project is rooted in a
+    # subdirectory, and matches case-sensitively where git on Windows does not —
+    # so any of those alone re-exposes the file. Deny by name here regardless.
+    ".env",
+    ".env.*",
+    "*.env",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.keystore",
+    "*.jks",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".npmrc",
+    ".netrc",
+    ".pypirc",
+    "credentials",
+    "credentials.*",
+    "secrets.*",
+    "secret.*",
+    "*-secrets.*",
+    "*.secrets.*",
+    "service-account*.json",
+    "*-key.json",
+    "*.tfvars",
+    "*.tfvars.json",
+    "local.settings.json",
+    ".ssh/",
+    ".aws/",
+    ".gnupg/",
 ]
 
 _DEFAULT_INCLUDE: list[str] = [
@@ -142,7 +205,54 @@ _DEFAULT_INCLUDE: list[str] = [
     "*.php",
     # Markdown (documentation indexing)
     "*.md",
+    # Terraform / HCL
+    "*.tf",
+    "*.tfvars",
+    "*.hcl",
+    # Shell
+    "*.sh",
+    "*.bash",
+    "*.zsh",
+    # Container builds. Extensionless variants are dispatched by
+    # LanguageConfig.filenames, not by suffix — both casings are listed because
+    # pathspec matching is case-sensitive while filename dispatch lowercases
+    # the basename, so the registry key is always the lowercase form.
+    "*.dockerfile",
+    "*.containerfile",
+    "Dockerfile",
+    "dockerfile",
+    "Containerfile",
+    "containerfile",
+    # SQL
+    "*.sql",
+    # Structured config / data. Deliberately broad — see the volume note below.
+    "*.yaml",
+    "*.yml",
+    "*.json",
+    "*.toml",
+    "*.xml",
+    # Salesforce Apex. Registered ahead of the parser module so the scope
+    # plumbing lands once; until an apex language module exists these files
+    # pass is_included() but are dropped by scan()'s language-support gate.
+    "*.cls",
+    "*.trigger",
 ]
+
+# NOTE: the config/data globs above (*.yaml, *.yml, *.json, *.toml, *.xml) put
+# every committed config file in every repo into indexing scope by default. That
+# is a deliberate trade: those files carry real architectural signal (CI
+# pipelines, k8s manifests, compose topologies) that the graph cannot see
+# otherwise. The cost is bounded by three things and no more:
+#   1. .gitignore is always applied (_build_exclude_spec), so build output and
+#      test artefacts — the bulk of generated config noise — are already gone.
+#   2. Committed lockfiles, which .gitignore by definition does not cover, are
+#      excluded explicitly in _DEFAULT_EXCLUDE above.
+#   3. A parser that recognises no dialect in a file returns an empty
+#      ParsedFile, which creates no nodes and therefore no embeddings.
+# What remains is per-file scan + hash + one tree-sitter parse on first index
+# (amortised to a hash check afterwards), plus a larger denominator in the
+# delta_threshold ratio that decides full-vs-incremental reindex. Users who do
+# not want config indexed at all should set `[scope] include` in atlas.toml.
 
 # Directories to always skip during sub-project detection walk
 _DETECT_PRUNE_DIRS = frozenset(d.rstrip("/") for d in _DEFAULT_EXCLUDE if d.endswith("/"))

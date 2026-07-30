@@ -78,7 +78,19 @@ csharp = ["tree-sitter-c-sharp~=0.23"]
 cpp = ["tree-sitter-c~=0.24", "tree-sitter-cpp~=0.23"]
 ruby = ["tree-sitter-ruby~=0.23"]
 php = ["tree-sitter-php~=0.24"]
-all-languages = ["code-atlas-mcp[typescript,go,rust,java,csharp,cpp,ruby,php]"]
+terraform = ["tree-sitter-hcl~=1.2"]
+shell = ["tree-sitter-bash~=0.25"]
+# tree-sitter-containerfile, NOT tree-sitter-dockerfile — the latter ships no
+# Windows wheels.
+docker = ["tree-sitter-containerfile~=0.9"]
+sql = ["tree-sitter-sql~=0.3"]
+config = [
+    "tree-sitter-yaml~=0.7",
+    "tree-sitter-json~=0.24",
+    "tree-sitter-toml~=0.7",
+    "tree-sitter-xml~=0.7",
+]
+all-languages = ["code-atlas-mcp[typescript,go,rust,java,csharp,cpp,ruby,php,terraform,shell,docker,sql,config]"]
 
 [project.scripts]
 atlas = "code_atlas.cli:app"
@@ -156,16 +168,24 @@ allowed-unresolved-imports = [
     "opentelemetry.*.*.*.*",
     "opentelemetry.*.*.*.*.*",
     # tree-sitter grammars are optional extras — may not be installed.
+    "tree_sitter_bash",
     "tree_sitter_c",
+    "tree_sitter_containerfile",
     "tree_sitter_cpp",
     "tree_sitter_c_sharp",
     "tree_sitter_go",
+    "tree_sitter_hcl",
     "tree_sitter_java",
     "tree_sitter_javascript",
+    "tree_sitter_json",
     "tree_sitter_php",
     "tree_sitter_ruby",
     "tree_sitter_rust",
+    "tree_sitter_sql",
+    "tree_sitter_toml",
     "tree_sitter_typescript",
+    "tree_sitter_xml",
+    "tree_sitter_yaml",
 ]
 
 # --------------------------------------------------------------------------- #

@@ -589,6 +589,7 @@ class ASTConsumer(TierConsumer):
             source,
             project_name,
             max_source_chars=self.settings.index.max_source_chars,
+            max_parse_bytes=self.settings.index.max_parse_bytes,
             rationale=self.settings.rationale,
         )
         if parsed is None:

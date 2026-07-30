@@ -1,4 +1,4 @@
-"""Unit tests for parsing.ast — content hash formula (v4) contract."""
+"""Unit tests for parsing.ast — content hash formula (v4) contract, dispatch, parse_func contract."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import hashlib
 import json
 from typing import Any
 
-from code_atlas.parsing.ast import ParsedEntity, _compute_content_hash
+import pytest
+
+from code_atlas.parsing.ast import ParsedEntity, ParsedFile, _compute_content_hash
 from code_atlas.schema import NodeLabel
 
 
@@ -152,3 +154,245 @@ def test_rationale_settings_defaults_match_parser_defaults():
     assert settings.citation_schemes == list(DEFAULT_CITATION_SCHEMES)
     assert settings.enabled is True
     assert settings.tasks is False
+
+
+# ---------------------------------------------------------------------------
+# Filename dispatch
+#
+# get_language_for_file matched on suffix only, which made extensionless
+# formats unreachable: PurePosixPath("Dockerfile").suffix == "". Registering ""
+# as an extension is not an option — it would hijack LICENSE, Makefile and
+# every other extensionless file — so basenames get their own registry.
+# ---------------------------------------------------------------------------
+
+
+def test_language_config_filenames_defaults_to_empty():
+    """The field must default: LanguageConfig is frozen and all 9 pre-existing
+    modules construct it without a `filenames` argument."""
+    import tree_sitter_python as ts_python
+    from tree_sitter import Language, Query
+
+    from code_atlas.parsing.ast import LanguageConfig
+
+    lang = Language(ts_python.language())
+    config = LanguageConfig(
+        name="probe",
+        extensions=frozenset({".probe"}),
+        language=lang,
+        query=Query(lang, "(module) @root"),
+        parse_func=lambda path, source, root, project: ParsedFile(path, "probe", [], []),
+    )
+    assert config.filenames == frozenset()
+
+
+def test_filename_dispatch_routes_extensionless_file():
+    """Dockerfile has no suffix at all — it must still resolve, in any casing."""
+    pytest.importorskip("tree_sitter_containerfile", reason="tree-sitter-containerfile not installed")
+    from code_atlas.parsing.ast import get_language_for_file
+
+    for path in ("Dockerfile", "dockerfile", "build/Dockerfile", "deploy/prod/Containerfile"):
+        config = get_language_for_file(path)
+        assert config is not None, f"{path} did not resolve to a language"
+        assert config.name == "containerfile"
+
+
+def test_filename_dispatch_is_whole_basename_not_prefix():
+    """`dockerfile.txt` must NOT route to the container language.
+
+    Its basename is "dockerfile.txt" (absent from the filename registry) and its
+    suffix is ".txt" (absent from the extension registry), so it is unsupported.
+    """
+    from code_atlas.parsing.ast import get_language_for_file
+
+    assert get_language_for_file("dockerfile.txt") is None
+    assert get_language_for_file("Dockerfile.bak") is None
+    assert get_language_for_file("my-dockerfile") is None
+
+
+def test_filename_dispatch_does_not_capture_other_extensionless_files():
+    """The regression the empty-string extension would have caused."""
+    from code_atlas.parsing.ast import get_language_for_file
+
+    for path in ("LICENSE", "Makefile", "CODEOWNERS", ".gitignore", "src/Jenkinsfile"):
+        assert get_language_for_file(path) is None, f"{path} must not resolve"
+
+
+def test_filename_map_takes_precedence_over_extension_map(monkeypatch):
+    """Basename is checked before suffix, so a filename registration wins."""
+    from code_atlas.parsing import ast as ast_module
+    from code_atlas.parsing.ast import get_language_for_file
+
+    monkeypatch.setitem(ast_module._EXTENSION_MAP, ".conf", "ext-lang")
+    monkeypatch.setitem(ast_module._FILENAME_MAP, "special.conf", "name-lang")
+    monkeypatch.setitem(ast_module._LANGUAGES, "ext-lang", "EXT-SENTINEL")
+    monkeypatch.setitem(ast_module._LANGUAGES, "name-lang", "NAME-SENTINEL")
+
+    assert get_language_for_file("special.conf") == "NAME-SENTINEL"
+    assert get_language_for_file("other.conf") == "EXT-SENTINEL"
+
+
+def test_register_language_populates_both_maps():
+    """register_language must fill _FILENAME_MAP alongside _EXTENSION_MAP."""
+    import tree_sitter_python as ts_python
+    from tree_sitter import Language, Query
+
+    from code_atlas.parsing import ast as ast_module
+    from code_atlas.parsing.ast import LanguageConfig, register_language
+
+    lang = Language(ts_python.language())
+    config = LanguageConfig(
+        name="_probe_lang",
+        extensions=frozenset({".probeext"}),
+        language=lang,
+        query=Query(lang, "(module) @root"),
+        parse_func=lambda path, source, root, project: ParsedFile(path, "_probe_lang", [], []),
+        filenames=frozenset({"probefile"}),
+    )
+    try:
+        register_language(config)
+        assert ast_module._EXTENSION_MAP[".probeext"] == "_probe_lang"
+        assert ast_module._FILENAME_MAP["probefile"] == "_probe_lang"
+    finally:
+        ast_module._EXTENSION_MAP.pop(".probeext", None)
+        ast_module._FILENAME_MAP.pop("probefile", None)
+        ast_module._LANGUAGES.pop("_probe_lang", None)
+
+
+# ---------------------------------------------------------------------------
+# parse_func declining a file
+#
+# A handler returning None means "I have no dialect for this file", NOT
+# "unsupported language". The distinction is load-bearing: the AST consumer only
+# records a file hash for paths that produced a ParsedFile, so a None leaking
+# out of parse_file would keep the file outside the hash gate and re-parse it on
+# every indexing pass forever.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_func_returning_none_yields_empty_parsed_file(monkeypatch):
+    import tree_sitter_python as ts_python
+    from tree_sitter import Language, Query
+
+    from code_atlas.parsing import ast as ast_module
+    from code_atlas.parsing.ast import LanguageConfig, parse_file
+
+    lang = Language(ts_python.language())
+    config = LanguageConfig(
+        name="_declining",
+        extensions=frozenset({".declines"}),
+        language=lang,
+        query=Query(lang, "(module) @root"),
+        parse_func=lambda path, source, root, project: None,
+    )
+    monkeypatch.setitem(ast_module._LANGUAGES, "_declining", config)
+    monkeypatch.setitem(ast_module._EXTENSION_MAP, ".declines", "_declining")
+
+    parsed = parse_file("some/file.declines", b"whatever = 1\n", "test_project")
+
+    assert parsed is not None, "declining a file must not look like an unsupported language"
+    assert parsed.entities == []
+    assert parsed.relationships == []
+    assert parsed.file_path == "some/file.declines"
+    assert parsed.language == "_declining"
+
+
+def test_parse_file_still_returns_none_for_unregistered_extension():
+    """The None return stays reserved for 'no language registered'."""
+    from code_atlas.parsing.ast import parse_file
+
+    assert parse_file("data.csv", b"a,b\n1,2\n", "test_project") is None
+
+
+# ---------------------------------------------------------------------------
+# Pre-parse safety guard (_parse_hazard / _block_depth)
+#
+# Some grammars die NATIVELY on deeply-nested input — a scanner-buffer overflow
+# inside Parser.parse() that kills the process (Windows 0xC0000005, POSIX
+# SIGSEGV) with no Python exception to catch. Anything that could trigger that
+# must be exercised in a SUBPROCESS: an in-process assertion would take the
+# test runner down with it.
+# ---------------------------------------------------------------------------
+
+_CRASH_PROBE = """
+import sys
+from code_atlas.parsing.ast import parse_file
+src = sys.argv[1].encode() * int(sys.argv[2])
+parse_file(sys.argv[3], src + b"\n", "probe")
+print("SURVIVED")
+"""
+
+
+def _parse_in_subprocess(unit: str, repeat: int, path: str) -> int:
+    """Return the child's exit code. 0/1 are survivable; anything else is a native kill."""
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, "-c", _CRASH_PROBE, unit, str(repeat), path],
+        capture_output=True,
+        check=False,
+    ).returncode
+
+
+@pytest.mark.parametrize(
+    ("unit", "path"),
+    [
+        (">", "deep.md"),  # blockquote, marker-only line
+        ("> ", "deep.md"),  # blockquote with padding
+        ("- ", "deep.yaml"),  # block sequence, marker-only line
+        ("- ", "deep.md"),  # nested list, marker-only line
+    ],
+)
+def test_marker_only_lines_cannot_kill_the_process(unit: str, path: str):
+    """Regression: `_prefix_shape` folds marker bytes into its `columns` return,
+    so a line of PURE markers satisfies `columns == len(line)` exactly like a
+    blank line does. Skipping those scored them depth 0 and handed the very
+    inputs the guard's own measurements list as native kills straight through
+    to Parser.parse(). Reproduced as exit 3221225477 before the fix.
+    """
+    assert _parse_in_subprocess(unit, 400, path) in (0, 1), (
+        f"{unit!r} x400 in {path} killed the interpreter — the pre-parse guard was bypassed"
+    )
+
+
+def test_deeply_indented_block_nesting_is_refused_not_crashed():
+    from code_atlas.parsing.ast import MAX_BLOCK_DEPTH, _block_depth, _parse_hazard
+
+    src = b"\n".join(b" " * i + b"k:" for i in range(MAX_BLOCK_DEPTH + 10)) + b"\n"
+    assert _block_depth(src) >= MAX_BLOCK_DEPTH
+    assert _parse_hazard(src, 0) is not None
+
+
+def test_guard_leaves_ordinary_files_alone():
+    """The guard must not be implemented by refusing everything."""
+    from code_atlas.parsing.ast import _parse_hazard
+
+    ordinary = [
+        b"apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n",
+        b"[project]\nname = 'x'\n[tool.ruff.lint.per-file-ignores]\n'a.py' = ['E1']\n",
+        b'{"a": {"b": {"c": {"d": 1}}}}\n',
+        b"# Title\n\n- one\n  - two\n    - three\n\n> quoted\n",
+    ]
+    for src in ordinary:
+        assert _parse_hazard(src, 0) is None, f"guard wrongly refused: {src[:40]!r}"
+
+
+def test_size_ceiling_refuses_oversized_input():
+    from code_atlas.parsing.ast import _parse_hazard
+
+    assert _parse_hazard(b"x" * 2048, 1024) is not None
+    assert _parse_hazard(b"x" * 512, 1024) is None
+    assert _parse_hazard(b"x" * 99_999, 0) is None, "0 must disable the ceiling"
+
+
+def test_max_parse_bytes_is_actually_threaded_from_settings():
+    """A guard limit that is configurable but never passed to the call site is
+    no guard at all. `[rationale]` shipped exactly that bug earlier in this same
+    release — settings block defined, never handed to parse_file.
+    """
+    import inspect
+
+    from code_atlas.indexing.consumers import ASTConsumer
+
+    src = inspect.getsource(ASTConsumer._parse_file)
+    assert "max_parse_bytes=" in src, "IndexSettings.max_parse_bytes is defined but never reaches parse_file"

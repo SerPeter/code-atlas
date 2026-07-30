@@ -7,6 +7,7 @@ import subprocess
 import time
 from typing import TYPE_CHECKING
 
+import pathspec
 import pytest
 
 from code_atlas.indexing import orchestrator as orchestrator_module
@@ -23,6 +24,8 @@ from code_atlas.indexing.orchestrator import (
     gc_vanished_worktree_projects,
     scan_files,
 )
+from code_atlas.parsing.ast import _EXTENSION_MAP, _FILENAME_MAP
+from code_atlas.parsing.languages import discover_plugins
 from code_atlas.settings import AtlasSettings, ScopeSettings, derive_project_name, resolve_git_dir
 
 if TYPE_CHECKING:
@@ -72,7 +75,10 @@ class TestScanFiles:
         assert "lib/utils.py" in result
 
     def test_ignores_unsupported_files(self, tmp_path):
-        _write(tmp_path, "data.json", "{}")
+        # NOTE: .json used to be the example of an unsupported file here. It is
+        # now indexable (structured-config support), so the example moved to
+        # extensions no parser claims.
+        _write(tmp_path, "data.csv", "a,b\n1,2\n")
         _write(tmp_path, "image.png", "")
         _write(tmp_path, "app.py", "x = 1")
         _write(tmp_path, "readme.md", "# Hello")
@@ -324,20 +330,185 @@ class TestScanFiles:
     def test_extend_include_adds_patterns(self, tmp_path):
         """extend_include adds to default include patterns."""
         _write(tmp_path, "app.py", "x = 1")
-        _write(tmp_path, "config.yaml", "key: val")
+        _write(tmp_path, "data.csv", "a,b\n1,2\n")
 
-        # .yaml is not in _DEFAULT_INCLUDE, but extend_include adds it
-        # config.yaml has no language parser so scan() won't return it,
-        # but is_included() should pass it through
-        scope = FileScope(tmp_path, _make_settings(tmp_path, extend_include=["*.yaml"]))
-        assert scope.is_included("config.yaml") is True
+        # .csv is not in _DEFAULT_INCLUDE, but extend_include adds it.
+        # data.csv has no language parser so scan() won't return it, but
+        # is_included() should pass it through. (This used to use *.yaml, which
+        # became a default include when structured-config support landed and so
+        # no longer proved anything.)
+        scope = FileScope(tmp_path, _make_settings(tmp_path, extend_include=["*.csv"]))
+        assert scope.is_included("data.csv") is True
         assert scope.is_included("app.py") is True
 
-    def test_default_include_covers_common_extensions(self, tmp_path):
-        """_DEFAULT_INCLUDE covers all common source extensions."""
-        expected_extensions = [".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".cs", ".rb", ".md"]
-        for ext in expected_extensions:
-            assert any(pat.endswith(ext) for pat in _DEFAULT_INCLUDE), f"{ext} missing from _DEFAULT_INCLUDE"
+    def test_default_include_covers_every_registered_language(self):
+        """_DEFAULT_INCLUDE must cover every extension and filename in the parser registry.
+
+        This is the guard against the project's sharpest silent-failure mode.
+        Two registries decide whether a file is ever indexed, and they are
+        maintained by hand in different files:
+
+          * ``_DEFAULT_INCLUDE`` (here)   — the scope allowlist
+          * ``_EXTENSION_MAP``/``_FILENAME_MAP`` (parsing.ast) — the parser registry
+
+        ``FileScope.scan`` consults both, but the live ``FileWatcher`` consults
+        only the allowlist. So registering a language without adding its globs
+        here yields a parser that never runs: no error, no warning at INFO, the
+        files simply never appear.
+
+        Asserted as a superset, not equality — ``_DEFAULT_INCLUDE`` legitimately
+        carries patterns with no registered parser (Apex ``*.cls``/``*.trigger``
+        are plumbed ahead of their module).
+
+        The probe is behavioural rather than a string-set comparison: it compiles
+        the real PathSpec and asks it about a synthetic path per registry entry.
+        That way non-``*.ext`` patterns (bare ``Dockerfile``) and pathspec's
+        case-sensitivity are exercised as the scanner actually experiences them.
+
+        Note this can only under-report: a grammar missing from the venv keeps
+        its extension out of the registry, so the assertion passes. It fails
+        loudly in the dev venv and in CI, where all grammars are installed.
+        """
+        discover_plugins()
+        assert _EXTENSION_MAP, "language registry is empty — discover_plugins() did not run"
+
+        spec = pathspec.PathSpec.from_lines("gitignore", _DEFAULT_INCLUDE)
+        # {probe path: what it represents in the failure message}
+        probes = {f"probe{ext}": ext for ext in _EXTENSION_MAP}
+        probes.update({filename: f"filename {filename!r}" for filename in _FILENAME_MAP})
+
+        missing = sorted(label for probe, label in probes.items() if not spec.match_file(probe))
+        assert not missing, (
+            f"registered by a parser but not matched by _DEFAULT_INCLUDE: {missing}. "
+            "Files with these extensions are silently never scanned and never watched. "
+            "Add the matching glob(s) to _DEFAULT_INCLUDE in indexing/orchestrator.py."
+        )
+
+    def test_default_include_covers_new_config_and_infra_extensions(self):
+        """Pin the extensions this release added, independent of what happens to register."""
+        spec = pathspec.PathSpec.from_lines("gitignore", _DEFAULT_INCLUDE)
+        for ext in (".tf", ".tfvars", ".hcl", ".sh", ".bash", ".zsh", ".sql", ".cls", ".trigger"):
+            assert spec.match_file(f"probe{ext}"), f"{ext} missing from _DEFAULT_INCLUDE"
+        for ext in (".yaml", ".yml", ".json", ".toml", ".xml"):
+            assert spec.match_file(f"probe{ext}"), f"{ext} missing from _DEFAULT_INCLUDE"
+        # Extensionless container builds, in the casings that occur in the wild.
+        for name in ("Dockerfile", "dockerfile", "Containerfile", "containerfile"):
+            assert spec.match_file(name), f"{name} missing from _DEFAULT_INCLUDE"
+        assert spec.match_file("build/Dockerfile"), "Dockerfile must match at any depth"
+
+    def test_secret_bearing_files_are_denied_by_name(self):
+        """Hard backstop: an indexed entity is an *embedded* one, so its content
+        leaves the machine for the embedding API. Widening the include list to
+        *.yaml/*.json/*.toml/*.tfvars made these reachable for the first time —
+        before this deny-list, every name below passed is_included().
+
+        .gitignore is not an adequate substitute: atlas never reads
+        .git/info/exclude or core.excludesFile, drops the repo-root .gitignore
+        when a monorepo sub-project is rooted in a subdirectory, and matches
+        case-sensitively where git on Windows does not.
+        """
+        spec = pathspec.PathSpec.from_lines("gitignore", _DEFAULT_EXCLUDE)
+        for secret in (
+            ".env",
+            ".env.local",
+            "prod.env",
+            "secrets.yaml",
+            "app-secrets.yaml",
+            "gcp-key.json",
+            "service-account.json",
+            "local.settings.json",
+            "credentials.toml",
+            "terraform.tfvars",
+            "id_rsa",
+            "id_ed25519",
+            "server.pem",
+            "private.key",
+            "store.p12",
+            ".npmrc",
+            ".netrc",
+            ".pypirc",
+            ".aws/credentials",
+            ".ssh/id_ed25519",
+        ):
+            assert spec.match_file(secret), f"{secret} is NOT denied — secrets would be indexed and embedded"
+
+    def test_secret_deny_list_does_not_swallow_ordinary_config(self):
+        """The deny-list must not be so broad it defeats the config parsers."""
+        spec = pathspec.PathSpec.from_lines("gitignore", _DEFAULT_EXCLUDE)
+        for benign in (
+            "values-prod.yaml",
+            "tsconfig.json",
+            "pyproject.toml",
+            "main.tf",
+            "docker-compose.yml",
+            "k8s/deployment.yaml",
+            "package.json",
+            ".github/workflows/ci.yml",
+        ):
+            assert not spec.match_file(benign), f"{benign} wrongly denied — config parsing would never see it"
+
+    def test_lockfiles_excluded_but_real_manifests_are_not(self):
+        """Committed lockfiles must not ride in on the new *.json/*.yaml includes.
+
+        .gitignore covers most generated config, but lockfiles are deliberately
+        committed, so only _DEFAULT_EXCLUDE can keep them out.
+        """
+        spec = pathspec.PathSpec.from_lines("gitignore", _DEFAULT_EXCLUDE)
+        for locked in (
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "poetry.lock",
+            "uv.lock",
+            "Cargo.lock",
+            "composer.lock",
+            "Gemfile.lock",
+            ".terraform.lock.hcl",
+            "bundle.min.json",
+            "frontend/package-lock.json",
+        ):
+            assert spec.match_file(locked), f"{locked} should be excluded"
+
+        # Hand-written manifests carry real signal and must survive.
+        for kept in ("package.json", "pyproject.toml", "docker-compose.yml", "infra/main.tf"):
+            assert not spec.match_file(kept), f"{kept} must NOT be excluded"
+
+    def test_terraform_provider_cache_is_pruned(self):
+        """.terraform/ is the .tf equivalent of node_modules — vendored provider schemas."""
+        assert ".terraform/" in _DEFAULT_EXCLUDE
+        assert ".terraform" in orchestrator_module._DETECT_PRUNE_DIRS
+
+    def test_scan_surfaces_filename_dispatched_dockerfile(self, tmp_path):
+        """End-to-end proof the two-registry trap is closed for an extensionless file.
+
+        scan() applies the allowlist AND the parser registry, so a Dockerfile
+        coming back from here means both halves agree.
+        """
+        pytest.importorskip("tree_sitter_containerfile", reason="tree-sitter-containerfile not installed")
+        _write(tmp_path, "Dockerfile", "FROM alpine:3\nRUN echo hi\n")
+        # NOT "build/" — that is a _DEFAULT_EXCLUDE directory and would be pruned.
+        _write(tmp_path, "docker/api.dockerfile", "FROM alpine:3\n")
+        _write(tmp_path, "notes.txt", "not indexable")
+
+        result = scan_files(tmp_path, _make_settings(tmp_path))
+
+        assert "Dockerfile" in result
+        assert "docker/api.dockerfile" in result
+        assert "notes.txt" not in result
+
+    def test_scan_skips_extension_registered_without_a_parser(self, tmp_path):
+        """Apex is in the allowlist but has no module yet — scan()'s second gate drops it.
+
+        Documents the accepted cost of plumbing an extension early: the file
+        passes is_included() (so the watcher will publish events for it) but
+        produces nothing until an apex language module lands.
+        """
+        _write(tmp_path, "Foo.cls", "public class Foo {}")
+
+        scope = FileScope(tmp_path, _make_settings(tmp_path))
+        assert scope.is_included("Foo.cls") is True
+        assert scan_files(tmp_path, _make_settings(tmp_path)) == []
 
     def test_gitignore_applied_with_custom_exclude(self, tmp_path):
         """.gitignore still works when exclude overrides defaults."""

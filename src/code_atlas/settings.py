@@ -409,6 +409,13 @@ class IndexSettings(BaseModel):
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
     )
     max_source_chars: int = Field(default=2000, description="Max characters for entity source text (0 to disable).")
+    max_parse_bytes: int = Field(
+        default=1_048_576,
+        description="Skip files larger than this many bytes instead of parsing them (0 disables the ceiling). "
+        "Tree-sitter error recovery is superlinear, so one committed dump can stall indexing: an unparseable "
+        "T-SQL dump measured 5s at 1 MiB, 45s at 2 MiB and 4min at 4 MiB. Must stay in sync with "
+        "parsing.ast.DEFAULT_MAX_PARSE_BYTES (asserted by a unit test).",
+    )
     file_hash_gate: bool = Field(default=True, description="Skip files whose content hash hasn't changed.")
     strip_whitespace: bool = Field(
         default=True, description="Normalize whitespace before hashing (ignores formatting-only changes)."

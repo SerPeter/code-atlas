@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
 from tree_sitter import Language, Parser, Query
 
 from code_atlas.schema import NodeLabel, RelType, Visibility
@@ -90,7 +91,23 @@ class LanguageConfig:
     extensions: frozenset[str]
     language: Language
     query: Query
-    parse_func: Callable[[str, bytes, Node, str], ParsedFile]
+    parse_func: Callable[[str, bytes, Node, str], ParsedFile | None]
+    """Handler for a matched file.
+
+    Returning ``None`` means "this handler declines the file" — the framework
+    turns that into an *empty* ``ParsedFile`` rather than propagating ``None``.
+    See ``parse_file`` for why declining must not look like an unsupported
+    language.
+    """
+    filenames: frozenset[str] = frozenset()
+    """Exact basenames claimed by this language, lowercased, e.g. ``{"dockerfile"}``.
+
+    For formats identified by filename rather than extension. Checked before
+    ``extensions`` (see ``get_language_for_file``), because such files have no
+    usable suffix — ``PurePosixPath("Dockerfile").suffix`` is ``""``, and
+    registering ``""`` as an extension would hijack every extensionless file in
+    the repo (LICENSE, Makefile, .gitignore, ...).
+    """
     comment_node_types: frozenset[str] = frozenset()
     """Tree-sitter node types that hold comments, e.g. ``frozenset({"comment"})``.
 
@@ -102,6 +119,7 @@ class LanguageConfig:
 
 _LANGUAGES: dict[str, LanguageConfig] = {}
 _EXTENSION_MAP: dict[str, str] = {}
+_FILENAME_MAP: dict[str, str] = {}
 
 
 def register_language(config: LanguageConfig) -> None:
@@ -109,10 +127,17 @@ def register_language(config: LanguageConfig) -> None:
     _LANGUAGES[config.name] = config
     for ext in config.extensions:
         _EXTENSION_MAP[ext] = config.name
+    for filename in config.filenames:
+        _FILENAME_MAP[filename] = config.name
 
 
 def get_language_for_file(path: str) -> LanguageConfig | None:
-    """Look up language config by file extension.
+    """Look up language config by exact basename, then by file extension.
+
+    Basename wins so that extensionless formats (``Dockerfile``,
+    ``Containerfile``) are reachable at all. It is a *whole-basename* match, so
+    ``dockerfile.txt`` does not route to the container language — that file's
+    basename is ``dockerfile.txt`` and its suffix is ``.txt``.
 
     Triggers plugin discovery on first call so that built-in and
     external languages are available.
@@ -121,8 +146,10 @@ def get_language_for_file(path: str) -> LanguageConfig | None:
 
     discover_plugins()
 
-    suffix = PurePosixPath(path).suffix.lower()
-    lang_name = _EXTENSION_MAP.get(suffix)
+    posix_path = PurePosixPath(path)
+    lang_name = _FILENAME_MAP.get(posix_path.name.lower())
+    if lang_name is None:
+        lang_name = _EXTENSION_MAP.get(posix_path.suffix.lower())
     if lang_name is None:
         return None
     return _LANGUAGES.get(lang_name)
@@ -439,6 +466,159 @@ def _resolve_rationale_markers(rationale: RationaleSettings | None) -> tuple[tup
 
 
 # ---------------------------------------------------------------------------
+# Pre-parse safety guard
+#
+# Some tree-sitter grammars die *natively* on pathological input — a C stack /
+# scanner-buffer overflow inside ``Parser.parse()`` that takes the whole process
+# down (Windows 0xC0000005, POSIX SIGSEGV). There is no Python exception to
+# catch and no language handler involved: the kill happens before ``parse_func``
+# is ever called, so the only place this can be stopped is here, on the raw
+# bytes.
+#
+# Measured on this repo's pinned grammars (binary search, one subprocess per
+# probe; "last ok" / "first crash" nesting depth):
+#
+#   NATIVE KILL (0xC0000005) inside Parser.parse() — no traceback, process dies:
+#     yaml   block map, 1-space indent      253 / 256
+#     yaml   block map, 2-space indent      253 / 256
+#     yaml   block seq inline "- - - x"     253 / 256
+#     yaml   block seq, newline+indent      250 / 253   <-- lowest observed
+#     md     nested list (indented)         253 / 256
+#     md     blockquote "> > > x"           253 / 256
+#     md     blockquote ">>>x"              253 / 256
+#     md     ordered list "1. 1. 1. x"      253 / 256
+#     md     list inline "- - -" / "* * *"  253 / 256
+#
+#   RECOVERABLE RecursionError raised by the Python handler *after* parse()
+#   returned fine — caught in parse_file, see the try block there:
+#     yaml flow map/seq 490/493 · bash $( ) 496/500 · bash subshell + if 990/993
+#     python indentation 496/500 · rust parens 990/993 · json 9590/9593 (object)
+#     and 11321/11325 (array)
+#
+#   No failure up to depth 25600: xml, toml (array + inline table), hcl (list +
+#   block), sql (parens + subqueries), python/ts/go/cpp/java/ruby/php parens,
+#   markdown emphasis/link/inline-html.
+#
+# The uniform 256 for every yaml/markdown *block* construct is the external
+# scanner's fixed serialization buffer overflowing, not C recursion — which is
+# why *block* depth, not bracket depth or file size, is the thing to bound here.
+# Bracket nesting never killed the process at any depth up to 25600: tree-sitter's
+# core parser is iterative, so that whole family only ever surfaces as a
+# RecursionError from a handler's own walk, and is handled by catching it in
+# parse_file rather than by a byte heuristic (which would have to reject
+# legitimate files — minified JS in site-packages measures bracket depth 270).
+# ---------------------------------------------------------------------------
+
+MAX_BLOCK_DEPTH = 64
+"""Refuse input whose estimated indentation/marker block nesting reaches this.
+
+The estimate counts *levels*, and one level can open two grammar blocks (a YAML
+block sequence plus the mapping inside it), so the real tree depth at the
+refusal point is at most ~128 — still half the 250 that kills the process.
+Measured the other way: over 8017 real files in this repo plus its
+site-packages, the deepest estimate is 5.
+
+Deliberately not configurable — raising it re-arms a process kill.
+"""
+
+DEFAULT_MAX_PARSE_BYTES = 1_048_576
+"""Default ceiling on file size handed to tree-sitter. Mirrored by
+``IndexSettings.max_parse_bytes`` — see that field for the timing curve."""
+
+# Cheap C-speed pre-filter for _block_depth. A line's leading run of block
+# markers — indentation columns, blockquote '>', list bullets "- "/"* "/"+ ",
+# ordered-list "1. "/"1) " — must be at least MAX_BLOCK_DEPTH - 1 units long
+# before the exact scan can possibly reach the limit: levels have strictly
+# increasing indentation, so the deepest line carries one column per enclosing
+# level, plus its own markers. Real files almost never trip it (9 of 8017), so
+# the Python scan below effectively never runs.
+_PREFIX_UNIT = r"(?:[ \t>]|[-*+][ \t]|[0-9]{1,9}[.)][ \t])"
+
+# ``(?=\S)`` skips lines that are only padding whitespace — they open no block.
+# "> " * 300 is still caught: the engine backtracks one unit and the final ">"
+# satisfies the lookahead.
+_DEEP_PREFIX_RE = re.compile(("(?m)^" + _PREFIX_UNIT + "{" + str(MAX_BLOCK_DEPTH - 1) + ",}(?=\\S)").encode())
+
+_SPACE_TAB = (0x20, 0x09)
+_BULLETS = (0x2D, 0x2A, 0x2B)  # - * +
+_ORDERED_SEPS = (0x2E, 0x29)  # . )
+
+
+def _prefix_shape(line: bytes) -> tuple[int, int]:
+    """Measure a line's leading block-marker run: ``(columns, marker count)``.
+
+    Stops at the first byte that cannot open a block, so ``"  - foo"`` is
+    ``(4, 1)`` and ``"----------"`` (a horizontal rule, no space after the
+    dash) is ``(0, 0)``.
+    """
+    i = 0
+    markers = 0
+    n = len(line)
+    while i < n:
+        char = line[i]
+        if char in _SPACE_TAB:
+            i += 1
+        elif char == 0x3E:  # '>' blockquote
+            i += 1
+            markers += 1
+        elif char in _BULLETS and i + 1 < n and line[i + 1] in _SPACE_TAB:
+            i += 2
+            markers += 1
+        elif 0x30 <= char <= 0x39:  # ordered list "12. "
+            end = i
+            while end < n and 0x30 <= line[end] <= 0x39:
+                end += 1
+            if end + 1 < n and line[end] in _ORDERED_SEPS and line[end + 1] in _SPACE_TAB:
+                i = end + 2
+                markers += 1
+            else:
+                break
+        else:
+            break
+    return i, markers
+
+
+def _block_depth(source: bytes) -> int:
+    """Estimate the deepest indentation/marker block nesting in *source*.
+
+    Offside-rule accounting: a line's indentation closes every enclosing level
+    at or beyond its own column and opens one of its own, and each marker on
+    the line opens one more (``"> > > x"`` nests three blockquotes on a single
+    line). Counting *levels* rather than columns is what keeps an aligned
+    continuation line or a wide ASCII diagram — one deep line with no staircase
+    under it — from reading as deep nesting.
+    """
+    deepest = 0
+    levels: list[int] = []
+    for line in source.splitlines():
+        columns, markers = _prefix_shape(line)
+        if markers == 0 and columns == len(line):
+            # Whitespace-only: opens nothing. The `markers == 0` half is
+            # load-bearing — `_prefix_shape` folds marker bytes into `columns`,
+            # so a line that is ENTIRELY markers (`">" * 400`, `"- " * 400`)
+            # also satisfies `columns == len(line)` while opening one block per
+            # marker. Skipping those scored them 0 and handed the exact inputs
+            # this guard exists to stop straight to a native process kill.
+            continue
+        while levels and columns <= levels[-1]:
+            levels.pop()
+        levels.append(columns)
+        deepest = max(deepest, len(levels) + markers)
+    return deepest
+
+
+def _parse_hazard(source: bytes, max_parse_bytes: int) -> str | None:
+    """Return why *source* must not be handed to tree-sitter, or ``None`` if it is safe."""
+    if 0 < max_parse_bytes < len(source):
+        return f"{len(source)} bytes exceeds max_parse_bytes={max_parse_bytes}"
+    if _DEEP_PREFIX_RE.search(source) is not None:
+        depth = _block_depth(source)
+        if depth >= MAX_BLOCK_DEPTH:
+            return f"block nesting depth {depth} reaches the limit of {MAX_BLOCK_DEPTH}"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Core parse function
 # ---------------------------------------------------------------------------
 
@@ -449,16 +629,21 @@ def parse_file(
     project_name: str,
     *,
     max_source_chars: int = 2000,
+    max_parse_bytes: int = DEFAULT_MAX_PARSE_BYTES,
     rationale: RationaleSettings | None = None,
 ) -> ParsedFile | None:
     """Parse a source file and extract entities + relationships.
 
     Returns ParsedFile with entities mapped to schema labels/kinds,
-    qualified names built from file path + nesting. Returns None if
-    the language is not supported.
+    qualified names built from file path + nesting. Returns None when the file
+    cannot be parsed at all — either no language is registered for it, or the
+    pre-parse guard refused it (see ``_parse_hazard``).
 
     ``max_source_chars`` caps the ``source`` field on each entity.
     Set to 0 to disable source extraction entirely.
+
+    ``max_parse_bytes`` caps the file size handed to tree-sitter; 0 disables the
+    ceiling. Wired from ``IndexSettings.max_parse_bytes``.
 
     ``rationale`` configures intent-comment extraction; ``None`` uses the
     shipped defaults (NOTE/WHY/HACK plus ADR/RFC citations, no TODO/FIXME).
@@ -467,10 +652,41 @@ def parse_file(
     if lang_config is None:
         return None
 
+    hazard = _parse_hazard(source, max_parse_bytes)
+    if hazard is not None:
+        # None, not an empty ParsedFile: unlike a handler declining a dialect,
+        # nothing here was parsed, so this file's existing graph entities must
+        # not be diffed away. The re-parse-every-pass cost the empty-ParsedFile
+        # path exists to avoid is nil in this case — the guard is a linear byte
+        # scan over a source the hash gate has already read.
+        logger.warning("parse: refusing {} — {}", path, hazard)
+        return None
+
     parser = Parser(lang_config.language)
     tree = parser.parse(source)
 
-    result = lang_config.parse_func(path, source, tree.root_node, project_name)
+    try:
+        result = lang_config.parse_func(path, source, tree.root_node, project_name)
+    except RecursionError:
+        # Handlers walk the tree recursively, so nesting the byte guard cannot
+        # see — keyword blocks ("if/then/fi" 993 deep), bracket chains (490+) —
+        # exhausts the interpreter stack instead of the scanner buffer. Left
+        # uncaught this is a poison pill: the AST consumer's batch handler
+        # catches it, logs "batch failed, will retry", and retries the same file
+        # forever. Same clean skip as the pre-parse refusal.
+        logger.warning("parse: refusing {} — handler recursion limit exceeded", path)
+        return None
+
+    if result is None:
+        # A handler declining a file (e.g. the config parser meeting a generic
+        # YAML blob it has no dialect for) must NOT surface as "unsupported
+        # language": the AST consumer only records a file hash for files that
+        # produced a ParsedFile (consumers.py step 6), so returning None from
+        # here would leave the file permanently outside the hash gate and force
+        # a re-read + re-parse on every single indexing pass. An empty
+        # ParsedFile creates no nodes and no embeddings, but does get hashed —
+        # so the cost of a declined file amortises to zero after the first pass.
+        result = ParsedFile(file_path=path, language=lang_config.name, entities=[], relationships=[])
 
     entities = result.entities
     if lang_config.comment_node_types:
