@@ -29,4 +29,4 @@ need it instead of reading it here.
 
 Phases 0–1 of the knowledge-convergence architecture are implemented (vault parsing, schema, search integration).
 Capture tooling (`remember`), anchor staleness, and dream-mode consolidation are not built yet — see
-`.tasks/research/2026-07-11-knowledge-convergence-architecture.md` for the full roadmap.
+`.specs/research/2026-07-11-knowledge-convergence-architecture.md` for the full roadmap.

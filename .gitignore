@@ -51,7 +51,7 @@ docker-compose.override.yml
 # Agent-specific
 # =============================================================================
 .claude/settings.local.json
-.tasks/
+.specs/
 CLAUDE.local.md
 
 # =============================================================================
