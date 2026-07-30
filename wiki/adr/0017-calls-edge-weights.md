@@ -123,12 +123,13 @@ Two findings, one of which corrects a natural misreading of the Decision above:
    `"weight"`, so the pre-change `get(subgraph)` call was already reading a property of that name — it simply did not
    exist, so every edge fell back to 1.0. The behavior change came from **writing** the property, not from passing the
    argument. The explicit argument is retained for readability and because it documents the dependency, but it is
-   functionally redundant. The corollary is worth remembering: **any** numeric edge property named `weight` in this graph
-   is silently consumed by Leiden, whatever wrote it and whatever it was meant for.
+   functionally redundant. The corollary is worth remembering: **any** numeric edge property named `weight` in this
+   graph is silently consumed by Leiden, whatever wrote it and whatever it was meant for.
 
 Also observed: `leiden_community_detection.get` **raises** `No communities detected` rather than returning an empty
-result when it cannot partition the subgraph (reproduced on the degenerate 0.01-vs-500 weight spread). `_analyze_communities`
-now distinguishes that from a genuinely missing procedure instead of advising the caller to check their Docker image.
+result when it cannot partition the subgraph (reproduced on the degenerate 0.01-vs-500 weight spread).
+`_analyze_communities` now distinguishes that from a genuinely missing procedure instead of advising the caller to check
+their Docker image.
 
 ## Alternatives Considered
 
