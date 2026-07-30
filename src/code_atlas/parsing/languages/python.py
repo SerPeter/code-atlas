@@ -1462,5 +1462,6 @@ register_language(
         language=_PY_LANGUAGE,
         query=_PY_QUERY,
         parse_func=_parse_python,
+        comment_node_types=frozenset({"comment"}),
     )
 )

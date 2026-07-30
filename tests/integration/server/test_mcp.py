@@ -1351,3 +1351,89 @@ class TestBlastRadius:
     async def test_invalid_direction(self, app_ctx, seeded_traversal_graph):
         result = await _invoke_tool(app_ctx, "blast_radius", uid=f"{_TRAVERSAL_PROJECT}:mod.a", direction="sideways")
         assert result["code"] == "INVALID_DIRECTION"
+
+
+# ---------------------------------------------------------------------------
+# module_summary / summarize_module (Track B — whole-module graph summary)
+# ---------------------------------------------------------------------------
+
+
+class TestModuleSummary:
+    """Exercises the Cypher in GraphClient.get_module_summary against a real
+    Memgraph — the formatting itself is covered by tests/unit/server/test_analysis.py.
+    """
+
+    async def test_skeleton_lists_entities_with_signatures_and_first_doc_line(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="mypkg/models.py")
+
+        outline = result["outline"]
+        assert result["analysis"] == "module_summary"
+        assert result["modules"] == ["mypkg.models"]
+        assert result["entity_count"] == 3
+        assert "mypkg.models (mypkg/models.py)" in outline
+        assert "+ class User(Base) L22-45  # User model." in outline
+        # Base has no stored signature — the outline falls back to kind + name.
+        assert "+ class Base L5-20  # Base model class." in outline
+        # save is DEFINEd by User, so it is indented under it.
+        assert "    + def save(self) -> None L30-40  # Save the user." in outline
+        # No bodies, no source.
+        assert "return" not in outline
+
+    async def test_internal_inherits_edge_is_reported(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="mypkg/models.py")
+
+        assert "INHERITS" in result["outline"]
+        assert "User > Base" in result["outline"]
+
+    async def test_boundary_separates_fan_in_from_fan_out(self, app_ctx, seeded_analysis_graph):
+        """The boundary is the part get_context cannot give you: mypkg.utils
+        imports models.Base (in), models imports utils.helper and an external
+        symbol (out).
+        """
+        result = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="mypkg/models.py")
+
+        outline = result["outline"]
+        assert "FAN-IN" in outline
+        assert "Base < mypkg.utils" in outline
+        assert "FAN-OUT" in outline
+        assert "mypkg.utils.helper" in outline
+        # External targets carry the * marker (ExternalSymbol has no file_path).
+        assert "ext/dataclasses.dataclass*" in outline
+        assert result["fan_in_count"] >= 1
+        assert result["fan_out_count"] >= 2
+
+    async def test_package_scope_covers_every_module_under_it(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="mypkg/")
+
+        assert set(result["modules"]) == {"mypkg.models", "mypkg.utils", "mypkg.sub.api"}
+        # Whole package in scope, so the CALLS edge between two of its modules
+        # is internal rather than boundary.
+        assert "CALLS" in result["outline"]
+        assert "sub.api.handle_request > utils.helper" in result["outline"]
+
+    async def test_unknown_path_is_not_found(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="nosuchpkg/")
+
+        assert result["code"] == "NOT_FOUND"
+
+    async def test_missing_path_is_path_required(self, app_ctx, seeded_analysis_graph):
+        result = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="")
+
+        assert result["code"] == "PATH_REQUIRED"
+
+    async def test_shortcut_matches_analyze_repo_sub_case(self, app_ctx, seeded_analysis_graph):
+        """ADR-0013: the shortcut is a thin wrapper, never a second implementation."""
+        shortcut = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="mypkg/models.py")
+        umbrella = await _invoke_tool(
+            app_ctx, "analyze_repo", analysis="module_summary", project=_PROJECT, path="mypkg/models.py"
+        )
+
+        assert shortcut["outline"] == umbrella["outline"]
+
+    async def test_limit_bounds_the_payload(self, app_ctx, seeded_analysis_graph):
+        """limit=1 gives a 10-entity budget — enough here, but the knob must reach
+        the backend so a huge package cannot blow the context this is meant to save.
+        """
+        result = await _invoke_tool(app_ctx, "summarize_module", project=_PROJECT, path="mypkg/", limit=1)
+
+        assert result["entity_count"] <= 10

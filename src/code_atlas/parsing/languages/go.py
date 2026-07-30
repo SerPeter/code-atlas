@@ -979,5 +979,6 @@ if _HAS_GO:
             language=_GO_LANGUAGE,
             query=_GO_QUERY,
             parse_func=_parse_go,
+            comment_node_types=frozenset({"comment"}),
         )
     )

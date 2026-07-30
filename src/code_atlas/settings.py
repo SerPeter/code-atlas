@@ -365,6 +365,39 @@ class DetectorSettings(BaseModel):
     )
 
 
+class RationaleSettings(BaseModel):
+    """Extraction of intent-bearing comments (``# NOTE:``, ``# WHY:``, ``# HACK:``).
+
+    Matched comments are attached to the smallest enclosing entity as the
+    ``rationale`` node property, and ADR/RFC references as ``citations``.
+    Marker matching is case-sensitive and uppercase-only — ``Note:`` in
+    ordinary prose is not a marker.
+
+    Defaults mirror ``parsing.ast.DEFAULT_RATIONALE_MARKERS`` /
+    ``DEFAULT_TASK_MARKERS`` / ``DEFAULT_CITATION_SCHEMES``, which are what a
+    caller that passes no settings object gets.
+    """
+
+    enabled: bool = Field(default=True, description="Master switch for rationale extraction.")
+    markers: list[str] = Field(
+        default_factory=lambda: ["NOTE", "WHY", "HACK"],
+        description="Uppercase comment markers treated as rationale.",
+    )
+    tasks: bool = Field(
+        default=False,
+        description="Also extract work-tracking markers (TODO/FIXME). Off by default — high volume, short lived.",
+    )
+    task_markers: list[str] = Field(
+        default_factory=lambda: ["TODO", "FIXME"],
+        description="Work-tracking markers, extracted only when 'tasks' is true.",
+    )
+    citations: bool = Field(default=True, description="Record ADR/RFC style references found in comments.")
+    citation_schemes: list[str] = Field(
+        default_factory=lambda: ["ADR", "RFC"],
+        description="Reference schemes to record, e.g. 'ADR-0014' from 'see ADR 14'.",
+    )
+
+
 class IndexSettings(BaseModel):
     """Indexing delta settings."""
 
@@ -530,6 +563,7 @@ class AtlasSettings(BaseSettings):
     memgraph: MemgraphSettings = Field(default_factory=MemgraphSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     index: IndexSettings = Field(default_factory=IndexSettings)
+    rationale: RationaleSettings = Field(default_factory=RationaleSettings)
     watcher: WatcherSettings = Field(default_factory=WatcherSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)

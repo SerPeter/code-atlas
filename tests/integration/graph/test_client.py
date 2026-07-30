@@ -13,6 +13,7 @@ import pytest
 from code_atlas.graph.client import QueryTimeoutError
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
 from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
+from code_atlas.server.analysis import _analyze_communities
 
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
@@ -2896,6 +2897,246 @@ async def test_resolve_calls_ambiguous_project_wide(graph_client: GraphClient):
         assert record["callee"] == "run"
         assert record["confidence"] == "ambiguous"
         assert record["strategy"] == "project_wide"
+
+
+# ---------------------------------------------------------------------------
+# CALLS edge weighting (amends ADR-0014)
+# ---------------------------------------------------------------------------
+
+
+async def _calls_props(graph_client: GraphClient, project: str) -> list[dict]:
+    """Every CALLS edge in *project* with the five properties resolve_calls writes."""
+    return await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE} {{project_name: $p}})-[r:{RelType.CALLS}]->(b:{NodeLabel.CALLABLE}) "
+        "RETURN a.name AS caller, b.name AS callee, b.file_path AS callee_fp, "
+        "r.confidence AS confidence, r.strategy AS strategy, r.candidate_count AS candidate_count, "
+        "r.from_test AS from_test, r.weight AS weight",
+        {"p": project},
+    )
+
+
+async def test_resolve_calls_writes_a_numeric_positive_weight(graph_client: GraphClient):
+    """The weight MUST arrive as a real number, not a string.
+
+    MAGE's GetNumericProperty silently falls back to 1.0 for a missing or
+    non-numeric property, so a string weight would make weighted Leiden
+    indistinguishable from the unweighted call it replaced — no error, no
+    warning, byte-identical output. Assert the driver hands back a Python
+    float/int (Bolt preserves the Cypher type) and that it is strictly
+    positive, since Leiden divides gamma by the sum of weights.
+    """
+    await graph_client.ensure_schema()
+    project = "call_weight"
+    fp = "src/mod.py"
+
+    entities = [
+        _make_entity(project, "caller", fp, content_hash="c1"),
+        _make_entity(project, "helper", fp, line_start=10, line_end=15, content_hash="h1"),
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+    await graph_client.resolve_calls(
+        project,
+        [ParsedRelationship(from_qualified_name=f"{project}:src.mod.caller", rel_type=RelType.CALLS, to_name="helper")],
+    )
+
+    records = await _calls_props(graph_client, project)
+
+    assert len(records) == 1
+    weight = records[0]["weight"]
+    assert isinstance(weight, int | float), f"weight is {type(weight)}, not numeric — MAGE would read it as 1.0"
+    assert not isinstance(weight, bool)
+    assert weight > 0
+    assert weight == 1.0
+    assert records[0]["candidate_count"] == 1
+    assert records[0]["from_test"] is False
+    assert records[0]["confidence"] == "resolved"
+
+
+async def test_resolve_calls_ambiguous_edges_split_the_weight(graph_client: GraphClient):
+    """Two candidates → candidate_count 2 on each edge and half the weight."""
+    await graph_client.ensure_schema()
+    project = "call_weight_ambig"
+
+    for mod in ("a", "b"):
+        await graph_client.upsert_file_entities(
+            project,
+            f"src/mod_{mod}.py",
+            [_make_entity(project, "run", f"src/mod_{mod}.py", content_hash=f"run_{mod}")],
+            [],
+        )
+    await graph_client.upsert_file_entities(
+        project, "src/mod_c.py", [_make_entity(project, "caller", "src/mod_c.py", content_hash="c")], []
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [ParsedRelationship(from_qualified_name=f"{project}:src.mod_c.caller", rel_type=RelType.CALLS, to_name="run")],
+    )
+
+    records = await _calls_props(graph_client, project)
+
+    assert len(records) == 2
+    for record in records:
+        assert record["candidate_count"] == 2
+        assert record["weight"] == 0.5
+        assert record["confidence"] == "ambiguous"
+
+
+async def test_resolve_calls_flags_and_damps_test_callers(graph_client: GraphClient):
+    """A caller under tests/ is tagged from_test and its edge is damped below a
+    production call's — that ordering is what makes blast_radius rank production
+    impact first."""
+    await graph_client.ensure_schema()
+    project = "call_weight_test"
+
+    await graph_client.upsert_file_entities(
+        project, "src/mod.py", [_make_entity(project, "helper", "src/mod.py", content_hash="h")], []
+    )
+    await graph_client.upsert_file_entities(
+        project,
+        "tests/check_mod.py",
+        [_make_entity(project, "exercise", "tests/check_mod.py", content_hash="t")],
+        [],
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:tests.check_mod.exercise",
+                rel_type=RelType.CALLS,
+                to_name="helper",
+            )
+        ],
+    )
+
+    records = await _calls_props(graph_client, project)
+
+    assert len(records) == 1
+    assert records[0]["from_test"] is True
+    assert records[0]["candidate_count"] == 1
+    assert 0 < records[0]["weight"] < 1.0
+
+
+async def _weighted_call_graph(graph_client: GraphClient, project: str) -> None:
+    """Four callables and two equal-length routes a -> d.
+
+    ``a -> b -> d`` is fully resolved production; ``a -> c -> d`` is ambiguous
+    and test-provenance. Edges are written directly rather than through
+    resolve_calls so the weights under test are exact.
+    """
+    fp = "src/mod.py"
+    entities = [
+        _make_entity(project, name, fp, line_start=i * 10, line_end=i * 10 + 5, content_hash=name)
+        for i, name in enumerate(("a", "b", "c", "d"))
+    ]
+    await graph_client.upsert_file_entities(project, fp, entities, [])
+
+    async def link(src: str, dst: str, weight: float, *, confidence: str, from_test: bool) -> None:
+        await graph_client.execute_write(
+            f"MATCH (x:{NodeLabel.CALLABLE} {{uid: $f}}), (y:{NodeLabel.CALLABLE} {{uid: $t}}) "
+            f"MERGE (x)-[e:{RelType.CALLS}]->(y) SET e += $props",
+            {
+                "f": f"{project}:src.mod.{src}",
+                "t": f"{project}:src.mod.{dst}",
+                "props": {"weight": weight, "confidence": confidence, "from_test": from_test, "strategy": "test"},
+            },
+        )
+
+    await link("a", "b", 1.0, confidence="resolved", from_test=False)
+    await link("b", "d", 1.0, confidence="resolved", from_test=False)
+    await link("a", "c", 0.25, confidence="ambiguous", from_test=True)
+    await link("c", "d", 0.25, confidence="ambiguous", from_test=True)
+
+
+async def test_trace_path_prefers_the_higher_weight_route_among_equal_length_paths(graph_client: GraphClient):
+    """Both routes are two hops; the all-resolved production one must win."""
+    await graph_client.ensure_schema()
+    project = "trace_weight"
+    await _weighted_call_graph(graph_client, project)
+
+    result = await graph_client.trace_path_between(
+        f"{project}:src.mod.a", f"{project}:src.mod.d", 4, (RelType.CALLS.value,)
+    )
+
+    assert result["found"] is True
+    assert result["hop_count"] == 2
+    assert [hop["to"]["name"] for hop in result["hops"]] == ["b", "d"]
+    assert result["path_weight"] == 1.0
+    assert result["hops"][0]["weight"] == 1.0
+    assert result["hops"][0]["from_test"] is False
+
+
+async def test_blast_radius_scores_paths_and_flags_test_only_callers(graph_client: GraphClient):
+    """confidence_score is the best path's weight product; test_only means no
+    test-free path reaches the entity."""
+    await graph_client.ensure_schema()
+    project = "blast_weight"
+    await _weighted_call_graph(graph_client, project)
+
+    entries = {
+        e["uid"]: e
+        for e in await graph_client.compute_blast_radius(f"{project}:src.mod.d", "in", (RelType.CALLS.value,), 3)
+    }
+
+    prod = entries[f"{project}:src.mod.b"]
+    test_caller = entries[f"{project}:src.mod.c"]
+    upstream = entries[f"{project}:src.mod.a"]
+
+    assert prod["min_depth"] == 1
+    assert prod["confidence_score"] == 1.0
+    assert prod["test_only"] is False
+    assert prod["ambiguous_only"] is False
+
+    assert test_caller["min_depth"] == 1
+    assert test_caller["confidence_score"] == 0.25
+    assert test_caller["test_only"] is True
+    assert test_caller["ambiguous_only"] is True
+
+    # Reachable both ways; the production route is the better-scoring one, so it
+    # is neither test_only nor ambiguous_only despite the a -> c -> d route.
+    assert upstream["min_depth"] == 2
+    assert upstream["confidence_score"] == 1.0
+    assert upstream["test_only"] is False
+    assert upstream["ambiguous_only"] is False
+
+
+async def test_weighted_leiden_projects_numeric_calls_weights(graph_client: GraphClient):
+    """Weighted Leiden cannot be validated by "the query succeeded".
+
+    MAGE's GetNumericProperty falls through to 1.0 for a missing property AND
+    for any non-numeric type, with no error and no warning — so pointing
+    ``weight_property`` at a typo, or at the *string* ``confidence``, produces a
+    clean run whose output is byte-identical to the unweighted call it was
+    supposed to replace. This asserts the thing that actually distinguishes the
+    two: the edges the projection spans carry a numeric, strictly-positive
+    weight. The partition itself is not asserted — Leiden is documented as
+    non-deterministic, so a single before/after comparison cannot separate a
+    real weighting effect from run-to-run variance.
+
+    Lives here rather than with the other analysis tests because what is under
+    test is whether Memgraph/MAGE can read the weights this layer writes.
+    """
+    await graph_client.ensure_schema()
+    project = "leiden_weight"
+    await _weighted_call_graph(graph_client, project)
+
+    rows = await graph_client.execute(
+        f"MATCH (a {{project_name: $p}})-[r:{RelType.CALLS}]->(b {{project_name: $p}}) RETURN r.weight AS w",
+        {"p": project},
+    )
+
+    assert rows, "no CALLS edges were projected — the weight assertion would be vacuous"
+    for row in rows:
+        weight = row["w"]
+        assert isinstance(weight, int | float), f"weight is {type(weight)} — MAGE would silently read it as 1.0"
+        assert not isinstance(weight, bool)
+        assert weight > 0
+
+    result = await _analyze_communities(graph_client, project, "", 10)
+
+    assert "error" not in result, result.get("error")
+    assert result["analysis"] == "communities"
 
 
 # ---------------------------------------------------------------------------

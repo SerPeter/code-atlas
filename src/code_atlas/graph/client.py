@@ -36,10 +36,12 @@ from code_atlas.schema import (
     generate_unique_constraint_ddl,
     generate_vector_index_ddl,
 )
+from code_atlas.search.engine import matches_test_pattern
+from code_atlas.settings import SearchSettings
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from neo4j import AsyncDriver
 
@@ -168,8 +170,10 @@ def _build_graph_search_query(
 def _format_path_hops(path_nodes: list[Any], path_rels: list[Any]) -> list[dict[str, Any]]:
     """Render a Cypher path's nodes/relationships into per-hop dicts for ``trace_path_between``.
 
-    Includes CALLS ``confidence``/``strategy`` edge properties (ADR-0014) when
-    present on the traversed edge.
+    Includes the CALLS ``confidence``/``strategy`` edge properties (ADR-0014)
+    and the ``weight``/``from_test`` properties that amend it, when present on
+    the traversed edge — ``weight`` explains why this path won an equal-hop-count
+    tie-break, ``from_test`` shows the hop runs through a test caller.
     """
     hops: list[dict[str, Any]] = []
     for i, rel in enumerate(path_rels):
@@ -185,6 +189,10 @@ def _format_path_hops(path_nodes: list[Any], path_rels: list[Any]) -> list[dict[
             hop["confidence"] = rel_props["confidence"]
         if "strategy" in rel_props:
             hop["strategy"] = rel_props["strategy"]
+        if "weight" in rel_props:
+            hop["weight"] = rel_props["weight"]
+        if "from_test" in rel_props:
+            hop["from_test"] = rel_props["from_test"]
         hops.append(hop)
     return hops
 
@@ -570,6 +578,98 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     return None
 
 
+# ---------------------------------------------------------------------------
+# CALLS edge weighting (amends ADR-0014)
+#
+# ADR-0014 tags every CALLS edge with two *categorical* facts (`confidence`,
+# `strategy`) and explicitly rejected a numeric score as premature precision.
+# Three consumers since needed a magnitude rather than a category: MAGE's
+# weighted Leiden (which silently runs unweighted unless a numeric property is
+# persisted on the relationship), blast_radius impact ranking, and trace_path's
+# equal-hop-count tie-break.
+#
+# ADR-0014's objection is honored by storing the *raw observed facts* on the
+# edge — `candidate_count` (how many targets the winning strategy returned) and
+# `from_test` (whether the caller lives in test code) — and deriving `weight`
+# from them here, in one place. Consumers that want the underlying evidence
+# read the facts; consumers that need a scalar read the derived weight.
+#
+# Caveat inherited from _resolve_one_call: strategies 1-3 early-return a
+# single-element candidate list, so `candidate_count == 1` means "this strategy
+# committed to one target", not "provably unique".
+
+# Base weight of one fully-resolved, non-test call edge. Deliberately 1.0
+# because MAGE reads a *missing* weight property as 1.0 — IMPORTS edges carry
+# no weight, so this makes "a certain production call" worth exactly one
+# import, which is the reference point _analyze_communities documents. Change
+# this and that equivalence silently stops holding.
+_CALL_WEIGHT_BASE = 1.0
+# Test callers do exercise their callee, so their edges are damped rather than
+# dropped: a test-only caller ranks below every production caller, above none.
+_CALL_WEIGHT_TEST_DAMPING = 0.25
+# Strictly-positive floor. MAGE's Leiden normalizes gamma by the sum of edge
+# weights, so a zero total yields NaN and silently meaningless communities.
+_MIN_CALL_WEIGHT = 1e-6
+# What a missing/unweighted edge counts as when traversals multiply weights
+# together. Matches MAGE's own default so weighted Leiden and the Python-side
+# consumers agree about untagged edges (IMPORTS, USES_TYPE, and CALLS edges
+# written before this change).
+_DEFAULT_EDGE_WEIGHT = 1.0
+
+# Default test-path patterns behind the `from_test` flag. Single-sourced from
+# SearchSettings rather than re-listed here so the graph layer cannot drift
+# from the search layer's rule; resolve_calls takes an override for projects
+# that configure their own patterns.
+_DEFAULT_TEST_PATTERNS: tuple[str, ...] = tuple(SearchSettings().test_patterns)
+
+# Both weight numbers above are heuristics, not measurements — they are
+# expected to be retuned once there is evidence about what ranks well.
+
+
+def _call_edge_weight(candidate_count: int, from_test: bool) -> float:
+    """Derive a CALLS edge's numeric weight from its raw observed facts.
+
+    ``1 / candidate_count`` spreads one call's worth of evidence across the
+    candidates the resolver could not disambiguate; ``from_test`` then damps
+    the result. The return value is always strictly positive.
+    """
+    weight = _CALL_WEIGHT_BASE / max(candidate_count, 1)
+    if from_test:
+        weight *= _CALL_WEIGHT_TEST_DAMPING
+    return max(weight, _MIN_CALL_WEIGHT)
+
+
+class _CallEdgeFacts(NamedTuple):
+    """Observed facts for one ``(caller, callee)`` CALLS edge.
+
+    N call sites from the same caller to the same callee collapse into a single
+    edge, so these are the *combined* observations — see
+    :func:`_combine_call_edge_facts`.
+    """
+
+    confidence: str
+    strategy: str
+    candidate_count: int
+    from_test: bool
+
+
+def _combine_call_edge_facts(existing: _CallEdgeFacts, observed: _CallEdgeFacts) -> _CallEdgeFacts:
+    """Combine two observations of the same ``(caller, callee)`` pair.
+
+    The prior rule was last-write-wins, which made a pair's stored confidence
+    depend on parse order — a site resolved unambiguously by strategy 3 could
+    be overwritten by a later ambiguous strategy-4 site, or the reverse. This
+    keeps the *best-evidenced* observation instead (lowest ``candidate_count``;
+    ties keep the one seen first, so the result is order-stable), and treats
+    ``from_test`` as true only when *every* observed call site was in test code
+    — one production caller is enough to make the edge production-relevant.
+    """
+    best = observed if observed.candidate_count < existing.candidate_count else existing
+    return _CallEdgeFacts(
+        best.confidence, best.strategy, best.candidate_count, existing.from_test and observed.from_test
+    )
+
+
 @dataclass(frozen=True)
 class CallStats:
     """Caller/callee statistics for a single entity."""
@@ -712,6 +812,8 @@ class GraphClient:
                 await self._migrate_v4_clear_freshness_markers()
             if stored < 5:  # v5 data migration threshold
                 await self._migrate_v5_clear_freshness_markers()
+            if stored < 6:  # v6 data migration threshold
+                await self._migrate_v6_clear_freshness_markers()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -1313,6 +1415,7 @@ class GraphClient:
         *,
         lookup: _CallLookup | None = None,
         name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
+        test_patterns: Sequence[str] | None = None,
     ) -> None:
         """Resolve CALLS relationships after all files in a batch have been upserted.
 
@@ -1328,7 +1431,15 @@ class GraphClient:
         Every created edge is tagged ``confidence`` (``"resolved"`` for a single
         candidate, ``"ambiguous"`` when strategy 4/5 matched more than one — see
         ADR-0014) and ``strategy`` (``"import"|"sibling"|"same_file"|"project_unique"|
-        "project_wide"|"constructor"``).
+        "project_wide"|"constructor"``), plus three properties amending ADR-0014:
+        ``candidate_count`` (how many targets the winning strategy returned),
+        ``from_test`` (the caller lives in test code), and the numeric ``weight``
+        derived from those two by :func:`_call_edge_weight`.
+
+        *test_patterns* overrides the glob patterns behind ``from_test``;
+        ``None`` uses ``SearchSettings``' defaults. A caller whose uid is absent
+        from the lookup (not yet upserted, or a NULL file_path) has no path to
+        match and is treated as non-test.
         """
         if not call_rels:
             return
@@ -1346,8 +1457,11 @@ class GraphClient:
             for r in td_records:
                 name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
 
-        # Resolve each call
-        edges: dict[tuple[str, str], tuple[str, str]] = {}  # (from,to) -> (confidence, strategy)
+        # Resolve each call. Several call sites can produce the same (from,to)
+        # pair; _combine_call_edge_facts decides what the single stored edge says.
+        patterns = list(_DEFAULT_TEST_PATTERNS if test_patterns is None else test_patterns)
+        caller_is_test: dict[str, bool] = {}
+        edges: dict[tuple[str, str], _CallEdgeFacts] = {}
         resolved = 0
         ambiguous = 0
         unresolved = 0
@@ -1362,19 +1476,38 @@ class GraphClient:
                 resolved += 1
             else:
                 ambiguous += 1
+            caller_uid = rel.from_qualified_name
+            from_test = caller_is_test.get(caller_uid)
+            if from_test is None:
+                caller_name, caller_fp = lookup.uid_to_info.get(caller_uid, ("", ""))
+                from_test = matches_test_pattern(caller_fp, caller_name, patterns)
+                caller_is_test[caller_uid] = from_test
+            observed = _CallEdgeFacts(confidence, strategy, len(candidate_uids), from_test)
             for target_uid in candidate_uids:
-                edges[(rel.from_qualified_name, target_uid)] = (confidence, strategy)
+                key = (caller_uid, target_uid)
+                prior = edges.get(key)
+                edges[key] = observed if prior is None else _combine_call_edge_facts(prior, observed)
 
         # Batch-create CALLS edges
         if edges:
             edge_params = [
-                {"f": f, "t": t, "confidence": conf, "strategy": strat} for (f, t), (conf, strat) in edges.items()
+                {
+                    "f": f,
+                    "t": t,
+                    "confidence": facts.confidence,
+                    "strategy": facts.strategy,
+                    "candidate_count": facts.candidate_count,
+                    "from_test": facts.from_test,
+                    "weight": _call_edge_weight(facts.candidate_count, facts.from_test),
+                }
+                for (f, t), facts in edges.items()
             ]
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 f"MATCH (a:{NodeLabel.CALLABLE} {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
                 f"MERGE (a)-[e:{RelType.CALLS}]->(b) "
-                f"SET e.confidence = r.confidence, e.strategy = r.strategy",
+                f"SET e.confidence = r.confidence, e.strategy = r.strategy, "
+                f"e.candidate_count = r.candidate_count, e.from_test = r.from_test, e.weight = r.weight",
                 {"rels": edge_params},
             )
 
@@ -2510,9 +2643,17 @@ class GraphClient:
         """Existence check + shortest-path traversal for ``server.analysis.trace_path``.
 
         Returns ``from_exists``/``to_exists`` booleans plus (when both exist
-        and a path is found) the shortest path's ``hop_count`` and formatted
-        ``hops`` (endpoint uid/name, edge type, and CALLS confidence/strategy
-        when present — ADR-0014).
+        and a path is found) the shortest path's ``hop_count``, its
+        ``path_weight``, and formatted ``hops`` (endpoint uid/name, edge type,
+        and CALLS confidence/strategy/weight/from_test when present — ADR-0014
+        and its weighting amendment).
+
+        Shortest-path-first semantics are unchanged; among paths of *equal* hop
+        count the one with the highest product of edge weights wins, so an
+        all-resolved production path beats an equally short path through
+        ambiguous or test-provenance edges. Edges with no ``weight`` property
+        (IMPORTS, USES_TYPE, CALLS written before the amendment) count as
+        ``_DEFAULT_EDGE_WEIGHT``, i.e. they neither help nor hurt.
         """
         params: dict[str, Any] = {"from_uid": from_uid, "to_uid": to_uid}
         exist_raw = await self.execute(
@@ -2528,17 +2669,26 @@ class GraphClient:
                 "found": False,
                 "hop_count": None,
                 "hops": [],
+                "path_weight": None,
             }
 
         rel_pattern = "|".join(edge_types)
         records = await self.execute(
             f"MATCH p=(a {{uid: $from_uid}})-[:{rel_pattern}*1..{max_depth}]->(b {{uid: $to_uid}}) "
-            "RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels, length(p) AS hops "
-            "ORDER BY hops LIMIT 1",
+            "RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels, length(p) AS hops, "
+            f"reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT})) AS path_weight "
+            "ORDER BY hops, path_weight DESC LIMIT 1",
             params,
         )
         if not records:
-            return {"from_exists": True, "to_exists": True, "found": False, "hop_count": None, "hops": []}
+            return {
+                "from_exists": True,
+                "to_exists": True,
+                "found": False,
+                "hop_count": None,
+                "hops": [],
+                "path_weight": None,
+            }
 
         record = records[0]
         return {
@@ -2547,6 +2697,7 @@ class GraphClient:
             "found": True,
             "hop_count": record["hops"],
             "hops": _format_path_hops(record["path_nodes"], record["path_rels"]),
+            "path_weight": record["path_weight"],
         }
 
     async def compute_blast_radius(
@@ -2554,9 +2705,25 @@ class GraphClient:
     ) -> list[dict[str, Any]]:
         """One directional (``"out"``/``"in"``) traversal for ``server.analysis.blast_radius``.
 
-        Returns affected-entity dicts with ``min_depth`` (shortest hop count
-        to *uid*) and ``ambiguous_only`` (True unless some path made entirely
-        of ``confidence: "resolved"`` edges reaches the entity — ADR-0014).
+        Returns affected-entity dicts with:
+
+        - ``min_depth`` — shortest hop count to *uid*.
+        - ``ambiguous_only`` — True unless some path made entirely of
+          ``confidence: "resolved"`` edges reaches the entity (ADR-0014).
+        - ``confidence_score`` — the *best* path's product of edge ``weight``
+          properties. A product (rather than the minimum hop weight) because
+          each hop's weight reads as an independent "is this edge real"
+          factor, so uncertainty compounds along a chain the way it does in
+          practice: two ambiguous hops are a weaker claim than one. Missing
+          weights count as ``_DEFAULT_EDGE_WEIGHT``, so an all-resolved
+          production chain scores 1.0 at any depth and ranking stays driven by
+          evidence quality rather than distance (``min_depth`` already carries
+          distance). Note the best-scoring path need not be the shortest one.
+        - ``test_only`` — True when *no* path free of ``from_test`` edges
+          reaches the entity, i.e. only test code gets there. Computed by the
+          same second-traversal pattern as ``ambiguous_only`` rather than from
+          the entity's own file path, so it reflects how the entity is reached
+          rather than where it happens to live.
         """
         rel_pattern = "|".join(edge_types)
         pattern = (
@@ -2567,7 +2734,9 @@ class GraphClient:
             "WHERE affected.uid <> $uid "
             "RETURN affected.uid AS uid, affected.name AS name, affected.qualified_name AS qn, "
             "labels(affected)[0] AS label, affected.file_path AS file_path, "
-            "min(length(p)) AS min_depth",
+            "min(length(p)) AS min_depth, "
+            f"max(reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}))) "
+            "AS confidence_score",
             {"uid": uid},
         )
         resolved_raw = await self.execute(
@@ -2576,7 +2745,16 @@ class GraphClient:
             "RETURN DISTINCT affected.uid AS uid",
             {"uid": uid},
         )
+        # Same shape as resolved_raw (all(...) rather than none(...) so both
+        # passes use the one predicate form already proven against Memgraph).
+        production_raw = await self.execute(
+            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
+            "WHERE affected.uid <> $uid AND all(r IN relationships(p) WHERE NOT coalesce(r.from_test, false)) "
+            "RETURN DISTINCT affected.uid AS uid",
+            {"uid": uid},
+        )
         resolved_uids = {r["uid"] for r in resolved_raw}
+        production_uids = {r["uid"] for r in production_raw}
         return [
             {
                 "uid": r["uid"],
@@ -2587,6 +2765,8 @@ class GraphClient:
                 "min_depth": r["min_depth"],
                 "direction": direction_kind,
                 "ambiguous_only": r["uid"] not in resolved_uids,
+                "confidence_score": r["confidence_score"],
+                "test_only": r["uid"] not in production_uids,
             }
             for r in all_raw
         ]
@@ -2923,6 +3103,85 @@ class GraphClient:
         )
         return {"module": mod, "entities": entities, "methods": methods, "inherits": inherits}
 
+    async def get_module_summary(
+        self, project: str, path: str, limit: int, edge_limit: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Whole-scope skeleton + boundary — ``analyze_repo(analysis="module_summary")``.
+
+        *path* is a file or directory prefix; every Module/TypeDef/Callable/Value
+        whose ``file_path`` starts with it is "in scope". Six record lists come
+        back: ``modules`` and ``entities`` (the skeleton — signature, docstring,
+        visibility, line span, DEFINES parent), ``internal_edges`` (both endpoints
+        in scope), ``fan_in``/``fan_out`` (exactly one endpoint in scope — the
+        boundary an agent needs to judge whether a change is safe), and ``docs``
+        (inbound DOCUMENTS links).
+
+        Edge rows return ``properties(r)`` wholesale rather than named
+        confidence/strategy columns so any relationship property that exists
+        (ADR-0014's ``confidence``/``strategy`` plus later additions) reaches
+        the formatter without another query change.
+        """
+        params: dict[str, Any] = {"project": project, "path": path, "limit": limit, "edge_limit": edge_limit}
+        modules = await self.execute(
+            f"MATCH (m:{NodeLabel.MODULE} {{project_name: $project}}) WHERE m.file_path STARTS WITH $path "
+            "RETURN m.qualified_name AS qn, m.name AS name, m.file_path AS file_path, "
+            "m.docstring AS docstring ORDER BY m.file_path LIMIT $limit",
+            params,
+        )
+        entities = await self.execute(
+            "MATCH (e {project_name: $project}) "
+            f"WHERE (e:{NodeLabel.TYPE_DEF} OR e:{NodeLabel.CALLABLE} OR e:{NodeLabel.VALUE}) "
+            "AND e.file_path STARTS WITH $path "
+            f"OPTIONAL MATCH (p)-[:{RelType.DEFINES}]->(e) "
+            "RETURN e.uid AS uid, e.name AS name, e.qualified_name AS qn, labels(e)[0] AS label, "
+            "e.kind AS kind, e.visibility AS vis, e.signature AS sig, e.docstring AS docstring, "
+            "e.line_start AS line_start, e.line_end AS line_end, e.file_path AS file_path, "
+            "p.qualified_name AS parent_qn ORDER BY e.file_path, e.line_start LIMIT $limit",
+            params,
+        )
+        structural = f"{RelType.CALLS}|{RelType.INHERITS}|{RelType.IMPLEMENTS}|{RelType.USES_TYPE}|{RelType.OVERRIDES}"
+        boundary = f"{structural}|{RelType.IMPORTS}"
+        internal_edges = await self.execute(
+            f"MATCH (a {{project_name: $project}})-[r:{structural}]->(b {{project_name: $project}}) "
+            "WHERE a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path AND a.uid <> b.uid "
+            "RETURN a.qualified_name AS from_qn, b.qualified_name AS to_qn, type(r) AS rel_type, "
+            "properties(r) AS props ORDER BY rel_type, from_qn, to_qn LIMIT $edge_limit",
+            params,
+        )
+        fan_in = await self.execute(
+            f"MATCH (a {{project_name: $project}})-[r:{boundary}]->(b {{project_name: $project}}) "
+            "WHERE b.file_path STARTS WITH $path "
+            "AND (a.file_path IS NULL OR NOT a.file_path STARTS WITH $path) "
+            "RETURN a.qualified_name AS from_qn, a.name AS from_name, a.file_path AS from_path, "
+            "labels(a)[0] AS from_label, b.qualified_name AS to_qn, type(r) AS rel_type, "
+            "properties(r) AS props ORDER BY rel_type, to_qn, from_qn LIMIT $edge_limit",
+            params,
+        )
+        fan_out = await self.execute(
+            f"MATCH (a {{project_name: $project}})-[r:{boundary}]->(b {{project_name: $project}}) "
+            "WHERE a.file_path STARTS WITH $path "
+            "AND (b.file_path IS NULL OR NOT b.file_path STARTS WITH $path) "
+            "RETURN a.qualified_name AS from_qn, b.qualified_name AS to_qn, b.name AS to_name, "
+            "b.file_path AS to_path, labels(b)[0] AS to_label, type(r) AS rel_type, "
+            "properties(r) AS props ORDER BY rel_type, from_qn, to_qn LIMIT $edge_limit",
+            params,
+        )
+        docs = await self.execute(
+            f"MATCH (d)-[r:{RelType.DOCUMENTS}]->(e {{project_name: $project}}) "
+            "WHERE e.file_path STARTS WITH $path "
+            "RETURN d.qualified_name AS doc_qn, d.name AS doc_name, labels(d)[0] AS doc_label, "
+            "e.qualified_name AS to_qn, r.link_type AS link_type ORDER BY to_qn, doc_qn LIMIT $limit",
+            params,
+        )
+        return {
+            "modules": modules,
+            "entities": entities,
+            "internal_edges": internal_edges,
+            "fan_in": fan_in,
+            "fan_out": fan_out,
+            "docs": docs,
+        }
+
     # -- Context expansion / navigation (search/engine.py's expand_context) ---
 
     async def get_entity_by_uid(self, uid: str, label: str = "") -> dict[str, Any] | None:
@@ -3164,6 +3423,10 @@ class GraphClient:
                     "header_path": e.header_path,
                     "header_level": e.header_level,
                     "content_hash": e.content_hash,
+                    "rationale": e.rationale,
+                    # Empty -> null so the property is absent rather than an empty
+                    # list on every node in the graph.
+                    "citations": e.citations or None,
                     "extra_properties": e.extra_properties,
                 }
                 for e in entity_list
@@ -3178,6 +3441,7 @@ class GraphClient:
                 f"n.visibility = e.visibility, n.docstring = e.docstring, "
                 f"n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
                 f"n.header_path = e.header_path, n.header_level = e.header_level, "
+                f"n.rationale = e.rationale, n.citations = e.citations, "
                 f"n.content_hash = e.content_hash "
                 f"ON MATCH SET "
                 f"n.project_name = e.project_name, n.name = e.name, "
@@ -3186,6 +3450,7 @@ class GraphClient:
                 f"n.visibility = e.visibility, n.docstring = e.docstring, "
                 f"n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
                 f"n.header_path = e.header_path, n.header_level = e.header_level, "
+                f"n.rationale = e.rationale, n.citations = e.citations, "
                 f"n.content_hash = e.content_hash "
                 f"SET n += e.extra_properties"
             )
@@ -3210,6 +3475,8 @@ class GraphClient:
                     "header_path": e.header_path,
                     "header_level": e.header_level,
                     "content_hash": e.content_hash,
+                    "rationale": e.rationale,
+                    "citations": e.citations or None,
                     "extra_properties": e.extra_properties,
                 }
                 for e in group
@@ -3222,6 +3489,7 @@ class GraphClient:
                 "n.visibility = e.visibility, n.docstring = e.docstring, "
                 "n.signature = e.signature, n.source = e.source, n.tags = e.tags, "
                 "n.header_path = e.header_path, n.header_level = e.header_level, "
+                "n.rationale = e.rationale, n.citations = e.citations, "
                 "n.content_hash = e.content_hash, "
                 "n += e.extra_properties",
                 {"entities": params},
@@ -3587,6 +3855,25 @@ class GraphClient:
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v5: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v5"
+        )
+
+    async def _migrate_v6_clear_freshness_markers(self) -> None:
+        """v6: CALLS edges gained numeric ``weight``/``candidate_count``/``from_test``, and
+        entities gained ``rationale``/``citations``. Both are produced during indexing, so an
+        existing graph keeps neither until its files are re-parsed — and the file-hash gate
+        skips unchanged files, so nothing would ever re-run. Clear file/git hashes to force a
+        full re-parse, and drop the pre-v6 CALLS edges so they are rebuilt with weights rather
+        than surviving unweighted (a missing weight silently reads as 1.0 in MAGE's Leiden).
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.weight IS NULL DELETE r")
+        logger.info(
+            "Schema v6: cleared stored file/git hashes and unweighted CALLS edges — "
+            "run 'atlas index' to rebuild with edge weights and rationale"
         )
 
     async def _set_schema_version(self, version: int) -> None:

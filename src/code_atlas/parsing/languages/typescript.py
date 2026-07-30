@@ -1263,6 +1263,7 @@ try:
             language=_TS_LANGUAGE,
             query=_TS_QUERY,
             parse_func=_parse_typescript,
+            comment_node_types=frozenset({"comment"}),
         )
     )
 
@@ -1279,6 +1280,7 @@ try:
             language=_TSX_LANGUAGE,
             query=_TSX_QUERY,
             parse_func=_parse_typescript,
+            comment_node_types=frozenset({"comment"}),
         )
     )
 except ImportError:
@@ -1299,6 +1301,7 @@ try:
             language=_JS_LANGUAGE,
             query=_JS_QUERY,
             parse_func=_parse_typescript,
+            comment_node_types=frozenset({"comment"}),
         )
     )
 except ImportError:

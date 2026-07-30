@@ -35,6 +35,7 @@ _VALID_ANALYSES = frozenset(
         "complexity",
         "communities",
         "git_signals",
+        "module_summary",
     }
 )
 _VALID_DIAGRAM_TYPES = frozenset({"packages", "imports", "inheritance", "module_detail"})
@@ -134,7 +135,9 @@ async def analyze_repo(
     ADR-0016). Whole-repo aggregate counts that don't rank individual entities
     (structure's label_counts/kind_counts, patterns' visibility_distribution/
     docstring_coverage) are intentionally left unfiltered — those describe total
-    repo composition, not "notable" entities.
+    repo composition, not "notable" entities. ``module_summary`` draws the same
+    line one level down: its boundary lists (fan-in/fan-out) are filtered, its
+    in-scope entity listing is not, because the caller named that path.
     """
     if analysis not in _VALID_ANALYSES:
         return {
@@ -151,6 +154,7 @@ async def analyze_repo(
         "complexity": _analyze_complexity,
         "communities": _analyze_communities,
         "git_signals": _analyze_git_signals,
+        "module_summary": _analyze_module_summary,
     }
     return await dispatch[analysis](graph, project, path, limit, test_patterns)
 
@@ -193,8 +197,14 @@ async def trace_path(
 
     Traverses *edge_types* (default CALLS|IMPORTS|USES_TYPE). Returns the
     hop-by-hop path — edge type, endpoint uid/name, and CALLS confidence/
-    strategy when present (ADR-0014) — or a ``found: false`` result when no
-    path exists within ``max_depth``.
+    strategy/weight/from_test when present (ADR-0014 and its weighting
+    amendment) — or a ``found: false`` result when no path exists within
+    ``max_depth``.
+
+    Shortest-path-first is unchanged; ties between paths of equal hop count go
+    to the higher ``path_weight`` (the product of the path's edge weights), so
+    an all-resolved production route wins over an equally short route through
+    ambiguous or test-provenance calls.
     """
     t0 = time.monotonic()
     result = await graph.trace_path_between(from_uid, to_uid, max_depth, edge_types)
@@ -215,12 +225,14 @@ async def trace_path(
             "query_ms": round(elapsed, 1),
         }
 
+    path_weight = result.get("path_weight")
     return {
         "found": True,
         "from_uid": from_uid,
         "to_uid": to_uid,
         "hop_count": result["hop_count"],
         "hops": result["hops"],
+        "path_weight": round(path_weight, 6) if isinstance(path_weight, int | float) else None,
         "query_ms": round(elapsed, 1),
     }
 
@@ -244,7 +256,15 @@ async def blast_radius(
     entirely of ``confidence: "resolved"`` CALLS edges (ADR-0014) reaches it
     within ``max_depth`` — a heuristic signal, not a guarantee (e.g. an
     out-of-scope edge_types override without a confidence property always
-    counts as not-resolved).
+    counts as not-resolved). Two further per-entity signals come from the
+    weighting amendment to ADR-0014: ``test_only`` (no test-free path reaches
+    it) and ``confidence_score`` (the best path's product of edge weights).
+
+    Results are ordered nearest-first, then production impact before test-only
+    impact, then by descending ``confidence_score`` — so what a change most
+    likely breaks in production surfaces above heuristic and test-only hits.
+    Backends that predate these fields (or hand-built test doubles) simply
+    fall back to the neutral "production, fully-weighted" defaults.
     """
     t0 = time.monotonic()
 
@@ -267,7 +287,15 @@ async def blast_radius(
                 affected[entry["uid"]] = entry
 
     elapsed = (time.monotonic() - t0) * 1000
-    results = sorted(affected.values(), key=lambda x: (x["min_depth"], x["qualified_name"] or ""))
+    results = sorted(
+        affected.values(),
+        key=lambda x: (
+            x["min_depth"],
+            x.get("test_only", False),
+            -x.get("confidence_score", 1.0),
+            x["qualified_name"] or "",
+        ),
+    )
     total = len(results)
     return {
         "uid": uid,
@@ -1006,6 +1034,33 @@ async def _analyze_communities(
     are meant to reflect cohesive *project* subsystems, not "everything that
     happens to import the same stdlib/third-party symbol".
 
+    Clustering is **weighted** by the CALLS ``weight`` edge property (the
+    amendment to ADR-0014): the procedure's ``weight_property`` argument is
+    passed positionally as ``get(subgraph, "weight")``. Three traps make this
+    easy to get silently wrong and are handled deliberately:
+
+    1. MAGE reads a missing or non-numeric weight as 1.0 with no error, so a
+       typo'd property name produces byte-identical (unweighted) output rather
+       than a failure. This can only be validated by asserting the projected
+       edges actually carry a numeric ``weight`` — see the integration tests.
+       Note the CALLS ``confidence`` property is a *string*, so naming it here
+       would silently degrade to unweighted.
+    2. IMPORTS edges carry no weight and therefore default to 1.0. That is the
+       deliberate choice, not an oversight: ``_CALL_WEIGHT_BASE`` is 1.0, so a
+       fully-resolved, non-test call is worth exactly one import, and only
+       ambiguity (``1/candidate_count``) or test provenance discounts an edge
+       below that reference point. Writing an explicit weight on IMPORTS would
+       add a second edge-property backfill for no change in behavior.
+    3. Leiden deduplicates parallel edges rather than summing them, so a node
+       pair joined by both a CALLS and an IMPORTS edge would contribute only
+       one of the two, arbitrarily. That cannot happen with this projection:
+       CALLS is written Callable->Callable only (both endpoints are
+       ``:Callable``-matched in ``resolve_calls``) while every IMPORTS edge
+       starts at a Module or Package, so no node pair carries both — including
+       under Leiden's undirected view, since a CALLS target is never a
+       Module/Package either. Reciprocal CALLS (a->b and b->a) *do* collapse
+       into one undirected edge; that predates weighting and is unchanged.
+
     Communities of size < ``_COMMUNITY_NOISE_THRESHOLD`` (isolated/near-isolated
     nodes) are dropped as noise; the remaining communities are returned
     largest-first, capped at *limit* (which also caps members shown per
@@ -1061,7 +1116,9 @@ async def _analyze_communities(
         "MATCH p=(a {project_name: $project})-[:CALLS|IMPORTS]->(b {project_name: $project}) "
         f"WHERE {excl}{pa}{excluded_clause} "
         "WITH project(p) AS subgraph "
-        "CALL leiden_community_detection.get(subgraph) YIELD node, community_id "
+        # MAGE's Leiden takes positional args only; the first is the engine-injected
+        # subgraph, the second is weight_property. Untagged edges default to 1.0.
+        'CALL leiden_community_detection.get(subgraph, "weight") YIELD node, community_id '
         "RETURN node.uid AS uid, node.name AS name, node.qualified_name AS qn, "
         "labels(node)[0] AS label, node.file_path AS file_path, community_id AS community_id"
     )
@@ -1409,5 +1466,334 @@ async def _diagram_module_detail(graph: GraphBackend, project: str, path: str, m
         "module": mod["qn"],
         "mermaid": "\n".join(lines),
         "node_count": len(nodes),
+        "query_ms": round(elapsed, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Module summary — token-dense whole-scope skeleton (analyze_repo sub-case)
+# ---------------------------------------------------------------------------
+#
+# The competing shape is "the agent just reads the files". So the output is a
+# rendered text skeleton, not a JSON record set: repeating {"qualified_name":
+# ..., "signature": ..., "docstring": ...} keys for every entity costs more
+# tokens than the information they label. Precedent for a rendered string in
+# this module is generate_diagram's `mermaid`.
+
+# analyze_repo's shared `limit` means "max items per sub-section" and is clamped
+# to 100 by the tool layer — far too small to budget a whole package's entities.
+# module_summary scales it instead of overloading it: `limit` * these factors is
+# the real cap. Default limit 20 -> 200 entities, 600 edges per boundary list.
+_MODULE_SUMMARY_ENTITY_FACTOR = 10
+_MODULE_SUMMARY_EDGE_FACTOR = 3
+
+_MODULE_SUMMARY_VIS = {"public": "+", "private": "-", "protected": "#", "internal": "~"}
+_MODULE_SUMMARY_FALLBACK_KIND = {"TypeDef": "class", "Callable": "def", "Value": "var"}
+_MODULE_SUMMARY_EXTERNAL_LABELS = frozenset({"ExternalPackage", "ExternalSymbol"})
+_MODULE_SUMMARY_SIG_MAX = 160
+_MODULE_SUMMARY_DOC_MAX = 100
+# Hard ceiling on the rendered outline. ~60k chars is roughly 15k tokens: large enough
+# that a normal package is never cut, small enough that a pathological one cannot blow
+# the context this tool exists to conserve.
+_MODULE_SUMMARY_OUTLINE_MAX = 60_000
+_MODULE_SUMMARY_LEGEND = (
+    "LEGEND +public -private #protected ~internal | L<start>-<end> | '# ' first docstring line | "
+    "a > b: a uses b | a < b: a used by b | trailing * external | [k=v] non-default edge props"
+)
+
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _first_doc_line(text: str | None, max_len: int = _MODULE_SUMMARY_DOC_MAX) -> str:
+    """First non-empty docstring line, whitespace-collapsed and truncated.
+
+    First line only is deliberate: it is the summary sentence by convention in
+    every docstring style this indexer sees, and full docstrings would dominate
+    the outline's token budget.
+    """
+    if not text:
+        return ""
+    for raw in text.splitlines():
+        line = _WHITESPACE_RUN.sub(" ", raw).strip()
+        if line:
+            return line if len(line) <= max_len else line[: max_len - 3] + "..."
+    return ""
+
+
+def _compact_signature(sig: str | None) -> str:
+    """Collapse a stored (possibly multi-line) signature onto one bounded line."""
+    if not sig:
+        return ""
+    text = _WHITESPACE_RUN.sub(" ", sig).strip()
+    return text if len(text) <= _MODULE_SUMMARY_SIG_MAX else text[: _MODULE_SUMMARY_SIG_MAX - 3] + "..."
+
+
+def _common_dotted_prefix(qns: list[str]) -> str:
+    """Longest shared dotted namespace of *qns* (``""`` when there is none)."""
+    if not qns:
+        return ""
+    parts = qns[0].split(".")
+    for qn in qns[1:]:
+        other = qn.split(".")
+        keep = 0
+        for a, b in zip(parts, other, strict=False):
+            if a != b:
+                break
+            keep += 1
+        parts = parts[:keep]
+        if not parts:
+            return ""
+    return ".".join(parts)
+
+
+def _rel_name(qn: str | None, prefix: str) -> str:
+    """Strip the scope's shared dotted prefix — the single biggest token win.
+
+    Qualified names in a code graph are long and share almost all of their
+    text within one package; the prefix is stated once in the outline header
+    instead of on every line.
+    """
+    if not qn:
+        return "?"
+    if prefix and qn.startswith(prefix + "."):
+        return qn[len(prefix) + 1 :]
+    return qn
+
+
+def _line_span(line_start: Any, line_end: Any) -> str:
+    if line_start is None:
+        return ""
+    if line_end is None or line_end == line_start:
+        return f"L{line_start}"
+    return f"L{line_start}-{line_end}"
+
+
+def _quiet_edge_prop(value: Any) -> bool:
+    """Whether an edge property value is the neutral one and not worth tokens.
+
+    Value-based, not key-based, on purpose: any property whose value is absent/
+    empty, false, 1 (the neutral weight/count), or ``"resolved"`` is dropped and
+    everything else is rendered. New CALLS edge properties (ADR-0014's
+    confidence/strategy and anything added later) therefore surface in the
+    outline without this module knowing their names.
+    """
+    if value is None or value == "":
+        return True
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int | float):
+        return value == 1
+    return value == "resolved"
+
+
+def _edge_annotation(props: dict[str, Any] | None) -> str:
+    """``[k=v k2=v2]`` for the informative subset of an edge's properties."""
+    if not props:
+        return ""
+    # `strategy` is never neutral by value (it is always a non-empty, non-"resolved"
+    # string), so the value-based rule alone renders it on every CALLS edge. How a
+    # confidently-resolved edge was resolved is not worth tokens here — keep it only
+    # when the edge is not confidently resolved, which is when it explains something.
+    quiet_keys = {"strategy"} if props.get("confidence", "resolved") == "resolved" else set()
+    parts = [
+        f"{k}={round(v, 3) if isinstance(v, float) else v}"
+        for k, v in sorted(props.items())
+        if k not in quiet_keys and not _quiet_edge_prop(v)
+    ]
+    return f"[{' '.join(parts)}]" if parts else ""
+
+
+def _adjacency_lines(
+    rows: list[dict[str, Any]],
+    prefix: str,
+    src_key: str,
+    dst_key: str,
+    arrow: str,
+    external_qns: frozenset[str] | set[str] = frozenset(),
+) -> list[str]:
+    """Collapse edge rows to one line per (rel_type, source): ``src > a, b, c``.
+
+    One row per edge would repeat the source name once per neighbour; grouping
+    pays for it once.
+    """
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for row in rows:
+        by_src = grouped.setdefault(row["rel_type"], {})
+        target = _rel_name(row[dst_key], prefix)
+        if row[dst_key] in external_qns:
+            target += "*"
+        by_src.setdefault(_rel_name(row[src_key], prefix), []).append(target + _edge_annotation(row.get("props")))
+    lines: list[str] = []
+    for rel_type in sorted(grouped):
+        lines.append(f"  {rel_type}")
+        lines.extend(
+            f"    {src} {arrow} {', '.join(sorted(set(targets)))}" for src, targets in sorted(grouped[rel_type].items())
+        )
+    return lines
+
+
+def _skeleton_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]]) -> list[str]:
+    """Per-file entity outline: signature, visibility, line span, first doc line.
+
+    Members of an in-scope TypeDef are indented under it (the DEFINES parent),
+    so the containment structure is carried by layout instead of an edge list.
+    """
+    mod_by_path = {m["file_path"]: m for m in modules}
+    typedef_qns = {e["qn"] for e in entities if e["label"] == "TypeDef"}
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for e in entities:
+        by_path.setdefault(e["file_path"] or "", []).append(e)
+
+    lines: list[str] = []
+    for file_path in sorted(set(mod_by_path) | set(by_path)):
+        mod = mod_by_path.get(file_path)
+        lines.append("")
+        lines.append(f"{mod['qn']} ({file_path})" if mod else f"({file_path})")
+        mod_doc = _first_doc_line(mod.get("docstring")) if mod else ""
+        if mod_doc:
+            lines.append(f"  # {mod_doc}")
+        for e in by_path.get(file_path, []):
+            indent = "    " if e["parent_qn"] in typedef_qns else "  "
+            marker = _MODULE_SUMMARY_VIS.get(e["vis"] or "public", "+")
+            header = _compact_signature(e["sig"]) or (
+                f"{e['kind'] or _MODULE_SUMMARY_FALLBACK_KIND.get(e['label'], '')} {e['name']}".strip()
+            )
+            span = _line_span(e["line_start"], e["line_end"])
+            doc = _first_doc_line(e["docstring"])
+            lines.append(f"{indent}{marker} {header}{' ' + span if span else ''}{'  # ' + doc if doc else ''}")
+    return lines
+
+
+def _doc_link_lines(docs: list[dict[str, Any]], prefix: str) -> list[str]:
+    """``entity < note(link_type), ...`` for inbound DOCUMENTS edges."""
+    grouped: dict[str, set[str]] = {}
+    for d in docs:
+        label = d["doc_qn"] or d["doc_name"] or "?"
+        link = d.get("link_type")
+        grouped.setdefault(_rel_name(d["to_qn"], prefix), set()).add(f"{label}({link})" if link else str(label))
+    return [f"  {target} < {', '.join(sorted(refs))}" for target, refs in sorted(grouped.items())]
+
+
+def _dedupe_entities(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop duplicate rows produced by the OPTIONAL MATCH / LEFT JOIN on DEFINES."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        uid = row["uid"]
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(row)
+    return out
+
+
+async def _analyze_module_summary(
+    graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """Token-dense skeleton of everything under *path*, plus its scope boundary.
+
+    Emits, as one rendered ``outline`` string: every in-scope entity's
+    signature/visibility/line-span/first-docstring-line grouped by file with
+    class members indented under their class; the intra-scope CALLS/INHERITS/
+    IMPLEMENTS/USES_TYPE/OVERRIDES adjacency; the boundary (``FAN-IN`` — who
+    outside calls in, ``FAN-OUT`` — what this scope depends on, including
+    external packages); and inbound DOCUMENTS links. No entity bodies, no full
+    docstrings — that is the whole compression argument versus reading the
+    files.
+
+    *path* is required. Fan-in/fan-out are defined by "exactly one endpoint has
+    a file_path under *path*", so with no path everything is in scope and the
+    boundary — the most valuable part — would be empty by construction.
+
+    *test_patterns* filtering is applied to the **boundary only**, not to
+    in-scope entities: the caller named *path* explicitly, so everything under
+    it is what they asked for (including when *path* is itself a test package),
+    while test callers otherwise swamp fan-in for any widely-exercised module.
+    Same "filter the ranked/listed noise, not the thing itself" line the other
+    sub-analyses draw around whole-repo aggregates.
+    """
+    t0 = time.monotonic()
+    if not path:
+        return {
+            "analysis": "module_summary",
+            "project": project,
+            "error": "path parameter required for module_summary (a file or package path prefix)",
+            "code": "PATH_REQUIRED",
+        }
+
+    entity_limit = limit * _MODULE_SUMMARY_ENTITY_FACTOR
+    edge_limit = entity_limit * _MODULE_SUMMARY_EDGE_FACTOR
+    raw = await graph.get_module_summary(project, path, entity_limit, edge_limit)
+
+    modules = raw["modules"]
+    entities = _dedupe_entities(raw["entities"])
+    fan_in, fan_out = raw["fan_in"], raw["fan_out"]
+    if test_patterns:
+        patterns = list(test_patterns)
+        fan_in = [r for r in fan_in if not matches_test_pattern(r["from_path"] or "", r["from_name"] or "", patterns)]
+        fan_out = [r for r in fan_out if not matches_test_pattern(r["to_path"] or "", r["to_name"] or "", patterns)]
+
+    if not modules and not entities:
+        return {
+            "analysis": "module_summary",
+            "project": project,
+            "path": path,
+            "error": f"No indexed modules or entities found under path '{path}'",
+            "code": "NOT_FOUND",
+        }
+
+    prefix = _common_dotted_prefix([m["qn"] for m in modules if m["qn"]])
+    external_qns = {r["to_qn"] for r in fan_out if r["to_label"] in _MODULE_SUMMARY_EXTERNAL_LABELS}
+    truncated = (
+        len(raw["entities"]) >= entity_limit
+        or len(raw["internal_edges"]) >= edge_limit
+        or len(raw["fan_in"]) >= edge_limit
+        or len(raw["fan_out"]) >= edge_limit
+    )
+
+    lines = [
+        f"SCOPE {path}  |  {len(modules)} module(s)  |  {len(entities)} entities"
+        + ("  |  TRUNCATED (raise limit for more)" if truncated else ""),
+    ]
+    if prefix:
+        lines.append(f"NAMES below are relative to {prefix} unless fully qualified")
+    lines.append(_MODULE_SUMMARY_LEGEND)
+    lines.extend(_skeleton_lines(modules, entities))
+
+    internal = _adjacency_lines(raw["internal_edges"], prefix, "from_qn", "to_qn", ">")
+    if internal:
+        lines.extend(["", f"EDGES within scope ({len(raw['internal_edges'])})", *internal])
+    inbound = _adjacency_lines(fan_in, prefix, "to_qn", "from_qn", "<")
+    if inbound:
+        lines.extend(["", f"FAN-IN — callers/importers outside this scope ({len(fan_in)})", *inbound])
+    outbound = _adjacency_lines(fan_out, prefix, "from_qn", "to_qn", ">", external_qns)
+    if outbound:
+        lines.extend(["", f"FAN-OUT — what this scope depends on ({len(fan_out)})", *outbound])
+    doc_lines = _doc_link_lines(raw["docs"], prefix)
+    if doc_lines:
+        lines.extend(["", f"DOCS — linked notes/docs ({len(raw['docs'])})", *doc_lines])
+
+    # Item-count caps alone do not bound the rendered size — a package of very wide
+    # signatures can still exceed the context this tool exists to save. Enforce a hard
+    # character ceiling as the last step, cutting on a line boundary so the outline
+    # stays parseable, and tell the caller it happened.
+    outline = "\n".join(lines)
+    size_capped = len(outline) > _MODULE_SUMMARY_OUTLINE_MAX
+    if size_capped:
+        keep = outline[:_MODULE_SUMMARY_OUTLINE_MAX].rsplit("\n", 1)[0]
+        outline = keep + "\n... OUTLINE TRUNCATED (size cap) — narrow `path` or lower `limit` for a complete view"
+
+    elapsed = (time.monotonic() - t0) * 1000
+    return {
+        "analysis": "module_summary",
+        "project": project,
+        "path": path,
+        "modules": [m["qn"] for m in modules],
+        "entity_count": len(entities),
+        "internal_edge_count": len(raw["internal_edges"]),
+        "fan_in_count": len(fan_in),
+        "fan_out_count": len(fan_out),
+        "truncated": truncated or size_capped,
+        "outline": outline,
         "query_ms": round(elapsed, 1),
     }

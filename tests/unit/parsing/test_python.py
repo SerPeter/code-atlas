@@ -20,6 +20,7 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
+from code_atlas.settings import RationaleSettings
 
 PROJECT = "test_project"
 
@@ -1443,3 +1444,239 @@ async def test_module_exports_no_shadowing_by_module_entity():
 
     assert len(result.relationships) == 1
     assert result.relationships[0].to_name == "proj:src.app.app"
+
+
+# ---------------------------------------------------------------------------
+# Rationale extraction (intent-bearing comments -> entity.rationale/.citations)
+# ---------------------------------------------------------------------------
+
+
+def test_rationale_from_comment_inside_body():
+    parsed = _parse("""\
+def render():
+    # HACK: upstream returns 204 with a body
+    return 1
+""")
+    assert _entity_by_name(parsed, "render").rationale == "HACK: upstream returns 204 with a body"
+
+
+def test_rationale_preceding_declaration_beats_enclosing_class():
+    """A comment above a method belongs to the method, not the class that encloses it."""
+    parsed = _parse("""\
+class Widget:
+    # WHY: rendering is lazy so the template cache stays warm
+    def render(self):
+        return 1
+""")
+    assert _entity_by_name(parsed, "render").rationale == "WHY: rendering is lazy so the template cache stays warm"
+    assert _entity_by_name(parsed, "Widget").rationale is None
+
+
+def test_rationale_skips_decorator_lines():
+    """Decorators sit between the comment and ``def`` — they must not break attribution."""
+    parsed = _parse("""\
+import functools
+
+
+# NOTE: cached because the lookup hits the network
+@functools.cache
+def lookup():
+    return 1
+""")
+    assert _entity_by_name(parsed, "lookup").rationale == "NOTE: cached because the lookup hits the network"
+
+
+def test_rationale_falls_back_to_module_when_code_intervenes():
+    """Real code between the comment and the next declaration means it annotates the file."""
+    parsed = _parse("""\
+# NOTE: this module is legacy
+import os
+
+CONST = os.sep
+
+
+def helper():
+    return 1
+""")
+    assert _entity_by_name(parsed, "example").rationale == "NOTE: this module is legacy"
+    assert _entity_by_name(parsed, "helper").rationale is None
+
+
+def test_rationale_trailing_comment_stays_with_enclosing_function():
+    """A note at the tail of a body must not be claimed by the next top-level function."""
+    parsed = _parse("""\
+def first():
+    x = 1
+    # NOTE: the caller relies on x being returned unwrapped
+    return x
+
+
+def second():
+    return 2
+""")
+    assert _entity_by_name(parsed, "first").rationale == "NOTE: the caller relies on x being returned unwrapped"
+    assert _entity_by_name(parsed, "second").rationale is None
+
+
+def test_rationale_folds_wrapped_lines_into_one_entry():
+    parsed = _parse("""\
+def render():
+    # WHY: the cache is per-instance because sharing it
+    # across threads corrupted the counters
+    return 1
+""")
+    expected = "WHY: the cache is per-instance because sharing it across threads corrupted the counters"
+    assert _entity_by_name(parsed, "render").rationale == expected
+
+
+def test_rationale_multiple_markers_are_newline_joined():
+    parsed = _parse("""\
+def render():
+    # WHY: first reason
+    x = 1
+    # HACK: second reason
+    return x
+""")
+    assert _entity_by_name(parsed, "render").rationale == "WHY: first reason\nHACK: second reason"
+
+
+def test_rationale_ignores_lowercase_prose():
+    """Uppercase-only matching keeps ordinary prose (``Note:``) out of the graph."""
+    parsed = _parse("""\
+def render():
+    # Note: this is just prose
+    # why: also prose
+    return 1
+""")
+    assert _entity_by_name(parsed, "render").rationale is None
+
+
+def test_rationale_ignores_marker_inside_string_literal():
+    """Only comment nodes are scanned — a marker in a string is not a comment."""
+    parsed = _parse("""\
+def render():
+    return "NOTE: not a comment"
+""")
+    assert _entity_by_name(parsed, "render").rationale is None
+
+
+def test_rationale_todo_off_by_default():
+    parsed = _parse("""\
+def render():
+    # TODO: rip this out
+    return 1
+""")
+    assert _entity_by_name(parsed, "render").rationale is None
+
+
+def test_rationale_tasks_opt_in():
+    source = "def render():\n    # TODO: rip this out\n    return 1\n"
+    result = parse_file("src/example.py", source.encode("utf-8"), PROJECT, rationale=RationaleSettings(tasks=True))
+    assert result is not None
+    assert _entity_by_name(result, "render").rationale == "TODO: rip this out"
+
+
+def test_rationale_task_marker_does_not_get_absorbed_into_a_note():
+    """A disabled TODO directly under a NOTE must terminate the note, not continue it."""
+    parsed = _parse("""\
+def render():
+    # NOTE: real reason
+    # TODO: unrelated chore
+    return 1
+""")
+    assert _entity_by_name(parsed, "render").rationale == "NOTE: real reason"
+
+
+def test_rationale_disabled_by_settings():
+    source = "def render():\n    # NOTE: reason\n    return 1\n"
+    result = parse_file("src/example.py", source.encode("utf-8"), PROJECT, rationale=RationaleSettings(enabled=False))
+    assert result is not None
+    entity = _entity_by_name(result, "render")
+    assert entity.rationale is None
+    assert entity.citations == []
+
+
+def test_rationale_custom_marker_set():
+    source = "def render():\n    # GOTCHA: watch out\n    # NOTE: ignored now\n    return 1\n"
+    settings = RationaleSettings(markers=["GOTCHA"])
+    result = parse_file("src/example.py", source.encode("utf-8"), PROJECT, rationale=settings)
+    assert result is not None
+    assert _entity_by_name(result, "render").rationale == "GOTCHA: watch out"
+
+
+def test_rationale_marker_with_owner_parenthetical():
+    parsed = _parse("""\
+def render():
+    # NOTE(peter): owner annotations are tolerated
+    return 1
+""")
+    assert _entity_by_name(parsed, "render").rationale == "NOTE: owner annotations are tolerated"
+
+
+def test_citations_recorded_as_normalized_strings():
+    parsed = _parse("""\
+def render():
+    # WHY: see ADR 14 and RFC-7231
+    return 1
+""")
+    assert _entity_by_name(parsed, "render").citations == ["ADR-14", "RFC-7231"]
+
+
+def test_citations_recorded_from_unmarked_comments():
+    """A bare reference is worth recording even without a NOTE/WHY marker."""
+    parsed = _parse("""\
+def render():
+    # implements ADR-0014
+    return 1
+""")
+    entity = _entity_by_name(parsed, "render")
+    assert entity.citations == ["ADR-0014"]
+    assert entity.rationale is None
+
+
+def test_citations_deduplicated_and_sorted():
+    parsed = _parse("""\
+def render():
+    # NOTE: see RFC 7231
+    x = 1
+    # HACK: still RFC 7231, and ADR-0014
+    return x
+""")
+    assert _entity_by_name(parsed, "render").citations == ["ADR-0014", "RFC-7231"]
+
+
+def test_citations_disabled_by_settings():
+    source = "def render():\n    # NOTE: see ADR-0014\n    return 1\n"
+    settings = RationaleSettings(citations=False)
+    result = parse_file("src/example.py", source.encode("utf-8"), PROJECT, rationale=settings)
+    assert result is not None
+    entity = _entity_by_name(result, "render")
+    assert entity.rationale == "NOTE: see ADR-0014"
+    assert entity.citations == []
+
+
+def test_rationale_removal_restores_original_content_hash():
+    """Deleting the comment returns the entity to its pre-rationale hash.
+
+    The property is rewritten wholesale on every upsert, so it self-heals —
+    unlike detector ``PropertyEnrichment``, which is ``SET n += props`` and
+    never clears.
+    """
+    without = _parse("def render():\n    return 1\n")
+    with_note = _parse("def render():\n    # NOTE: reason\n    return 1\n")
+    readded = _parse("def render():\n    return 1\n")
+
+    assert _entity_by_name(with_note, "render").content_hash != _entity_by_name(without, "render").content_hash
+    assert _entity_by_name(readded, "render").content_hash == _entity_by_name(without, "render").content_hash
+    assert _entity_by_name(readded, "render").rationale is None
+
+
+def test_rationale_absent_leaves_defaults_on_every_entity():
+    parsed = _parse("""\
+class Widget:
+    def render(self):
+        return 1
+""")
+    for entity in parsed.entities:
+        assert entity.rationale is None
+        assert entity.citations == []

@@ -14,7 +14,10 @@ from code_atlas.graph.client import (
     _POST_BATCH_REL_TYPES,
     _UID_ROUTED_REL_TYPES,
     GraphClient,
+    _call_edge_weight,
+    _CallEdgeFacts,
     _CallLookup,
+    _combine_call_edge_facts,
     _format_path_hops,
     _fuse_bm25_results,
     _resolve_one_call,
@@ -248,6 +251,79 @@ class TestResolveOneCall:
         assert result is None
 
 
+class TestCallEdgeWeight:
+    """_call_edge_weight (client.py) — the numeric weight amending ADR-0014.
+
+    ADR-0014 rejected a float confidence as premature; the amendment stores the
+    raw facts (candidate_count, from_test) and derives the scalar here, so the
+    derivation is the only thing that needs retuning.
+    """
+
+    def test_single_candidate_production_call_is_the_base_weight(self):
+        assert _call_edge_weight(1, from_test=False) == 1.0
+
+    def test_evidence_is_split_across_ambiguous_candidates(self):
+        assert _call_edge_weight(4, from_test=False) == 0.25
+        assert _call_edge_weight(2, from_test=False) > _call_edge_weight(3, from_test=False)
+
+    def test_test_caller_ranks_below_the_same_call_from_production(self):
+        assert _call_edge_weight(1, from_test=True) < _call_edge_weight(1, from_test=False)
+        assert _call_edge_weight(3, from_test=True) < _call_edge_weight(3, from_test=False)
+
+    def test_weight_is_always_strictly_positive(self):
+        """MAGE's Leiden divides gamma by the sum of edge weights, so a zero total
+        produces NaN and silently meaningless communities — the floor is load-bearing."""
+        for count in (0, 1, 2, 100, 1_000_000, 10_000_000):
+            for from_test in (False, True):
+                assert _call_edge_weight(count, from_test=from_test) > 0.0
+
+
+class TestCombineCallEdgeFacts:
+    """_combine_call_edge_facts (client.py) — N call sites collapse to one edge.
+
+    Replaces the previous last-write-wins assignment, whose stored confidence
+    depended on parse order.
+    """
+
+    RESOLVED = _CallEdgeFacts("resolved", "same_file", 1, False)
+    AMBIGUOUS = _CallEdgeFacts("ambiguous", "project_wide", 3, False)
+
+    def test_best_evidenced_observation_wins_in_either_order(self):
+        forward = _combine_call_edge_facts(self.RESOLVED, self.AMBIGUOUS)
+        backward = _combine_call_edge_facts(self.AMBIGUOUS, self.RESOLVED)
+
+        assert forward == backward
+        assert forward.confidence == "resolved"
+        assert forward.strategy == "same_file"
+        assert forward.candidate_count == 1
+
+    def test_equal_evidence_keeps_the_first_observation(self):
+        first = _CallEdgeFacts("resolved", "import", 1, False)
+        second = _CallEdgeFacts("resolved", "sibling", 1, False)
+
+        assert _combine_call_edge_facts(first, second).strategy == "import"
+
+    def test_edge_is_from_test_only_when_every_call_site_was(self):
+        test_site = _CallEdgeFacts("resolved", "import", 1, True)
+        prod_site = _CallEdgeFacts("resolved", "import", 1, False)
+
+        assert _combine_call_edge_facts(test_site, test_site).from_test is True
+        assert _combine_call_edge_facts(test_site, prod_site).from_test is False
+        assert _combine_call_edge_facts(prod_site, test_site).from_test is False
+
+    def test_from_test_is_combined_independently_of_the_evidence_comparison(self):
+        """The losing observation still contributes its from_test — one production
+        caller makes the edge production-relevant regardless of which site had
+        the better-evidenced resolution."""
+        best = _CallEdgeFacts("resolved", "import", 1, True)
+        worse = _CallEdgeFacts("ambiguous", "project_wide", 5, True)
+
+        combined = _combine_call_edge_facts(worse, best)
+
+        assert combined.candidate_count == 1
+        assert combined.from_test is True
+
+
 class TestConstructorInjection:
     """GraphClient accepts a pre-built driver, bypassing AsyncGraphDatabase.driver()."""
 
@@ -301,6 +377,17 @@ class TestFormatPathHops:
             }
         ]
 
+    def test_includes_weight_and_from_test(self):
+        """The weighting amendment to ADR-0014 — weight explains an equal-hop tie-break,
+        from_test shows the hop runs through a test caller."""
+        nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
+        rels = [_FakeRel("CALLS", confidence="resolved", strategy="import", weight=0.25, from_test=True)]
+
+        hops = _format_path_hops(nodes, rels)
+
+        assert hops[0]["weight"] == 0.25
+        assert hops[0]["from_test"] is True
+
     def test_omits_confidence_when_absent(self):
         """A non-CALLS edge (e.g. IMPORTS) has no confidence/strategy property to surface."""
         nodes = [{"uid": "p:a", "name": "a"}, {"uid": "p:b", "name": "b"}]
@@ -310,6 +397,8 @@ class TestFormatPathHops:
 
         assert "confidence" not in hops[0]
         assert "strategy" not in hops[0]
+        assert "weight" not in hops[0]
+        assert "from_test" not in hops[0]
         assert hops[0]["edge_type"] == "IMPORTS"
 
     def test_multi_hop(self):
@@ -422,3 +511,194 @@ class TestAnalysisQueryConstruction:
         inherits_query = client.execute.call_args_list[3][0][0]
         assert "LIMIT" in methods_query.upper()
         assert "LIMIT" in inherits_query.upper()
+
+
+class TestResolveCallsEdgeProperties:
+    """resolve_calls persists the ADR-0014 amendment's raw facts plus the derived weight.
+
+    Asserts the Cypher SET clause and the parameter payload rather than a live
+    graph — a missing property here is invisible downstream (Memgraph is
+    schemaless for edge properties and MAGE reads an absent weight as 1.0
+    without erroring), so the write payload is the thing worth pinning.
+    """
+
+    PROJECT = "proj"
+    CALLER = "proj:mod.caller"
+
+    def _lookup(self, caller_fp: str, targets: list[tuple[str, str, str]]) -> _CallLookup:
+        info = {self.CALLER: ("caller", caller_fp)}
+        for uid, fp, _vis in targets:
+            info[uid] = ("helper", fp)
+        return _CallLookup(
+            name_to_callables={"helper": targets},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info=info,
+        )
+
+    async def _write_call(
+        self,
+        tmp_path: Path,
+        caller_fp: str,
+        targets: list[tuple[str, str, str]],
+        *,
+        test_patterns: tuple[str, ...] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        client = _client_with_fake_execute(tmp_path)
+        client.execute_write = AsyncMock()
+        rel = ParsedRelationship(from_qualified_name=self.CALLER, rel_type=RelType.CALLS, to_name="helper")
+
+        await client.resolve_calls(
+            self.PROJECT,
+            [rel],
+            lookup=self._lookup(caller_fp, targets),
+            name_to_typedefs={},
+            test_patterns=test_patterns,
+        )
+
+        query, params = client.execute_write.call_args[0]
+        return query, params["rels"]
+
+    async def test_resolved_production_call_writes_full_weight_and_raw_facts(self, tmp_path: Path):
+        query, rels = await self._write_call(tmp_path, "src/mod.py", [("proj:other.helper", "other.py", "public")])
+
+        assert "e.candidate_count = r.candidate_count" in query
+        assert "e.from_test = r.from_test" in query
+        assert "e.weight = r.weight" in query
+        assert rels == [
+            {
+                "f": "proj:mod.caller",
+                "t": "proj:other.helper",
+                "confidence": "resolved",
+                "strategy": "project_unique",
+                "candidate_count": 1,
+                "from_test": False,
+                "weight": 1.0,
+            }
+        ]
+
+    async def test_ambiguous_call_records_the_count_and_splits_the_weight(self, tmp_path: Path):
+        targets = [("proj:a.helper", "a.py", "public"), ("proj:b.helper", "b.py", "public")]
+
+        _query, rels = await self._write_call(tmp_path, "src/mod.py", targets)
+
+        assert {r["t"] for r in rels} == {"proj:a.helper", "proj:b.helper"}
+        assert all(r["confidence"] == "ambiguous" for r in rels)
+        assert all(r["candidate_count"] == 2 for r in rels)
+        assert all(r["weight"] == 0.5 for r in rels)
+
+    async def test_caller_in_a_test_directory_is_flagged_and_damped(self, tmp_path: Path):
+        _query, rels = await self._write_call(
+            tmp_path, "tests/unit/check_mod.py", [("proj:other.helper", "other.py", "public")]
+        )
+
+        assert rels[0]["from_test"] is True
+        assert rels[0]["weight"] < 1.0
+
+    async def test_test_patterns_override_the_search_settings_default(self, tmp_path: Path):
+        """The graph layer must not hardcode test policy — a project configuring
+        its own patterns gets its own from_test verdict."""
+        targets = [("proj:other.helper", "other.py", "public")]
+
+        _q1, default_rels = await self._write_call(tmp_path, "spec/mod_spec.py", targets)
+        _q2, custom_rels = await self._write_call(tmp_path, "spec/mod_spec.py", targets, test_patterns=("*_spec.py",))
+
+        assert default_rels[0]["from_test"] is False
+        assert custom_rels[0]["from_test"] is True
+
+    async def test_unknown_caller_defaults_to_non_test(self, tmp_path: Path):
+        """uid_to_info is Callable-scoped; a caller absent from it has no path to
+        match, and guessing "test" there would damp real production edges."""
+        client = _client_with_fake_execute(tmp_path)
+        client.execute_write = AsyncMock()
+        lookup = _CallLookup(
+            name_to_callables={"helper": [("proj:other.helper", "other.py", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={"proj:other.helper": ("helper", "other.py")},
+        )
+        rel = ParsedRelationship(from_qualified_name=self.CALLER, rel_type=RelType.CALLS, to_name="helper")
+
+        await client.resolve_calls(self.PROJECT, [rel], lookup=lookup, name_to_typedefs={})
+
+        assert client.execute_write.call_args[0][1]["rels"][0]["from_test"] is False
+
+
+class TestWeightAwareTraversalQueries:
+    """trace_path_between / compute_blast_radius Cypher — the weight-aware parts."""
+
+    async def test_trace_path_breaks_equal_hop_ties_by_path_weight(self, tmp_path: Path):
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [[{"from_exists": True, "to_exists": True}], []]
+
+        await client.trace_path_between("p:a", "p:b", 4, ("CALLS", "IMPORTS"))
+
+        query = client.execute.call_args_list[1][0][0]
+        assert "coalesce(r.weight, 1.0)" in query
+        assert "AS path_weight" in query
+        assert "ORDER BY hops, path_weight DESC" in query
+
+    async def test_trace_path_reports_no_path_weight_when_no_path_exists(self, tmp_path: Path):
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [[{"from_exists": True, "to_exists": True}], []]
+
+        result = await client.trace_path_between("p:a", "p:b", 4, ("CALLS",))
+
+        assert result["found"] is False
+        assert result["path_weight"] is None
+
+    async def test_blast_radius_scores_best_path_and_flags_test_only_reachability(self, tmp_path: Path):
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [
+            [
+                {
+                    "uid": "p:x",
+                    "name": "x",
+                    "qn": "m.x",
+                    "label": "Callable",
+                    "file_path": "m.py",
+                    "min_depth": 1,
+                    "confidence_score": 0.25,
+                }
+            ],
+            [],
+            [],
+        ]
+
+        results = await client.compute_blast_radius("p:a", "in", ("CALLS",), 3)
+
+        all_query, resolved_query, production_query = (c[0][0] for c in client.execute.call_args_list)
+        assert "max(reduce(w = 1.0" in all_query
+        assert "coalesce(r.weight, 1.0)" in all_query
+        assert "AS confidence_score" in all_query
+        assert "r.confidence = 'resolved'" in resolved_query
+        assert "NOT coalesce(r.from_test, false)" in production_query
+        assert results[0]["confidence_score"] == 0.25
+        assert results[0]["ambiguous_only"] is True
+        assert results[0]["test_only"] is True
+
+    async def test_blast_radius_clears_the_flags_when_a_clean_path_exists(self, tmp_path: Path):
+        client = _client_with_fake_execute(tmp_path)
+        client.execute.side_effect = [
+            [
+                {
+                    "uid": "p:x",
+                    "name": "x",
+                    "qn": "m.x",
+                    "label": "Callable",
+                    "file_path": "m.py",
+                    "min_depth": 1,
+                    "confidence_score": 1.0,
+                }
+            ],
+            [{"uid": "p:x"}],
+            [{"uid": "p:x"}],
+        ]
+
+        results = await client.compute_blast_radius("p:a", "in", ("CALLS",), 3)
+
+        assert results[0]["ambiguous_only"] is False
+        assert results[0]["test_only"] is False
+        assert results[0]["confidence_score"] == 1.0

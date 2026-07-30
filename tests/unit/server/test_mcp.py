@@ -1093,6 +1093,7 @@ class TestQueryTimeout:
         mock_graph.trace_path_between = AsyncMock(side_effect=QueryTimeoutError(10.0, "trace_path_between"))
         mock_graph.get_dead_code_candidates = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_dead_code_candidates"))
         mock_graph.get_complexity_hotspots = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_complexity_hotspots"))
+        mock_graph.get_module_summary = AsyncMock(side_effect=QueryTimeoutError(10.0, "get_module_summary"))
         mock_graph.node_exists = AsyncMock(side_effect=QueryTimeoutError(10.0, "node_exists"))
         # get_node/get_context/index_status/list_projects now call named GraphBackend methods
         # (query construction moved into GraphClient — see graph/protocol.py) instead of
@@ -1160,6 +1161,10 @@ class TestQueryTimeout:
 
     async def test_blast_radius_timeout(self, timeout_app):
         result = await _invoke_tool(timeout_app, "blast_radius", uid="p:a")
+        assert result["code"] == "QUERY_TIMEOUT"
+
+    async def test_summarize_module_timeout(self, timeout_app):
+        result = await _invoke_tool(timeout_app, "summarize_module", path="pkg", project="p")
         assert result["code"] == "QUERY_TIMEOUT"
 
 
@@ -1444,3 +1449,89 @@ class TestGatedToolsSurfaceIndexRequired:
             result = await asyncio.wait_for(_invoke_tool(app, "health_check"), timeout=1.0)
 
         assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# summarize_module — ADR-0013 shortcut tool over analyze_repo("module_summary")
+# ---------------------------------------------------------------------------
+
+
+class TestSummarizeModule:
+    """summarize_module is a thin wrapper (ADR-0013), so what matters is that it
+    delegates with the analysis pre-set and forwards path/limit/test patterns
+    exactly like find_dead_code/find_complexity_hotspots do."""
+
+    @pytest.fixture
+    def summary_app(self, settings):
+        mock_graph = AsyncMock(spec=GraphClient)
+        mock_graph.get_module_summary = AsyncMock(
+            return_value={
+                "modules": [{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+                "entities": [],
+                "internal_edges": [],
+                "fan_in": [],
+                "fan_out": [],
+                "docs": [],
+            }
+        )
+        return AppContext(graph=mock_graph, settings=settings, embed=EmbedClient(settings.embeddings))
+
+    async def test_shortcut_delegates_with_analysis_preset(self, summary_app):
+        result = await _invoke_tool(summary_app, "summarize_module", path="pkg", project="proj")
+
+        assert result["analysis"] == "module_summary"
+        assert result["path"] == "pkg"
+        summary_app.graph.get_module_summary.assert_awaited_once()
+
+    async def test_shortcut_scales_limit_before_hitting_the_backend(self, summary_app):
+        await _invoke_tool(summary_app, "summarize_module", path="pkg", project="proj", limit=5)
+
+        assert summary_app.graph.get_module_summary.call_args[0] == ("proj", "pkg", 50, 150)
+
+    async def test_shortcut_clamps_limit_to_max(self, summary_app):
+        await _invoke_tool(summary_app, "summarize_module", path="pkg", project="proj", limit=10_000)
+
+        assert summary_app.graph.get_module_summary.call_args[0][2] == 100 * 10
+
+    async def test_exclude_tests_false_disables_boundary_filtering(self, summary_app):
+        """exclude_tests=False must reach _resolve_test_patterns the same way the
+        other analyze_repo shortcuts wire it."""
+        summary_app.graph.get_module_summary = AsyncMock(
+            return_value={
+                "modules": [{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+                "entities": [],
+                "internal_edges": [],
+                "fan_in": [
+                    {
+                        "from_qn": "tests.unit.test_mod.test_x",
+                        "from_name": "test_x",
+                        "from_path": "tests/unit/test_mod.py",
+                        "from_label": "Callable",
+                        "to_qn": "pkg.mod.f",
+                        "rel_type": "CALLS",
+                        "props": {},
+                    }
+                ],
+                "fan_out": [],
+                "docs": [],
+            }
+        )
+
+        filtered = await _invoke_tool(summary_app, "summarize_module", path="pkg", project="proj")
+        unfiltered = await _invoke_tool(
+            summary_app, "summarize_module", path="pkg", project="proj", exclude_tests=False
+        )
+
+        assert filtered["fan_in_count"] == 0
+        assert unfiltered["fan_in_count"] == 1
+
+    async def test_missing_path_is_a_clean_error_not_a_query(self, summary_app):
+        result = await _invoke_tool(summary_app, "summarize_module", path="", project="proj")
+
+        assert result["code"] == "PATH_REQUIRED"
+        summary_app.graph.get_module_summary.assert_not_awaited()
+
+    async def test_analyze_repo_exposes_the_same_analysis(self, summary_app):
+        result = await _invoke_tool(summary_app, "analyze_repo", analysis="module_summary", project="proj", path="pkg")
+
+        assert result["analysis"] == "module_summary"

@@ -11,8 +11,11 @@ records a backend returns.
 
 from __future__ import annotations
 
+import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.server.analysis import _sid, analyze_repo, blast_radius, generate_diagram, trace_path
 
 # ---------------------------------------------------------------------------
@@ -415,6 +418,37 @@ async def test_trace_path_found_builds_hops_with_confidence():
     assert result["hops"][0]["edge_type"] == "CALLS"
 
 
+async def test_trace_path_surfaces_path_weight():
+    """path_weight is what broke the tie between equal-length paths — surface it
+    so the choice is inspectable rather than opaque."""
+    graph = MagicMock()
+    graph.trace_path_between = AsyncMock(
+        return_value={
+            "from_exists": True,
+            "to_exists": True,
+            "found": True,
+            "hop_count": 2,
+            "hops": [],
+            "path_weight": 0.1250001,
+        }
+    )
+
+    result = await trace_path(graph, "p:a", "p:b")
+
+    assert result["path_weight"] == 0.125
+
+
+async def test_trace_path_tolerates_a_backend_without_path_weight():
+    graph = MagicMock()
+    graph.trace_path_between = AsyncMock(
+        return_value={"from_exists": True, "to_exists": True, "found": True, "hop_count": 1, "hops": []}
+    )
+
+    result = await trace_path(graph, "p:a", "p:b")
+
+    assert result["path_weight"] is None
+
+
 async def test_blast_radius_not_found():
     graph = MagicMock()
     graph.node_exists = AsyncMock(return_value=False)
@@ -494,6 +528,87 @@ async def test_blast_radius_respects_limit_and_reports_truncated():
     assert result["affected_count"] == 3
     assert len(result["affected"]) == 2
     assert result["truncated"] is True
+
+
+def _affected(uid: str, **overrides: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "uid": uid,
+        "name": uid,
+        "qualified_name": f"mod.{uid}",
+        "label": "Callable",
+        "file_path": "mod.py",
+        "min_depth": 1,
+        "direction": "in",
+        "ambiguous_only": False,
+        "confidence_score": 1.0,
+        "test_only": False,
+    }
+    entry.update(overrides)
+    return entry
+
+
+async def test_blast_radius_ranks_production_impact_above_test_only_callers():
+    """Same depth, same score — the caller only test code reaches sorts last,
+    even though its qualified_name would sort first alphabetically."""
+    graph = MagicMock()
+    graph.node_exists = AsyncMock(return_value=True)
+    graph.compute_blast_radius = AsyncMock(
+        return_value=[
+            _affected("aaa", test_only=True, confidence_score=0.25),
+            _affected("zzz"),
+        ]
+    )
+
+    result = await blast_radius(graph, "p:a")
+
+    assert [a["uid"] for a in result["affected"]] == ["zzz", "aaa"]
+
+
+async def test_blast_radius_ranks_higher_confidence_first_within_a_depth():
+    graph = MagicMock()
+    graph.node_exists = AsyncMock(return_value=True)
+    graph.compute_blast_radius = AsyncMock(
+        return_value=[
+            _affected("aaa", confidence_score=0.2, ambiguous_only=True),
+            _affected("zzz", confidence_score=1.0),
+        ]
+    )
+
+    result = await blast_radius(graph, "p:a")
+
+    assert [a["uid"] for a in result["affected"]] == ["zzz", "aaa"]
+
+
+async def test_blast_radius_keeps_depth_as_the_primary_sort_key():
+    """Confidence ranking must not promote a distant high-confidence entity above
+    a nearer one — depth is still what "blast radius" means."""
+    graph = MagicMock()
+    graph.node_exists = AsyncMock(return_value=True)
+    graph.compute_blast_radius = AsyncMock(
+        return_value=[
+            _affected("far", min_depth=3, confidence_score=1.0),
+            _affected("near", min_depth=1, confidence_score=0.05, test_only=True),
+        ]
+    )
+
+    result = await blast_radius(graph, "p:a")
+
+    assert [a["uid"] for a in result["affected"]] == ["near", "far"]
+
+
+async def test_blast_radius_tolerates_entries_without_the_new_confidence_fields():
+    """A backend (or graph) predating the weighting amendment returns entries with
+    no confidence_score/test_only — those must rank as neutral, not crash."""
+    graph = MagicMock()
+    graph.node_exists = AsyncMock(return_value=True)
+    legacy = _affected("legacy")
+    del legacy["confidence_score"]
+    del legacy["test_only"]
+    graph.compute_blast_radius = AsyncMock(return_value=[legacy, _affected("scored", confidence_score=0.1)])
+
+    result = await blast_radius(graph, "p:a")
+
+    assert [a["uid"] for a in result["affected"]] == ["legacy", "scored"]
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +800,23 @@ async def test_communities_groups_and_sorts_by_size_descending():
     query = graph.execute.call_args[0][0]
     assert "leiden_community_detection.get" in query
     assert "project(p)" in query
+
+
+async def test_communities_passes_the_numeric_weight_property_to_leiden():
+    """MAGE reads a missing or non-numeric weight_property as 1.0 with no error, so
+    an unweighted call and a mis-named one are indistinguishable from the result.
+    Pin the exact positional argument instead — and specifically that it is not
+    'confidence', which is a *string* on CALLS edges and would silently degrade
+    the whole clustering back to unweighted.
+    """
+    graph = MagicMock()
+    graph.execute = AsyncMock(return_value=[])
+
+    await analyze_repo(graph, "communities", "code-atlas")
+
+    query = graph.execute.call_args[0][0]
+    assert 'leiden_community_detection.get(subgraph, "weight")' in query
+    assert '"confidence"' not in query
 
 
 async def test_communities_query_excludes_external_labels():
@@ -1156,3 +1288,431 @@ async def test_module_detail_skips_inheritance_edge_for_truncated_child():
     result = await generate_diagram(graph, "module_detail", "code-atlas", path="pkg/mod", max_nodes=5)
 
     assert _sid("pkg.mod.Bar") not in result["mermaid"]
+
+
+# ---------------------------------------------------------------------------
+# Module summary (analyze_repo(analysis="module_summary"))
+# ---------------------------------------------------------------------------
+
+
+def _summary_entity(
+    qn: str,
+    *,
+    name: str | None = None,
+    label: str = "Callable",
+    kind: str = "function",
+    vis: str = "public",
+    sig: str | None = None,
+    docstring: str | None = None,
+    line_start: int = 1,
+    line_end: int | None = None,
+    file_path: str = "pkg/mod.py",
+    parent_qn: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "uid": f"proj:{qn}",
+        "name": name or qn.rsplit(".", 1)[-1],
+        "qn": qn,
+        "label": label,
+        "kind": kind,
+        "vis": vis,
+        "sig": sig,
+        "docstring": docstring,
+        "line_start": line_start,
+        "line_end": line_end,
+        "file_path": file_path,
+        "parent_qn": parent_qn,
+    }
+
+
+def _graph_for_module_summary(**overrides: Any) -> MagicMock:
+    """Fake GraphBackend returning a canned get_module_summary payload."""
+    payload: dict[str, list[dict[str, Any]]] = {
+        "modules": [],
+        "entities": [],
+        "internal_edges": [],
+        "fan_in": [],
+        "fan_out": [],
+        "docs": [],
+    }
+    payload.update(overrides)
+    graph = MagicMock()
+    graph.get_module_summary = AsyncMock(return_value=payload)
+    return graph
+
+
+async def test_module_summary_requires_a_path():
+    """Fan-in/fan-out mean "exactly one endpoint outside path" — with no path
+    everything is in scope and the boundary would be empty by construction.
+    """
+    graph = _graph_for_module_summary()
+
+    result = await analyze_repo(graph, "module_summary", "proj")
+
+    assert result["code"] == "PATH_REQUIRED"
+    graph.get_module_summary.assert_not_awaited()
+
+
+async def test_module_summary_not_found_when_path_matches_nothing():
+    graph = _graph_for_module_summary()
+
+    result = await analyze_repo(graph, "module_summary", "proj", path="pkg/nope")
+
+    assert result["code"] == "NOT_FOUND"
+    assert "pkg/nope" in result["error"]
+
+
+async def test_module_summary_scales_limit_into_entity_and_edge_budgets():
+    """analyze_repo's shared limit (<=100) is a per-section knob, not an entity
+    budget — module_summary multiplies it before it reaches the backend.
+    """
+    graph = _graph_for_module_summary(modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py"}])
+
+    await analyze_repo(graph, "module_summary", "proj", path="pkg", limit=20)
+
+    assert graph.get_module_summary.call_args[0] == ("proj", "pkg", 200, 600)
+
+
+async def test_module_summary_emits_signature_visibility_span_and_first_doc_line_only():
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": "Module blurb.\n\nMore."}],
+        entities=[
+            _summary_entity(
+                "pkg.mod.run",
+                sig="def run(self,\n        x: int) -> str",
+                docstring="Do the thing.\n\nLong explanation nobody needs here.",
+                line_start=10,
+                line_end=42,
+            ),
+            _summary_entity("pkg.mod._helper", vis="private", sig="def _helper()", line_start=50),
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    assert "+ def run(self, x: int) -> str L10-42  # Do the thing." in outline
+    assert "- def _helper() L50" in outline
+    assert "Long explanation nobody needs here." not in outline
+    assert "More." not in outline
+    assert "# Module blurb." in outline
+
+
+async def test_module_summary_indents_class_members_under_their_class():
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[
+            _summary_entity("pkg.mod.Widget", label="TypeDef", kind="class", sig=None, line_start=1, line_end=30),
+            _summary_entity("pkg.mod.Widget.draw", kind="method", sig="def draw(self)", parent_qn="pkg.mod.Widget"),
+            _summary_entity("pkg.mod.free_fn", sig="def free_fn()", parent_qn="pkg.mod"),
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    assert "  + class Widget L1-30" in outline
+    assert "    + def draw(self) L1" in outline
+    assert "  + def free_fn() L1" in outline
+
+
+async def test_module_summary_collapses_adjacency_and_relativizes_names():
+    graph = _graph_for_module_summary(
+        modules=[
+            {"qn": "pkg.a", "name": "a", "file_path": "pkg/a.py", "docstring": None},
+            {"qn": "pkg.b", "name": "b", "file_path": "pkg/b.py", "docstring": None},
+        ],
+        entities=[_summary_entity("pkg.a.caller", sig="def caller()", file_path="pkg/a.py")],
+        internal_edges=[
+            {"from_qn": "pkg.a.caller", "to_qn": "pkg.b.one", "rel_type": "CALLS", "props": {}},
+            {"from_qn": "pkg.a.caller", "to_qn": "pkg.b.two", "rel_type": "CALLS", "props": {}},
+        ],
+    )
+
+    result = await analyze_repo(graph, "module_summary", "proj", path="pkg")
+
+    assert "NAMES below are relative to pkg" in result["outline"]
+    # One line per source, not one per edge.
+    assert "    a.caller > b.one, b.two" in result["outline"]
+    assert result["internal_edge_count"] == 2
+
+
+async def test_module_summary_reports_fan_in_and_fan_out_boundary():
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[_summary_entity("pkg.mod.api", sig="def api()")],
+        fan_in=[
+            {
+                "from_qn": "other.cli.main",
+                "from_name": "main",
+                "from_path": "other/cli.py",
+                "from_label": "Callable",
+                "to_qn": "pkg.mod.api",
+                "rel_type": "CALLS",
+                "props": {},
+            }
+        ],
+        fan_out=[
+            {
+                "from_qn": "pkg.mod.api",
+                "to_qn": "requests",
+                "to_name": "requests",
+                "to_path": None,
+                "to_label": "ExternalPackage",
+                "rel_type": "IMPORTS",
+                "props": {},
+            }
+        ],
+    )
+
+    result = await analyze_repo(graph, "module_summary", "proj", path="pkg")
+
+    # Single in-scope module, so the shared prefix is its full qn and in-scope
+    # names shrink to bare locals; out-of-scope names stay fully qualified.
+    assert "NAMES below are relative to pkg.mod" in result["outline"]
+    assert "FAN-IN" in result["outline"]
+    assert "    api < other.cli.main" in result["outline"]
+    assert "FAN-OUT" in result["outline"]
+    # External targets are marked so an agent does not hunt for them in the repo.
+    assert "    api > requests*" in result["outline"]
+    assert (result["fan_in_count"], result["fan_out_count"]) == (1, 1)
+
+
+async def test_module_summary_passes_through_unknown_edge_properties():
+    """Edge annotations are value-driven, not a hardcoded key list: neutral values
+    (confidence='resolved', weight 1, false flags) cost no tokens, and any other
+    property — including ones added after this code was written — is rendered.
+    """
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[_summary_entity("pkg.mod.a", sig="def a()")],
+        internal_edges=[
+            {
+                "from_qn": "pkg.mod.a",
+                "to_qn": "pkg.mod.b",
+                "rel_type": "CALLS",
+                "props": {"confidence": "ambiguous", "strategy": "name_match", "candidate_count": 3},
+            },
+            {
+                "from_qn": "pkg.mod.a",
+                "to_qn": "pkg.mod.c",
+                "rel_type": "CALLS",
+                "props": {"confidence": "resolved", "weight": 1.0, "from_test": False},
+            },
+            {
+                "from_qn": "pkg.mod.a",
+                "to_qn": "pkg.mod.d",
+                "rel_type": "CALLS",
+                "props": {"weight": 0.25, "from_test": True, "some_future_prop": "xyz"},
+            },
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    assert "b[candidate_count=3 confidence=ambiguous strategy=name_match]" in outline
+    assert ", c," in outline
+    assert "c[" not in outline
+    assert "d[from_test=True some_future_prop=xyz weight=0.25]" in outline
+
+
+async def test_module_summary_filters_test_callers_but_not_in_scope_entities():
+    """The caller named the path explicitly, so in-scope entities are never
+    filtered (summarizing a test package must work); test scaffolding is only
+    dropped from the boundary lists, where it otherwise swamps fan-in.
+    """
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "tests.unit.test_thing", "name": "test_thing", "file_path": "tests/unit/test_thing.py"}],
+        entities=[
+            _summary_entity(
+                "tests.unit.test_thing.test_it",
+                sig="def test_it()",
+                file_path="tests/unit/test_thing.py",
+            )
+        ],
+        fan_in=[
+            {
+                "from_qn": "tests.unit.test_other.test_x",
+                "from_name": "test_x",
+                "from_path": "tests/unit/test_other.py",
+                "from_label": "Callable",
+                "to_qn": "tests.unit.test_thing.test_it",
+                "rel_type": "CALLS",
+                "props": {},
+            },
+            {
+                "from_qn": "pkg.mod.prod_caller",
+                "from_name": "prod_caller",
+                "from_path": "pkg/mod.py",
+                "from_label": "Callable",
+                "to_qn": "tests.unit.test_thing.test_it",
+                "rel_type": "CALLS",
+                "props": {},
+            },
+        ],
+    )
+
+    result = await analyze_repo(graph, "module_summary", "proj", path="tests/unit", test_patterns=("test_*", "tests/"))
+
+    assert result["entity_count"] == 1
+    assert "def test_it()" in result["outline"]
+    assert result["fan_in_count"] == 1
+    assert "pkg.mod.prod_caller" in result["outline"]
+    assert "test_other" not in result["outline"]
+
+
+async def test_module_summary_flags_truncation_at_the_entity_cap():
+    entities = [_summary_entity(f"pkg.mod.f{i}", sig=f"def f{i}()", line_start=i) for i in range(10)]
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=entities,
+    )
+
+    result = await analyze_repo(graph, "module_summary", "proj", path="pkg", limit=1)
+
+    assert result["truncated"] is True
+    assert "TRUNCATED" in result["outline"]
+
+
+async def test_module_summary_dedupes_rows_duplicated_by_the_defines_join():
+    """The backend's OPTIONAL MATCH / LEFT JOIN on DEFINES can emit a row per
+    parent; the same uid must not be rendered twice.
+    """
+    row = _summary_entity("pkg.mod.f", sig="def f()")
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[row, dict(row, parent_qn="pkg.mod")],
+    )
+
+    result = await analyze_repo(graph, "module_summary", "proj", path="pkg")
+
+    assert result["entity_count"] == 1
+    assert result["outline"].count("def f()") == 1
+
+
+async def test_module_summary_renders_linked_docs():
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[_summary_entity("pkg.mod.f", sig="def f()")],
+        docs=[
+            {
+                "doc_qn": "note:f-gotchas",
+                "doc_name": "f-gotchas",
+                "doc_label": "Note",
+                "to_qn": "pkg.mod.f",
+                "link_type": "anchor",
+            }
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    assert "DOCS" in outline
+    assert "  f < note:f-gotchas(anchor)" in outline
+
+
+# ---------------------------------------------------------------------------
+# Module summary over the real SQLite backend
+#
+# Placed here rather than in tests/unit/backends/ because it is the analysis
+# function that is under test end-to-end; SqliteGraphClient is just a real
+# backend to run its SQL against (same direction as the _analyze_communities
+# import already in tests/unit/backends/test_sqlite_graph.py). Memgraph parity
+# for the same scenario is covered by tests/integration/server/test_mcp.py.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_sqlite_scope(client: SqliteGraphClient) -> None:
+    conn = await client._get_conn()
+    nodes = [
+        ("proj:pkg.mod", "Module", "pkg.mod", "pkg/mod.py", "mod", None, {"docstring": "Scope module."}),
+        (
+            "proj:pkg.mod.Widget",
+            "TypeDef",
+            "pkg.mod.Widget",
+            "pkg/mod.py",
+            "Widget",
+            "class",
+            {"visibility": "public", "line_start": 5, "line_end": 40, "docstring": "A widget.\nDetails."},
+        ),
+        (
+            "proj:pkg.mod.Widget.draw",
+            "Callable",
+            "pkg.mod.Widget.draw",
+            "pkg/mod.py",
+            "draw",
+            "method",
+            {"visibility": "public", "line_start": 10, "line_end": 20, "signature": "def draw(self) -> None"},
+        ),
+        (
+            "proj:pkg.mod._hidden",
+            "Callable",
+            "pkg.mod._hidden",
+            "pkg/mod.py",
+            "_hidden",
+            "function",
+            {"visibility": "private", "line_start": 45, "line_end": 47, "signature": "def _hidden()"},
+        ),
+        (
+            "proj:other.cli.main",
+            "Callable",
+            "other.cli.main",
+            "other/cli.py",
+            "main",
+            "function",
+            {"visibility": "public", "line_start": 1, "line_end": 3},
+        ),
+        ("proj:ext/requests", "ExternalPackage", "requests", None, "requests", None, {}),
+    ]
+    for uid, label, qn, file_path, name, kind, props in nodes:
+        await conn.execute(
+            "INSERT INTO nodes(uid, labels, project_name, qualified_name, file_path, name, kind, props_json) "
+            "VALUES (?, ?, 'proj', ?, ?, ?, ?, ?)",
+            (uid, label, qn, file_path, name, kind, json.dumps(props)),
+        )
+    edges = [
+        ("proj:pkg.mod", "proj:pkg.mod.Widget", "DEFINES", {}),
+        ("proj:pkg.mod.Widget", "proj:pkg.mod.Widget.draw", "DEFINES", {}),
+        ("proj:pkg.mod", "proj:pkg.mod._hidden", "DEFINES", {}),
+        ("proj:pkg.mod.Widget.draw", "proj:pkg.mod._hidden", "CALLS", {"confidence": "ambiguous"}),
+        ("proj:other.cli.main", "proj:pkg.mod.Widget.draw", "CALLS", {"confidence": "resolved"}),
+        ("proj:pkg.mod.Widget.draw", "proj:ext/requests", "IMPORTS", {}),
+    ]
+    for from_uid, to_uid, rel_type, props in edges:
+        await conn.execute(
+            "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, ?)",
+            (from_uid, to_uid, rel_type, json.dumps(props)),
+        )
+    await conn.commit()
+
+
+async def test_module_summary_sqlite_backend_end_to_end(tmp_path):
+    client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    await client.ensure_schema()
+    await _seed_sqlite_scope(client)
+
+    result = await analyze_repo(client, "module_summary", "proj", path="pkg/")
+
+    outline = result["outline"]
+    assert result["entity_count"] == 3
+    assert "pkg.mod (pkg/mod.py)" in outline
+    assert "# Scope module." in outline
+    # Class members indented under the class, private marker preserved.
+    assert "  + class Widget L5-40  # A widget." in outline
+    assert "    + def draw(self) -> None L10-20" in outline
+    assert "  - def _hidden() L45-47" in outline
+    # Intra-scope edge with its ADR-0014 confidence annotation.
+    assert "Widget.draw > _hidden[confidence=ambiguous]" in outline
+    # Boundary: an external caller in, an external package out.
+    assert "Widget.draw < other.cli.main" in outline
+    assert "Widget.draw > requests*" in outline
+    assert (result["fan_in_count"], result["fan_out_count"]) == (1, 1)
+    await client.close()
+
+
+async def test_module_summary_sqlite_backend_reports_not_found(tmp_path):
+    client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    await client.ensure_schema()
+
+    result = await analyze_repo(client, "module_summary", "proj", path="nope/")
+
+    assert result["code"] == "NOT_FOUND"
+    await client.close()

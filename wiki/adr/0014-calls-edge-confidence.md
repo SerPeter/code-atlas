@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted — amends [ADR-0008](./0008-cross-file-relationship-resolution.md)
+Accepted — amends [ADR-0008](./0008-cross-file-relationship-resolution.md); itself amended by
+[ADR-0017](./0017-calls-edge-weights.md), which supersedes this ADR's rejection of a numeric confidence score (see its
+Alternatives Considered below) now that MAGE's weighted Leiden, blast-radius ranking, and test provenance require a
+magnitude rather than a category.
 
 ## Date
 

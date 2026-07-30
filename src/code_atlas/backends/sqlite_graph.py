@@ -51,13 +51,18 @@ import sqlite_vec
 from loguru import logger
 
 from code_atlas.graph.client import (
+    _DEFAULT_EDGE_WEIGHT,
+    _DEFAULT_TEST_PATTERNS,
     SCHEMA_VERSION,
     CallStats,
     EntityHashData,
     UpsertResult,
     _AnchorLookup,
     _BatchClassification,
+    _call_edge_weight,
+    _CallEdgeFacts,
     _CallLookup,
+    _combine_call_edge_facts,
     _fuse_bm25_results,
     _resolve_one_call,
     _resolve_one_path_anchor,
@@ -73,9 +78,11 @@ from code_atlas.schema import (
     TEXT_INDICES,
     build_vector_index_specs,
 )
+from code_atlas.search.engine import matches_test_pattern
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Sequence
     from pathlib import Path
 
     from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
@@ -141,6 +148,19 @@ def _sanitize_fts_query(query: str) -> str:
     if not terms:
         return '""'
     return " ".join(f'"{t}"' for t in terms)
+
+
+def _props_weight(props: dict[str, Any]) -> float:
+    """Numeric ``weight`` out of a decoded ``props_json`` dict.
+
+    Mirrors how Memgraph/MAGE reads the property: a missing or non-numeric
+    value is the neutral ``_DEFAULT_EDGE_WEIGHT``, never an error. ``bool`` is
+    excluded explicitly since it is an ``int`` subclass in Python.
+    """
+    value = props.get("weight")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return _DEFAULT_EDGE_WEIGHT
+    return float(value)
 
 
 def _prefix_clause(column: str, path: str) -> tuple[str, list[Any]]:
@@ -248,6 +268,11 @@ def _entity_props(e: ParsedEntity) -> dict[str, Any]:
         "tags": e.tags,
         "header_path": e.header_path,
         "header_level": e.header_level,
+        # Always emitted, null when absent: the update path merges with
+        # ``json_patch``, whose RFC 7396 semantics drop a key on null — that is
+        # what makes a deleted ``# NOTE:`` clear the stored property.
+        "rationale": e.rationale,
+        "citations": e.citations or None,
     }
     props.update(e.extra_properties)
     return props
@@ -356,6 +381,30 @@ class SqliteGraphClient:
 
     async def _set_schema_version(self, conn: aiosqlite.Connection, version: int) -> None:
         await self._upsert_meta(conn, "schema_version", str(version))
+
+    async def _migrate_v6_clear_freshness_markers(self, conn: aiosqlite.Connection) -> None:
+        """Mirror of ``GraphClient._migrate_v6_clear_freshness_markers``.
+
+        CALLS edges gained numeric ``weight``/``candidate_count``/``from_test`` and entities
+        gained ``rationale``/``citations``; both are produced at index time, and the file-hash
+        gate would otherwise skip every unchanged file forever.
+        """
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
+            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
+            "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
+        )
+        await conn.execute(
+            "DELETE FROM edges WHERE rel_type = 'CALLS' AND json_extract(props_json, '$.weight') IS NULL"
+        )
+        await conn.commit()
+        logger.info(
+            "SQLite schema v6: cleared stored file/git hashes and unweighted CALLS edges — "
+            "run 'atlas index' to rebuild with edge weights and rationale"
+        )
         await conn.commit()
 
     async def _apply_full_schema(self, conn: aiosqlite.Connection) -> None:
@@ -390,6 +439,8 @@ class SqliteGraphClient:
         elif stored < SCHEMA_VERSION:
             logger.info("SQLite graph schema v{} -> v{} (idempotent re-apply)", stored, SCHEMA_VERSION)
             await self._apply_full_schema(conn)
+            if stored < 6:
+                await self._migrate_v6_clear_freshness_markers(conn)
             await self._set_schema_version(conn, SCHEMA_VERSION)
         else:
             msg = (
@@ -458,7 +509,10 @@ class SqliteGraphClient:
         table = f"text_{label.lower()}"
         uid = e.qualified_name
         qn = uid.split(":", 1)[1] if ":" in uid else uid
-        parts = [e.name, qn, e.docstring, e.signature, e.source, " ".join(e.tags)]
+        # Memgraph's text index is label-wide (CREATE TEXT INDEX ... ON :Label),
+        # so new properties are BM25-visible there for free; the SQLite FTS
+        # document is an explicit field list and has to name them.
+        parts = [e.name, qn, e.docstring, e.signature, e.source, " ".join(e.tags), e.rationale, " ".join(e.citations)]
         text = " ".join(p for p in parts if p)
         await self._safe_exec(conn, f"DELETE FROM {table} WHERE uid = ?", (uid,))
         await self._safe_exec(conn, f"INSERT INTO {table}(uid, text) VALUES (?, ?)", (uid, text))
@@ -1107,9 +1161,13 @@ class SqliteGraphClient:
         *,
         lookup: _CallLookup | None = None,
         name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
+        test_patterns: Sequence[str] | None = None,
     ) -> None:
-        """Full-parity port — reuses ``_resolve_one_call`` (all 5 matching strategies)
-        from ``graph.client`` verbatim; only the lookup-building queries are SQL.
+        """Full-parity port — reuses ``_resolve_one_call`` (all 5 matching strategies),
+        ``_combine_call_edge_facts`` and ``_call_edge_weight`` from ``graph.client``
+        verbatim; only the lookup-building queries are SQL. Writes the same five
+        edge properties as the Memgraph path (``confidence``, ``strategy``,
+        ``candidate_count``, ``from_test``, ``weight``).
         """
         if not call_rels:
             return
@@ -1119,7 +1177,9 @@ class SqliteGraphClient:
         if name_to_typedefs is None:
             name_to_typedefs = await self._name_to_typedefs(project_name)
 
-        edges: dict[tuple[str, str], tuple[str, str]] = {}
+        patterns = list(_DEFAULT_TEST_PATTERNS if test_patterns is None else test_patterns)
+        caller_is_test: dict[str, bool] = {}
+        edges: dict[tuple[str, str], _CallEdgeFacts] = {}
         resolved = ambiguous = unresolved = 0
         for rel in call_rels:
             result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
@@ -1130,13 +1190,35 @@ class SqliteGraphClient:
             confidence = "resolved" if len(candidate_uids) == 1 else "ambiguous"
             resolved += confidence == "resolved"
             ambiguous += confidence == "ambiguous"
+            caller_uid = rel.from_qualified_name
+            from_test = caller_is_test.get(caller_uid)
+            if from_test is None:
+                caller_name, caller_fp = lookup.uid_to_info.get(caller_uid, ("", ""))
+                from_test = matches_test_pattern(caller_fp, caller_name, patterns)
+                caller_is_test[caller_uid] = from_test
+            observed = _CallEdgeFacts(confidence, strategy, len(candidate_uids), from_test)
             for target_uid in candidate_uids:
-                edges[(rel.from_qualified_name, target_uid)] = (confidence, strategy)
+                key = (caller_uid, target_uid)
+                prior = edges.get(key)
+                edges[key] = observed if prior is None else _combine_call_edge_facts(prior, observed)
 
         if edges:
             rows = [
-                (f, t, "CALLS", json.dumps({"confidence": conf, "strategy": strat}))
-                for (f, t), (conf, strat) in edges.items()
+                (
+                    f,
+                    t,
+                    "CALLS",
+                    json.dumps(
+                        {
+                            "confidence": facts.confidence,
+                            "strategy": facts.strategy,
+                            "candidate_count": facts.candidate_count,
+                            "from_test": facts.from_test,
+                            "weight": _call_edge_weight(facts.candidate_count, facts.from_test),
+                        }
+                    ),
+                )
+                for (f, t), facts in edges.items()
             ]
             await conn.executemany(
                 "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, ?) "
@@ -1960,15 +2042,23 @@ class SqliteGraphClient:
     async def _bfs_shortest_path(
         self, conn: aiosqlite.Connection, from_uid: str, to_uid: str, edge_types: tuple[str, ...], max_depth: int
     ) -> list[tuple[str, str, str, dict[str, Any]]] | None:
-        """Unweighted BFS shortest path over ``edges``, restricted to *edge_types*.
+        """BFS shortest path over ``edges``, restricted to *edge_types*.
 
         Returns an ordered list of ``(from_uid, to_uid, rel_type, props)``
         hops, or ``None`` if no path exists within *max_depth*.
+
+        Hop count still decides the winner (level-synchronous BFS, unchanged);
+        among the equal-length paths a node can be reached by, the one with the
+        highest running product of edge ``weight`` properties is kept. That is
+        exact rather than greedy: every prefix of a shortest path is itself a
+        shortest path, so keeping the best-scoring prefix per node at its
+        min-depth level is a correct DP over shortest paths.
         """
         if from_uid == to_uid:
             return None
         type_placeholders = ",".join("?" * len(edge_types))
         parent: dict[str, tuple[str, str, dict[str, Any]]] = {}
+        best: dict[str, float] = {from_uid: 1.0}
         visited = {from_uid}
         frontier = [from_uid]
         for _ in range(max_depth):
@@ -1982,14 +2072,19 @@ class SqliteGraphClient:
             )
             rows = await cur.fetchall()
             await cur.close()
-            next_frontier: list[str] = []
+            level_best: dict[str, float] = {}
             for f_uid, t_uid, rel_type, props_json in rows:
                 if t_uid in visited:
                     continue
-                visited.add(t_uid)
-                parent[t_uid] = (f_uid, rel_type, json.loads(props_json) if props_json else {})
-                next_frontier.append(t_uid)
-            frontier = next_frontier
+                props = json.loads(props_json) if props_json else {}
+                score = best[f_uid] * _props_weight(props)
+                if t_uid in level_best and score <= level_best[t_uid]:
+                    continue
+                level_best[t_uid] = score
+                parent[t_uid] = (f_uid, rel_type, props)
+            visited.update(level_best)
+            best.update(level_best)
+            frontier = list(level_best)
 
         if to_uid not in parent:
             return None
@@ -2012,11 +2107,25 @@ class SqliteGraphClient:
         from_exists = from_uid in found_uids
         to_exists = to_uid in found_uids
         if not from_exists or not to_exists:
-            return {"from_exists": from_exists, "to_exists": to_exists, "found": False, "hop_count": None, "hops": []}
+            return {
+                "from_exists": from_exists,
+                "to_exists": to_exists,
+                "found": False,
+                "hop_count": None,
+                "hops": [],
+                "path_weight": None,
+            }
 
         path = await self._bfs_shortest_path(conn, from_uid, to_uid, edge_types, max_depth)
         if path is None:
-            return {"from_exists": True, "to_exists": True, "found": False, "hop_count": None, "hops": []}
+            return {
+                "from_exists": True,
+                "to_exists": True,
+                "found": False,
+                "hop_count": None,
+                "hops": [],
+                "path_weight": None,
+            }
 
         path_uids = {u for hop in path for u in (hop[0], hop[1])}
         placeholders = ",".join("?" * len(path_uids))
@@ -2025,6 +2134,7 @@ class SqliteGraphClient:
         await cur.close()
 
         hops: list[dict[str, Any]] = []
+        path_weight = 1.0
         for f_uid, t_uid, rel_type, props in path:
             hop: dict[str, Any] = {
                 "from": {"uid": f_uid, "name": names.get(f_uid)},
@@ -2035,8 +2145,20 @@ class SqliteGraphClient:
                 hop["confidence"] = props["confidence"]
             if "strategy" in props:
                 hop["strategy"] = props["strategy"]
+            if "weight" in props:
+                hop["weight"] = props["weight"]
+            if "from_test" in props:
+                hop["from_test"] = props["from_test"]
+            path_weight *= _props_weight(props)
             hops.append(hop)
-        return {"from_exists": True, "to_exists": True, "found": True, "hop_count": len(hops), "hops": hops}
+        return {
+            "from_exists": True,
+            "to_exists": True,
+            "found": True,
+            "hop_count": len(hops),
+            "hops": hops,
+            "path_weight": path_weight,
+        }
 
     async def _bfs_reachable(
         self,
@@ -2048,38 +2170,59 @@ class SqliteGraphClient:
         max_depth: int,
         *,
         resolved_only: bool = False,
-    ) -> dict[str, int]:
-        """BFS from *uid* following ``src_col -> dst_col`` edges, returning ``{reached_uid: min_depth}``.
+        production_only: bool = False,
+    ) -> dict[str, tuple[int, float]]:
+        """BFS from *uid* following ``src_col -> dst_col`` edges.
 
-        When *resolved_only* is set, only traverses edges whose
-        ``confidence`` property is ``"resolved"`` (ADR-0014) — used to compute
-        ``compute_blast_radius``'s ``ambiguous_only`` flag.
+        Returns ``{reached_uid: (min_depth, best_weight)}`` where ``best_weight``
+        is the largest product of edge ``weight`` properties over any path of at
+        most *max_depth* hops (missing weights count as ``_DEFAULT_EDGE_WEIGHT``,
+        matching how MAGE reads an absent property). A node is re-expanded when
+        a later round finds a better-scoring route to it — plain
+        first-sighting BFS would lock in whichever path happened to be shortest
+        and report its score, which is not the maximum.
+
+        When *resolved_only* is set, only traverses edges whose ``confidence``
+        property is ``"resolved"`` (ADR-0014); when *production_only* is set,
+        only traverses edges not tagged ``from_test``. Those two filtered passes
+        back ``compute_blast_radius``'s ``ambiguous_only``/``test_only`` flags
+        and ignore the returned weights.
         """
         type_placeholders = ",".join("?" * len(edge_types))
-        confidence_clause = " AND json_extract(props_json, '$.confidence') = 'resolved'" if resolved_only else ""
-        min_depth: dict[str, int] = {}
-        seen = {uid}
-        frontier = [uid]
+        filter_clause = ""
+        if resolved_only:
+            filter_clause += " AND json_extract(props_json, '$.confidence') = 'resolved'"
+        if production_only:
+            filter_clause += " AND coalesce(json_extract(props_json, '$.from_test'), 0) = 0"
+        reached: dict[str, tuple[int, float]] = {}
+        frontier: dict[str, float] = {uid: 1.0}
         depth = 0
         while frontier and depth < max_depth:
             depth += 1
             f_placeholders = ",".join("?" * len(frontier))
             cur = await conn.execute(
-                f"SELECT DISTINCT {dst_col} FROM edges "
-                f"WHERE rel_type IN ({type_placeholders}) AND {src_col} IN ({f_placeholders}){confidence_clause}",
+                f"SELECT {src_col}, {dst_col}, coalesce(json_extract(props_json, '$.weight'), "
+                f"{_DEFAULT_EDGE_WEIGHT}) FROM edges "
+                f"WHERE rel_type IN ({type_placeholders}) AND {src_col} IN ({f_placeholders}){filter_clause}",
                 (*edge_types, *frontier),
             )
             rows = await cur.fetchall()
             await cur.close()
-            next_frontier: list[str] = []
-            for (nid,) in rows:
-                if nid in seen:
+            next_frontier: dict[str, float] = {}
+            for src, dst, edge_weight in rows:
+                if dst == uid:
                     continue
-                seen.add(nid)
-                min_depth[nid] = depth
-                next_frontier.append(nid)
+                score = frontier[src] * float(edge_weight)
+                prior = reached.get(dst)
+                if prior is None:
+                    reached[dst] = (depth, score)
+                elif score > prior[1]:
+                    reached[dst] = (prior[0], score)
+                else:
+                    continue
+                next_frontier[dst] = max(next_frontier.get(dst, 0.0), score)
             frontier = next_frontier
-        return min_depth
+        return reached
 
     async def compute_blast_radius(
         self, uid: str, direction_kind: str, edge_types: tuple[str, ...], max_depth: int
@@ -2087,12 +2230,13 @@ class SqliteGraphClient:
         conn = await self._get_conn()
         src_col, dst_col = ("from_uid", "to_uid") if direction_kind == "out" else ("to_uid", "from_uid")
 
-        min_depth = await self._bfs_reachable(conn, uid, src_col, dst_col, edge_types, max_depth)
-        if not min_depth:
+        reached = await self._bfs_reachable(conn, uid, src_col, dst_col, edge_types, max_depth)
+        if not reached:
             return []
         resolved = await self._bfs_reachable(conn, uid, src_col, dst_col, edge_types, max_depth, resolved_only=True)
+        production = await self._bfs_reachable(conn, uid, src_col, dst_col, edge_types, max_depth, production_only=True)
 
-        affected_uids = list(min_depth)
+        affected_uids = list(reached)
         placeholders = ",".join("?" * len(affected_uids))
         cur = await conn.execute(
             f"SELECT uid, name, qualified_name, file_path, labels FROM nodes WHERE uid IN ({placeholders})",
@@ -2103,7 +2247,7 @@ class SqliteGraphClient:
         node_by_uid = {r[0]: r for r in node_rows}
 
         results: list[dict[str, Any]] = []
-        for nuid, depth in min_depth.items():
+        for nuid, (depth, score) in reached.items():
             node = node_by_uid.get(nuid)
             results.append(
                 {
@@ -2115,6 +2259,8 @@ class SqliteGraphClient:
                     "min_depth": depth,
                     "direction": direction_kind,
                     "ambiguous_only": nuid not in resolved,
+                    "confidence_score": score,
+                    "test_only": nuid not in production,
                 }
             )
         return results
@@ -2597,6 +2743,141 @@ class SqliteGraphClient:
         await cur.close()
 
         return {"module": mod, "entities": entities, "methods": methods, "inherits": inherits}
+
+    async def get_module_summary(
+        self, project: str, path: str, limit: int, edge_limit: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        conn = await self._get_conn()
+
+        clause, extra = _prefix_clause("file_path", path)
+        cur = await conn.execute(
+            "SELECT qualified_name, name, file_path, json_extract(props_json, '$.docstring') FROM nodes "
+            f"WHERE project_name = ? AND labels = 'Module'{clause} ORDER BY file_path LIMIT ?",
+            [project, *extra, limit],
+        )
+        modules = [{"qn": r[0], "name": r[1], "file_path": r[2], "docstring": r[3]} for r in await cur.fetchall()]
+        await cur.close()
+
+        clause, extra = _prefix_clause("e.file_path", path)
+        cur = await conn.execute(
+            "SELECT e.uid, e.name, e.qualified_name, e.labels, e.kind, "
+            "json_extract(e.props_json, '$.visibility'), json_extract(e.props_json, '$.signature'), "
+            "json_extract(e.props_json, '$.docstring'), json_extract(e.props_json, '$.line_start'), "
+            "json_extract(e.props_json, '$.line_end'), e.file_path, p.qualified_name FROM nodes e "
+            "LEFT JOIN edges rel ON rel.to_uid = e.uid AND rel.rel_type = 'DEFINES' "
+            "LEFT JOIN nodes p ON p.uid = rel.from_uid "
+            "WHERE e.project_name = ? AND e.labels IN ('TypeDef', 'Callable', 'Value')"
+            f"{clause} ORDER BY e.file_path, json_extract(e.props_json, '$.line_start') LIMIT ?",
+            [project, *extra, limit],
+        )
+        entities = [
+            {
+                "uid": r[0],
+                "name": r[1],
+                "qn": r[2],
+                "label": r[3],
+                "kind": r[4],
+                "vis": r[5],
+                "sig": r[6],
+                "docstring": r[7],
+                "line_start": r[8],
+                "line_end": r[9],
+                "file_path": r[10],
+                "parent_qn": r[11],
+            }
+            for r in await cur.fetchall()
+        ]
+        await cur.close()
+
+        structural = "('CALLS', 'INHERITS', 'IMPLEMENTS', 'USES_TYPE', 'OVERRIDES')"
+        boundary = "('CALLS', 'INHERITS', 'IMPLEMENTS', 'USES_TYPE', 'OVERRIDES', 'IMPORTS')"
+        clause_a, extra_a = _prefix_clause("a.file_path", path)
+        clause_b, extra_b = _prefix_clause("b.file_path", path)
+        # "not in scope" has no _prefix_clause equivalent. An empty *path* puts
+        # everything in scope, which makes both boundary lists empty by definition.
+        a_outside = " AND (a.file_path IS NULL OR substr(a.file_path, 1, ?) != ?)" if path else " AND 1 = 0"
+        b_outside = " AND (b.file_path IS NULL OR substr(b.file_path, 1, ?) != ?)" if path else " AND 1 = 0"
+        out_extra: list[Any] = [len(path), path] if path else []
+
+        cur = await conn.execute(
+            "SELECT a.qualified_name, b.qualified_name, r.rel_type, r.props_json FROM edges r "
+            "JOIN nodes a ON a.uid = r.from_uid AND a.project_name = ? "
+            "JOIN nodes b ON b.uid = r.to_uid AND b.project_name = ? "
+            f"WHERE r.rel_type IN {structural} AND a.uid != b.uid{clause_a}{clause_b} "
+            "ORDER BY 3, 1, 2 LIMIT ?",
+            [project, project, *extra_a, *extra_b, edge_limit],
+        )
+        internal_edges = [
+            {"from_qn": r[0], "to_qn": r[1], "rel_type": r[2], "props": json.loads(r[3]) if r[3] else {}}
+            for r in await cur.fetchall()
+        ]
+        await cur.close()
+
+        cur = await conn.execute(
+            "SELECT a.qualified_name, a.name, a.file_path, a.labels, b.qualified_name, r.rel_type, r.props_json "
+            "FROM edges r JOIN nodes a ON a.uid = r.from_uid AND a.project_name = ? "
+            "JOIN nodes b ON b.uid = r.to_uid AND b.project_name = ? "
+            f"WHERE r.rel_type IN {boundary}{clause_b}{a_outside} ORDER BY 6, 5, 1 LIMIT ?",
+            [project, project, *extra_b, *out_extra, edge_limit],
+        )
+        fan_in = [
+            {
+                "from_qn": r[0],
+                "from_name": r[1],
+                "from_path": r[2],
+                "from_label": r[3],
+                "to_qn": r[4],
+                "rel_type": r[5],
+                "props": json.loads(r[6]) if r[6] else {},
+            }
+            for r in await cur.fetchall()
+        ]
+        await cur.close()
+
+        cur = await conn.execute(
+            "SELECT a.qualified_name, b.qualified_name, b.name, b.file_path, b.labels, r.rel_type, r.props_json "
+            "FROM edges r JOIN nodes a ON a.uid = r.from_uid AND a.project_name = ? "
+            "JOIN nodes b ON b.uid = r.to_uid AND b.project_name = ? "
+            f"WHERE r.rel_type IN {boundary}{clause_a}{b_outside} ORDER BY 6, 1, 2 LIMIT ?",
+            [project, project, *extra_a, *out_extra, edge_limit],
+        )
+        fan_out = [
+            {
+                "from_qn": r[0],
+                "to_qn": r[1],
+                "to_name": r[2],
+                "to_path": r[3],
+                "to_label": r[4],
+                "rel_type": r[5],
+                "props": json.loads(r[6]) if r[6] else {},
+            }
+            for r in await cur.fetchall()
+        ]
+        await cur.close()
+
+        clause_e, extra_e = _prefix_clause("e.file_path", path)
+        cur = await conn.execute(
+            "SELECT d.qualified_name, d.name, d.labels, e.qualified_name, "
+            "json_extract(r.props_json, '$.link_type') FROM edges r "
+            "JOIN nodes d ON d.uid = r.from_uid "
+            "JOIN nodes e ON e.uid = r.to_uid AND e.project_name = ? "
+            f"WHERE r.rel_type = 'DOCUMENTS'{clause_e} ORDER BY 4, 1 LIMIT ?",
+            [project, *extra_e, limit],
+        )
+        docs = [
+            {"doc_qn": r[0], "doc_name": r[1], "doc_label": r[2], "to_qn": r[3], "link_type": r[4]}
+            for r in await cur.fetchall()
+        ]
+        await cur.close()
+
+        return {
+            "modules": modules,
+            "entities": entities,
+            "internal_edges": internal_edges,
+            "fan_in": fan_in,
+            "fan_out": fan_out,
+            "docs": docs,
+        }
 
     # -- Context expansion / navigation (search/engine.py's expand_context) ---
 

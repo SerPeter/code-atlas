@@ -519,7 +519,11 @@ class ASTConsumer(TierConsumer):
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
                 if proj_calls:
                     await self.graph.resolve_calls(
-                        project_name, proj_calls, lookup=shared_lookup, name_to_typedefs=td_map
+                        project_name,
+                        proj_calls,
+                        lookup=shared_lookup,
+                        name_to_typedefs=td_map,
+                        test_patterns=self.settings.search.test_patterns,
                     )
                 if proj_types:
                     await self.graph.resolve_type_refs(
@@ -580,7 +584,13 @@ class ASTConsumer(TierConsumer):
                 logger.warning("AST: cannot read {}", file_path)
                 return None
 
-        parsed = parse_file(file_path, source, project_name, max_source_chars=self.settings.index.max_source_chars)
+        parsed = parse_file(
+            file_path,
+            source,
+            project_name,
+            max_source_chars=self.settings.index.max_source_chars,
+            rationale=self.settings.rationale,
+        )
         if parsed is None:
             logger.debug("AST: unsupported language for {}", file_path)
             return None

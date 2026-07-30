@@ -1685,7 +1685,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
     @mcp.tool(
         description=(
             "Analyze repository structure, centrality, dependencies, patterns, quality, dead code, "
-            "complexity hotspots, communities, or git-derived signals. "
+            "complexity hotspots, communities, git-derived signals, or a whole-module skeleton. "
             "Returns: {analysis, project, ...analysis-specific keys, query_ms}."
         ),
     )
@@ -1701,6 +1701,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
                 "complexity",
                 "communities",
                 "git_signals",
+                "module_summary",
             ],
             Field(
                 description=(
@@ -1714,7 +1715,9 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
                     "communities (Leiden clustering over the CALLS+IMPORTS subgraph — requires the "
                     "memgraph-mage Docker image), "
                     "git_signals (commit-count hotspots, bus-factor risks, co-change pairs — requires "
-                    "'atlas mine-git-history' to have been run; empty lists otherwise)."
+                    "'atlas mine-git-history' to have been run; empty lists otherwise), "
+                    "module_summary (dense text skeleton of everything under 'path' — signatures, first "
+                    "docstring lines, internal edges, fan-in/fan-out; requires path — see summarize_module)."
                 ),
             ),
         ],
@@ -1722,7 +1725,15 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
         path: Annotated[
             str, Field("", description="Scope analysis to a file or package path prefix. Empty = entire project.")
         ] = "",
-        limit: Annotated[int, Field(20, description="Max items per sub-section.", ge=1, le=100)] = 20,
+        limit: Annotated[
+            int,
+            Field(
+                20,
+                description="Max items per sub-section (module_summary scales it x10 for its entity budget).",
+                ge=1,
+                le=100,
+            ),
+        ] = 20,
         exclude_tests: Annotated[
             bool | None,
             Field(
@@ -1926,6 +1937,55 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
         try:
             return await _analyze_repo(
                 app.graph, "git_signals", project_name, path=path, limit=clamped, test_patterns=test_patterns
+            )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+    @mcp.tool(
+        description=(
+            "Shortcut for analyze_repo(analysis='module_summary'). Dense text skeleton of an entire "
+            "module or package in one call — read this instead of opening the files. For every entity "
+            "under 'path': signature, visibility, line span and the FIRST docstring line only (no "
+            "bodies, no full docstrings). Plus the intra-scope CALLS/INHERITS/IMPLEMENTS/USES_TYPE "
+            "adjacency, the scope boundary (FAN-IN: who outside calls in — the thing get_context cannot "
+            "tell you; FAN-OUT: what this scope depends on, external packages marked *), and linked "
+            "notes/docs. Edge annotations like [confidence=ambiguous] mark non-default CALLS edge "
+            "properties. The outline is self-describing (SCOPE/NAMES/LEGEND header). "
+            "Returns: {analysis, project, path, modules, entity_count, internal_edge_count, "
+            "fan_in_count, fan_out_count, truncated, outline, query_ms}, or {error, code} with "
+            "'PATH_REQUIRED' when path is empty / 'NOT_FOUND' when nothing is indexed under it."
+        ),
+    )
+    async def summarize_module(
+        path: Annotated[
+            str,
+            Field(description="File or package path prefix to summarize, e.g. 'src/code_atlas/graph' — required."),
+        ],
+        project: Annotated[str, Field("", description="Project name. Empty = auto-detect from workspace.")] = "",
+        limit: Annotated[
+            int,
+            Field(20, description="Budget knob: entities are capped at limit x 10, edges at limit x 30.", ge=1, le=100),
+        ] = 20,
+        exclude_tests: Annotated[
+            bool | None,
+            Field(
+                None,
+                description="Exclude test callers/dependencies from the fan-in/fan-out lists. Default true — "
+                "override to include. Entities inside 'path' are never filtered: you asked for that path.",
+            ),
+        ] = None,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
+        project_name = project or derive_project_name(app.settings.project_root)
+        clamped = _clamp_limit(limit)
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
+        try:
+            return await _analyze_repo(
+                app.graph, "module_summary", project_name, path=path, limit=clamped, test_patterns=test_patterns
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")

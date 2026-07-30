@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 5
+SCHEMA_VERSION: int = 6
 
 # ---------------------------------------------------------------------------
 # Node labels

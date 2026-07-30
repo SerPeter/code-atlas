@@ -86,3 +86,69 @@ def test_content_hash_extra_properties_matches_json_dumps():
     ]
     expected = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
     assert _compute_content_hash(entity) == expected
+
+
+# ---------------------------------------------------------------------------
+# Rationale / citations — hash contract
+#
+# The invariant that matters operationally: an entity with no intent-bearing
+# comment must hash EXACTLY as it did before the fields existed, otherwise
+# adding the feature reindexes every project.
+# ---------------------------------------------------------------------------
+
+
+def test_content_hash_without_rationale_matches_eight_part_formula():
+    """No rationale/citations -> the parts list stays at eight elements, byte-identical."""
+    entity = _entity()
+    assert entity.rationale is None
+    assert entity.citations == []
+    parts = [
+        entity.name,
+        entity.kind,
+        entity.visibility,
+        entity.signature or "",
+        entity.docstring or "",
+        ",".join(sorted(entity.tags)),
+        entity.source or "",
+        "",
+    ]
+    expected = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
+    assert _compute_content_hash(entity) == expected
+
+
+def test_content_hash_rationale_changes_hash():
+    assert _compute_content_hash(_entity()) != _compute_content_hash(_entity(rationale="WHY: because"))
+
+
+def test_content_hash_citations_change_hash():
+    assert _compute_content_hash(_entity()) != _compute_content_hash(_entity(citations=["ADR-0014"]))
+
+
+def test_content_hash_citations_order_independent():
+    a = _entity(citations=["ADR-0014", "RFC-7231"])
+    b = _entity(citations=["RFC-7231", "ADR-0014"])
+    assert _compute_content_hash(a) == _compute_content_hash(b)
+
+
+def test_content_hash_rationale_and_citations_are_distinguishable():
+    """The same payload in either field must not collide (each element is key-prefixed)."""
+    a = _entity(rationale="ADR-0014")
+    b = _entity(citations=["ADR-0014"])
+    assert _compute_content_hash(a) != _compute_content_hash(b)
+
+
+def test_rationale_settings_defaults_match_parser_defaults():
+    """settings.py and ast.py each carry the marker defaults — pin them together."""
+    from code_atlas.parsing.ast import (
+        DEFAULT_CITATION_SCHEMES,
+        DEFAULT_RATIONALE_MARKERS,
+        DEFAULT_TASK_MARKERS,
+    )
+    from code_atlas.settings import RationaleSettings
+
+    settings = RationaleSettings()
+    assert settings.markers == list(DEFAULT_RATIONALE_MARKERS)
+    assert settings.task_markers == list(DEFAULT_TASK_MARKERS)
+    assert settings.citation_schemes == list(DEFAULT_CITATION_SCHEMES)
+    assert settings.enabled is True
+    assert settings.tasks is False

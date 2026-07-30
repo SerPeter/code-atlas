@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from typing import Protocol
 
     from code_atlas.graph.client import CallStats, UpsertResult, _AnchorLookup, _CallLookup
@@ -106,6 +107,7 @@ if TYPE_CHECKING:
             *,
             lookup: _CallLookup | None = None,
             name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
+            test_patterns: Sequence[str] | None = None,
         ) -> None: ...
 
         async def build_anchor_lookup(self) -> _AnchorLookup: ...
@@ -248,10 +250,17 @@ if TYPE_CHECKING:
 
         async def node_exists(self, uid: str) -> bool: ...
 
+        # trace_path_between returns from_exists/to_exists/found/hop_count/hops
+        # plus path_weight (product of the chosen path's CALLS edge weights;
+        # used to break ties between equal-hop-count paths).
         async def trace_path_between(
             self, from_uid: str, to_uid: str, max_depth: int, edge_types: tuple[str, ...]
         ) -> dict[str, Any]: ...
 
+        # compute_blast_radius entries carry uid/name/qualified_name/label/
+        # file_path/min_depth/direction plus three confidence signals:
+        # ambiguous_only, confidence_score (best path's edge-weight product)
+        # and test_only (reachable only through from_test CALLS edges).
         async def compute_blast_radius(
             self, uid: str, direction_kind: str, edge_types: tuple[str, ...], max_depth: int
         ) -> list[dict[str, Any]]: ...
@@ -283,6 +292,17 @@ if TYPE_CHECKING:
         async def get_diagram_inheritance(self, project: str, path: str, max_nodes: int) -> list[dict[str, Any]]: ...
 
         async def get_diagram_module_detail(self, project: str, path: str, max_nodes: int) -> dict[str, Any] | None: ...
+
+        # get_module_summary returns six record lists keyed
+        # modules/entities/internal_edges/fan_in/fan_out/docs — everything
+        # analyze_repo(analysis="module_summary") needs to render a whole
+        # module/package skeleton plus its scope boundary. Edge records carry a
+        # decoded ``props`` dict (all relationship properties, whatever they
+        # are) rather than a fixed confidence/strategy pair, so new CALLS edge
+        # properties surface without a backend change.
+        async def get_module_summary(
+            self, project: str, path: str, limit: int, edge_limit: int
+        ) -> dict[str, list[dict[str, Any]]]: ...
 
         # -- Context expansion / navigation (search/engine.py's expand_context) --
 

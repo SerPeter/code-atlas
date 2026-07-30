@@ -947,3 +947,89 @@ func (c *Cache[K, V]) Get(k K, extra Widget) (V, bool) { var v V; return v, fals
     assert "K" not in used
     assert "V" not in used
     assert "Widget" in used
+
+
+# ---------------------------------------------------------------------------
+# 24. Rationale extraction (intent-bearing comments)
+# ---------------------------------------------------------------------------
+
+
+def test_rationale_line_comment_above_declaration():
+    parsed = _parse("""\
+package main
+
+// NOTE: Server is deliberately not thread-safe; callers serialize access.
+type Server struct{}
+""")
+    assert _entity_by_name(parsed, "Server").rationale == (
+        "NOTE: Server is deliberately not thread-safe; callers serialize access."
+    )
+
+
+def test_rationale_block_comment_inside_body():
+    parsed = _parse("""\
+package main
+
+func Handle() {
+	/* HACK: the upstream lib panics on empty input */
+	_ = 1
+}
+""")
+    assert _entity_by_name(parsed, "Handle").rationale == "HACK: the upstream lib panics on empty input"
+
+
+def test_rationale_wrapped_doc_comment_folded():
+    """Go doc comments are contiguous // lines — a wrapped marker folds into one entry."""
+    parsed = _parse("""\
+package main
+
+// WHY: the retry budget is per-call because a shared budget
+// starved the slow endpoints.
+func Fetch() {}
+""")
+    expected = "WHY: the retry budget is per-call because a shared budget starved the slow endpoints."
+    assert _entity_by_name(parsed, "Fetch").rationale == expected
+
+
+def test_rationale_coexists_with_doc_comment():
+    """Marker extraction must not disturb the existing docstring path."""
+    parsed = _parse("""\
+package main
+
+// NOTE: kept for backwards compatibility.
+func Legacy() {}
+""")
+    entity = _entity_by_name(parsed, "Legacy")
+    assert entity.docstring == "NOTE: kept for backwards compatibility."
+    assert entity.rationale == "NOTE: kept for backwards compatibility."
+
+
+def test_rationale_citations_in_go_comment():
+    parsed = _parse("""\
+package main
+
+// WHY: status handling follows RFC 7231, see also ADR-0014.
+func Status() {}
+""")
+    assert _entity_by_name(parsed, "Status").citations == ["ADR-0014", "RFC-7231"]
+
+
+def test_rationale_todo_off_by_default_go():
+    parsed = _parse("""\
+package main
+
+// TODO: delete after the migration
+func Old() {}
+""")
+    assert _entity_by_name(parsed, "Old").rationale is None
+
+
+def test_rationale_absent_for_plain_go_file():
+    parsed = _parse("""\
+package main
+
+func Plain() {}
+""")
+    for entity in parsed.entities:
+        assert entity.rationale is None
+        assert entity.citations == []

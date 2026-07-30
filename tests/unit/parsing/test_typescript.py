@@ -1024,3 +1024,75 @@ const handler = (req: Request): Response => {
     type_names = {r.to_name for r in uses_type}
     assert "Request" in type_names
     assert "Response" in type_names
+
+
+# ---------------------------------------------------------------------------
+# 25. Rationale extraction (intent-bearing comments)
+# ---------------------------------------------------------------------------
+
+
+def test_rationale_line_comment_above_function():
+    parsed = _parse("""\
+// WHY: debounce avoids hammering the API on every keystroke
+export function search(q: string) {
+  return q;
+}
+""")
+    assert _entity_by_name(parsed, "search").rationale == ("WHY: debounce avoids hammering the API on every keystroke")
+
+
+def test_rationale_jsdoc_block_comment():
+    """`/** ... */` leading asterisks are stripped before marker matching."""
+    parsed = _parse("""\
+function render() {
+  /**
+   * NOTE: an empty query short-circuits before the fetch.
+   */
+  return 1;
+}
+""")
+    assert _entity_by_name(parsed, "render").rationale == "NOTE: an empty query short-circuits before the fetch."
+
+
+def test_rationale_method_beats_enclosing_class():
+    parsed = _parse("""\
+class Widget {
+  // HACK: the constructor runs twice under StrictMode
+  render() {
+    return 1;
+  }
+}
+""")
+    assert _entity_by_name(parsed, "render").rationale == "HACK: the constructor runs twice under StrictMode"
+    assert _entity_by_name(parsed, "Widget").rationale is None
+
+
+def test_rationale_citations_in_ts_comment():
+    parsed = _parse("""\
+// NOTE: content negotiation follows RFC-7231
+export function negotiate() {
+  return 1;
+}
+""")
+    assert _entity_by_name(parsed, "negotiate").citations == ["RFC-7231"]
+
+
+def test_rationale_todo_off_by_default_ts():
+    parsed = _parse("""\
+// TODO: migrate to the new client
+export function old() {
+  return 1;
+}
+""")
+    assert _entity_by_name(parsed, "old").rationale is None
+
+
+def test_rationale_absent_for_plain_ts_file():
+    parsed = _parse("""\
+export function plain() {
+  return 1;
+}
+""")
+    for entity in parsed.entities:
+        assert entity.rationale is None
+        assert entity.citations == []
