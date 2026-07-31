@@ -106,6 +106,8 @@ unnecessary startup-cost multiplier.
 
 - [ADR-0009: Event Pipeline Durability Contract](./0009-event-pipeline-durability-contract.md) — the investigation that
   surfaced the production-database-wipe defect this ADR fixes
-- `tests/integration/conftest.py` — `_infra_endpoints`, `_assert_disposable_db`
+- `tests/conftest.py` — `_infra_endpoints`, `_assert_disposable_db` (moved up from `tests/integration/conftest.py` in
+  ATL-089 so `tests/bench/`, which also carries the `integration` marker, can see them; `tests/integration/conftest.py`
+  now holds only the TEI fixtures)
 - `docker-compose.yml` — `memgraph-test`/`valkey-test` services (`profiles: [test]`)
 - `CLAUDE.md` — Infrastructure and Testing sections (developer-facing instructions)

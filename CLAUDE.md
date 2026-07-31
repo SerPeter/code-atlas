@@ -127,7 +127,8 @@ src/code_atlas/
 
 - Tests in `tests/` directory, async-first with pytest-asyncio (auto mode)
 - Markers: `@pytest.mark.slow`, `@pytest.mark.integration`
-- Fixtures centralized in `conftest.py`
+- `integration` means "needs real Memgraph/Valkey", nothing narrower — it is orthogonal to directory. `tests/bench/` carries both `bench` and `integration`, so `-m integration` from the repo root is the complete infra-requiring set and must collect and pass; `bench` additionally means "slow, measures throughput" and is deselected in CI.
+- Infra fixtures (`_infra_endpoints`, `settings`, `graph_client`, `event_bus`, the wipe guard) live in `tests/conftest.py` so both `tests/integration/` and `tests/bench/` see them; `tests/integration/conftest.py` holds only the TEI tier. They are lazy — a unit-only run never starts a container.
 - **High gear (default):** Integration tests exercising full workflows and public APIs
 - **Low gear (selective):** Unit tests only for complex algorithms or edge cases unreachable via integration
 - Don't test every function. Test system behavior.
