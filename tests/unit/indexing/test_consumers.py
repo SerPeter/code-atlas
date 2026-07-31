@@ -6,10 +6,11 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from code_atlas.events import FileChanged, Topic, encode_event
+from code_atlas.graph.client import UpsertResult
 from code_atlas.indexing.consumers import _MAX_BATCH_FAILURES, ASTConsumer, BatchPolicy, TierConsumer
-from code_atlas.parsing.ast import ParsedFile, ParsedRelationship
+from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship
 from code_atlas.schema import RelType
-from code_atlas.settings import AtlasSettings
+from code_atlas.settings import AtlasSettings, EmbeddingSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,10 +43,51 @@ class StubGraph:
     def __init__(self) -> None:
         self.deleted: list[tuple[str, str]] = []
         self.member_calls: list[tuple[str, list[ParsedRelationship]]] = []
+        self.config_calls: list[tuple[str, list[ParsedRelationship]]] = []
+        self.citation_calls: list[tuple[str, dict[str, list[str]], set[str] | None, bool]] = []
+        self.gc_calls: int = 0
 
     async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
         self.deleted.append((project_name, file_path))
         return []
+
+    async def get_batch_file_hashes(self, project_name: str, file_paths: list[str]) -> dict[str, str]:
+        return {}
+
+    async def set_batch_file_hashes(self, project_name: str, hashes: dict[str, str]) -> None:
+        return None
+
+    async def upsert_batch_entities(
+        self, project_name: str, file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]]
+    ) -> dict[str, UpsertResult]:
+        # ``added`` carries qualified_names with the project prefix stripped,
+        # the way the real delta classifier reports them.
+        return {
+            fp: UpsertResult(added=[e.qualified_name.split(":", 1)[1] for e in entities])
+            for fp, (entities, _rels) in file_data.items()
+        }
+
+    async def invalidate_stale_anchors(self, changed_uids: set[str]) -> int:
+        return 0
+
+    async def resolve_config_refs(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
+        self.config_calls.append((project_name, list(ref_rels)))
+
+    async def gc_orphaned_reference_nodes(self) -> int:
+        self.gc_calls += 1
+        return 0
+
+    async def resolve_citations(
+        self,
+        project_name: str,
+        citations_by_uid: dict[str, list[str]],
+        *,
+        file_paths: Any = None,
+        lookup: Any = None,
+        retry_unresolved: bool = False,
+    ) -> None:
+        scope = set(file_paths) if file_paths is not None else None
+        self.citation_calls.append((project_name, dict(citations_by_uid), scope, retry_unresolved))
 
     async def build_resolution_lookup(self, project_name: str) -> tuple[Any, dict]:
         return object(), {}
@@ -405,3 +447,152 @@ async def test_flush_routes_member_rels_to_resolve_member_defines(tmp_path: Path
 
     assert consumer.graph.member_calls == [("proj", [rel])]  # type: ignore[attr-defined]
     assert consumer._pending_member_rels == []
+
+
+async def test_parse_file_partitions_config_rels(tmp_path: Path, monkeypatch) -> None:
+    """READS_ENV/REFERENCES_FILE are deferred like imports — their target node
+    does not exist until post-batch resolution MERGEs it, so they must never
+    reach the immediate relationship-creation path.
+    """
+    consumer = _make_consumer(tmp_path)
+    env = ParsedRelationship(from_qualified_name="p:conf.load", rel_type=RelType.READS_ENV, to_name="DATABASE_URL")
+    res = ParsedRelationship(
+        from_qualified_name="p:conf.load", rel_type=RelType.REFERENCES_FILE, to_name="data/fixtures.json"
+    )
+    plain = ParsedRelationship(from_qualified_name="p:conf", rel_type=RelType.DEFINES, to_name="p:conf.load")
+    fake = ParsedFile(file_path="conf.py", language="python", entities=[], relationships=[env, res, plain])
+    monkeypatch.setattr("code_atlas.indexing.consumers.parse_file", lambda *a, **k: fake)
+
+    pfd = await consumer._parse_file("p", "conf.py", source=b"")
+
+    assert pfd is not None
+    assert pfd.config_rels == [env, res]
+    assert pfd.non_import_rels == [plain]
+
+
+async def test_flush_resolves_config_refs_then_runs_gc(tmp_path: Path) -> None:
+    """Order matters: the sweep deletes anything at zero incoming edges, so it
+    must run only after this flush has re-created its references.
+    """
+    consumer = _make_consumer(tmp_path)
+    rel = ParsedRelationship(from_qualified_name="proj:conf.load", rel_type=RelType.READS_ENV, to_name="DATABASE_URL")
+    consumer._pending_config_rels.append(rel)
+    consumer._pending_project_names.add("proj")
+
+    await consumer._flush_deferred_resolution()
+
+    assert consumer.graph.config_calls == [("proj", [rel])]  # type: ignore[attr-defined]
+    assert consumer.graph.gc_calls == 1  # type: ignore[attr-defined]
+    assert consumer._pending_config_rels == []
+
+
+async def test_flush_runs_gc_even_with_no_config_rels(tmp_path: Path) -> None:
+    """A file whose LAST os.getenv() call was just deleted produces no config
+    rels at all — and that is exactly the case that orphans a node. Gating the
+    sweep on config rels being present would never collect it.
+    """
+    consumer = _make_consumer(tmp_path)
+    consumer._pending_project_names.add("proj")
+
+    await consumer._flush_deferred_resolution()
+
+    assert consumer.graph.config_calls == []  # type: ignore[attr-defined]
+    assert consumer.graph.gc_calls == 1  # type: ignore[attr-defined]
+
+
+async def test_flush_skips_gc_when_nothing_was_processed(tmp_path: Path) -> None:
+    consumer = _make_consumer(tmp_path)
+
+    await consumer._flush_deferred_resolution()
+
+    assert consumer.graph.gc_calls == 0  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Citation retry sweep
+# ---------------------------------------------------------------------------
+
+
+async def test_indexing_a_document_retries_that_projects_unresolved_citations(tmp_path: Path) -> None:
+    """The live trigger. A daemon indexes the ADR long after the code that
+    cites it; without re-attempting on that event the citation stays broken
+    until the process restarts (the end-of-run sweep is shutdown-only).
+    """
+    consumer = _make_consumer(tmp_path)
+    consumer._pending_project_names.add("proj")
+    consumer._citation_retry_projects.add("proj")
+
+    await consumer._flush_deferred_resolution()
+
+    assert consumer.graph.citation_calls == [("proj", {}, None, True)]  # type: ignore[attr-defined]
+    assert consumer._citation_retry_projects == set()
+
+
+async def test_new_citations_and_a_document_change_resolve_in_one_pass(tmp_path: Path) -> None:
+    """The batch's own citations ride along with the retry scan rather than
+    costing a second project-wide pass."""
+    consumer = _make_consumer(tmp_path)
+    consumer._pending_project_names.add("proj")
+    consumer._pending_citations["proj"] = {"proj:src.mod.f": ["ADR-0014"]}
+    consumer._pending_citation_files["proj"] = {"src/mod.py"}
+    consumer._citation_retry_projects.add("proj")
+
+    await consumer._flush_deferred_resolution()
+
+    assert consumer.graph.citation_calls == [  # type: ignore[attr-defined]
+        ("proj", {"proj:src.mod.f": ["ADR-0014"]}, {"src/mod.py"}, True)
+    ]
+
+
+async def test_flush_without_documents_or_citations_does_not_sweep(tmp_path: Path) -> None:
+    """Steady-state daemon flushes must not pay for a project-wide scan."""
+    consumer = _make_consumer(tmp_path)
+    consumer._pending_project_names.add("proj")
+
+    await consumer._flush_deferred_resolution()
+
+    assert consumer.graph.citation_calls == []  # type: ignore[attr-defined]
+
+
+async def test_a_reparsed_file_with_no_citations_still_reaches_the_resolver(tmp_path: Path) -> None:
+    """The removal signal. A file whose last `see ADR-14` comment was deleted
+    contributes nothing to _pending_citations, so gating the call on that dict
+    is exactly why the stale edge used to survive — the file scope has to carry
+    the call on its own."""
+    consumer = _make_consumer(tmp_path)
+    consumer._pending_project_names.add("proj")
+    consumer._pending_citation_files["proj"] = {"src/mod.py"}
+
+    await consumer._flush_deferred_resolution()
+
+    assert consumer.graph.citation_calls == [("proj", {}, {"src/mod.py"}, False)]  # type: ignore[attr-defined]
+    assert consumer._pending_citation_files == {}
+
+
+async def test_process_batch_scopes_every_parsed_file_not_just_citing_ones(tmp_path: Path) -> None:
+    """The scope is built from the parse, not from the citations it produced."""
+    settings = AtlasSettings(project_root=tmp_path, embeddings=EmbeddingSettings(enabled=False))
+    consumer = ASTConsumer(RecordingBus(), StubGraph(), settings)  # type: ignore[arg-type]
+    (tmp_path / "cited.py").write_text("# WHY: see ADR-0014\ndef f():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "plain.py").write_text("def g():\n    return 2\n", encoding="utf-8")
+
+    events = [_event("cited.py", "proj", str(tmp_path)), _event("plain.py", "proj", str(tmp_path))]
+    await consumer.process_batch(events, "b1")
+
+    # The batch's own flush already drained the buffers, so assert on what
+    # actually reached the resolver.
+    assert consumer.graph.citation_calls == [  # type: ignore[attr-defined]
+        ("proj", {"proj:cited.f": ["ADR-0014"]}, {"cited.py", "plain.py"}, False)
+    ]
+
+
+async def test_final_flush_sweeps_every_project_that_saw_a_citation(tmp_path: Path) -> None:
+    """Backstop for the cold index: the document may have been in the graph
+    before this run started, so no document-change event ever fires."""
+    consumer = _make_consumer(tmp_path)
+    consumer._citation_projects.add("proj")
+
+    await consumer._flush_deferred_resolution(final=True)
+
+    assert consumer.graph.citation_calls == [("proj", {}, None, True)]  # type: ignore[attr-defined]
+    assert consumer._citation_projects == set()

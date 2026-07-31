@@ -88,7 +88,11 @@ class TestDDLGeneration:
     def test_vector_index_ddl_dimension_parameterized(self):
         stmts_768 = generate_vector_index_ddl(768)
         stmts_384 = generate_vector_index_ddl(384)
-        assert len(stmts_768) == len(_TEXT_SEARCHABLE_LABELS)  # same count as embeddable
+        # One vector index per EMBEDDABLE label. This used to be spelled
+        # len(_TEXT_SEARCHABLE_LABELS) ("same count as embeddable") — the two
+        # sets diverged in v7, when EnvVar/ResourceFile became text-searchable
+        # but deliberately not embeddable.
+        assert len(stmts_768) == len(_EMBEDDABLE_LABELS)
         for stmt in stmts_768:
             assert "768" in stmt
             assert stmt.startswith("CREATE VECTOR INDEX")

@@ -15,6 +15,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    looks_like_resource_path,
     node_text,
     register_language,
 )
@@ -26,6 +27,8 @@ from code_atlas.parsing.detectors import (
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind, ValueKind, Visibility
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from tree_sitter import Node
 
     from code_atlas.graph.client import GraphClient
@@ -336,6 +339,12 @@ def _parse_python(
     _walk_python_node(
         root, path, source, project_name, module_qn, package_qn, entities, relationships, seen, enum_classes
     )
+
+    # Runtime config surface. Runs after the main walk because it needs both the
+    # finished entity list (to attribute each reference to its enclosing entity)
+    # and the IMPORTS relationships (to know whether a bare `getenv`/`environ`
+    # actually came from `os`).
+    _extract_config_refs(root, source, entities, relationships)
 
     # Post-processing: tag conditional (duplicate) definitions
     _tag_conditional_definitions(entities)
@@ -804,6 +813,276 @@ def _extract_calls(
         # Recurse but don't descend into nested function/class definitions
         if child.type not in ("function_definition", "class_definition", "decorated_definition"):
             _extract_calls(child, source, from_qn, relationships)
+
+
+# ---------------------------------------------------------------------------
+# Runtime config surface (READS_ENV / REFERENCES_FILE)
+#
+# SECURITY INVARIANT — capture the env var NAME, never its value or default.
+#
+# ``os.getenv("API_KEY", "sk-live-abc123")`` carries a live secret in its SECOND
+# argument. Everything below reads the FIRST positional argument and stops:
+# ``_first_positional_argument`` returns on the first non-``(`` child of the
+# argument list, so no later argument node is ever even looked at, and the
+# emitted ``ParsedRelationship`` has no ``properties`` — there is no channel a
+# default could ride out on. graph/client.py's ``_plan_config_refs`` enforces the
+# same rule again on the write side.
+#
+# SECOND INVARIANT — a referenced file is a PATH, never contents.
+#
+# Recording that code reads ``.env`` or ``certs/server.pem`` is the whole point
+# of REFERENCES_FILE, so those paths are emitted like any other. Nothing here
+# opens, stats or resolves them: the only inputs are tree-sitter nodes and the
+# already-in-memory source bytes, and the only string operations are the pure
+# predicates in ``looks_like_resource_path``.
+# ---------------------------------------------------------------------------
+
+# Byte probes for the cheap pre-filter — a file mentioning none of these cannot
+# produce a config reference, so it skips the extra tree walk entirely. The
+# openers carry their "(" because bare "open"/"Path" match nearly every module
+# (a `Path` annotation, the word "open" in a prose docstring); with the paren
+# only 28% of modules reach the walk. A space before the paren is not valid
+# formatting anywhere this runs.
+_CONFIG_REF_PROBES: tuple[bytes, ...] = (b"getenv", b"environ", b"open(", b"Path(")
+
+# String prefixes (f/b/r/u) are rejected wholesale: an f-string is not a literal,
+# and bytes/raw forms are rare enough here that decoding them is not worth the
+# escaping subtleties.
+_PLAIN_STRING_QUOTES: frozenset[str] = frozenset({'"', "'", '"""', "'''"})
+
+# Env var names are matched against the near-universal shell-identifier shape.
+# Anything else is far more likely to be a misparse than a real variable.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+# Callables whose first string argument names a file. Kept tiny on purpose:
+# every addition is a new way to mint a ResourceFile node for something that is
+# not a path. ``Path(...)`` also covers the ``Path("x").read_text()`` form,
+# because the literal sits in the inner ``Path`` call either way.
+_FILE_OPENER_NAMES: frozenset[str] = frozenset({"open", "Path"})
+
+
+def _plain_string_value(node: Node | None) -> str | None:
+    """Return the text of a plain string literal, or ``None`` if it is not one.
+
+    Rejects f-strings (an ``interpolation`` child), prefixed strings, strings
+    containing escape sequences (``escape_sequence`` hangs off ``string_content``
+    and would otherwise be emitted un-unescaped), and implicit concatenation
+    (which parses as ``concatenated_string``, not ``string``).
+    """
+    if node is None or node.type != "string":
+        return None
+    parts: list[str] = []
+    for child in node.children:
+        if child.type == "string_start":
+            if node_text(child) not in _PLAIN_STRING_QUOTES:
+                return None
+        elif child.type == "string_content":
+            if child.children:  # escape_sequence and friends
+                return None
+            parts.append(node_text(child))
+        elif child.type != "string_end":
+            return None
+    return "".join(parts)
+
+
+def _first_positional_argument(call: Node) -> Node | None:
+    """The first positional argument node of a call, or ``None``.
+
+    Returns as soon as the first argument is seen, so arguments after it — the
+    secret in ``os.getenv("API_KEY", "sk-live-abc123")`` — are never visited.
+    """
+    args = call.child_by_field_name("arguments")
+    if args is None or args.type != "argument_list":
+        return None
+    for child in args.children:
+        if child.type == "(":
+            continue
+        if child.type in ("keyword_argument", "list_splat", "dictionary_splat", ")"):
+            return None
+        return child
+    return None
+
+
+def _first_string_argument(call: Node) -> str | None:
+    """The first positional argument of a call, when it is a plain string literal."""
+    return _plain_string_value(_first_positional_argument(call))
+
+
+def _identifier_named(node: Node | None, name: str) -> bool:
+    return node is not None and node.type == "identifier" and node_text(node) == name
+
+
+def _is_os_environ(node: Node | None) -> bool:
+    """True for the ``os.environ`` attribute node."""
+    if node is None or node.type != "attribute":
+        return False
+    return _identifier_named(node.child_by_field_name("attribute"), "environ") and _identifier_named(
+        node.child_by_field_name("object"), "os"
+    )
+
+
+def _is_environ_ref(node: Node | None, direct_imports: frozenset[str]) -> bool:
+    """True for ``os.environ`` or a bare ``environ`` that came from ``from os import environ``.
+
+    The ``direct_imports`` membership is tested BEFORE ``_identifier_named``: the
+    set is empty for almost every file, and that ordering skips a text decode on
+    the object of every ``something.get(...)`` in the codebase.
+    """
+    return _is_os_environ(node) or ("environ" in direct_imports and _identifier_named(node, "environ"))
+
+
+def _env_name_from_call(call: Node, callee: str, func: Node, direct_imports: frozenset[str]) -> str | None:
+    """``os.getenv(...)`` / ``getenv(...)`` / ``os.environ.get(...)`` / ``environ.get(...)``.
+
+    *callee* is the already-decoded terminal name of *func* — see
+    ``_config_ref_from_call`` for why it is passed in rather than re-derived.
+    """
+    if func.type == "identifier":
+        if not (callee == "getenv" and "getenv" in direct_imports):
+            return None
+    else:
+        obj = func.child_by_field_name("object")
+        if callee == "getenv":
+            if not _identifier_named(obj, "os"):
+                return None
+        elif not _is_environ_ref(obj, direct_imports):
+            return None
+    name = _first_string_argument(call)
+    return name if name is not None and _ENV_NAME_RE.fullmatch(name) else None
+
+
+def _env_name_from_subscript(node: Node, direct_imports: frozenset[str]) -> str | None:
+    """``os.environ["NAME"]`` / ``environ["NAME"]``."""
+    if not _is_environ_ref(node.child_by_field_name("value"), direct_imports):
+        return None
+    name = _plain_string_value(node.child_by_field_name("subscript"))
+    return name if name is not None and _ENV_NAME_RE.fullmatch(name) else None
+
+
+def _file_path_from_call(call: Node, callee: str, func: Node) -> str | None:
+    """``open("data/x.json")`` / ``Path("config/y.yaml")`` / ``pathlib.Path(...)``."""
+    # Only the attribute form of ``Path`` (``pathlib.Path(...)``) is honored.
+    # ``x.open(...)`` is deliberately excluded — it matches archive members and
+    # mock objects as readily as real files.
+    if func.type != "identifier" and callee != "Path":
+        return None
+    literal = _first_string_argument(call)
+    if literal is None or not looks_like_resource_path(literal):
+        return None
+    return literal
+
+
+# Terminal callee names that can possibly produce a config reference. One set
+# lookup against one decoded name rejects the overwhelming majority of call
+# nodes before any further node access — this walk sees every call in the file,
+# so that first check is the whole cost of the pass on most files.
+_CONFIG_CALL_NAMES: frozenset[str] = frozenset({"getenv", "get"}) | _FILE_OPENER_NAMES
+
+
+def _config_ref_from_call(call: Node, direct_imports: frozenset[str]) -> tuple[RelType, str] | None:
+    """Classify one call node as an env read, a file reference, or neither."""
+    func = call.child_by_field_name("function")
+    if func is None:
+        return None
+    if func.type == "identifier":
+        callee = node_text(func)
+    elif func.type == "attribute":
+        attr = func.child_by_field_name("attribute")
+        if attr is None:
+            return None
+        callee = node_text(attr)
+    else:
+        return None
+    if callee not in _CONFIG_CALL_NAMES:
+        return None
+
+    if callee in _FILE_OPENER_NAMES:
+        path = _file_path_from_call(call, callee, func)
+        return (RelType.REFERENCES_FILE, path) if path is not None else None
+    env_name = _env_name_from_call(call, callee, func, direct_imports)
+    return (RelType.READS_ENV, env_name) if env_name is not None else None
+
+
+def _direct_os_imports(relationships: list[ParsedRelationship]) -> frozenset[str]:
+    """Names pulled straight out of ``os`` (``from os import getenv, environ``).
+
+    Gating the bare forms on a real import is what stops a project's own local
+    ``getenv()`` helper or an unrelated ``environ`` dict from minting EnvVar nodes.
+    """
+    return frozenset(
+        name
+        for name in ("getenv", "environ")
+        if any(r.rel_type == RelType.IMPORTS and r.to_name == f"os.{name}" for r in relationships)
+    )
+
+
+def _innermost_owner(spans: list[tuple[int, int, int]], line: int) -> int:
+    """Index of the smallest entity span covering *line*; 0 (the module) if none.
+
+    Attributing to the innermost entity means a module-level
+    ``DATABASE_URL = os.getenv("DATABASE_URL")`` hangs off the Value it defines
+    rather than off the whole module, which is the more useful answer to "what
+    reads DATABASE_URL".
+    """
+    covering = [(end - start, -start, index) for start, end, index in spans if start <= line <= end]
+    return min(covering)[2] if covering else 0
+
+
+def _walk_all_nodes(root: Node) -> Iterator[Node]:
+    """Yield every node under *root* in pre-order, via a tree-sitter cursor.
+
+    Config references can sit anywhere — module level, a class body, a nested
+    function — so this is the one pass that does not stop at definition
+    boundaries the way ``_walk_python_node`` and ``_extract_calls`` do. The
+    cursor rather than a Python stack over ``node.children``: the latter
+    materializes a fresh list at every node and measured ~2x slower over this
+    repo's dependency tree.
+    """
+    cursor = root.walk()
+    while True:
+        yield cursor.node
+        if cursor.goto_first_child():
+            continue
+        while not cursor.goto_next_sibling():
+            if not cursor.goto_parent():
+                return
+
+
+def _extract_config_refs(
+    root: Node,
+    source: bytes,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Emit READS_ENV / REFERENCES_FILE from the enclosing entity of each reference."""
+    if not entities or not any(probe in source for probe in _CONFIG_REF_PROBES):
+        return
+
+    direct_imports = _direct_os_imports(relationships)
+    spans = [(e.line_start, e.line_end, i) for i, e in enumerate(entities)]
+    seen: set[tuple[str, RelType, str]] = set()
+    found: list[tuple[int, RelType, str]] = []  # (line, rel_type, target name)
+
+    for node in _walk_all_nodes(root):
+        if node.type == "call":
+            ref = _config_ref_from_call(node, direct_imports)
+        elif node.type == "subscript":
+            env_name = _env_name_from_subscript(node, direct_imports)
+            ref = (RelType.READS_ENV, env_name) if env_name is not None else None
+        else:
+            continue
+        if ref is not None:
+            found.append((node.start_point[0] + 1, *ref))
+
+    for line, rel_type, target in found:
+        from_qn = entities[_innermost_owner(spans, line)].qualified_name
+        key = (from_qn, rel_type, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        # No `properties`: the reference is a name, and there is nothing else
+        # about it that may be persisted (see the security invariant above).
+        relationships.append(ParsedRelationship(from_qualified_name=from_qn, rel_type=rel_type, to_name=target))
 
 
 # ---------------------------------------------------------------------------

@@ -21,10 +21,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
     from typing import Protocol
 
-    from code_atlas.graph.client import CallStats, UpsertResult, _AnchorLookup, _CallLookup
+    from code_atlas.graph.client import CallStats, UpsertResult, _AnchorLookup, _CallLookup, _CitationLookup
     from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
     from code_atlas.parsing.detectors import PropertyEnrichment
 
@@ -120,6 +120,47 @@ if TYPE_CHECKING:
         ) -> None: ...
 
         async def invalidate_stale_anchors(self, changed_uids: set[str]) -> int: ...
+
+        async def build_citation_lookup(self, project_name: str) -> _CitationLookup: ...
+
+        # resolve_citations turns the ``citations`` strings extract_rationale
+        # recorded on an entity ("ADR-0014") into DOCUMENTS(link_type='citation')
+        # edges running (cited document) -> (citing entity), the same direction
+        # every other DOCUMENTS edge runs; whatever fails to resolve lands on
+        # the citing node's ``unresolved_citations``. ``confidence`` grades how
+        # the document was identified — 1.0 only for a numbered file in a
+        # scheme-named directory.
+        # ``file_paths`` is the citing files being reparsed: their inbound
+        # citation edges are deleted before the new ones are written, which is
+        # the ONLY thing that revokes a citation whose comment was removed (the
+        # edge is inbound to the citing file, so the _recreate_* delete phases
+        # never see it). Pass it whenever a parse produced the payload, even if
+        # the payload is empty — that empty case IS the removal. Leave it None
+        # for project-wide ``retry_unresolved`` sweeps, which must not delete.
+        async def resolve_citations(
+            self,
+            project_name: str,
+            citations_by_uid: dict[str, list[str]],
+            *,
+            file_paths: Collection[str] | None = None,
+            lookup: _CitationLookup | None = None,
+            retry_unresolved: bool = False,
+        ) -> None: ...
+
+        # resolve_config_refs MERGEs the EnvVar/ResourceFile node each
+        # READS_ENV/REFERENCES_FILE reference points at (the target does not
+        # exist until this call creates it, like an ExternalPackage stub) and
+        # links it. Names only: nothing from the reference's ``properties``
+        # reaches the graph — see graph/client.py's "capture NAMES, never
+        # VALUES" invariant.
+        async def resolve_config_refs(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None: ...
+
+        # gc_orphaned_reference_nodes deletes EnvVar/ResourceFile nodes with
+        # zero incoming edges. Those labels get no structural edges, so
+        # incoming-edge count is their reference count. Run it AFTER the
+        # batch's resolve_config_refs — between the relationship delete and
+        # the recreate, a still-referenced node is momentarily unreferenced.
+        async def gc_orphaned_reference_nodes(self) -> int: ...
 
         async def resolve_type_refs(
             self,

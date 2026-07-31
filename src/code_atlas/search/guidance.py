@@ -38,6 +38,8 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.IMPORTS: "Module/entity -> imported dependency (has optional type_only=true for TYPE_CHECKING/import type)",
     RelType.USES_TYPE: "Callable -> type referenced in parameter/return annotations (auto-extracted from signatures)",
     RelType.OVERRIDES: "Method -> parent method it overrides",
+    RelType.READS_ENV: "Entity -> EnvVar it reads (EnvVar is GLOBAL: uid 'env/NAME', project_name '_global')",
+    RelType.REFERENCES_FILE: "Entity -> ResourceFile it reads/writes (project-scoped, uid '{project}:res/{path}')",
     RelType.DEPENDS_ON: "Project -> project dependency (monorepo)",
     RelType.DOCUMENTS: "Doc section/Note -> code entity it documents (or Note anchor)",
     RelType.SIMILAR_TO: "Entity -> semantically similar entity (embedding cosine)",

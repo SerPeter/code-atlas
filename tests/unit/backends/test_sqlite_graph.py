@@ -11,7 +11,7 @@ import aiosqlite
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
 from code_atlas.parsing.detectors import PropertyEnrichment
-from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType, Visibility
+from code_atlas.schema import GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType, Visibility
 from code_atlas.server.analysis import _analyze_communities
 
 if TYPE_CHECKING:
@@ -245,10 +245,13 @@ class TestCommunitiesGuard:
 
         result = await _analyze_communities(client, "proj", "", 10)
 
-        assert result == {
-            "analysis": "communities",
-            "error": "unsupported on the sqlite backend — requires Memgraph+MAGE",
-        }
+        # Assert the contract, not the prose: the exact wording explains WHY the
+        # backend cannot run it, and that reason has already changed once (it was
+        # MAGE/Leiden; it is now the two raw Cypher reads the clustering feeds on).
+        # Pinning the full string made a correct explanation update look like a
+        # regression.
+        assert result["analysis"] == "communities"
+        assert "unsupported on the sqlite backend" in result["error"]
         await client.close()
 
 
@@ -1145,4 +1148,177 @@ class TestGetNoteEmbeddings:
         assert rows[0]["uid"] == "proj:note:a"
         assert rows[0]["project_name"] == "proj"
         assert rows[0]["embedding"] == [1.0, 2.0, 3.0]
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Config references (EnvVar / ResourceFile) + reference-counted GC
+# ---------------------------------------------------------------------------
+
+
+def _env_ref(from_uid: str, name: str, **props: Any) -> ParsedRelationship:
+    return ParsedRelationship(
+        from_qualified_name=from_uid, rel_type=RelType.READS_ENV, to_name=name, properties=dict(props)
+    )
+
+
+def _file_ref(from_uid: str, path: str, **props: Any) -> ParsedRelationship:
+    return ParsedRelationship(
+        from_qualified_name=from_uid, rel_type=RelType.REFERENCES_FILE, to_name=path, properties=dict(props)
+    )
+
+
+async def _node_row(client: SqliteGraphClient, uid: str) -> Any:
+    conn = await client._get_conn()
+    cur = await conn.execute(
+        "SELECT labels, project_name, name, qualified_name, props_json FROM nodes WHERE uid = ?", (uid,)
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return row
+
+
+async def _scalar(client: SqliteGraphClient, sql: str, params: tuple[Any, ...] = ()) -> Any:
+    conn = await client._get_conn()
+    cur = await conn.execute(sql, params)
+    row = await cur.fetchone()
+    await cur.close()
+    return row[0] if row else None
+
+
+class TestResolveConfigRefs:
+    async def test_creates_global_env_var_and_scoped_resource_file(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+
+        await client.resolve_config_refs(
+            "proj", [_env_ref("proj:mod.f", "DATABASE_URL"), _file_ref("proj:mod.f", "./data/fixtures.json")]
+        )
+
+        env = await _node_row(client, "env/DATABASE_URL")
+        assert env[:4] == ("EnvVar", GLOBAL_PROJECT, "DATABASE_URL", "env/DATABASE_URL")
+        res = await _node_row(client, "proj:res/data/fixtures.json")
+        assert res[:4] == ("ResourceFile", "proj", "fixtures.json", "res/data/fixtures.json")
+        await client.close()
+
+    async def test_stores_names_not_values(self, tmp_path: Path) -> None:
+        """A default argument is a live-secret channel — nothing from the
+        reference's properties may be persisted on the node, the edge, or the
+        BM25 document.
+        """
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+        secret = "sk-live-abc123"
+
+        await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "API_KEY", default=secret, value=secret)])
+
+        assert await _scalar(client, "SELECT props_json FROM nodes WHERE uid = 'env/API_KEY'") == "{}"
+        assert await _scalar(client, "SELECT props_json FROM edges WHERE rel_type = 'READS_ENV'") == "{}"
+        fts_text = await _scalar(client, "SELECT text FROM text_envvar WHERE uid = 'env/API_KEY'")
+        assert secret not in fts_text
+        await client.close()
+
+    async def test_env_var_is_text_searchable_from_a_scoped_search(self, tmp_path: Path) -> None:
+        """A project-scoped search must still surface the global node — the
+        whole point of making these labels text-searchable.
+        """
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+        await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "DATABASE_URL")])
+
+        hits = await client.text_search("DATABASE_URL", project="proj")
+
+        assert [h["node"]["uid"] for h in hits] == ["env/DATABASE_URL"]
+        await client.close()
+
+    async def test_reresolve_is_idempotent(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+        rels = [_env_ref("proj:mod.f", "X")]
+
+        await client.resolve_config_refs("proj", rels)
+        await client.resolve_config_refs("proj", rels)
+
+        assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE rel_type = 'READS_ENV'") == 1
+        await client.close()
+
+
+class TestGcOrphanedReferenceNodes:
+    async def test_keeps_referenced_nodes(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+        await client.resolve_config_refs(
+            "proj", [_env_ref("proj:mod.f", "KEEP"), _file_ref("proj:mod.f", "data/keep.json")]
+        )
+
+        assert await client.gc_orphaned_reference_nodes() == 0
+
+        assert await _node_row(client, "env/KEEP") is not None
+        assert await _node_row(client, "proj:res/data/keep.json") is not None
+        await client.close()
+
+    async def test_sweeps_node_after_its_last_reference_disappears(self, tmp_path: Path) -> None:
+        """The end-to-end reference-counting contract: re-upserting the file
+        without the reference drops the edge (relationship recreation), and the
+        sweep then reclaims the now-unreferenced node.
+        """
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+        await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "GONE")])
+        assert await _node_row(client, "env/GONE") is not None
+
+        # Reparse the same file with changed content and no config refs at all.
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f", content_hash="h2")], [])
+
+        assert await client.gc_orphaned_reference_nodes() == 1
+        assert await _node_row(client, "env/GONE") is None
+        await client.close()
+
+    async def test_sweep_also_clears_the_fts_row(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+        await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "GONE")])
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f", content_hash="h2")], [])
+
+        await client.gc_orphaned_reference_nodes()
+
+        assert await client.text_search("GONE") == []
+        await client.close()
+
+    async def test_survives_while_one_of_two_referrers_remains(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "a.py", [_entity("f", "a.f", file_path="a.py")], [])
+        await client.upsert_file_entities("proj", "b.py", [_entity("g", "b.g", file_path="b.py")], [])
+        await client.resolve_config_refs("proj", [_env_ref("proj:a.f", "SHARED"), _env_ref("proj:b.g", "SHARED")])
+
+        await client.upsert_file_entities(
+            "proj", "a.py", [_entity("f", "a.f", file_path="a.py", content_hash="h2")], []
+        )
+
+        assert await client.gc_orphaned_reference_nodes() == 0
+        assert await _node_row(client, "env/SHARED") is not None
+        await client.close()
+
+    async def test_project_deletion_orphans_the_global_env_var(self, tmp_path: Path) -> None:
+        """``delete_project_data`` cannot reach a ``_global`` node — the sweep is
+        what stops deleted projects from leaking env vars forever.
+        """
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
+        await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "ORPHANED")])
+
+        await client.delete_project_data("proj")
+        assert await _node_row(client, "env/ORPHANED") is not None  # survived the project wipe
+
+        assert await client.gc_orphaned_reference_nodes() == 1
+        assert await _node_row(client, "env/ORPHANED") is None
         await client.close()

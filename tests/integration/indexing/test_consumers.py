@@ -295,6 +295,55 @@ async def test_file_hash_gate_processes_modified(
 
 
 @pytest.mark.usefixtures("_clean_streams")
+async def test_deleting_a_citation_comment_revokes_the_edge_through_the_pipeline(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """The reported bug, driven the way a user hits it: remove ``see ADR-0014``
+    from a comment, let the daemon reindex, and the DOCUMENTS edge must go with
+    it. The edge is inbound to the citing file's entity, so nothing in the
+    relationship-delete phase can revoke it — only the file-scoped pass in
+    resolve_citations, which the consumer has to reach even though a file with
+    no citations left contributes an empty payload."""
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(settings.project_root, "wiki/adr/0014-x.md", "# ADR-0014: Thing\n\nBody.\n")
+    _write_python_file(settings.project_root, "cited.py", "# WHY: see ADR-0014\ndef resolve():\n    return 1\n")
+
+    async def _run_once(paths: list[str]) -> None:
+        consumer = ASTConsumer(
+            event_bus,
+            graph_client,
+            settings,
+            policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+        )
+        for path in paths:
+            await event_bus.publish(Topic.FILE_CHANGED, _file_changed(settings, path))
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(1.5)
+        consumer.stop()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    async def _citation_count() -> int:
+        records = await graph_client.execute(
+            "MATCH ()-[r:DOCUMENTS {link_type: 'citation'}]->(n {project_name: $p}) RETURN count(r) AS cnt",
+            {"p": project_name},
+        )
+        return records[0]["cnt"]
+
+    await _run_once(["wiki/adr/0014-x.md", "cited.py"])
+    assert await _citation_count() == 1, "the citation never linked, so the revoke case cannot be under test"
+
+    # The comment is deleted; only the citing file changes.
+    _write_python_file(settings.project_root, "cited.py", "def resolve():\n    return 1\n")
+    await _run_once(["cited.py"])
+
+    assert await _citation_count() == 0
+
+
+@pytest.mark.usefixtures("_clean_streams")
 async def test_cooldown_defers_rapid_edits(
     event_bus: EventBus,
     graph_client: GraphClient,

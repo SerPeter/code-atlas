@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from loguru import logger
@@ -22,13 +24,17 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
+    _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
+    GLOBAL_PROJECT,
+    RESOURCE_FILE_PREFIX,
     SCHEMA_VERSION,
     CallableKind,
     NodeLabel,
     NoteKind,
     RelType,
     TypeDefKind,
+    env_var_uid,
     generate_composite_index_ddl,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
@@ -37,13 +43,14 @@ from code_atlas.schema import (
     generate_text_index_ddl,
     generate_unique_constraint_ddl,
     generate_vector_index_ddl,
+    resource_file_uid,
 )
 from code_atlas.search.engine import matches_test_pattern
 from code_atlas.settings import SearchSettings
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Sequence
 
     from neo4j import AsyncDriver
 
@@ -87,6 +94,9 @@ _UID_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
 # by type name, DOCUMENTS by symbol or file-path suffix via _create_doc_links).
 # IMPLEMENTS also has a uid-shaped path (detector-emitted target uids), but it
 # always falls back to this name-matched route for parser-emitted bare names.
+# DOCUMENTS has two further post-batch routes that carry no ParsedRelationship
+# of their own: resolve_anchors (link_type='anchor') and resolve_citations
+# (link_type='citation', driven by the entity's `citations` property).
 _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
     {
         RelType.INHERITS,
@@ -96,13 +106,27 @@ _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
 )
 
 # Resolved post-batch, after all files in a batch are upserted (see
-# GraphClient.resolve_calls / resolve_imports / resolve_uses_type) — not
-# part of _create_relationships at all.
+# GraphClient.resolve_calls / resolve_imports / resolve_uses_type /
+# resolve_config_refs) — not part of _create_relationships at all.
+# READS_ENV/REFERENCES_FILE belong here because their *target* node does not
+# exist until resolution MERGEs it, exactly like an ExternalPackage stub.
 _POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
     {
         RelType.CALLS,
         RelType.IMPORTS,
         RelType.USES_TYPE,
+        RelType.READS_ENV,
+        RelType.REFERENCES_FILE,
+    }
+)
+
+# Config references, split out of _POST_BATCH_REL_TYPES so callers that only
+# care about the EnvVar/ResourceFile pair (the AST consumer's partitioning,
+# the SQLite backend's create-phase skip list) do not have to re-enumerate it.
+_CONFIG_REF_REL_TYPES: frozenset[RelType] = frozenset(
+    {
+        RelType.READS_ENV,
+        RelType.REFERENCES_FILE,
     }
 )
 
@@ -134,6 +158,99 @@ def _validate_relationship_routing() -> None:
 
 
 _validate_relationship_routing()
+
+
+# ---------------------------------------------------------------------------
+# Config references (EnvVar / ResourceFile)
+#
+# SECURITY INVARIANT — capture NAMES, never VALUES.
+#
+# ``os.getenv("API_KEY", "sk-live-abc123")`` puts a live secret in the default
+# argument, and a referenced config file's *contents* are secrets far more
+# often than its path is.  If a value or a default ever reached a node
+# property, it would be persisted in the graph AND — for any label that is
+# embeddable — shipped verbatim to a third-party embedding API.
+#
+# The invariant is enforced structurally rather than by review: _plan_config_refs
+# builds each node from a fixed four-key allowlist derived only from the
+# reference's *target name*, and never reads ``rel.properties`` at all.  Edges
+# are written bare for the same reason — a parser that starts attaching a
+# ``default=`` property cannot leak it through this path.  Neither label is in
+# _EMBEDDABLE_LABELS, so nothing here can reach an embedding provider even if
+# the allowlist were widened later.
+# ---------------------------------------------------------------------------
+
+
+class _ConfigRefPlan(NamedTuple):
+    """Nodes to MERGE and edges to create for one batch of config references."""
+
+    env_nodes: dict[str, dict[str, str]]  # uid -> allowlisted node properties
+    file_nodes: dict[str, dict[str, str]]  # uid -> allowlisted node properties
+    edges: list[tuple[str, str, str]]  # (from_uid, to_uid, rel_type)
+
+
+def _normalize_resource_path(raw: str) -> str:
+    """Canonicalize a referenced path so one file yields one node.
+
+    Backslashes fold to forward slashes and leading ``./`` segments are
+    stripped, so ``./data\\fixtures.json`` and ``data/fixtures.json`` converge.
+    Nothing else is rewritten: the path is not resolved against the filesystem
+    (the reference may well point at a file that does not exist) and ``..`` is
+    left intact rather than collapsed, since collapsing it would silently merge
+    references made from different directories.
+    """
+    path = raw.strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def _plan_config_refs(project_name: str, ref_rels: list[ParsedRelationship]) -> _ConfigRefPlan:
+    """Turn READS_ENV/REFERENCES_FILE references into nodes + edges to write.
+
+    Pure and backend-agnostic — both graph backends share it so they cannot
+    drift on uid construction, normalization, or the names-only allowlist.
+    """
+    env_nodes: dict[str, dict[str, str]] = {}
+    file_nodes: dict[str, dict[str, str]] = {}
+    edges: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for rel in ref_rels:
+        if rel.rel_type == RelType.READS_ENV:
+            name = rel.to_name.strip()
+            if not name:
+                continue
+            uid = env_var_uid(name)
+            # GLOBAL_PROJECT, not project_name: one node per variable name
+            # across every indexed repo (see schema.env_var_uid).
+            env_nodes.setdefault(
+                uid,
+                {"uid": uid, "project_name": GLOBAL_PROJECT, "name": name, "qualified_name": uid},
+            )
+        elif rel.rel_type == RelType.REFERENCES_FILE:
+            path = _normalize_resource_path(rel.to_name)
+            if not path:
+                continue
+            uid = resource_file_uid(project_name, path)
+            file_nodes.setdefault(
+                uid,
+                {
+                    "uid": uid,
+                    "project_name": project_name,
+                    "name": path.rsplit("/", 1)[-1],
+                    "qualified_name": f"{RESOURCE_FILE_PREFIX}{path}",
+                },
+            )
+        else:
+            continue
+
+        key = (rel.from_qualified_name, uid, rel.rel_type.value)
+        if key not in seen:
+            seen.add(key)
+            edges.append(key)
+
+    return _ConfigRefPlan(env_nodes=env_nodes, file_nodes=file_nodes, edges=edges)
 
 
 def _assert_valid_label(label: str) -> None:
@@ -466,6 +583,207 @@ def _resolve_one_path_anchor(rel: ParsedRelationship, lookup: _AnchorLookup) -> 
         if sym_target is not None:
             return sym_target
     return target
+
+
+# ---------------------------------------------------------------------------
+# Citation resolution (ADR/RFC references captured by extract_rationale)
+#
+# CANONICAL FORM
+# --------------
+# ``extract_rationale`` stores what the author wrote, verbatim-ish, in the
+# entity's ``citations`` list ("ADR-14", "ADR-0014", "RFC-793"). That string is
+# the *evidence* and is never rewritten — normalising at capture time would
+# throw away the only record of what the comment actually said, and any
+# padding rule that unifies "ADR 14" with "ADR-0014" would also turn "RFC 793"
+# into the nonexistent "RFC-0793".
+#
+# So the canonical form lives here, at resolution time, and is not a string at
+# all: a citation's identity is the pair ``(scheme, number)`` — scheme
+# case-folded, number compared as an *integer*. Leading zeros stop mattering
+# without anything being padded or stripped destructively:
+#
+#     "ADR-14" "ADR 0014" "adr#014"  -> ("ADR", 14)
+#     "RFC 793" "rfc-793"            -> ("RFC", 793)
+#
+# Document nodes are keyed into the same space (``_document_citation_keys``),
+# so an ADR whose filename is ``0014-calls-edge-confidence.md`` answers to
+# ``("ADR", 14)`` and both spellings above find it. Edges record the canonical
+# pair rendered back as ``"<SCHEME>-<number>"`` (unpadded, e.g. ``"ADR-14"``)
+# in their ``citation`` property, so the edge is self-describing and identical
+# regardless of which spelling produced it.
+#
+# DIRECTION
+# ---------
+# The emitted edge runs ``(document) -[:DOCUMENTS {link_type:'citation'}]->
+# (citing entity)`` — document to code, the same way every other DOCUMENTS
+# edge runs. The evidence was found on the code side ("see ADR-14"), but the
+# fact it establishes is the ordinary one: that ADR documents this function.
+# Writing it the other way round would make DOCUMENTS the only relationship in
+# the schema whose direction depends on which parser noticed it, and every
+# reader (get_linked_docs, get_module_summary, the module-summary renderer,
+# the zombie-preservation carve-out — in two backends) would have to special-
+# case the exception forever. Provenance is not lost: ``link_type='citation'``
+# says the edge came from a reference in the code, and ``citation`` records the
+# identifier as canonicalised. See ``resolve_citations`` for the ownership
+# consequence — the edge is owned by the CITING file's parse, not by the
+# document's, so it is carved out of the document's relationship-delete phase.
+# ---------------------------------------------------------------------------
+
+# A whole captured citation string. The separator class matches the one
+# ``parsing.ast._citation_pattern`` accepts, so any string that extractor can
+# emit round-trips, plus the raw forms a human might hand-write. The scheme is
+# letters-only so the separator can be absent ("ADR0014") without the scheme
+# greedily swallowing the leading digits.
+_CITATION_KEY_RE = re.compile(r"^(?P<scheme>[A-Za-z]{2,16})[ \t\-_#]?(?P<number>\d{1,6})$")
+
+# Same shape but anchored only at the start, for document *titles*
+# ("# ADR-0014: CALLS Edge Confidence").
+_DOC_TITLE_RE = re.compile(r"^(?P<scheme>[A-Za-z]{2,16})[ \t\-_#]?(?P<number>\d{1,6})\b")
+
+# The near-universal numbered-document filename convention: ``0014-slug.md``.
+# Deliberately not tied to any parent directory — see ``_directory_scheme``.
+_DOC_FILENAME_RE = re.compile(r"^(?P<number>\d{1,6})[-_]")
+
+# Candidate strength, lowest wins. A whole numbered file beats the heading
+# inside it, so "cite ADR-0014" links the document, not its H1 section.
+_CITATION_RANK_FILENAME = 0
+_CITATION_RANK_FILE_TITLE = 1
+_CITATION_RANK_DOC_HEADING = 2
+
+# Confidence stamped on the edge, per winning rank. Only the filename form is
+# structural evidence — a file *named* ``0014-*.md`` inside an ``adr/``
+# directory is that ADR, there is nothing to infer. The two title forms are
+# inference from prose ("ADR 22 rollout notes" is a note *about* ADR-22 as
+# plausibly as it is ADR-22), and the edge says so rather than claiming 1.0.
+_CITATION_RANK_CONFIDENCE: dict[int, float] = {
+    _CITATION_RANK_FILENAME: 1.0,
+    _CITATION_RANK_FILE_TITLE: 0.9,
+    _CITATION_RANK_DOC_HEADING: 0.8,
+}
+
+# Only a document's own top-level heading is treated as naming that document.
+# A deeper heading that starts with an identifier ("## ADR-0014 rationale",
+# "### ADR-0014 was rejected") is a passage *discussing* the record, and
+# matching it produced the resolver's worst failure mode: when the real ADR
+# lived outside a scheme-named directory, the only candidate left was some
+# unrelated document that merely mentions the number, linked at confidence
+# 1.0. A confidently wrong edge is worse than no edge, so those citations are
+# now recorded as unresolved instead. The cost is the "one file, many records"
+# layout (a changelog of ``## ADR-NNNN`` sections), which stops resolving —
+# that layout is served by giving each record its own file, and an unresolved
+# citation is still reported on the citing node.
+_CITATION_DOC_HEADING_LEVEL = 1
+
+_FILE_LEVEL_DOC_LABELS: frozenset[str] = frozenset({NodeLabel.DOC_FILE.value, NodeLabel.NOTE.value})
+
+
+def _citation_key(citation: str) -> tuple[str, int] | None:
+    """Canonical match key for one captured citation string, or ``None`` if unparseable.
+
+    ``"ADR-0014"`` and ``"ADR 14"`` both yield ``("ADR", 14)``; ``"RFC 793"``
+    yields ``("RFC", 793)`` and is never zero-padded. See the module-section
+    comment above for why normalisation happens here rather than at capture.
+    """
+    match = _CITATION_KEY_RE.match(citation.strip())
+    if match is None:
+        return None
+    return match.group("scheme").upper(), int(match.group("number"))
+
+
+def _render_citation_key(key: tuple[str, int]) -> str:
+    """Canonical key rendered back to a string for the edge's ``citation`` property."""
+    return f"{key[0]}-{key[1]}"
+
+
+def _directory_scheme(directory: str) -> str:
+    """Scheme a document *directory* name implies — ``adr``/``ADRs`` → ``ADR``.
+
+    This is how ``wiki/adr/0014-foo.md`` gets an ``ADR`` scheme without the
+    ADR directory being hardcoded anywhere: whatever the containing folder is
+    called *is* the scheme, singularised and upper-cased. A repo using
+    ``docs/adr``, ``doc/adrs`` or ``notes/rfc`` works identically, and a
+    directory that is not a plausible scheme token (``notes``, ``2026-07``)
+    simply yields a key nothing cites.
+    """
+    token = directory.strip().upper()
+    if token.endswith("S") and len(token) > 1:
+        token = token[:-1]
+    return token if token.isalpha() and 2 <= len(token) <= 16 else ""
+
+
+def _document_citation_keys(
+    label: str, name: str, file_path: str, header_level: int | None = None
+) -> list[tuple[tuple[str, int], int]]:
+    """Citation keys a document node answers to, each paired with a match rank.
+
+    Three forms, none requiring a configured ADR path, in descending strength:
+
+    * **filename shape** — a file-level node (DocFile/Note) named
+      ``NNNN-slug.md`` inside a scheme-named directory (``adr/``, ``rfcs/``).
+      Strongest: it identifies a whole document structurally.
+    * **file title shape** — a file-level node whose own name *starts* with a
+      scheme+number (``ADR-0014: CALLS Edge Confidence``, ``ADR-0014-foo.md``).
+      Catches repos whose decision records live in a differently-named folder.
+    * **document heading shape** — a DocSection that is its file's top-level
+      heading, i.e. the document's title by another route.
+
+    *header_level* is the DocSection's heading depth; a section only qualifies
+    at depth ``_CITATION_DOC_HEADING_LEVEL``. Deeper headings, and sections
+    passed with no level at all, are treated as mentions and produce no key —
+    see ``_CITATION_DOC_HEADING_LEVEL`` for why that is worth the miss.
+    """
+    keys: list[tuple[tuple[str, int], int]] = []
+    is_file_level = label in _FILE_LEVEL_DOC_LABELS
+
+    if is_file_level and file_path:
+        posix = PurePosixPath(file_path.replace("\\", "/"))
+        filename_match = _DOC_FILENAME_RE.match(posix.stem)
+        scheme = _directory_scheme(posix.parent.name)
+        if filename_match is not None and scheme:
+            keys.append(((scheme, int(filename_match.group("number"))), _CITATION_RANK_FILENAME))
+
+    titles_document = is_file_level or header_level == _CITATION_DOC_HEADING_LEVEL
+    title_match = _DOC_TITLE_RE.match(name.strip()) if titles_document else None
+    if title_match is not None:
+        rank = _CITATION_RANK_FILE_TITLE if is_file_level else _CITATION_RANK_DOC_HEADING
+        keys.append(((title_match.group("scheme").upper(), int(title_match.group("number"))), rank))
+
+    return keys
+
+
+@dataclass(frozen=True)
+class _CitationLookup:
+    """Per-project index from canonical citation key to candidate document uids.
+
+    ``by_key[("ADR", 14)]`` is a list of ``(rank, uid)`` candidates — see
+    ``_document_citation_keys`` for what the ranks mean.
+    """
+
+    by_key: dict[tuple[str, int], list[tuple[int, str]]]
+
+
+def _pick_citation_target(key: tuple[str, int], lookup: _CitationLookup) -> tuple[str, float] | None:
+    """Best ``(document uid, edge confidence)`` for *key*, or ``None`` when missing or ambiguous.
+
+    The strongest available rank wins outright — a DocFile and the H1
+    DocSection inside it both answer to ``("ADR", 14)``, and that is not
+    ambiguity, it is one document described twice. A genuine tie *within* the
+    winning rank (two ``0014-*.md`` files in two ``adr/`` directories) resolves
+    to nothing rather than guessing, matching the never-multi-link discipline
+    ``resolve_anchors``/``_create_doc_links`` already use.
+
+    The winning rank also fixes the confidence written onto the edge
+    (``_CITATION_RANK_CONFIDENCE``): a weaker form of evidence still links,
+    but it does not get to claim certainty.
+    """
+    candidates = lookup.by_key.get(key)
+    if not candidates:
+        return None
+    best_rank = min(rank for rank, _ in candidates)
+    winners = {uid for rank, uid in candidates if rank == best_rank}
+    if len(winners) != 1:
+        return None
+    return next(iter(winners)), _CITATION_RANK_CONFIDENCE[best_rank]
 
 
 @dataclass(frozen=True)
@@ -840,6 +1158,8 @@ class GraphClient:
                 await self._migrate_v5_clear_freshness_markers()
             if stored < 6:  # v6 data migration threshold
                 await self._migrate_v6_clear_freshness_markers()
+            if stored < 7:  # v7 data migration threshold
+                await self._migrate_v7_clear_freshness_markers()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -1291,10 +1611,14 @@ class GraphClient:
         if not import_rels:
             return
 
-        # 1. Query all internal entity qualified_name → uid
+        # 1. Query all internal entity qualified_name → uid.
+        #    Every referenced-not-defined label is excluded: their
+        #    qualified_names live in synthetic namespaces (ext/, res/) that an
+        #    import must never resolve into.
         records = await self.execute(
             f"MATCH (n {{project_name: $p}}) "
             f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
+            f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
             f"AND NOT n:{NodeLabel.SCHEMA_VERSION} AND NOT n:{NodeLabel.PROJECT} "
             "RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp",
             {"p": project_name},
@@ -1433,6 +1757,83 @@ class GraphClient:
             len(ext_packages),
             len(ext_symbols),
         )
+
+    async def resolve_config_refs(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
+        """MERGE EnvVar/ResourceFile nodes and their READS_ENV/REFERENCES_FILE edges.
+
+        Runs post-batch for the same reason ``resolve_imports`` does: the target
+        node does not exist until this call creates it.
+
+        Node properties come from :func:`_plan_config_refs`'s four-key allowlist
+        and edges are written bare — see the module-level "capture NAMES, never
+        VALUES" invariant above.  ``MERGE ... ON CREATE SET`` (never a bare
+        ``SET``) means a re-resolve of an existing node cannot overwrite it
+        either.
+        """
+        if not ref_rels:
+            return
+
+        plan = _plan_config_refs(project_name, ref_rels)
+
+        for label, nodes in (
+            (NodeLabel.ENV_VAR, plan.env_nodes),
+            (NodeLabel.RESOURCE_FILE, plan.file_nodes),
+        ):
+            if not nodes:
+                continue
+            await self.execute_write(
+                f"UNWIND $nodes AS n "
+                f"MERGE (x:{label} {{uid: n.uid}}) "
+                f"ON CREATE SET x.project_name = n.project_name, x.name = n.name, "
+                f"x.qualified_name = n.qualified_name",
+                {"nodes": list(nodes.values())},
+            )
+
+        for rel_type in (RelType.READS_ENV, RelType.REFERENCES_FILE):
+            edges = [{"from_uid": f, "to_uid": t} for f, t, rt in plan.edges if rt == rel_type.value]
+            if not edges:
+                continue
+            await self.execute_write(
+                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) MERGE (a)-[:{rel_type}]->(b)",
+                {"rels": edges},
+            )
+
+        logger.debug(
+            "Resolved {} config refs ({} env vars, {} resource files)",
+            len(ref_rels),
+            len(plan.env_nodes),
+            len(plan.file_nodes),
+        )
+
+    async def gc_orphaned_reference_nodes(self) -> int:
+        """Delete EnvVar/ResourceFile nodes that nothing points at any more.
+
+        These labels are reference-counted: they exist only because some entity
+        referenced them, and they receive no structural edges, so incoming-edge
+        count *is* the reference count (see schema._REFERENCE_COUNTED_LABELS).
+        ``_recreate_batch_relationships`` drops every outgoing edge of a
+        reparsed file's entities before recreating them, so the last reference
+        vanishing from source is exactly the last incoming edge vanishing here.
+
+        Cost is bounded by the two smallest labels in the graph, not by the
+        graph: one label-index scan each, never a full scan.  Must run *after*
+        the batch's ``resolve_config_refs``, never between the edge-delete and
+        the recreate — in that window a still-referenced node has zero edges.
+        """
+        total = 0
+        for label in sorted(_REFERENCE_COUNTED_LABELS, key=lambda lbl: lbl.value):
+            records = await self.execute(f"MATCH (n:{label}) WHERE NOT ()-[]->(n) RETURN n.uid AS uid")
+            uids = [r["uid"] for r in records if r["uid"]]
+            if not uids:
+                continue
+            await self.execute_write(
+                f"UNWIND $uids AS uid MATCH (n:{label} {{uid: uid}}) DETACH DELETE n",
+                {"uids": uids},
+            )
+            total += len(uids)
+        if total:
+            logger.debug("GC swept {} orphaned reference node(s)", total)
+        return total
 
     async def resolve_calls(
         self,
@@ -1664,6 +2065,165 @@ class GraphClient:
         if count:
             logger.debug("Marked {} anchor edge(s) stale", count)
         return count
+
+    async def build_citation_lookup(self, project_name: str) -> _CitationLookup:
+        """Build *project_name*'s canonical-key → document-node index for citation resolution."""
+        records = await self.execute(
+            f"MATCH (n {{project_name: $p}}) "
+            f"WHERE n:{NodeLabel.DOC_FILE} OR n:{NodeLabel.DOC_SECTION} OR n:{NodeLabel.NOTE} "
+            "RETURN labels(n)[0] AS label, n.uid AS uid, n.name AS name, n.file_path AS fp, "
+            "n.header_level AS lvl",
+            {"p": project_name},
+        )
+        by_key: dict[tuple[str, int], list[tuple[int, str]]] = {}
+        for r in records:
+            keys = _document_citation_keys(r["label"] or "", r["name"] or "", r["fp"] or "", r["lvl"])
+            for key, rank in keys:
+                by_key.setdefault(key, []).append((rank, r["uid"]))
+        return _CitationLookup(by_key=by_key)
+
+    async def resolve_citations(
+        self,
+        project_name: str,
+        citations_by_uid: dict[str, list[str]],
+        *,
+        file_paths: Collection[str] | None = None,
+        lookup: _CitationLookup | None = None,
+        retry_unresolved: bool = False,
+    ) -> None:
+        """Turn recorded ``citations`` strings into DOCUMENTS edges after batch upsert.
+
+        *citations_by_uid* maps a citing entity's uid to the raw citation
+        strings ``extract_rationale`` found in its comments. Each resolves to
+        at most one document node in the same project via the canonical
+        ``(scheme, number)`` key (see ``_citation_key``), producing
+
+            (document) -[:DOCUMENTS {link_type: 'citation'}]-> (citing entity)
+
+        — doc → code, like every other DOCUMENTS edge (see the DIRECTION note
+        in this module's citation section). ``link_type`` distinguishes these
+        from ``'anchor'`` edges and from the heuristic ``'explicit'``/
+        ``'symbol_mention'``/``'file_ref'`` links ``_create_doc_links`` emits,
+        and ``confidence`` reflects how the document was identified — 1.0 only
+        for a numbered file in a scheme-named directory.
+
+        The edge is written from the document's node but *owned* by the citing
+        file's parse, which is why ``_recreate_batch_relationships`` and
+        ``_recreate_file_relationships`` exclude it from the delete phase (the
+        same carve-out cross-file DEFINES gets): re-parsing the ADR must not
+        drop the citations pointing out of it, because nothing in that parse
+        could put them back.
+
+        *file_paths* is the other half of that ownership: the citing files this
+        call is (re)parsing. Their INBOUND citation edges are deleted before the
+        MERGE below, which is what gives citations the delete-then-recreate
+        lifecycle every other parsed relationship has. Those two ``_recreate_*``
+        delete phases only ever sweep edges *leaving* the file being parsed, so
+        they structurally cannot reach an inbound citation — without this pass a
+        citation whose comment was deleted would survive forever. The scope is
+        file paths rather than uids precisely so the removal case works: a file
+        whose last citation is gone contributes no entry to *citations_by_uid*
+        at all, and it stays bounded by the batch's file count either way.
+
+        Omit *file_paths* (``None``) for any pass that resolves without
+        reparsing the citing side — above all a ``retry_unresolved`` sweep,
+        which is project-wide and must never delete.
+
+        Resolution is project-scoped: every repo has an ADR-0001, so a
+        cross-project lookup (what anchors do, because anchors carry explicit
+        project/uid forms) would collide by construction.
+
+        Anything that does not resolve — a typo'd ADR number, an ADR not
+        indexed yet, or an inherently external scheme like RFC, which has no
+        local document by definition — is recorded on the citing node's
+        ``unresolved_citations``, never silently dropped. The list is
+        recomputed from scratch for every uid passed in, so a citation that
+        starts resolving clears itself.
+
+        *retry_unresolved* additionally re-attempts entities already carrying a
+        non-empty ``unresolved_citations``, re-reading their ``citations``
+        property as the source of truth. Without it a first full index leaves
+        every ADR reference broken: code files are almost always published
+        before the ``wiki/``/``docs/`` tree, so the document node does not
+        exist yet when the citing file's batch resolves. Callers run it
+        whenever a batch adds or changes document nodes, and once more at the
+        end of a run (see ``ASTConsumer._flush_deferred_resolution``).
+        """
+        if not citations_by_uid and not retry_unresolved and not file_paths:
+            return
+
+        if file_paths:
+            # Revoke phase, scoped to the citing files being reparsed. Runs
+            # before the MERGE below (and before the early return for an empty
+            # payload) so a file whose last citation was deleted still clears.
+            await self.execute_write(
+                f"MATCH (entity {{project_name: $p}})<-[r:{RelType.DOCUMENTS} {{link_type: 'citation'}}]-() "
+                "WHERE entity.file_path IN $fps DELETE r",
+                {"p": project_name, "fps": list(file_paths)},
+            )
+
+        pending: dict[str, list[str]] = {uid: list(raws) for uid, raws in citations_by_uid.items()}
+        if retry_unresolved:
+            records = await self.execute(
+                "MATCH (n {project_name: $p}) "
+                "WHERE n.unresolved_citations IS NOT NULL AND size(n.unresolved_citations) > 0 "
+                "RETURN n.uid AS uid, n.citations AS citations",
+                {"p": project_name},
+            )
+            for r in records:
+                # ``citations`` is the evidence; ``unresolved_citations`` is
+                # only bookkeeping. Re-reading the former means an entity whose
+                # citation comment was deleted gets its stale bookkeeping
+                # cleared here rather than lingering forever.
+                pending.setdefault(r["uid"], list(r["citations"] or []))
+
+        if not pending:
+            return
+        if lookup is None:
+            lookup = await self.build_citation_lookup(project_name)
+
+        resolved: list[dict[str, Any]] = []
+        unresolved_by_uid: dict[str, list[str]] = {}
+        for entity_uid, raws in pending.items():
+            for raw in raws:
+                key = _citation_key(raw)
+                target = _pick_citation_target(key, lookup) if key is not None else None
+                if key is None or target is None or target[0] == entity_uid:
+                    unresolved_by_uid.setdefault(entity_uid, []).append(raw)
+                    continue
+                doc_uid, confidence = target
+                resolved.append(
+                    {
+                        "doc_uid": doc_uid,
+                        "entity_uid": entity_uid,
+                        "citation": _render_citation_key(key),
+                        "confidence": confidence,
+                    }
+                )
+
+        if resolved:
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                f"MATCH (doc {{uid: r.doc_uid}}) "
+                f"MATCH (entity {{uid: r.entity_uid}}) "
+                f"MERGE (doc)-[e:{RelType.DOCUMENTS} {{link_type: 'citation'}}]->(entity) "
+                f"SET e.confidence = r.confidence, e.citation = r.citation",
+                {"rels": resolved},
+            )
+
+        entity_updates = [{"uid": uid, "unresolved": unresolved_by_uid.get(uid, [])} for uid in pending]
+        await self.execute_write(
+            "UNWIND $items AS item MATCH (n {uid: item.uid}) SET n.unresolved_citations = item.unresolved",
+            {"items": entity_updates},
+        )
+
+        total_unresolved = sum(len(v) for v in unresolved_by_uid.values())
+        logger.debug(
+            "Resolved {} citation edge(s) for project {} ({} unresolved)",
+            len(resolved),
+            project_name,
+            total_unresolved,
+        )
 
     async def resolve_type_refs(  # noqa: PLR0912
         self,
@@ -1991,6 +2551,7 @@ class GraphClient:
                 "UNWIND $pairs AS p "
                 "MATCH (n {project_name: p.target_project, name: p.name}) "
                 f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
+                f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
                 f"AND NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
                 "RETURN p.es_uid AS es_uid, n.uid AS real_uid",
                 {"pairs": lookup_pairs},
@@ -2490,9 +3051,11 @@ class GraphClient:
             results_per_index = await asyncio.gather(*(_ts_one(idx) for idx in indices))
             all_results = _fuse_bm25_results(results_per_index)
 
-            # Post-filter by project scope
+            # Post-filter by project scope. GLOBAL_PROJECT always passes: a
+            # shared node (EnvVar) belongs to every project, so scoping a
+            # search to one repo must not hide the env vars that repo reads.
             if filter_projects:
-                project_set = set(filter_projects)
+                project_set = {*filter_projects, GLOBAL_PROJECT}
                 all_results = [r for r in all_results if _node_project_name(r) in project_set]
 
             return all_results[:limit]
@@ -2605,8 +3168,13 @@ class GraphClient:
         """
         filter_projects = projects if projects is not None else ([project] if project else None)
 
+        # GLOBAL_PROJECT rides along in the scope list — see text_search.
         project_clause = " AND n.project_name IN $projects" if filter_projects else ""
-        params: dict[str, Any] = {"query": query, "suffix": f".{query}", "projects": filter_projects or []}
+        params: dict[str, Any] = {
+            "query": query,
+            "suffix": f".{query}",
+            "projects": [*filter_projects, GLOBAL_PROJECT] if filter_projects else [],
+        }
         fetch_limit = limit * 3
 
         query_str = _build_graph_search_query(label, project_clause, fetch_limit)
@@ -2866,6 +3434,9 @@ class GraphClient:
             "MATCH (n {project_name: $project}) "
             "WHERE NOT n:Project AND NOT n:SchemaVersion AND NOT n:Package "
             f"AND NOT n:ExternalPackage AND NOT n:ExternalSymbol{pa_leaf} "
+            # EnvVar/ResourceFile can never receive IMPORTS/INHERITS/CALLS, so
+            # a label-only filter would report every one of them as a leaf.
+            "AND NOT n:EnvVar AND NOT n:ResourceFile "
             "AND NOT ()-[:IMPORTS|INHERITS|CALLS]->(n) "
             "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
             f"n.kind AS kind, n.file_path AS file_path LIMIT {limit}",
@@ -3271,15 +3842,20 @@ class GraphClient:
         return [r["n"] for r in records]
 
     async def get_linked_docs(self, uid: str, label: str, limit: int) -> list[dict[str, Any]]:
-        """DocSection/Note entities documenting *uid* — ``expand_context``'s docs.
+        """DocFile/DocSection/Note entities documenting *uid* — ``expand_context``'s docs.
 
         Each item is ``{"node": ..., "link_type": ..., "stale": ..., "anchor_hash": ...}``;
         ``stale``/``anchor_hash`` are only populated for explicit ``anchors:`` links (§3.6).
+
+        DocFile is in the doc-side filter for citations: ``resolve_citations``
+        resolves ``see ADR-14`` to the whole document, so the cited node is a
+        DocFile far more often than a section. No other DOCUMENTS route can
+        originate from one, so admitting the label adds nothing else.
         """
         label_clause = f":{label}" if label else ""
         records = await self.execute(
             f"MATCH (doc)-[r:{RelType.DOCUMENTS}]->(n{label_clause} {{uid: $uid}}) "
-            f"WHERE doc:{NodeLabel.DOC_SECTION} OR doc:{NodeLabel.NOTE} "
+            f"WHERE doc:{NodeLabel.DOC_SECTION} OR doc:{NodeLabel.NOTE} OR doc:{NodeLabel.DOC_FILE} "
             "RETURN doc AS n, r.link_type AS link_type, r.stale AS stale, r.anchor_hash AS anchor_hash "
             f"LIMIT {limit}",
             {"uid": uid},
@@ -3558,13 +4134,17 @@ class GraphClient:
         including on reappearance. Treating them as "foreign" here would make
         a genuinely deleted cross-file member an undeletable zombie.
 
-        Anchor-type DOCUMENTS edges are also excluded: unlike CALLS/INHERITS/
-        heuristic-DOCUMENTS edges (which preserve the zombie because nothing
-        could recreate them), an explicit anchors: reference is meant to go
-        stale/broken and be surfaced to the user (§3.6), not keep an
-        otherwise-dead entity alive forever. Deletion proceeds normally, and
+        Anchor- and citation-type DOCUMENTS edges are also excluded: unlike
+        CALLS/INHERITS/heuristic-DOCUMENTS edges (which preserve the zombie
+        because nothing could recreate them), an explicit anchors: reference is
+        meant to go stale/broken and be surfaced to the user (§3.6), not keep
+        an otherwise-dead entity alive forever. Deletion proceeds normally, and
         the affected Note's ``has_broken_anchors`` is set in the same
-        statement as the DETACH DELETE below.
+        statement as the DETACH DELETE below. Citations are excluded for the
+        same reason plus a stronger one: they *are* recreatable — the citing
+        file's next parse re-runs ``resolve_citations`` — so an inbound
+        citation from some ADR must not keep a genuinely deleted function
+        alive as a zombie.
         """
         # Pass 1: read which uids have a foreign inbound edge, across all
         # labels, before any writes — so an earlier label's delete in this
@@ -3587,7 +4167,7 @@ class GraphClient:
                 f"UNWIND $uids AS uid {match_n} "
                 "MATCH (other)-[r]->(n) WHERE (other.file_path IS NULL OR other.file_path <> n.file_path) "
                 f"AND NOT type(r) = '{RelType.DEFINES}' "
-                f"AND NOT (type(r) = '{RelType.DOCUMENTS}' AND r.link_type = 'anchor') "
+                f"AND NOT (type(r) = '{RelType.DOCUMENTS}' AND r.link_type IN ['anchor', 'citation']) "
                 "AND NOT other.uid IN $all_uids "
                 "RETURN DISTINCT uid",
                 {"uids": uids, "all_uids": all_uids},
@@ -3636,13 +4216,19 @@ class GraphClient:
         # --- Delete phase: single label-free query for all file entities ---
         # Cross-file DEFINES edges are preserved: they are created by
         # resolve_member_defines from the MEMBER file's parse, so this file's
-        # recreation would never restore them.
+        # recreation would never restore them. Citation DOCUMENTS edges are
+        # preserved for the same reason: they leave the cited document's node
+        # but are created by resolve_citations from the CITING file's parse —
+        # which is also what deletes them, in its own file_paths-scoped revoke
+        # pass, since they are inbound to the citing file and this query only
+        # ever sweeps outbound edges.
         delete_fps = [fp for fp in file_rels if fp not in new_file_paths]
         if delete_fps:
             await self.execute_write(
                 f"MATCH (n {{project_name: $p}})-[r]->(m) "
                 f"WHERE n.file_path IN $fps AND NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
                 f"AND NOT (type(r) = '{RelType.DEFINES}' AND coalesce(m.file_path, n.file_path) <> n.file_path) "
+                f"AND NOT (type(r) = '{RelType.DOCUMENTS}' AND r.link_type = 'citation') "
                 f"DELETE r",
                 {"p": project_name, "fps": delete_fps},
             )
@@ -3665,13 +4251,19 @@ class GraphClient:
         """Delete all relationships originating from this file's entities, then recreate them.
 
         Cross-file DEFINES edges (resolve_member_defines output, owned by the
-        member file's parse) are preserved — recreation would never restore them.
+        member file's parse) and citation DOCUMENTS edges (resolve_citations
+        output, owned by the citing file's parse) are preserved — recreation
+        would never restore them. Citations are revoked instead by
+        ``resolve_citations``'s own ``file_paths``-scoped pass, which is the
+        only phase that can see them: they run INTO the citing file's entities,
+        and this query only deletes edges running out of them.
         """
         if not skip_delete:
             await self.execute_write(
                 f"MATCH (n {{project_name: $p, file_path: $f}})-[r]->(m) "
                 f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-                f"AND NOT (type(r) = '{RelType.DEFINES}' AND coalesce(m.file_path, $f) <> $f) DELETE r",
+                f"AND NOT (type(r) = '{RelType.DEFINES}' AND coalesce(m.file_path, $f) <> $f) "
+                f"AND NOT (type(r) = '{RelType.DOCUMENTS}' AND r.link_type = 'citation') DELETE r",
                 {"p": project_name, "f": file_path},
             )
         await self._create_relationships(project_name, relationships)
@@ -3908,6 +4500,31 @@ class GraphClient:
         logger.info(
             "Schema v6: cleared stored file/git hashes and unweighted CALLS edges — "
             "run 'atlas index' to rebuild with edge weights and rationale"
+        )
+
+    async def _migrate_v7_clear_freshness_markers(self) -> None:
+        """v7: EnvVar/ResourceFile nodes and their READS_ENV/REFERENCES_FILE edges.
+
+        A full re-parse *is* required here, and not by analogy with v3-v6 — this
+        one has its own reason. Unlike those migrations, no existing entity's
+        ``content_hash`` changes: the new data is a whole class of node that
+        only the parser can produce, and it is produced from source text nobody
+        has ever looked at before. There is nothing in the graph to derive it
+        from, so every file has to go through the parser again. The file-hash
+        gate would otherwise skip every unchanged file forever and the two new
+        labels would stay permanently empty on any pre-v7 index.
+
+        Nothing is deleted, unlike v6's unweighted-CALLS purge: there are no
+        pre-v7 EnvVar/ResourceFile nodes to be stale.
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v7: cleared stored file/git hashes — run 'atlas index' to extract "
+            "environment-variable and referenced-file nodes"
         )
 
     async def _set_schema_version(self, version: int) -> None:

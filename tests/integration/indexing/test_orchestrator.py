@@ -9,7 +9,7 @@ import pytest
 
 from code_atlas.events import Topic
 from code_atlas.indexing.orchestrator import StalenessChecker, index_monorepo, index_project
-from code_atlas.schema import NodeLabel
+from code_atlas.schema import NodeLabel, RelType
 from code_atlas.settings import AtlasSettings, IndexSettings, derive_project_name
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
@@ -42,6 +42,17 @@ def _init_git_repo(tmp_path):
     _git(tmp_path, "init")
     _git(tmp_path, "config", "user.email", "test@test.com")
     _git(tmp_path, "config", "user.name", "Test")
+
+
+async def _citation_edges(graph_client, project: str) -> list[tuple[str, str, str]]:
+    """``(cited document path, citing entity name, citation)``, doc → code."""
+    records = await graph_client.execute(
+        f"MATCH (doc {{project_name: $p}})-[r:{RelType.DOCUMENTS} {{link_type: 'citation'}}]->(entity) "
+        "RETURN doc.file_path AS doc_path, entity.name AS entity_name, r.citation AS citation "
+        "ORDER BY doc_path, entity_name",
+        {"p": project},
+    )
+    return [(r["doc_path"], r["entity_name"], r["citation"]) for r in records]
 
 
 def _get_head(tmp_path):
@@ -152,6 +163,31 @@ class TestDeltaIndexIntegration:
         _git(tmp_path, "add", ".")
         _git(tmp_path, "commit", "-m", "initial")
         return tmp_path
+
+    async def test_citation_resolves_when_only_the_adr_is_published(self, git_project, graph_client, event_bus):
+        """The daemon's shape: an ADR written days after the code it explains.
+
+        The citing file is unchanged, so delta mode publishes only the new
+        document and the citing entity is never re-parsed — nothing but the
+        retry sweep that rides on indexing a document can link it.
+        """
+        _write(git_project, "src/mod.py", "# WHY: retry cascade documented in ADR-14.\ndef resolve():\n    return 1\n")
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "cite an adr")
+        settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(git_project)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert await _citation_edges(graph_client, project) == []
+
+        _write(git_project, "wiki/adr/0014-calls.md", "# ADR-0014: CALLS Edge Confidence\n\nBody.\n")
+        _git(git_project, "add", ".")
+        _git(git_project, "commit", "-m", "write the adr")
+        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert r2.files_published == 1, "only the ADR should be republished"
+        assert await _citation_edges(graph_client, project) == [("wiki/adr/0014-calls.md", "resolve", "ADR-14")]
 
     async def test_delta_index_mode(self, git_project, graph_client, event_bus):
         """Re-indexing without changes uses delta mode."""
@@ -535,3 +571,63 @@ class TestStalenessCheckIntegration:
         assert info.stale is True
         assert info.last_indexed_commit is None
         assert info.current_commit is not None
+
+
+class TestManifestVersionsIntegration:
+    """End-to-end proof of which manifest → ExternalPackage joins actually land."""
+
+    async def _external_versions(self, graph_client, project_root: Path) -> dict[str, str | None]:
+        rows = await graph_client.execute(
+            f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $pn}}) RETURN p.name AS name, p.version AS version",
+            {"pn": derive_project_name(project_root)},
+        )
+        return {r["name"]: r["version"] for r in rows}
+
+    async def test_package_json_versions_land_on_external_packages(self, tmp_path, graph_client, event_bus):
+        """An npm name *is* the import specifier root, scope included — so the version joins."""
+        _write(
+            tmp_path,
+            "package.json",
+            '{"name": "web", "dependencies": {"react": "^18.3.1", "@tanstack/react-query": "^5.36.0"}}',
+        )
+        _write(
+            tmp_path,
+            "src/app.ts",
+            'import { useState } from "react";\n'
+            'import { QueryClient } from "@tanstack/react-query";\n'
+            "\n"
+            "export function App() {\n"
+            "  return useState(new QueryClient());\n"
+            "}\n",
+        )
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        versions = await self._external_versions(graph_client, tmp_path)
+        assert versions.get("react") == "^18.3.1"
+        assert versions.get("@tanstack/react-query") == "^5.36.0"
+
+    async def test_go_mod_version_is_not_stamped_on_the_shared_import_root(self, tmp_path, graph_client, event_bus):
+        """A Go import root is a hosting domain, so go.mod deliberately joins nothing.
+
+        ``github.com/spf13/cobra`` collapses to an ExternalPackage named ``github``
+        that aggregates every GitHub-hosted module. Stamping one module's version
+        onto it would be a wrong mapping, so the parser emits the module path
+        verbatim and the write is a no-op.
+        """
+        _write(tmp_path, "go.mod", "module example.com/demo\n\ngo 1.22\n\nrequire github.com/spf13/cobra v1.8.0\n")
+        _write(
+            tmp_path,
+            "main.go",
+            'package main\n\nimport "github.com/spf13/cobra"\n\nfunc main() {\n\tvar c cobra.Command\n\t_ = c\n}\n',
+        )
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        versions = await self._external_versions(graph_client, tmp_path)
+        assert "github" in versions, "the collapsed aggregate node should still be created by import resolution"
+        assert versions["github"] is None

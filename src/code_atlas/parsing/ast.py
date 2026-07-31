@@ -211,6 +211,60 @@ def node_text(node: Node) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Referenced-file heuristic (REFERENCES_FILE)
+#
+# Shared by every language that extracts file references, so they cannot drift
+# on how permissive the test is. Deliberately strict: a false positive MINTS a
+# ResourceFile node for a path that does not exist, and that node then shows up
+# in search results and dependency views as if the repo really read it. A miss
+# costs nothing but a missing edge, so the bar sits well above "contains a dot".
+#
+# This function inspects a STRING. It never touches the filesystem — no stat, no
+# open, no resolve — which is what lets a reference to `.env` or `certs/key.pem`
+# be recorded as a path without the parser ever reading the secret behind it.
+# ---------------------------------------------------------------------------
+
+MAX_RESOURCE_PATH_CHARS = 200
+"""Upper bound on a referenced path. Anything longer is prose, not a path."""
+
+# Whole-literal character allowlist. Excluding ':' rejects URLs ("s3://b/k.json")
+# and Windows drive letters ("C:/x.json") in one rule; excluding whitespace,
+# '{}', '%', '*' and '?' rejects prose, format templates and globs.
+_RESOURCE_PATH_CHARS_RE = re.compile(r"[A-Za-z0-9_./\\-]+")
+
+# A file extension on the final segment. Together with the separator rule below
+# this is what keeps mode strings ("rb", "w+"), bare names and `Path(".")` out.
+_RESOURCE_FILE_EXT_RE = re.compile(r"\.[A-Za-z0-9_]{1,10}\Z")
+
+
+def looks_like_resource_path(literal: str) -> bool:
+    """Is *literal* conservatively recognizable as a relative path to a file?
+
+    Accepts ``data/x.json``, ``.env``, ``certs/server.pem``, ``../shared/a.yaml``
+    and extensionless files below a directory (``.ssh/id_rsa``). Rejects absolute
+    paths, ``~``-relative paths, URLs, globs, format templates, mode strings and
+    bare extensionless names — see the module comment above for the bias.
+
+    A directory separator counts as its own evidence, because the caller has
+    already established that the literal is the first argument of an open/Path
+    call and almost nothing else passed there contains a ``/``. An extensionless
+    literal with no separator at all (``open("rb")``, ``Path("data")``) is the
+    ambiguous case, and it is refused.
+    """
+    if not literal or len(literal) > MAX_RESOURCE_PATH_CHARS:
+        return False
+    if _RESOURCE_PATH_CHARS_RE.fullmatch(literal) is None:
+        return False
+    normalized = literal.replace("\\", "/")
+    if normalized.startswith(("/", "-")) or "//" in normalized or normalized.endswith("/"):
+        return False
+    last_segment = normalized.rsplit("/", 1)[-1]
+    if last_segment in (".", ".."):
+        return False
+    return "/" in normalized or _RESOURCE_FILE_EXT_RE.search(last_segment) is not None
+
+
+# ---------------------------------------------------------------------------
 # Rationale extraction (intent-bearing comments)
 # ---------------------------------------------------------------------------
 

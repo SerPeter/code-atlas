@@ -12,7 +12,7 @@ import pytest
 
 from code_atlas.graph.client import QueryTimeoutError
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
-from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
+from code_atlas.schema import GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
 from code_atlas.server.analysis import _analyze_communities
 
 if TYPE_CHECKING:
@@ -4015,3 +4015,803 @@ async def test_batch_delete_same_call_mutual_referrer_both_removed(graph_client:
 
     assert await _node_count(func_a.qualified_name) == 0, "func_a preserved as a zombie node"
     assert await _node_count(func_b.qualified_name) == 0
+
+
+# ---------------------------------------------------------------------------
+# ADR/RFC citation resolution
+# ---------------------------------------------------------------------------
+
+
+async def _citation_edges(graph_client: GraphClient, project: str) -> list[tuple[str, str, str]]:
+    """``(document uid, citing uid, citation)`` for every citation-type DOCUMENTS edge.
+
+    Direction is doc → code, like every other DOCUMENTS edge, so the source is
+    the cited document.
+    """
+    records = await graph_client.execute(
+        f"MATCH (a {{project_name: $p}})-[r:{RelType.DOCUMENTS} {{link_type: 'citation'}}]->(b) "
+        "RETURN a.uid AS src, b.uid AS dst, r.citation AS citation ORDER BY a.uid, b.uid",
+        {"p": project},
+    )
+    return [(r["src"], r["dst"], r["citation"]) for r in records]
+
+
+async def _unresolved_citations(graph_client: GraphClient, uid: str) -> list[str] | None:
+    records = await graph_client.execute(
+        "MATCH (n {uid: $uid}) RETURN n.unresolved_citations AS unresolved", {"uid": uid}
+    )
+    return records[0]["unresolved"] if records else None
+
+
+def _adr_docfile(project: str, number: str, slug: str, *, directory: str = "wiki/adr") -> ParsedEntity:
+    """A DocFile exactly as the markdown parser emits one for ``wiki/adr/NNNN-slug.md``."""
+    path = f"{directory}/{number}-{slug}.md"
+    return ParsedEntity(
+        name=f"{number}-{slug}.md",
+        qualified_name=f"{project}:{path}",
+        label=NodeLabel.DOC_FILE,
+        kind="doc_file",
+        line_start=1,
+        line_end=40,
+        file_path=path,
+        content_hash=f"doc-{number}",
+    )
+
+
+def _citing_callable(
+    project: str,
+    citations: list[str],
+    *,
+    content_hash: str = "c1",
+    name: str = "resolve",
+    file_path: str = "src/mod.py",
+) -> ParsedEntity:
+    """A Callable carrying ``citations`` the way extract_rationale leaves it.
+
+    The property matters, not just the argument to ``resolve_citations``: the
+    retry sweep re-reads ``n.citations`` as the source of truth.
+    """
+    module = file_path.removesuffix(".py").replace("/", ".")
+    return ParsedEntity(
+        name=name,
+        qualified_name=f"{project}:{module}.{name}",
+        label=NodeLabel.CALLABLE,
+        kind="function",
+        line_start=1,
+        line_end=5,
+        file_path=file_path,
+        citations=citations,
+        content_hash=content_hash,
+    )
+
+
+async def test_citation_resolves_through_the_real_parser(graph_client: GraphClient):
+    """End-to-end: one WHY comment citing an ADR two different ways links both
+    spellings to the single ADR document, while the RFC stays unresolved."""
+    await graph_client.ensure_schema()
+    project = "cite_e2e"
+
+    adr = _adr_docfile(project, "0014", "calls-edge-confidence")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+
+    source = (
+        b"# WHY: cascade documented in ADR 14 and ADR-0014; wire format per RFC 793.\ndef resolve():\n    return 1\n"
+    )
+    parsed = parse_file("src/mod.py", source, project)
+    assert parsed is not None
+    await graph_client.upsert_file_entities(project, parsed.file_path, parsed.entities, parsed.relationships)
+
+    citing = next(e for e in parsed.entities if e.citations)
+    # Captured verbatim: the two ADR spellings do NOT unify at capture time.
+    assert citing.citations == ["ADR-0014", "ADR-14", "RFC-793"]
+
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    assert await _citation_edges(graph_client, project) == [(adr.qualified_name, citing.qualified_name, "ADR-14")]
+    assert await _unresolved_citations(graph_client, citing.qualified_name) == ["RFC-793"]
+
+
+async def test_citation_prefers_the_docfile_over_its_own_heading_section(graph_client: GraphClient):
+    """The ADR markdown produces a DocFile *and* an ADR-0014 DocSection. Both
+    answer to the same citation; the whole document must win."""
+    await graph_client.ensure_schema()
+    project = "cite_rank"
+
+    body = b"# ADR-0014: CALLS Edge Confidence\n\n## Status\n\nAccepted.\n"
+    parsed_doc = parse_file("wiki/adr/0014-calls-edge-confidence.md", body, project)
+    assert parsed_doc is not None
+    labels = {e.label for e in parsed_doc.entities}
+    assert NodeLabel.DOC_FILE in labels
+    assert NodeLabel.DOC_SECTION in labels
+    await graph_client.upsert_file_entities(
+        project, parsed_doc.file_path, parsed_doc.entities, parsed_doc.relationships
+    )
+
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    edges = await _citation_edges(graph_client, project)
+    assert len(edges) == 1
+    assert edges[0][0] == f"{project}:wiki/adr/0014-calls-edge-confidence.md"
+
+
+async def test_citation_falls_back_to_a_heading_when_the_directory_is_not_scheme_named(graph_client: GraphClient):
+    """wiki/decisions/ gives no filename scheme, but the document's own H1 does
+    — at a confidence that admits it was inferred from a title."""
+    await graph_client.ensure_schema()
+    project = "cite_fallback"
+
+    body = b"# ADR-0014: CALLS Edge Confidence\n\nBody.\n"
+    parsed_doc = parse_file("wiki/decisions/0014-calls.md", body, project)
+    assert parsed_doc is not None
+    await graph_client.upsert_file_entities(
+        project, parsed_doc.file_path, parsed_doc.entities, parsed_doc.relationships
+    )
+
+    citing = _citing_callable(project, ["ADR-14"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    edges = await _citation_edges(graph_client, project)
+    assert len(edges) == 1
+    section = next(e for e in parsed_doc.entities if e.label == NodeLabel.DOC_SECTION)
+    assert edges[0][0] == section.qualified_name
+
+    records = await graph_client.execute(
+        f"MATCH ()-[r:{RelType.DOCUMENTS} {{link_type: 'citation'}}]->() RETURN r.confidence AS conf"
+    )
+    assert [r["conf"] for r in records] == [0.8]
+
+
+async def test_a_document_that_merely_discusses_the_adr_is_not_linked(graph_client: GraphClient):
+    """Real parser, real store: a ``## ADR-0014 ...`` subsection is a passage
+    about the record, not the record. With no genuine ADR-0014 indexed it used
+    to win by default, at confidence 1.0."""
+    await graph_client.ensure_schema()
+    project = "cite_mention"
+
+    body = b"# Design log\n\n## ADR-0014 rationale\n\nWhy we went with confidence tags.\n"
+    parsed_doc = parse_file("wiki/notes/design-log.md", body, project)
+    assert parsed_doc is not None
+    assert any(e.name == "ADR-0014 rationale" for e in parsed_doc.entities), "the risky heading must exist"
+    await graph_client.upsert_file_entities(
+        project, parsed_doc.file_path, parsed_doc.entities, parsed_doc.relationships
+    )
+
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    assert await _citation_edges(graph_client, project) == []
+    assert await _unresolved_citations(graph_client, citing.qualified_name) == ["ADR-0014"]
+
+
+async def test_citation_edge_is_distinguishable_from_anchor_and_heuristic_links(graph_client: GraphClient):
+    """link_type keeps the three DOCUMENTS populations apart."""
+    await graph_client.ensure_schema()
+    project = "cite_linktype"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    records = await graph_client.execute(
+        f"MATCH (a {{project_name: $p}})-[r:{RelType.DOCUMENTS}]->() RETURN r.link_type AS lt, r.confidence AS conf",
+        {"p": project},
+    )
+    assert [(r["lt"], r["conf"]) for r in records] == [("citation", 1.0)]
+
+
+async def test_citation_resolution_is_idempotent(graph_client: GraphClient):
+    """Replaying the same batch (retry, overlapping windows) must not fan out edges."""
+    await graph_client.ensure_schema()
+    project = "cite_idem"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014", "ADR-14"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+
+    payload = {citing.qualified_name: citing.citations}
+    await graph_client.resolve_citations(project, payload)
+    await graph_client.resolve_citations(project, payload)
+
+    assert len(await _citation_edges(graph_client, project)) == 1
+
+
+async def test_unresolved_citation_is_recorded_and_creates_no_phantom_node(graph_client: GraphClient):
+    await graph_client.ensure_schema()
+    project = "cite_missing"
+
+    citing = _citing_callable(project, ["ADR-9999", "RFC-7231"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    assert await _citation_edges(graph_client, project) == []
+    assert await _unresolved_citations(graph_client, citing.qualified_name) == ["ADR-9999", "RFC-7231"]
+    counts = await graph_client.execute("MATCH (n {project_name: $p}) RETURN count(n) AS cnt", {"p": project})
+    assert counts[0]["cnt"] == 1, "no node was invented for the external RFC"
+
+
+async def test_ambiguous_citation_number_creates_no_edge(graph_client: GraphClient):
+    """Two 0014-*.md files in two adr/ directories: no guessing."""
+    await graph_client.ensure_schema()
+    project = "cite_ambig"
+
+    first = _adr_docfile(project, "0014", "a")
+    second = _adr_docfile(project, "0014", "b", directory="docs/adr")
+    await graph_client.upsert_file_entities(project, first.file_path, [first], [])
+    await graph_client.upsert_file_entities(project, second.file_path, [second], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    assert await _citation_edges(graph_client, project) == []
+    assert await _unresolved_citations(graph_client, citing.qualified_name) == ["ADR-0014"]
+
+
+async def test_citation_does_not_resolve_across_projects(graph_client: GraphClient):
+    """Every repo has an ADR-0001; a cross-project lookup would collide."""
+    await graph_client.ensure_schema()
+    other, mine = "cite_other", "cite_mine"
+
+    adr = _adr_docfile(other, "0001", "x")
+    await graph_client.upsert_file_entities(other, adr.file_path, [adr], [])
+    citing = _citing_callable(mine, ["ADR-0001"])
+    await graph_client.upsert_file_entities(mine, "src/mod.py", [citing], [])
+
+    await graph_client.resolve_citations(mine, {citing.qualified_name: citing.citations})
+
+    assert await _citation_edges(graph_client, mine) == []
+
+
+async def test_retry_sweep_links_documents_indexed_after_the_citing_file(graph_client: GraphClient):
+    """A cold full index publishes src/ before wiki/, so the per-batch pass has
+    no ADR to find — the end-of-run sweep is what makes citations work at all."""
+    await graph_client.ensure_schema()
+    project = "cite_retry"
+
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+    assert await _citation_edges(graph_client, project) == []
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    await graph_client.resolve_citations(project, {}, retry_unresolved=True)
+
+    assert await _citation_edges(graph_client, project) == [(adr.qualified_name, citing.qualified_name, "ADR-14")]
+    assert await _unresolved_citations(graph_client, citing.qualified_name) == []
+
+
+async def test_retry_sweep_clears_bookkeeping_when_the_citation_comment_is_deleted(graph_client: GraphClient):
+    """``citations`` is the evidence, ``unresolved_citations`` only bookkeeping —
+    the sweep re-reads the former so a removed comment stops being reported."""
+    await graph_client.ensure_schema()
+    project = "cite_removed"
+
+    citing = _citing_callable(project, ["ADR-9999"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+    assert await _unresolved_citations(graph_client, citing.qualified_name) == ["ADR-9999"]
+
+    stripped = _citing_callable(project, [], content_hash="c2")
+    await graph_client.upsert_file_entities(project, "src/mod.py", [stripped], [])
+    await graph_client.resolve_citations(project, {}, retry_unresolved=True)
+
+    assert await _unresolved_citations(graph_client, citing.qualified_name) == []
+
+
+async def test_the_cited_document_reaches_the_citing_entity_through_get_linked_docs(graph_client: GraphClient):
+    """The read path that get_context/expand_context use. A citation resolves to
+    the whole document, so the doc-side filter has to admit DocFile."""
+    await graph_client.ensure_schema()
+    project = "cite_context"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    docs = await graph_client.get_linked_docs(citing.qualified_name, "", 10)
+
+    assert [(d["node"]["uid"], d["link_type"]) for d in docs] == [(adr.qualified_name, "citation")]
+
+
+async def test_the_citation_reaches_the_module_summary_the_right_way_round(graph_client: GraphClient):
+    """``get_module_summary`` reports docs as (documentation node -> in-scope
+    entity). A backwards edge would render with both ends swapped."""
+    await graph_client.ensure_schema()
+    project = "cite_summary"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+
+    summary = await graph_client.get_module_summary(project, "src/", 100, 100)
+
+    # qualified_name is the uid without its project prefix.
+    assert [(d["doc_qn"], d["to_qn"], d["link_type"]) for d in summary["docs"]] == [
+        ("wiki/adr/0014-x.md", "src.mod.resolve", "citation")
+    ]
+
+
+async def test_reparsing_the_cited_adr_keeps_the_citation_edge(graph_client: GraphClient):
+    """The edge leaves the ADR's node but is created by the citing file's parse,
+    so the ADR's own relationship-delete phase must skip it — otherwise every
+    edit to an ADR silently drops every citation pointing at it."""
+    await graph_client.ensure_schema()
+    project = "cite_reparse"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+    assert len(await _citation_edges(graph_client, project)) == 1
+
+    edited = replace(_adr_docfile(project, "0014", "x"), content_hash="doc-0014-edited")
+    await graph_client.upsert_file_entities(project, edited.file_path, [edited], [])
+
+    assert await _citation_edges(graph_client, project) == [(adr.qualified_name, citing.qualified_name, "ADR-14")]
+
+
+async def test_deleting_the_citing_comment_revokes_the_citation_edge(graph_client: GraphClient):
+    """The removal case, end to end on the real store. The edge runs INTO the
+    citing file's entity, so ``_recreate_{file,batch}_relationships`` — which
+    only ever sweep edges leaving the file being parsed — structurally cannot
+    reach it. Without the file-scoped revoke pass it outlives its own comment
+    forever."""
+    await graph_client.ensure_schema()
+    project = "cite_revoke"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations}, file_paths=["src/mod.py"])
+    assert len(await _citation_edges(graph_client, project)) == 1
+
+    # The `see ADR-0014` comment is edited away and the file is reparsed.
+    stripped = _citing_callable(project, [], content_hash="c2")
+    await graph_client.upsert_batch_entities(project, {"src/mod.py": ([stripped], [])})
+    await graph_client.resolve_citations(project, {}, file_paths=["src/mod.py"])
+
+    assert await _citation_edges(graph_client, project) == []
+
+
+async def test_the_revoke_pass_only_touches_the_files_it_was_given(graph_client: GraphClient):
+    """A batch reparsing one file must leave every other file's citations alone
+    — the reason the scope is file paths and not the project."""
+    await graph_client.ensure_schema()
+    project = "cite_scope"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    mine = _citing_callable(project, ["ADR-0014"])
+    theirs = _citing_callable(project, ["ADR-0014"], name="other", file_path="src/other.py")
+    await graph_client.upsert_file_entities(project, "src/mod.py", [mine], [])
+    await graph_client.upsert_file_entities(project, "src/other.py", [theirs], [])
+    await graph_client.resolve_citations(
+        project,
+        {mine.qualified_name: mine.citations, theirs.qualified_name: theirs.citations},
+        file_paths=["src/mod.py", "src/other.py"],
+    )
+    assert len(await _citation_edges(graph_client, project)) == 2
+
+    await graph_client.resolve_citations(project, {}, file_paths=["src/mod.py"])
+
+    assert await _citation_edges(graph_client, project) == [(adr.qualified_name, theirs.qualified_name, "ADR-14")]
+
+
+async def test_the_retry_sweep_revokes_nothing(graph_client: GraphClient):
+    """The sweep is project-wide and reparses nothing, so it gets no scope.
+    Deleting there would wipe every citation in the project the moment any ADR
+    is indexed. The unresolved entity shares a file with a resolved one, so a
+    scope wrongly derived from the sweep's own pending set is caught too."""
+    await graph_client.ensure_schema()
+    project = "cite_sweep_scope"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    resolved = _citing_callable(project, ["ADR-0014"])
+    broken = _citing_callable(project, ["ADR-9999"], name="broken")
+    elsewhere = _citing_callable(project, ["ADR-0014"], name="other", file_path="src/other.py")
+    await graph_client.upsert_file_entities(project, "src/mod.py", [resolved, broken], [])
+    await graph_client.upsert_file_entities(project, "src/other.py", [elsewhere], [])
+    await graph_client.resolve_citations(
+        project,
+        {
+            resolved.qualified_name: resolved.citations,
+            broken.qualified_name: broken.citations,
+            elsewhere.qualified_name: elsewhere.citations,
+        },
+        file_paths=["src/mod.py", "src/other.py"],
+    )
+    before = await _citation_edges(graph_client, project)
+    assert len(before) == 2
+
+    await graph_client.resolve_citations(project, {}, retry_unresolved=True)
+
+    assert await _citation_edges(graph_client, project) == before
+
+
+async def test_reparsing_the_cited_adr_under_its_own_scope_keeps_the_citation(graph_client: GraphClient):
+    """Same carve-out as the test above, one layer down. Editing the ADR puts the
+    ADR's own file in the revoke scope; the scope is matched on the citing
+    (target) side, so it must not hit. Matching it on the source side would drop
+    every citation the ADR answers to on every edit."""
+    await graph_client.ensure_schema()
+    project = "cite_reparse_scoped"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations}, file_paths=["src/mod.py"])
+    assert len(await _citation_edges(graph_client, project)) == 1
+
+    edited = replace(_adr_docfile(project, "0014", "x"), content_hash="doc-0014-edited")
+    await graph_client.upsert_file_entities(project, edited.file_path, [edited], [])
+    await graph_client.resolve_citations(project, {}, file_paths=[adr.file_path], retry_unresolved=True)
+
+    assert await _citation_edges(graph_client, project) == [(adr.qualified_name, citing.qualified_name, "ADR-14")]
+
+
+async def test_deleting_the_citing_function_does_not_leave_it_a_zombie(graph_client: GraphClient):
+    """The ADR's citation edge is inbound to the function from another file —
+    exactly the shape that normally preserves a node. It must not here: the
+    edge is recreatable from the citing file's next parse."""
+    await graph_client.ensure_schema()
+    project = "cite_zombie_code"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+    assert len(await _citation_edges(graph_client, project)) == 1
+
+    await graph_client.upsert_batch_entities(project, {"src/mod.py": ([], [])})
+
+    records = await graph_client.execute("MATCH (n {uid: $uid}) RETURN count(n) AS cnt", {"uid": citing.qualified_name})
+    assert records[0]["cnt"] == 0
+
+
+async def test_deleting_the_cited_adr_does_not_leave_a_zombie_docfile(graph_client: GraphClient):
+    """A cited ADR is still deletable — nothing about the citation pins it."""
+    await graph_client.ensure_schema()
+    project = "cite_zombie"
+
+    adr = _adr_docfile(project, "0014", "x")
+    await graph_client.upsert_file_entities(project, adr.file_path, [adr], [])
+    citing = _citing_callable(project, ["ADR-0014"])
+    await graph_client.upsert_file_entities(project, "src/mod.py", [citing], [])
+    await graph_client.resolve_citations(project, {citing.qualified_name: citing.citations})
+    assert len(await _citation_edges(graph_client, project)) == 1
+
+    await graph_client.upsert_batch_entities(project, {adr.file_path: ([], [])})
+
+    records = await graph_client.execute("MATCH (n {uid: $uid}) RETURN count(n) AS cnt", {"uid": adr.qualified_name})
+    assert records[0]["cnt"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Config references (EnvVar / ResourceFile) + reference-counted GC
+# ---------------------------------------------------------------------------
+
+
+def _reader_callable(project: str, *, name: str = "load", content_hash: str = "c1") -> ParsedEntity:
+    return ParsedEntity(
+        name=name,
+        qualified_name=f"{project}:src.conf.{name}",
+        label=NodeLabel.CALLABLE,
+        kind="function",
+        line_start=1,
+        line_end=5,
+        file_path="src/conf.py",
+        content_hash=content_hash,
+    )
+
+
+def _env_ref(from_uid: str, name: str, **props: object) -> ParsedRelationship:
+    return ParsedRelationship(
+        from_qualified_name=from_uid, rel_type=RelType.READS_ENV, to_name=name, properties=dict(props)
+    )
+
+
+def _file_ref(from_uid: str, path: str, **props: object) -> ParsedRelationship:
+    return ParsedRelationship(
+        from_qualified_name=from_uid, rel_type=RelType.REFERENCES_FILE, to_name=path, properties=dict(props)
+    )
+
+
+async def _uid_exists(graph_client: GraphClient, uid: str) -> bool:
+    records = await graph_client.execute("MATCH (n {uid: $uid}) RETURN count(n) AS cnt", {"uid": uid})
+    return bool(records[0]["cnt"])
+
+
+async def test_env_var_node_commits_with_the_global_sentinel(graph_client: GraphClient):
+    """``project_name`` carries an existence constraint that Memgraph enforces at
+    COMMIT, not at statement time — a violating write looks like it succeeded
+    and kills the transaction later. Prove the sentinel actually commits.
+    """
+    await graph_client.ensure_schema()
+    project = "test_envvar_commit"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+
+    await graph_client.resolve_config_refs(project, [_env_ref(reader.qualified_name, "DATABASE_URL")])
+
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.ENV_VAR} {{uid: 'env/DATABASE_URL'}}) "
+        "RETURN n.project_name AS pn, n.name AS name, n.qualified_name AS qn"
+    )
+    assert records == [{"pn": GLOBAL_PROJECT, "name": "DATABASE_URL", "qn": "env/DATABASE_URL"}]
+
+
+async def test_new_labels_inherit_the_entity_constraints(graph_client: GraphClient):
+    """Joining ``_EXTERNAL_LABELS`` is what buys uid uniqueness and the
+    uid+project_name existence constraints — prove the DDL really was
+    generated and applied for the new labels, not silently skipped.
+    """
+    await graph_client.ensure_schema()
+
+    with pytest.raises(Exception, match=r"(?i)constraint"):
+        await graph_client.execute_write(f"CREATE (:{NodeLabel.ENV_VAR} {{uid: 'env/NO_PROJECT', name: 'NO_PROJECT'}})")
+
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.RESOURCE_FILE} {{uid: 'p:res/a.json', project_name: 'p', name: 'a.json'}})"
+    )
+    with pytest.raises(Exception, match="uid"):
+        await graph_client.execute_write(
+            f"CREATE (:{NodeLabel.RESOURCE_FILE} {{uid: 'p:res/a.json', project_name: 'p', name: 'dup'}})"
+        )
+
+
+async def test_config_refs_create_both_node_kinds_and_their_edges(graph_client: GraphClient):
+    await graph_client.ensure_schema()
+    project = "test_config_refs"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+
+    await graph_client.resolve_config_refs(
+        project,
+        [_env_ref(reader.qualified_name, "PORT"), _file_ref(reader.qualified_name, "./data/fixtures.json")],
+    )
+
+    records = await graph_client.execute(
+        "MATCH (a {uid: $uid})-[r]->(b) WHERE type(r) IN ['READS_ENV', 'REFERENCES_FILE'] "
+        "RETURN type(r) AS rel, labels(b)[0] AS label, b.uid AS uid ORDER BY rel",
+        {"uid": reader.qualified_name},
+    )
+    assert records == [
+        {"rel": "READS_ENV", "label": "EnvVar", "uid": "env/PORT"},
+        {"rel": "REFERENCES_FILE", "label": "ResourceFile", "uid": f"{project}:res/data/fixtures.json"},
+    ]
+
+
+async def test_config_refs_persist_names_not_values(graph_client: GraphClient):
+    """The security invariant, checked against the real store: a default value
+    handed to the resolver must not survive anywhere on the node or the edge.
+    """
+    await graph_client.ensure_schema()
+    project = "test_config_secret"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+    secret = "sk-live-abc123"
+
+    await graph_client.resolve_config_refs(
+        project, [_env_ref(reader.qualified_name, "API_KEY", default=secret, value=secret)]
+    )
+
+    records = await graph_client.execute(
+        f"MATCH (a)-[r:{RelType.READS_ENV}]->(n:{NodeLabel.ENV_VAR} {{uid: 'env/API_KEY'}}) "
+        "RETURN properties(n) AS node_props, properties(r) AS edge_props"
+    )
+    assert records[0]["node_props"] == {
+        "uid": "env/API_KEY",
+        "project_name": GLOBAL_PROJECT,
+        "name": "API_KEY",
+        "qualified_name": "env/API_KEY",
+    }
+    assert records[0]["edge_props"] == {}
+
+
+async def test_env_var_is_findable_by_a_project_scoped_text_search(graph_client: GraphClient):
+    """The global sentinel must not be filtered out by project scoping —
+    otherwise making these labels text-searchable buys nothing.
+    """
+    await graph_client.ensure_schema()
+    project = "test_env_search"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+    await graph_client.resolve_config_refs(project, [_env_ref(reader.qualified_name, "DATABASE_URL")])
+
+    hits = await graph_client.text_search("DATABASE_URL", project=project)
+
+    assert "env/DATABASE_URL" in {h["node"].get("uid") for h in hits}
+
+
+async def test_gc_keeps_referenced_nodes_and_sweeps_unreferenced_ones(graph_client: GraphClient):
+    await graph_client.ensure_schema()
+    project = "test_gc_basic"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+    await graph_client.resolve_config_refs(
+        project, [_env_ref(reader.qualified_name, "KEPT"), _file_ref(reader.qualified_name, "data/kept.json")]
+    )
+    # An unreferenced node, as a project wipe or a crashed run would leave one.
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.ENV_VAR} {{uid: 'env/STRAY', project_name: $pn, "
+        "name: 'STRAY', qualified_name: 'env/STRAY'})",
+        {"pn": GLOBAL_PROJECT},
+    )
+
+    swept = await graph_client.gc_orphaned_reference_nodes()
+
+    assert swept == 1
+    assert not await _uid_exists(graph_client, "env/STRAY")
+    assert await _uid_exists(graph_client, "env/KEPT")
+    assert await _uid_exists(graph_client, f"{project}:res/data/kept.json")
+
+
+async def test_reparse_dropping_the_last_reference_makes_the_node_collectable(graph_client: GraphClient):
+    """The whole reference-counting contract end to end: relationship recreation
+    removes the edge, so the node falls to zero incoming edges and the sweep
+    reclaims it. A second env var still read by the file must survive.
+    """
+    await graph_client.ensure_schema()
+    project = "test_gc_reparse"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+    await graph_client.resolve_config_refs(
+        project, [_env_ref(reader.qualified_name, "OLD"), _env_ref(reader.qualified_name, "STAYS")]
+    )
+    assert await _uid_exists(graph_client, "env/OLD")
+
+    # Reparse: same entity, changed body, only one of the two env reads left.
+    reparsed = _reader_callable(project, content_hash="c2")
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reparsed], [])
+    await graph_client.resolve_config_refs(project, [_env_ref(reader.qualified_name, "STAYS")])
+
+    assert await graph_client.gc_orphaned_reference_nodes() == 1
+    assert not await _uid_exists(graph_client, "env/OLD")
+    assert await _uid_exists(graph_client, "env/STAYS")
+
+
+async def test_gc_reclaims_env_vars_orphaned_by_a_project_deletion(graph_client: GraphClient):
+    """``delete_project_data`` matches on ``project_name`` and so cannot reach a
+    ``_global`` node — the sweep is what keeps deleted projects from leaking
+    env vars forever.
+    """
+    await graph_client.ensure_schema()
+    project = "test_gc_projectrm"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+    await graph_client.resolve_config_refs(
+        project, [_env_ref(reader.qualified_name, "LEAKED"), _file_ref(reader.qualified_name, "data/gone.json")]
+    )
+
+    await graph_client.delete_project_data(project)
+    assert await _uid_exists(graph_client, "env/LEAKED")  # survived, being global
+
+    assert await graph_client.gc_orphaned_reference_nodes() == 1
+    assert not await _uid_exists(graph_client, "env/LEAKED")
+
+
+async def test_config_ref_targets_are_never_treated_as_import_targets(graph_client: GraphClient):
+    """EnvVar/ResourceFile live in synthetic ``env/``/``res/`` namespaces that
+    ``resolve_imports``' internal-entity lookup must not resolve into.
+    """
+    await graph_client.ensure_schema()
+    project = "test_config_import_iso"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+    await graph_client.resolve_config_refs(project, [_file_ref(reader.qualified_name, "data/fixtures.json")])
+
+    await graph_client.resolve_imports(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=reader.qualified_name,
+                rel_type=RelType.IMPORTS,
+                to_name="res/data/fixtures.json",
+            )
+        ],
+    )
+
+    records = await graph_client.execute(
+        f"MATCH (a {{uid: $uid}})-[:{RelType.IMPORTS}]->(b) RETURN labels(b)[0] AS label",
+        {"uid": reader.qualified_name},
+    )
+    # Classified external (an ExternalSymbol stub), never matched to the
+    # ResourceFile node that happens to carry that qualified_name.
+    assert [r["label"] for r in records] == ["ExternalSymbol"]
+
+
+async def _guard_verdict(graph_client: GraphClient) -> str | None:
+    """Run the production-data guard out of band; return its abort message, if any.
+
+    ``_assert_disposable_db`` aborts the whole pytest session on a hit, so it is
+    called here with its ``_GUARD_OK`` memo cleared and the ``Exit`` caught —
+    otherwise asserting on its behaviour would end the run either way.
+    """
+    from tests.integration.conftest import _GUARD_OK, _assert_disposable_db
+
+    saved = set(_GUARD_OK)
+    _GUARD_OK.clear()
+    try:
+        await _assert_disposable_db(graph_client, "localhost", 0)
+    except pytest.exit.Exception as exc:  # pytest.exit raises Exit
+        return str(exc)
+    finally:
+        _GUARD_OK.clear()
+        _GUARD_OK.update(saved)
+    return None
+
+
+async def test_wipe_guard_allows_the_global_sentinel(graph_client: GraphClient):
+    """A single indexed ``os.getenv`` call creates a ``_global`` node. Without an
+    allowlist entry the guard would abort every subsequent integration session
+    with a message that reads exactly like a production-safety incident.
+    """
+    await graph_client.ensure_schema()
+    project = "test_guard_global"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+    await graph_client.resolve_config_refs(project, [_env_ref(reader.qualified_name, "DATABASE_URL")])
+
+    assert await _guard_verdict(graph_client) is None
+
+
+async def test_wipe_guard_still_trips_on_real_project_data(graph_client: GraphClient):
+    """The allowlist must not weaken the guard: a real index is identified by its
+    own project names, and those still abort.
+    """
+    await graph_client.ensure_schema()
+    await graph_client.merge_project_node("my-production-repo")
+
+    verdict = await _guard_verdict(graph_client)
+
+    assert verdict is not None
+    assert "my-production-repo" in verdict
+
+
+async def test_v7_migration_clears_freshness_markers(graph_client: GraphClient):
+    """A pre-v7 index has no EnvVar/ResourceFile nodes and nothing to derive
+    them from, so every file must be re-parsed — which only happens if the
+    stored file/git hashes are cleared.
+    """
+    await graph_client.ensure_schema()
+    project = "test_v7_migration"
+    module = ParsedEntity(
+        name="conf",
+        qualified_name=f"{project}:src.conf",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=1,
+        file_path="src/conf.py",
+        content_hash="c1",
+    )
+    await graph_client.upsert_file_entities(project, "src/conf.py", [module], [])
+    await graph_client.merge_project_node(project, git_hash="deadbeef")
+    await graph_client.set_batch_file_hashes(project, {"src/conf.py": "fh1"})
+    await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 6")
+
+    await graph_client.ensure_schema()
+
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
+    records = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.MODULE} {{project_name: $p}}) RETURN m.file_hash AS fh", {"p": project}
+    )
+    assert [r["fh"] for r in records] == [None]
+    assert await graph_client.get_project_git_hash(project) is None

@@ -30,9 +30,10 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
+from code_atlas.graph.client import _CONFIG_REF_REL_TYPES
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, parse_file
 from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, run_detectors
-from code_atlas.schema import RelType
+from code_atlas.schema import NodeLabel, RelType
 from code_atlas.search.embeddings import EmbedCache, build_embed_text
 from code_atlas.settings import derive_project_name
 from code_atlas.telemetry import get_metrics, get_tracer
@@ -377,6 +378,12 @@ _SIG_ORDER: dict[Significance, int] = {
 }
 
 
+# Labels a citation can resolve to. A batch that adds or changes one of these
+# is the signal that previously unresolvable citations may now have a target —
+# see ASTConsumer._citation_retry_projects.
+_DOCUMENT_LABELS: frozenset[NodeLabel] = frozenset({NodeLabel.DOC_FILE, NodeLabel.DOC_SECTION, NodeLabel.NOTE})
+
+
 @dataclass
 class ASTStats:
     """Accumulated delta statistics for AST stage processing."""
@@ -411,6 +418,14 @@ class _ParsedFileData:
     type_rels: list[ParsedRelationship]
     member_rels: list[ParsedRelationship]
     anchor_rels: list[ParsedRelationship]
+    # READS_ENV / REFERENCES_FILE. Deferred like imports because the target
+    # EnvVar/ResourceFile node does not exist until resolution MERGEs it.
+    config_rels: list[ParsedRelationship]
+    # entity uid → the raw ADR/RFC strings extract_rationale found in its
+    # comments. Not a ParsedRelationship like the rest: citations are captured
+    # as an entity *property*, and only post-batch resolution
+    # (GraphClient.resolve_citations) knows which document node they mean.
+    citations: dict[str, list[str]]
 
 
 _SENTINEL_DELETED = _ParsedFileData(
@@ -423,6 +438,8 @@ _SENTINEL_DELETED = _ParsedFileData(
     type_rels=[],
     member_rels=[],
     anchor_rels=[],
+    config_rels=[],
+    citations={},
 )
 
 
@@ -472,7 +489,29 @@ class ASTConsumer(TierConsumer):
         self._pending_type_rels: list[ParsedRelationship] = []
         self._pending_member_rels: list[ParsedRelationship] = []
         self._pending_anchor_rels: list[ParsedRelationship] = []
+        self._pending_config_rels: list[ParsedRelationship] = []
+        self._pending_citations: dict[str, dict[str, list[str]]] = {}  # project_name -> {uid: citations}
+        # Every file this flush's batches actually re-parsed, per project — the
+        # revoke scope handed to resolve_citations. Deliberately NOT derived
+        # from _pending_citations: a file whose last "see ADR-14" comment was
+        # just deleted yields no citations at all, and that is exactly the file
+        # whose stale citation edge has to be cleared.
+        self._pending_citation_files: dict[str, set[str]] = {}  # project_name -> {file_path}
         self._pending_project_names: set[str] = set()
+        # Every project that has ever contributed a citation in this consumer's
+        # lifetime — NOT cleared per flush. The end-of-run retry sweep needs it
+        # because a citation's target document is usually indexed in a LATER
+        # batch than the citing code file (src/ sorts before wiki/), so the
+        # per-batch pass legitimately cannot resolve it yet.
+        self._citation_projects: set[str] = set()
+        # Projects whose current batch added or changed a DocFile/DocSection/
+        # Note. Cleared per flush, like the rel buffers. This is what makes
+        # citations resolve in a long-running daemon: the end-of-run sweep only
+        # fires when the consumer shuts down, so without a live trigger an ADR
+        # written today would stay unlinked until the next restart. Indexing
+        # the document IS the event that can newly satisfy a pending citation,
+        # so the sweep rides on it instead of polling.
+        self._citation_retry_projects: set[str] = set()
 
         # File hashes withheld from the graph until their batch's deferred
         # IMPORTS/CALLS/USES_TYPE/member-DEFINES rels are actually resolved —
@@ -484,18 +523,26 @@ class ASTConsumer(TierConsumer):
         try:
             await super().run()
         finally:
-            # Final resolution flush for any remaining deferred rels
-            if (
-                self._pending_import_rels
-                or self._pending_call_rels
-                or self._pending_type_rels
-                or self._pending_member_rels
-                or self._pending_anchor_rels
-            ):
-                await self._flush_deferred_resolution()
+            # Final resolution flush for any remaining deferred rels, plus the
+            # end-of-run citation retry sweep (which must run even when every
+            # buffer is already empty — see _flush_deferred_resolution).
+            await self._flush_deferred_resolution(final=True)
 
-    async def _flush_deferred_resolution(self) -> None:
-        """Run resolution for all accumulated rels across batches."""
+    async def _flush_deferred_resolution(self, *, final: bool = False) -> None:  # noqa: PLR0912
+        """Run resolution for all accumulated rels across batches.
+
+        Citations are re-attempted whenever this flush's batches touched a
+        document node (``_citation_retry_projects``) — indexing the ADR is what
+        makes an earlier, unresolvable citation resolvable — and once more when
+        *final* marks the last flush of a run, as a backstop for a document
+        that was already in the graph before this run started.
+
+        The per-project citation call also carries ``_pending_citation_files``,
+        the revoke scope, so this flush's parsed files get delete-then-recreate
+        rather than merge-only. The two retry sweeps deliberately pass no scope:
+        they cover the whole project and reparse nothing, so a delete there
+        would wipe citations for files nobody touched.
+        """
         if self._pending_anchor_rels:
             # Anchors may target code in any project (uid/project-prefixed/
             # absolute path forms) — resolved once, cross-project, rather
@@ -511,9 +558,13 @@ class ASTConsumer(TierConsumer):
             proj_members = [
                 r for r in self._pending_member_rels if r.from_qualified_name.startswith(project_name + ":")
             ]
+            proj_config = [r for r in self._pending_config_rels if r.from_qualified_name.startswith(project_name + ":")]
 
             if proj_imports:
                 await self.graph.resolve_imports(project_name, proj_imports)
+
+            if proj_config:
+                await self.graph.resolve_config_refs(project_name, proj_config)
 
             if proj_calls or proj_types or proj_members:
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
@@ -534,6 +585,17 @@ class ASTConsumer(TierConsumer):
                         project_name, proj_members, lookup=shared_lookup, name_to_typedefs=td_map
                     )
 
+            proj_citations = self._pending_citations.pop(project_name, None)
+            citation_files = self._pending_citation_files.pop(project_name, None)
+            retry_citations = project_name in self._citation_retry_projects
+            if proj_citations or citation_files or retry_citations:
+                await self.graph.resolve_citations(
+                    project_name,
+                    proj_citations or {},
+                    file_paths=citation_files,
+                    retry_unresolved=retry_citations,
+                )
+
             # Only now — after this project's deferred rels are actually
             # resolved — persist the file hashes withheld in process_batch.
             # A crash before this point leaves the stored hash unset, so the
@@ -543,11 +605,33 @@ class ASTConsumer(TierConsumer):
             if pending_hashes:
                 await self.graph.set_batch_file_hashes(project_name, pending_hashes)
 
+        if final:
+            for project_name in self._citation_projects:
+                await self.graph.resolve_citations(project_name, {}, retry_unresolved=True)
+            self._citation_projects.clear()
+
+        # Reference-counted GC, last: every project's resolve_config_refs above
+        # has already re-created this flush's references, so anything still at
+        # zero incoming edges really has lost its last callsite. Running it
+        # any earlier would delete nodes that are about to be re-linked.
+        #
+        # Gated on the flush having processed a project rather than on
+        # proj_config being non-empty: a file whose LAST os.getenv() call was
+        # just deleted produces no config rels at all, and that is precisely
+        # the case that orphans a node. Cost is two label-index scans over the
+        # two smallest labels in the graph — bounded by them, not by the graph.
+        if self._pending_project_names:
+            await self.graph.gc_orphaned_reference_nodes()
+
         self._pending_import_rels.clear()
         self._pending_call_rels.clear()
         self._pending_type_rels.clear()
         self._pending_member_rels.clear()
         self._pending_anchor_rels.clear()
+        self._pending_config_rels.clear()
+        self._pending_citations.clear()
+        self._pending_citation_files.clear()
+        self._citation_retry_projects.clear()
         self._pending_project_names.clear()
         self._batches_since_resolve = 0
         self._last_resolve_time = asyncio.get_event_loop().time()
@@ -596,7 +680,7 @@ class ASTConsumer(TierConsumer):
             logger.debug("AST: unsupported language for {}", file_path)
             return None
 
-        _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE}
+        _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE} | _CONFIG_REF_REL_TYPES
 
         def _is_member(r: ParsedRelationship) -> bool:
             # Member DEFINES whose parent type may live in another file —
@@ -623,6 +707,8 @@ class ASTConsumer(TierConsumer):
             type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
             anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
+            config_rels=[r for r in parsed.relationships if r.rel_type in _CONFIG_REF_REL_TYPES],
+            citations={e.qualified_name: list(e.citations) for e in parsed.entities if e.citations},
         )
 
     async def process_batch(self, events: list[Event], batch_id: str) -> set[str]:  # noqa: PLR0912, PLR0915
@@ -834,6 +920,8 @@ class ASTConsumer(TierConsumer):
                             entity = entity_map.get(qn)
                             if entity is not None:
                                 changed_uids.add(entity.qualified_name)
+                                if entity.label in _DOCUMENT_LABELS:
+                                    self._citation_retry_projects.add(project_name)
                                 ref = EntityRef(
                                     qualified_name=entity.qualified_name,
                                     node_type=entity.label.value,
@@ -872,7 +960,15 @@ class ASTConsumer(TierConsumer):
                     for fp, pfd in parsed_files.items():
                         if fp not in new_hashes:
                             continue
-                        if pfd.import_rels or pfd.call_rels or pfd.type_rels or pfd.member_rels or pfd.anchor_rels:
+                        if (
+                            pfd.import_rels
+                            or pfd.call_rels
+                            or pfd.type_rels
+                            or pfd.member_rels
+                            or pfd.anchor_rels
+                            or pfd.config_rels
+                            or pfd.citations
+                        ):
                             self._pending_file_hashes.setdefault(project_name, {})[fp] = new_hashes[fp]
                         else:
                             immediate_hashes[fp] = new_hashes[fp]
@@ -885,13 +981,26 @@ class ASTConsumer(TierConsumer):
                 group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
                 group_member_rels = [r for pfd in parsed_files.values() for r in pfd.member_rels]
                 group_anchor_rels = [r for pfd in parsed_files.values() for r in pfd.anchor_rels]
+                group_config_rels = [r for pfd in parsed_files.values() for r in pfd.config_rels]
 
                 self._pending_import_rels.extend(group_import_rels)
                 self._pending_call_rels.extend(group_call_rels)
                 self._pending_type_rels.extend(group_type_rels)
                 self._pending_member_rels.extend(group_member_rels)
                 self._pending_anchor_rels.extend(group_anchor_rels)
+                self._pending_config_rels.extend(group_config_rels)
                 self._pending_project_names.add(project_name)
+
+                group_citations = {uid: raws for pfd in parsed_files.values() for uid, raws in pfd.citations.items()}
+                # The scope covers every re-parsed file, citations or not: it is
+                # what lets resolve_citations revoke an edge whose comment was
+                # deleted. Files the hash gate skipped are absent by
+                # construction, so their citations are left alone.
+                if parsed_files:
+                    self._pending_citation_files.setdefault(project_name, set()).update(parsed_files)
+                if group_citations:
+                    self._pending_citations.setdefault(project_name, {}).update(group_citations)
+                    self._citation_projects.add(project_name)
 
                 # 8. Set per-file cooldown for processed files
                 if self._cooldown_s > 0:

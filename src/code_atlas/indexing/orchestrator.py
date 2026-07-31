@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
+import json
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from xml.etree import ElementTree as ET
 
 import pathspec
 from loguru import logger
@@ -26,10 +28,13 @@ from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from code_atlas.graph.client import GraphClient
     from code_atlas.settings import AtlasSettings, MonorepoSettings
+
+    type ManifestParser = Callable[[str], dict[str, str]]
+    """Parses dependency-manifest text into import-space name → version constraint."""
 
 _tracer = get_tracer(__name__)
 
@@ -970,30 +975,271 @@ async def _check_model_lock(
 
 
 # ---------------------------------------------------------------------------
-# Dependency version extraction
+# Dependency manifest parsing
 # ---------------------------------------------------------------------------
+#
+# Manifests declare *distribution* names; source code imports *module* names.
+# ``update_external_package_versions`` joins on ``{project}:ext/{key}``, where
+# ``key`` is what ``GraphClient.resolve_imports`` derives from an import
+# statement (``to_name.split(".")[0]``). Every parser below therefore returns
+# keys in *import* space, using the deterministic rule for its ecosystem:
+#
+#   pyproject.toml    distribution name lowered, ``-`` → ``_`` (pre-existing)
+#   package.json      verbatim — an npm name *is* the specifier root, scope
+#                     included (``@scope/pkg``)
+#   Cargo.toml        table key with ``-`` → ``_`` (cargo's default lib-target
+#                     name; the key is already the name code writes, even for
+#                     renamed ``{ package = "..." }`` dependencies)
+#   Gemfile           verbatim — a gem name is the usual ``require`` path
+#
+# For go.mod, pom.xml, build.gradle(.kts) and composer.json the two namespaces
+# CANNOT be reconciled from the manifest alone: the import root is a hosting
+# domain (``github``), a TLD segment (``com``/``org``) or a PSR-4 namespace
+# that only the dependency's own metadata declares. Collapsing a coordinate
+# onto such a token would stamp a version onto an aggregate node shared by
+# unrelated packages, so those parsers emit the declared coordinate verbatim
+# (``github.com/spf13/cobra``, ``org.slf4j:slf4j-api``, ``monolog/monolog``).
+# Those keys match no ExternalPackage under today's uid scheme — the version
+# write is a deliberate no-op rather than a wrong mapping.
 
 _PEP508_RE = re.compile(r"^([A-Za-z0-9][\w.-]*)\s*(.*)")
+_GRADLE_COORD_RE = re.compile(
+    r"""['"]([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-+]+)(?::[A-Za-z0-9_.\-]+)?(?:@[A-Za-z0-9]+)?['"]"""
+)
+_GRADLE_MAP_RE = re.compile(
+    r"""group\s*:\s*['"]([^'"]+)['"]\s*,\s*name\s*:\s*['"]([^'"]+)['"]\s*,\s*version\s*:\s*['"]([^'"]+)['"]"""
+)
+_GEM_RE = re.compile(r"""^\s*gem\s+['"]([^'"]+)['"](.*)$""")
+_GEM_CONSTRAINT_RE = re.compile(r"""\s*,\s*['"]([^'"]+)['"]""")
+_POM_PROPERTY_RE = re.compile(r"\$\{([^}]+)\}")
+_COMPOSER_PLATFORM_RE = re.compile(r"^(php|hhvm|composer|(ext|lib)-.+|(php|composer)-.+)$")
 
 
-def _parse_dependency_versions(project_root: Path) -> dict[str, str]:
-    """Extract package name → version constraint from pyproject.toml dependencies."""
-    pyproject = project_root / "pyproject.toml"
-    if not pyproject.is_file():
-        return {}
-    try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    deps: list[str] = data.get("project", {}).get("dependencies", [])
+def _nested_table(data: Any, *keys: str) -> dict[Any, Any]:
+    """Return a nested TOML/JSON table, or an empty dict if any level is missing or not a table."""
+    node: Any = data
+    for key in keys:
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key)
+    return node if isinstance(node, dict) else {}
+
+
+def _parse_pyproject_deps(text: str) -> dict[str, str]:
+    """PEP 621 ``[project].dependencies`` → import name → PEP 508 constraint."""
+    deps = _nested_table(tomllib.loads(text), "project").get("dependencies", [])
     versions: dict[str, str] = {}
     for dep in deps:
+        if not isinstance(dep, str):
+            continue
         match = _PEP508_RE.match(dep.strip())
         if match:
             pkg_name = match.group(1).lower().replace("-", "_")
             constraint = match.group(2).strip().rstrip(";").strip()
             if constraint:
                 versions[pkg_name] = constraint
+    return versions
+
+
+def _parse_package_json_deps(text: str) -> dict[str, str]:
+    """npm/pnpm/yarn ``package.json`` → specifier root → semver range."""
+    data = json.loads(text)
+    versions: dict[str, str] = {}
+    # Priority order: a runtime dependency's range wins over a dev/peer echo of it.
+    for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        for name, constraint in _nested_table(data, section).items():
+            if isinstance(constraint, str) and constraint.strip():
+                versions.setdefault(name, constraint.strip())
+    return versions
+
+
+def _parse_cargo_toml_deps(text: str) -> dict[str, str]:
+    """Cargo ``[dependencies]`` (plus dev/build/workspace) → crate name → version req."""
+    data = tomllib.loads(text)
+    versions: dict[str, str] = {}
+    tables = (
+        _nested_table(data, "dependencies"),
+        _nested_table(data, "dev-dependencies"),
+        _nested_table(data, "build-dependencies"),
+        _nested_table(data, "workspace", "dependencies"),
+    )
+    for table in tables:
+        for name, spec in table.items():
+            constraint = spec if isinstance(spec, str) else spec.get("version") if isinstance(spec, dict) else None
+            # Path/git/workspace-inherited deps carry no version requirement.
+            if isinstance(constraint, str) and constraint.strip():
+                versions.setdefault(name.replace("-", "_"), constraint.strip())
+    return versions
+
+
+def _parse_go_mod_deps(text: str) -> dict[str, str]:
+    """``go.mod`` require directives → module path (verbatim) → version.
+
+    Both the single-line (``require path v1.2.3``) and block forms are read;
+    ``// indirect`` requirements count too. ``replace``/``exclude`` blocks are
+    skipped — their contents are not dependency declarations.
+    """
+    versions: dict[str, str] = {}
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if in_block:
+            if line == ")":
+                in_block = False
+                continue
+            entry = line
+        elif line == "require" or line.startswith(("require(", "require (")):
+            in_block = line.endswith("(")
+            continue
+        elif line.startswith("require "):
+            entry = line[len("require ") :].strip()
+        else:
+            continue
+        parts = entry.split()
+        if len(parts) >= 2 and parts[1].startswith("v"):
+            versions.setdefault(parts[0], parts[1])
+    return versions
+
+
+def _pom_child_text(element: ET.Element, tag: str) -> str:
+    """Return the text of a namespace-agnostic direct child, or an empty string."""
+    child = element.find(f"./{{*}}{tag}")
+    return (child.text or "").strip() if child is not None else ""
+
+
+def _parse_pom_xml_deps(text: str) -> dict[str, str]:
+    """Maven ``pom.xml`` → ``groupId:artifactId`` (verbatim) → version.
+
+    ``${...}`` placeholders are resolved against ``<properties>``; entries whose
+    version stays unresolved (inherited from a parent pom or dependency
+    management we cannot see) are skipped rather than recorded as a literal.
+    """
+    root = ET.fromstring(text)
+    properties = {prop.tag.rpartition("}")[2]: (prop.text or "").strip() for prop in root.iterfind("./{*}properties/*")}
+    versions: dict[str, str] = {}
+    for dep in root.iterfind(".//{*}dependency"):
+        group = _pom_child_text(dep, "groupId")
+        artifact = _pom_child_text(dep, "artifactId")
+        version = _pom_child_text(dep, "version")
+        if not (group and artifact and version):
+            continue
+        resolved = _POM_PROPERTY_RE.sub(lambda m: properties.get(m.group(1), m.group(0)), version)
+        if "${" in resolved:
+            continue
+        versions.setdefault(f"{group}:{artifact}", resolved)
+    return versions
+
+
+def _parse_gradle_deps(text: str) -> dict[str, str]:
+    """Gradle Groovy/Kotlin DSL → ``group:artifact`` (verbatim) → version.
+
+    Both the string-coordinate form (``implementation "g:a:v"``) and the Groovy
+    map form (``group: 'g', name: 'a', version: 'v'``) are read. Interpolated
+    versions (``$ktorVersion``) do not match the coordinate pattern and are
+    skipped — a variable name is not a version.
+    """
+    versions: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith(("//", "*", "/*", "#")):
+            continue
+        for pattern in (_GRADLE_COORD_RE, _GRADLE_MAP_RE):
+            for group, artifact, version in pattern.findall(line):
+                versions.setdefault(f"{group}:{artifact}", version)
+    return versions
+
+
+def _parse_composer_json_deps(text: str) -> dict[str, str]:
+    """Composer ``require``/``require-dev`` → ``vendor/package`` (verbatim) → constraint."""
+    data = json.loads(text)
+    versions: dict[str, str] = {}
+    for section in ("require", "require-dev"):
+        for name, constraint in _nested_table(data, section).items():
+            # php, hhvm, ext-*, lib-* are platform requirements, not packages.
+            if _COMPOSER_PLATFORM_RE.match(name):
+                continue
+            if isinstance(constraint, str) and constraint.strip():
+                versions.setdefault(name, constraint.strip())
+    return versions
+
+
+def _parse_gemfile_deps(text: str) -> dict[str, str]:
+    """Bundler ``Gemfile`` → gem name → joined version requirements.
+
+    Only the ``gem "name", "req", ...`` form is read (the Gemfile is Ruby, not
+    a declarative format). Options such as ``require:``/``git:``/``group:``
+    terminate the requirement list, and gems declared without a requirement
+    yield no entry.
+    """
+    versions: dict[str, str] = {}
+    for raw in text.splitlines():
+        match = _GEM_RE.match(raw.split("#", 1)[0])
+        if match is None:
+            continue
+        rest = match.group(2)
+        constraints: list[str] = []
+        while (constraint := _GEM_CONSTRAINT_RE.match(rest)) is not None:
+            constraints.append(constraint.group(1))
+            rest = rest[constraint.end() :]
+        if constraints:
+            versions.setdefault(match.group(1), ", ".join(constraints))
+    return versions
+
+
+# The dispatch table: adding an ecosystem is an entry here plus its parser.
+_MANIFEST_PARSERS: dict[str, ManifestParser] = {
+    "pyproject.toml": _parse_pyproject_deps,
+    "package.json": _parse_package_json_deps,
+    "Cargo.toml": _parse_cargo_toml_deps,
+    "go.mod": _parse_go_mod_deps,
+    "pom.xml": _parse_pom_xml_deps,
+    "build.gradle": _parse_gradle_deps,
+    "build.gradle.kts": _parse_gradle_deps,
+    "composer.json": _parse_composer_json_deps,
+    "Gemfile": _parse_gemfile_deps,
+}
+
+
+def register_manifest_parser(filename: str, parser: ManifestParser) -> None:
+    """Register a dependency-manifest parser under its exact filename.
+
+    Extension point for ecosystems outside the built-in table; the parser takes
+    the manifest text and returns import-space name → version constraint.
+    """
+    _MANIFEST_PARSERS[filename] = parser
+    logger.debug("Registered manifest parser: {}", filename)
+
+
+def _parse_dependency_versions(project_root: Path) -> dict[str, str]:
+    """Extract package name → version constraint from every known manifest in *project_root*.
+
+    Unknown filenames are simply never probed. A manifest that fails to parse is
+    skipped, not fatal. A key claimed with different constraints by two
+    manifests (a polyglot root declaring the same name in two ecosystems) is
+    dropped — there is one language-blind ExternalPackage node per name, so
+    picking a winner would be a coin flip.
+    """
+    versions: dict[str, str] = {}
+    conflicting: set[str] = set()
+    for filename, parser in _MANIFEST_PARSERS.items():
+        manifest = project_root / filename
+        if not manifest.is_file():
+            continue
+        try:
+            parsed = parser(manifest.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("Skipping unparsable manifest {}: {}", manifest, exc)
+            continue
+        for name, constraint in parsed.items():
+            if versions.get(name, constraint) != constraint:
+                conflicting.add(name)
+            versions[name] = constraint
+    for name in conflicting:
+        del versions[name]
+    if conflicting:
+        logger.debug("Dropped {} dependency name(s) declared inconsistently across manifests", len(conflicting))
     return versions
 
 
@@ -1013,6 +1259,47 @@ async def _create_package_hierarchy(
     batch = [(qn, qn.rsplit(".", 1)[-1], f"{rel_path}/__init__.py") for qn, rel_path in packages]
     await graph.merge_package_batch(project_name, batch)
     return len(packages)
+
+
+# How long a stopped consumer gets to finish before it is cancelled.
+#
+# The AST consumer's ``run()`` ends with ``_flush_deferred_resolution(final=True)``
+# — the deferred CALLS/IMPORTS/USES_TYPE resolution, the withheld file-hash
+# writes, and the end-of-run citation retry sweep that makes ADR references
+# resolve at all on a cold index. This replaced a flat ``sleep(0.5)`` before an
+# unconditional ``cancel()``, which was short enough that cancellation
+# routinely landed *inside* that flush; ``contextlib.suppress(CancelledError)``
+# then swallowed it, so the sweep silently never completed.
+#
+# The wait is normally instant: ``stop()`` is observed at the top of the next
+# loop iteration and the only blocking await in between is a bounded
+# ``read_batch``. The ceiling only matters for a genuinely slow final flush.
+_CONSUMER_TEARDOWN_S = 60.0
+
+
+async def _stop_consumer_tasks(tasks: Sequence[asyncio.Task[None] | None]) -> None:
+    """Let already-stopped consumers finish their final flush, then cancel stragglers.
+
+    Callers must have invoked ``stop()`` on every consumer first — this only
+    waits. Exceptions propagate exactly as they did before (only
+    ``CancelledError`` is suppressed).
+    """
+    live = [t for t in tasks if t is not None]
+    if not live:
+        return
+    _done, still_running = await asyncio.wait(live, timeout=_CONSUMER_TEARDOWN_S)
+    if still_running:
+        logger.warning(
+            "{} consumer task(s) still running {}s after stop() — cancelling; "
+            "the final resolution flush may be incomplete",
+            len(still_running),
+            _CONSUMER_TEARDOWN_S,
+        )
+        for task in still_running:
+            task.cancel()
+    for task in live:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def _run_pipeline(
@@ -1076,14 +1363,7 @@ async def _run_pipeline(
         ast_consumer.stop()
         if embed_consumer is not None:
             embed_consumer.stop()
-        await asyncio.sleep(0.5)
-        ast_task.cancel()
-        if embed_task is not None:
-            embed_task.cancel()
-        for t in [ast_task, embed_task]:
-            if t is not None:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await t
+        await _stop_consumer_tasks([ast_task, embed_task])
         if cache is not None:
             await cache.close()
 
@@ -1810,11 +2090,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         ast_consumer.stop()
         if embed_consumer is not None:
             embed_consumer.stop()
-        await asyncio.sleep(0.5)
-        for task in consumer_tasks:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        await _stop_consumer_tasks(consumer_tasks)
         if cache is not None:
             await cache.close()
 

@@ -54,6 +54,7 @@ from code_atlas.graph.client import (
     _CODE_ENTITY_KINDS,
     _DEFAULT_EDGE_WEIGHT,
     _DEFAULT_TEST_PATTERNS,
+    _POST_BATCH_REL_TYPES,
     SCHEMA_VERSION,
     CallStats,
     EntityHashData,
@@ -63,8 +64,14 @@ from code_atlas.graph.client import (
     _call_edge_weight,
     _CallEdgeFacts,
     _CallLookup,
+    _citation_key,
+    _CitationLookup,
     _combine_call_edge_facts,
+    _document_citation_keys,
     _fuse_bm25_results,
+    _pick_citation_target,
+    _plan_config_refs,
+    _render_citation_key,
     _resolve_one_call,
     _resolve_one_path_anchor,
 )
@@ -73,17 +80,20 @@ from code_atlas.graph.client import (
 )
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
+    _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     COMPOSITE_INDICES,
+    GLOBAL_PROJECT,
     LABEL_PROPERTY_INDICES,
     TEXT_INDICES,
+    NodeLabel,
     build_vector_index_specs,
 )
 from code_atlas.search.engine import matches_test_pattern
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
     from pathlib import Path
 
     from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
@@ -91,8 +101,18 @@ if TYPE_CHECKING:
 
 _VEC_LABEL_VALUES: frozenset[str] = frozenset(lbl.value for lbl in _EMBEDDABLE_LABELS)
 _TEXT_LABEL_VALUES: frozenset[str] = frozenset(lbl.value for lbl in _TEXT_SEARCHABLE_LABELS)
+_POST_BATCH_REL_VALUES: frozenset[str] = frozenset(r.value for r in _POST_BATCH_REL_TYPES)
 
 _NODE_COLUMNS = "uid, labels, project_name, qualified_name, file_path, name, kind, content_hash, props_json"
+
+# A citation DOCUMENTS edge leaves the CITED document's node but is created by
+# the citing file's parse (resolve_citations), so re-parsing the document must
+# not delete it — nothing in that parse could put it back. Mirrors the same
+# carve-out in ``GraphClient._recreate_{file,batch}_relationships``. The same
+# predicate drives resolve_citations' own file-scoped revoke pass, which is
+# where these edges DO get deleted (from the citing side, where they are
+# inbound and the two _recreate_* sweeps below cannot see them).
+_CITATION_EDGE_PREDICATE = "rel_type = 'DOCUMENTS' AND json_extract(props_json, '$.link_type') = 'citation'"
 
 
 def _node_columns(alias: str) -> str:
@@ -408,6 +428,28 @@ class SqliteGraphClient:
         )
         await conn.commit()
 
+    async def _migrate_v7_clear_freshness_markers(self, conn: aiosqlite.Connection) -> None:
+        """Mirror of ``GraphClient._migrate_v7_clear_freshness_markers``.
+
+        EnvVar/ResourceFile nodes exist only if a parser produced the reference,
+        and nothing already in the graph can be used to derive them — so every
+        file has to be re-parsed, and the file-hash gate would otherwise skip
+        each unchanged one forever.
+        """
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
+            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
+            "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
+        )
+        await conn.commit()
+        logger.info(
+            "SQLite schema v7: cleared stored file/git hashes — run 'atlas index' to extract "
+            "environment-variable and referenced-file nodes"
+        )
+
     async def _apply_full_schema(self, conn: aiosqlite.Connection) -> None:
         for stmt in _node_index_ddl():
             await conn.execute(stmt)
@@ -442,6 +484,8 @@ class SqliteGraphClient:
             await self._apply_full_schema(conn)
             if stored < 6:
                 await self._migrate_v6_clear_freshness_markers(conn)
+            if stored < 7:
+                await self._migrate_v7_clear_freshness_markers(conn)
             await self._set_schema_version(conn, SCHEMA_VERSION)
         else:
             msg = (
@@ -733,7 +777,10 @@ class SqliteGraphClient:
         doc_rels: list[ParsedRelationship] = []
 
         for r in relationships:
-            if r.rel_type.value in ("CALLS", "IMPORTS", "USES_TYPE"):
+            # Post-batch types (CALLS/IMPORTS/USES_TYPE/READS_ENV/REFERENCES_FILE)
+            # carry a bare target *name*, not a uid — the direct_rels path below
+            # would happily insert a dangling edge to that name.
+            if r.rel_type.value in _POST_BATCH_REL_VALUES:
                 continue
             if r.rel_type.value == "DEFINES" and "parent_type_name" in r.properties:
                 continue
@@ -820,7 +867,8 @@ class SqliteGraphClient:
             await conn.execute(
                 "DELETE FROM edges WHERE from_uid IN "
                 "(SELECT uid FROM nodes WHERE project_name = ? AND file_path = ? "
-                "AND labels NOT IN ('Package', 'Project'))",
+                "AND labels NOT IN ('Package', 'Project')) "
+                f"AND NOT ({_CITATION_EDGE_PREDICATE})",
                 (project_name, file_path),
             )
         await self._create_relationships(conn, project_name, relationships)
@@ -840,7 +888,8 @@ class SqliteGraphClient:
             await conn.execute(
                 f"DELETE FROM edges WHERE from_uid IN "
                 f"(SELECT uid FROM nodes WHERE project_name = ? AND file_path IN ({placeholders}) "
-                f"AND labels NOT IN ('Package', 'Project'))",
+                f"AND labels NOT IN ('Package', 'Project')) "
+                f"AND NOT ({_CITATION_EDGE_PREDICATE})",
                 (project_name, *chunk),
             )
         all_rels: list[ParsedRelationship] = [r for rels in file_rels.values() for r in rels]
@@ -1088,7 +1137,8 @@ class SqliteGraphClient:
         conn = await self._get_conn()
         cur = await conn.execute(
             "SELECT qualified_name, uid FROM nodes WHERE project_name = ? "
-            "AND labels NOT IN ('ExternalPackage', 'ExternalSymbol', 'SchemaVersion', 'Project')",
+            "AND labels NOT IN ('ExternalPackage', 'ExternalSymbol', 'EnvVar', 'ResourceFile', "
+            "'SchemaVersion', 'Project')",
             (project_name,),
         )
         rows = await cur.fetchall()
@@ -1154,6 +1204,89 @@ class SqliteGraphClient:
             len(ext_packages),
             len(ext_symbols),
         )
+
+    async def resolve_config_refs(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
+        """Full-parity port of ``GraphClient.resolve_config_refs``.
+
+        Shares ``_plan_config_refs`` verbatim, so uid construction, path
+        normalization and the names-only property allowlist cannot drift from
+        the Memgraph path. ``DO NOTHING`` on conflict mirrors ``ON CREATE SET``.
+        Also writes the FTS row that Memgraph's label-wide text index gives for
+        free (``_sync_fts_row`` only runs for parser-produced entities, and
+        these nodes are never parser-produced).
+        """
+        if not ref_rels:
+            return
+        conn = await self._get_conn()
+        plan = _plan_config_refs(project_name, ref_rels)
+
+        for label, nodes in (
+            (NodeLabel.ENV_VAR.value, plan.env_nodes),
+            (NodeLabel.RESOURCE_FILE.value, plan.file_nodes),
+        ):
+            for node in nodes.values():
+                await conn.execute(
+                    f"INSERT INTO nodes({_NODE_COLUMNS}) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, '{}') ON CONFLICT(uid) DO NOTHING",
+                    (node["uid"], label, node["project_name"], node["qualified_name"], node["name"]),
+                )
+                if label in _TEXT_LABEL_VALUES:
+                    table = f"text_{label.lower()}"
+                    text = f"{node['name']} {node['qualified_name']}"
+                    await self._safe_exec(conn, f"DELETE FROM {table} WHERE uid = ?", (node["uid"],))
+                    await self._safe_exec(conn, f"INSERT INTO {table}(uid, text) VALUES (?, ?)", (node["uid"], text))
+
+        for from_uid, to_uid, rel_type in plan.edges:
+            await conn.execute(
+                "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, '{}')",
+                (from_uid, to_uid, rel_type),
+            )
+        await conn.commit()
+        logger.debug(
+            "Resolved {} config refs ({} env vars, {} resource files)",
+            len(ref_rels),
+            len(plan.env_nodes),
+            len(plan.file_nodes),
+        )
+
+    async def gc_orphaned_reference_nodes(self) -> int:
+        """Mirror of ``GraphClient.gc_orphaned_reference_nodes`` — see it for why
+        incoming-edge count is a reference count and when this is safe to run.
+
+        ``NOT EXISTS`` over ``ix_edges_to`` keeps the per-label pass an index
+        probe rather than a table scan.
+        """
+        conn = await self._get_conn()
+        total = 0
+        for label in sorted(_REFERENCE_COUNTED_LABELS, key=lambda lbl: lbl.value):
+            cur = await conn.execute(
+                "SELECT uid FROM nodes n WHERE n.labels = ? "
+                "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = n.uid)",
+                (label.value,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            uids = [r[0] for r in rows]
+            if not uids:
+                continue
+            for chunk in _chunks(uids):
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" * len(chunk))
+                await conn.execute(f"DELETE FROM nodes WHERE uid IN ({placeholders})", chunk)
+                # Orphans have no incoming edges by definition, but they may
+                # still own outgoing ones if a future schema gives them any —
+                # mirror Cypher's DETACH rather than leaving dangling rows.
+                await conn.execute(f"DELETE FROM edges WHERE from_uid IN ({placeholders})", chunk)
+                if label.value in _TEXT_LABEL_VALUES:
+                    await self._safe_exec(
+                        conn, f"DELETE FROM text_{label.value.lower()} WHERE uid IN ({placeholders})", chunk
+                    )
+            total += len(uids)
+        if total:
+            await conn.commit()
+            logger.debug("GC swept {} orphaned reference node(s)", total)
+        return total
 
     async def resolve_calls(
         self,
@@ -1366,6 +1499,120 @@ class SqliteGraphClient:
             logger.debug("Marked {} anchor edge(s) stale", count)
         return count
 
+    async def build_citation_lookup(self, project_name: str) -> _CitationLookup:
+        conn = await self._get_conn()
+        cur = await conn.execute(
+            "SELECT labels, uid, name, file_path, json_extract(props_json, '$.header_level') FROM nodes "
+            "WHERE project_name = ? AND labels IN ('DocFile', 'DocSection', 'Note')",
+            (project_name,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        by_key: dict[tuple[str, int], list[tuple[int, str]]] = defaultdict(list)
+        for label, uid, name, file_path, header_level in rows:
+            for key, rank in _document_citation_keys(label or "", name or "", file_path or "", header_level):
+                by_key[key].append((rank, uid))
+        return _CitationLookup(by_key=dict(by_key))
+
+    async def resolve_citations(
+        self,
+        project_name: str,
+        citations_by_uid: dict[str, list[str]],
+        *,
+        file_paths: Collection[str] | None = None,
+        lookup: _CitationLookup | None = None,
+        retry_unresolved: bool = False,
+    ) -> None:
+        """Reuses ``_citation_key``/``_pick_citation_target`` from ``graph.client`` verbatim.
+
+        Edge direction matches Memgraph's — ``(document) -> (citing entity)``,
+        see the DIRECTION note in ``graph.client``'s citation section. The one
+        behavioural difference is structural: ``edges`` is unique on
+        ``(from_uid, to_uid, rel_type)``, so a document that both mentions a
+        symbol heuristically *and* is cited by it collapses to a single row,
+        with the citation (explicit author intent) overwriting the heuristic
+        guess. Memgraph keeps both as parallel edges.
+
+        That collapse also colours the *file_paths* revoke pass (see the
+        Memgraph docstring for what it is and why it exists): deleting the one
+        collapsed row takes the heuristic link with it, where Memgraph would
+        drop only the parallel citation edge. The heuristic link is owned by the
+        document's parse and comes back the next time that document is indexed;
+        the alternative — remembering a link this schema cannot represent — is
+        the divergence getting worse, not better.
+        """
+        if not citations_by_uid and not retry_unresolved and not file_paths:
+            return
+        conn = await self._get_conn()
+
+        if file_paths:
+            # Non-empty by the guard above, so _chunks never yields its empty
+            # placeholder chunk here.
+            for chunk in _chunks(list(file_paths)):
+                placeholders = ",".join("?" * len(chunk))
+                await conn.execute(
+                    f"DELETE FROM edges WHERE {_CITATION_EDGE_PREDICATE} AND to_uid IN "
+                    f"(SELECT uid FROM nodes WHERE project_name = ? AND file_path IN ({placeholders}))",
+                    (project_name, *chunk),
+                )
+            await conn.commit()
+
+        pending: dict[str, list[str]] = {uid: list(raws) for uid, raws in citations_by_uid.items()}
+        if retry_unresolved:
+            cur = await conn.execute(
+                "SELECT uid, json_extract(props_json, '$.citations') FROM nodes "
+                "WHERE project_name = ? AND json_extract(props_json, '$.unresolved_citations') IS NOT NULL "
+                "AND json_array_length(props_json, '$.unresolved_citations') > 0",
+                (project_name,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for uid, citations_json in rows:
+                pending.setdefault(uid, json.loads(citations_json) if citations_json else [])
+
+        if not pending:
+            return
+        if lookup is None:
+            lookup = await self.build_citation_lookup(project_name)
+
+        resolved: list[tuple[str, str, str, float]] = []
+        unresolved_by_uid: dict[str, list[str]] = defaultdict(list)
+        for entity_uid, raws in pending.items():
+            for raw in raws:
+                key = _citation_key(raw)
+                target = _pick_citation_target(key, lookup) if key is not None else None
+                if key is None or target is None or target[0] == entity_uid:
+                    unresolved_by_uid[entity_uid].append(raw)
+                    continue
+                doc_uid, confidence = target
+                resolved.append((doc_uid, entity_uid, _render_citation_key(key), confidence))
+
+        for doc_uid, entity_uid, citation, confidence in resolved:
+            await conn.execute(
+                "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'DOCUMENTS', ?) "
+                "ON CONFLICT(from_uid, to_uid, rel_type) DO UPDATE SET props_json = excluded.props_json",
+                (
+                    doc_uid,
+                    entity_uid,
+                    json.dumps({"link_type": "citation", "confidence": confidence, "citation": citation}),
+                ),
+            )
+
+        for uid in pending:
+            await conn.execute(
+                "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
+                (json.dumps({"unresolved_citations": unresolved_by_uid.get(uid, [])}), uid),
+            )
+        await conn.commit()
+
+        total_unresolved = sum(len(v) for v in unresolved_by_uid.values())
+        logger.debug(
+            "Resolved {} citation edge(s) for project {} ({} unresolved)",
+            len(resolved),
+            project_name,
+            total_unresolved,
+        )
+
     async def resolve_type_refs(  # noqa: PLR0912
         self,
         project_name: str,
@@ -1549,7 +1796,8 @@ class SqliteGraphClient:
                 es_name = es_uid.rsplit("/", 1)[-1]
                 cur = await conn.execute(
                     "SELECT uid FROM nodes WHERE project_name = ? AND name = ? "
-                    "AND labels NOT IN ('ExternalPackage', 'ExternalSymbol', 'Project', 'SchemaVersion')",
+                    "AND labels NOT IN ('ExternalPackage', 'ExternalSymbol', 'EnvVar', 'ResourceFile', "
+                    "'Project', 'SchemaVersion')",
                     (target_project, es_name),
                 )
                 real = await cur.fetchone()
@@ -1820,9 +2068,10 @@ class SqliteGraphClient:
         proj_sql = ""
         proj_params: list[str] = []
         if filter_projects:
-            placeholders = ",".join("?" * len(filter_projects))
+            # GLOBAL_PROJECT rides along in the scope list — see text_search.
+            proj_params = [*filter_projects, GLOBAL_PROJECT]
+            placeholders = ",".join("?" * len(proj_params))
             proj_sql = f" AND project_name IN ({placeholders})"
-            proj_params = list(filter_projects)
         fetch_limit = limit * 3
 
         scored: dict[str, tuple[dict[str, Any], float]] = {}
@@ -1886,7 +2135,8 @@ class SqliteGraphClient:
         all_results = _fuse_bm25_results(results_per_index)
 
         if filter_projects:
-            project_set = set(filter_projects)
+            # GLOBAL_PROJECT always passes — see GraphClient.text_search.
+            project_set = {*filter_projects, GLOBAL_PROJECT}
             all_results = [r for r in all_results if r["node"].get("project_name") in project_set]
 
         return all_results[:limit]
@@ -2375,8 +2625,11 @@ class SqliteGraphClient:
         clause, extra = _prefix_clause("n.file_path", path)
         cur = await conn.execute(
             "SELECT n.name, n.qualified_name, n.labels, n.kind, n.file_path FROM nodes n "
+            # EnvVar/ResourceFile can never receive IMPORTS/INHERITS/CALLS, so a
+            # label-only filter would report every one of them as a leaf.
             "WHERE n.project_name = ? AND n.labels NOT IN "
-            "('Project', 'SchemaVersion', 'Package', 'ExternalPackage', 'ExternalSymbol')"
+            "('Project', 'SchemaVersion', 'Package', 'ExternalPackage', 'ExternalSymbol', "
+            "'EnvVar', 'ResourceFile')"
             f"{clause} "
             "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = n.uid "
             "AND e.rel_type IN ('IMPORTS', 'INHERITS', 'CALLS')) "
@@ -2996,7 +3249,8 @@ class SqliteGraphClient:
             f"SELECT {_node_columns('doc')}, json_extract(e.props_json, '$.link_type'), "
             "json_extract(e.props_json, '$.stale'), json_extract(e.props_json, '$.anchor_hash') "
             "FROM edges e JOIN nodes doc ON doc.uid = e.from_uid "
-            "WHERE e.rel_type = 'DOCUMENTS' AND e.to_uid = ? AND doc.labels IN ('DocSection', 'Note') LIMIT ?",
+            "WHERE e.rel_type = 'DOCUMENTS' AND e.to_uid = ? "
+            "AND doc.labels IN ('DocSection', 'Note', 'DocFile') LIMIT ?",
             (uid, limit),
         )
         rows = await cur.fetchall()

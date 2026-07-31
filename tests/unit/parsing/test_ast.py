@@ -118,6 +118,18 @@ def test_content_hash_without_rationale_matches_eight_part_formula():
     assert _compute_content_hash(entity) == expected
 
 
+def test_content_hash_golden_digest_is_frozen():
+    """A literal pin on the formula's output, not just its shape.
+
+    Every parser addition that touches what entities carry (rationale, citations,
+    and now the env-var/referenced-file extraction) has to leave this digest
+    alone — a change here means every indexed project re-diffs and re-embeds on
+    upgrade. Recomputing the parts list in the tests above cannot catch a change
+    to the parts list itself; this can.
+    """
+    assert _compute_content_hash(_entity()) == "ae12f7ed54977d9b"
+
+
 def test_content_hash_rationale_changes_hash():
     assert _compute_content_hash(_entity()) != _compute_content_hash(_entity(rationale="WHY: because"))
 
@@ -154,6 +166,91 @@ def test_rationale_settings_defaults_match_parser_defaults():
     assert settings.citation_schemes == list(DEFAULT_CITATION_SCHEMES)
     assert settings.enabled is True
     assert settings.tasks is False
+
+
+# ---------------------------------------------------------------------------
+# looks_like_resource_path — the shared REFERENCES_FILE gate
+#
+# Biased hard towards rejection: a false positive mints a ResourceFile node for
+# a path that does not exist, which then shows up in search and dependency
+# views as if the repo really read it. A miss just costs an edge.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "data/fixtures.json",
+        "config/y.yaml",
+        ".env",
+        "certs/server.pem",
+        "../shared/config.yaml",
+        "./data/x.json",
+        "schema.sql",
+        "a/b/c/d.txt",
+        # Extensionless, but the separator is evidence enough — this is the
+        # `.ssh/id_rsa` shape, which must be recordable as a path.
+        ".ssh/id_rsa",
+        "etc/hosts",
+    ],
+)
+def test_resource_path_accepts_relative_file_paths(literal: str):
+    from code_atlas.parsing.ast import looks_like_resource_path
+
+    assert looks_like_resource_path(literal) is True
+
+
+@pytest.mark.parametrize(
+    ("literal", "why"),
+    [
+        ("", "empty"),
+        ("rb", "an open() mode string"),
+        ("w+", "an open() mode string"),
+        (".", "the cwd"),
+        ("..", "the parent dir"),
+        ("data", "a bare directory name"),
+        ("data/", "a trailing separator means a directory"),
+        ("logs/..", "resolves to a directory"),
+        ("/etc/passwd", "absolute"),
+        ("C:/Users/x.json", "a Windows drive letter (the ':' rule)"),
+        ("s3://bucket/key.json", "a URL scheme"),
+        ("https://example.com/a.json", "a URL"),
+        ("~/.config/app.yaml", "home-relative, not project-relative"),
+        ("data/{name}.json", "a format template"),
+        ("data/%s.json", "a printf template"),
+        ("data/*.json", "a glob"),
+        ("data/?.json", "a glob"),
+        ("my file.json", "whitespace"),
+        ("-v.txt", "looks like a CLI flag"),
+        ("x" * 201 + ".json", "longer than MAX_RESOURCE_PATH_CHARS"),
+    ],
+)
+def test_resource_path_rejects_non_paths(literal: str, why: str):
+    from code_atlas.parsing.ast import looks_like_resource_path
+
+    assert looks_like_resource_path(literal) is False, f"wrongly accepted {literal!r} ({why})"
+
+
+def test_resource_path_never_touches_the_filesystem(monkeypatch):
+    """The gate is a pure string predicate. It must reach a verdict on
+    ``certs/server.pem`` without stat-ing, opening or resolving anything —
+    that is what makes recording a path to a secret safe.
+    """
+    import builtins
+    import pathlib
+
+    def _forbidden(*args: Any, **kwargs: Any):
+        raise AssertionError("looks_like_resource_path touched the filesystem")
+
+    from code_atlas.parsing.ast import looks_like_resource_path
+
+    monkeypatch.setattr(builtins, "open", _forbidden)
+    for attr in ("open", "read_text", "read_bytes", "exists", "stat", "resolve", "is_file"):
+        monkeypatch.setattr(pathlib.Path, attr, _forbidden)
+
+    assert looks_like_resource_path("certs/server.pem") is True
+    assert looks_like_resource_path(".env") is True
+    assert looks_like_resource_path("nonexistent/nowhere.json") is True
 
 
 # ---------------------------------------------------------------------------

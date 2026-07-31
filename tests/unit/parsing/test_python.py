@@ -1680,3 +1680,414 @@ class Widget:
     for entity in parsed.entities:
         assert entity.rationale is None
         assert entity.citations == []
+
+
+# ---------------------------------------------------------------------------
+# Runtime config surface — READS_ENV / REFERENCES_FILE
+# ---------------------------------------------------------------------------
+
+
+def _config_refs(parsed: ParsedFile, rel_type: RelType) -> set[tuple[str, str]]:
+    """``{(from_qualified_name, to_name)}`` for one config relationship type."""
+    return {(r.from_qualified_name, r.to_name) for r in parsed.relationships if r.rel_type == rel_type}
+
+
+def _env_names(parsed: ParsedFile) -> set[str]:
+    return {name for _, name in _config_refs(parsed, RelType.READS_ENV)}
+
+
+def _file_paths(parsed: ParsedFile) -> set[str]:
+    return {path for _, path in _config_refs(parsed, RelType.REFERENCES_FILE)}
+
+
+def test_env_var_read_forms():
+    """All five supported spellings produce a READS_ENV with the bare name."""
+    parsed = _parse("""\
+import os
+from os import environ, getenv
+
+
+def load():
+    a = os.getenv("A")
+    b = os.getenv("B", "fallback")
+    c = os.environ["C"]
+    d = os.environ.get("D")
+    e = os.environ.get("E", "fallback")
+    f = getenv("F")
+    g = environ["G"]
+    h = environ.get("H")
+    return a, b, c, d, e, f, g, h
+""")
+    assert _env_names(parsed) == {"A", "B", "C", "D", "E", "F", "G", "H"}
+
+
+def test_env_var_bare_forms_require_a_real_os_import():
+    """A project's own ``getenv()`` helper or an unrelated ``environ`` dict must
+    not mint EnvVar nodes — the bare spellings are gated on ``from os import``.
+    """
+    parsed = _parse("""\
+from mylib import getenv
+
+environ = {"NOT_AN_ENV_VAR": 1}
+
+
+def load():
+    return getenv("NOT_AN_ENV_VAR"), environ["ALSO_NOT"]
+""")
+    assert _env_names(parsed) == set()
+
+
+def test_env_var_non_literal_name_is_ignored():
+    parsed = _parse("""\
+import os
+
+KEY = "DYNAMIC"
+
+
+def load():
+    return os.getenv(KEY), os.environ[KEY], os.getenv(f"PREFIX_{KEY}")
+""")
+    assert _env_names(parsed) == set()
+
+
+def test_env_var_attributed_to_innermost_entity():
+    """Module-level reads hang off the Value they define; in-function reads off
+    the function; method reads off the method.
+    """
+    parsed = _parse("""\
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+def load():
+    return os.getenv("PORT")
+
+
+class Service:
+    def start(self):
+        return os.getenv("SERVICE_HOST")
+""")
+    assert _config_refs(parsed, RelType.READS_ENV) == {
+        (f"{PROJECT}:example.DATABASE_URL", "DATABASE_URL"),
+        (f"{PROJECT}:example.load", "PORT"),
+        (f"{PROJECT}:example.Service.start", "SERVICE_HOST"),
+    }
+
+
+def test_env_var_outside_any_definition_falls_back_to_the_module():
+    parsed = _parse("""\
+import os
+
+if os.getenv("FEATURE_FLAG"):
+    pass
+""")
+    assert _config_refs(parsed, RelType.READS_ENV) == {(f"{PROJECT}:example", "FEATURE_FLAG")}
+
+
+def test_env_var_repeated_reads_collapse_to_one_relationship():
+    """The graph stores no call-site multiplicity — two reads in one function
+    are one edge (mirrors _plan_config_refs' own dedup).
+    """
+    parsed = _parse("""\
+import os
+
+
+def load():
+    return os.getenv("PORT"), os.environ["PORT"], os.environ.get("PORT")
+""")
+    reads = [r for r in parsed.relationships if r.rel_type == RelType.READS_ENV]
+    assert len(reads) == 1
+    assert reads[0].to_name == "PORT"
+
+
+def test_no_config_refs_when_the_file_has_none():
+    parsed = _parse("""\
+def add(a, b):
+    return a + b
+""")
+    assert _env_names(parsed) == set()
+    assert _file_paths(parsed) == set()
+
+
+# ---------------------------------------------------------------------------
+# SECURITY: env var NAMES only — never a value, never a default
+#
+# os.getenv("API_KEY", "sk-live-abc123") puts a live secret in the second
+# argument. The extraction reads the FIRST positional argument and returns, so
+# no later argument node is visited at all.
+# ---------------------------------------------------------------------------
+
+_SECRET = "sk-live-abc123-DO-NOT-PERSIST"
+
+
+def test_getenv_default_secret_never_reaches_a_relationship():
+    parsed = _parse(f'''\
+import os
+
+
+def load():
+    """Load credentials."""
+    return os.getenv("API_KEY", "{_SECRET}")
+''')
+
+    reads = [r for r in parsed.relationships if r.rel_type == RelType.READS_ENV]
+    assert len(reads) == 1
+    assert reads[0].to_name == "API_KEY"
+    # No property channel exists for a default to ride out on.
+    assert reads[0].properties == {}
+
+    for rel in parsed.relationships:
+        assert _SECRET not in rel.to_name
+        assert _SECRET not in repr(rel.properties)
+
+
+def test_getenv_default_secret_reaches_no_new_entity_field():
+    """The only field that carries the secret is ``source`` — the verbatim entity
+    body, which predates this extraction and is unchanged by it. Every other
+    field, and every field of the EnvVar-bearing relationship, must be clean.
+
+    (``source`` IS shipped to the embedding provider for Callables. That is a
+    pre-existing exposure of *any* hardcoded literal, not something this change
+    introduces, and it is out of scope here — EnvVar/ResourceFile themselves are
+    deliberately non-embeddable.)
+    """
+    parsed = _parse(f"""\
+import os
+
+API_KEY = os.getenv("API_KEY", "{_SECRET}")
+
+
+def load():
+    return os.getenv("API_KEY", "{_SECRET}")
+""")
+
+    for entity in parsed.entities:
+        leaking = {
+            field: value for field, value in vars(entity).items() if field != "source" and _SECRET in repr(value)
+        }
+        assert leaking == {}, f"{entity.qualified_name} leaked the default via {sorted(leaking)}"
+
+
+def test_env_var_names_are_shell_identifier_shaped():
+    """A first argument that is a string but not a plausible variable name is a
+    misparse, not an env var.
+    """
+    parsed = _parse("""\
+import os
+
+
+def load():
+    return os.getenv("has spaces"), os.getenv("dotted.name"), os.getenv(""), os.getenv("9LEADING")
+""")
+    assert _env_names(parsed) == set()
+
+
+# ---------------------------------------------------------------------------
+# REFERENCES_FILE — conservative path literals only
+# ---------------------------------------------------------------------------
+
+
+def test_file_reference_openers():
+    parsed = _parse("""\
+from pathlib import Path
+import pathlib
+
+
+def load():
+    a = open("data/fixtures.json")
+    b = Path("config/schema.yaml")
+    c = Path("wiki/notes.md").read_text()
+    d = Path("assets/logo.bin").read_bytes()
+    e = pathlib.Path("etc/defaults.toml")
+    return a, b, c, d, e
+""")
+    assert _file_paths(parsed) == {
+        "data/fixtures.json",
+        "config/schema.yaml",
+        "wiki/notes.md",
+        "assets/logo.bin",
+        "etc/defaults.toml",
+    }
+
+
+def test_file_reference_mode_argument_is_never_a_path():
+    """``open(path, "rb")`` — only the first positional argument is inspected."""
+    parsed = _parse("""\
+def load():
+    return open("data/fixtures.json", "rb")
+""")
+    assert _file_paths(parsed) == {"data/fixtures.json"}
+
+
+def test_file_reference_requires_a_plain_literal():
+    """f-strings, concatenation, variables and escapes are all rejected — a
+    non-literal path would mint a node for a file that does not exist.
+    """
+    parsed = _parse(r"""
+name = "x"
+
+
+def load():
+    a = open(f"data/{name}.json")
+    b = open("data/" + name + ".json")
+    c = open(name)
+    d = open("data/" "fixtures.json")
+    e = open("data\tfixtures.json")
+    f = open(rb"data/fixtures.json")
+    return a, b, c, d, e, f
+""")
+    assert _file_paths(parsed) == set()
+
+
+def test_file_reference_rejects_non_path_literals():
+    parsed = _parse("""\
+from pathlib import Path
+
+
+def load():
+    return open("rb"), Path("."), Path("data"), open("/etc/passwd"), open("https://x.dev/a.json")
+""")
+    assert _file_paths(parsed) == set()
+
+
+def test_file_reference_attributed_to_innermost_entity():
+    parsed = _parse("""\
+from pathlib import Path
+
+SCHEMA = Path("config/schema.yaml")
+
+
+def load():
+    return open("data/fixtures.json")
+""")
+    assert _config_refs(parsed, RelType.REFERENCES_FILE) == {
+        (f"{PROJECT}:example.SCHEMA", "config/schema.yaml"),
+        (f"{PROJECT}:example.load", "data/fixtures.json"),
+    }
+
+
+def test_arbitrary_attribute_open_is_not_a_file_reference():
+    """``zipfile.open("entry.txt")`` / ``self.open(...)`` name archive members and
+    mock objects as often as real files, so only the bare builtin counts.
+    """
+    parsed = _parse("""\
+def load(archive, session):
+    return archive.open("member/entry.txt"), session.open("data/x.json")
+""")
+    assert _file_paths(parsed) == set()
+
+
+# ---------------------------------------------------------------------------
+# SECURITY: a sensitive file is recorded as a PATH and never read
+# ---------------------------------------------------------------------------
+
+
+def test_sensitive_file_references_are_recorded_as_paths():
+    """Recording that code reads ``.env`` is the point of REFERENCES_FILE."""
+    parsed = _parse("""\
+from pathlib import Path
+
+
+def load():
+    a = open(".env")
+    b = Path("certs/server.pem").read_text()
+    c = open("secrets/credentials.json")
+    d = Path(".ssh/id_rsa").read_bytes()
+    return a, b, c, d
+""")
+    assert _file_paths(parsed) == {
+        ".env",
+        "certs/server.pem",
+        "secrets/credentials.json",
+        ".ssh/id_rsa",
+    }
+
+
+def test_parser_never_opens_a_referenced_file(monkeypatch, tmp_path):
+    """The path is data, not an instruction to read. Parsing a module that
+    references a REAL secret file on disk must not touch it — the parser only
+    ever sees the source bytes it was handed.
+    """
+    import builtins
+    import pathlib
+
+    secret_file = tmp_path / "server.pem"
+    secret_file.write_text("-----BEGIN PRIVATE KEY-----\n")
+
+    source = f"""
+from pathlib import Path
+
+
+def load():
+    return open("{secret_file.name}"), Path("certs/server.pem").read_text(), open(".env")
+""".encode()
+
+    # Warm the memoized language-plugin discovery before the filesystem is sealed.
+    parse_file("src/warmup.py", b"x = 1\n", PROJECT)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("the parser touched the filesystem")
+
+    monkeypatch.setattr(builtins, "open", _forbidden)
+    for attr in ("open", "read_text", "read_bytes", "exists", "stat", "resolve", "is_file"):
+        monkeypatch.setattr(pathlib.Path, attr, _forbidden)
+
+    parsed = parse_file("src/example.py", source, PROJECT)
+
+    assert parsed is not None
+    assert _file_paths(parsed) == {secret_file.name, "certs/server.pem", ".env"}
+    assert not any("BEGIN PRIVATE KEY" in repr(r) for r in parsed.relationships)
+
+
+# ---------------------------------------------------------------------------
+# HASH SAFETY
+#
+# Config references live entirely in ParsedFile.relationships. Nothing about
+# them reaches ParsedEntity, so content_hash must still be the eight-part
+# formula — otherwise adding this feature reindexes every project.
+# ---------------------------------------------------------------------------
+
+
+def _eight_part_hash(entity: ParsedEntity) -> str:
+    """The pre-change content_hash formula, recomputed independently."""
+    import hashlib
+
+    parts = [
+        entity.name,
+        entity.kind,
+        entity.visibility,
+        entity.signature or "",
+        entity.docstring or "",
+        ",".join(sorted(entity.tags)),
+        entity.source or "",
+        "",  # extra_properties empty
+    ]
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def test_plain_function_still_hashes_to_the_pre_change_formula():
+    parsed = _parse("""\
+def add(a, b):
+    return a + b
+""")
+    for entity in parsed.entities:
+        assert entity.content_hash == _eight_part_hash(entity), entity.qualified_name
+
+
+def test_config_references_are_not_folded_into_content_hash():
+    """An entity that DOES read env vars and files still hashes by the same
+    eight-part formula — the references are edges, not entity state.
+    """
+    parsed = _parse("""\
+import os
+from pathlib import Path
+
+
+def load():
+    return os.getenv("PORT"), Path("config/schema.yaml").read_text()
+""")
+    assert _env_names(parsed) == {"PORT"}
+    assert _file_paths(parsed) == {"config/schema.yaml"}
+    for entity in parsed.entities:
+        assert entity.content_hash == _eight_part_hash(entity), entity.qualified_name

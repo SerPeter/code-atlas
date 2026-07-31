@@ -11,7 +11,20 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 6
+SCHEMA_VERSION: int = 7
+
+# Sentinel ``project_name`` for nodes that are shared across every project.
+#
+# ``project_name`` carries an existence constraint on every entity label, so a
+# genuinely global node cannot simply omit it (Memgraph reports the violation
+# at COMMIT, not at statement time, so the offending write appears to succeed
+# and the whole transaction dies later).  A reserved sentinel is the only way
+# to express "belongs to no single project" — see NodeLabel.ENV_VAR.
+#
+# Anything that filters by project must treat this value as a member of every
+# project, and anything that refuses to touch non-test data must allowlist it
+# (see tests/integration/conftest.py::_assert_disposable_db).
+GLOBAL_PROJECT: str = "_global"
 
 # ---------------------------------------------------------------------------
 # Node labels
@@ -35,6 +48,9 @@ class NodeLabel(StrEnum):
     # External dependencies
     EXTERNAL_PACKAGE = "ExternalPackage"
     EXTERNAL_SYMBOL = "ExternalSymbol"
+    # Referenced-but-not-defined runtime surface (see _EXTERNAL_LABELS)
+    ENV_VAR = "EnvVar"
+    RESOURCE_FILE = "ResourceFile"
     # Meta
     SCHEMA_VERSION = "SchemaVersion"
 
@@ -56,6 +72,9 @@ class RelType(StrEnum):
     IMPORTS = "IMPORTS"
     USES_TYPE = "USES_TYPE"
     OVERRIDES = "OVERRIDES"
+    # Runtime configuration surface (code -> EnvVar / ResourceFile)
+    READS_ENV = "READS_ENV"
+    REFERENCES_FILE = "REFERENCES_FILE"
     # Dependencies
     DEPENDS_ON = "DEPENDS_ON"
     # Documentation
@@ -154,10 +173,35 @@ _DOC_LABELS: frozenset[NodeLabel] = frozenset(
     }
 )
 
+# "Exists only because something referenced it" — no source location of its
+# own, MERGEd during post-batch resolution, never produced by a parser as a
+# ParsedEntity.  EnvVar/ResourceFile share exactly that lifecycle with
+# ExternalPackage/ExternalSymbol, which is why they live here rather than in
+# _CODE_LABELS: joining this group is what gives them uid uniqueness, the
+# uid+project_name existence constraints, and the property/composite indices.
 _EXTERNAL_LABELS: frozenset[NodeLabel] = frozenset(
     {
         NodeLabel.EXTERNAL_PACKAGE,
         NodeLabel.EXTERNAL_SYMBOL,
+        NodeLabel.ENV_VAR,
+        NodeLabel.RESOURCE_FILE,
+    }
+)
+
+# Reference-counted labels: a node exists exactly as long as something points
+# at it, so "zero incoming edges" means "unreferenced" and the node can be
+# swept (see GraphBackend.gc_orphaned_reference_nodes).  ExternalPackage and
+# ExternalSymbol are deliberately NOT here — ExternalPackage carries a
+# per-project ``version`` and receives a structural CONTAINS edge from its
+# package, so incoming-edge count is not a reference count for them.
+#
+# INVARIANT: never give these labels a structural incoming edge (a Project or
+# Package CONTAINS, say).  It would make every node permanently referenced and
+# silently disable the sweep.
+_REFERENCE_COUNTED_LABELS: frozenset[NodeLabel] = frozenset(
+    {
+        NodeLabel.ENV_VAR,
+        NodeLabel.RESOURCE_FILE,
     }
 )
 
@@ -172,6 +216,10 @@ _EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
     }
 )
 
+# EnvVar/ResourceFile are text-searchable but NOT embeddable: an agent asking
+# "where is DATABASE_URL read?" needs the keyword hit, and there is nothing to
+# embed — the node is a bare identifier, and by the names-only invariant it
+# never holds the variable's value or a default.
 _TEXT_SEARCHABLE_LABELS: frozenset[NodeLabel] = frozenset(
     {
         NodeLabel.TYPE_DEF,
@@ -180,11 +228,48 @@ _TEXT_SEARCHABLE_LABELS: frozenset[NodeLabel] = frozenset(
         NodeLabel.MODULE,
         NodeLabel.DOC_SECTION,
         NodeLabel.NOTE,
+        NodeLabel.ENV_VAR,
+        NodeLabel.RESOURCE_FILE,
     }
 )
 
 # All non-meta labels (must have uid + project_name)
 _ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS
+
+
+# ---------------------------------------------------------------------------
+# uid construction for reference-counted nodes
+#
+# Shared by both graph backends (and by the parsers that emit the references)
+# so the two can never drift on the key that identifies the node.
+# ---------------------------------------------------------------------------
+
+ENV_VAR_PREFIX: str = "env/"
+RESOURCE_FILE_PREFIX: str = "res/"
+
+
+def env_var_uid(name: str) -> str:
+    """uid for an environment variable — GLOBAL, deliberately unprefixed by project.
+
+    Breaks the usual ``{project_name}:{qualified_name}`` uid format on purpose:
+    an env var means the same thing in every repo, has no version dimension and
+    carries no per-project attributes, so every callsite everywhere converges on
+    one node.  That is what makes "who reads DATABASE_URL across all my repos" a
+    single-node lookup instead of a name-join.  The node still needs a
+    ``project_name`` for the existence constraint — it gets ``GLOBAL_PROJECT``.
+    """
+    return f"{ENV_VAR_PREFIX}{name}"
+
+
+def resource_file_uid(project_name: str, path: str) -> str:
+    """uid for a referenced (not indexed) file — PROJECT-SCOPED, unlike env vars.
+
+    The asymmetry with :func:`env_var_uid` is intentional: a path is only
+    meaningful relative to a project root, so ``data/fixtures.json`` in two
+    repos is two different files and must not collapse into one node.
+    """
+    return f"{project_name}:{RESOURCE_FILE_PREFIX}{path}"
+
 
 # ---------------------------------------------------------------------------
 # Spec dataclasses (frozen, for generating DDL)

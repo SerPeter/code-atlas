@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from code_atlas.graph.client import GraphClient
-from code_atlas.schema import generate_drop_text_index_ddl, generate_drop_vector_index_ddl
+from code_atlas.schema import GLOBAL_PROJECT, generate_drop_text_index_ddl, generate_drop_vector_index_ddl
 from code_atlas.settings import AtlasSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
 
 if TYPE_CHECKING:
@@ -164,15 +164,23 @@ async def _assert_disposable_db(client: GraphClient, host: str, port: int) -> No
     directories (``test_...`` / ``bench_...``); anything else means this is a
     real index. Aborts the whole session via pytest.exit — never wipes.
     Override with ATLAS_TEST_DB=1 only for known-disposable instances (CI).
+
+    ``GLOBAL_PROJECT`` is allowlisted alongside those prefixes: it is the
+    sentinel ``project_name`` on globally-shared nodes (EnvVar), so a test that
+    indexes a single ``os.getenv`` call would otherwise abort the entire
+    session with a message that reads exactly like a production-safety
+    incident. This does not weaken the guard — a real index still trips on its
+    own project names, which is what identifies it as real.
     """
     if os.environ.get("ATLAS_TEST_DB") == "1" or (host, port) in _GUARD_OK:
         return
     rows = await client.execute(
         "MATCH (n) "
         "WHERE (n:Project AND NOT (n.name STARTS WITH 'test' OR n.name STARTS WITH 'bench')) "
-        "   OR (n.project_name IS NOT NULL "
+        "   OR (n.project_name IS NOT NULL AND n.project_name <> $global_project "
         "       AND NOT (n.project_name STARTS WITH 'test' OR n.project_name STARTS WITH 'bench')) "
-        "RETURN DISTINCT coalesce(n.project_name, n.name) AS name LIMIT 5"
+        "RETURN DISTINCT coalesce(n.project_name, n.name) AS name LIMIT 5",
+        {"global_project": GLOBAL_PROJECT},
     )
     if rows:
         names = sorted({r["name"] for r in rows})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import time
@@ -19,9 +20,12 @@ from code_atlas.indexing.orchestrator import (
     _check_model_lock,
     _detect_packages,
     _git_changed_files,
+    _parse_dependency_versions,
     _read_git_head,
+    _stop_consumer_tasks,
     _wait_for_drain,
     gc_vanished_worktree_projects,
+    register_manifest_parser,
     scan_files,
 )
 from code_atlas.parsing.ast import _EXTENSION_MAP, _FILENAME_MAP
@@ -497,18 +501,19 @@ class TestScanFiles:
         assert "docker/api.dockerfile" in result
         assert "notes.txt" not in result
 
-    def test_scan_skips_extension_registered_without_a_parser(self, tmp_path):
-        """Apex is in the allowlist but has no module yet — scan()'s second gate drops it.
+    def test_scan_picks_up_apex_now_that_it_has_a_parser(self, tmp_path):
+        """``.cls``/``.trigger`` clear both gates: the allowlist and scan()'s parser check.
 
-        Documents the accepted cost of plumbing an extension early: the file
-        passes is_included() (so the watcher will publish events for it) but
-        produces nothing until an apex language module lands.
+        Inverted from the pre-parser assertion this replaces — ``parsing.languages.apex``
+        registers both extensions, so the files the watcher already published events
+        for now actually produce entities.
         """
         _write(tmp_path, "Foo.cls", "public class Foo {}")
+        _write(tmp_path, "Bar.trigger", "trigger Bar on Account (before insert) {}")
 
         scope = FileScope(tmp_path, _make_settings(tmp_path))
         assert scope.is_included("Foo.cls") is True
-        assert scan_files(tmp_path, _make_settings(tmp_path)) == []
+        assert sorted(scan_files(tmp_path, _make_settings(tmp_path))) == ["Bar.trigger", "Foo.cls"]
 
     def test_gitignore_applied_with_custom_exclude(self, tmp_path):
         """.gitignore still works when exclude overrides defaults."""
@@ -1196,3 +1201,416 @@ class TestGcVanishedWorktreeProjects:
 
         assert removed == []
         assert graph.deleted == []
+
+
+# ---------------------------------------------------------------------------
+# Dependency manifest parsing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def manifest_registry():
+    """Snapshot/restore the manifest parser registry so extension tests stay isolated."""
+    original = dict(orchestrator_module._MANIFEST_PARSERS)
+    yield orchestrator_module._MANIFEST_PARSERS
+    orchestrator_module._MANIFEST_PARSERS.clear()
+    orchestrator_module._MANIFEST_PARSERS.update(original)
+
+
+class TestDependencyManifests:
+    """One realistic sample per supported manifest format, parsed through the registry."""
+
+    def test_pyproject_toml(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "pyproject.toml",
+            """
+[project]
+name = "demo"
+requires-python = ">=3.12"
+dependencies = [
+    "loguru",
+    "pydantic>=2.0",
+    "PyYAML~=6.0",
+    "python-dotenv==1.0.1",
+    "requests[socks]>=2.31",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "pydantic": ">=2.0",
+            "pyyaml": "~=6.0",
+            "python_dotenv": "==1.0.1",
+            "requests": "[socks]>=2.31",
+        }
+        # Unpinned deps carry no constraint, and [dependency-groups] is not read.
+        assert "loguru" not in result
+        assert "pytest" not in result
+
+    def test_package_json(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "package.json",
+            """
+{
+  "name": "@acme/web",
+  "private": true,
+  "dependencies": {
+    "react": "^18.3.1",
+    "@tanstack/react-query": "^5.36.0",
+    "lodash.debounce": "^4.0.8"
+  },
+  "devDependencies": {
+    "typescript": "~5.4.5",
+    "react": "^18.0.0"
+  },
+  "peerDependencies": {
+    "react-dom": ">=18"
+  }
+}
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "react": "^18.3.1",  # runtime range wins over the devDependencies echo
+            "@tanstack/react-query": "^5.36.0",
+            "lodash.debounce": "^4.0.8",
+            "typescript": "~5.4.5",
+            "react-dom": ">=18",
+        }
+
+    def test_cargo_toml(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "Cargo.toml",
+            """
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing-subscriber = "0.3"
+local-lib = { path = "../local-lib" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[build-dependencies]
+cc = "1.0"
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "serde": "1.0",
+            "serde_json": "1.0",
+            "tracing_subscriber": "0.3",  # crate name, not the dashed package name
+            "criterion": "0.5",
+            "cc": "1.0",
+        }
+        # Path dependencies declare no version requirement.
+        assert "local_lib" not in result
+
+    def test_go_mod(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "go.mod",
+            "module github.com/example/demo\n"
+            "\n"
+            "go 1.22\n"
+            "\n"
+            "require (\n"
+            "\tgithub.com/spf13/cobra v1.8.0\n"
+            "\tgolang.org/x/text v0.14.0 // indirect\n"
+            ")\n"
+            "\n"
+            "require github.com/stretchr/testify v1.9.0\n"
+            "\n"
+            "replace github.com/example/other => ../other\n"
+            "\n"
+            "exclude (\n"
+            "\tgithub.com/bad/pkg v0.1.0\n"
+            ")\n",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        # Keys are module paths verbatim — see the module-level note on why a Go
+        # import root ("github") is not a usable ExternalPackage key.
+        assert result == {
+            "github.com/spf13/cobra": "v1.8.0",
+            "golang.org/x/text": "v0.14.0",
+            "github.com/stretchr/testify": "v1.9.0",
+        }
+        assert "github.com/bad/pkg" not in result
+        assert "github.com/example/other" not in result
+
+    def test_pom_xml(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "pom.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>demo</artifactId>
+  <version>1.0.0</version>
+  <properties>
+    <junit.version>5.10.2</junit.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>2.0.13</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "org.slf4j:slf4j-api": "2.0.13",
+            "org.junit.jupiter:junit-jupiter": "5.10.2",  # ${junit.version} resolved
+        }
+        # Version inherited from a parent pom / dependencyManagement we cannot see.
+        assert "com.google.guava:guava" not in result
+
+    def test_build_gradle_groovy(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "build.gradle",
+            """
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+    maven { url "https://repo.spring.io/milestone" }
+}
+
+dependencies {
+    implementation 'com.google.guava:guava:33.1.0-jre'
+    implementation "org.slf4j:slf4j-api:$slf4jVersion"
+    testImplementation group: 'junit', name: 'junit', version: '4.13.2'
+    runtimeOnly 'org.postgresql:postgresql:42.7.3'
+    // implementation 'commented:out:1.0'
+}
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "com.google.guava:guava": "33.1.0-jre",
+            "junit:junit": "4.13.2",
+            "org.postgresql:postgresql": "42.7.3",
+        }
+        # An interpolated version is a variable name, not a version.
+        assert "org.slf4j:slf4j-api" not in result
+        assert "commented:out" not in result
+
+    def test_build_gradle_kts(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "build.gradle.kts",
+            """
+dependencies {
+    implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.5"))
+    implementation("io.ktor:ktor-client-core:2.3.11")
+    testImplementation("org.jetbrains.kotlin:kotlin-test:1.9.23")
+}
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "org.springframework.boot:spring-boot-dependencies": "3.2.5",
+            "io.ktor:ktor-client-core": "2.3.11",
+            "org.jetbrains.kotlin:kotlin-test": "1.9.23",
+        }
+
+    def test_composer_json(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "composer.json",
+            """
+{
+  "name": "example/demo",
+  "require": {
+    "php": ">=8.2",
+    "ext-json": "*",
+    "monolog/monolog": "^3.6",
+    "symfony/console": "^7.0"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.0"
+  }
+}
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "monolog/monolog": "^3.6",
+            "symfony/console": "^7.0",
+            "phpunit/phpunit": "^11.0",
+        }
+        # Platform requirements are not packages.
+        assert "php" not in result
+        assert "ext-json" not in result
+
+    def test_gemfile(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "Gemfile",
+            """
+source "https://rubygems.org"
+
+gem "rails", "~> 7.1.3"
+gem "puma", ">= 6.0", "< 7.0"
+gem "nokogiri"
+gem "pg", "~> 1.5", require: false
+gem "dotenv-rails", group: :development
+# gem "commented", "1.0"
+
+group :test do
+  gem "rspec", "~> 3.13"
+end
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "rails": "~> 7.1.3",
+            "puma": ">= 6.0, < 7.0",
+            "pg": "~> 1.5",
+            "rspec": "~> 3.13",
+        }
+        # Gems declared without a requirement contribute nothing.
+        assert "nokogiri" not in result
+        assert "dotenv-rails" not in result
+        assert "commented" not in result
+
+    def test_unknown_manifest_filename_is_ignored(self, tmp_path: Path):
+        """An unregistered manifest is skipped silently — not an error, not a guess."""
+        _write(tmp_path, "requirements.txt", "requests==2.31.0\n")
+        _write(tmp_path, "Pipfile", "[packages]\nflask = '*'\n")
+        _write(tmp_path, "setup.py", "from setuptools import setup\n\nsetup(install_requires=['click'])\n")
+
+        assert _parse_dependency_versions(tmp_path) == {}
+
+    def test_empty_project_root(self, tmp_path: Path):
+        assert _parse_dependency_versions(tmp_path) == {}
+
+    def test_polyglot_root_merges_manifests(self, tmp_path: Path):
+        _write(tmp_path, "pyproject.toml", '[project]\nname = "api"\ndependencies = ["fastapi>=0.111"]\n')
+        _write(tmp_path, "package.json", '{"dependencies": {"react": "^18.3.1"}}')
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {"fastapi": ">=0.111", "react": "^18.3.1"}
+
+    def test_conflicting_name_across_manifests_is_dropped(self, tmp_path: Path):
+        """One ExternalPackage node per name — two ecosystems disagreeing means no answer."""
+        _write(tmp_path, "pyproject.toml", '[project]\nname = "api"\ndependencies = ["redis>=5.0", "httpx>=0.27"]\n')
+        _write(tmp_path, "package.json", '{"dependencies": {"redis": "^4.6.0"}}')
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {"httpx": ">=0.27"}
+
+    def test_malformed_manifest_does_not_break_siblings(self, tmp_path: Path):
+        _write(tmp_path, "package.json", "{ this is not json")
+        _write(tmp_path, "pom.xml", "<project><dependencies>")
+        _write(tmp_path, "Cargo.toml", "[dependencies\nbroken =")
+        _write(tmp_path, "pyproject.toml", '[project]\nname = "api"\ndependencies = ["httpx>=0.27"]\n')
+
+        assert _parse_dependency_versions(tmp_path) == {"httpx": ">=0.27"}
+
+    def test_register_manifest_parser_extends_the_table(self, tmp_path: Path, manifest_registry):
+        _write(tmp_path, "deps.txt", "leftpad 1.0.0\n")
+
+        assert _parse_dependency_versions(tmp_path) == {}
+
+        def _parse_deps_txt(text: str) -> dict[str, str]:
+            versions: dict[str, str] = {}
+            for line in text.splitlines():
+                if line.strip():
+                    name, constraint = line.split(maxsplit=1)
+                    versions[name] = constraint
+            return versions
+
+        register_manifest_parser("deps.txt", _parse_deps_txt)
+
+        assert "deps.txt" in manifest_registry
+        assert _parse_dependency_versions(tmp_path) == {"leftpad": "1.0.0"}
+
+
+# ---------------------------------------------------------------------------
+# Consumer teardown
+# ---------------------------------------------------------------------------
+
+
+class TestStopConsumerTasks:
+    """The AST consumer's ``finally`` runs the end-of-run resolution flush —
+    deferred CALLS/IMPORTS, the withheld file-hash writes, and the citation
+    retry sweep. Teardown has to let it finish."""
+
+    async def test_a_final_flush_longer_than_the_old_budget_still_completes(self):
+        """0.6s: longer than the flat ``sleep(0.5)`` this replaced, which used
+        to cancel straight into the middle of the flush."""
+        flushed = asyncio.Event()
+
+        async def consumer() -> None:
+            try:
+                await asyncio.sleep(0)
+            finally:
+                await asyncio.sleep(0.6)
+                flushed.set()
+
+        task = asyncio.create_task(consumer())
+
+        await _stop_consumer_tasks([task, None])
+
+        assert flushed.is_set()
+        assert not task.cancelled()
+
+    async def test_a_straggler_is_still_cancelled_at_the_ceiling(self, monkeypatch):
+        monkeypatch.setattr(orchestrator_module, "_CONSUMER_TEARDOWN_S", 0.05)
+        task = asyncio.create_task(asyncio.sleep(30))
+
+        await _stop_consumer_tasks([task])
+
+        assert task.cancelled()
+
+    async def test_no_tasks_is_a_no_op(self):
+        await _stop_consumer_tasks([None])
