@@ -845,14 +845,6 @@ class ASTConsumer(TierConsumer):
                     if deleted:
                         batch_max_sig = Significance.HIGH
 
-                # Files whose entity set the upsert below actually changed.
-                # Consumed by step 6: an entity's ``citations`` are folded into
-                # its content_hash, so "no entity added/modified/deleted" is
-                # proof that the file's stored citations are exactly the ones
-                # this parse produced — and therefore that the deferred citation
-                # revoke has nothing to do for that file.
-                entity_changed_files: set[str] = set()
-
                 # 3. Batched upsert (2 managed transactions) — entities + parser-only
                 #    rels. Graph-querying detectors run AFTER this write (step 3.5)
                 #    so this batch's own entities are visible for same-batch
@@ -861,12 +853,6 @@ class ASTConsumer(TierConsumer):
                 if parsed_files:
                     file_data = {fp: (pfd.entities, pfd.non_import_rels) for fp, pfd in parsed_files.items()}
                     results = await self.graph.upsert_batch_entities(project_name, file_data)
-                    entity_changed_files = {
-                        fp
-                        for fp in parsed_files
-                        # A missing result is unknown, not unchanged — withhold.
-                        if (r := results.get(fp)) is None or r.added or r.modified or r.deleted
-                    }
 
                     # 3.5. Graph-querying detectors, now that this batch's entities exist.
                     det_results: dict[str, DetectorResult] = {}
@@ -962,49 +948,27 @@ class ASTConsumer(TierConsumer):
                                     text_hash = EmbedCache.hash_text(text)
                                     embed_candidates[entity.qualified_name] = (ref, text_hash)
 
-                # 6. Write back file hashes for processed files — immediately for
-                #    files with nothing deferred; withheld for files whose parse
-                #    produced IMPORTS/CALLS/USES_TYPE/member-DEFINES rels, until
-                #    those are actually resolved in _flush_deferred_resolution.
-                #    Writing the hash any earlier would let a crash between this
-                #    write and that (possibly much later) flush permanently drop
-                #    the rels — the hash gate would then skip the file forever.
+                # 6. Withhold EVERY processed file's hash until the deferred flush.
+                #    A hash written before _flush_deferred_resolution completes lets a
+                #    crash in between drop that file's deferred work permanently — the
+                #    gate skips the file forever afterwards.
                 #
-                #    Citation REVOCATION is deferred work too, and it is owned by
-                #    files that produce no citations at all: the revoke scope in
-                #    step 7 is every parsed file, precisely so a deleted
-                #    "see ADR-14" comment clears its edge. A file with no
-                #    deferred rels and no citations left therefore still has
-                #    something pending, which is why entity_changed_files joins
-                #    the condition (ATL-090). It is the narrowest signal that
-                #    covers it: citations are part of an entity's content_hash,
-                #    so any citation that appeared or disappeared shows up as an
-                #    added/modified/deleted entity here. The converse keeps
-                #    immediate_hashes alive — a file the hash gate passed whose
-                #    entities all came back unchanged (a formatting-only edit
-                #    the whitespace strip missed, or a re-parse after a schema
-                #    migration cleared file_hash project-wide) has provably
-                #    identical citations, so its revoke is a no-op.
+                #    This used to write immediately for files with "nothing deferred",
+                #    gated on entity_changed_files. That signal is derived from the
+                #    step-3 upsert delta, and step 3 has ALREADY advanced the entity's
+                #    stored content_hash. So after an interrupted run the delta compares
+                #    against a partially-applied state: the file reports "unchanged",
+                #    takes the immediate path, and a second crash strands its citation
+                #    edge exactly as before (ATL-090). The old comment claimed an
+                #    unchanged entity has "provably identical citations" — true only if
+                #    the previous run finished, which is precisely what a crash denies.
+                #
+                #    Withholding unconditionally is strictly MORE conservative: recovery
+                #    re-parses more, never less. It also costs nothing extra — the flush
+                #    already issues one set_batch_file_hashes per project, so this
+                #    removes a second write rather than adding one.
                 if new_hashes:
-                    immediate_hashes: dict[str, str] = {}
-                    for fp, pfd in parsed_files.items():
-                        if fp not in new_hashes:
-                            continue
-                        if (
-                            pfd.import_rels
-                            or pfd.call_rels
-                            or pfd.type_rels
-                            or pfd.member_rels
-                            or pfd.anchor_rels
-                            or pfd.config_rels
-                            or pfd.citations
-                            or fp in entity_changed_files
-                        ):
-                            self._pending_file_hashes.setdefault(project_name, {})[fp] = new_hashes[fp]
-                        else:
-                            immediate_hashes[fp] = new_hashes[fp]
-                    if immediate_hashes:
-                        await self.graph.set_batch_file_hashes(project_name, immediate_hashes)
+                    self._pending_file_hashes.setdefault(project_name, {}).update(new_hashes)
 
                 # 7. Accumulate rels for deferred resolution
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]

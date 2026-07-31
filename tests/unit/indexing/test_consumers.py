@@ -653,11 +653,20 @@ async def test_a_file_whose_only_deferred_work_is_the_revoke_withholds_its_hash(
     assert graph.hash_writes == []
 
 
-async def test_a_file_with_no_entity_change_still_takes_the_immediate_hash_path(tmp_path: Path) -> None:
-    """The other half of the withholding condition: ``immediate_hashes`` stays
-    reachable. When every entity comes back unchanged, the file's stored
-    citations are byte-identical to the ones this parse produced, so the
-    revoke can neither delete nor recreate anything for it.
+async def test_an_unchanged_file_still_withholds_its_hash_until_the_flush(tmp_path: Path) -> None:
+    """Inverted from the assertion this replaces, which pinned the bug.
+
+    The old behaviour wrote the hash immediately when every entity came back
+    unchanged, on the argument that unchanged entities have "provably identical
+    citations" so the revoke is a no-op. That holds only if the previous run
+    FINISHED. Step 3's upsert has already advanced the stored content_hash, so
+    after an interrupted run the delta compares against a partially-applied
+    state: the file reports unchanged, takes the immediate path, and a second
+    crash strands its citation edge permanently (ATL-090).
+
+    Withholding unconditionally is strictly more conservative — recovery
+    re-parses more, never less — and costs no extra write, because the flush
+    already issues one set_batch_file_hashes per project.
     """
     graph = _UnchangedGraph()
     consumer = _reindex_consumer(tmp_path, graph)
@@ -666,5 +675,31 @@ async def test_a_file_with_no_entity_change_still_takes_the_immediate_hash_path(
     await consumer.process_batch([], "warmup")
     await consumer.process_batch([_event("plain.py", "proj", str(tmp_path))], "b1")
 
-    assert consumer._pending_file_hashes == {}
-    assert [fp for _, hashes in graph.hash_writes for fp in hashes] == ["plain.py"]
+    assert "plain.py" in consumer._pending_file_hashes.get("proj", {})
+    assert graph.hash_writes == [], "no hash may be written before the deferred flush"
+
+
+async def test_hash_survives_only_after_the_flush_so_a_crash_loop_cannot_strand_work(tmp_path: Path) -> None:
+    """The crash-loop case: interrupted run, then an unchanged-looking re-parse.
+
+    Simulates run N crashing after process_batch but before the flush, then run
+    N+1 seeing every entity as unchanged (because run N's upsert advanced the
+    stored hash). Run N+1 must STILL withhold, or a second crash gates the file
+    out forever.
+    """
+    graph = _UnchangedGraph()
+    consumer = _reindex_consumer(tmp_path, graph)
+    (tmp_path / "plain.py").write_text("def g():\n    return 2\n", encoding="utf-8")
+    event = _event("plain.py", "proj", str(tmp_path))
+
+    await consumer.process_batch([], "warmup")
+
+    # Run N: processed, then "crash" — the flush never runs.
+    await consumer.process_batch([event], "b1")
+    assert graph.hash_writes == []
+    consumer._pending_file_hashes.clear()  # the crash loses in-memory state
+
+    # Run N+1: entities now look unchanged. It must not shortcut to a hash write.
+    await consumer.process_batch([event], "b2")
+    assert graph.hash_writes == [], "an unchanged-looking recovery run wrote the hash before its flush"
+    assert "plain.py" in consumer._pending_file_hashes.get("proj", {})
