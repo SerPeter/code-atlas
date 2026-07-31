@@ -4815,3 +4815,48 @@ async def test_v7_migration_clears_freshness_markers(graph_client: GraphClient):
     )
     assert [r["fh"] for r in records] == [None]
     assert await graph_client.get_project_git_hash(project) is None
+
+
+# ---------------------------------------------------------------------------
+# Batch file-hash round-trip — the incremental gate's whole basis
+# ---------------------------------------------------------------------------
+
+
+async def test_batch_file_hashes_round_trip_every_file(graph_client: GraphClient):
+    """All files in a batch must be written AND read back, not just the first.
+
+    Regression: both queries used `UNWIND ... MATCH (n {..}) WHERE n:Module OR
+    n:Package`. That shape is order-sensitive in Memgraph and silently drops rows.
+    Measured before the fix: SET wrote 1 of 3 hashes with every node present, and
+    GET returned 0 of 3 when a non-matching path came first in the list. The
+    file-hash gate is what makes indexing incremental, so this made nearly every
+    file re-parse on every run — a silent, permanent performance loss with no error.
+    """
+    project = "test_batch_hash_roundtrip"
+    files = ["a.py", "b.py", "c.py"]
+    for i, fp in enumerate(files):
+        await graph_client.upsert_file_entities(
+            project,
+            fp,
+            [
+                ParsedEntity(
+                    name=f"mod{i}",
+                    qualified_name=f"{project}:mod{i}",
+                    label=NodeLabel.MODULE,
+                    kind="module",
+                    line_start=1,
+                    line_end=1,
+                    file_path=fp,
+                    content_hash=f"h{i}",
+                )
+            ],
+            [],
+        )
+
+    await graph_client.set_batch_file_hashes(project, {fp: f"hash-{fp}" for fp in files})
+
+    # A path with no node, FIRST — the exact trigger that lost every row before.
+    got = await graph_client.get_batch_file_hashes(project, ["missing.py", *files])
+
+    assert got["missing.py"] is None
+    assert {fp: got[fp] for fp in files} == {fp: f"hash-{fp}" for fp in files}

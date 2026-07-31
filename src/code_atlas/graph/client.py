@@ -1437,16 +1437,22 @@ class GraphClient:
         """
         if not file_paths:
             return {}
-        records = await self.execute(
-            f"UNWIND $fps AS fp "
-            f"MATCH (n {{project_name: $p, file_path: fp}}) "
-            f"WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE} "
-            "RETURN DISTINCT n.file_path AS fp, n.file_hash AS fh",
-            {"p": project_name, "fps": file_paths},
-        )
+        # The label filter MUST be inline on the node pattern, not a post-MATCH WHERE.
+        # `UNWIND ... MATCH (n {...}) WHERE n:Label` is order-sensitive in Memgraph and
+        # silently drops rows: measured, a batch of 3 existing files with one
+        # non-matching path FIRST returned 0 rows. That made the hash gate read back
+        # nothing and re-parse everything. One statement per label because the inline
+        # form takes a single label.
         result: dict[str, str | None] = dict.fromkeys(file_paths)
-        for r in records:
-            result[r["fp"]] = r["fh"]
+        for label in (NodeLabel.MODULE, NodeLabel.PACKAGE):
+            records = await self.execute(
+                f"UNWIND $fps AS fp "
+                f"MATCH (n:{label} {{project_name: $p, file_path: fp}}) "
+                "RETURN n.file_path AS fp, n.file_hash AS fh",
+                {"p": project_name, "fps": file_paths},
+            )
+            for r in records:
+                result[r["fp"]] = r["fh"]
         return result
 
     async def set_batch_file_hashes(
@@ -1458,13 +1464,18 @@ class GraphClient:
         if not file_hashes:
             return
         params = [{"fp": fp, "fh": fh} for fp, fh in file_hashes.items()]
-        await self.execute_write(
-            f"UNWIND $items AS item "
-            f"MATCH (n {{project_name: $p, file_path: item.fp}}) "
-            f"WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE} "
-            "SET n.file_hash = item.fh",
-            {"p": project_name, "items": params},
-        )
+        # Inline label, one statement per label — see get_batch_file_hashes. With the
+        # post-MATCH `WHERE n:Module OR n:Package` form this wrote only the FIRST
+        # file's hash per call (measured: 1 of 3, with every file's node present), so
+        # the incremental hash gate recorded almost nothing and re-parsed the repo on
+        # every run.
+        for label in (NodeLabel.MODULE, NodeLabel.PACKAGE):
+            await self.execute_write(
+                f"UNWIND $items AS item "
+                f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
+                "SET n.file_hash = item.fh",
+                {"p": project_name, "items": params},
+            )
 
     async def merge_package_node(self, project_name: str, qualified_name: str, name: str, file_path: str) -> None:
         """Create or update a Package node by uid."""
