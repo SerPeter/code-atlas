@@ -709,11 +709,25 @@ async def seeded_communities_bridge_graph(seeded_analysis_graph):
     # Cluster x: two disconnected CALLS pairs (x1->x2, x3->x4) — no path between
     # the pairs except through the shared external symbol below.
     # Cluster y: same shape, entirely separate from cluster x.
+    #
+    # Each callable gets the Module that owns its file: community detection
+    # aggregates CALLS to module granularity via file_path, so without these the
+    # bridge callables never enter the clustered graph and the test is vacuous.
     for name in ("x1", "x2", "x3", "x4", "y1", "y2", "y3", "y4"):
         await graph_client.execute_write(
             "CREATE (n:Callable {uid: $uid, project_name: $p, name: $name, "
             "qualified_name: $name, file_path: $fp, kind: 'function', line_start: 1, line_end: 2})",
             {"uid": f"{_PROJECT}:{name}", "p": _PROJECT, "name": name, "fp": f"bridge/{name}.py"},
+        )
+        await graph_client.execute_write(
+            "CREATE (m:Module {uid: $uid, project_name: $p, name: $name, qualified_name: $qn, file_path: $fp})",
+            {
+                "uid": f"{_PROJECT}:bridge.{name}",
+                "p": _PROJECT,
+                "name": name,
+                "qn": f"bridge.{name}",
+                "fp": f"bridge/{name}.py",
+            },
         )
     for f, t in [("x1", "x2"), ("x3", "x4"), ("y1", "y2"), ("y3", "y4")]:
         await graph_client.execute_write(
@@ -919,27 +933,32 @@ class TestAnalyzeRepo:
         assert result["hotspots"][0]["name"] == "handle_request"
         assert result["hotspots"][0]["loc_span"] == 25
 
-    async def test_communities_clusters_connected_entities(self, app_ctx, seeded_analysis_graph):
-        """Requires the memgraph-mage image (leiden_community_detection.get()) — see docker-compose.yml.
+    async def test_communities_clusters_modules_not_callables(self, app_ctx, seeded_analysis_graph):
+        """Community members are Modules — the granularity the question is asked at.
 
-        The fixture's CALLS+IMPORTS edges connect handle_request, helper, models,
-        utils, User, and Base into one component, so they should land in the
-        same community.
+        ``handle_request`` (mypkg/sub/api.py) CALLS ``helper`` (mypkg/utils.py);
+        that callable-level edge must surface as coupling between *mypkg.sub.api*
+        and *mypkg.utils*, and the fixture's IMPORTS edges tie mypkg.models in
+        too — one three-module subsystem, no callables listed.
         """
         result = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
         assert result["analysis"] == "communities"
         assert "error" not in result
-        assert result["community_count"] >= 1
-        all_names = {m["name"] for c in result["communities"] for m in c["members"]}
-        assert {"handle_request", "helper"} <= all_names
-        # handle_request and helper are directly CALLS-connected — must share a community.
-        owning_communities = {
-            c["community_id"]
-            for c in result["communities"]
-            for m in c["members"]
-            if m["name"] in {"handle_request", "helper"}
-        }
-        assert len(owning_communities) == 1
+        assert result["granularity"] == "module"
+        assert result["community_count"] == 1
+        members = result["communities"][0]["members"]
+        assert {m["label"] for m in members} == {"Module"}
+        assert {m["qualified_name"] for m in members} == {"mypkg.models", "mypkg.utils", "mypkg.sub.api"}
+
+    async def test_communities_are_deterministic_on_a_real_graph(self, app_ctx, seeded_analysis_graph):
+        """Two identical calls must return an identical partition — the property
+        MAGE's Leiden could not offer, and the reason the clustering moved into
+        Python (ADR-0017's mechanism is superseded, see _analyze_communities).
+        """
+        first = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
+        second = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
+        del first["query_ms"], second["query_ms"]
+        assert first == second
 
     async def test_communities_shared_external_symbol_does_not_merge_unrelated_clusters(
         self, app_ctx, seeded_communities_bridge_graph
@@ -951,9 +970,13 @@ class TestAnalyzeRepo:
         internally-connected clusters (x1-x2/x3-x4 and y1-y2/y3-y4) that share no
         real CALLS/IMPORTS edge with each other — their only common neighbor is an
         ExternalSymbol imported by both, plus filler modules that import nothing
-        else. Pre-fix this reproduces the reported bug (verified manually: parts of
-        the x/y clusters land in one community together with the external node);
-        post-fix they must stay apart.
+        else.
+
+        Module-granularity clustering makes this structurally impossible rather
+        than merely handled: only ``:Module`` nodes are ever clustered and an
+        entity only enters the graph if its file_path maps to one, so an external
+        node has nowhere to appear. Kept as a guard against a future projection
+        change reintroducing entity-level endpoints.
         """
         result = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
         assert result["analysis"] == "communities"
@@ -996,20 +1019,15 @@ class TestShortcutTools:
         assert shortcut == direct
 
     async def test_find_communities_matches_analyze_repo(self, app_ctx, seeded_analysis_graph):
-        """community_id is an arbitrary label Leiden reassigns per run — compare
-        membership sets, not the raw ids, so two separate calls stay comparable.
+        """Strict equality, not just matching membership sets: the partition (and
+        with it every community_id) is deterministic now, so the shortcut and the
+        dispatcher must agree byte for byte.
         """
         shortcut = await _invoke_tool(app_ctx, "find_communities", project=_PROJECT)
         direct = await _invoke_tool(app_ctx, "analyze_repo", analysis="communities", project=_PROJECT)
         del shortcut["query_ms"]
         del direct["query_ms"]
-
-        def member_sets(result: dict) -> list[tuple[str, ...]]:
-            return sorted(tuple(sorted(m["uid"] for m in c["members"])) for c in result["communities"])
-
-        assert shortcut["analysis"] == direct["analysis"] == "communities"
-        assert shortcut["community_count"] == direct["community_count"]
-        assert member_sets(shortcut) == member_sets(direct)
+        assert shortcut == direct
 
     async def test_find_hotspots_matches_analyze_repo(self, app_ctx, seeded_analysis_graph):
         from code_atlas.indexing.git_signals import CoChangePair, FileSignal, GitSignalsResult, write_git_signals

@@ -16,7 +16,15 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
-from code_atlas.server.analysis import _sid, analyze_repo, blast_radius, generate_diagram, trace_path
+from code_atlas.server.analysis import (
+    _detect_module_communities,
+    _modularity,
+    _sid,
+    analyze_repo,
+    blast_radius,
+    generate_diagram,
+    trace_path,
+)
 
 # ---------------------------------------------------------------------------
 # Dependencies: cross-package coupling
@@ -761,255 +769,292 @@ async def test_complexity_excludes_test_modules_and_backfills_real_hotspot():
 
 
 # ---------------------------------------------------------------------------
-# Communities (ADR-0013 shortcut: find_communities, MAGE leiden_community_detection)
+# Communities (ADR-0013 shortcut: find_communities)
 #
-# _analyze_communities still calls graph.execute() directly (deliberate — see
-# its docstring), so these tests are unchanged from before the encapsulation.
+# Clustering happens at MODULE granularity over a graph built in Python, so
+# these tests feed the two raw reads _fetch_community_inputs performs (module
+# inventory, then module-pair CALLS weights) through graph.execute's side_effect
+# and the module-to-module IMPORTS through the get_module_import_edges backend
+# method. Only the two reads are Memgraph-specific; everything asserted below
+# (aggregation, weighting, clustering, filtering) is pure Python.
 # ---------------------------------------------------------------------------
 
 
-def _community_row(uid: str, community_id: int, name: str = "", label: str = "Callable") -> dict[str, object]:
+def _mod_row(qn: str, file_path: str = "", name: str = "") -> dict[str, Any]:
     return {
-        "uid": uid,
-        "name": name or uid,
-        "qn": uid,
-        "label": label,
-        "file_path": "pkg/mod.py",
-        "community_id": community_id,
+        "uid": f"proj:{qn}",
+        "name": name or qn.rsplit(".", 1)[-1],
+        "qn": qn,
+        "file_path": file_path or (qn.replace(".", "/") + ".py"),
     }
 
 
-async def test_communities_groups_and_sorts_by_size_descending():
-    graph = MagicMock()
-    graph.execute = AsyncMock(
-        return_value=[
-            _community_row("p:a", 0),
-            _community_row("p:b", 0),
-            _community_row("p:c", 1),
-            _community_row("p:d", 1),
-            _community_row("p:e", 1),
-        ]
-    )
+def _call_row(from_path: str, to_path: str, weight: float) -> dict[str, Any]:
+    return {"from_path": from_path, "to_path": to_path, "weight": weight}
 
-    result = await analyze_repo(graph, "communities", "code-atlas")
+
+def _community_graph(
+    modules: list[dict[str, Any]],
+    calls: list[dict[str, Any]] | None = None,
+    direct: list[dict[str, str]] | None = None,
+    indirect: list[dict[str, str]] | None = None,
+) -> MagicMock:
+    graph = MagicMock()
+    graph.execute = AsyncMock(side_effect=[modules, calls or []])
+    graph.get_module_import_edges = AsyncMock(return_value={"direct": direct or [], "indirect": indirect or []})
+    return graph
+
+
+def _path_of(qn: str) -> str:
+    return qn.replace(".", "/") + ".py"
+
+
+def _clique(qns: list[str], weight: float) -> list[dict[str, Any]]:
+    """CALLS rows joining every pair in *qns* (one direction) at *weight*."""
+    return [_call_row(_path_of(a), _path_of(b), weight) for i, a in enumerate(qns) for b in qns[i + 1 :]]
+
+
+async def test_communities_cluster_modules_not_callables():
+    """The unit of a subsystem is a module.
+
+    Callable-level CALLS rows are attributed to the module owning each endpoint
+    (via file_path) before anything is clustered — at callable granularity the
+    call graph is one dense giant component and the partition is useless.
+    """
+    modules = [_mod_row(qn) for qn in ("pkg.a1", "pkg.a2", "pkg.a3", "pkg.b1", "pkg.b2", "pkg.b3")]
+    calls = _clique(["pkg.a1", "pkg.a2", "pkg.a3"], 10.0) + _clique(["pkg.b1", "pkg.b2", "pkg.b3"], 10.0)
+    calls.append(_call_row(_path_of("pkg.a1"), _path_of("pkg.b1"), 0.25))
+    graph = _community_graph(modules, calls)
+
+    result = await analyze_repo(graph, "communities", "proj")
 
     assert result["analysis"] == "communities"
+    assert result["granularity"] == "module"
     assert result["community_count"] == 2
-    assert [c["community_id"] for c in result["communities"]] == [1, 0]
-    assert [c["size"] for c in result["communities"]] == [3, 2]
-    query = graph.execute.call_args[0][0]
-    assert "leiden_community_detection.get" in query
-    assert "project(p)" in query
+    assert {m["label"] for c in result["communities"] for m in c["members"]} == {"Module"}
+    grouped = [{m["qualified_name"] for m in c["members"]} for c in result["communities"]]
+    assert {"pkg.a1", "pkg.a2", "pkg.a3"} in grouped
+    assert {"pkg.b1", "pkg.b2", "pkg.b3"} in grouped
 
 
-async def test_communities_reports_an_unpartitionable_subgraph_as_empty_not_a_deployment_error():
-    """MAGE raises rather than returning empty when Leiden cannot partition.
+async def test_communities_query_sums_the_numeric_calls_weight():
+    """A silently-unweighted run is indistinguishable from a weighted one by output.
 
-    Verified live against memgraph-mage:3.7.2 (see ADR-0017's Empirical Validation).
-    Reporting that as PROCEDURE_UNAVAILABLE sends the caller off to check their Docker
-    image when the real cause is a sparse subgraph, so the two must stay distinguished.
+    The summation happens database-side (one row per module pair), so pin the
+    aggregate itself: ``sum`` of the *numeric* ``weight`` property, defaulting to
+    ``1.0`` (``_CALL_WEIGHT_BASE``) for edges written before the ADR-0014
+    weighting amendment. Summing — not averaging, not counting rows — is what
+    makes a module pair joined by many confident calls outrank one joined by a
+    single ambiguous or test-provenance call. ``confidence`` is a *string* and
+    must never appear as the aggregated property.
     """
-    graph = MagicMock()
-    graph.execute = AsyncMock(side_effect=RuntimeError("leiden_community_detection.get: No communities detected."))
+    graph = _community_graph([_mod_row("pkg.a")])
 
-    result = await analyze_repo(graph, "communities", "code-atlas")
+    await analyze_repo(graph, "communities", "proj")
 
-    assert result["communities"] == []
-    assert "code" not in result, "an unpartitionable subgraph is not an error condition"
-    assert "no communities detected" in result["note"].lower()
-
-
-async def test_communities_still_reports_a_missing_mage_procedure_as_an_error():
-    graph = MagicMock()
-    graph.execute = AsyncMock(side_effect=RuntimeError("Unknown procedure leiden_community_detection.get"))
-
-    result = await analyze_repo(graph, "communities", "code-atlas")
-
-    assert result["code"] == "PROCEDURE_UNAVAILABLE"
-    assert "memgraph-mage" in result["error"]
+    calls_query = graph.execute.call_args_list[1][0][0]
+    assert "sum(coalesce(r.weight, 1.0))" in calls_query
+    assert "confidence" not in calls_query
 
 
-async def test_communities_passes_the_numeric_weight_property_to_leiden():
-    """MAGE reads a missing or non-numeric weight_property as 1.0 with no error, so
-    an unweighted call and a mis-named one are indistinguishable from the result.
-    Pin the exact positional argument instead — and specifically that it is not
-    'confidence', which is a *string* on CALLS edges and would silently degrade
-    the whole clustering back to unweighted.
+async def test_greedy_modularity_is_weight_sensitive():
+    """Proof the maximizer reads weights rather than edge presence.
+
+    Same 4-node path either way: with weights 10/10/0.1 the near-zero last hop
+    cannot pay for its own community, so all four modules stay together; with
+    every edge at 1.0 the identical topology splits in two. If weights were
+    dropped anywhere between aggregation and clustering, both calls would return
+    the unweighted partition.
     """
-    graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[])
+    weighted = {("a", "b"): 10.0, ("b", "c"): 10.0, ("c", "d"): 0.1}
+    unweighted = dict.fromkeys(weighted, 1.0)
 
-    await analyze_repo(graph, "communities", "code-atlas")
-
-    query = graph.execute.call_args[0][0]
-    assert 'leiden_community_detection.get(subgraph, "weight")' in query
-    assert '"confidence"' not in query
+    assert _detect_module_communities({"a", "b", "c", "d"}, weighted) == [["a", "b", "c", "d"]]
+    assert _detect_module_communities({"a", "b", "c", "d"}, unweighted) == [["a", "b"], ["c", "d"]]
 
 
-async def test_communities_query_excludes_external_labels():
-    """ExternalPackage/ExternalSymbol must be excluded from both edge endpoints —
-    otherwise a widely-referenced external symbol (e.g. collections.abc.Coroutine)
-    becomes a false hub that glues unrelated modules into one giant community."""
-    graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[])
+async def test_communities_are_deterministic_across_identical_calls():
+    """Determinism is the reason this isn't MAGE's Leiden.
 
-    await analyze_repo(graph, "communities", "code-atlas")
+    Leiden is documented non-deterministic, so two identical calls could return
+    different partitions and no two runs could be diffed. Greedy modularity with
+    a lexicographic tie-break must be byte-stable.
+    """
+    modules = [_mod_row(f"pkg.m{i}") for i in range(8)]
+    calls = _clique([f"pkg.m{i}" for i in range(4)], 5.0) + _clique([f"pkg.m{i}" for i in range(4, 8)], 5.0)
+    calls.append(_call_row(_path_of("pkg.m0"), _path_of("pkg.m4"), 0.1))
 
-    query = graph.execute.call_args[0][0]
-    assert "NOT a:ExternalPackage" in query
-    assert "NOT a:ExternalSymbol" in query
-    assert "NOT b:ExternalPackage" in query
-    assert "NOT b:ExternalSymbol" in query
+    runs = []
+    for _ in range(2):
+        result = await analyze_repo(_community_graph(list(modules), list(calls)), "communities", "proj")
+        result.pop("query_ms")
+        runs.append(json.dumps(result, sort_keys=True))
+
+    assert runs[0] == runs[1]
 
 
-async def test_communities_drops_singleton_noise():
-    graph = MagicMock()
-    graph.execute = AsyncMock(
-        return_value=[
-            _community_row("p:solo", 0),
-            _community_row("p:a", 1),
-            _community_row("p:b", 1),
-        ]
+async def test_communities_fold_reciprocal_and_import_edges_into_one_module_pair():
+    """a->b, b->a and an a/b IMPORTS edge are one undirected module pair, not three.
+
+    Modularity is defined on undirected graphs; leaving parallel edges separate
+    would double-count the same coupling. Their weights add.
+    """
+    modules = [_mod_row("pkg.a"), _mod_row("pkg.b")]
+    calls = [
+        _call_row(_path_of("pkg.a"), _path_of("pkg.b"), 3.0),
+        _call_row(_path_of("pkg.b"), _path_of("pkg.a"), 2.0),
+    ]
+    graph = _community_graph(modules, calls, direct=[{"from_mod": "pkg.a", "to_mod": "pkg.b"}])
+
+    result = await analyze_repo(graph, "communities", "proj")
+
+    assert result["edge_count"] == 1
+    assert result["community_count"] == 1
+
+
+async def test_communities_include_module_to_module_imports_without_any_calls():
+    """IMPORTS is the other half of the projection.
+
+    ``get_module_import_edges`` already resolves Module->symbol edges back
+    through DEFINES to the defining module (the ``indirect`` list) — that
+    resolution is what makes IMPORTS genuine module-to-module structure instead
+    of a hub through every shared symbol.
+    """
+    modules = [_mod_row("pkg.a"), _mod_row("pkg.b")]
+    graph = _community_graph(modules, indirect=[{"from_mod": "pkg.a", "to_mod": "pkg.b"}])
+
+    result = await analyze_repo(graph, "communities", "proj")
+
+    assert result["edge_count"] == 1
+    assert result["community_count"] == 1
+    assert {m["qualified_name"] for m in result["communities"][0]["members"]} == {"pkg.a", "pkg.b"}
+
+
+async def test_communities_ignore_import_edges_pointing_out_of_scope():
+    """get_module_import_edges only path-filters the importing side, so a scoped
+    call can return edges whose target module isn't in the inventory. Those must
+    not conjure a phantom node into the clustered graph."""
+    graph = _community_graph(
+        [_mod_row("pkg.a"), _mod_row("pkg.b")],
+        direct=[{"from_mod": "pkg.a", "to_mod": "other.z"}, {"from_mod": "pkg.a", "to_mod": "pkg.b"}],
     )
 
-    result = await analyze_repo(graph, "communities", "code-atlas")
+    result = await analyze_repo(graph, "communities", "proj")
 
+    assert result["module_count"] == 2
+    assert result["edge_count"] == 1
+
+
+async def test_communities_drop_intra_module_calls():
+    """Calls between two entities in the same module say how cohesive that module
+    is internally, not which modules belong together."""
+    graph = _community_graph(
+        [_mod_row("pkg.a"), _mod_row("pkg.b")],
+        [_call_row(_path_of("pkg.a"), _path_of("pkg.a"), 50.0)],
+    )
+
+    result = await analyze_repo(graph, "communities", "proj")
+
+    assert result["edge_count"] == 0
+    assert result["communities"] == []
+
+
+async def test_communities_exclude_test_modules_from_the_clustered_graph():
+    """Test modules must be gone before the graph is built, not filtered from the
+    result — otherwise a test module that exercises two unrelated production
+    subsystems bridges them into one community (see ADR-0016).
+
+    Here tests/test_bridge.py exercises all of pkg.a* and pkg.b* — heavier
+    coupling than either production pair has with itself, so with it in the graph
+    the whole thing is one community and the two subsystems disappear.
+    """
+    modules = [_mod_row(qn) for qn in ("pkg.a1", "pkg.a2", "pkg.b1", "pkg.b2")]
+    modules.append(_mod_row("tests.test_bridge", file_path="tests/test_bridge.py", name="test_bridge"))
+    calls = [
+        _call_row(_path_of("pkg.a1"), _path_of("pkg.a2"), 1.0),
+        _call_row(_path_of("pkg.b1"), _path_of("pkg.b2"), 1.0),
+    ] + [_call_row("tests/test_bridge.py", _path_of(qn), 5.0) for qn in ("pkg.a1", "pkg.a2", "pkg.b1", "pkg.b2")]
+
+    unfiltered = await analyze_repo(_community_graph(list(modules), list(calls)), "communities", "proj")
+    assert unfiltered["module_count"] == 5
+    assert unfiltered["community_count"] == 1, "fixture must actually bridge, or the test proves nothing"
+
+    filtered = await analyze_repo(
+        _community_graph(list(modules), list(calls)), "communities", "proj", test_patterns=("tests/",)
+    )
+
+    assert filtered["module_count"] == 4
+    assert filtered["community_count"] == 2
+    assert all(not m["file_path"].startswith("tests/") for c in filtered["communities"] for m in c["members"])
+
+
+async def test_communities_drop_isolated_modules_as_noise():
+    """Config/manifest pseudo-modules and unreferenced leaves have no edges at
+    all — they'd otherwise flood the output as singleton 'communities'."""
+    graph = _community_graph(
+        [_mod_row("pkg.a"), _mod_row("pkg.b"), _mod_row("pyproject_toml", file_path="pyproject.toml")],
+        [_call_row(_path_of("pkg.a"), _path_of("pkg.b"), 4.0)],
+    )
+
+    result = await analyze_repo(graph, "communities", "proj")
+
+    assert result["module_count"] == 3
     assert result["community_count"] == 1
-    assert result["communities"][0]["community_id"] == 1
     assert result["noise_threshold"] == 2
+    assert {m["qualified_name"] for m in result["communities"][0]["members"]} == {"pkg.a", "pkg.b"}
 
 
 async def test_communities_caps_members_and_communities_by_limit():
-    graph = MagicMock()
-    graph.execute = AsyncMock(
-        return_value=[_community_row(f"p:c1_{i}", 0) for i in range(5)]
-        + [_community_row(f"p:c2_{i}", 1) for i in range(3)]
-    )
+    modules = [_mod_row(f"pkg.a{i}") for i in range(5)] + [_mod_row(f"pkg.b{i}") for i in range(3)]
+    calls = _clique([f"pkg.a{i}" for i in range(5)], 10.0) + _clique([f"pkg.b{i}" for i in range(3)], 10.0)
+    graph = _community_graph(modules, calls)
 
-    result = await analyze_repo(graph, "communities", "code-atlas", limit=1)
+    result = await analyze_repo(graph, "communities", "proj", limit=1)
 
     assert len(result["communities"]) == 1
-    assert result["communities"][0]["community_id"] == 0
+    assert result["communities"][0]["size"] == 5, "size reports full membership, limit only caps what's listed"
     assert len(result["communities"][0]["members"]) == 1
 
 
-async def test_communities_excludes_test_uids_from_the_leiden_query_itself():
-    """Test entities must be excluded from the a/b edge endpoints Leiden clusters
-    on (query-level), not filtered from already-computed communities afterward.
+async def test_communities_report_an_unclusterable_scope_as_empty_not_an_error():
+    graph = _community_graph([_mod_row("pkg.a")])
 
-    Simulates the two-phase flow: a cheap node-listing pre-query (used to compute
-    which uids match test_patterns via the canonical matches_test_pattern), then
-    the actual Leiden query — which, in the mock, already omits the test uids,
-    matching what Memgraph would do once the NOT a.uid IN $excluded_uids clause
-    is applied. If excluded_uids weren't actually computed/passed, the assertion
-    on the second call's params below would fail.
-    """
-    graph = MagicMock()
-    node_listing_rows = [
-        {"uid": "p:t1", "name": "test_a", "file_path": "tests/test_a.py"},
-        {"uid": "p:t2", "name": "test_b", "file_path": "tests/test_b.py"},
-        {"uid": "p:r1", "name": "real_a", "file_path": "pkg/real_a.py"},
-        {"uid": "p:r2", "name": "real_b", "file_path": "pkg/real_b.py"},
+    result = await analyze_repo(graph, "communities", "proj")
+
+    assert result["communities"] == []
+    assert "code" not in result, "a scope with no module-to-module edges is not an error condition"
+    assert "no communities detected" in result["note"].lower()
+
+
+async def test_communities_respect_path_scope():
+    graph = _community_graph([_mod_row("pkg.a")])
+
+    await analyze_repo(graph, "communities", "proj", path="src/foo")
+
+    module_query, module_params = graph.execute.call_args_list[0][0]
+    calls_query, _ = graph.execute.call_args_list[1][0]
+    assert "m.file_path STARTS WITH $path" in module_query
+    assert "a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path" in calls_query
+    assert module_params["path"] == "src/foo"
+    graph.get_module_import_edges.assert_awaited_once_with("proj", "src/foo")
+
+
+async def test_communities_report_modularity_of_the_full_partition():
+    """Q is computed before the noise cut so it stays comparable across calls —
+    dropping singletons would otherwise inflate it as the repo grows leaves."""
+    modules = [_mod_row("pkg.a"), _mod_row("pkg.b"), _mod_row("pkg.c"), _mod_row("pkg.d")]
+    calls = [
+        _call_row(_path_of("pkg.a"), _path_of("pkg.b"), 10.0),
+        _call_row(_path_of("pkg.c"), _path_of("pkg.d"), 10.0),
+        _call_row(_path_of("pkg.b"), _path_of("pkg.c"), 0.1),
     ]
-    leiden_rows = [
-        {
-            "uid": "p:r1",
-            "name": "real_a",
-            "qn": "pkg.real_a",
-            "label": "Callable",
-            "file_path": "pkg/real_a.py",
-            "community_id": 1,
-        },
-        {
-            "uid": "p:r2",
-            "name": "real_b",
-            "qn": "pkg.real_b",
-            "label": "Callable",
-            "file_path": "pkg/real_b.py",
-            "community_id": 1,
-        },
-    ]
-    graph.execute = AsyncMock(side_effect=[node_listing_rows, leiden_rows])
+    graph = _community_graph(modules, calls)
 
-    result = await analyze_repo(graph, "communities", "code-atlas", test_patterns=("tests/",))
+    result = await analyze_repo(graph, "communities", "proj")
 
-    assert graph.execute.call_count == 2
-    leiden_call_params = graph.execute.call_args_list[1][0][1]
-    assert set(leiden_call_params["excluded_uids"]) == {"p:t1", "p:t2"}
-    assert result["community_count"] == 1
-    assert {m["name"] for m in result["communities"][0]["members"]} == {"real_a", "real_b"}
-
-
-async def test_communities_skips_node_listing_query_when_no_test_patterns():
-    """No test_patterns means no filtering is needed — must not pay for the
-    extra node-listing pre-query when it can't change anything."""
-    graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[])
-
-    await analyze_repo(graph, "communities", "code-atlas")
-
-    assert graph.execute.call_count == 1
-
-
-async def test_communities_drops_test_only_community_below_noise_threshold():
-    """A community whose only members are test scaffolding must disappear
-    entirely once filtered, not survive with an empty/tiny member list."""
-    graph = MagicMock()
-    graph.execute = AsyncMock(
-        side_effect=[
-            [
-                {"uid": "p:t1", "name": "test_a", "file_path": "tests/test_a.py"},
-                {"uid": "p:t2", "name": "test_b", "file_path": "tests/test_b.py"},
-                {"uid": "p:r1", "name": "real_a", "file_path": "pkg/real_a.py"},
-                {"uid": "p:r2", "name": "real_b", "file_path": "pkg/real_b.py"},
-            ],
-            [
-                {
-                    "uid": "p:r1",
-                    "name": "real_a",
-                    "qn": "pkg.real_a",
-                    "label": "Callable",
-                    "file_path": "pkg/real_a.py",
-                    "community_id": 1,
-                },
-                {
-                    "uid": "p:r2",
-                    "name": "real_b",
-                    "qn": "pkg.real_b",
-                    "label": "Callable",
-                    "file_path": "pkg/real_b.py",
-                    "community_id": 1,
-                },
-            ],
-        ]
-    )
-
-    result = await analyze_repo(graph, "communities", "code-atlas", test_patterns=("tests/",))
-
-    assert result["community_count"] == 1
-    assert result["communities"][0]["community_id"] == 1
-    assert {m["name"] for m in result["communities"][0]["members"]} == {"real_a", "real_b"}
-
-
-async def test_communities_returns_procedure_unavailable_error_when_mage_missing():
-    graph = MagicMock()
-    graph.execute = AsyncMock(side_effect=Exception("Unknown procedure 'leiden_community_detection.get'"))
-
-    result = await analyze_repo(graph, "communities", "code-atlas")
-
-    assert result["code"] == "PROCEDURE_UNAVAILABLE"
-    assert "error" in result
-
-
-async def test_communities_respects_path_scope():
-    graph = MagicMock()
-    graph.execute = AsyncMock(return_value=[])
-
-    await analyze_repo(graph, "communities", "code-atlas", path="src/foo")
-
-    query, params = graph.execute.call_args[0]
-    assert "$path" in query
-    assert params["path"] == "src/foo"
+    assert result["community_count"] == 2
+    expected_edges = {("pkg.a", "pkg.b"): 10.0, ("pkg.c", "pkg.d"): 10.0, ("pkg.b", "pkg.c"): 0.1}
+    assert result["modularity"] == round(_modularity([["pkg.a", "pkg.b"], ["pkg.c", "pkg.d"]], expected_edges), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -1634,6 +1679,28 @@ async def test_module_summary_renders_linked_docs():
 
     assert "DOCS" in outline
     assert "  f < note:f-gotchas(anchor)" in outline
+
+
+async def test_module_summary_renders_a_citation_the_right_way_round():
+    """``<`` means "documented by". A citation edge is doc → code like every
+    other DOCUMENTS edge, so the cited ADR is the reference, not the target."""
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[_summary_entity("pkg.mod.f", sig="def f()")],
+        docs=[
+            {
+                "doc_qn": "wiki/adr/0014-calls-edge-confidence.md",
+                "doc_name": "0014-calls-edge-confidence.md",
+                "doc_label": "DocFile",
+                "to_qn": "pkg.mod.f",
+                "link_type": "citation",
+            }
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    assert "  f < wiki/adr/0014-calls-edge-confidence.md(citation)" in outline
 
 
 # ---------------------------------------------------------------------------

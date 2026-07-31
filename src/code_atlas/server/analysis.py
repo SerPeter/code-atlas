@@ -56,6 +56,24 @@ _INSTABILITY_HIGH = 0.9
 # actionable groupings, drop them before ranking by size.
 _COMMUNITY_NOISE_THRESHOLD = 2
 
+# Communities clustering (see _analyze_communities). Greedy modularity is subject
+# to the well-known resolution limit (Fortunato & Barthelemy 2007): on a weighted
+# graph it fuses genuinely distinct blocks whose internal weight is small relative
+# to the whole. The standard remedy is to re-run the maximizer on each community's
+# *induced* subgraph and keep the split when the sub-partition is itself
+# well-structured. _COMMUNITY_SPLIT_MIN_MODULARITY is that "well-structured" bar,
+# expressed as the sub-partition's modularity inside its own subgraph — roughly
+# half of Newman & Girvan's 0.3 "significant community structure" rule of thumb,
+# because the subgraph being split is already a cohesive block. Measured on this
+# repo's own module graph the partition is flat across 0.08-0.17 (7 communities);
+# 0.12 sits in the middle of that plateau. Below ~0.06 it starts carving cohesive
+# packages apart, above ~0.18 it stops splitting the giant blob at all.
+_COMMUNITY_SPLIT_MIN_MODULARITY = 0.12
+_COMMUNITY_MAX_SPLIT_DEPTH = 6
+# Modularity gains are floats; treat anything under this as "no gain" so the
+# agglomeration terminates instead of chasing rounding noise.
+_MODULARITY_EPSILON = 1e-12
+
 # Bus-factor risk: a file with only this many distinct authors (and at least
 # one commit) is a single/double-owner risk worth flagging.
 _BUS_FACTOR_AUTHOR_THRESHOLD = 1
@@ -1009,186 +1027,314 @@ async def _analyze_complexity(
 
 
 # ---------------------------------------------------------------------------
-# Communities (Leiden clustering over the CALLS+IMPORTS subgraph, ADR-0013/MAGE)
+# Communities (module-granularity greedy modularity over the aggregated
+# CALLS+IMPORTS graph — ADR-0013's find_communities)
 # ---------------------------------------------------------------------------
+
+# Undirected edge key: always (min, max) so a->b and b->a fold into one entry.
+type _ModuleEdges = dict[tuple[str, str], float]
+
+
+def _undirected_key(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a < b else (b, a)
+
+
+def _greedy_modularity(nodes: set[str], edges: _ModuleEdges) -> list[list[str]]:
+    """Agglomerative greedy modularity maximization (Clauset-Newman-Moore).
+
+    Every node starts alone; the connected community pair with the largest
+    modularity gain is merged repeatedly until no merge improves modularity.
+    For weighted undirected graphs the gain of merging communities *i* and *j*
+    is ``2 * (w_ij/2m - tot_i*tot_j/(2m)^2)`` where ``w_ij`` is the weight
+    between them, ``tot`` their summed node degrees and ``m`` the total edge
+    weight.
+
+    **Deterministic by construction** — ties are broken on the lexicographically
+    smallest community-key pair, and a community's key is the smallest member
+    name it has absorbed. Identical input always yields byte-identical output,
+    which is the whole reason this exists instead of MAGE's Leiden (documented
+    non-deterministic, so consecutive identical calls could disagree and no two
+    runs were diffable).
+
+    Isolated nodes (no incident edge) come back as their own single-member
+    community.
+    """
+    all_nodes = sorted(nodes | {n for key in edges for n in key})
+    members: dict[str, list[str]] = {n: [n] for n in all_nodes}
+    if not edges:
+        return [[n] for n in all_nodes]
+
+    degree: dict[str, float] = dict.fromkeys(members, 0.0)
+    between: _ModuleEdges = {}
+    total_weight = 0.0
+    for (u, v), w in edges.items():
+        degree[u] += w
+        degree[v] += w
+        total_weight += w
+        key = _undirected_key(u, v)
+        between[key] = between.get(key, 0.0) + w
+    two_m = 2.0 * total_weight
+
+    while between:
+        gains = {
+            key: 2.0 * (w / two_m - degree[key[0]] * degree[key[1]] / (two_m * two_m)) for key, w in between.items()
+        }
+        best_gain = max(gains.values())
+        if best_gain <= _MODULARITY_EPSILON:
+            break
+        keep, absorbed = min(key for key, gain in gains.items() if gain >= best_gain - _MODULARITY_EPSILON)
+
+        members[keep].extend(members.pop(absorbed))
+        degree[keep] += degree.pop(absorbed)
+        merged: _ModuleEdges = {}
+        for (a, b), w in between.items():
+            left = keep if a == absorbed else a
+            right = keep if b == absorbed else b
+            if left == right:
+                continue
+            key = _undirected_key(left, right)
+            merged[key] = merged.get(key, 0.0) + w
+        between = merged
+
+    return [sorted(group) for group in members.values()]
+
+
+def _modularity(partition: list[list[str]], edges: _ModuleEdges) -> float:
+    """Newman modularity Q of *partition* over the weighted undirected *edges*."""
+    total_weight = sum(edges.values())
+    if total_weight <= 0:
+        return 0.0
+    community_of = {node: idx for idx, group in enumerate(partition) for node in group}
+    internal = [0.0] * len(partition)
+    degree = [0.0] * len(partition)
+    for (u, v), w in edges.items():
+        cu, cv = community_of[u], community_of[v]
+        degree[cu] += w
+        degree[cv] += w
+        if cu == cv:
+            internal[cu] += w
+    two_m = 2.0 * total_weight
+    return sum(inner / total_weight - (deg / two_m) ** 2 for inner, deg in zip(internal, degree, strict=True))
+
+
+def _detect_module_communities(nodes: set[str], edges: _ModuleEdges, depth: int = 0) -> list[list[str]]:
+    """Greedy modularity plus recursive refinement of the resolution limit.
+
+    Plain modularity maximization systematically under-splits: on this repo it
+    fuses everything below the parsing package into three blobs. Re-running the
+    same maximizer on each community's induced subgraph and accepting the split
+    only when that sub-partition scores at least
+    ``_COMMUNITY_SPLIT_MIN_MODULARITY`` inside its own subgraph recovers the
+    real subsystems without introducing a hand-tuned resolution parameter that
+    would need re-tuning per repository.
+    """
+    partition = _greedy_modularity(nodes, edges)
+    if depth >= _COMMUNITY_MAX_SPLIT_DEPTH:
+        return partition
+
+    refined: list[list[str]] = []
+    for group in partition:
+        if len(group) < _COMMUNITY_NOISE_THRESHOLD + 1:
+            refined.append(group)
+            continue
+        inside = set(group)
+        sub_edges = {key: w for key, w in edges.items() if key[0] in inside and key[1] in inside}
+        sub_partition = _greedy_modularity(inside, sub_edges)
+        if len(sub_partition) > 1 and _modularity(sub_partition, sub_edges) >= _COMMUNITY_SPLIT_MIN_MODULARITY:
+            refined.extend(_detect_module_communities(inside, sub_edges, depth + 1))
+        else:
+            refined.append(group)
+    return refined
+
+
+async def _fetch_community_inputs(
+    graph: GraphBackend, project: str, path: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Module inventory + module-pair CALLS weights, both read-only.
+
+    Two raw-Cypher reads rather than ``GraphBackend`` methods, for the same
+    reason ``cypher_query``/``validate_cypher`` bypass the contract: there is no
+    portable method for either shape yet, and adding one touches
+    ``graph/protocol.py``/``graph/client.py``/``backends/sqlite_graph.py``. That
+    is the *only* thing standing between this analysis and the SQLite backend —
+    the clustering itself is pure Python now (see ``_analyze_communities``).
+
+    The CALLS read aggregates in the database (``sum`` grouped by the endpoint
+    file paths) so the ~10k callable-level edges never cross the wire; what comes
+    back is one row per ordered file pair. ``coalesce(r.weight, 1.0)`` matches
+    ``_CALL_WEIGHT_BASE`` — edges written before the weighting amendment to
+    ADR-0014 count as one fully-resolved production call.
+    """
+    params: dict[str, Any] = {"project": project, "path": path}
+    module_scope = " AND m.file_path STARTS WITH $path" if path else ""
+    modules = await graph.execute(
+        "MATCH (m:Module {project_name: $project}) "
+        f"WHERE m.file_path IS NOT NULL{module_scope} "
+        "RETURN m.uid AS uid, m.name AS name, m.qualified_name AS qn, m.file_path AS file_path",
+        params,
+    )
+    call_scope = " AND a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path" if path else ""
+    call_edges = await graph.execute(
+        "MATCH (a {project_name: $project})-[r:CALLS]->(b {project_name: $project}) "
+        "WHERE a.file_path IS NOT NULL AND b.file_path IS NOT NULL "
+        f"AND a.file_path <> b.file_path{call_scope} "
+        "RETURN a.file_path AS from_path, b.file_path AS to_path, "
+        "sum(coalesce(r.weight, 1.0)) AS weight",
+        params,
+    )
+    return modules, call_edges
 
 
 async def _analyze_communities(
     graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
 ) -> dict[str, Any]:
-    """Cluster the project's CALLS+IMPORTS subgraph via Leiden community detection.
+    """Cluster the project's **modules** into subsystems by greedy modularity.
 
-    Requires a MAGE-enabled Memgraph image (``memgraph/memgraph-mage``, not the
-    plain community ``memgraph/memgraph`` image) — ``leiden_community_detection.get()``
-    is a MAGE query module, not core Cypher (same procedure-call pattern already
-    used for ``text_search.search_all``/``vector_search.search``). Returns a
-    clear ``PROCEDURE_UNAVAILABLE`` error instead of raising when the module
-    isn't installed.
+    Answers "what subsystems does this codebase have?". That is a question about
+    modules (order 10^2 here), not about individual callables (order 10^3-10^4),
+    and getting the granularity wrong is what made the previous MAGE-Leiden
+    implementation useless: projected at callable granularity the CALLS+IMPORTS
+    subgraph put ~95% of production code into one community at every usable
+    resolution, because (a) a real call graph is densely connected through shared
+    helpers — CALLS alone gives a 98% giant component here — and (b) IMPORTS
+    almost never joins two Modules, it joins a Module to the individual *symbol*
+    it imports, so every module importing a shared symbol hubs through that one
+    node. No ``resolution_parameter`` fixes that; only aggregating does.
 
-    Deliberately calls ``graph.execute()`` directly rather than a
-    ``GraphBackend`` method — Leiden clustering has no SQL translation, so
-    there is nothing to put behind a shared contract (same "no meaningful
-    translation" exception documented for ``cypher_query``/``validate_cypher``).
-    The isinstance guard below narrows *graph* to ``GraphClient`` for the rest
-    of this function before ``execute()`` is ever called.
+    So the graph actually clustered is built in Python, one node per Module:
 
-    ExternalPackage/ExternalSymbol nodes are excluded from both edge endpoints —
-    otherwise dozens of unrelated modules that merely reference the same external
-    type (e.g. many modules' return-type annotations pointing at
-    ``collections.abc.Coroutine``) turn that external node into a false hub that
-    glues most of the project into one meaningless giant community. Communities
-    are meant to reflect cohesive *project* subsystems, not "everything that
-    happens to import the same stdlib/third-party symbol".
+    * **CALLS**, aggregated from callable level. Each callable-to-callable edge
+      is attributed to the modules owning its endpoints (via ``file_path``) and
+      the per-pair weights are **summed** — a module pair joined by many
+      confident production calls outranks one joined by a single ambiguous or
+      test-provenance call, which is exactly what the numeric ``weight``
+      property from the ADR-0014 weighting amendment encodes (``1/candidate_count``
+      for ambiguous edges, discounted again for ``from_test``). Summing, rather
+      than averaging or counting, is what makes volume *and* confidence both
+      count; averaging would let one high-confidence call outrank fifty.
+    * **IMPORTS**, via ``get_module_import_edges`` — both the rare direct
+      Module->Module edges and the far more common Module->symbol edges resolved
+      back through ``DEFINES`` to the module that owns the symbol. That
+      resolution is what turns IMPORTS into genuine module-to-module structure;
+      it is the same aggregation the ``dependencies`` analysis already does, and
+      it reuses the same ``_module_imports_from_records`` helper. Each import
+      record contributes 1.0, matching ``_CALL_WEIGHT_BASE``: one import is worth
+      exactly one fully-resolved non-test call.
 
-    Clustering is **weighted** by the CALLS ``weight`` edge property (the
-    amendment to ADR-0014): the procedure's ``weight_property`` argument is
-    passed positionally as ``get(subgraph, "weight")``. Three traps make this
-    easy to get silently wrong and are handled deliberately:
+    Intra-module calls (both endpoints in the same file) and self-imports are
+    dropped — they say how cohesive a module is internally, not which modules
+    belong together. Reciprocal pairs fold into a single undirected edge whose
+    weight is the sum of both directions.
 
-    1. MAGE reads a missing or non-numeric weight as 1.0 with no error, so a
-       typo'd property name produces byte-identical (unweighted) output rather
-       than a failure. This can only be validated by asserting the projected
-       edges actually carry a numeric ``weight`` — see the integration tests.
-       Note the CALLS ``confidence`` property is a *string*, so naming it here
-       would silently degrade to unweighted.
-    2. IMPORTS edges carry no weight and therefore default to 1.0. That is the
-       deliberate choice, not an oversight: ``_CALL_WEIGHT_BASE`` is 1.0, so a
-       fully-resolved, non-test call is worth exactly one import, and only
-       ambiguity (``1/candidate_count``) or test provenance discounts an edge
-       below that reference point. Writing an explicit weight on IMPORTS would
-       add a second edge-property backfill for no change in behavior.
-    3. Leiden deduplicates parallel edges rather than summing them, so a node
-       pair joined by both a CALLS and an IMPORTS edge would contribute only
-       one of the two, arbitrarily. That cannot happen with this projection:
-       CALLS is written Callable->Callable only (both endpoints are
-       ``:Callable``-matched in ``resolve_calls``) while every IMPORTS edge
-       starts at a Module or Package, so no node pair carries both — including
-       under Leiden's undirected view, since a CALLS target is never a
-       Module/Package either. Reciprocal CALLS (a->b and b->a) *do* collapse
-       into one undirected edge; that predates weighting and is unchanged.
+    ExternalPackage/ExternalSymbol can no longer act as false hubs (the bug that
+    motivated the old projection's exclusion clause): only ``:Module`` nodes are
+    ever clustered, and a CALLS endpoint only enters the graph if its
+    ``file_path`` maps to one of them, so an external node has nowhere to appear.
 
-    Communities of size < ``_COMMUNITY_NOISE_THRESHOLD`` (isolated/near-isolated
-    nodes) are dropped as noise; the remaining communities are returned
-    largest-first, capped at *limit* (which also caps members shown per
-    community — full membership can be large at scale).
+    Clustering is **greedy modularity (Clauset-Newman-Moore)** — see
+    ``_greedy_modularity`` — with recursive refinement for the resolution limit
+    (``_detect_module_communities``). Deliberately deterministic: MAGE's Leiden
+    is documented non-deterministic, so its output could differ between two
+    identical calls and could not be diffed across runs. The aggregated graph is
+    small (order 10^2 nodes) so an exact Python maximizer is instant, and it
+    needs no query module, no materialized helper edges and no write access —
+    the whole analysis path stays read-only.
 
-    Unsupported on the embedded SQLite backend — Leiden clustering has no
-    SQLite equivalent (community detection is explicitly out of scope for
-    the embedded backend, see ADR-0015) — returns a clear error instead of
-    attempting a Cypher query the backend can't run.
+    Communities of size < ``_COMMUNITY_NOISE_THRESHOLD`` (isolated modules —
+    config/manifest pseudo-modules, leaf scripts) are dropped as noise; the rest
+    are returned largest-first, capped at *limit* (which also caps members shown
+    per community). ``modularity`` in the result is Q for the full partition
+    before that noise cut, so it stays comparable across calls.
 
-    *test_patterns*, when non-empty, excludes matching entities from the
-    ``a``/``b`` edge endpoints Leiden clusters on — the same "exclude before
-    projecting the subgraph" technique already used for ExternalPackage/
-    ExternalSymbol above, not a post-hoc filter of already-computed
-    communities. Test-node connectivity can no longer act as a bridge gluing
-    otherwise-unrelated production communities together. Since Cypher has no
-    glob/fnmatch operator, the excluded uid set is computed in Python via the
-    same ``matches_test_pattern`` used everywhere else (one canonical
-    implementation, not a second Cypher-regex-translated one that could
-    silently drift from it) and passed in as a parameterized uid list — one
-    extra cheap node-listing query, only when filtering is actually active.
+    *test_patterns*, when non-empty, drops test modules from the module
+    inventory **before** the graph is built, so test connectivity cannot bridge
+    two production subsystems (the ``exclude test entities from the input graph,
+    not just its output`` rule). Matching uses the canonical
+    ``matches_test_pattern`` on the module's own file_path/name.
+
+    Still guarded off on the embedded SQLite backend, but no longer because of
+    MAGE: the clustering is portable now and only the two read queries in
+    ``_fetch_community_inputs`` are Memgraph-specific. Making it work on SQLite
+    is a mechanical follow-up — add a portable inventory + module-pair-CALLS
+    method to ``GraphBackend`` and both implementations — after which this guard
+    and ``mcp.py``'s ``remove_tool("find_communities")`` both come out.
     """
     if isinstance(graph, SqliteGraphClient):
         return {
             "analysis": "communities",
-            "error": "unsupported on the sqlite backend — requires Memgraph+MAGE",
+            "error": (
+                "unsupported on the sqlite backend — the module-pair CALLS aggregation and module "
+                "inventory it clusters are still raw Cypher reads (see _fetch_community_inputs)"
+            ),
         }
 
     t0 = time.monotonic()
-    params: dict[str, Any] = {"project": project, "path": path}
-    # Exclude ExternalPackage/ExternalSymbol from both endpoints — dozens of unrelated
-    # modules referencing the same external type (e.g. collections.abc.Coroutine) would
-    # otherwise act as false hub nodes gluing the whole project into one giant community.
-    excl = "NOT a:ExternalPackage AND NOT a:ExternalSymbol AND NOT b:ExternalPackage AND NOT b:ExternalSymbol"
-    pa = " AND a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path" if path else ""
+    module_rows, call_rows = await _fetch_community_inputs(graph, project, path)
 
-    excluded_clause = ""
     if test_patterns:
         patterns = list(test_patterns)
-        node_pa = " AND n.file_path STARTS WITH $path" if path else ""
-        node_rows = await graph.execute(
-            "MATCH (n {project_name: $project}) "
-            f"WHERE NOT n:ExternalPackage AND NOT n:ExternalSymbol{node_pa} "
-            "RETURN n.uid AS uid, n.name AS name, n.file_path AS file_path",
-            params,
-        )
-        excluded_uids = [r["uid"] for r in node_rows if matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
-        if excluded_uids:
-            params["excluded_uids"] = excluded_uids
-            excluded_clause = " AND NOT a.uid IN $excluded_uids AND NOT b.uid IN $excluded_uids"
+        module_rows = [r for r in module_rows if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
 
-    query = (
-        "MATCH p=(a {project_name: $project})-[:CALLS|IMPORTS]->(b {project_name: $project}) "
-        f"WHERE {excl}{pa}{excluded_clause} "
-        "WITH project(p) AS subgraph "
-        # MAGE's Leiden takes positional args only; the first is the engine-injected
-        # subgraph, the second is weight_property. Untagged edges default to 1.0.
-        'CALL leiden_community_detection.get(subgraph, "weight") YIELD node, community_id '
-        "RETURN node.uid AS uid, node.name AS name, node.qualified_name AS qn, "
-        "labels(node)[0] AS label, node.file_path AS file_path, community_id AS community_id"
-    )
-    try:
-        raw = await graph.execute(query, params)
-    except Exception as exc:
-        # MAGE raises rather than returning an empty result when Leiden partitions
-        # nothing — a sparse or tiny subgraph, not a deployment problem. Sending that
-        # user off to check their Docker image is a misleading diagnostic, so split
-        # the two cases on the procedure's own message.
-        if "no communities detected" in str(exc).lower():
-            return {
-                "analysis": "communities",
-                "project": project,
-                "communities": [],
-                "note": (
-                    "No communities detected — the subgraph has too little internal structure to "
-                    "partition (try a broader `path`, or check the project is fully indexed)."
-                ),
-                "query_ms": round((time.monotonic() - t0) * 1000, 1),
-            }
-        return {
-            "error": (
-                "Community detection unavailable: leiden_community_detection.get() is a MAGE query "
-                f"module — confirm Memgraph is running the memgraph-mage image, not memgraph. ({exc})"
-            ),
-            "code": "PROCEDURE_UNAVAILABLE",
-        }
+    modules_by_qn = {r["qn"]: r for r in module_rows if r["qn"]}
+    qn_by_path = {r["file_path"]: r["qn"] for r in module_rows if r["file_path"] and r["qn"]}
 
-    # community_id < 0 means "unassigned" (per MAGE docs) — drop before grouping. Test
-    # entities are already excluded from the query itself above, not filtered here.
-    groups: dict[int, list[dict[str, Any]]] = {}
-    for r in raw:
-        if r["community_id"] < 0:
+    edges: dict[tuple[str, str], float] = {}
+    for row in call_rows:
+        from_qn = qn_by_path.get(row["from_path"])
+        to_qn = qn_by_path.get(row["to_path"])
+        if from_qn is None or to_qn is None or from_qn == to_qn:
             continue
-        groups.setdefault(r["community_id"], []).append(
-            {
-                "uid": r["uid"],
-                "name": r["name"],
-                "qualified_name": r["qn"],
-                "label": r["label"],
-                "file_path": r["file_path"],
-            }
-        )
+        key = _undirected_key(from_qn, to_qn)
+        edges[key] = edges.get(key, 0.0) + float(row["weight"])
 
-    sized: list[dict[str, Any]] = sorted(
-        (
-            {"community_id": cid, "size": len(members), "members": members}
-            for cid, members in groups.items()
-            if len(members) >= _COMMUNITY_NOISE_THRESHOLD
-        ),
-        key=lambda c: c["size"],
-        reverse=True,
-    )
+    import_records = await graph.get_module_import_edges(project, path)
+    import_pairs = _module_imports_from_records(import_records["direct"], import_records["indirect"])
+    for (from_mod, to_mod), count in import_pairs.items():
+        if from_mod == to_mod or from_mod not in modules_by_qn or to_mod not in modules_by_qn:
+            continue
+        key = _undirected_key(from_mod, to_mod)
+        edges[key] = edges.get(key, 0.0) + float(count)
 
-    elapsed = (time.monotonic() - t0) * 1000
-    return {
+    partition = _detect_module_communities(set(modules_by_qn), edges)
+    partition.sort(key=lambda group: (-len(group), group[0] if group else ""))
+
+    sized: list[dict[str, Any]] = [
+        {
+            "community_id": idx,
+            "size": len(group),
+            "members": [
+                {
+                    "uid": modules_by_qn[qn]["uid"],
+                    "name": modules_by_qn[qn]["name"],
+                    "qualified_name": qn,
+                    "label": "Module",
+                    "file_path": modules_by_qn[qn]["file_path"],
+                }
+                for qn in group
+            ],
+        }
+        for idx, group in enumerate(partition)
+        if len(group) >= _COMMUNITY_NOISE_THRESHOLD
+    ]
+
+    result: dict[str, Any] = {
         "analysis": "communities",
         "project": project,
+        "granularity": "module",
+        "module_count": len(modules_by_qn),
+        "edge_count": len(edges),
+        "modularity": round(_modularity(partition, edges), 4),
         "community_count": len(sized),
         "communities": [{**c, "members": c["members"][:limit]} for c in sized[:limit]],
         "noise_threshold": _COMMUNITY_NOISE_THRESHOLD,
-        "query_ms": round(elapsed, 1),
+        "query_ms": round((time.monotonic() - t0) * 1000, 1),
     }
+    if not sized:
+        result["note"] = (
+            "No communities detected — no two in-scope modules are joined by a call or import "
+            "(try a broader `path`, or check the project is fully indexed)."
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------

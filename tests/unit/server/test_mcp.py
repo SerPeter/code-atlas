@@ -1326,8 +1326,10 @@ class TestAppLifespanNeedsFirstIndex:
 
 
 class TestFindCommunitiesBackendVisibility:
-    """find_communities has no SQL translation (Leiden is MAGE-only) — hidden from
-    tools/list entirely on the embedded SQLite backend, present on Memgraph."""
+    """find_communities is Memgraph-only — its clustering is pure Python (no MAGE), but
+    the module inventory / module-pair CALLS reads it clusters are still raw Cypher with
+    no GraphBackend method. Hidden from tools/list entirely on the embedded SQLite
+    backend, present on Memgraph."""
 
     async def test_hidden_on_sqlite_backend(self, settings, tmp_path, monkeypatch):
         from code_atlas.server.mcp import create_mcp_server

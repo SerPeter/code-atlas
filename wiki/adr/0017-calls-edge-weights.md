@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted — amends [ADR-0014](./0014-calls-edge-confidence.md)
+Accepted — amends [ADR-0014](./0014-calls-edge-confidence.md); itself amended by
+[ADR-0019](./0019-module-granularity-community-detection.md), which replaced weighted Leiden with module-granularity
+clustering. The weights below are unchanged and still the input — ADR-0019 sums them per module pair instead of handing
+them to MAGE. The Empirical Validation section therefore documents a procedure this codebase no longer calls; read it as
+the record of why the string `confidence` could not serve as a weight, which remains the reason a numeric `weight`
+property exists.
 
 ## Date
 

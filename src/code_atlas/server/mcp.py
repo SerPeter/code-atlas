@@ -673,9 +673,12 @@ def create_mcp_server(  # noqa: PLR0915
         if not needs_first_index:
             first_index_ready.set()
 
-        # find_communities has no SQL translation (Leiden clustering is MAGE-only) — on the
-        # embedded backend it's not just non-functional, it's unreachable, so drop it from
-        # tools/list entirely rather than leaving it listed with a guaranteed-error response.
+        # find_communities is Memgraph-only — the clustering itself is pure Python now (no
+        # MAGE), but the two reads it clusters (module inventory + module-pair CALLS
+        # aggregation) are still raw Cypher with no GraphBackend method, so on the embedded
+        # backend it's not just non-functional, it's unreachable. Drop it from tools/list
+        # entirely rather than leaving it listed with a guaranteed-error response. Adding
+        # those two portable backend methods removes this branch and the analysis.py guard.
         # Safe to remove here: FastMCP's lifespan setup fully completes (Server.run enters the
         # lifespan context before creating the ServerSession) before any client request —
         # including tools/list — is processed, so there's no race with a caller listing tools
@@ -1712,8 +1715,8 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
                     "quality (health score, god modules, circular deps, tangled modules, coupling, instability), "
                     "dead_code (Callables/TypeDefs with zero incoming CALLS edges), "
                     "complexity (top Callables by LOC-span proxy, not true cyclomatic complexity), "
-                    "communities (Leiden clustering over the CALLS+IMPORTS subgraph — requires the "
-                    "memgraph-mage Docker image), "
+                    "communities (which subsystems the repo has — clusters MODULES over the "
+                    "call/import graph aggregated to module level; Memgraph backend only), "
                     "git_signals (commit-count hotspots, bus-factor risks, co-change pairs — requires "
                     "'atlas mine-git-history' to have been run; empty lists otherwise), "
                     "module_summary (dense text skeleton of everything under 'path' — signatures, first "
@@ -1862,13 +1865,15 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
 
     @mcp.tool(
         description=(
-            "Shortcut for analyze_repo(analysis='communities'). Clusters the project's CALLS+IMPORTS "
-            "subgraph via Leiden community detection — requires the memgraph-mage Docker image (see "
-            "docker-compose.yml; the plain memgraph image doesn't have this procedure). Communities "
-            "of size < 2 (isolated/near-isolated nodes) are dropped as noise; returned largest first. "
-            "Returns: {analysis, project, community_count, communities: [{community_id, size, "
-            "members: [{uid, name, qualified_name, label, file_path}]}], noise_threshold, query_ms}, "
-            "or {error, code: 'PROCEDURE_UNAVAILABLE'} if the MAGE module isn't installed."
+            "Shortcut for analyze_repo(analysis='communities'). Answers 'what subsystems does this "
+            "codebase have?' — clusters MODULES, not individual callables: the callable-level CALLS "
+            "graph is aggregated up to the modules owning each endpoint (weights summed) and merged "
+            "with module-to-module IMPORTS, then partitioned by deterministic greedy modularity "
+            "(same input always gives the same answer). Memgraph backend only. Communities of size "
+            "< 2 (isolated modules) are dropped as noise; returned largest first. "
+            "Returns: {analysis, project, granularity: 'module', module_count, edge_count, "
+            "modularity, community_count, communities: [{community_id, size, members: [{uid, name, "
+            "qualified_name, label, file_path}]}], noise_threshold, query_ms}."
         ),
     )
     async def find_communities(
@@ -1884,9 +1889,9 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             bool | None,
             Field(
                 None,
-                description="Exclude test files/entities from community membership. Default true — override to "
-                "include. Filtering happens after clustering runs, so it hides test members from already-computed "
-                "communities rather than preventing test-node connectivity from shaping them.",
+                description="Exclude test modules from the clustered graph. Default true — override to include. "
+                "Test modules are dropped before the graph is built, so test connectivity cannot bridge two "
+                "production subsystems; including them typically pairs each module with its own test modules.",
             ),
         ] = None,
         ctx: Context = None,  # type: ignore[assignment]
