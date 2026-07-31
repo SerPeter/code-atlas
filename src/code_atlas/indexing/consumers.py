@@ -845,6 +845,14 @@ class ASTConsumer(TierConsumer):
                     if deleted:
                         batch_max_sig = Significance.HIGH
 
+                # Files whose entity set the upsert below actually changed.
+                # Consumed by step 6: an entity's ``citations`` are folded into
+                # its content_hash, so "no entity added/modified/deleted" is
+                # proof that the file's stored citations are exactly the ones
+                # this parse produced — and therefore that the deferred citation
+                # revoke has nothing to do for that file.
+                entity_changed_files: set[str] = set()
+
                 # 3. Batched upsert (2 managed transactions) — entities + parser-only
                 #    rels. Graph-querying detectors run AFTER this write (step 3.5)
                 #    so this batch's own entities are visible for same-batch
@@ -853,6 +861,12 @@ class ASTConsumer(TierConsumer):
                 if parsed_files:
                     file_data = {fp: (pfd.entities, pfd.non_import_rels) for fp, pfd in parsed_files.items()}
                     results = await self.graph.upsert_batch_entities(project_name, file_data)
+                    entity_changed_files = {
+                        fp
+                        for fp in parsed_files
+                        # A missing result is unknown, not unchanged — withhold.
+                        if (r := results.get(fp)) is None or r.added or r.modified or r.deleted
+                    }
 
                     # 3.5. Graph-querying detectors, now that this batch's entities exist.
                     det_results: dict[str, DetectorResult] = {}
@@ -955,6 +969,22 @@ class ASTConsumer(TierConsumer):
                 #    Writing the hash any earlier would let a crash between this
                 #    write and that (possibly much later) flush permanently drop
                 #    the rels — the hash gate would then skip the file forever.
+                #
+                #    Citation REVOCATION is deferred work too, and it is owned by
+                #    files that produce no citations at all: the revoke scope in
+                #    step 7 is every parsed file, precisely so a deleted
+                #    "see ADR-14" comment clears its edge. A file with no
+                #    deferred rels and no citations left therefore still has
+                #    something pending, which is why entity_changed_files joins
+                #    the condition (ATL-090). It is the narrowest signal that
+                #    covers it: citations are part of an entity's content_hash,
+                #    so any citation that appeared or disappeared shows up as an
+                #    added/modified/deleted entity here. The converse keeps
+                #    immediate_hashes alive — a file the hash gate passed whose
+                #    entities all came back unchanged (a formatting-only edit
+                #    the whitespace strip missed, or a re-parse after a schema
+                #    migration cleared file_hash project-wide) has provably
+                #    identical citations, so its revoke is a no-op.
                 if new_hashes:
                     immediate_hashes: dict[str, str] = {}
                     for fp, pfd in parsed_files.items():
@@ -968,6 +998,7 @@ class ASTConsumer(TierConsumer):
                             or pfd.anchor_rels
                             or pfd.config_rels
                             or pfd.citations
+                            or fp in entity_changed_files
                         ):
                             self._pending_file_hashes.setdefault(project_name, {})[fp] = new_hashes[fp]
                         else:

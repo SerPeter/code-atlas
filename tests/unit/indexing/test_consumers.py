@@ -45,6 +45,7 @@ class StubGraph:
         self.member_calls: list[tuple[str, list[ParsedRelationship]]] = []
         self.config_calls: list[tuple[str, list[ParsedRelationship]]] = []
         self.citation_calls: list[tuple[str, dict[str, list[str]], set[str] | None, bool]] = []
+        self.hash_writes: list[tuple[str, dict[str, str]]] = []
         self.gc_calls: int = 0
 
     async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
@@ -55,7 +56,7 @@ class StubGraph:
         return {}
 
     async def set_batch_file_hashes(self, project_name: str, hashes: dict[str, str]) -> None:
-        return None
+        self.hash_writes.append((project_name, dict(hashes)))
 
     async def upsert_batch_entities(
         self, project_name: str, file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]]
@@ -596,3 +597,74 @@ async def test_final_flush_sweeps_every_project_that_saw_a_citation(tmp_path: Pa
 
     assert consumer.graph.citation_calls == [("proj", {}, None, True)]  # type: ignore[attr-defined]
     assert consumer._citation_projects == set()
+
+
+# ---------------------------------------------------------------------------
+# File-hash withholding vs. the deferred citation revoke (ATL-090)
+# ---------------------------------------------------------------------------
+
+
+class _UnchangedGraph(StubGraph):
+    """Upserts that classify every entity as ``unchanged``.
+
+    The shape of a file the hash gate let through whose entities all matched
+    their stored ``content_hash`` — the file's bytes moved, nothing semantic
+    did. Citations are part of ``content_hash``, so this is provably a file
+    with no citation to revoke or recreate.
+    """
+
+    async def upsert_batch_entities(
+        self, project_name: str, file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]]
+    ) -> dict[str, UpsertResult]:
+        return {
+            fp: UpsertResult(unchanged=[e.qualified_name.split(":", 1)[1] for e in entities])
+            for fp, (entities, _rels) in file_data.items()
+        }
+
+
+def _reindex_consumer(tmp_path: Path, graph: StubGraph) -> ASTConsumer:
+    """Consumer on the reindex policy, warmed past its spurious first flush.
+
+    ``time_window_s=0`` sets ``_resolve_batch_interval=5``, so a single batch
+    does NOT flush — which is what makes ``_pending_file_hashes`` observable.
+    """
+    return ASTConsumer(
+        RecordingBus(),  # type: ignore[arg-type]
+        graph,  # type: ignore[arg-type]
+        AtlasSettings(project_root=tmp_path, embeddings=EmbeddingSettings(enabled=False)),
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+
+
+async def test_a_file_whose_only_deferred_work_is_the_revoke_withholds_its_hash(tmp_path: Path) -> None:
+    """A file with no imports/calls/type-refs and no citations left still has
+    deferred work — it is in the revoke scope handed to resolve_citations.
+    Writing its hash in process_batch would let a crash before the flush strand
+    the stale edge behind a hash gate that now believes the file current.
+    """
+    graph = StubGraph()
+    consumer = _reindex_consumer(tmp_path, graph)
+    (tmp_path / "plain.py").write_text("def g():\n    return 2\n", encoding="utf-8")
+
+    await consumer.process_batch([], "warmup")  # absorbs the spurious first-batch flush
+    await consumer.process_batch([_event("plain.py", "proj", str(tmp_path))], "b1")
+
+    assert "plain.py" in consumer._pending_file_hashes.get("proj", {})
+    assert graph.hash_writes == []
+
+
+async def test_a_file_with_no_entity_change_still_takes_the_immediate_hash_path(tmp_path: Path) -> None:
+    """The other half of the withholding condition: ``immediate_hashes`` stays
+    reachable. When every entity comes back unchanged, the file's stored
+    citations are byte-identical to the ones this parse produced, so the
+    revoke can neither delete nor recreate anything for it.
+    """
+    graph = _UnchangedGraph()
+    consumer = _reindex_consumer(tmp_path, graph)
+    (tmp_path / "plain.py").write_text("def g():\n    return 2\n", encoding="utf-8")
+
+    await consumer.process_batch([], "warmup")
+    await consumer.process_batch([_event("plain.py", "proj", str(tmp_path))], "b1")
+
+    assert consumer._pending_file_hashes == {}
+    assert [fp for _, hashes in graph.hash_writes for fp in hashes] == ["plain.py"]

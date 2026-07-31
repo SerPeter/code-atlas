@@ -1061,6 +1061,81 @@ async def test_anchor_only_file_hash_withheld_until_flush(
     assert note_rel_path in c1._pending_file_hashes.get(project_name, {})
 
 
+@pytest.mark.usefixtures("_clean_streams")
+async def test_citation_revoke_survives_a_crash_between_hash_write_and_flush(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """ATL-090. Revocation is deferred work for every parsed file — the revoke
+    scope handed to resolve_citations is the set of files this flush reparsed,
+    not the set that produced citations. A file whose LAST citation comment was
+    just deleted therefore has deferred work while producing neither deferred
+    rels nor citations, so the old withhold condition let its hash through
+    immediately. Crash before the flush and the hash gate skips the file
+    forever: the stale DOCUMENTS edge is unreachable until ``index --full``.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    def _consumer() -> ASTConsumer:
+        return ASTConsumer(
+            event_bus,
+            graph_client,
+            settings,
+            policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+        )
+
+    async def _citation_count() -> int:
+        records = await graph_client.execute(
+            "MATCH ()-[r:DOCUMENTS {link_type: 'citation'}]->(n {project_name: $p, file_path: $f}) "
+            "RETURN count(r) AS cnt",
+            {"p": project_name, "f": "crash_cited.py"},
+        )
+        return records[0]["cnt"]
+
+    _write_python_file(settings.project_root, "wiki/adr/0090-x.md", "# ADR-0090: Thing\n\nBody.\n")
+    _write_python_file(
+        settings.project_root,
+        "crash_cited.py",
+        "# WHY: see ADR-0090\ndef resolve_crash():\n    return 1\n",
+    )
+
+    # 1. Baseline: the edge exists and crash_cited.py's hash is stored.
+    c0 = _consumer()
+    await c0.process_batch(
+        [
+            _file_changed(settings, "wiki/adr/0090-x.md", "created"),
+            _file_changed(settings, "crash_cited.py", "created"),
+        ],
+        "batch-0",
+    )
+    await c0._flush_deferred_resolution(final=True)
+    assert await _citation_count() == 1, "the citation never linked, so the revoke case cannot be under test"
+
+    # 2. Delete the comment. The file now yields no deferred rels AND no
+    #    citations — the exact gap in the old withhold condition.
+    _write_python_file(settings.project_root, "crash_cited.py", "def resolve_crash():\n    return 1\n")
+    ev = _file_changed(settings, "crash_cited.py")
+
+    c1 = _consumer()
+    await c1.process_batch([], "warmup")  # absorbs the spurious first-batch flush
+    await c1.process_batch([ev], "batch-1")
+    assert "crash_cited.py" in c1._pending_file_hashes.get(project_name, {}), (
+        "hash written while the revoke was still queued in memory"
+    )
+
+    # 3. Hard crash: the instance dies without ever flushing.
+    del c1
+
+    # 4. Restart. The hash gate must NOT skip the file, so the revoke lands.
+    c2 = _consumer()
+    await c2.process_batch([ev], "batch-2")
+    await c2._flush_deferred_resolution()
+
+    assert await _citation_count() == 0
+
+
 # ---------------------------------------------------------------------------
 # Detector timing (finding: consumers.py:~485)
 # ---------------------------------------------------------------------------
