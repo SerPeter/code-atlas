@@ -134,6 +134,29 @@ src/code_atlas/
 - Don't test every function. Test system behavior.
 - Integration tests start session-scoped testcontainers on random ports by default (Docker required; skip if unavailable). Fast path: `docker compose --profile test up -d`, then `ATLAS_TEST_MEMGRAPH_PORT=7688 ATLAS_TEST_VALKEY_PORT=6380 uv run pytest -m integration` — the env vars point tests at any isolated stack (e.g. CI service containers). Never connects to the production Memgraph/Valkey on 7687/6379. A conftest guard refuses to wipe any Memgraph containing project data not prefixed `test`/`bench`; `ATLAS_TEST_DB=1` bypasses it for known-disposable instances only.
 
+### Running tests efficiently — read this before running anything
+
+Measured baselines: unit ~63s serial, integration ~700s scoped / ~1100s from the repo root. Agent workflows
+have spent **78-100% of their wall-clock running tests**, one of them re-running the full unit suite 28
+times. Almost all of that is avoidable.
+
+- **While iterating, run only what you touched.** `uv run pytest tests/unit/parsing/test_apex.py`, or
+  `uv run pytest tests/integration/graph -m integration`. `tests/integration/` mirrors `src/`
+  (graph, indexing, search, server, backends), so directory scoping is a natural unit. Do NOT re-run the
+  full suite after every edit.
+- **Run the full suite once, at the end**, before reporting or committing. That is the gate; the iteration
+  loop is not.
+- **Use `-n auto` for unit tests** — measured 63s → 31s. `pytest-xdist` is already a dev dependency.
+  It is deliberately NOT in `addopts`, because it would also apply to single-test debugging runs where it
+  adds startup cost, scrambles output order and breaks `pdb`.
+- **NEVER combine `-n` with `ATLAS_TEST_MEMGRAPH_PORT`/`ATLAS_TEST_VALKEY_PORT`.** `graph_client` is
+  function-scoped and runs `MATCH (n) DETACH DELETE n` before every test. Under xdist, session fixtures run
+  once _per worker_, so with the env overrides unset each worker gets its own container and is isolated —
+  but with them set, every worker shares one instance and they wipe each other's data mid-test. The
+  failures look like nondeterministic product bugs.
+- **Never pass an extra `-q`.** `addopts` already contains one; a second makes `-qq`, which suppresses the
+  totals line entirely. That has repeatedly produced "tests pass" reports with no count behind them.
+
 ## Commits
 
 - Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) format: `<type>(<scope>): <description>`
