@@ -23,6 +23,10 @@ resolves an extension to exactly one handler, so the branching *must* happen
 inside the handler — which is fine, because ``parse_func`` already receives the
 path and the raw bytes. ``markdown.py`` is the precedent: it branches on YAML
 frontmatter to pick Note-mode versus DocFile-mode inside a single registration.
+The XML branch goes one step further and hands off: ``_parse_xml`` offers every
+document to ``salesforce.parse_salesforce_metadata`` first (SFDX metadata is all
+plain ``.xml``, and its dialects need real per-type handling), and only parses
+structurally when that declines.
 
 Why PyYAML rather than the tree-sitter tree
 -------------------------------------------
@@ -120,6 +124,12 @@ from code_atlas.parsing.ast import (
     ParsedRelationship,
     node_text,
     register_language,
+)
+from code_atlas.parsing.languages.salesforce import (
+    parse_salesforce_metadata,
+    xml_child_elements,
+    xml_tag,
+    xml_text,
 )
 from code_atlas.schema import NodeLabel, RelType
 
@@ -1202,64 +1212,28 @@ def _entry_position(out: _Out, pair: tuple[yaml.Node, yaml.Node] | None, doc: _D
 # XML
 # ---------------------------------------------------------------------------
 
-_XML_TAG_NODES = frozenset({"STag", "EmptyElemTag"})
-
-
-def _xml_tag(element: Node) -> str | None:
-    """The element's tag name, read from its ``STag``/``EmptyElemTag`` ``Name`` child."""
-    for child in element.children:
-        if child.type in _XML_TAG_NODES:
-            for part in child.children:
-                if part.type == "Name":
-                    text = part.text
-                    return text.decode("utf-8", errors="replace") if text is not None else None
-            return None
-    return None
-
-
-def _xml_content(element: Node) -> Node | None:
-    return next((child for child in element.children if child.type == "content"), None)
-
-
-def _xml_child_elements(element: Node) -> list[Node]:
-    content = _xml_content(element)
-    if content is None:
-        return []
-    return [child for child in content.children if child.type == "element"]
-
-
-def _xml_text(element: Node) -> str | None:
-    """Concatenated character data directly inside *element*, or ``None`` if blank."""
-    content = _xml_content(element)
-    if content is None:
-        return None
-    parts: list[str] = []
-    for child in content.children:
-        if child.type == "CharData":
-            text = child.text
-            if text is not None:
-                parts.append(text.decode("utf-8", errors="replace"))
-        elif child.type == "CDSect":
-            parts.extend(
-                piece.text.decode("utf-8", errors="replace")
-                for piece in child.children
-                if piece.type == "CData" and piece.text is not None
-            )
-    joined = "".join(parts).strip()
-    return joined or None
-
 
 def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
-    """Minimal structural parse: the root element and its immediate children.
+    """Salesforce metadata if the document is any, otherwise a minimal structural parse.
 
-    Deliberately one level deep. This exists for Salesforce metadata, where the
-    root element is the object type and its direct children are the settings
-    worth searching for (``<status>``, ``<label>``, ``<processType>``); walking
-    the whole tree of a large Flow would mint hundreds of nodes per file for no
-    additional answerable question.
+    ``salesforce.parse_salesforce_metadata`` claims the SFDX metadata types it
+    models (CustomObject, CustomField, Flow, CustomLabels, CustomMetadata) and
+    declines everything else, which lands here.
+
+    The fallback is deliberately one level deep: the root element is the
+    document type and its direct children are the settings worth searching for
+    (``<status>``, ``<label>``, ``<isExposed>``), whereas walking the whole tree
+    of a large FlexiPage or permission set would mint hundreds of nodes per file
+    for no additional answerable question.  The element-tree primitives it uses
+    live in ``salesforce.py`` so that the import between the two modules runs in
+    exactly one direction.
     """
+    parsed = parse_salesforce_metadata(path, root, project_name)
+    if parsed is not None:
+        return parsed
+
     element = next((child for child in root.children if child.type == "element"), None)
-    tag = _xml_tag(element) if element is not None else None
+    tag = xml_tag(element) if element is not None else None
     if element is None or tag is None:
         return None
 
@@ -1282,11 +1256,11 @@ def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
     )
     out.rel(module_uid, RelType.DEFINES, root_uid)
 
-    for child in _xml_child_elements(element):
-        child_tag = _xml_tag(child)
+    for child in xml_child_elements(element):
+        child_tag = xml_tag(child)
         if child_tag is None:
             continue
-        has_children = bool(_xml_child_elements(child))
+        has_children = bool(xml_child_elements(child))
         child_uid = out.add(
             name=child_tag,
             qn_suffix=f"{_suffix(root_uid)}.{_qn_segment(child_tag)}",
@@ -1294,7 +1268,7 @@ def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
             kind="xml_element" if has_children else "xml_setting",
             line_start=child.start_point[0] + 1,
             line_end=child.end_point[0] + 1,
-            source=None if has_children else _xml_text(child),
+            source=None if has_children else xml_text(child),
         )
         out.rel(root_uid, RelType.DEFINES, child_uid)
 

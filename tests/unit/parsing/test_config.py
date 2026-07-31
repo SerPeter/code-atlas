@@ -739,44 +739,69 @@ def test_wide_hand_written_config_survives_the_key_census() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. XML — the deliberate exception (Salesforce metadata needs it)
+# 7. XML — the structural fallback behind the Salesforce dialect
+#
+# ``_parse_xml`` offers every document to ``salesforce.parse_salesforce_metadata``
+# first; what these tests cover is the parse that runs when it declines, plus the
+# handoff itself. Salesforce extraction detail belongs in ``test_salesforce.py``.
 # ---------------------------------------------------------------------------
 
 
 def test_xml_structural_parse() -> None:
     source = """\
 <?xml version="1.0" encoding="UTF-8"?>
-<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
     <apiVersion>59.0</apiVersion>
-    <label>My Flow</label>
-    <decisions>
-        <name>Check</name>
-    </decisions>
-    <status>Active</status>
-</Flow>
+    <isExposed>true</isExposed>
+    <targets>
+        <target>lightning__RecordPage</target>
+    </targets>
+    <masterLabel>Property Tile</masterLabel>
+</LightningComponentBundle>
 """
-    parsed = _parse(source, "force-app/flows/MyFlow.flow-meta.xml")
+    parsed = _parse(source, "force-app/lwc/propertyTile/propertyTile.js-meta.xml")
 
-    module = _entity_by_name(parsed, "MyFlow.flow-meta.xml")
+    module = _entity_by_name(parsed, "propertyTile.js-meta.xml")
     assert module.kind == "xml_document"
 
-    root = _entity_by_name(parsed, "Flow")
+    root = _entity_by_name(parsed, "LightningComponentBundle")
     assert root.label == NodeLabel.TYPE_DEF
     assert root.kind == "xml_element"
     assert root.line_start == 2
 
-    label = _entity_by_name(parsed, "label")
+    label = _entity_by_name(parsed, "masterLabel")
     assert label.label == NodeLabel.VALUE
     assert label.kind == "xml_setting"
-    assert label.source == "My Flow"
+    assert label.source == "Property Tile"
 
     # A child with element children stays a container, not a setting.
-    assert _entity_by_name(parsed, "decisions").label == NodeLabel.TYPE_DEF
+    assert _entity_by_name(parsed, "targets").label == NodeLabel.TYPE_DEF
 
-    assert _targets(parsed, ".MyFlow_flow-meta_xml", RelType.DEFINES) == {
-        f"{PROJECT}:force-app.flows.MyFlow_flow-meta_xml.Flow"
-    }
-    assert len(_rels_from(parsed, ".MyFlow_flow-meta_xml.Flow", RelType.DEFINES)) == 4
+    stem = ".propertyTile_js-meta_xml"
+    root_qn = f"{PROJECT}:force-app.lwc.propertyTile.propertyTile_js-meta_xml.LightningComponentBundle"
+    assert _targets(parsed, stem, RelType.DEFINES) == {root_qn}
+    assert len(_rels_from(parsed, f"{stem}.LightningComponentBundle", RelType.DEFINES)) == 4
+
+
+def test_salesforce_metadata_bypasses_the_structural_parse() -> None:
+    """A recognised SFDX type must reach its own handler, not the key-tree fallback.
+
+    The two paths mint completely different graphs from the same bytes — a
+    ``TypeDef{kind=sobject}`` whose uid joins the Apex tier, versus a bag of
+    ``xml_element`` nodes that joins nothing — so which one runs is worth
+    pinning here as well as in ``test_salesforce.py``.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Property</label>
+</CustomObject>
+"""
+    parsed = _parse(source, "force-app/main/default/objects/Property__c/Property__c.object-meta.xml")
+
+    kinds = {entity.kind for entity in parsed.entities}
+    assert kinds == {"sf_object", "sobject"}
+    assert not kinds & {"xml_document", "xml_element", "xml_setting"}
 
 
 def test_xml_without_an_element_declines() -> None:

@@ -158,6 +158,18 @@ class _Sample(NamedTuple):
 
 _SAMPLES = [
     _Sample(
+        # Apex has no grammar of its own — it reuses tree-sitter-java behind a
+        # length-preserving shim (see parsing/languages/apex.py).
+        "apex",
+        "tree_sitter_java",
+        "force-app/main/default/classes/AccountService.cls",
+        "public with sharing class AccountService {\n"
+        "    public static List<Account> getAccounts() {\n"
+        "        return [SELECT Id FROM Account];\n"
+        "    }\n"
+        "}\n",
+    ),
+    _Sample(
         "c",
         "tree_sitter_c",
         "src/util.c",

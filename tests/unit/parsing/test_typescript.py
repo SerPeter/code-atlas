@@ -1096,3 +1096,58 @@ export function plain() {
     for entity in parsed.entities:
         assert entity.rationale is None
         assert entity.citations == []
+
+
+# ---------------------------------------------------------------------------
+# Salesforce Lightning Web Components
+# ---------------------------------------------------------------------------
+
+_LWC_PATH = "force-app/main/default/lwc/accountList/accountList.js"
+
+
+def _lwc_imports(source: str) -> set[str]:
+    parsed = _parse(source, path=_LWC_PATH)
+    return {r.to_name for r in parsed.relationships if r.rel_type == RelType.IMPORTS}
+
+
+def test_lwc_apex_import_targets_the_apex_qualified_name():
+    """`apex.Class.method` is what parsing/languages/apex.py stores, so resolve_imports
+    classifies the import as internal and wires the LWC module to the real Callable."""
+    assert "apex.AccountService.getAccounts" in _lwc_imports(
+        "import getAccounts from '@salesforce/apex/AccountService.getAccounts';\n"
+    )
+
+
+def test_lwc_apex_import_keeps_a_managed_package_namespace():
+    assert "apex.ns.AccountService.getAccounts" in _lwc_imports(
+        "import getAccounts from '@salesforce/apex/ns.AccountService.getAccounts';\n"
+    )
+
+
+def test_lwc_schema_import_targets_the_sobject_shared_with_apex():
+    assert "sobject.Account" in _lwc_imports("import NAME from '@salesforce/schema/Account.Name';\n")
+
+
+def test_lwc_schema_import_without_a_field():
+    assert "sobject.Contact" in _lwc_imports("import CONTACT from '@salesforce/schema/Contact';\n")
+
+
+def test_lwc_custom_object_field_reduces_to_the_object():
+    assert "sobject.My_Object__c" in _lwc_imports("import F from '@salesforce/schema/My_Object__c.My_Field__c';\n")
+
+
+def test_lwc_rewrite_replaces_the_raw_specifier():
+    """Emitting both would leave a second, unjoinable ext/ stub beside the resolved target."""
+    imports = _lwc_imports("import getAccounts from '@salesforce/apex/AccountService.getAccounts';\n")
+    assert imports == {"apex.AccountService.getAccounts"}
+
+
+def test_other_salesforce_pseudo_modules_are_left_alone():
+    imports = _lwc_imports(
+        "import userId from '@salesforce/user/Id';\nimport label from '@salesforce/label/c.Greeting';\n"
+    )
+    assert imports == {"@salesforce/user/Id", "@salesforce/label/c.Greeting"}
+
+
+def test_ordinary_imports_are_unaffected():
+    assert _lwc_imports("import { LightningElement } from 'lwc';\n") == {"lwc"}

@@ -125,6 +125,48 @@ def _get_string_content(string_node: Node) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Salesforce Lightning Web Components
+# ---------------------------------------------------------------------------
+
+_SALESFORCE_APEX_PREFIX = "@salesforce/apex/"
+_SALESFORCE_SCHEMA_PREFIX = "@salesforce/schema/"
+
+
+def _salesforce_import_target(specifier: str) -> str | None:
+    """Rewrite an LWC ``@salesforce/*`` module specifier into a graph import target.
+
+    An LWC calls server-side code through pseudo-modules whose *specifier* names
+    the target exactly — the cleanest cross-tier edge source Salesforce offers::
+
+        @salesforce/apex/AccountService.getAccounts  ->  apex.AccountService.getAccounts
+        @salesforce/schema/Account.Name              ->  sobject.Account
+
+    ``apex.<Class>.<method>`` is the qualified name ``parsing/languages/apex.py``
+    stores for Apex members, so ``GraphClient.resolve_imports`` matches it as an
+    *internal* import and wires the LWC module straight to the real ``Callable``
+    (which then lets CALLS resolution's import strategy resolve the call site
+    exactly, instead of guessing by bare name project-wide).
+
+    ``sobject.<Object>`` is the same target the Apex parser emits for SOQL and
+    DML, so both tiers meet on one ``ext/sobject.<Object>`` node.  The field half
+    of ``Account.Name`` is dropped: object-level is the granularity the Apex side
+    can supply, and a half-populated field graph is worse than none.
+
+    Returns ``None`` for every other specifier, including other ``@salesforce/*``
+    pseudo-modules (labels, static resources, user context), which stay ordinary
+    external imports.
+    """
+    if specifier.startswith(_SALESFORCE_APEX_PREFIX):
+        member = specifier.removeprefix(_SALESFORCE_APEX_PREFIX).strip("/")
+        return f"apex.{member}" if member else None
+    if specifier.startswith(_SALESFORCE_SCHEMA_PREFIX):
+        reference = specifier.removeprefix(_SALESFORCE_SCHEMA_PREFIX).strip("/")
+        sobject = reference.split(".")[0]
+        return f"sobject.{sobject}" if sobject else None
+    return None
+
+
 def _is_exported(node: Node) -> bool:
     """Check if a declaration node is wrapped in an export_statement."""
     parent = node.parent
@@ -219,11 +261,15 @@ def _process_import(
     props: dict[str, Any] = {"type_only": True} if is_type_import else {}
 
     import_source = _get_string_content(source_node)
+    # LWC's @salesforce/* pseudo-modules are rewritten, not duplicated: emitting
+    # the raw specifier too would leave a second, unjoinable ext/ stub next to the
+    # resolved target.
+    salesforce_target = _salesforce_import_target(import_source)
     relationships.append(
         ParsedRelationship(
             from_qualified_name=f"{project_name}:{module_qn}",
             rel_type=RelType.IMPORTS,
-            to_name=import_source,
+            to_name=salesforce_target or import_source,
             properties=props,
         )
     )

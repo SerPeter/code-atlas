@@ -25,6 +25,7 @@ _discovered = False
 # side effects. Each is imported independently so one module's failure does not
 # prevent the others (including this list's own remaining entries) from loading.
 _BUILTIN_LANGUAGE_MODULES: tuple[str, ...] = (
+    "code_atlas.parsing.languages.apex",
     "code_atlas.parsing.languages.config",
     "code_atlas.parsing.languages.containerfile",
     "code_atlas.parsing.languages.cpp",
@@ -36,6 +37,9 @@ _BUILTIN_LANGUAGE_MODULES: tuple[str, ...] = (
     "code_atlas.parsing.languages.python",
     "code_atlas.parsing.languages.ruby",
     "code_atlas.parsing.languages.rust",
+    # No register_language() of its own — it is imported by config.py, which owns
+    # the .xml registration and offers every XML document to it first.
+    "code_atlas.parsing.languages.salesforce",
     "code_atlas.parsing.languages.shell",
     "code_atlas.parsing.languages.sql",
     "code_atlas.parsing.languages.typescript",
