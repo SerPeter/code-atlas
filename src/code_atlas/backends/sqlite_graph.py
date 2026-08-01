@@ -55,6 +55,7 @@ from code_atlas.graph.client import (
     _DEFAULT_EDGE_WEIGHT,
     _DEFAULT_TEST_PATTERNS,
     _POST_BATCH_REL_TYPES,
+    _UNVERIFIED_STRATEGIES,
     SCHEMA_VERSION,
     CallStats,
     EntityHashData,
@@ -428,6 +429,27 @@ class SqliteGraphClient:
         )
         await conn.commit()
 
+    async def _migrate_v8_drop_unverified_calls(self, conn: aiosqlite.Connection) -> None:
+        """Mirror of ``GraphClient._migrate_v8_drop_unverified_calls``.
+
+        project_unique edges were written confidence:"resolved" with full weight, so
+        nothing downstream distrusts them; they must be removed rather than left to be
+        overwritten by a re-parse.
+        """
+        await conn.execute(
+            "DELETE FROM edges WHERE rel_type = 'CALLS' AND json_extract(props_json, '$.strategy') = 'project_unique'"
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
+            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
+            "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
+        )
+        await conn.commit()
+        logger.info("SQLite graph schema v8: dropped project_unique CALLS edges and cleared freshness markers")
+
     async def _migrate_v7_clear_freshness_markers(self, conn: aiosqlite.Connection) -> None:
         """Mirror of ``GraphClient._migrate_v7_clear_freshness_markers``.
 
@@ -492,6 +514,8 @@ class SqliteGraphClient:
                 await self._migrate_v6_clear_freshness_markers(conn)
             if stored < 7:
                 await self._migrate_v7_clear_freshness_markers(conn)
+            if stored < 8:
+                await self._migrate_v8_drop_unverified_calls(conn)
             await self._set_schema_version(conn, SCHEMA_VERSION)
         else:
             msg = (
@@ -1339,7 +1363,12 @@ class SqliteGraphClient:
                 unresolved += 1
                 continue
             candidate_uids, strategy = result
-            confidence = "resolved" if len(candidate_uids) == 1 else "ambiguous"
+            # A lone candidate is not enough on its own: an unverified receiver yields
+            # exactly one name match and still cannot be trusted, so candidate_count 1
+            # with confidence "ambiguous" is a real and informative combination.
+            confidence = (
+                "resolved" if len(candidate_uids) == 1 and strategy not in _UNVERIFIED_STRATEGIES else "ambiguous"
+            )
             resolved += confidence == "resolved"
             ambiguous += confidence == "ambiguous"
             caller_uid = rel.from_qualified_name

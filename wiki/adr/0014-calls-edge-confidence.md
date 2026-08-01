@@ -7,6 +7,10 @@ Accepted — amends [ADR-0008](./0008-cross-file-relationship-resolution.md); it
 Alternatives Considered below) now that MAGE's weighted Leiden, blast-radius ranking, and test provenance require a
 magnitude rather than a category.
 
+Amended by [ADR-0022](./0022-call-resolution-requires-a-grounded-receiver.md): a lone candidate is no longer sufficient
+for `resolved`. An attribute call on a receiver whose type is unknown yields `candidate_count: 1` with
+`confidence: "ambiguous"` — a combination this ADR did not anticipate.
+
 ## Date
 
 2026-07-17

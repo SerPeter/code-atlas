@@ -807,6 +807,7 @@ def _extract_calls(
                     )
                 elif func.type == "attribute":
                     attr = func.child_by_field_name("attribute")
+                    obj = func.child_by_field_name("object")
                     if attr is not None:
                         call_name = node_text(attr)
                         relationships.append(
@@ -814,6 +815,13 @@ def _extract_calls(
                                 from_qualified_name=from_qn,
                                 rel_type=RelType.CALLS,
                                 to_name=call_name,
+                                # The receiver is what separates a name the resolver may
+                                # trust from one it may not: `helper()` must resolve in
+                                # lexical scope, but `client.scan()` names a member of a
+                                # type that may never have been indexed. Both arms used
+                                # to emit an identical relationship, discarding the one
+                                # fact that distinguishes them.
+                                properties={"receiver": node_text(obj)} if obj is not None else {},
                             )
                         )
         # Recurse but don't descend into nested function/class definitions

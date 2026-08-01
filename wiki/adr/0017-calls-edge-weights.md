@@ -9,6 +9,9 @@ them to MAGE. The Empirical Validation section therefore documents a procedure t
 the record of why the string `confidence` could not serve as a weight, which remains the reason a numeric `weight`
 property exists.
 
+Amended by [ADR-0022](./0022-call-resolution-requires-a-grounded-receiver.md), which reclassifies unverifiable attribute
+calls as ambiguous and so lowers total CALLS weight.
+
 ## Date
 
 2026-07-30

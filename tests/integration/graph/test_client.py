@@ -4914,3 +4914,163 @@ async def test_batch_file_hashes_round_trip_every_file(graph_client: GraphClient
 
     assert got["missing.py"] is None
     assert {fp: got[fp] for fp in files} == {fp: f"hash-{fp}" for fp in files}
+
+
+async def test_resolve_calls_will_not_resolve_a_call_on_an_unknown_receiver(graph_client: GraphClient):
+    """Uniqueness within the project is evidence of identity only if the name was looked
+    up in the project's namespace.
+
+    Reproduces the reported defect: EmbedCache.clear called the Valkey client's .scan(),
+    and because FileScope.scan was the only project entity named "scan", project_unique
+    claimed it as confidence:"resolved" with full weight. Nothing downstream could see
+    the doubt — ambiguous_only cannot flag a resolved edge and the outline's annotation
+    renders nothing when every property sits at its neutral value.
+    """
+    await graph_client.ensure_schema()
+    project = "call_receiver"
+
+    fp_t = "src/scanner.py"
+    await graph_client.upsert_file_entities(
+        project,
+        fp_t,
+        [
+            ParsedEntity(
+                name="scanner",
+                qualified_name=f"{project}:src.scanner",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=9,
+                file_path=fp_t,
+                content_hash="t_mod",
+            ),
+            ParsedEntity(
+                name="scan",
+                qualified_name=f"{project}:src.scanner.scan",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=2,
+                line_end=4,
+                file_path=fp_t,
+                content_hash="t_scan",
+            ),
+        ],
+        [],
+    )
+
+    fp_c = "src/cache.py"
+    await graph_client.upsert_file_entities(
+        project,
+        fp_c,
+        [
+            ParsedEntity(
+                name="cache",
+                qualified_name=f"{project}:src.cache",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=9,
+                file_path=fp_c,
+                content_hash="c_mod",
+            ),
+            ParsedEntity(
+                name="clear",
+                qualified_name=f"{project}:src.cache.clear",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=2,
+                line_end=4,
+                file_path=fp_c,
+                content_hash="c_clear",
+            ),
+        ],
+        [],
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.cache.clear",
+                rel_type=RelType.CALLS,
+                to_name="scan",
+                properties={"receiver": "self._valkey"},
+            )
+        ],
+    )
+
+    rows = await graph_client.execute(
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN r.confidence AS c, r.strategy AS s, b.uid AS t",
+        {"a": f"{project}:src.cache.clear"},
+    )
+    assert len(rows) == 1
+    # The edge survives — it is the best guess available and ADR-0014 materializes rather
+    # than discards — but it no longer claims to be resolved.
+    assert rows[0]["t"] == f"{project}:src.scanner.scan"
+    assert rows[0]["c"] == "ambiguous"
+    assert rows[0]["s"] == "unverified_receiver"
+
+
+async def test_resolve_calls_still_resolves_self_and_bare_calls(graph_client: GraphClient):
+    """The receiver gate must not regress ordinary resolution. `self.helper()` is exactly
+    as lexically grounded as `helper()`, and same-file resolution is the bulk of correct
+    edges — 4005 of them in the reference index against project_unique's 334.
+    """
+    await graph_client.ensure_schema()
+    project = "call_self_ok"
+    fp = "src/only.py"
+    await graph_client.upsert_file_entities(
+        project,
+        fp,
+        [
+            ParsedEntity(
+                name="only",
+                qualified_name=f"{project}:src.only",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=9,
+                file_path=fp,
+                content_hash="o_mod",
+            ),
+            ParsedEntity(
+                name="helper",
+                qualified_name=f"{project}:src.only.helper",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=2,
+                line_end=3,
+                file_path=fp,
+                content_hash="o_helper",
+            ),
+            ParsedEntity(
+                name="caller",
+                qualified_name=f"{project}:src.only.caller",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=5,
+                line_end=7,
+                file_path=fp,
+                content_hash="o_caller",
+            ),
+        ],
+        [],
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.only.caller",
+                rel_type=RelType.CALLS,
+                to_name="helper",
+                properties={"receiver": "self"},
+            )
+        ],
+    )
+
+    rows = await graph_client.execute(
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN r.confidence AS c",
+        {"a": f"{project}:src.only.caller"},
+    )
+    assert [r["c"] for r in rows] == ["resolved"]

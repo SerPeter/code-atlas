@@ -809,6 +809,17 @@ def _typedef_init_uid(typedef_uid: str, lk: _CallLookup) -> str | None:
     return None
 
 
+# Receiver expressions that denote the enclosing instance, where an attribute call is
+# still lexically grounded: `self.helper()` is exactly as resolvable as `helper()`.
+# Anything else — `client.scan()`, `self._valkey.scan()` — names a member of a type the
+# indexer may never have seen.
+_SELF_RECEIVERS = frozenset({"self", "cls", "this"})
+
+# Strategies whose match is a name coincidence rather than a lexical resolution. Kept as
+# edges (ADR-0014 materializes rather than discards) but never marked resolved.
+_UNVERIFIED_STRATEGIES = frozenset({"unverified_receiver"})
+
+
 def _resolve_one_call(  # noqa: PLR0911, PLR0912
     project_name: str,
     rel: ParsedRelationship,
@@ -879,6 +890,16 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     candidates = lk.name_to_callables.get(bare_name, [])
     non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
     if len(non_self) == 1:
+        # Uniqueness within the project is evidence of identity only if the name was
+        # looked up in the project's namespace. For `client.scan()` it was not: the
+        # receiver's type may never have been indexed, so the single same-named entity
+        # is a coincidence, not the callee. The edge is still worth recording — it is
+        # the best guess available — but it must not claim to be resolved. Verified in
+        # the field: EmbedCache.clear called Valkey's .scan() and this branch pointed it
+        # at FileScope.scan with confidence "resolved" and full weight.
+        receiver = str(rel.properties.get("receiver") or "")
+        if receiver and receiver not in _SELF_RECEIVERS:
+            return (non_self, "unverified_receiver")
         return (non_self, "project_unique")
     if len(non_self) > 1:
         return (non_self, "project_wide")
@@ -1164,6 +1185,8 @@ class GraphClient:
                 await self._migrate_v6_clear_freshness_markers()
             if stored < 7:  # v7 data migration threshold
                 await self._migrate_v7_clear_freshness_markers()
+            if stored < 8:  # v8 data migration threshold
+                await self._migrate_v8_drop_unverified_calls()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -1924,7 +1947,12 @@ class GraphClient:
                 unresolved += 1
                 continue
             candidate_uids, strategy = result
-            confidence = "resolved" if len(candidate_uids) == 1 else "ambiguous"
+            # A lone candidate is not enough on its own: an unverified receiver yields
+            # exactly one name match and still cannot be trusted, so candidate_count 1
+            # with confidence "ambiguous" is a real and informative combination.
+            confidence = (
+                "resolved" if len(candidate_uids) == 1 and strategy not in _UNVERIFIED_STRATEGIES else "ambiguous"
+            )
             if confidence == "resolved":
                 resolved += 1
             else:
@@ -4448,6 +4476,31 @@ class GraphClient:
             await self._create_vector_indices()
         for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
+
+    async def _migrate_v8_drop_unverified_calls(self) -> None:
+        """v8: ``project_unique`` no longer resolves an attribute call on a receiver
+        whose type is unknown.
+
+        Those edges are the one class this migration must remove rather than leave to be
+        overwritten. They were written as ``confidence: "resolved"`` with full weight, so
+        nothing downstream distrusts them — ``ambiguous_only`` cannot flag them and the
+        outline's annotation renders nothing, every property being at its neutral value.
+        Re-parsing alone would not clear a stale one whose call site has since gone.
+
+        Only ``project_unique`` edges are dropped. The other four strategies are
+        lexically grounded (an import, a class sibling, the same file, a constructor) and
+        are unaffected by the change, so purging them would cost a rebuild for nothing.
+        """
+        await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.strategy = 'project_unique' DELETE r")
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v8: dropped project_unique CALLS edges and cleared file/git hashes — "
+            "run 'atlas index' to re-resolve them against the call's receiver"
+        )
 
     async def _reconcile_search_indices(self) -> None:
         """Recreate vector/text indices that have gone missing at the current version.
