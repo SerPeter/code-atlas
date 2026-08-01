@@ -185,6 +185,7 @@ async def generate_diagram(
     project: str,
     path: str = "",
     max_nodes: int = 30,
+    test_patterns: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Dispatch to the requested diagram generator."""
     if diagram_type not in _VALID_DIAGRAM_TYPES:
@@ -192,9 +193,10 @@ async def generate_diagram(
             "error": f"Unknown diagram type '{diagram_type}'. Valid: {sorted(_VALID_DIAGRAM_TYPES)}",
             "code": "INVALID_DIAGRAM_TYPE",
         }
+    if diagram_type == "imports":
+        return await _diagram_imports(graph, project, path, max_nodes, test_patterns)
     dispatch = {
         "packages": _diagram_packages,
-        "imports": _diagram_imports,
         "inheritance": _diagram_inheritance,
         "module_detail": _diagram_module_detail,
     }
@@ -1476,11 +1478,81 @@ async def _diagram_packages(graph: GraphBackend, project: str, path: str, max_no
 # Diagram: imports (module dependency graph)
 # ---------------------------------------------------------------------------
 
+# Mermaid is a rendering format, and measurement says it never pays for itself as text:
+# it costs 3.2-3.6x a plain adjacency list at EVERY size from 2 nodes to 122, because the
+# overhead is per-edge (_sid()'s sha1 suffix is re-emitted at both endpoints of every edge
+# line — 36.8% of a 57-node document). There is no crossover to find. So this threshold is
+# not a token inflection; it is the point below which the absolute cost is small enough
+# that keeping a picture a human can actually render stays worth it, and above which the
+# rendered picture is a hairball nobody looks at anyway.
+_DIAGRAM_MERMAID_MAX_NODES = 25
 
-async def _diagram_imports(graph: GraphBackend, project: str, path: str, max_nodes: int) -> dict[str, Any]:
+
+def _render_grouped_adjacency(nodes: set[str], edges: list[tuple[tuple[str, str], int]]) -> str:
+    """Community-grouped adjacency — the cheapest lossless rendering measured (0.19x
+    Mermaid at 57 nodes, 0.20x at 122) and also the most local: a node's neighbourhood
+    spans a median of 12 lines against Mermaid's 270.
+
+    Same-community targets render as a bare leaf name; cross-community ones are tagged
+    ``Cn:leaf`` and stay inline on the source's own line. Deferring them to a trailing
+    section measured both larger and less local, so inlining wins twice.
+    """
+    undirected: _ModuleEdges = {}
+    for (a, b), w in edges:
+        undirected[_undirected_key(a, b)] = undirected.get(_undirected_key(a, b), 0.0) + float(w)
+    communities = _detect_module_communities(set(nodes), undirected)
+
+    community_of = {qn: i for i, members in enumerate(communities) for qn in members}
+    # Leaf names collide once test modules are in scope (conftest, test_client, ...), so
+    # fall back to the shortest suffix that is unique across the rendered node set.
+    leaf_counts = Counter(qn.rsplit(".", 1)[-1] for qn in nodes)
+    label = {qn: (qn.rsplit(".", 1)[-1] if leaf_counts[qn.rsplit(".", 1)[-1]] == 1 else qn) for qn in nodes}
+
+    def target(src: str, dst: str, weight: int) -> str:
+        c_src, c_dst = community_of.get(src), community_of.get(dst)
+        tag = f"C{c_dst}:" if c_dst is not None and c_dst != c_src else ""
+        return f"{tag}{label[dst]}" + (f"*{weight}" if weight > 1 else "")
+
+    out_edges: dict[str, list[str]] = {}
+    for (a, b), w in edges:
+        out_edges.setdefault(a, []).append(target(a, b, w))
+
+    lines = [
+        f"IMPORTS {len(nodes)} modules, {len(edges)} edges, {len(communities)} clusters",
+        "LEGEND 'a > b, c': a imports b and c | Cn: prefix = target in cluster n | *N edge weight",
+    ]
+    for i, members in enumerate(communities):
+        lines.append("")
+        lines.append(f"[C{i}] {len(members)} modules")
+        for qn in sorted(members):
+            targets = out_edges.get(qn)
+            lines.append(f"  {label[qn]} > {', '.join(sorted(targets))}" if targets else f"  {label[qn]}")
+    loose = sorted(n for n in nodes if n not in community_of)
+    if loose:
+        lines.extend(["", f"[unclustered] {len(loose)} modules"])
+        lines.extend(
+            f"  {label[qn]} > {', '.join(sorted(out_edges[qn]))}" if out_edges.get(qn) else f"  {label[qn]}"
+            for qn in loose
+        )
+    return "\n".join(lines)
+
+
+async def _diagram_imports(
+    graph: GraphBackend, project: str, path: str, max_nodes: int, test_patterns: tuple[str, ...] = ()
+) -> dict[str, Any]:
     t0 = time.monotonic()
     module_edges = await graph.get_module_import_edges(project, path)
     edge_weights = _module_imports_from_records(module_edges["direct"], module_edges["indirect"])
+    if test_patterns:
+        # _analyze_dependencies and _analyze_quality already filter; this one never did,
+        # so 60 of the 100 nodes at the cap were test modules — 60% of the node budget
+        # spent on things nobody asks a dependency diagram about.
+        patterns = list(test_patterns)
+        edge_weights = {
+            (a, b): w
+            for (a, b), w in edge_weights.items()
+            if not _matches_test_qn(a, patterns) and not _matches_test_qn(b, patterns)
+        }
 
     if not edge_weights:
         elapsed = (time.monotonic() - t0) * 1000
@@ -1507,6 +1579,16 @@ async def _diagram_imports(graph: GraphBackend, project: str, path: str, max_nod
         kept_nodes.update(new_nodes)
         kept_edges.append(((from_mod, to_mod), weight))
 
+    if len(kept_nodes) > _DIAGRAM_MERMAID_MAX_NODES:
+        elapsed = (time.monotonic() - t0) * 1000
+        return {
+            "type": "imports",
+            "format": "outline",
+            "outline": _render_grouped_adjacency(kept_nodes, kept_edges),
+            "node_count": len(kept_nodes),
+            "query_ms": round(elapsed, 1),
+        }
+
     lines = ["graph LR"]
     lines.extend(f'    {_sid(qn)}["{_slabel(qn)}"]' for qn in sorted(kept_nodes))
     for (from_mod, to_mod), weight in kept_edges:
@@ -1516,6 +1598,7 @@ async def _diagram_imports(graph: GraphBackend, project: str, path: str, max_nod
     elapsed = (time.monotonic() - t0) * 1000
     return {
         "type": "imports",
+        "format": "mermaid",
         "mermaid": "\n".join(lines),
         "node_count": len(kept_nodes),
         "query_ms": round(elapsed, 1),

@@ -356,6 +356,49 @@ async def test_diagram_packages_forwards_path_scope():
     assert graph.get_diagram_packages.call_args[0] == ("code-atlas", "src/foo", 30)
 
 
+def _import_graph(n: int) -> MagicMock:
+    """A chain of n modules, m0 -> m1 -> ... , half of them test modules."""
+    direct = [
+        {
+            "from_mod": f"pkg.{'test_' if i % 2 else ''}m{i}",
+            "to_mod": f"pkg.{'test_' if (i + 1) % 2 else ''}m{i + 1}",
+        }
+        for i in range(n - 1)
+    ]
+    graph = MagicMock()
+    graph.get_module_import_edges = AsyncMock(return_value={"direct": direct, "indirect": []})
+    return graph
+
+
+async def test_diagram_imports_switches_off_mermaid_once_the_picture_stops_being_one():
+    """Mermaid costs 3.2-3.6x an adjacency list at every measured size — the overhead is
+    per-edge, so it never amortizes. Past the threshold, emit the cheaper form.
+    """
+    small = await generate_diagram(_import_graph(6), "imports", "p", max_nodes=100)
+    assert small["format"] == "mermaid"
+    assert small["mermaid"].startswith("graph LR")
+
+    big = await generate_diagram(_import_graph(60), "imports", "p", max_nodes=100)
+    assert big["format"] == "outline"
+    assert "mermaid" not in big
+    assert "IMPORTS" in big["outline"]
+    assert len(big["outline"]) < len(small["mermaid"]) * 12  # far sublinear in node count
+
+
+async def test_diagram_imports_excludes_test_modules_by_default():
+    """_analyze_dependencies and _analyze_quality already filtered; this one never did,
+    so 60 of the 100 nodes at the cap were test modules.
+    """
+    unfiltered = await generate_diagram(_import_graph(20), "imports", "p", max_nodes=100)
+    filtered = await generate_diagram(
+        _import_graph(20), "imports", "p", max_nodes=100, test_patterns=("tests/", "test_*")
+    )
+
+    assert filtered["node_count"] < unfiltered["node_count"]
+    body = filtered.get("outline") or filtered["mermaid"]
+    assert "test_m" not in body
+
+
 # ---------------------------------------------------------------------------
 # trace_path / blast_radius (information-retrieval family, ADR-0013)
 # ---------------------------------------------------------------------------

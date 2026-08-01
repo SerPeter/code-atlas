@@ -1790,7 +1790,12 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             return _error(str(exc), code="QUERY_TIMEOUT")
 
     @mcp.tool(
-        description=("Generate Mermaid diagrams of the codebase. Returns: {type, mermaid, node_count, query_ms}."),
+        description=(
+            "Diagram the codebase. Returns {type, format, node_count, query_ms} plus either "
+            "`mermaid` (format='mermaid', small graphs — renders as a picture) or `outline` "
+            "(format='outline', larger import graphs — community-grouped adjacency, ~5x cheaper "
+            "in tokens than Mermaid and far easier to follow at scale). Check `format` before reading."
+        ),
     )
     async def generate_diagram(
         type: Annotated[  # noqa: A002
@@ -1808,6 +1813,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             Field("", description="Scope to a file/package path. Required for module_detail, optional otherwise."),
         ] = "",
         max_nodes: Annotated[int, Field(30, description="Maximum nodes in the diagram.", ge=1, le=100)] = 30,
+        exclude_tests: Annotated[
+            bool | None,
+            Field(None, description="Exclude test modules from the imports graph. Default true."),
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -1816,8 +1825,11 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             return _error(str(exc), code="INDEX_REQUIRED")
         project_name = project or derive_project_name(app.settings.project_root)
         max_nodes = max(1, min(max_nodes, _MAX_LIMIT))
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
-            return await _generate_diagram(app.graph, type, project_name, path=path, max_nodes=max_nodes)
+            return await _generate_diagram(
+                app.graph, type, project_name, path=path, max_nodes=max_nodes, test_patterns=test_patterns
+            )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
 
