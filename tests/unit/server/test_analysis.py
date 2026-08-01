@@ -1772,9 +1772,116 @@ async def test_module_summary_passes_through_unknown_edge_properties():
     outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
 
     assert "b[candidate_count=3 confidence=ambiguous strategy=name_match]" in outline
-    assert ", c," in outline
-    assert "c[" not in outline
+    assert "c" in outline
+    assert "c[" not in outline  # neutral-valued props cost no tokens
     assert "d[from_test=True some_future_prop=xyz weight=0.25]" in outline
+    # Confidently-resolved targets lead, ambiguous ones trail: a reader scanning a long
+    # row should hit the trustworthy names first, and it puts the "+N ambiguous" summary
+    # in a consistent place once the set is large enough to collapse.
+    assert outline.index("> c") < outline.index("b[candidate_count")
+
+
+async def test_module_summary_collapses_wide_ambiguous_fan_in_to_a_count():
+    """One entity in the live index has 295 ambiguous callers — every same-named method
+    in the project, not a fact about the code. Enumerating them buries the real edges.
+    """
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[_summary_entity("pkg.mod.close", sig="def close()")],
+        fan_in=[
+            {
+                "from_qn": f"other.mod{i}.close",
+                "from_name": "close",
+                "from_path": f"other/mod{i}.py",
+                "from_label": "Callable",
+                "to_qn": "pkg.mod.close",
+                "rel_type": "CALLS",
+                "props": {"confidence": "ambiguous", "candidate_count": 9},
+            }
+            for i in range(9)
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    assert "+9 ambiguous (use blast_radius)" in outline
+    assert "other.mod3.close" not in outline
+    # The count is still reported honestly in the structured field.
+    assert (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["fan_in_count"] == 9
+
+
+async def test_module_summary_keeps_small_ambiguous_sets_enumerated():
+    """A handful of candidates is often right and worth reading; only wide fan-outs
+    are noise. Annotations survive so the edge stays auditable."""
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[_summary_entity("pkg.mod.a", sig="def a()")],
+        internal_edges=[
+            {
+                "from_qn": "pkg.mod.a",
+                "to_qn": f"pkg.mod.t{i}",
+                "rel_type": "CALLS",
+                "props": {"confidence": "ambiguous", "candidate_count": 2},
+            }
+            for i in range(2)
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    assert "ambiguous (use blast_radius)" not in outline
+    assert "t0[candidate_count=2 confidence=ambiguous]" in outline
+
+
+async def test_module_summary_separates_stdlib_from_third_party_and_ranks_callers():
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[_summary_entity("pkg.mod.a", sig="def a()")],
+        fan_out=[
+            {
+                "from_qn": "pkg.mod.a",
+                "to_qn": f"ext/{name}",
+                "to_name": name,
+                "to_path": None,
+                "to_label": "ExternalPackage",
+                "rel_type": "IMPORTS",
+                "props": {},
+            }
+            for name in ("hashlib", "litellm")
+        ],
+        fan_in=[
+            {
+                "from_qn": f"other.caller{i}",
+                "from_name": f"caller{i}",
+                "from_path": "other/busy.py" if i < 3 else "other/quiet.py",
+                "from_label": "Callable",
+                "to_qn": "pkg.mod.a",
+                "rel_type": "CALLS",
+                "props": {},
+            }
+            for i in range(4)
+        ],
+    )
+
+    outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
+
+    # "ext/" alone means only "outside this project", so a stdlib import and a real
+    # dependency rendered identically and the outline could not answer "what does this
+    # depend on".
+    assert "std/hashlib" in outline
+    assert "ext/litellm" in outline
+    assert "ext/hashlib" not in outline
+    # "Who uses this most" previously required tallying every comma-separated name.
+    assert "TOP CALLERS by file: other/busy.py(3), other/quiet.py" in outline
+
+
+async def test_first_doc_line_marks_that_more_docstring_follows():
+    from code_atlas.server.analysis import _first_doc_line
+
+    assert _first_doc_line("Only one line.") == "Only one line."
+    # A wrapped first line read as mangled rather than clipped.
+    assert _first_doc_line("Wraps mid-sentence (rate limits,\nand more).") == "Wraps mid-sentence (rate limits,..."
+    assert _first_doc_line("Summary.\n\n   \n") == "Summary."
 
 
 async def test_module_summary_filters_test_callers_but_not_in_scope_entities():

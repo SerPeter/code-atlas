@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -1795,6 +1796,34 @@ _MODULE_SUMMARY_LEGEND_MAP = (
 _WHITESPACE_RUN = re.compile(r"\s+")
 _RST_LITERAL = re.compile(r"``([^`]+)``")
 
+# Above this many ambiguous edges from one source, list the count instead of the targets.
+# Small sets are usually right and worth reading; large ones are a name collision fanning
+# out across the project and say nothing.
+_ADJACENCY_AMBIGUOUS_MAX = 3
+
+_STDLIB_MODULES = frozenset(sys.stdlib_module_names)
+_EXTERNAL_PREFIX = "ext/"
+_STDLIB_PREFIX = "std/"
+
+
+def _mark_external(target: str) -> str:
+    """Re-prefix a stdlib import ``std/`` so it is distinguishable from a real dependency.
+
+    ``ext/`` means only "outside this project", so ``ext/hashlib`` and ``ext/litellm``
+    render identically and the outline cannot answer "what does this depend on".
+
+    Python's stdlib list is the only one available in-process, so this is a Python-only
+    refinement; anything unrecognised keeps ``ext/`` rather than being guessed at. A
+    package named after a Python stdlib module in another language would be mislabelled
+    — the honest fix is recording the language on the node at parse time, which needs a
+    re-index (see the spec for the wider external-dependency work).
+    """
+    if not target.startswith(_EXTERNAL_PREFIX):
+        return target
+    root = target[len(_EXTERNAL_PREFIX) :].split(".", 1)[0]
+    return _STDLIB_PREFIX + target[len(_EXTERNAL_PREFIX) :] if root in _STDLIB_MODULES else target
+
+
 # Below this many lines a span's end adds nothing an agent acts on — it can read the
 # entity in one go either way. " L40-67" costs 4 tokens against " L40"'s 2, so the end
 # is spent only where the entity is big enough for its size to be the point.
@@ -1813,11 +1842,18 @@ def _first_doc_line(text: str | None, max_len: int = _MODULE_SUMMARY_DOC_MAX) ->
     """
     if not text:
         return ""
-    for raw in text.splitlines():
+    lines = text.splitlines()
+    for i, raw in enumerate(lines):
         line = _WHITESPACE_RUN.sub(" ", raw).strip()
-        if line:
-            line = _RST_LITERAL.sub(r"\1", line)
-            return line if len(line) <= max_len else line[: max_len - 3] + "..."
+        if not line:
+            continue
+        line = _RST_LITERAL.sub(r"\1", line)
+        if len(line) > max_len:
+            return line[: max_len - 3] + "..."
+        # A first line that wraps mid-sentence reads as mangled rather than clipped —
+        # "...on transient provider errors (rate limits," with nothing to say more was
+        # dropped. Signature truncation already marks itself; match it.
+        return line + "..." if any(ln.strip() for ln in lines[i + 1 :]) else line
     return ""
 
 
@@ -1906,6 +1942,21 @@ def _edge_annotation(props: dict[str, Any] | None) -> str:
     return f"[{' '.join(parts)}]" if parts else ""
 
 
+def _top_callers(fan_in: list[dict[str, Any]], limit: int = 5) -> list[str]:
+    """One line ranking the outside FILES that reach into this scope.
+
+    "Who uses this most" is the first question a reader brings to a boundary section and
+    the one it could not answer: the counts were spread across dozens of comma-separated
+    rows, so both blind readers had to tally 123 names by hand to get there.
+    """
+    counts = Counter(str(r.get("from_path") or r.get("from_qn") or "?") for r in fan_in)
+    if len(counts) < 2:
+        return []
+    top = ", ".join(f"{path}({n})" for path, n in counts.most_common(limit))
+    more = f", +{len(counts) - limit} more" if len(counts) > limit else ""
+    return [f"  TOP CALLERS by file: {top}{more}"]
+
+
 def _adjacency_lines(
     rows: list[dict[str, Any]],
     prefix: str,
@@ -1918,21 +1969,39 @@ def _adjacency_lines(
     One row per edge would repeat the source name once per neighbour; grouping
     pays for it once.
     """
-    grouped: dict[str, dict[str, list[str]]] = {}
+    # Per (rel_type, src): confidently-resolved targets, and ambiguous ones held apart.
+    firm: dict[str, dict[str, set[str]]] = {}
+    vague: dict[str, dict[str, set[str]]] = {}
     for row in rows:
-        by_src = grouped.setdefault(row["rel_type"], {})
+        src = _rel_name(row[src_key], prefix)
+        props = row.get("props") or {}
         # No external marker: every external node's qualified name already begins
         # "ext/" (verified across all 585 in the index), so a trailing * was exactly
         # redundant with the prefix. A blind reader of this format called it out as
         # carrying no information.
-        target = _rel_name(row[dst_key], prefix)
-        by_src.setdefault(_rel_name(row[src_key], prefix), []).append(target + _edge_annotation(row.get("props")))
+        target = _mark_external(_rel_name(row[dst_key], prefix))
+        bucket = vague if props.get("confidence") == "ambiguous" else firm
+        bucket.setdefault(row["rel_type"], {}).setdefault(src, set()).add(target + _edge_annotation(props))
+
     lines: list[str] = []
-    for rel_type in sorted(grouped):
+    for rel_type in sorted(set(firm) | set(vague)):
         lines.append(f"  {rel_type}")
-        lines.extend(
-            f"    {src} {arrow} {', '.join(sorted(set(targets)))}" for src, targets in sorted(grouped[rel_type].items())
-        )
+        srcs = sorted(set(firm.get(rel_type, {})) | set(vague.get(rel_type, {})))
+        for src in srcs:
+            shown = sorted(firm.get(rel_type, {}).get(src, set()))
+            amb = vague.get(rel_type, {}).get(src, set())
+            # Enumerating ambiguous edges is what makes these rows unusable: one entity
+            # in this index has 295 ambiguous callers — that is every same-named method
+            # in the project, not a fact about the code. Small sets still list, since
+            # they are often right; past the threshold only the count is honest.
+            if len(amb) > _ADJACENCY_AMBIGUOUS_MAX:
+                shown.append(f"+{len(amb)} ambiguous (use blast_radius)")
+            else:
+                # Below the threshold they are enumerated in full, annotations included:
+                # candidate_count and strategy are what make an ambiguous edge auditable.
+                shown.extend(sorted(amb))
+            if shown:
+                lines.append(f"    {src} {arrow} {', '.join(shown)}")
     return lines
 
 
@@ -2090,7 +2159,10 @@ def _render_outline(src: _OutlineInputs, tier: str) -> str:
     if internal:
         lines.extend(["", f"EDGES within scope ({len(src.internal_edges)})", *internal])
     if inbound:
-        lines.extend(["", f"FAN-IN — callers/importers outside this scope ({len(src.fan_in)})", *inbound])
+        lines.extend(
+            ["", f"FAN-IN — callers/importers outside this scope ({len(src.fan_in)})", *_top_callers(src.fan_in)]
+        )
+        lines.extend(inbound)
     if outbound:
         lines.extend(["", f"FAN-OUT — what this scope depends on ({len(src.fan_out)})", *outbound])
     doc_lines = _doc_link_lines(src.docs, p)
