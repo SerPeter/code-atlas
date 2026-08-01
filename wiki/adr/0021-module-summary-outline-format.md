@@ -70,6 +70,32 @@ The notation is still not in any model's training distribution. That cost is rea
 understood it, but a comparison against a standard format for _equal information_ was not run, because no standard
 format carries the boundary sections.
 
+## Amendments
+
+Changes made after the blind-read evaluation, all of them findings that evaluation produced.
+
+**Visibility marker is now conditional** (ATL-092). It is emitted only when the rendered line does not already carry the
+information: Python states it in the name, Java/C#/C++/PHP in the signature keyword. On this index that means no marker
+is emitted at all, which also removes the `#`-means-protected versus `# `-introduces-a-docstring collision a reader
+flagged as surviving only by luck. Measured -77 tokens on one scope; the point is the removed ambiguity, not the saving.
+
+**Signatures elide comments** (ATL-092). They were a raw byte slice, so a lint-suppression comment inside a multi-line
+signature reached the outline. They are now rebuilt excising the ranges the grammar labelled as comments — correct where
+a regex is not, since a hash inside a string default belongs to a `string` node and survives.
+
+**Boundary sections were reworked.** Ambiguous fan-in collapses past three candidates (one entity had 295 ambiguous
+callers — every same-named method in the project, not a fact about the code); stdlib renders `std/` against a
+third-party `ext/`, which the single prefix could not distinguish; FAN-IN gained a `TOP CALLERS by file` line, because
+"who uses this most" previously meant hand-tallying 123 names; and a truncated first docstring line now ends `...`, the
+one place the outline still dropped content silently.
+
+**The import diagram gained cycles, file locations and a scope statement** (ATL-093), each placed by the rule that an
+addition may cost O(nodes) but never O(edges) — the arithmetic that killed Mermaid. Cycles are one block reusing
+`_find_sccs`; identity is a `FILES` block grouped by directory, since inlining a path per mention measured +54% against
+grouping's +21%; the absence of external dependencies is stated rather than implied. Cluster members order by in-degree,
+which was free. Net 1020 -> 1238 tokens against a Mermaid baseline of 10389. The +21% exceeds the +14% bar this ADR set
+with in-degree — a deliberate overrun, taken because the alternative leaves the diagram unable to say where anything is.
+
 ## Alternatives Considered
 
 **Abbreviating keywords** (`async def` -> `afn`, `class` -> `cls`). Rejected on measurement: it saves 6,123 characters

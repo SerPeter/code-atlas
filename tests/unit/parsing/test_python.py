@@ -2129,3 +2129,12 @@ def test_signature_without_comments_is_unchanged():
     parsed = _parse("def plain(a: int) -> bool:\n    return True\n")
 
     assert _entity_by_name(parsed, "plain").signature == "def plain(a: int) -> bool"
+
+
+def test_docstring_containing_a_hash_round_trips():
+    """A hash in prose is not a marker and not a comment. The signature extractor elides
+    only nodes the grammar labelled `comment`, so docstring text is untouched.
+    """
+    parsed = _parse('def rank() -> int:\n    """Return the #1 match."""\n    return 1\n')
+
+    assert _entity_by_name(parsed, "rank").docstring == "Return the #1 match."
