@@ -52,6 +52,7 @@ from code_atlas.search.engine import (
     expand_context,
     expand_scope,
     filter_raw_records,
+    matches_test_pattern,
 )
 from code_atlas.search.engine import hybrid_search as _hybrid_search
 from code_atlas.search.guidance import (
@@ -63,7 +64,7 @@ from code_atlas.search.guidance import (
     validate_cypher_explain,
     validate_cypher_static,
 )
-from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES, _DEFAULT_TRACE_EDGE_TYPES
+from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES, _DEFAULT_TRACE_EDGE_TYPES, _padded_limit
 from code_atlas.server.analysis import analyze_repo as _analyze_repo
 from code_atlas.server.analysis import blast_radius as _blast_radius
 from code_atlas.server.analysis import generate_diagram as _generate_diagram
@@ -815,6 +816,12 @@ def create_mcp_server(  # noqa: PLR0915
 # ---------------------------------------------------------------------------
 
 
+def _keep_node_row(row: dict[str, Any], patterns: list[str]) -> bool:
+    """Whether a get_node partial-match row survives test filtering."""
+    node = row.get("n") or {}
+    return not matches_test_pattern(node.get("file_path") or "", node.get("name") or "", patterns)
+
+
 def _register_node_tools(mcp: FastMCP) -> None:
     """Register the get_node tool (separated for statement-count limits)."""
 
@@ -851,6 +858,16 @@ def _register_node_tools(mcp: FastMCP) -> None:
                 description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
             ),
         ] = "summary",
+        exclude_tests: Annotated[
+            bool | None,
+            Field(
+                None,
+                description=(
+                    "Exclude test entities from PARTIAL matches. Exact uid/name matches are never "
+                    "filtered — you asked for that name. Default true — override to include."
+                ),
+            ),
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -858,6 +875,8 @@ def _register_node_tools(mcp: FastMCP) -> None:
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
         clamped = _clamp_limit(limit)
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
+        patterns = list(test_patterns)
 
         if label and label not in NodeLabel:
             valid = ", ".join(sorted(lbl.value for lbl in NodeLabel))
@@ -866,7 +885,9 @@ def _register_node_tools(mcp: FastMCP) -> None:
         found: list[dict[str, Any]] | None = None
         total: int | None = None
         page_end = offset + clamped
-        peek = page_end + 1  # fetch one extra row to detect truncation past this page
+        # One extra row to detect truncation past this page, padded when filtering is on
+        # so discarded rows backfill from real candidates instead of under-delivering.
+        peek = _padded_limit(page_end, test_patterns) + 1
 
         try:
             # Stage A: Exact matches (uid + exact name) — 1 RTT
@@ -879,6 +900,13 @@ def _register_node_tools(mcp: FastMCP) -> None:
                     seen[uid] = r
                     ordered_uids.append(uid)
 
+            # Stage A results are never test-filtered: an exact name match is what the
+            # caller asked for by name. Filtering them would make 51.8% of this repo's
+            # distinct entity names unresolvable, including production symbols that only
+            # look test-shaped (test_filter, test_patterns, from_test). Exempting Stage A
+            # also means the gate below can keep counting raw rows — the "a page of test
+            # exact matches suppresses Stage B" hazard only exists if Stage A is filtered.
+            #
             # Stage B: Partial matches (suffix > prefix > contains) — 1 RTT. Runs
             # whenever Stage A didn't fill the requested budget, not only when it
             # found nothing — otherwise a single exact hit silently hides
@@ -889,7 +917,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
                 partial_best: dict[str, dict[str, Any]] = {}
                 for r in partial:
                     uid = r["n"]["uid"]
-                    if uid in seen:
+                    if uid in seen or (patterns and not _keep_node_row(r, patterns)):
                         continue
                     if r.get("_match_score", 0) > partial_best.get(uid, {}).get("_match_score", -1):
                         partial_best[uid] = r
@@ -2063,6 +2091,17 @@ def _register_traversal_tools(mcp: FastMCP) -> None:
             str, Field("", description="Comma-separated relationship types to traverse. Empty = CALLS.")
         ] = "",
         limit: Annotated[int, Field(20, description="Max affected entities to return.", ge=1, le=100)] = 20,
+        exclude_tests: Annotated[
+            bool | None,
+            Field(
+                None,
+                description=(
+                    "Exclude test entities from the affected list and affected_count. Default true — "
+                    "override to include. Distinct from the per-entity test_only flag, which reports "
+                    "whether a test-free call path reaches the entity, not where the entity lives."
+                ),
+            ),
+        ] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         try:
@@ -2074,9 +2113,16 @@ def _register_traversal_tools(mcp: FastMCP) -> None:
             return type_error
         depth = _clamp_depth(max_depth)
         clamped_limit = _clamp_limit(limit)
+        test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
             return await _blast_radius(
-                app.graph, uid, direction=direction, max_depth=depth, edge_types=types, limit=clamped_limit
+                app.graph,
+                uid,
+                direction=direction,
+                max_depth=depth,
+                edge_types=types,
+                limit=clamped_limit,
+                test_patterns=test_patterns,
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")

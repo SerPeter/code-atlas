@@ -538,6 +538,46 @@ async def test_blast_radius_respects_limit_and_reports_truncated():
     assert result["truncated"] is True
 
 
+async def test_blast_radius_excludes_test_entities_and_corrects_the_count():
+    """affected_count is the headline number — filtering after it is computed would
+    report an impact 3x larger than what the list shows."""
+    graph = MagicMock()
+    graph.node_exists = AsyncMock(return_value=True)
+    graph.compute_blast_radius = AsyncMock(
+        return_value=[
+            _affected("prod", file_path="src/mod.py"),
+            _affected("test_a", file_path="tests/unit/test_mod.py"),
+            _affected("test_b", file_path="tests/unit/test_other.py"),
+        ]
+    )
+
+    unfiltered = await blast_radius(graph, "src:mod.prod")
+    assert unfiltered["affected_count"] == 3
+
+    filtered = await blast_radius(graph, "src:mod.prod", test_patterns=("tests/",))
+    assert filtered["affected_count"] == 1
+    assert [a["uid"] for a in filtered["affected"]] == ["prod"]
+
+
+async def test_blast_radius_filters_on_location_not_on_the_test_only_flag():
+    """``test_only`` means "no test-free call path reaches this", is baked in at index
+    time from the caller side, and disagrees with path matching on real data. An entity
+    in production code must survive even when that flag is set.
+    """
+    graph = MagicMock()
+    graph.node_exists = AsyncMock(return_value=True)
+    graph.compute_blast_radius = AsyncMock(
+        return_value=[
+            _affected("prod_reached_only_via_tests", file_path="src/mod.py", test_only=True),
+            _affected("helper_living_in_tests", file_path="tests/conftest.py", test_only=False),
+        ]
+    )
+
+    result = await blast_radius(graph, "src:mod.x", test_patterns=("tests/",))
+
+    assert [a["uid"] for a in result["affected"]] == ["prod_reached_only_via_tests"]
+
+
 def _affected(uid: str, **overrides: object) -> dict[str, object]:
     entry: dict[str, object] = {
         "uid": uid,

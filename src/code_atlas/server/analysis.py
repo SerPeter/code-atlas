@@ -267,6 +267,7 @@ async def blast_radius(
     max_depth: int = 3,
     edge_types: tuple[str, ...] = _DEFAULT_BLAST_EDGE_TYPES,
     limit: int = 20,
+    test_patterns: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Depth-limited transitive closure of callers/callees/both from *uid*.
 
@@ -305,6 +306,18 @@ async def blast_radius(
             existing = affected.get(entry["uid"])
             if existing is None or entry["min_depth"] < existing["min_depth"]:
                 affected[entry["uid"]] = entry
+
+    if test_patterns:
+        # Filter on the entity's own path/name, NOT on its ``test_only`` flag. That flag
+        # answers a different question — "no test-free CALL path reaches this" — is baked
+        # in at index time from the *caller* side, and so cannot honour query-time
+        # patterns. The two disagree on 131 of the entities across a sampled traversal.
+        patterns = list(test_patterns)
+        affected = {
+            k: v
+            for k, v in affected.items()
+            if not matches_test_pattern(v["file_path"] or "", v["name"] or "", patterns)
+        }
 
     elapsed = (time.monotonic() - t0) * 1000
     results = sorted(
