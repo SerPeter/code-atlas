@@ -53,6 +53,32 @@ async def test_ensure_schema_idempotent(graph_client: GraphClient):
     assert version == SCHEMA_VERSION
 
 
+async def test_ensure_schema_recreates_a_vector_index_lost_at_the_current_version(graph_client: GraphClient):
+    """A current version node does not prove the indices still exist.
+
+    Observed in the field: a graph with 5481 embedded Callables and zero vector
+    indices. ensure_schema kept taking the "already current" branch, so nothing
+    recreated them, and hybrid_search silently returned BM25-only results while
+    health_check still reported the embedding provider healthy.
+    """
+
+    async def vector_labels() -> set[str]:
+        rows = await graph_client.execute("SHOW INDEX INFO")
+        return {str(r["label"]) for r in rows if "vector" in str(r.get("index type", "")).lower()}
+
+    await graph_client.ensure_schema()
+    assert "Callable" in await vector_labels()
+
+    await graph_client.execute_write("DROP VECTOR INDEX vec_callable;")
+    assert "Callable" not in await vector_labels()
+
+    # Version is unchanged, so this takes the "already current" branch.
+    await graph_client.ensure_schema()
+
+    assert "Callable" in await vector_labels()
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
+
+
 async def test_ensure_schema_rejects_downgrade(graph_client: GraphClient):
     """A newer DB version should raise RuntimeError."""
     await graph_client.ensure_schema()

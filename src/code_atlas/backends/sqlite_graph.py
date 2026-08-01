@@ -479,6 +479,12 @@ class SqliteGraphClient:
             logger.info("SQLite graph schema v{} applied", SCHEMA_VERSION)
         elif stored == SCHEMA_VERSION:
             logger.debug("SQLite graph schema v{} already current", SCHEMA_VERSION)
+            # Re-apply rather than trust the version: a current version node does not
+            # prove the vec0/FTS5 side tables still exist, and without them search
+            # degrades silently. The DDL is CREATE ... IF NOT EXISTS throughout, so
+            # this is a no-op when nothing is missing. Mirrors
+            # GraphClient._reconcile_search_indices.
+            await self._apply_full_schema(conn)
         elif stored < SCHEMA_VERSION:
             logger.info("SQLite graph schema v{} -> v{} (idempotent re-apply)", stored, SCHEMA_VERSION)
             await self._apply_full_schema(conn)

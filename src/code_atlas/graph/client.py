@@ -1146,6 +1146,7 @@ class GraphClient:
 
         elif stored == SCHEMA_VERSION:
             logger.debug("Schema v{} already current — no migration needed", SCHEMA_VERSION)
+            await self._reconcile_search_indices()
 
         elif stored < SCHEMA_VERSION:
             logger.info("Migrating schema v{} → v{}", stored, SCHEMA_VERSION)
@@ -4431,6 +4432,57 @@ class GraphClient:
             await self._create_vector_indices()
         for stmt in generate_text_index_ddl():
             await self._exec_ddl(stmt)
+
+    async def _reconcile_search_indices(self) -> None:
+        """Recreate vector/text indices that have gone missing at the current version.
+
+        The version check answers "is the schema shape current?", not "do the indices
+        still exist?" — and those come apart. An index can vanish while the version
+        node still reads current: a restore from a snapshot predating it, a manual
+        drop, a CREATE that failed after the version was written. Every subsequent
+        startup then takes the no-op branch, so nothing ever puts it back.
+
+        The failure is silent, which is what makes it worth a startup check. Node
+        embeddings keep being written, ``health_check`` keeps reporting the embedding
+        provider healthy, and ``hybrid_search`` keeps returning results — just BM25
+        ones, with the vector channel contributing nothing. Observed in the field:
+        a graph with 5481 embedded Callables and zero vector indices.
+
+        Only missing indices are created; this is not a drop-and-rebuild.
+        """
+        try:
+            rows = await self.execute("SHOW INDEX INFO")
+        except Exception as exc:  # pragma: no cover - catalogue unavailable
+            logger.debug("Could not read index catalogue to reconcile: {}", exc)
+            return
+
+        present_vector = {str(r.get("label")) for r in rows if "vector" in str(r.get("index type", "")).lower()}
+        present_text = {
+            str(r["index type"]).split("name: ")[-1].rstrip(")")
+            for r in rows
+            if str(r.get("index type", "")).startswith("label_text")
+        }
+
+        expected_vector = {lbl.value for lbl in _EMBEDDABLE_LABELS} if self._embeddings_enabled else set()
+        expected_text = {f"text_{lbl.value.lower()}" for lbl in _TEXT_SEARCHABLE_LABELS}
+
+        missing_vector = expected_vector - present_vector
+        missing_text = expected_text - present_text
+        if not missing_vector and not missing_text:
+            return
+
+        logger.warning(
+            "Schema v{} is current but search indices are missing (vector: {}, text: {}) — recreating. "
+            "Semantic search returns nothing without them.",
+            SCHEMA_VERSION,
+            sorted(missing_vector) or "none",
+            sorted(missing_text) or "none",
+        )
+        if missing_vector:
+            await self._create_vector_indices()
+        if missing_text:
+            for stmt in generate_text_index_ddl():
+                await self._exec_ddl(stmt)
 
     async def _migrate_indices(self) -> None:
         """Drop and recreate vector/text indices (dimension may have changed).
