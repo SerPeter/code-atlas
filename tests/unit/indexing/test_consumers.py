@@ -471,6 +471,28 @@ async def test_parse_file_partitions_config_rels(tmp_path: Path, monkeypatch) ->
     assert pfd.non_import_rels == [plain]
 
 
+async def test_parse_file_drops_references_to_directories_but_keeps_missing_files(tmp_path: Path, monkeypatch) -> None:
+    """A directory path in a string literal is indistinguishable from a file path to
+    the parser, which is pure and does no I/O. ``.atlas`` (a Path-typed settings
+    default) became a ResourceFile node this way. A path that simply does not exist is
+    kept — an unresolved reference to a data file is what this node type is for.
+    """
+    (tmp_path / "somedir").mkdir()
+    consumer = _make_consumer(tmp_path)
+    a_dir = ParsedRelationship(from_qualified_name="p:conf.load", rel_type=RelType.REFERENCES_FILE, to_name="somedir")
+    absent = ParsedRelationship(
+        from_qualified_name="p:conf.load", rel_type=RelType.REFERENCES_FILE, to_name="data/generated.json"
+    )
+    env = ParsedRelationship(from_qualified_name="p:conf.load", rel_type=RelType.READS_ENV, to_name="DATABASE_URL")
+    fake = ParsedFile(file_path="conf.py", language="python", entities=[], relationships=[a_dir, absent, env])
+    monkeypatch.setattr("code_atlas.indexing.consumers.parse_file", lambda *a, **k: fake)
+
+    pfd = await consumer._parse_file("p", "conf.py", source=b"")
+
+    assert pfd is not None
+    assert pfd.config_rels == [absent, env]
+
+
 async def test_flush_resolves_config_refs_then_runs_gc(tmp_path: Path) -> None:
     """Order matters: the sweep deletes anything at zero incoming edges, so it
     must run only after this flush has re-created its references.

@@ -52,8 +52,12 @@ class TestNamesOnlyInvariant:
         plan = _plan_config_refs("proj", [_file_ref("proj:m.f", "conf/creds.yaml", contents=secret, mode="r")])
 
         node = plan.file_nodes[resource_file_uid("proj", "conf/creds.yaml")]
-        assert set(node) == {"uid", "project_name", "name", "qualified_name"}
+        # file_path is admissible under the names-never-values invariant: it is derived
+        # from rel.to_name, the same source as name and qualified_name, and carries no
+        # parser-observed content. The file's *contents* and open mode stay out.
+        assert set(node) == {"uid", "project_name", "name", "qualified_name", "file_path"}
         assert secret not in "".join(node.values())
+        assert node["file_path"] == "conf/creds.yaml"
 
     def test_edges_carry_no_properties_at_all(self) -> None:
         """Edges are bare 3-tuples — there is no channel for a default value to

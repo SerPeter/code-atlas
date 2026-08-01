@@ -4624,6 +4624,34 @@ async def test_config_refs_create_both_node_kinds_and_their_edges(graph_client: 
     ]
 
 
+async def test_resource_file_carries_its_path_without_polluting_delta_detection(graph_client: GraphClient):
+    """The path must land on file_path — it previously survived only inside the uid, so
+    nothing filtering or rendering by file_path could see the node.
+
+    But a ResourceFile's path names a file the project *references*, not one it indexed,
+    so get_project_file_paths must not report it. If it did, every referenced data file
+    would look like a source file that had since been deleted: the delta ratio inflates
+    and a `deleted` FileChanged DETACH DELETEs the node on the next delta index.
+    """
+    await graph_client.ensure_schema()
+    project = "test_resource_path"
+    reader = _reader_callable(project)
+    await graph_client.upsert_file_entities(project, "src/conf.py", [reader], [])
+
+    await graph_client.resolve_config_refs(
+        project, [_file_ref(reader.qualified_name, "./data/fixtures.json"), _env_ref(reader.qualified_name, "PORT")]
+    )
+
+    rows = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.RESOURCE_FILE} {{project_name: $p}}) RETURN n.file_path AS fp", {"p": project}
+    )
+    assert [r["fp"] for r in rows] == ["data/fixtures.json"]
+
+    indexed = await graph_client.get_project_file_paths(project)
+    assert "src/conf.py" in indexed
+    assert "data/fixtures.json" not in indexed
+
+
 async def test_config_refs_persist_names_not_values(graph_client: GraphClient):
     """The security invariant, checked against the real store: a default value
     handed to the resolver must not survive anywhere on the node or the edge.

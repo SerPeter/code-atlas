@@ -693,6 +693,21 @@ class ASTConsumer(TierConsumer):
             # a cross-project lookup, unlike the immediate heuristic doc-links).
             return r.rel_type == RelType.DOCUMENTS and r.properties.get("link_type") == "anchor"
 
+        def _keep_config_ref(r: ParsedRelationship) -> bool:
+            # A directory path in a string literal looks exactly like a file path to the
+            # parser, which is a pure no-I/O function and cannot tell them apart. This
+            # wrapper already owns the project root and already stats the file, so the
+            # check belongs here. A path that does not exist is kept: an unresolved
+            # reference to a data file is the case this node type is for.
+            if r.rel_type not in _CONFIG_REF_REL_TYPES:
+                return False
+            if r.rel_type != RelType.REFERENCES_FILE:
+                return True
+            try:
+                return not (root / r.to_name).is_dir()
+            except OSError:
+                return True
+
         return _ParsedFileData(
             file_path=file_path,
             parsed_file=parsed,
@@ -707,7 +722,7 @@ class ASTConsumer(TierConsumer):
             type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
             anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
-            config_rels=[r for r in parsed.relationships if r.rel_type in _CONFIG_REF_REL_TYPES],
+            config_rels=[r for r in parsed.relationships if _keep_config_ref(r)],
             citations={e.qualified_name: list(e.citations) for e in parsed.entities if e.citations},
         )
 

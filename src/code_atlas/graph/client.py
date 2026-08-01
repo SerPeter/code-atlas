@@ -240,6 +240,9 @@ def _plan_config_refs(project_name: str, ref_rels: list[ParsedRelationship]) -> 
                     "project_name": project_name,
                     "name": path.rsplit("/", 1)[-1],
                     "qualified_name": f"{RESOURCE_FILE_PREFIX}{path}",
+                    # Without this the path survives only inside the uid, so nothing that
+                    # filters or renders by file_path can see the node at all.
+                    "file_path": path,
                 },
             )
         else:
@@ -1588,9 +1591,15 @@ class GraphClient:
         Includes Package nodes (from ``__init__.py``) so delta detection
         doesn't treat them as newly added on every re-index.
         """
+        # Reference-counted stubs are excluded even though they now carry a file_path:
+        # theirs names a file this project *mentions*, not one it indexed. Counting it
+        # here would make every referenced data file look like a source file that had
+        # since been deleted — inflating the delta ratio and publishing a `deleted`
+        # FileChanged that DETACH DELETEs the node on every delta index.
         records = await self.execute(
             f"MATCH (n {{project_name: $p}}) "
             f"WHERE NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
+            f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
             "RETURN DISTINCT n.file_path AS fp",
             {"p": project_name},
         )
@@ -1797,7 +1806,12 @@ class GraphClient:
                 f"UNWIND $nodes AS n "
                 f"MERGE (x:{label} {{uid: n.uid}}) "
                 f"ON CREATE SET x.project_name = n.project_name, x.name = n.name, "
-                f"x.qualified_name = n.qualified_name",
+                f"x.qualified_name = n.qualified_name "
+                # Unconditional, unlike the rest, so nodes created before file_path was
+                # planned self-heal on the next resolve instead of needing a migration.
+                # Safe for EnvVar, whose node dicts carry no such key: a missing map key
+                # is null in Cypher and SET to null is a no-op.
+                f"SET x.file_path = n.file_path",
                 {"nodes": list(nodes.values())},
             )
 

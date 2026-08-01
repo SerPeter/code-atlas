@@ -949,8 +949,12 @@ class SqliteGraphClient:
     async def get_project_file_paths(self, project_name: str) -> set[str]:
         conn = await self._get_conn()
         cur = await conn.execute(
+            # ResourceFile/EnvVar carry a file_path they only *reference*, never one this
+            # project indexed. Counting them makes every referenced data file look like a
+            # deleted source file on the next delta index. Mirrors GraphClient.
             "SELECT DISTINCT file_path FROM nodes WHERE project_name = ? "
-            "AND labels NOT IN ('Project', 'SchemaVersion') AND file_path IS NOT NULL",
+            "AND labels NOT IN ('Project', 'SchemaVersion', 'ResourceFile', 'EnvVar') "
+            "AND file_path IS NOT NULL",
             (project_name,),
         )
         rows = await cur.fetchall()
@@ -1233,8 +1237,16 @@ class SqliteGraphClient:
             for node in nodes.values():
                 await conn.execute(
                     f"INSERT INTO nodes({_NODE_COLUMNS}) "
-                    "VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, '{}') ON CONFLICT(uid) DO NOTHING",
-                    (node["uid"], label, node["project_name"], node["qualified_name"], node["name"]),
+                    "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, '{}') "
+                    "ON CONFLICT(uid) DO UPDATE SET file_path = excluded.file_path",
+                    (
+                        node["uid"],
+                        label,
+                        node["project_name"],
+                        node["qualified_name"],
+                        node.get("file_path"),
+                        node["name"],
+                    ),
                 )
                 if label in _TEXT_LABEL_VALUES:
                     table = f"text_{label.lower()}"
