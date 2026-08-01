@@ -1462,7 +1462,9 @@ async def test_module_summary_emits_signature_visibility_span_and_first_doc_line
 
     outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
 
-    assert "+ def run(self, x: int) -> str L10-42  # Do the thing." in outline
+    # No marker means public — the marker is spent only where it carries information.
+    assert "def run(self, x: int) -> str L10-42 # Do the thing." in outline
+    assert "+ def run" not in outline
     assert "- def _helper() L50" in outline
     assert "Long explanation nobody needs here." not in outline
     assert "More." not in outline
@@ -1481,9 +1483,113 @@ async def test_module_summary_indents_class_members_under_their_class():
 
     outline = (await analyze_repo(graph, "module_summary", "proj", path="pkg"))["outline"]
 
-    assert "  + class Widget L1-30" in outline
-    assert "    + def draw(self) L1" in outline
-    assert "  + def free_fn() L1" in outline
+    assert "  class Widget L1-30" in outline
+    assert "    def draw(self) L1" in outline
+    assert "  def free_fn() L1" in outline
+
+
+def _wide_summary_graph(n_entities: int = 600) -> MagicMock:
+    """A scope too big to render at T2, with a boundary edge to watch."""
+    ents = [
+        _summary_entity(
+            f"pkg.mod.fn{i}",
+            sig=f"def fn{i}(alpha: SomeLongTypeName, beta: AnotherLongTypeName) -> YetAnotherType",
+            docstring=f"Does thing number {i} with a reasonably wordy summary sentence.",
+            line_start=i,
+        )
+        for i in range(n_entities)
+    ]
+    return _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": "Scope."}],
+        entities=ents,
+        fan_in=[
+            {
+                "from_qn": "other.cli.main",
+                "from_name": "main",
+                "from_path": "other/cli.py",
+                "from_label": "Callable",
+                "to_qn": "pkg.mod.fn0",
+                "rel_type": "CALLS",
+                "props": {},
+            }
+        ],
+    )
+
+
+async def test_module_summary_drops_a_tier_instead_of_truncating_the_boundary_away():
+    """The old size cap cut the joined string from the end, which deleted EDGES/
+    FAN-IN/FAN-OUT while leaving their counts in the response claiming otherwise.
+    Dropping detail must keep the outline structurally complete.
+    """
+    result = await analyze_repo(_wide_summary_graph(), "module_summary", "proj", path="pkg", limit=100)
+
+    assert result["detail_tier"] == "T1"
+    assert "FAN-IN" in result["outline"]
+    assert result["fan_in_count"] == 1
+    assert "OUTLINE TRUNCATED" not in result["outline"]
+    assert result["next_step"]
+
+    # Wider still and it keeps stepping down rather than cutting.
+    huge = await analyze_repo(_wide_summary_graph(4000), "module_summary", "proj", path="pkg", limit=100)
+    assert huge["detail_tier"] == "T0"
+    assert "FAN-IN" in huge["outline"]
+    assert "OUTLINE TRUNCATED" not in huge["outline"]
+
+
+async def test_module_summary_tier_is_reported_and_counts_do_not_contradict_the_outline():
+    result = await analyze_repo(_wide_summary_graph(), "module_summary", "proj", path="pkg", limit=100)
+
+    assert result["entity_count"] == 600  # in scope
+    # T1 reduces per-entity detail, not the entity set, so these can legitimately match.
+    assert result["entities_rendered"] == 600
+    assert f"DETAIL {result['detail_tier']}" in result["outline"]
+
+    # At T0 they diverge, and that is exactly when a lone count would mislead.
+    t0 = await analyze_repo(_wide_summary_graph(4000), "module_summary", "proj", path="pkg", limit=100)
+    assert (t0["entity_count"], t0["entities_rendered"]) == (4000, 0)
+
+
+async def test_module_summary_t1_drops_signatures_and_non_public_and_value_entities():
+    graph = _graph_for_module_summary(
+        modules=[{"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None}],
+        entities=[
+            _summary_entity("pkg.mod.keep", sig="def keep(a: int) -> str"),
+            _summary_entity("pkg.mod._gone", vis="private", sig="def _gone()"),
+            _summary_entity("pkg.mod.CONST", label="Value", kind="constant", sig=None),
+        ],
+    )
+    from code_atlas.server.analysis import _tier_entities
+
+    kept = {e["name"] for e in _tier_entities(graph.get_module_summary.return_value["entities"], "T1")}
+    assert kept == {"keep"}
+    # And T2 is a strict superset, so drilling down never loses what a wider view showed.
+    t2 = {e["name"] for e in _tier_entities(graph.get_module_summary.return_value["entities"], "T2")}
+    assert kept < t2
+
+
+async def test_module_summary_excludes_in_scope_tests_unless_the_path_is_itself_a_test_path():
+    graph = _graph_for_module_summary(
+        modules=[
+            {"qn": "pkg.mod", "name": "mod", "file_path": "pkg/mod.py", "docstring": None},
+            {"qn": "tests.test_mod", "name": "test_mod", "file_path": "tests/test_mod.py", "docstring": None},
+        ],
+        entities=[
+            _summary_entity("pkg.mod.run", sig="def run()"),
+            _summary_entity("tests.test_mod.test_run", sig="def test_run()", file_path="tests/test_mod.py"),
+        ],
+    )
+    patterns = ("tests/", "test_*")
+
+    wide = await analyze_repo(graph, "module_summary", "proj", path="", limit=100, test_patterns=patterns)
+    assert "PATH_REQUIRED" in wide["code"]
+
+    prod = await analyze_repo(graph, "module_summary", "proj", path="pkg", limit=100, test_patterns=patterns)
+    assert "test_run" not in prod["outline"]
+    assert "run" in prod["outline"]
+
+    # Asking for a test path plainly means you want the tests; filtering returns nothing.
+    scoped = await analyze_repo(graph, "module_summary", "proj", path="tests/", limit=100, test_patterns=patterns)
+    assert "test_run" in scoped["outline"]
 
 
 async def test_module_summary_collapses_adjacency_and_relativizes_names():
@@ -1790,9 +1896,9 @@ async def test_module_summary_sqlite_backend_end_to_end(tmp_path):
     assert "pkg.mod (pkg/mod.py)" in outline
     assert "# Scope module." in outline
     # Class members indented under the class, private marker preserved.
-    assert "  + class Widget L5-40  # A widget." in outline
-    assert "    + def draw(self) -> None L10-20" in outline
-    assert "  - def _hidden() L45-47" in outline
+    assert "  class Widget L5-40 # A widget." in outline  # 35 lines -> span end kept
+    assert "    def draw(self) -> None L10" in outline  # 10 lines -> span end dropped
+    assert "  - def _hidden() L45" in outline
     # Intra-scope edge with its ADR-0014 confidence annotation.
     assert "Widget.draw > _hidden[confidence=ambiguous]" in outline
     # Boundary: an external caller in, an external package out.

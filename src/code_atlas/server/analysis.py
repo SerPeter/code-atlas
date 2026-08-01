@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
@@ -1654,6 +1656,15 @@ async def _diagram_module_detail(graph: GraphBackend, project: str, path: str, m
 _MODULE_SUMMARY_ENTITY_FACTOR = 10
 _MODULE_SUMMARY_EDGE_FACTOR = 3
 
+# Detail tiers, widest-scope-first. The tier is chosen by the size of the rendered
+# result, never by the shape of `path`: one module can hold 316 entities while a
+# package holds 12, so selecting on "is this a package?" gets it backwards in both
+# directions. Strictly nested (T0 ⊂ T1 ⊂ T2) so drilling down is additive.
+_TIER_MAP = "T0"
+_TIER_SKELETON = "T1"
+_TIER_DETAIL = "T2"
+_MODULE_SUMMARY_TIERS = (_TIER_DETAIL, _TIER_SKELETON, _TIER_MAP)
+
 _MODULE_SUMMARY_VIS = {"public": "+", "private": "-", "protected": "#", "internal": "~"}
 _MODULE_SUMMARY_FALLBACK_KIND = {"TypeDef": "class", "Callable": "def", "Value": "var"}
 _MODULE_SUMMARY_EXTERNAL_LABELS = frozenset({"ExternalPackage", "ExternalSymbol"})
@@ -1664,11 +1675,22 @@ _MODULE_SUMMARY_DOC_MAX = 100
 # the context this tool exists to conserve.
 _MODULE_SUMMARY_OUTLINE_MAX = 60_000
 _MODULE_SUMMARY_LEGEND = (
-    "LEGEND +public -private #protected ~internal | L<start>-<end> | '# ' first docstring line | "
-    "a > b: a uses b | a < b: a used by b | trailing * external | [k=v] non-default edge props"
+    "LEGEND no marker=public -private #protected ~internal | L<start>[-<end> when >=20 lines] | "
+    "'# ' first docstring line | a > b: a uses b | a < b: a used by b | trailing * external | "
+    "[k=v] non-default edge props"
+)
+_MODULE_SUMMARY_LEGEND_TERSE = (
+    "LEGEND no marker=public -private #protected ~internal | L<start> | '# ' first docstring line | "
+    "'name (N)' N entities | edges are module-level with (count): a > b: a uses b | a < b: a used by b"
 )
 
 _WHITESPACE_RUN = re.compile(r"\s+")
+_RST_LITERAL = re.compile(r"``([^`]+)``")
+
+# Below this many lines a span's end adds nothing an agent acts on — it can read the
+# entity in one go either way. " L40-67" costs 4 tokens against " L40"'s 2, so the end
+# is spent only where the entity is big enough for its size to be the point.
+_MODULE_SUMMARY_SPAN_RANGE_MIN = 20
 
 
 def _first_doc_line(text: str | None, max_len: int = _MODULE_SUMMARY_DOC_MAX) -> str:
@@ -1677,12 +1699,16 @@ def _first_doc_line(text: str | None, max_len: int = _MODULE_SUMMARY_DOC_MAX) ->
     First line only is deliberate: it is the summary sentence by convention in
     every docstring style this indexer sees, and full docstrings would dominate
     the outline's token budget.
+
+    RST inline literals are unwrapped because the backticks are pure markup here
+    — nothing renders this string — and they tokenize as their own tokens.
     """
     if not text:
         return ""
     for raw in text.splitlines():
         line = _WHITESPACE_RUN.sub(" ", raw).strip()
         if line:
+            line = _RST_LITERAL.sub(r"\1", line)
             return line if len(line) <= max_len else line[: max_len - 3] + "..."
     return ""
 
@@ -1731,6 +1757,8 @@ def _line_span(line_start: Any, line_end: Any) -> str:
     if line_start is None:
         return ""
     if line_end is None or line_end == line_start:
+        return f"L{line_start}"
+    if line_end - line_start < _MODULE_SUMMARY_SPAN_RANGE_MIN:
         return f"L{line_start}"
     return f"L{line_start}-{line_end}"
 
@@ -1799,11 +1827,32 @@ def _adjacency_lines(
     return lines
 
 
-def _skeleton_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]]) -> list[str]:
+def _tier_entities(entities: list[dict[str, Any]], tier: str) -> list[dict[str, Any]]:
+    """The entity subset a tier renders. Strictly nested: T0 ⊂ T1 ⊂ T2.
+
+    Nesting is the point — drilling down is additive, so an agent never has to
+    re-read what it already holds.
+    """
+    if tier == _TIER_DETAIL:
+        return entities
+    if tier == _TIER_MAP:
+        return []
+    # T1 drops Value (42% of entities here, and a module constant is rarely what
+    # someone widening their scope is looking for) and non-public members.
+    return [e for e in entities if e["label"] != "Value" and (e["vis"] or "public") == "public"]
+
+
+def _skeleton_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]], tier: str) -> list[str]:
     """Per-file entity outline: signature, visibility, line span, first doc line.
 
     Members of an in-scope TypeDef are indented under it (the DEFINES parent),
     so the containment structure is carried by layout instead of an edge list.
+    The 2-space indent costs exactly one token per entity (measured) and is the
+    cheapest encoding of that containment; deeper nesting is free.
+
+    At T1 the signature is dropped and only ``kind name`` is kept — signatures are
+    36% of the rendered outline, by far the largest single component, and the
+    first docstring line carries more meaning per token than the parameter list.
     """
     mod_by_path = {m["file_path"]: m for m in modules}
     typedef_qns = {e["qn"] for e in entities if e["label"] == "TypeDef"}
@@ -1814,20 +1863,43 @@ def _skeleton_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]
     lines: list[str] = []
     for file_path in sorted(set(mod_by_path) | set(by_path)):
         mod = mod_by_path.get(file_path)
+        # Both the qualified name and the path, despite the redundancy: dropping the
+        # path measured at only -399 tokens (0.6%) and a dotted name does not tell you
+        # where the file is — nothing in `code_atlas.parsing.ast` implies `src/`.
         lines.append("")
         lines.append(f"{mod['qn']} ({file_path})" if mod else f"({file_path})")
         mod_doc = _first_doc_line(mod.get("docstring")) if mod else ""
         if mod_doc:
-            lines.append(f"  # {mod_doc}")
+            lines.append(f" # {mod_doc}")
         for e in by_path.get(file_path, []):
             indent = "    " if e["parent_qn"] in typedef_qns else "  "
-            marker = _MODULE_SUMMARY_VIS.get(e["vis"] or "public", "+")
-            header = _compact_signature(e["sig"]) or (
-                f"{e['kind'] or _MODULE_SUMMARY_FALLBACK_KIND.get(e['label'], '')} {e['name']}".strip()
-            )
+            # Absent marker means public (stated in the LEGEND). Not derived from the
+            # leading underscore: that rule is exact for Python but wrong for the jvm/
+            # cpp/php grammars, where visibility is a keyword.
+            vis = e["vis"] or "public"
+            marker = "" if vis == "public" else _MODULE_SUMMARY_VIS.get(vis, "") + " "
+            kind_name = f"{e['kind'] or _MODULE_SUMMARY_FALLBACK_KIND.get(e['label'], '')} {e['name']}".strip()
+            header = (_compact_signature(e["sig"]) or kind_name) if tier == _TIER_DETAIL else kind_name
             span = _line_span(e["line_start"], e["line_end"])
             doc = _first_doc_line(e["docstring"])
-            lines.append(f"{indent}{marker} {header}{' ' + span if span else ''}{'  # ' + doc if doc else ''}")
+            lines.append(f"{indent}{marker}{header}{' ' + span if span else ''}{' # ' + doc if doc else ''}")
+    return lines
+
+
+def _map_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]]) -> list[str]:
+    """T0: one line per module — name, entity count, first docstring line.
+
+    No entities at all. At repo scope this is the only tier that fits, and a
+    complete list of modules beats a detailed view of an arbitrary 40% of them.
+    """
+    counts: dict[str, int] = {}
+    for e in entities:
+        counts[e["file_path"] or ""] = counts.get(e["file_path"] or "", 0) + 1
+    lines: list[str] = [""]
+    for m in sorted(modules, key=lambda m: m["file_path"] or ""):
+        doc = _first_doc_line(m.get("docstring"))
+        n = counts.get(m["file_path"], 0)
+        lines.append(f"{m['qn']} ({n}){' # ' + doc if doc else ''}")
     return lines
 
 
@@ -1839,6 +1911,96 @@ def _doc_link_lines(docs: list[dict[str, Any]], prefix: str) -> list[str]:
         link = d.get("link_type")
         grouped.setdefault(_rel_name(d["to_qn"], prefix), set()).add(f"{label}({link})" if link else str(label))
     return [f"  {target} < {', '.join(sorted(refs))}" for target, refs in sorted(grouped.items())]
+
+
+@dataclass(frozen=True)
+class _OutlineInputs:
+    """Everything ``_render_outline`` needs, so the tier cascade can re-render
+    from memory without re-querying."""
+
+    path: str
+    modules: list[dict[str, Any]]
+    entities: list[dict[str, Any]]
+    internal_edges: list[dict[str, Any]]
+    fan_in: list[dict[str, Any]]
+    fan_out: list[dict[str, Any]]
+    docs: list[dict[str, Any]]
+    prefix: str
+    external_qns: frozenset[str]
+    qn_to_module: dict[str, str]
+    truncated: bool
+
+
+def _render_outline(src: _OutlineInputs, tier: str) -> str:
+    """Render the whole outline at one detail tier."""
+    shown = _tier_entities(src.entities, tier)
+    header = f"SCOPE {src.path} | {len(src.modules)} module(s) | {len(shown)} entities | DETAIL {tier}"
+    lines = [header + ("  |  TRUNCATED (raise limit for more)" if src.truncated else "")]
+    if src.prefix:
+        lines.append(f"NAMES below are relative to {src.prefix} unless fully qualified")
+    lines.append(_MODULE_SUMMARY_LEGEND if tier == _TIER_DETAIL else _MODULE_SUMMARY_LEGEND_TERSE)
+    lines.extend(
+        _map_lines(src.modules, src.entities) if tier == _TIER_MAP else _skeleton_lines(src.modules, shown, tier)
+    )
+
+    p, q = src.prefix, src.qn_to_module
+    if tier == _TIER_DETAIL:
+        internal = _adjacency_lines(src.internal_edges, p, "from_qn", "to_qn", ">")
+        inbound = _adjacency_lines(src.fan_in, p, "to_qn", "from_qn", "<")
+        outbound = _adjacency_lines(src.fan_out, p, "from_qn", "to_qn", ">", src.external_qns)
+    else:
+        internal = _aggregated_boundary_lines(src.internal_edges, p, "from_qn", "", "to_qn", ">", q)
+        inbound = _aggregated_boundary_lines(src.fan_in, p, "to_qn", "from_path", "from_qn", "<", q)
+        outbound = _aggregated_boundary_lines(src.fan_out, p, "from_qn", "to_path", "to_qn", ">", q)
+    if internal:
+        lines.extend(["", f"EDGES within scope ({len(src.internal_edges)})", *internal])
+    if inbound:
+        lines.extend(["", f"FAN-IN — callers/importers outside this scope ({len(src.fan_in)})", *inbound])
+    if outbound:
+        lines.extend(["", f"FAN-OUT — what this scope depends on ({len(src.fan_out)})", *outbound])
+    doc_lines = _doc_link_lines(src.docs, p)
+    if doc_lines:
+        lines.extend(["", f"DOCS — linked notes/docs ({len(src.docs)})", *doc_lines])
+    return "\n".join(lines)
+
+
+def _aggregated_boundary_lines(
+    rows: list[dict[str, Any]],
+    prefix: str,
+    scope_key: str,
+    other_path_key: str,
+    other_qn_key: str,
+    arrow: str,
+    qn_to_module: dict[str, str],
+) -> list[str]:
+    """Boundary edges collapsed to module granularity with per-target counts.
+
+    Enumerating the boundary per entity is what actually blows the budget: measured
+    on ``src/code_atlas``, FAN-IN alone is 58.5% of the rendered outline against the
+    entity skeleton's 19%. Below T2 the question a boundary answers is "which modules
+    reach into this scope", not "which of 3839 individual edges" — so both endpoints
+    collapse to their module and identical pairs become a count.
+    """
+
+    def group_of(qn: str, path: str) -> str:
+        """Module for an in-scope endpoint; the file path for one outside the scope,
+        whose module qualified name this query never returns."""
+        known = qn_to_module.get(qn)
+        if known:
+            return _rel_name(known, prefix)
+        return path or _rel_name(qn, prefix) or "?"
+
+    grouped: dict[str, Counter[str]] = {}
+    for r in rows:
+        scope = group_of(r.get(scope_key) or "", "")
+        other = group_of(r.get(other_qn_key) or "", str(r.get(other_path_key) or "") if other_path_key else "")
+        if other == scope:
+            continue  # collapsed to a self-edge by the aggregation; says nothing
+        grouped.setdefault(scope, Counter())[other] += 1
+    return [
+        f"  {mod} {arrow} {', '.join(f'{o}({n})' if n > 1 else o for o, n in sorted(others.items()))}"
+        for mod, others in sorted(grouped.items())
+    ]
 
 
 def _dedupe_entities(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1872,12 +2034,19 @@ async def _analyze_module_summary(
     a file_path under *path*", so with no path everything is in scope and the
     boundary — the most valuable part — would be empty by construction.
 
-    *test_patterns* filtering is applied to the **boundary only**, not to
-    in-scope entities: the caller named *path* explicitly, so everything under
-    it is what they asked for (including when *path* is itself a test package),
-    while test callers otherwise swamp fan-in for any widely-exercised module.
-    Same "filter the ranked/listed noise, not the thing itself" line the other
-    sub-analyses draw around whole-repo aggregates.
+    *test_patterns* filtering applies to in-scope entities as well as the
+    boundary, **unless *path* itself names a test location** — then the caller
+    plainly wants the tests and filtering them would return nothing. Test bodies
+    are detail nobody widening their scope asked for; the earlier rule (boundary
+    only, because "the caller named *path* explicitly") held that against them
+    even at repo scope, where it is exactly the noise the tier system exists to
+    shed.
+
+    Detail is chosen by rendering: T2 first, and if the result exceeds the size
+    ceiling, again at T1, then T0. A complete outline at a coarser tier beats a
+    detailed one cut off mid-section — the previous behaviour truncated the
+    joined string from the end, which silently deleted EDGES/FAN-IN/FAN-OUT
+    while leaving their counts in the response claiming otherwise.
     """
     t0 = time.monotonic()
     if not path:
@@ -1895,10 +2064,17 @@ async def _analyze_module_summary(
     modules = raw["modules"]
     entities = _dedupe_entities(raw["entities"])
     fan_in, fan_out = raw["fan_in"], raw["fan_out"]
+    internal_edges = raw["internal_edges"]
+    scope_is_tests = bool(test_patterns) and matches_test_pattern(path, "", list(test_patterns))
     if test_patterns:
         patterns = list(test_patterns)
         fan_in = [r for r in fan_in if not matches_test_pattern(r["from_path"] or "", r["from_name"] or "", patterns)]
         fan_out = [r for r in fan_out if not matches_test_pattern(r["to_path"] or "", r["to_name"] or "", patterns)]
+        if not scope_is_tests:
+            modules = [m for m in modules if not matches_test_pattern(m["file_path"] or "", "", patterns)]
+            entities = [e for e in entities if not matches_test_pattern(e["file_path"] or "", "", patterns)]
+            kept_qns = {e["qn"] for e in entities}
+            internal_edges = [r for r in internal_edges if r["from_qn"] in kept_qns and r["to_qn"] in kept_qns]
 
     if not modules and not entities:
         return {
@@ -1917,38 +2093,39 @@ async def _analyze_module_summary(
         or len(raw["fan_in"]) >= edge_limit
         or len(raw["fan_out"]) >= edge_limit
     )
+    # An entity in a package __init__ has no Module row (those are Package nodes), so
+    # fall back to its file path rather than to its own qualified name — the latter
+    # would leave it ungrouped and defeat the aggregation.
+    mod_qn_by_path = {m["file_path"]: m["qn"] for m in modules}
+    qn_to_module = {e["qn"]: mod_qn_by_path.get(e["file_path"]) or e["file_path"] or e["qn"] for e in entities}
+    qn_to_module.update({m["qn"]: m["qn"] for m in modules})
 
-    lines = [
-        f"SCOPE {path}  |  {len(modules)} module(s)  |  {len(entities)} entities"
-        + ("  |  TRUNCATED (raise limit for more)" if truncated else ""),
-    ]
-    if prefix:
-        lines.append(f"NAMES below are relative to {prefix} unless fully qualified")
-    lines.append(_MODULE_SUMMARY_LEGEND)
-    lines.extend(_skeleton_lines(modules, entities))
-
-    internal = _adjacency_lines(raw["internal_edges"], prefix, "from_qn", "to_qn", ">")
-    if internal:
-        lines.extend(["", f"EDGES within scope ({len(raw['internal_edges'])})", *internal])
-    inbound = _adjacency_lines(fan_in, prefix, "to_qn", "from_qn", "<")
-    if inbound:
-        lines.extend(["", f"FAN-IN — callers/importers outside this scope ({len(fan_in)})", *inbound])
-    outbound = _adjacency_lines(fan_out, prefix, "from_qn", "to_qn", ">", external_qns)
-    if outbound:
-        lines.extend(["", f"FAN-OUT — what this scope depends on ({len(fan_out)})", *outbound])
-    doc_lines = _doc_link_lines(raw["docs"], prefix)
-    if doc_lines:
-        lines.extend(["", f"DOCS — linked notes/docs ({len(raw['docs'])})", *doc_lines])
-
-    # Item-count caps alone do not bound the rendered size — a package of very wide
-    # signatures can still exceed the context this tool exists to save. Enforce a hard
-    # character ceiling as the last step, cutting on a line boundary so the outline
-    # stays parseable, and tell the caller it happened.
-    outline = "\n".join(lines)
+    src = _OutlineInputs(
+        path=path,
+        modules=modules,
+        entities=entities,
+        internal_edges=internal_edges,
+        fan_in=fan_in,
+        fan_out=fan_out,
+        docs=raw["docs"],
+        prefix=prefix,
+        external_qns=frozenset(external_qns),
+        qn_to_module=qn_to_module,
+        truncated=truncated,
+    )
+    # Drop a tier at a time until the whole thing fits. Rendering is pure string work
+    # over rows already in memory — no extra query — so at most three passes.
+    outline = ""
+    tier = _TIER_MAP
+    for candidate in _MODULE_SUMMARY_TIERS:
+        tier, outline = candidate, _render_outline(src, candidate)
+        if len(outline) <= _MODULE_SUMMARY_OUTLINE_MAX:
+            break
+    # Only reachable if even T0 overflows — thousands of modules under one path.
     size_capped = len(outline) > _MODULE_SUMMARY_OUTLINE_MAX
     if size_capped:
         keep = outline[:_MODULE_SUMMARY_OUTLINE_MAX].rsplit("\n", 1)[0]
-        outline = keep + "\n... OUTLINE TRUNCATED (size cap) — narrow `path` or lower `limit` for a complete view"
+        outline = keep + "\n... OUTLINE TRUNCATED (size cap) — narrow `path` for a complete view"
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -1956,10 +2133,24 @@ async def _analyze_module_summary(
         "project": project,
         "path": path,
         "modules": [m["qn"] for m in modules],
+        # Both, deliberately: a lone count that disagrees with the outline is how the
+        # old size cap misled callers into thinking they had the whole picture.
         "entity_count": len(entities),
-        "internal_edge_count": len(raw["internal_edges"]),
+        "entities_rendered": len(_tier_entities(entities, tier)),
+        "internal_edge_count": len(internal_edges),
         "fan_in_count": len(fan_in),
         "fan_out_count": len(fan_out),
+        "detail_tier": tier,
+        "detail_tiers": {
+            _TIER_DETAIL: "every entity, full signature, per-entity boundary",
+            _TIER_SKELETON: "public non-Value entities, no signatures, module-level boundary",
+            _TIER_MAP: "modules only",
+        },
+        "next_step": (
+            ""
+            if tier == _TIER_DETAIL
+            else f"Detail was reduced to {tier} to fit. Narrow `path` to a sub-package or single file for more."
+        ),
         "truncated": truncated or size_capped,
         "outline": outline,
         "query_ms": round(elapsed, 1),

@@ -1389,11 +1389,12 @@ class TestModuleSummary:
         assert result["modules"] == ["mypkg.models"]
         assert result["entity_count"] == 3
         assert "mypkg.models (mypkg/models.py)" in outline
-        assert "+ class User(Base) L22-45  # User model." in outline
+        # No visibility marker means public; span ends only survive a >=20-line body.
+        assert "class User(Base) L22-45 # User model." in outline
         # Base has no stored signature — the outline falls back to kind + name.
-        assert "+ class Base L5-20  # Base model class." in outline
+        assert "class Base L5 # Base model class." in outline
         # save is DEFINEd by User, so it is indented under it.
-        assert "    + def save(self) -> None L30-40  # Save the user." in outline
+        assert "    def save(self) -> None L30 # Save the user." in outline
         # No bodies, no source.
         assert "return" not in outline
 
