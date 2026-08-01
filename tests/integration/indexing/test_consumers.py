@@ -507,6 +507,9 @@ async def test_pel_retained_when_first_flush_fails(
         graph_client,
         settings,
         policy=BatchPolicy(time_window_s=0.5, max_batch_size=10, block_ms=50),
+        # The entries above belong to a dead peer's consumer name, so they arrive via the
+        # reclaim path. Production waits out an idle threshold; a test cannot.
+        abandoned_min_idle_ms=0,
     )
     task = asyncio.create_task(consumer.run())
     try:
@@ -557,13 +560,16 @@ async def test_cooldown_deferred_event_survives_shutdown(
     # The deferred change survived shutdown in the PEL
     assert await _pel_count(event_bus, Topic.FILE_CHANGED, "ast") >= 1
 
-    # A fresh consumer (same group/consumer name) reclaims and processes it
+    # A restarted consumer reclaims and processes it. Consumer names carry a process
+    # identity now, so c2 is NOT c1 — this is the real restart path (adopt the dead
+    # process's PEL), not a same-name history re-read.
     c2 = ASTConsumer(
         event_bus,
         graph_client,
         settings,
         policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
         cooldown_s=0.0,
+        abandoned_min_idle_ms=0,
     )
     task = asyncio.create_task(c2.run())
     try:

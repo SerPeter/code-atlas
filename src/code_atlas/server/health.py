@@ -332,6 +332,33 @@ async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResul
     return CheckResult(name, CheckStatus.OK, f"{len(project_names)} project(s) up to date", detail=detail)
 
 
+async def check_indexer_lease(bus: EventBus | SqliteEventBus | None) -> CheckResult | None:
+    """Report a foreign indexer holding the lease.
+
+    Without this a second indexer is invisible: Redis identifies a consumer by name only,
+    so two processes sharing one reported ``consumers=1`` and the pipeline looked healthy
+    while a single index run was being split between them.
+
+    Returns ``None`` when the lease is free — a check that says nothing when there is
+    nothing to say, rather than adding a permanent OK line to every report.
+    """
+    if bus is None:
+        return None
+    try:
+        holder = await bus.read_indexer_lease()
+    except Exception:
+        return None
+    if not holder:
+        return None
+    return CheckResult(
+        "indexer_lease",
+        CheckStatus.WARN,
+        f"Another indexer is running ({holder})",
+        detail="This project's pipeline is paused until that indexer finishes.",
+        suggestion="Wait for it to finish, or stop the other 'atlas index' / daemon.",
+    )
+
+
 def check_pipeline(daemon: DaemonManager) -> CheckResult:
     """Report in-process indexing pipeline liveness from the DaemonManager."""
     st = daemon.status()
@@ -406,6 +433,10 @@ async def run_health_checks(
         )
 
         results = [mode_res, config_res, mg_res, embed_res, valkey_res]
+
+        lease_res = await check_indexer_lease(bus)
+        if lease_res is not None:
+            results.append(lease_res)
 
         # Phase 2: Memgraph-dependent checks
         if mg_res.status == CheckStatus.FAIL:

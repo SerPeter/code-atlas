@@ -132,10 +132,10 @@ class DaemonManager:
             self._cache = cache
 
         consumers: list[ASTConsumer | EmbedConsumer] = [
-            ASTConsumer(bus, graph, settings, cooldown_s=settings.watcher.cooldown_s),
+            ASTConsumer(bus, graph, settings, cooldown_s=settings.watcher.cooldown_s, defer_to_lease=True),
         ]
         if embed is not None:
-            consumers.append(EmbedConsumer(bus, graph, embed, cache=cache))
+            consumers.append(EmbedConsumer(bus, graph, embed, cache=cache, defer_to_lease=True))
         self._consumers = consumers
 
         if include_watcher:

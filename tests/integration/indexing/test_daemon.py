@@ -107,7 +107,9 @@ async def test_consumer_restarts_after_group_destroyed(
             timeout_s=30.0,
         )
         assert rows, "entity never appeared — consumer was not restarted after NOGROUP"
-        assert daemon.status()["crash_counts"].get("ast-0", 0) >= 1
+        # Consumer names carry a process identity now, so the key is "ast-<host>-<pid>-<nonce>".
+        crashes = daemon.status()["crash_counts"]
+        assert any(name.startswith("ast-") and count >= 1 for name, count in crashes.items()), crashes
     finally:
         await daemon.stop()
 

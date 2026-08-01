@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
+import socket
 import time
+import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import orjson
 import redis.asyncio as aioredis
+from loguru import logger
 
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from code_atlas.settings import RedisSettings
 
 _tracer = get_tracer(__name__)
@@ -103,6 +112,67 @@ def decode_event(topic: Topic, data: dict[bytes, bytes]) -> Event:
         raw["entity"] = EntityRef(**raw["entity"])
 
     return cls(**raw)
+
+
+# ---------------------------------------------------------------------------
+# Indexer lease
+# ---------------------------------------------------------------------------
+
+# Long enough to survive a slow batch, short enough that a killed indexer does not block
+# the next one for a whole session. Renewed at a third of the TTL.
+INDEXER_LEASE_TTL_MS = 60_000
+_LEASE_RENEW_S = INDEXER_LEASE_TTL_MS / 3000
+
+
+class IndexerBusyError(RuntimeError):
+    """Another process holds the indexer lease for this project."""
+
+    def __init__(self, holder: str) -> None:
+        super().__init__(f"another indexer holds the lease for this project: {holder}")
+        self.holder = holder
+
+
+def new_lease_owner() -> str:
+    """Identity for a lease holder — host, pid and a nonce.
+
+    The nonce matters on top of the pid: a recycled pid must not be able to renew or
+    release a lease that a previous process of the same number took out.
+    """
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+@asynccontextmanager
+async def hold_indexer_lease(bus: Any, *, ttl_ms: int = INDEXER_LEASE_TTL_MS) -> AsyncIterator[str]:
+    """Hold the project's indexer lease for the duration of the block.
+
+    Raises :class:`IndexerBusyError` if someone else holds it, rather than indexing anyway —
+    two processes writing the same nodes is how a single index run got split across two
+    code versions, and how Memgraph's MVCC conflicts turned into dropped files.
+
+    Renewal runs in the background so a long index cannot lose the lease mid-run, and the
+    release is a compare-and-delete, so a process that stalled past its TTL cannot free a
+    lease that has since passed to someone else.
+    """
+    owner = new_lease_owner()
+    if not await bus.acquire_indexer_lease(owner, ttl_ms):
+        holder = await bus.read_indexer_lease()
+        raise IndexerBusyError(holder or "unknown")
+
+    async def _renew() -> None:
+        while True:
+            await asyncio.sleep(_LEASE_RENEW_S)
+            if not await bus.renew_indexer_lease(owner, ttl_ms):
+                logger.warning("Indexer lease lost while still indexing (owner={})", owner)
+                return
+
+    renewer = asyncio.create_task(_renew())
+    try:
+        yield owner
+    finally:
+        renewer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await renewer
+        await bus.release_indexer_lease(owner)
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +302,86 @@ class EventBus:
                 return []
             return result[0][1]
 
+    async def reclaim_abandoned(
+        self,
+        topic: Topic,
+        group: str,
+        consumer: str,
+        *,
+        min_idle_ms: int,
+        count: int = 10,
+    ) -> list[tuple[bytes, dict[bytes, bytes]]]:
+        """Claim messages left pending by a consumer that is no longer running.
+
+        Consumer names now carry a process identity, so a killed process's PEL entries
+        belong to a name nothing will ever use again. ``XREADGROUP ... 0`` only reads the
+        caller's own history, so without this they are orphaned permanently.
+
+        *min_idle_ms* is what keeps this from stealing live work: an entry is only taken
+        once no one has touched it for that long, which a running consumer's own batch
+        never satisfies.
+        """
+        with _tracer.start_as_current_span(
+            "eventbus.reclaim_abandoned", attributes={"topic": topic.value, "group": group, "consumer": consumer}
+        ):
+            try:
+                result: Any = await self._redis.xautoclaim(
+                    self._stream_key(topic), group, consumer, min_idle_time=min_idle_ms, count=count
+                )
+            except aioredis.ResponseError:
+                return []  # group or stream does not exist yet
+            # XAUTOCLAIM returns [next_cursor, [(msg_id, fields), ...], deleted_ids]
+            return list(result[1]) if len(result) > 1 else []
+
     async def ack(self, topic: Topic, group: str, *msg_ids: bytes) -> int:
         """Acknowledge messages after successful processing."""
         return await self._redis.xack(self._stream_key(topic), group, *msg_ids)
+
+    # -- Indexer lease ---------------------------------------------------------
+    #
+    # Unique consumer names stop two processes corrupting each other's PEL, but they do
+    # not stop two processes indexing the same project into the same graph at once. The
+    # lease is that invariant, and it lives in the store both indexers must already reach
+    # in order to index at all — unlike a PID file, which cannot see a peer in Docker,
+    # across a WSL boundary, or under another user.
+
+    def _lease_key(self) -> str:
+        return f"{self._prefix}:{self._project}:indexer-lease" if self._project else f"{self._prefix}:indexer-lease"
+
+    async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        """Take the indexer lease, or return False if someone else holds it."""
+        return bool(await self._redis.set(self._lease_key(), owner.encode(), nx=True, px=ttl_ms))
+
+    async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        """Extend the lease, but only while *owner* still holds it.
+
+        Compare-and-set: a holder that stalled past its TTL and lost the lease must not
+        silently take it back from whoever legitimately acquired it.
+        """
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else "
+            "return 0 end"
+        )
+        return bool(
+            await self._redis.eval(  # type: ignore[invalid-await]  # stub widened to Awaitable[str] | str
+                script, 1, self._lease_key(), owner.encode(), str(ttl_ms)
+            )
+        )
+
+    async def release_indexer_lease(self, owner: str) -> bool:
+        """Release the lease if *owner* holds it. Compare-and-delete, so a process can
+        never free a lease that has already passed to someone else."""
+        script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+        return bool(
+            await self._redis.eval(  # type: ignore[invalid-await]  # stub widened to Awaitable[str] | str
+                script, 1, self._lease_key(), owner.encode()
+            )
+        )
+
+    async def read_indexer_lease(self) -> str | None:
+        """Current lease holder, for diagnostics. ``None`` when the lease is free."""
+        raw = await self._redis.get(self._lease_key())
+        return raw.decode() if raw else None
 
     async def stream_group_info(self, topic: Topic, group: str) -> dict[str, int | None]:
         """Return pending + lag counts for a consumer group via XINFO GROUPS.

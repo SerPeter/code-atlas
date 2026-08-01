@@ -216,6 +216,7 @@ async def test_check_embeddings_unreachable_names_provider():
 async def test_check_valkey_success():
     redis_settings = RedisSettings()
     bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
     bus.ping = AsyncMock(return_value=True)
 
     result = await check_valkey(bus, redis_settings)
@@ -227,6 +228,7 @@ async def test_check_valkey_success():
 async def test_check_valkey_failure():
     redis_settings = RedisSettings()
     bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
     bus.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
 
     result = await check_valkey(bus, redis_settings)
@@ -238,6 +240,7 @@ async def test_check_valkey_down_names_indexing_disabled():
     """Valkey down must loudly state that indexing is disabled (not a silent WARN)."""
     redis_settings = RedisSettings()
     bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
     bus.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
 
     result = await check_valkey(bus, redis_settings)
@@ -393,6 +396,7 @@ async def test_skips_db_checks_when_memgraph_down(tmp_path):
     embed.health_check = AsyncMock(return_value=True)
 
     bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
     bus.ping = AsyncMock(return_value=True)
 
     report = await run_health_checks(settings, graph=graph, embed=embed, bus=bus)
@@ -437,6 +441,7 @@ async def test_all_pass_when_healthy(tmp_path):
     embed.health_check = AsyncMock(return_value=True)
 
     bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
     bus.ping = AsyncMock(return_value=True)
 
     with patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls:
@@ -477,6 +482,7 @@ async def test_pipeline_check_appended_when_daemon_passed(tmp_path):
     daemon = _FakeDaemon({"tasks_running": 2, "tasks_total": 2, "crash_counts": {}, "last_crash": {}})
 
     bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
     bus.ping = AsyncMock(return_value=True)
 
     with patch("code_atlas.server.health.StalenessChecker") as mock_checker_cls:
@@ -509,6 +515,7 @@ async def test_no_pipeline_check_without_daemon(tmp_path):
     embed.health_check = AsyncMock(return_value=True)
 
     bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
     bus.ping = AsyncMock(return_value=True)
 
     report = await run_health_checks(settings, graph=graph, embed=embed, bus=bus)
@@ -530,6 +537,7 @@ async def test_run_health_checks_uses_daemon_bus_when_not_explicitly_passed(tmp_
     embed.health_check = AsyncMock(return_value=True)
 
     daemon_bus = AsyncMock()
+    daemon_bus.read_indexer_lease.return_value = None  # no foreign indexer
     daemon_bus.ping = AsyncMock(return_value=True)
     daemon = _FakeDaemon({"tasks_running": 1, "tasks_total": 1, "crash_counts": {}, "last_crash": {}}, bus=daemon_bus)
 

@@ -134,6 +134,16 @@ class FakeStreamBus:
     ) -> list[tuple[bytes, dict[bytes, bytes]]]:
         return list(self.pel.items())[:count]
 
+    async def reclaim_abandoned(
+        self, topic: Topic, group: str, consumer: str, *, min_idle_ms: int, count: int
+    ) -> list[tuple[bytes, dict[bytes, bytes]]]:
+        """No abandoned entries in a single-consumer fake — this fake IS the only consumer.
+
+        Present because consumer names now carry a process identity, so the loop reclaims
+        another process's orphaned PEL after draining its own.
+        """
+        return []
+
     async def ack(self, topic: Topic, group: str, *msg_ids: bytes) -> int:
         for mid in msg_ids:
             self.pel.pop(mid, None)

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
+import socket
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -85,6 +87,27 @@ class BatchPolicy:
 # Batches a message may fail before it is parked (ACKed + dropped) on the next PEL reclaim.
 _MAX_BATCH_FAILURES = 5
 
+# How long an entry must sit untouched before another consumer may adopt it. Long enough
+# that a live consumer's own in-flight batch never qualifies, short enough that a crash
+# does not strand work for a whole session.
+_ABANDONED_MIN_IDLE_MS = 120_000
+
+# How often a paused consumer re-checks whether the foreign lease has been released.
+_LEASE_POLL_S = 1.0
+
+
+def _process_tag() -> str:
+    """Short identity for this process, unique across hosts and PIDs.
+
+    Consumer names used to be the constants "ast-0" and "embed", so every process that
+    built a consumer claimed the same identity in the same group. Measured consequence
+    on live Valkey: `XREADGROUP ... 0` returns the OTHER process's in-flight messages,
+    and either process's XACK of the other's message succeeds and removes it from the
+    PEL — silently deleting the peer's crash-recovery net. Redis identifies a consumer
+    solely by this string, so making it unique is what separates the two PELs.
+    """
+    return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
 
 def _stream_id_key(msg_id: bytes) -> tuple[int, int]:
     """Numeric sort key for a Redis Stream id (``b"<ms>-<seq>"``)."""
@@ -109,6 +132,8 @@ class TierConsumer(ABC):
         policy: BatchPolicy,
         *,
         project_filter: set[str] | None = None,
+        defer_to_lease: bool = False,
+        abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
     ) -> None:
         self.bus = bus
         self.input_topic = input_topic
@@ -119,6 +144,15 @@ class TierConsumer(ABC):
         self._stop = False
         self._pel_dirty = False
         self._fail_counts: dict[bytes, int] = {}  # msg_id → failed-batch count (poison cap)
+        # Long-lived consumers (daemon, MCP server) stand down while a CLI index holds the
+        # lease; a CLI index's own inline consumers hold it and must not wait on it.
+        self.defer_to_lease = defer_to_lease
+        self._lease_owner: str | None = None
+        self._lease_waiting = False
+        # Injectable so crash recovery is testable: a test cannot wait out the production
+        # threshold, and an untestable recovery path is how the old shared consumer name
+        # survived this long.
+        self._abandoned_min_idle_ms = abandoned_min_idle_ms
 
     @abstractmethod
     async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:
@@ -211,6 +245,32 @@ class TierConsumer(ABC):
         """
         return True
 
+    async def _defer_to_foreign_lease(self) -> None:
+        """Stand down while another process holds the indexer lease.
+
+        Placed at the top of the loop, BEFORE any read, so a paused consumer is simply
+        not asking for work — no in-flight batch is abandoned and no ACK path is touched.
+        ADR-0009 exists because a review found six silent-drop bugs in those paths, so the
+        yield is deliberately coarse: finish the current batch, then stop reading.
+
+        Only long-lived consumers defer. A CLI index holds the lease itself and must not
+        wait on it.
+        """
+        if not self.defer_to_lease:
+            return
+        while not self._stop:
+            try:
+                holder = await self.bus.read_indexer_lease()
+            except Exception:
+                return
+            if not holder or holder == self._lease_owner:
+                return
+            if not self._lease_waiting:
+                self._lease_waiting = True
+                logger.info("{} pausing — another indexer holds the lease ({})", self.consumer_name, holder)
+            await asyncio.sleep(_LEASE_POLL_S)
+        self._lease_waiting = False
+
     async def _ack_processed(self, events: list[Event], msg_ids: list[bytes], deferred: set[str]) -> None:
         """ACK msg_ids whose events were fully handled; deferred ones stay in the PEL."""
         ack_ids = [mid for mid, ev in zip(msg_ids, events, strict=True) if self.dedup_key(ev) not in deferred]
@@ -262,8 +322,13 @@ class TierConsumer(ABC):
             while not self._stop:
                 if not await self._wait_for_slot():
                     break
+                await self._defer_to_foreign_lease()
 
-                # Reclaim unacknowledged messages from PEL (failed batches).
+                # Reclaim unacknowledged messages from PEL (failed batches), then adopt
+                # anything a dead process abandoned. The second half exists because
+                # consumer names now carry a process identity: read_pending only ever
+                # returns THIS consumer's history, so a killed process's entries would
+                # otherwise be orphaned under a name nothing will use again.
                 if not pel_drained or self._pel_dirty:
                     self._pel_dirty = False
                     reclaimed = await self.bus.read_pending(
@@ -272,6 +337,14 @@ class TierConsumer(ABC):
                         self.consumer_name,
                         count=self.policy.max_batch_size,
                     )
+                    if not reclaimed:
+                        reclaimed = await self.bus.reclaim_abandoned(
+                            self.input_topic,
+                            self.group,
+                            self.consumer_name,
+                            min_idle_ms=self._abandoned_min_idle_ms,
+                            count=self.policy.max_batch_size,
+                        )
                     if reclaimed:
                         for msg_id, fields in reclaimed:
                             if not fields:
@@ -456,14 +529,18 @@ class ASTConsumer(TierConsumer):
         project_filter: set[str] | None = None,
         policy: BatchPolicy | None = None,
         cooldown_s: float = 0.0,
+        defer_to_lease: bool = False,
+        abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
     ) -> None:
         super().__init__(
             bus=bus,
             input_topic=Topic.FILE_CHANGED,
             group="ast",
-            consumer_name="ast-0",
+            consumer_name=f"ast-{_process_tag()}",
             policy=policy or BatchPolicy(time_window_s=3.0, max_batch_size=30),
             project_filter=project_filter,
+            defer_to_lease=defer_to_lease,
+            abandoned_min_idle_ms=abandoned_min_idle_ms,
         )
         self.graph = graph
         self.settings = settings
@@ -1095,19 +1172,23 @@ class EmbedConsumer(TierConsumer):
         project_filter: set[str] | None = None,
         policy: BatchPolicy | None = None,
         max_concurrency: int | None = None,
+        defer_to_lease: bool = False,
+        abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
     ) -> None:
         _max_conc = max_concurrency or embed.max_concurrency
         super().__init__(
             bus=bus,
             input_topic=Topic.EMBED_DIRTY,
             group="embed",
-            consumer_name="embed",
+            consumer_name=f"embed-{_process_tag()}",
             policy=policy
             or BatchPolicy(
                 time_window_s=10.0,
                 max_batch_size=embed.batch_size * _max_conc,
             ),
             project_filter=project_filter,
+            defer_to_lease=defer_to_lease,
+            abandoned_min_idle_ms=abandoned_min_idle_ms,
         )
         self.graph = graph
         self.embed = embed

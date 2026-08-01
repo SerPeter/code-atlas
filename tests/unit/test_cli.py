@@ -223,6 +223,19 @@ class TestMonorepoScopeDispatch:
             async def close(self) -> None:
                 return None
 
+            # atlas index takes an exclusive lease so it cannot run alongside a daemon.
+            async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+                return True
+
+            async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+                return True
+
+            async def release_indexer_lease(self, owner: str) -> bool:
+                return True
+
+            async def read_indexer_lease(self) -> str | None:
+                return None
+
         class FakeGraph:
             def __init__(self, *args, **kwargs) -> None:
                 pass
@@ -322,6 +335,19 @@ class TestIndexWithGitSignals:
                 return None
 
             async def close(self) -> None:
+                return None
+
+            # atlas index takes an exclusive lease so it cannot run alongside a daemon.
+            async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+                return True
+
+            async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+                return True
+
+            async def release_indexer_lease(self, owner: str) -> bool:
+                return True
+
+            async def read_indexer_lease(self) -> str | None:
                 return None
 
         class FakeGraph:

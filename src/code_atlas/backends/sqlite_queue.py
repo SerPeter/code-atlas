@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS groups (
     created_at REAL NOT NULL,
     PRIMARY KEY (topic, grp)
 );
+
+-- Single-row-per-project indexer lease, mirroring EventBus. The embedded backend is a
+-- fallback, not a toy: two processes can point at the same graph.sqlite3 just as easily
+-- as at the same Memgraph, so it needs the same invariant.
+CREATE TABLE IF NOT EXISTS leases (
+    name TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
 """
 
 _POLL_INTERVAL_S = 0.1
@@ -239,6 +248,86 @@ class SqliteEventBus:
         count = cur.rowcount
         await cur.close()
         return count
+
+    async def reclaim_abandoned(
+        self,
+        topic: Topic,
+        group: str,
+        consumer: str,
+        *,
+        min_idle_ms: int,
+        count: int = 10,
+    ) -> list[tuple[bytes, dict[bytes, bytes]]]:
+        """Take over deliveries a dead consumer left pending. Mirrors ``EventBus``."""
+        conn = await self._get_conn()
+        cutoff = time.time() - (min_idle_ms / 1000.0)
+        cur = await conn.execute(
+            "SELECT d.message_id, m.payload FROM deliveries d JOIN messages m ON m.id = d.message_id "
+            "WHERE d.topic = ? AND d.grp = ? AND d.acked_at IS NULL AND d.consumer <> ? "
+            "AND d.delivered_at <= ? ORDER BY d.message_id LIMIT ?",
+            (topic.value, group, consumer, cutoff, count),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            return []
+        ids = [r[0] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        await conn.execute(
+            f"UPDATE deliveries SET consumer = ?, delivered_at = ? WHERE topic = ? AND grp = ? "
+            f"AND message_id IN ({placeholders})",
+            (consumer, time.time(), topic.value, group, *ids),
+        )
+        await conn.commit()
+        return [(f"{r[0]}-0".encode(), {b"data": r[1]}) for r in rows]
+
+    # -- Indexer lease ---------------------------------------------------------
+
+    _LEASE_NAME = "indexer"
+
+    async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        """Take the indexer lease, or return False if a live one is held."""
+        conn = await self._get_conn()
+        now = time.time()
+        await conn.execute("DELETE FROM leases WHERE name = ? AND expires_at <= ?", (self._LEASE_NAME, now))
+        try:
+            await conn.execute(
+                "INSERT INTO leases(name, owner, expires_at) VALUES (?, ?, ?)",
+                (self._LEASE_NAME, owner, now + ttl_ms / 1000.0),
+            )
+        except aiosqlite.IntegrityError:
+            await conn.rollback()
+            return False
+        await conn.commit()
+        return True
+
+    async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        conn = await self._get_conn()
+        cur = await conn.execute(
+            "UPDATE leases SET expires_at = ? WHERE name = ? AND owner = ?",
+            (time.time() + ttl_ms / 1000.0, self._LEASE_NAME, owner),
+        )
+        await conn.commit()
+        changed = cur.rowcount
+        await cur.close()
+        return changed > 0
+
+    async def release_indexer_lease(self, owner: str) -> bool:
+        conn = await self._get_conn()
+        cur = await conn.execute("DELETE FROM leases WHERE name = ? AND owner = ?", (self._LEASE_NAME, owner))
+        await conn.commit()
+        changed = cur.rowcount
+        await cur.close()
+        return changed > 0
+
+    async def read_indexer_lease(self) -> str | None:
+        conn = await self._get_conn()
+        cur = await conn.execute(
+            "SELECT owner FROM leases WHERE name = ? AND expires_at > ?", (self._LEASE_NAME, time.time())
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else None
 
     async def stream_group_info(self, topic: Topic, group: str) -> dict[str, int | None]:
         """Return pending + lag counts for a consumer group.

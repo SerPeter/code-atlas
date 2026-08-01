@@ -389,6 +389,21 @@ async def _run_index(  # noqa: PLR0912, PLR0915
 
     await graph.ensure_schema()
 
+    # Refuse rather than index alongside another process. Two indexers writing the same
+    # nodes is how one run got split across two code versions, and how Memgraph's MVCC
+    # conflicts turned into dropped files. A running daemon stands down instead.
+    from code_atlas.events import IndexerBusyError, hold_indexer_lease
+
+    try:
+        lease = hold_indexer_lease(bus)
+        owner = await lease.__aenter__()
+    except IndexerBusyError as exc:
+        logger.error("{}", exc)
+        await graph.close()
+        await bus.close()
+        raise typer.Exit(code=1) from exc
+    logger.debug("Holding indexer lease ({})", owner)
+
     try:
         # Auto-detect monorepo: if sub-projects detected or --project specified → monorepo mode
         sub_projects = detect_sub_projects(project_root, settings.monorepo)
@@ -476,6 +491,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                 if git_signals_stats is not None:
                     _echo(_git_signals_summary_line(git_signals_stats, co_change_threshold))
     finally:
+        # Release before closing the bus — the release is a compare-and-delete over it.
+        await lease.__aexit__(None, None, None)
         await graph.close()
         await bus.close()
         shutdown_telemetry()
