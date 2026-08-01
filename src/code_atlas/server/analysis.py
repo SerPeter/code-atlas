@@ -1775,9 +1775,15 @@ _MODULE_SUMMARY_LEGEND = (
     "'# ' first docstring line | a > b: a uses b | a < b: a used by b | trailing * external | "
     "[k=v] non-default edge props"
 )
-_MODULE_SUMMARY_LEGEND_TERSE = (
-    "LEGEND no marker=public -private #protected ~internal | L<start> | '# ' first docstring line | "
-    "'name (N)' N entities | edges are module-level with (count): a > b: a uses b | a < b: a used by b"
+# T1 and T0 render different bodies, so they get different legends — an entry describing
+# a form that does not appear is the same failure as a count that disagrees with the text.
+_MODULE_SUMMARY_LEGEND_SKELETON = (
+    "LEGEND public entities only, no signatures | L<start> | '# ' first docstring line | "
+    "edges are module-level with (count): a > b: a uses b | a < b: a used by b"
+)
+_MODULE_SUMMARY_LEGEND_MAP = (
+    "LEGEND modules only, no entities | 'name (N)': N entities in scope | '# ' first docstring line | "
+    "edges are module-level with (count): a > b: a uses b | a < b: a used by b"
 )
 
 _WHITESPACE_RUN = re.compile(r"\s+")
@@ -2030,11 +2036,20 @@ class _OutlineInputs:
 def _render_outline(src: _OutlineInputs, tier: str) -> str:
     """Render the whole outline at one detail tier."""
     shown = _tier_entities(src.entities, tier)
-    header = f"SCOPE {src.path} | {len(src.modules)} module(s) | {len(shown)} entities | DETAIL {tier}"
+    # "N of M" whenever the tier is showing less than everything: the outline is what the
+    # agent reads, so the shortfall has to be visible there, not only in the JSON field.
+    n_shown, n_total = len(shown), len(src.entities)
+    counted = f"{n_shown} entities" if n_shown == n_total else f"{n_shown} of {n_total} entities"
+    header = f"SCOPE {src.path} | {len(src.modules)} module(s) | {counted} | DETAIL {tier}"
     lines = [header + ("  |  TRUNCATED (raise limit for more)" if src.truncated else "")]
     if src.prefix:
         lines.append(f"NAMES below are relative to {src.prefix} unless fully qualified")
-    lines.append(_MODULE_SUMMARY_LEGEND if tier == _TIER_DETAIL else _MODULE_SUMMARY_LEGEND_TERSE)
+    legends = {
+        _TIER_DETAIL: _MODULE_SUMMARY_LEGEND,
+        _TIER_SKELETON: _MODULE_SUMMARY_LEGEND_SKELETON,
+        _TIER_MAP: _MODULE_SUMMARY_LEGEND_MAP,
+    }
+    lines.append(legends[tier])
     lines.extend(
         _map_lines(src.modules, src.entities) if tier == _TIER_MAP else _skeleton_lines(src.modules, shown, tier)
     )
