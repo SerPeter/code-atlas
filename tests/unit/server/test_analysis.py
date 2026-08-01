@@ -1605,7 +1605,10 @@ async def test_module_summary_emits_signature_visibility_span_and_first_doc_line
     # No marker means public — the marker is spent only where it carries information.
     assert "def run(self, x: int) -> str L10-42 # Do the thing." in outline
     assert "+ def run" not in outline
-    assert "- def _helper() L50" in outline
+    # No marker either: a leading underscore already says private, so repeating it in a
+    # second notation channel adds nothing and is what collides with the docstring hash.
+    assert "def _helper() L50" in outline
+    assert "- def _helper" not in outline
     assert "Long explanation nobody needs here." not in outline
     assert "More." not in outline
     assert "# Module blurb." in outline
@@ -1836,6 +1839,19 @@ async def test_module_summary_passes_through_unknown_edge_properties():
     # row should hit the trustworthy names first, and it puts the "+N ambiguous" summary
     # in a consistent place once the set is large enough to collapse.
     assert outline.index("> c") < outline.index("b[candidate_count")
+
+
+async def test_visibility_marker_only_when_the_line_does_not_already_say_it():
+    """The marker is a second notation channel repeating what the language states, and
+    the "#" chosen for protected collides with the "#" that introduces a docstring.
+    """
+    from code_atlas.server.analysis import _visibility_is_evident
+
+    assert _visibility_is_evident("public", "run", "def run()")
+    assert _visibility_is_evident("private", "_helper", "def _helper()")  # Python: the name
+    assert _visibility_is_evident("protected", "doWork", "protected void doWork()")  # Java: the keyword
+    # A field in a keyword language stores no signature, so nothing on the line says it.
+    assert not _visibility_is_evident("protected", "count", "field count")
 
 
 async def test_module_summary_collapses_wide_ambiguous_fan_in_to_a_count():
@@ -2147,7 +2163,7 @@ async def test_module_summary_sqlite_backend_end_to_end(tmp_path):
     # Class members indented under the class, private marker preserved.
     assert "  class Widget L5-40 # A widget." in outline  # 35 lines -> span end kept
     assert "    def draw(self) -> None L10" in outline  # 10 lines -> span end dropped
-    assert "  - def _hidden() L45" in outline
+    assert "  def _hidden() L45" in outline
     # Intra-scope edge with its ADR-0014 confidence annotation.
     assert "Widget.draw > _hidden[confidence=ambiguous]" in outline
     # Boundary: an external caller in, an external package out.

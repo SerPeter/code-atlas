@@ -1818,7 +1818,8 @@ _MODULE_SUMMARY_DOC_MAX = 100
 # the context this tool exists to conserve.
 _MODULE_SUMMARY_OUTLINE_MAX = 60_000
 _MODULE_SUMMARY_LEGEND = (
-    "LEGEND no marker=public -private #protected ~internal | L<start>[-<end> when >=20 lines] | "
+    "LEGEND visibility marker (-private #protected ~internal) only when the name or signature "
+    "does not already say it | L<start>[-<end> when >=20 lines] | "
     "'# ' first docstring line | a > b: a uses b | a < b: a used by b | 'ext/' outside this project | "
     "[k=v] non-default edge props"
 )
@@ -2045,6 +2046,28 @@ def _adjacency_lines(
     return lines
 
 
+def _visibility_is_evident(vis: str, name: str, rendered: str) -> bool:
+    """Whether the rendered line already tells you the visibility without a marker.
+
+    A marker that repeats what the line already says is a second notation channel to
+    keep in sync, and the ``#`` chosen for *protected* collides with the ``#`` that
+    introduces a docstring. Emitting one only where it adds information removes the
+    collision wherever the language expresses visibility itself:
+
+    - Python and friends put it in the name — every one of this index's 1,580 non-public
+      entities is recoverable from a leading underscore.
+    - Java, C#, C++ and PHP put the keyword in the signature.
+
+    What is left is field-like entities in keyword languages, which store no signature.
+    Those lines have no signature to host a stray hash, so the collision cannot arise.
+    """
+    if vis == "public":
+        return True
+    if name.startswith("_"):
+        return True
+    return vis.lower() in rendered.lower()
+
+
 def _tier_entities(entities: list[dict[str, Any]], tier: str) -> list[dict[str, Any]]:
     """The entity subset a tier renders. Strictly nested: T0 ⊂ T1 ⊂ T2.
 
@@ -2105,13 +2128,10 @@ def _skeleton_lines(modules: list[dict[str, Any]], entities: list[dict[str, Any]
             lines.append(f" # {mod_doc}")
         for e in by_path.get(file_path, []):
             indent = "    " if parent_of(e) in typedef_qns else "  "
-            # Absent marker means public (stated in the LEGEND). Not derived from the
-            # leading underscore: that rule is exact for Python but wrong for the jvm/
-            # cpp/php grammars, where visibility is a keyword.
             vis = e["vis"] or "public"
-            marker = "" if vis == "public" else _MODULE_SUMMARY_VIS.get(vis, "") + " "
             kind_name = f"{e['kind'] or _MODULE_SUMMARY_FALLBACK_KIND.get(e['label'], '')} {e['name']}".strip()
             header = (_compact_signature(e["sig"]) or kind_name) if tier == _TIER_DETAIL else kind_name
+            marker = "" if _visibility_is_evident(vis, e["name"], header) else _MODULE_SUMMARY_VIS.get(vis, "") + " "
             span = _line_span(e["line_start"], e["line_end"])
             doc = _first_doc_line(e["docstring"])
             lines.append(f"{indent}{marker}{header}{' ' + span if span else ''}{' # ' + doc if doc else ''}")

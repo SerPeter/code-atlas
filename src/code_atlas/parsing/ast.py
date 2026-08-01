@@ -210,6 +210,43 @@ def node_text(node: Node) -> str:
     return text.decode("utf-8", errors="replace")
 
 
+def slice_without_comments(node: Node, source: bytes, end_byte: int, comment_types: frozenset[str]) -> str:
+    """Source between ``node.start_byte`` and *end_byte*, with comments removed.
+
+    A signature taken as a raw byte slice carries any comment inside it — a real
+    ``async def f(  # noqa: PLR0912`` reached the rendered outline this way, putting a
+    stray ``#`` in a format that gives ``#`` two other meanings.
+
+    Cutting comments by regex cannot be made correct: ``#`` and ``//`` also occur inside
+    string defaults. Excising the byte ranges the grammar itself labelled as comments is
+    correct by construction — a hash inside a string literal belongs to a ``string`` node
+    and survives, a real comment cannot — and it works for every language that declares
+    its comment node types, with no per-language pattern.
+    """
+    spans: list[tuple[int, int]] = []
+
+    def walk(n: Node) -> None:
+        for child in n.children:
+            if child.start_byte >= end_byte or child.end_byte <= node.start_byte:
+                continue
+            if child.type in comment_types:
+                spans.append((child.start_byte, child.end_byte))
+            else:
+                walk(child)
+
+    walk(node)
+    if not spans:
+        return source[node.start_byte : end_byte].decode("utf-8", errors="replace")
+
+    kept: list[bytes] = []
+    cursor = node.start_byte
+    for start, stop in sorted(spans):
+        kept.append(source[cursor:start])
+        cursor = max(cursor, stop)
+    kept.append(source[cursor:end_byte])
+    return b"".join(kept).decode("utf-8", errors="replace")
+
+
 # ---------------------------------------------------------------------------
 # Referenced-file heuristic (REFERENCES_FILE)
 #

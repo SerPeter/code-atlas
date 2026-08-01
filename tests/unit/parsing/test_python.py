@@ -2098,3 +2098,34 @@ def load():
     assert _file_paths(parsed) == {"config/schema.yaml"}
     for entity in parsed.entities:
         assert entity.content_hash == _eight_part_hash(entity), entity.qualified_name
+
+
+def test_signature_excludes_lint_pragmas_but_keeps_hashes_in_defaults():
+    """A signature was a raw byte slice, so a lint-suppression comment inside a
+    multi-line signature rode into it — and from there into the outline, where the hash
+    character already has two other meanings.
+
+    Excising the ranges the grammar labelled as comments is correct where a regex could
+    not be: the hash in a string default belongs to a `string` node and must survive.
+    """
+    parsed = _parse(
+        "def wide(  # noqa: PLR0913\n"
+        "    alpha: int,\n"
+        "    sep: str = '#tag',  # trailing note\n"
+        ") -> str:\n"
+        "    return sep\n"
+    )
+
+    sig = _entity_by_name(parsed, "wide").signature
+    assert sig is not None
+    assert "noqa" not in sig
+    assert "trailing note" not in sig
+    assert "'#tag'" in sig  # a hash inside a string literal is not a comment
+    assert "alpha: int" in sig
+    assert "-> str" in sig
+
+
+def test_signature_without_comments_is_unchanged():
+    parsed = _parse("def plain(a: int) -> bool:\n    return True\n")
+
+    assert _entity_by_name(parsed, "plain").signature == "def plain(a: int) -> bool"

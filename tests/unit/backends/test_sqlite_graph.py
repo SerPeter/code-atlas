@@ -470,7 +470,9 @@ class TestGetModuleImportEdges:
 
         data = await client.get_module_import_edges("proj", "")
 
-        assert {"from_mod": "pkg.a", "to_mod": "pkg.b"} in data["direct"]
+        assert ("pkg.a", "pkg.b") in [(r["from_mod"], r["to_mod"]) for r in data["direct"]]
+        # file_path rides along so generate_diagram can locate the module on disk
+        assert all("from_path" in r and "to_path" in r for r in data["direct"])
         await client.close()
 
     async def test_indirect_edge_via_entity_import(self, tmp_path: Path) -> None:
@@ -488,7 +490,9 @@ class TestGetModuleImportEdges:
 
         data = await client.get_module_import_edges("proj", "")
 
-        assert {"from_mod": "pkg.a", "to_mod": "pkg.b"} in data["indirect"]
+        assert ("pkg.a", "pkg.b") in [(r["from_mod"], r["to_mod"]) for r in data["indirect"]]
+        # file_path rides along so generate_diagram can locate the module on disk
+        assert all("from_path" in r and "to_path" in r for r in data["indirect"])
         await client.close()
 
 
@@ -536,7 +540,9 @@ class TestGetQualityData:
         data = await client.get_quality_data("proj", "pkg/a")
 
         assert data["entities"] == [{"module": "pkg.a", "file_path": "pkg/a.py", "entity_count": 1}]
-        assert {"from_mod": "pkg.b", "to_mod": "pkg.a"} in data["direct"]
+        assert ("pkg.b", "pkg.a") in [(r["from_mod"], r["to_mod"]) for r in data["direct"]]
+        # file_path rides along so generate_diagram can locate the module on disk
+        assert all("from_path" in r and "to_path" in r for r in data["direct"])
         await client.close()
 
 

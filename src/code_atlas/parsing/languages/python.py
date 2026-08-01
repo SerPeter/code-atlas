@@ -18,6 +18,7 @@ from code_atlas.parsing.ast import (
     looks_like_resource_path,
     node_text,
     register_language,
+    slice_without_comments,
 )
 from code_atlas.parsing.detectors import (
     DetectorResult,
@@ -176,6 +177,9 @@ def _extract_docstring(node: Node, source: bytes) -> str | None:
     return None
 
 
+_PY_COMMENT_TYPES = frozenset({"comment"})
+
+
 def _extract_signature(node: Node, source: bytes) -> str | None:
     """Extract function signature (def line without the body)."""
     if node.type != "function_definition":
@@ -187,8 +191,10 @@ def _extract_signature(node: Node, source: bytes) -> str | None:
     if name is None or params is None:
         return None
     end_byte = ret.end_byte if ret else params.end_byte
-    sig_bytes = source[node.start_byte : end_byte]
-    return sig_bytes.decode("utf-8", errors="replace")
+    # Not a raw slice: a multi-line signature can carry a lint-suppression comment, and
+    # rendering one into the outline puts a stray hash in a format that already gives
+    # the hash character two other meanings.
+    return slice_without_comments(node, source, end_byte, _PY_COMMENT_TYPES)
 
 
 def _is_inside_class(node: Node) -> str | None:
