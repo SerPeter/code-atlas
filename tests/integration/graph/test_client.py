@@ -5000,7 +5000,7 @@ async def test_resolve_calls_will_not_resolve_a_call_on_an_unknown_receiver(grap
     )
 
     rows = await graph_client.execute(
-        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN r.confidence AS c, r.strategy AS s, b.uid AS t",
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN r.confidence AS c, r.strategy AS s, b.uid AS t, r.weight AS w",
         {"a": f"{project}:src.cache.clear"},
     )
     assert len(rows) == 1
@@ -5009,6 +5009,10 @@ async def test_resolve_calls_will_not_resolve_a_call_on_an_unknown_receiver(grap
     assert rows[0]["t"] == f"{project}:src.scanner.scan"
     assert rows[0]["c"] == "ambiguous"
     assert rows[0]["s"] == "unverified_receiver"
+    # And the weight must fall with it. candidate_count is 1 here, so 1/candidate_count
+    # alone would hand an unverifiable edge the same 1.0 a genuinely resolved call gets,
+    # and the confidence flag would never reach Leiden or blast_radius ranking.
+    assert rows[0]["w"] == 0.5
 
 
 async def test_resolve_calls_still_resolves_self_and_bare_calls(graph_client: GraphClient):

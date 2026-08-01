@@ -951,6 +951,13 @@ _CALL_WEIGHT_BASE = 1.0
 # Test callers do exercise their callee, so their edges are damped rather than
 # dropped: a test-only caller ranks below every production caller, above none.
 _CALL_WEIGHT_TEST_DAMPING = 0.25
+
+# An unverified-receiver edge names one project entity, but the real callee may be a
+# method of a type that was never indexed. Halving says exactly that: at best an even
+# split between the name match and something outside the graph. Without it the edge is
+# marked ambiguous and still weighted like a certainty, because 1/candidate_count with
+# candidate_count 1 is 1.0 — the flag alone never reaches Leiden or blast_radius ranking.
+_CALL_WEIGHT_UNVERIFIED_DAMPING = 0.5
 # Strictly-positive floor. MAGE's Leiden normalizes gamma by the sum of edge
 # weights, so a zero total yields NaN and silently meaningless communities.
 _MIN_CALL_WEIGHT = 1e-6
@@ -994,14 +1001,20 @@ _DEFAULT_TEST_PATTERNS: tuple[str, ...] = tuple(SearchSettings().test_patterns)
 _CODE_ENTITY_KINDS: frozenset[str] = frozenset(str(k) for k in (*CallableKind, *TypeDefKind))
 
 
-def _call_edge_weight(candidate_count: int, from_test: bool) -> float:
+def _call_edge_weight(candidate_count: int, from_test: bool, strategy: str = "") -> float:
     """Derive a CALLS edge's numeric weight from its raw observed facts.
 
     ``1 / candidate_count`` spreads one call's worth of evidence across the
     candidates the resolver could not disambiguate; ``from_test`` then damps
     the result. The return value is always strictly positive.
+
+    An unverified receiver is damped separately because candidate_count cannot express
+    it: the resolver found exactly one name match, so the count is 1 and the quotient is
+    a full-confidence 1.0, even though the real callee may not be in the graph at all.
     """
     weight = _CALL_WEIGHT_BASE / max(candidate_count, 1)
+    if strategy in _UNVERIFIED_STRATEGIES:
+        weight *= _CALL_WEIGHT_UNVERIFIED_DAMPING
     if from_test:
         weight *= _CALL_WEIGHT_TEST_DAMPING
     return max(weight, _MIN_CALL_WEIGHT)
@@ -1979,7 +1992,7 @@ class GraphClient:
                     "strategy": facts.strategy,
                     "candidate_count": facts.candidate_count,
                     "from_test": facts.from_test,
-                    "weight": _call_edge_weight(facts.candidate_count, facts.from_test),
+                    "weight": _call_edge_weight(facts.candidate_count, facts.from_test, facts.strategy),
                 }
                 for (f, t), facts in edges.items()
             ]

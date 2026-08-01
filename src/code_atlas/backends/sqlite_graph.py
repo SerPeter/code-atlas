@@ -1395,7 +1395,7 @@ class SqliteGraphClient:
                             "strategy": facts.strategy,
                             "candidate_count": facts.candidate_count,
                             "from_test": facts.from_test,
-                            "weight": _call_edge_weight(facts.candidate_count, facts.from_test),
+                            "weight": _call_edge_weight(facts.candidate_count, facts.from_test, facts.strategy),
                         }
                     ),
                 )

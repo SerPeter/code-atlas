@@ -61,9 +61,15 @@ Schema v8. Existing `project_unique` edges are deleted rather than left to be ov
 with full weight, so nothing downstream distrusts them, and a stale one whose call site has since gone would never be
 revisited. Only that strategy is purged — rebuilding the other four would cost a re-index for nothing.
 
-Total CALLS weight falls, because reclassified edges lose the `resolved` weight ADR-0017 assigns them. ADR-0019's
-community-detection constants were calibrated on the older distribution and should be re-checked; a large modularity
-shift is a signal to retune, not to accept silently.
+Weight needed a separate change, which the first cut of this decision got wrong. ADR-0017 derives weight as
+`1 / candidate_count`, and an unverified match has a candidate_count of 1 — so reclassifying the edge left it marked
+`ambiguous` while still carrying the full 1.0 of a certainty, and the flag never reached Leiden or `blast_radius`
+ranking. `_call_edge_weight` now damps an unverified receiver by half: at best an even split between the one name match
+and something outside the graph. The lesson generalises — confidence and weight are not coupled just because both derive
+from the same observations; a new observation has to be wired into both.
+
+ADR-0019's community-detection constants were calibrated on the older distribution and should be re-checked; a large
+modularity shift is a signal to retune, not to accept silently.
 
 `self`, `cls` and `this` are a hardcoded set. That covers the languages this indexer parses today, but it is a naming
 convention, not a grammar fact, and a language using a different self-reference would silently lose `project_unique`
