@@ -2669,17 +2669,19 @@ class SqliteGraphClient:
         (``m1`` only vs. ``m1`` or ``m2``).
         """
         cur = await conn.execute(
-            "SELECT m1.qualified_name, m2.qualified_name FROM edges e "
+            "SELECT m1.qualified_name, m2.qualified_name, m1.file_path, m2.file_path FROM edges e "
             "JOIN nodes m1 ON m1.uid = e.from_uid AND m1.labels = 'Module' AND m1.project_name = ? "
             "JOIN nodes m2 ON m2.uid = e.to_uid AND m2.labels = 'Module' AND m2.project_name = ? "
             f"WHERE e.rel_type = 'IMPORTS' AND m1.uid <> m2.uid{clause}",
             [project, project, *extra],
         )
-        direct_raw = [{"from_mod": r[0], "to_mod": r[1]} for r in await cur.fetchall()]
+        direct_raw = [
+            {"from_mod": r[0], "to_mod": r[1], "from_path": r[2], "to_path": r[3]} for r in await cur.fetchall()
+        ]
         await cur.close()
 
         cur = await conn.execute(
-            "SELECT m1.qualified_name, m2.qualified_name FROM edges imp "
+            "SELECT m1.qualified_name, m2.qualified_name, m1.file_path, m2.file_path FROM edges imp "
             "JOIN nodes m1 ON m1.uid = imp.from_uid AND m1.labels = 'Module' AND m1.project_name = ? "
             "JOIN nodes ent ON ent.uid = imp.to_uid AND ent.labels <> 'Module' "
             "JOIN edges def ON def.to_uid = ent.uid AND def.rel_type = 'DEFINES' "
@@ -2687,7 +2689,9 @@ class SqliteGraphClient:
             f"WHERE imp.rel_type = 'IMPORTS' AND m1.uid <> m2.uid{clause}",
             [project, project, *extra],
         )
-        indirect_raw = [{"from_mod": r[0], "to_mod": r[1]} for r in await cur.fetchall()]
+        indirect_raw = [
+            {"from_mod": r[0], "to_mod": r[1], "from_path": r[2], "to_path": r[3]} for r in await cur.fetchall()
+        ]
         await cur.close()
         return {"direct": direct_raw, "indirect": indirect_raw}
 

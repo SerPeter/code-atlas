@@ -385,6 +385,63 @@ async def test_diagram_imports_switches_off_mermaid_once_the_picture_stops_being
     assert len(big["outline"]) < len(small["mermaid"]) * 12  # far sublinear in node count
 
 
+async def test_diagram_imports_surfaces_cycles_files_and_orders_by_load():
+    """Three gaps a blind reader found: cycles were only visible by cross-referencing two
+    distant lines, modules were bare basenames that could not be located on disk, and the
+    absence of external deps was unstated so it read as "there are none".
+    """
+    direct = [
+        # a <-> b is a cycle; c is imported by both, so it should lead its cluster.
+        {"from_mod": "pkg.a", "to_mod": "pkg.b", "from_path": "src/pkg/a.py", "to_path": "src/pkg/b.py"},
+        {"from_mod": "pkg.b", "to_mod": "pkg.a", "from_path": "src/pkg/b.py", "to_path": "src/pkg/a.py"},
+        {"from_mod": "pkg.a", "to_mod": "pkg.c", "from_path": "src/pkg/a.py", "to_path": "src/pkg/sub/c.py"},
+        {"from_mod": "pkg.b", "to_mod": "pkg.c", "from_path": "src/pkg/b.py", "to_path": "src/pkg/sub/c.py"},
+    ]
+    from code_atlas.server.analysis import _render_grouped_adjacency
+
+    nodes = {"pkg.a", "pkg.b", "pkg.c"}
+    edges = [(("pkg.a", "pkg.b"), 1), (("pkg.b", "pkg.a"), 1), (("pkg.a", "pkg.c"), 1), (("pkg.b", "pkg.c"), 1)]
+    paths = {r["from_mod"]: r["from_path"] for r in direct} | {r["to_mod"]: r["to_path"] for r in direct}
+
+    out = _render_grouped_adjacency(nodes, edges, paths)
+
+    assert "CYCLES 1 import cycle(s)" in out
+    assert "a <-> b" in out
+    # Locating a module must not require a second tool call.
+    assert "src/pkg/ a.py b.py" in out
+    assert "src/pkg/sub/ c.py" in out
+    # Absence of externals is stated, not implied.
+    assert "external and stdlib imports are excluded" in out
+    # c has in-degree 2 and leads; a and b have 1 each.
+    assert out.index("c(<-2)") < out.index("a(<-1)")
+
+
+async def test_diagram_imports_omits_the_cycles_block_when_there_are_none():
+    from code_atlas.server.analysis import _render_grouped_adjacency
+
+    out = _render_grouped_adjacency({"pkg.a", "pkg.b"}, [(("pkg.a", "pkg.b"), 1)], {"pkg.a": "a.py", "pkg.b": "b.py"})
+
+    assert "CYCLES" not in out
+    assert "(repo root) a.py b.py" in out
+
+
+async def test_diagram_imports_carries_module_paths_from_both_backends():
+    """The renderer can only place modules on disk if the query returns file_path; both
+    backends must supply it, and _diagram_imports must thread it through."""
+    direct = [
+        {"from_mod": f"pkg.m{i}", "to_mod": "pkg.hub", "from_path": f"src/m{i}.py", "to_path": "src/hub.py"}
+        for i in range(30)
+    ]
+    graph = MagicMock()
+    graph.get_module_import_edges = AsyncMock(return_value={"direct": direct, "indirect": []})
+
+    result = await generate_diagram(graph, "imports", "p", max_nodes=100)
+
+    assert result["format"] == "outline"  # 31 nodes is past the Mermaid threshold
+    assert "FILES by directory" in result["outline"]
+    assert "hub.py" in result["outline"]
+
+
 async def test_diagram_imports_excludes_test_modules_by_default():
     """_analyze_dependencies and _analyze_quality already filtered; this one never did,
     so 60 of the 100 nodes at the cap were test modules.

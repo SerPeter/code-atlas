@@ -3483,14 +3483,16 @@ class GraphClient:
             "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->"
             "(m2:Module {project_name: $project}) "
             f"WHERE m1 <> m2{pa_m1} "
-            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod, "
+            "m1.file_path AS from_path, m2.file_path AS to_path",
             params,
         )
         indirect_raw = await self.execute(
             "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)"
             "<-[:DEFINES]-(m2:Module {project_name: $project}) "
             f"WHERE m1 <> m2 AND NOT e:Module{pa_m1} "
-            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod",
+            "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod, "
+            "m1.file_path AS from_path, m2.file_path AS to_path",
             params,
         )
         return {"direct": direct_raw, "indirect": indirect_raw}

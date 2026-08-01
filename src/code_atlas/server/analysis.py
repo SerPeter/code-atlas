@@ -1489,7 +1489,9 @@ async def _diagram_packages(graph: GraphBackend, project: str, path: str, max_no
 _DIAGRAM_MERMAID_MAX_NODES = 25
 
 
-def _render_grouped_adjacency(nodes: set[str], edges: list[tuple[tuple[str, str], int]]) -> str:
+def _render_grouped_adjacency(
+    nodes: set[str], edges: list[tuple[tuple[str, str], int]], paths: dict[str, str] | None = None
+) -> str:
     """Community-grouped adjacency — the cheapest lossless rendering measured (0.19x
     Mermaid at 57 nodes, 0.20x at 122) and also the most local: a node's neighbourhood
     spans a median of 12 lines against Mermaid's 270.
@@ -1527,17 +1529,50 @@ def _render_grouped_adjacency(nodes: set[str], edges: list[tuple[tuple[str, str]
         "LEGEND 'a > b, c': a imports b and c | Cn: target is in cluster n | *N: N import "
         "statements | '(<-N)': imported by N of these modules | a bare name imports none of them",
         "CLUSTERS are computed by greedy modularity over this import graph, not by directory.",
+        # Silence reads as "there are none", which is the wrong conclusion to invite from a
+        # document someone is using to reason about a dependency surface.
+        "SCOPE first-party modules only — external and stdlib imports are excluded from this graph.",
     ]
+
+    # Cycles as one block, never as a per-edge annotation: O(cycles) instead of O(edges),
+    # and a structural pathology belongs where it can be seen rather than dispersed across
+    # the lines it implicates. Reuses the same SCC finder as analyze_repo(quality).
+    adjacency: dict[str, set[str]] = {}
+    for (a, b), _w in edges:
+        adjacency.setdefault(a, set()).add(b)
+        adjacency.setdefault(b, set())
+    cycles = [c for c in _find_sccs(adjacency) if len(c) > 1]
+    if cycles:
+        lines.append(f"CYCLES {len(cycles)} import cycle(s) — each set imports itself transitively:")
+        lines.extend(f"  {' <-> '.join(sorted(label[q] for q in c if q in label))}" for c in cycles)
+
+    # Identity, paid once per node rather than per mention. A node appears once as a
+    # source but many times as a target, so inlining its path would be O(edge-endpoints);
+    # the shared directory is stated once so each entry carries only what distinguishes it.
+    known = {qn: str(p).replace("\\", "/") for qn, p in (paths or {}).items() if qn in nodes and p}
+    if known:
+        by_dir: dict[str, list[str]] = {}
+        for p in known.values():
+            head, _, base = p.rpartition("/")
+            by_dir.setdefault(head + "/" if head else "", []).append(base)
+        lines.append("FILES by directory — every module above lives in exactly one of these")
+        lines.extend(f"  {d or '(repo root)'} {' '.join(sorted(files))}" for d, files in sorted(by_dir.items()))
 
     def node_line(qn: str) -> str:
         head = label[qn] + (f"(<-{in_deg[qn]})" if in_deg.get(qn) else "")
         targets = out_edges.get(qn)
         return f"  {head} > {', '.join(sorted(targets))}" if targets else f"  {head}"
 
+    # Most-depended-on first. Alphabetical ordering carried no information — a reader
+    # called it out as following "no rule I can identify" — and this costs nothing while
+    # putting the load-bearing modules at the top of each cluster.
+    def by_load(qn: str) -> tuple[int, str]:
+        return (-in_deg.get(qn, 0), label[qn])
+
     for i, members in enumerate(communities):
         lines.extend(["", f"[C{i}] {len(members)} modules"])
-        lines.extend(node_line(qn) for qn in sorted(members))
-    loose = sorted(n for n in nodes if n not in community_of)
+        lines.extend(node_line(qn) for qn in sorted(members, key=by_load))
+    loose = sorted((n for n in nodes if n not in community_of), key=by_load)
     if loose:
         lines.extend(["", f"[unclustered] {len(loose)} modules"])
         lines.extend(node_line(qn) for qn in loose)
@@ -1550,6 +1585,11 @@ async def _diagram_imports(
     t0 = time.monotonic()
     module_edges = await graph.get_module_import_edges(project, path)
     edge_weights = _module_imports_from_records(module_edges["direct"], module_edges["indirect"])
+    mod_paths: dict[str, str] = {}
+    for r in module_edges["direct"] + module_edges["indirect"]:
+        for qn_key, path_key in (("from_mod", "from_path"), ("to_mod", "to_path")):
+            if r.get(qn_key) and r.get(path_key):
+                mod_paths[r[qn_key]] = r[path_key]
     if test_patterns:
         # _analyze_dependencies and _analyze_quality already filter; this one never did,
         # so 60 of the 100 nodes at the cap were test modules — 60% of the node budget
@@ -1591,7 +1631,7 @@ async def _diagram_imports(
         return {
             "type": "imports",
             "format": "outline",
-            "outline": _render_grouped_adjacency(kept_nodes, kept_edges),
+            "outline": _render_grouped_adjacency(kept_nodes, kept_edges, mod_paths),
             "node_count": len(kept_nodes),
             "query_ms": round(elapsed, 1),
         }
