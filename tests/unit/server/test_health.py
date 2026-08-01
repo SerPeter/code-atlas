@@ -286,6 +286,26 @@ async def test_check_config_no_git(tmp_path):
     assert "No git repo" in result.message
 
 
+async def test_check_config_resolves_dotenv_when_caller_passes_none(tmp_path):
+    """The MCP server has no dotenv handle to pass — cli.py loads the file before
+    handing off. Reporting 'not found' for a loaded .env sent a past debugging
+    session chasing a phantom stale process.
+    """
+    (tmp_path / ".git").mkdir()
+    settings = AtlasSettings(project_root=tmp_path)
+    with patch("code_atlas.server.health.find_dotenv", return_value="/somewhere/.env"):
+        result = await check_config(settings)
+    assert ".env: /somewhere/.env" in result.detail
+
+
+async def test_check_config_reports_missing_dotenv(tmp_path):
+    (tmp_path / ".git").mkdir()
+    settings = AtlasSettings(project_root=tmp_path)
+    with patch("code_atlas.server.health.find_dotenv", return_value=""):
+        result = await check_config(settings)
+    assert ".env: not found" in result.detail
+
+
 # ---------------------------------------------------------------------------
 # check_schema
 # ---------------------------------------------------------------------------

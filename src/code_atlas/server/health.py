@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from dotenv import find_dotenv
+
 from code_atlas.backends import create_event_bus, create_graph_client
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.backends.sqlite_queue import SqliteEventBus
@@ -239,9 +241,13 @@ async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> Che
 
     # Build detail string showing which config files were loaded
     config_match = _find_atlas_toml()
+    # Callers that know the path pass it (the CLI captures it at load time). The MCP
+    # server has no such handle — cli.py loads the .env before handing off, so re-resolve
+    # it here rather than reporting "not found" for a file that is demonstrably loaded.
+    resolved_dotenv = dotenv_path or find_dotenv(usecwd=True)
     detail_parts: list[str] = []
     detail_parts.append(f"config: {config_match.path if config_match else 'not found'}")
-    detail_parts.append(f".env: {dotenv_path or 'not found'}")
+    detail_parts.append(f".env: {resolved_dotenv or 'not found'}")
     detail = " | ".join(detail_parts)
 
     git_root = find_git_root(root)
