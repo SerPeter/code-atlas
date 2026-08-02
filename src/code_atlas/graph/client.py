@@ -3710,11 +3710,23 @@ class GraphClient:
         """
         params: dict[str, Any] = {"project": project, "path": path, "code_kinds": sorted(_CODE_ENTITY_KINDS)}
         pa = " AND n.file_path STARTS WITH $path" if path else ""
+        # "Unused" cannot mean "no CALLS edge". A class is used by being annotated,
+        # subclassed or imported, and instantiating it calls its __init__ rather than the
+        # class — so a CALLS-only test called 29 of 30 live entities in one package dead,
+        # while the graph itself held the disproof (AppContext: 34 incoming edges,
+        # including USES_TYPE). Acting on that output deletes working code, which makes a
+        # false positive here far more expensive than a miss.
+        refs = (
+            f"{RelType.CALLS}|{RelType.USES_TYPE}|{RelType.IMPORTS}"
+            f"|{RelType.INHERITS}|{RelType.IMPLEMENTS}|{RelType.OVERRIDES}"
+        )
         return await self.execute(
             "MATCH (n {project_name: $project}) "
             f"WHERE (n:Callable OR n:TypeDef) AND n.kind IN $code_kinds "
             f"AND NOT n.name STARTS WITH '__'{pa} "
-            "AND NOT ()-[:CALLS]->(n) "
+            f"AND NOT ()-[:{refs}]->(n) "
+            # Constructing a class produces an edge to its __init__, not to the class.
+            f"AND NOT (n)-[:{RelType.DEFINES}]->()<-[:{RelType.CALLS}]-() "
             "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
             "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
             "ORDER BY n.file_path, n.line_start",

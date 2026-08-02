@@ -510,7 +510,13 @@ class TestAnalysisQueryConstruction:
         await client.get_dead_code_candidates("code-atlas", "")
 
         query = client.execute.call_args[0][0]
-        assert "NOT ()-[:CALLS]->(n)" in query
+        # "Unused" is not "no CALLS edge": a class is used by being annotated, subclassed
+        # or imported, and constructing it calls its __init__ rather than the class. The
+        # CALLS-only test reported 29 live entities dead out of 30 in one package.
+        assert "USES_TYPE" in query
+        assert "INHERITS" in query
+        assert "CALLS" in query
+        assert "DEFINES" in query  # a call into a member keeps its owner alive
         assert "NOT n.name STARTS WITH '__'" in query
 
     async def test_dead_code_query_gates_on_invocable_kinds(self, tmp_path: Path):

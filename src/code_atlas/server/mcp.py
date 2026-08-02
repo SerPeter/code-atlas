@@ -1838,9 +1838,14 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
 
     @mcp.tool(
         description=(
-            "Shortcut for analyze_repo(analysis='dead_code'). Callables/TypeDefs with zero incoming "
-            "CALLS edges, excluding dunder methods and test files. Caveat: dynamic dispatch and "
-            "framework entry points (CLI commands, route handlers) can still false-positive as dead. "
+            "Shortcut for analyze_repo(analysis='dead_code'). Callables/TypeDefs with no incoming "
+            "CALLS/USES_TYPE/IMPORTS/INHERITS/IMPLEMENTS/OVERRIDES edge and no call into their members, "
+            "excluding dunder methods and test files. "
+            "TREAT AS A LEAD, NOT A VERDICT — verify each hit against source before deleting anything. "
+            "Known false positives: a caller defined INSIDE another function is not indexed, so its "
+            "callees look dead (this hides every nested handler, e.g. decorator-registered tools); "
+            "entities referenced only through a dispatch table or by reflection have no static edge; "
+            "and dynamic dispatch is invisible generally. "
             "Returns: {analysis, project, dead_code_count, dead_code: [{name, qualified_name, label, "
             "kind, file_path, line_start}], truncated, query_ms}."
         ),
