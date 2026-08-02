@@ -429,6 +429,22 @@ class SqliteGraphClient:
         )
         await conn.commit()
 
+    async def _migrate_v9_clear_for_abstract_bases(self, conn: aiosqlite.Connection) -> None:
+        """Mirror of ``GraphClient._migrate_v9_clear_for_abstract_bases``."""
+        await conn.execute(
+            "DELETE FROM edges WHERE rel_type = 'CALLS' AND json_extract(props_json, '$.confidence') = 'ambiguous'"
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
+            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
+            "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
+        )
+        await conn.commit()
+        logger.info("SQLite graph schema v9: cleared ambiguous CALLS edges and freshness markers")
+
     async def _migrate_v8_drop_unverified_calls(self, conn: aiosqlite.Connection) -> None:
         """Mirror of ``GraphClient._migrate_v8_drop_unverified_calls``.
 
@@ -516,6 +532,8 @@ class SqliteGraphClient:
                 await self._migrate_v7_clear_freshness_markers(conn)
             if stored < 8:
                 await self._migrate_v8_drop_unverified_calls(conn)
+            if stored < 9:
+                await self._migrate_v9_clear_for_abstract_bases(conn)
             await self._set_schema_version(conn, SCHEMA_VERSION)
         else:
             msg = (

@@ -149,6 +149,9 @@ def _visibility_from_name(name: str) -> str:
 # e.g. r/f/b/u/rb/br/rf/fr) when immediately followed by a quote character.
 _STRING_PREFIX_RE = re.compile(r"^[A-Za-z]{1,2}(?=['\"])")
 
+# Bases whose presence makes a class a declaration rather than an implementation.
+_ABSTRACT_BASES = frozenset({"Protocol", "ABC", "ABCMeta"})
+
 
 def _extract_docstring(node: Node, source: bytes) -> str | None:
     """Extract docstring from the first statement of a function/class body."""
@@ -522,14 +525,25 @@ def _process_class(
 
     qn = f"{module_qn}.{name}" if class_name is None else f"{module_qn}.{class_name}.{name}"
 
-    # Detect Enum subclasses from superclass list
+    # Detect Enum and abstract bases from the superclass list.
     is_enum = False
+    is_abstract = False
     superclasses = node.child_by_field_name("superclasses")
     if superclasses is not None:
         for base in superclasses.children:
-            if base.type == "identifier" and node_text(base) in _ENUM_BASES:
+            # `identifier` alone misses the dotted forms `typing.Protocol` / `abc.ABC`,
+            # which are an `attribute` node — the last component is the base name.
+            if base.type == "identifier":
+                base_name = node_text(base)
+            elif base.type == "attribute":
+                attr = base.child_by_field_name("attribute")
+                base_name = node_text(attr) if attr is not None else ""
+            else:
+                continue
+            if base_name in _ENUM_BASES:
                 is_enum = True
-                break
+            if base_name in _ABSTRACT_BASES:
+                is_abstract = True
 
     kind = TypeDefKind.ENUM if is_enum else TypeDefKind.CLASS
     if is_enum:
@@ -547,6 +561,11 @@ def _process_class(
             docstring=docstring,
             visibility=_visibility_from_name(name),
             tags=tags,
+            # A Protocol/ABC declaration's methods are `...` stubs that can never run, so
+            # a call resolved to one is resolved to nothing. The parser already knew this
+            # and threw it away: it emits INHERITS -> Protocol, and both write paths drop
+            # that edge because `Protocol` is not an in-project TypeDef.
+            extra_properties={"is_abstract": True} if is_abstract else {},
         )
     )
     # DEFINES relationship from module -> class

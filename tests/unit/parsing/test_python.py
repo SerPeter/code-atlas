@@ -2138,3 +2138,34 @@ def test_docstring_containing_a_hash_round_trips():
     parsed = _parse('def rank() -> int:\n    """Return the #1 match."""\n    return 1\n')
 
     assert _entity_by_name(parsed, "rank").docstring == "Return the #1 match."
+
+
+def test_protocol_and_abc_bases_mark_a_class_abstract():
+    """A Protocol/ABC declaration's methods are `...` stubs that can never execute, so a
+    call resolved to one is resolved to nothing.
+
+    The parser already knew this and threw it away: it emits INHERITS -> Protocol and both
+    graph write paths drop that edge, because `Protocol` is not an in-project TypeDef.
+    """
+    parsed = _parse(
+        "from typing import Protocol\n"
+        "import abc\n"
+        "class Iface(Protocol):\n"
+        "    def go(self) -> None: ...\n"
+        "class Dotted(typing.Protocol):\n"
+        "    def go(self) -> None: ...\n"
+        "class Based(abc.ABC):\n"
+        "    def go(self) -> None: ...\n"
+        "class Real:\n"
+        "    def go(self) -> None:\n"
+        "        return None\n"
+    )
+
+    def abstract(name: str) -> bool:
+        return bool(_entity_by_name(parsed, name).extra_properties.get("is_abstract"))
+
+    assert abstract("Iface")
+    # The dotted form is an `attribute` node, which the old identifier-only guard skipped.
+    assert abstract("Dotted")
+    assert abstract("Based")
+    assert not abstract("Real")

@@ -5078,3 +5078,138 @@ async def test_resolve_calls_still_resolves_self_and_bare_calls(graph_client: Gr
         {"a": f"{project}:src.only.caller"},
     )
     assert [r["c"] for r in rows] == ["resolved"]
+
+
+async def test_resolve_calls_skips_protocol_stubs_and_resolves_the_lone_implementation(graph_client: GraphClient):
+    """A Protocol stub body can never execute, so an edge to one points at nothing.
+
+    And once the stub is removed, a single remaining implementation is a resolution, not
+    a guess — it must not fall into ATL-091's single-candidate branch and be re-damped to
+    half weight. A Protocol declaring this very name IS the project-namespace evidence
+    that branch looks for.
+    """
+    await graph_client.ensure_schema()
+    project = "poly_one"
+    fp = "src/backends.py"
+    await graph_client.upsert_file_entities(
+        project,
+        fp,
+        [
+            ParsedEntity(
+                name="backends",
+                qualified_name=f"{project}:src.backends",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=40,
+                file_path=fp,
+                content_hash="m",
+            ),
+            ParsedEntity(
+                name="Store",
+                qualified_name=f"{project}:src.backends.Store",
+                label=NodeLabel.TYPE_DEF,
+                kind="class",
+                line_start=3,
+                line_end=6,
+                file_path=fp,
+                content_hash="proto",
+                extra_properties={"is_abstract": True},
+            ),
+            ParsedEntity(
+                name="save",
+                qualified_name=f"{project}:src.backends.Store.save",
+                label=NodeLabel.CALLABLE,
+                kind="method",
+                line_start=4,
+                line_end=5,
+                file_path=fp,
+                content_hash="proto_save",
+            ),
+            ParsedEntity(
+                name="RealStore",
+                qualified_name=f"{project}:src.backends.RealStore",
+                label=NodeLabel.TYPE_DEF,
+                kind="class",
+                line_start=8,
+                line_end=14,
+                file_path=fp,
+                content_hash="impl",
+            ),
+            ParsedEntity(
+                name="save",
+                qualified_name=f"{project}:src.backends.RealStore.save",
+                label=NodeLabel.CALLABLE,
+                kind="method",
+                line_start=9,
+                line_end=12,
+                file_path=fp,
+                content_hash="impl_save",
+            ),
+        ],
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.backends.Store",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project}:src.backends.Store.save",
+            ),
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.backends.RealStore",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project}:src.backends.RealStore.save",
+            ),
+        ],
+    )
+
+    # The caller lives elsewhere, so same-file resolution cannot fire and the Protocol
+    # partition is what has to pick the implementation.
+    caller_fp = "src/service.py"
+    await graph_client.upsert_file_entities(
+        project,
+        caller_fp,
+        [
+            ParsedEntity(
+                name="service",
+                qualified_name=f"{project}:src.service",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=10,
+                file_path=caller_fp,
+                content_hash="svc",
+            ),
+            ParsedEntity(
+                name="caller",
+                qualified_name=f"{project}:src.service.caller",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=3,
+                line_end=6,
+                file_path=caller_fp,
+                content_hash="caller",
+            ),
+        ],
+        [],
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.service.caller",
+                rel_type=RelType.CALLS,
+                to_name="save",
+                properties={"receiver": "self._store"},
+            )
+        ],
+    )
+
+    rows = await graph_client.execute(
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN b.uid AS t, r.confidence AS c, r.strategy AS s, r.weight AS w",
+        {"a": f"{project}:src.service.caller"},
+    )
+    assert len(rows) == 1
+    assert rows[0]["t"] == f"{project}:src.backends.RealStore.save"  # not the stub
+    assert rows[0]["c"] == "resolved"
+    assert rows[0]["s"] == "polymorphic_unique"
+    assert rows[0]["w"] == 1.0  # NOT re-damped to 0.5 by the unverified-receiver rule

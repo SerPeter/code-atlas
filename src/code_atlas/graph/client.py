@@ -798,6 +798,9 @@ class _CallLookup:
     caller_to_parent: dict[str, str]  # callable_uid → parent TypeDef uid
     parent_children: dict[str, list[str]]  # parent_uid → [child_uids]
     uid_to_info: dict[str, tuple[str, str]]  # uid → (name, file_path)
+    # TypeDefs declared with a Protocol/ABC base. Their methods are `...` stubs that can
+    # never execute, so a call resolved to one is resolved to nothing.
+    abstract_parents: frozenset[str] = frozenset()
 
 
 def _typedef_init_uid(typedef_uid: str, lk: _CallLookup) -> str | None:
@@ -817,7 +820,12 @@ _SELF_RECEIVERS = frozenset({"self", "cls", "this"})
 
 # Strategies whose match is a name coincidence rather than a lexical resolution. Kept as
 # edges (ADR-0014 materializes rather than discards) but never marked resolved.
-_UNVERIFIED_STRATEGIES = frozenset({"unverified_receiver"})
+_UNVERIFIED_STRATEGIES = frozenset({"unverified_receiver", "unverified_wide"})
+
+
+def _is_abstract_stub(uid: str, lk: _CallLookup) -> bool:
+    """Whether *uid* is a method of a Protocol/ABC declaration rather than an implementation."""
+    return bool(lk.abstract_parents) and lk.caller_to_parent.get(uid) in lk.abstract_parents
 
 
 def _resolve_one_call(  # noqa: PLR0911, PLR0912
@@ -877,7 +885,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     caller_fp = caller_info[1] if caller_info else ""
     if caller_fp:
         for uid, fp, _vis in lk.name_to_callables.get(bare_name, []):
-            if fp == caller_fp and uid != caller_uid:
+            if fp == caller_fp and uid != caller_uid and not _is_abstract_stub(uid, lk):
                 return ([uid], "same_file")
 
     # Strategy 4: Project-wide match. Previously only fired when exactly 1
@@ -889,6 +897,21 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     # by the caller instead of being discarded (ADR-0014).
     candidates = lk.name_to_callables.get(bare_name, [])
     non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
+
+    # Drop Protocol/ABC stubs before counting. Their bodies are `...` and can never
+    # execute, so an edge to one points at nothing — 1254 edges in the reference index
+    # terminated on such a body. Removing them also shrinks the modal family from
+    # one-of-three to one-of-two without inventing any new evidence.
+    real = [uid for uid in non_self if not _is_abstract_stub(uid, lk)]
+    if real and len(real) < len(non_self):
+        # Exactly one implementation behind a declaration is a resolution, not a guess,
+        # and must NOT fall through to the single-candidate branch below: the receiver
+        # test there would re-tag it unverified at half weight. A Protocol declaring this
+        # very name IS the project-namespace evidence that branch looks for, so
+        # re-damping it would be precisely backwards.
+        return (real, "polymorphic_unique" if len(real) == 1 else "polymorphic")
+    non_self = real or non_self
+
     if len(non_self) == 1:
         # Uniqueness within the project is evidence of identity only if the name was
         # looked up in the project's namespace. For `client.scan()` it was not: the
@@ -902,6 +925,13 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
             return (non_self, "unverified_receiver")
         return (non_self, "project_unique")
     if len(non_self) > 1:
+        # The receiver is just as unverifiable here as it is with one candidate, and
+        # ATL-091 only damped the single-candidate case: 1498 of 1506 multi-candidate
+        # sites in the reference index have a non-self receiver and none were damped.
+        # Applying the same doubt to the same evidence is the point.
+        receiver = str(rel.properties.get("receiver") or "")
+        if receiver and receiver not in _SELF_RECEIVERS:
+            return (non_self, "unverified_wide")
         return (non_self, "project_wide")
 
     # Strategy 5: Constructor call (bare_name is a class, not a function) — a
@@ -1200,6 +1230,8 @@ class GraphClient:
                 await self._migrate_v7_clear_freshness_markers()
             if stored < 8:  # v8 data migration threshold
                 await self._migrate_v8_drop_unverified_calls()
+            if stored < 9:  # v9 data migration threshold
+                await self._migrate_v9_clear_for_abstract_bases()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -2500,14 +2532,17 @@ class GraphClient:
         # caller_uid → parent TypeDef uid, parent → children
         parent_records = await self.execute(
             f"MATCH (td:{NodeLabel.TYPE_DEF} {{project_name: $p}})-[:{RelType.DEFINES}]->(c:{NodeLabel.CALLABLE}) "
-            "RETURN td.uid AS td_uid, c.uid AS c_uid",
+            "RETURN td.uid AS td_uid, c.uid AS c_uid, td.is_abstract AS td_abstract",
             {"p": project_name},
         )
         caller_to_parent: dict[str, str] = {}
         parent_children: dict[str, list[str]] = {}
+        abstract_parents: set[str] = set()
         for r in parent_records:
             caller_to_parent[r["c_uid"]] = r["td_uid"]
             parent_children.setdefault(r["td_uid"], []).append(r["c_uid"])
+            if r["td_abstract"]:
+                abstract_parents.add(r["td_uid"])
 
         return _CallLookup(
             name_to_callables=name_to_callables,
@@ -2515,6 +2550,7 @@ class GraphClient:
             caller_to_parent=caller_to_parent,
             parent_children=parent_children,
             uid_to_info=uid_to_info,
+            abstract_parents=frozenset(abstract_parents),
         )
 
     async def build_resolution_lookup(self, project_name: str) -> tuple[_CallLookup, dict[str, list[tuple[str, str]]]]:
@@ -4513,6 +4549,30 @@ class GraphClient:
         logger.info(
             "Schema v8: dropped project_unique CALLS edges and cleared file/git hashes — "
             "run 'atlas index' to re-resolve them against the call's receiver"
+        )
+
+    async def _migrate_v9_clear_for_abstract_bases(self) -> None:
+        """v9: TypeDefs gained ``is_abstract``, and CALLS resolution now uses it.
+
+        Only the parser can produce the flag and nothing in the graph can be used to
+        derive it, so every file has to go through the parser again — the same reasoning
+        as v7, and the file-hash gate would otherwise skip each unchanged file forever.
+
+        Ambiguous CALLS edges are dropped because their candidate sets were computed
+        without the flag: a set that included a Protocol stub was resolved across it, and
+        re-parsing alone would leave the stale edge alongside the corrected one. Resolved
+        edges from the lexically-grounded strategies are unaffected and are left in place
+        rather than rebuilt for nothing.
+        """
+        await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.confidence = 'ambiguous' DELETE r")
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v9: cleared ambiguous CALLS edges and file/git hashes — run 'atlas index' "
+            "to re-resolve them against Protocol/ABC declarations"
         )
 
     async def _reconcile_search_indices(self) -> None:
