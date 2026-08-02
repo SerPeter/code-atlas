@@ -639,16 +639,26 @@ def _process_function(
     name: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    enclosing_qn: str | None = None,
 ) -> None:
-    """Process a function_definition node."""
-    class_name = _is_inside_class(node)
+    """Process a function_definition node.
+
+    *enclosing_qn* is set when this def is nested inside another function, and makes it
+    own its parent's qualified name the way a method owns its class's. Without it, a
+    nested def inherited `_is_inside_class`'s answer and would be named as a method of a
+    class it is only lexically inside.
+    """
+    class_name = None if enclosing_qn else _is_inside_class(node)
     docstring = _extract_docstring(node, source)
     tags = _get_decorators(node)
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
 
     is_method = class_name is not None
-    if is_method:
+    if enclosing_qn:
+        kind = CallableKind.FUNCTION
+        qn = f"{enclosing_qn}.{name}"
+    elif is_method:
         kind = _callable_kind_for_method(name, node)
         qn = f"{module_qn}.{class_name}.{name}"
     else:
@@ -681,7 +691,7 @@ def _process_function(
     )
 
     # DEFINES relationship
-    parent_qn = f"{module_qn}.{class_name}" if is_method else module_qn
+    parent_qn = enclosing_qn or (f"{module_qn}.{class_name}" if is_method else module_qn)
     relationships.append(
         ParsedRelationship(
             from_qualified_name=f"{project_name}:{parent_qn}",
@@ -697,6 +707,54 @@ def _process_function(
     body = node.child_by_field_name("body")
     if body is not None:
         _extract_calls(body, source, f"{project_name}:{qn}", relationships, _local_declared_types(node, body))
+        # ...then the defs that body encloses. _extract_calls deliberately stops at a
+        # nested definition, so without this its calls belong to nobody: measured on this
+        # repo, 0 of 64 nested functions existed and 458 call expressions in server/mcp.py
+        # alone were dropped, taking all 23 @mcp.tool handlers with them.
+        _process_nested_functions(body, path, source, project_name, module_qn, qn, entities, relationships)
+
+
+def _process_nested_functions(
+    body: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    module_qn: str,
+    enclosing_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Index `def`s written inside another function, at any depth.
+
+    A decorated nested def arrives wrapped in a `decorated_definition`, which is how the
+    registrar pattern (`@mcp.tool()` inside `_register_x`) appears — unwrap it, or the
+    handlers stay invisible. Lambdas are deliberately not entities: their calls already
+    attribute to the enclosing function, which is where a reader would look for them.
+    """
+    for child in body.children:
+        target = child
+        if child.type == "decorated_definition":
+            inner = child.child_by_field_name("definition")
+            if inner is None or inner.type != "function_definition":
+                continue
+            target = inner
+        elif child.type != "function_definition":
+            continue
+
+        name_node = target.child_by_field_name("name")
+        if name_node is None:
+            continue
+        _process_function(
+            target,
+            path,
+            source,
+            project_name,
+            module_qn,
+            node_text(name_node),
+            entities,
+            relationships,
+            enclosing_qn=enclosing_qn,
+        )
 
 
 def _resolve_relative_import(package_qn: str, relative_text: str) -> str | None:

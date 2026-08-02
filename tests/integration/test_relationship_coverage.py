@@ -378,13 +378,13 @@ CASES: tuple[Case, ...] = (
         "nested-function-entity",
         "is a nested function an entity at all?",
         "MATCH (n:Callable) WHERE n.project_name=$p AND n.name='inner' RETURN n.qualified_name AS hit",
-        "MISSING",
+        "LINKED",
     ),
     Case(
         "call-from-nested-body",
         "who calls helper(), which is only reached from inside a closure?",
         "MATCH (a)-[:CALLS]->(b) WHERE a.project_name=$p AND b.name='helper' RETURN a.qualified_name AS hit",
-        "MISSING",
+        "LINKED",
     ),
     Case(
         "public-api-surface",
