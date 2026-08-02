@@ -801,6 +801,9 @@ class _CallLookup:
     # Callables whose body is literally `...` or which are @abstractmethod. Per-method,
     # not per-class: an ABC's concrete methods are real code and must stay resolvable.
     stub_callables: frozenset[str] = frozenset()
+    # Every TypeDef name in the project, so a receiver whose declared type is NOT one of
+    # them can be recognised as leaving the project entirely.
+    typedef_names: frozenset[str] = frozenset()
 
 
 def _typedef_init_uid(typedef_uid: str, lk: _CallLookup) -> str | None:
@@ -849,6 +852,16 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     """
     caller_uid = rel.from_qualified_name
     bare_name = rel.to_name
+
+    # Before any strategy: a known receiver type that names no class in this project means
+    # the callee is not in this project either — `seen.add(x)` on a `set` is not a call to
+    # any project method named `add`. This has to precede the name-matching strategies,
+    # because a same-file match on `add` is exactly the false positive. The collisions it
+    # removes produced 78 edges each onto two unrelated project classes, and inflated one
+    # blast_radius answer from 5 entities to 26.
+    receiver_type = str(rel.properties.get("receiver_type") or "")
+    if receiver_type and lk.typedef_names and receiver_type not in lk.typedef_names:
+        return None
 
     # Derive caller's module uid — find the longest module prefix in import_map
     caller_qn = caller_uid.split(":", 1)[1] if ":" in caller_uid else caller_uid
@@ -2554,13 +2567,16 @@ class GraphClient:
         # caller_uid → parent TypeDef uid, parent → children
         parent_records = await self.execute(
             f"MATCH (td:{NodeLabel.TYPE_DEF} {{project_name: $p}})-[:{RelType.DEFINES}]->(c:{NodeLabel.CALLABLE}) "
-            "RETURN td.uid AS td_uid, c.uid AS c_uid, c.is_stub AS c_stub",
+            "RETURN td.uid AS td_uid, td.name AS td_name, c.uid AS c_uid, c.is_stub AS c_stub",
             {"p": project_name},
         )
         caller_to_parent: dict[str, str] = {}
         parent_children: dict[str, list[str]] = {}
         stub_callables: set[str] = set()
+        typedef_names: set[str] = set()
         for r in parent_records:
+            if r["td_name"]:
+                typedef_names.add(r["td_name"])
             caller_to_parent[r["c_uid"]] = r["td_uid"]
             parent_children.setdefault(r["td_uid"], []).append(r["c_uid"])
             if r["c_stub"]:
@@ -2573,6 +2589,7 @@ class GraphClient:
             parent_children=parent_children,
             uid_to_info=uid_to_info,
             stub_callables=frozenset(stub_callables),
+            typedef_names=frozenset(typedef_names),
         )
 
     async def build_resolution_lookup(self, project_name: str) -> tuple[_CallLookup, dict[str, list[tuple[str, str]]]]:

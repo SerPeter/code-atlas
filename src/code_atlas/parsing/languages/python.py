@@ -152,6 +152,12 @@ _STRING_PREFIX_RE = re.compile(r"^[A-Za-z]{1,2}(?=['\"])")
 # Bases whose presence makes a class a declaration rather than an implementation.
 _ABSTRACT_BASES = frozenset({"Protocol", "ABC", "ABCMeta"})
 
+# Receiver types that are definitively not project classes. Recorded so the resolver can
+# decline rather than guess — `set.add`, `dict.get` and `list.append` collide with common
+# project method names.
+_BUILTIN_CONTAINERS = frozenset({"set", "dict", "list", "tuple", "frozenset", "str", "bytes", "bytearray", "deque"})
+_CONTAINER_LITERALS = {"list": "list", "dictionary": "dict", "set": "set", "tuple": "tuple", "string": "str"}
+
 
 def _extract_docstring(node: Node, source: bytes) -> str | None:
     """Extract docstring from the first statement of a function/class body."""
@@ -862,7 +868,17 @@ def _plain_type_name(annotation: str) -> str:
     behaviour.
     """
     text = annotation.strip()
-    return text if text.isidentifier() else ""
+    if text.isidentifier():
+        return text
+    # `set[str]` / `dict[str, int]` -> the base. The subscript does not change which
+    # class the receiver is, and this form is how container annotations are actually
+    # written, so rejecting it left the builtin-collision edges in place.
+    base, bracket, rest = text.partition("[")
+    if bracket and rest.endswith("]") and base.strip().isidentifier():
+        return base.strip()
+    # Unions are deliberately NOT unwrapped. `Store | None` really can reach Store, so
+    # returning either half would be wrong: one loses a real edge, the other invents one.
+    return ""
 
 
 def _local_declared_types(func_node: Node, body: Node) -> dict[str, str]:
@@ -904,8 +920,14 @@ def _local_declared_types(func_node: Node, body: Node) -> dict[str, str]:
                         # name is not necessarily the attribute's own name.
                         if fn is not None and fn.type == "identifier":
                             name = node_text(fn)
-                            if name[:1].isupper():  # a constructor, not a plain function
+                            # Builtins are recorded deliberately, not skipped. Knowing a
+                            # receiver is a `set` is what lets the resolver refuse to
+                            # invent an edge: `seen.add(x)` was resolving to project
+                            # methods named `add`, 156 times.
+                            if name[:1].isupper() or name in _BUILTIN_CONTAINERS:
                                 types.setdefault(node_text(left), name)
+                    elif right.type in _CONTAINER_LITERALS:
+                        types.setdefault(node_text(left), _CONTAINER_LITERALS[right.type])
             # Do not descend into nested defs — their locals are a different scope.
             if child.type not in ("function_definition", "class_definition", "decorated_definition"):
                 walk(child)

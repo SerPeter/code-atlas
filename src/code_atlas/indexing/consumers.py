@@ -95,6 +95,13 @@ _ABANDONED_MIN_IDLE_MS = 120_000
 # How often a paused consumer re-checks whether the foreign lease has been released.
 _LEASE_POLL_S = 1.0
 
+# How often to sweep for work abandoned by a dead process, once this consumer's own PEL
+# is drained. Without a periodic sweep the adopt path only ever runs during a consumer's
+# initial drain, so a crashed indexer's messages sit stranded until something restarts —
+# observed live: 96 file and 1037 embed messages held by an exited process while a
+# healthy consumer polled beside them and never looked.
+_RECLAIM_SWEEP_S = 30.0
+
 
 def _process_tag() -> str:
     """Short identity for this process, unique across hosts and PIDs.
@@ -311,6 +318,7 @@ class TierConsumer(ABC):
         pending: dict[str, tuple[bytes, Event]] = {}  # dedup_key → (msg_id, event)
         window_start: float | None = None
         pel_drained = False  # True once all pending (unacked) messages have been reclaimed
+        last_reclaim_at = 0.0
         self._pel_dirty = False
         block_ms = (
             self.policy.block_ms
@@ -329,8 +337,11 @@ class TierConsumer(ABC):
                 # consumer names now carry a process identity: read_pending only ever
                 # returns THIS consumer's history, so a killed process's entries would
                 # otherwise be orphaned under a name nothing will use again.
-                if not pel_drained or self._pel_dirty:
+                now = asyncio.get_event_loop().time()
+                due_for_sweep = now - last_reclaim_at >= _RECLAIM_SWEEP_S
+                if not pel_drained or self._pel_dirty or due_for_sweep:
                     self._pel_dirty = False
+                    last_reclaim_at = now
                     reclaimed = await self.bus.read_pending(
                         self.input_topic,
                         self.group,

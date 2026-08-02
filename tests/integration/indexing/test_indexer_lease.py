@@ -84,3 +84,27 @@ async def test_lease_release_cannot_free_someone_elses(event_bus):
     async with hold_indexer_lease(event_bus) as owner:
         assert await event_bus.release_indexer_lease("some-other-process") is False
         assert await event_bus.read_indexer_lease() == owner
+
+
+async def test_abandoned_work_is_swept_up_after_the_owner_dies(event_bus):
+    """The adopt path must keep running, not only during a consumer's initial drain.
+
+    Observed live: an indexer exited holding 96 file-changed and 1037 embed messages, and
+    a healthy consumer polled beside them for minutes without ever looking — because
+    `pel_drained` had already flipped True, and the reclaim was gated behind it.
+    """
+    topic = Topic.FILE_CHANGED
+    group = "sweep-test"
+    await event_bus.ensure_group(topic, group)
+    await event_bus.publish(topic, FileChanged(path="stranded.py", change_type="modified", project_name="p"))
+
+    dead = await event_bus.read_batch(topic, group, "worker-dead", count=1, block_ms=200)
+    assert len(dead) == 1
+
+    # A live consumer that has already drained its own PEL must still adopt this.
+    adopted = await event_bus.reclaim_abandoned(topic, group, "worker-live", min_idle_ms=0, count=10)
+    assert {mid for mid, _ in adopted} == {mid for mid, _ in dead}
+
+    # And once adopted it is that consumer's own pending work, so a normal drain clears it.
+    own = await event_bus.read_pending(topic, group, "worker-live", count=10)
+    assert {mid for mid, _ in own} == {mid for mid, _ in dead}

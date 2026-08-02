@@ -5430,3 +5430,85 @@ async def test_receiver_type_never_resolves_onto_a_stub_body(graph_client: Graph
     assert f"{project}:src.be.Iface.run" not in targets, rows  # never the stub
     assert targets == {f"{project}:src.be.Impl.run"}
     assert rows[0]["s"] == "polymorphic_unique"
+
+
+async def test_resolve_calls_declines_when_the_receiver_type_is_not_a_project_class(graph_client: GraphClient):
+    """`seen.add(x)` on a builtin `set` is not a call to any project method named `add`.
+
+    Two project classes named _Out.add and _Emit.add collected 78 false edges each this
+    way, and one `run` collision inflated a blast_radius answer from 5 entities to 26.
+    Knowing the receiver's type is a builtin is enough to decline outright.
+    """
+    await graph_client.ensure_schema()
+    project = "ext_recv"
+    fp = "src/m.py"
+    await graph_client.upsert_file_entities(
+        project,
+        fp,
+        [
+            ParsedEntity(
+                name="m",
+                qualified_name=f"{project}:src.m",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=20,
+                file_path=fp,
+                content_hash="m",
+            ),
+            ParsedEntity(
+                name="Bag",
+                qualified_name=f"{project}:src.m.Bag",
+                label=NodeLabel.TYPE_DEF,
+                kind="class",
+                line_start=2,
+                line_end=6,
+                file_path=fp,
+                content_hash="bag",
+            ),
+            ParsedEntity(
+                name="add",
+                qualified_name=f"{project}:src.m.Bag.add",
+                label=NodeLabel.CALLABLE,
+                kind="method",
+                line_start=3,
+                line_end=4,
+                file_path=fp,
+                content_hash="bagadd",
+            ),
+            ParsedEntity(
+                name="caller",
+                qualified_name=f"{project}:src.m.caller",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=10,
+                line_end=14,
+                file_path=fp,
+                content_hash="c",
+            ),
+        ],
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.m.Bag",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project}:src.m.Bag.add",
+            )
+        ],
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.m.caller",
+                rel_type=RelType.CALLS,
+                to_name="add",
+                properties={"receiver": "seen", "receiver_type": "set"},
+            )
+        ],
+    )
+
+    rows = await graph_client.execute(
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN b.uid AS t", {"a": f"{project}:src.m.caller"}
+    )
+    assert rows == [], rows  # no edge at all, not a damped guess
