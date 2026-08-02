@@ -3816,6 +3816,14 @@ class GraphClient:
             f"AND NOT ()-[:{refs}]->(n) "
             # Constructing a class produces an edge to its __init__, not to the class.
             f"AND NOT (n)-[:{RelType.DEFINES}]->()<-[:{RelType.CALLS}]-() "
+            # A function defined INSIDE another function is reached through its enclosing
+            # scope, not by name: a decorator registers it, a closure returns it, a
+            # callback receives it. Nothing calls it directly and nothing ever will, so a
+            # by-name test reports every one of them dead. Indexing nested functions added
+            # 39 such false positives here in one commit — 20 of them the @mcp.tool()
+            # handlers that ARE this server's public surface. Its liveness is the
+            # enclosing function's liveness, which this predicate already judges separately.
+            f"AND NOT (:{NodeLabel.CALLABLE})-[:{RelType.DEFINES}]->(n) "
             "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
             "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
             "ORDER BY n.file_path, n.line_start",

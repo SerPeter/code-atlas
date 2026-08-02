@@ -2912,7 +2912,16 @@ class SqliteGraphClient:
             "json_extract(props_json, '$.line_start') FROM nodes n "
             "WHERE project_name = ? AND labels IN ('Callable', 'TypeDef') "
             f"AND kind IN ({kind_placeholders}) AND substr(name, 1, 2) != '__'{clause} "
-            "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = n.uid AND e.rel_type = 'CALLS') "
+            # Parity with the Memgraph predicate, which this had drifted from: "unused"
+            # cannot mean "no CALLS edge" (a class is used by being annotated, subclassed
+            # or imported), and a function nested in another function is reached through
+            # its enclosing scope rather than by name.
+            "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = n.uid AND e.rel_type IN "
+            "('CALLS', 'USES_TYPE', 'IMPORTS', 'INHERITS', 'IMPLEMENTS', 'OVERRIDES')) "
+            "AND NOT EXISTS (SELECT 1 FROM edges d JOIN edges c ON c.to_uid = d.to_uid "
+            "WHERE d.from_uid = n.uid AND d.rel_type = 'DEFINES' AND c.rel_type = 'CALLS') "
+            "AND NOT EXISTS (SELECT 1 FROM edges d JOIN nodes p ON p.uid = d.from_uid "
+            "WHERE d.to_uid = n.uid AND d.rel_type = 'DEFINES' AND p.labels = 'Callable') "
             "ORDER BY file_path, json_extract(props_json, '$.line_start')",
             [project, *code_kinds, *extra],
         )
