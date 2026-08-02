@@ -60,4 +60,5 @@ enabled = [
     "class_overrides",
     "di_injection",
     "cli_commands",
+    "module_exports",
 ]

@@ -148,6 +148,8 @@ DEFAULT_SERVICE = Service(SqlRepository())
     "registry.py": '''
 """Two registries: decorator-driven and a plain dict of callables."""
 
+__all__ = ["dispatch", "register"]
+
 _HANDLERS: dict[str, object] = {}
 
 
@@ -383,6 +385,12 @@ CASES: tuple[Case, ...] = (
         "who calls helper(), which is only reached from inside a closure?",
         "MATCH (a)-[:CALLS]->(b) WHERE a.project_name=$p AND b.name='helper' RETURN a.qualified_name AS hit",
         "MISSING",
+    ),
+    Case(
+        "public-api-surface",
+        "what does this module export as its public API?",
+        "MATCH (m:Module)-[:EXPORTS]->(x) WHERE m.project_name=$p RETURN x.name AS hit",
+        "LINKED",
     ),
     Case(
         "module-level-singleton",

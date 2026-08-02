@@ -360,6 +360,10 @@ class DetectorSettings(BaseModel):
             "class_overrides",
             "di_injection",
             "cli_commands",
+            # Emits EXPORTS (Module -> the Callable/TypeDef named in __all__). Registered
+            # since it was written but never enabled, so the public-API surface every
+            # __all__ already declares was captured as a property and never as an edge.
+            "module_exports",
         ],
         description="Enabled pattern detectors.",
     )
