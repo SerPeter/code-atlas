@@ -124,7 +124,7 @@ def _infra_endpoints() -> Iterator[InfraEndpoints]:
     mg = (
         # MAGE-enabled image (matches docker-compose.yml) — required for
         # leiden_community_detection.get() (analyze_repo(analysis="communities")).
-        DockerContainer("memgraph/memgraph-mage:3.7.2")
+        DockerContainer("memgraph/memgraph-mage:3.12.0")
         .with_exposed_ports(7687)
         .with_command("--log-level=WARNING --memory-limit=2048 --storage-wal-enabled=false")
         .waiting_for(ExecWaitStrategy(["bash", "-c", "echo 'RETURN 1;' | mgconsole"]).with_startup_timeout(60))

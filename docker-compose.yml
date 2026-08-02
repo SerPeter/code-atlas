@@ -5,10 +5,16 @@ services:
   memgraph:
     # MAGE-enabled image (not the plain community image) — required for the
     # leiden_community_detection.get()/community_detection.get() procedures
-    # backing analyze_repo(analysis="communities")/find_communities. Breaking
-    # infra change for existing deployments: `docker compose pull && docker
-    # compose up -d` to pick up the new image.
-    image: memgraph/memgraph-mage:3.7.2
+    # backing analyze_repo(analysis="communities")/find_communities.
+    #
+    # Pinned to 3.12.0, not 3.7.2: 3.7.2 segfaults in its Storage GC thread when
+    # vector-indexed nodes are mass-deleted and re-inserted, which is exactly what
+    # a full re-index does. Reproduced on demand and fixed by 3.9.0 ("Fixed a
+    # segfault during vector index garbage collection when vertices or edges were
+    # being inserted concurrently"). See ADR-0024.
+    #
+    # Upgrading an existing deployment: `docker compose pull && docker compose up -d`.
+    image: memgraph/memgraph-mage:3.12.0
     restart: unless-stopped
     ports:
       - "7687:7687" # Bolt protocol
@@ -59,7 +65,7 @@ services:
     profiles: [test]
     # Same MAGE-enabled image as `memgraph` — integration tests exercising
     # community detection need the query module available here too.
-    image: memgraph/memgraph-mage:3.7.2
+    image: memgraph/memgraph-mage:3.12.0
     restart: unless-stopped
     ports:
       - "7688:7687" # Bolt protocol (test)

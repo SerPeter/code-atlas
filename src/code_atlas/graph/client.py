@@ -3194,8 +3194,12 @@ class GraphClient:
             safe_query = _sanitize_bm25_query(query)
 
             async def _ts_one(idx: str) -> list[dict[str, Any]]:
+                # Memgraph 3.11 changed the third parameter from a bare integer limit to a
+                # config MAP; passing the old form is a hard ClientError, not a warning.
+                # `text_search.search` is still broken (Tantivy "Unable to create search
+                # query"), so search_all remains the only working entry point.
                 cypher = (
-                    f"CALL text_search.search_all('{idx}', $query, {fetch_limit}) "
+                    f"CALL text_search.search_all('{idx}', $query, {{limit: {fetch_limit}}}) "
                     "YIELD node, score "
                     "RETURN node, score "
                     f"ORDER BY score DESC LIMIT {fetch_limit}"
@@ -3264,10 +3268,19 @@ class GraphClient:
             fetch_limit = limit * 3 if filtering else limit
 
             async def _vs_one(idx: str) -> list[dict[str, Any]]:
+                # Memgraph 3.12's vector index is not purged synchronously on delete, so a
+                # search can hand back nodes that are already gone. Touching one is fatal to
+                # the whole query — `node.uid` raises "Trying to get a property from a
+                # deleted object", and `node:Label` raises the same for labels — which after
+                # a full re-index would take out semantic search entirely rather than drop a
+                # row. Re-matching on id() is the guard: id() is the one thing still legal to
+                # read off a dead node, and the MATCH yields nothing when it no longer exists.
                 cypher = (
                     f"CALL vector_search.search('{idx}', {fetch_limit}, $vector) "
                     "YIELD node, similarity "
-                    "RETURN node, similarity "
+                    "WITH node, similarity "
+                    "MATCH (live) WHERE id(live) = id(node) "
+                    "RETURN live AS node, similarity "
                     f"ORDER BY similarity DESC LIMIT {fetch_limit}"
                 )
                 try:
@@ -4683,7 +4696,17 @@ class GraphClient:
             logger.debug("Could not read index catalogue to reconcile: {}", exc)
             return
 
-        present_vector = {str(r.get("label")) for r in rows if "vector" in str(r.get("index type", "")).lower()}
+        # Memgraph 3.12 reports vector-index labels as ":Callable"; 3.7 reported "Callable",
+        # and label+property/label_text rows still do. Without the strip this set never
+        # intersects the expected one, so every ensure_schema believes all six vector
+        # indices are missing. The re-CREATE is harmless — a duplicate CREATE VECTOR INDEX
+        # is a verified no-op that preserves the populated index — but it warns on every
+        # startup and permanently blinds the detector to an index that is genuinely gone,
+        # which is the exact failure this reconciliation was added to catch.
+        # removeprefix, not lstrip: lstrip(":") would also eat the ":" in a ":A|:B" filter.
+        present_vector = {
+            str(r.get("label")).removeprefix(":") for r in rows if "vector" in str(r.get("index type", "")).lower()
+        }
         present_text = {
             str(r["index type"]).split("name: ")[-1].rstrip(")")
             for r in rows

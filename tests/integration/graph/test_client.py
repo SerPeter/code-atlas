@@ -64,7 +64,8 @@ async def test_ensure_schema_recreates_a_vector_index_lost_at_the_current_versio
 
     async def vector_labels() -> set[str]:
         rows = await graph_client.execute("SHOW INDEX INFO")
-        return {str(r["label"]) for r in rows if "vector" in str(r.get("index type", "")).lower()}
+        # 3.12 reports vector-index labels as ":Callable", earlier versions as "Callable".
+        return {str(r["label"]).removeprefix(":") for r in rows if "vector" in str(r.get("index type", "")).lower()}
 
     await graph_client.ensure_schema()
     assert "Callable" in await vector_labels()
@@ -483,6 +484,10 @@ async def test_vector_search_scope_filter(graph_client: GraphClient):
     records = await graph_client.execute(
         "CALL vector_search.search('vec_callable', 10, $vector) "
         "YIELD node, similarity "
+        # 3.12's DROP VECTOR INDEX returns before its state is cleaned, so entries for
+        # nodes an earlier test deleted still come back — and reading any property off
+        # one aborts the query. Same id() guard GraphClient.vector_search applies.
+        "WITH node, similarity MATCH (live) WHERE id(live) = id(node) WITH live AS node, similarity "
         "RETURN node.uid AS uid, node.project_name AS project_name, similarity",
         {"vector": vector_a},
     )
@@ -518,6 +523,10 @@ async def test_vector_search_threshold(graph_client: GraphClient):
     records = await graph_client.execute(
         "CALL vector_search.search('vec_callable', 10, $vector) "
         "YIELD node, similarity "
+        # 3.12's DROP VECTOR INDEX returns before its state is cleaned, so entries for
+        # nodes an earlier test deleted still come back — and reading any property off
+        # one aborts the query. Same id() guard GraphClient.vector_search applies.
+        "WITH node, similarity MATCH (live) WHERE id(live) = id(node) WITH live AS node, similarity "
         "RETURN node.uid AS uid, similarity",
         {"vector": vector_a},
     )
@@ -657,7 +666,10 @@ async def test_upsert_preserves_embed_data(graph_client: GraphClient):
     )
     assert len(records) == 1
     assert records[0]["hash"] == embed_hash
-    assert records[0]["vec"] == embedding
+    # Memgraph 3.12 round-trips a vector-indexed property through float32, so 0.1 reads
+    # back as 0.10000000149011612. Cosine similarity is unaffected, and exact float64
+    # round-trip was never something this schema promised.
+    assert records[0]["vec"] == pytest.approx(embedding, rel=1e-6)
 
 
 async def test_upsert_drops_embed_for_removed_entity(graph_client: GraphClient):
