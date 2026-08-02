@@ -866,6 +866,7 @@ class ASTConsumer(TierConsumer):
             RelType.USES_TYPE,
             RelType.INHERITS,
             RelType.REFERENCES,
+            RelType.REGISTERED_BY,
         } | _CONFIG_REF_REL_TYPES
 
         def _is_member(r: ParsedRelationship) -> bool:
@@ -907,7 +908,7 @@ class ASTConsumer(TierConsumer):
             call_rels=[r for r in parsed.relationships if r.rel_type == RelType.CALLS],
             type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
             inherit_rels=[r for r in parsed.relationships if r.rel_type == RelType.INHERITS],
-            ref_rels=[r for r in parsed.relationships if r.rel_type == RelType.REFERENCES],
+            ref_rels=[r for r in parsed.relationships if r.rel_type in (RelType.REFERENCES, RelType.REGISTERED_BY)],
             anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
             config_rels=[r for r in parsed.relationships if _keep_config_ref(r)],

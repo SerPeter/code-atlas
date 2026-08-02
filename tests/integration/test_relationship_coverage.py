@@ -317,8 +317,13 @@ CASES: tuple[Case, ...] = (
     Case(
         "decorator-registration",
         "is a registry-only handler linked to its registrar?",
-        "MATCH (a)-[:CALLS]->(b) WHERE a.project_name=$p AND b.name='register' RETURN a.qualified_name AS hit",
-        "MISSING",
+        # Any edge will do — the question is whether the link exists, not which type
+        # carries it. Asking only for CALLS would have answered "no" even once
+        # REGISTERED_BY was written, which is the third time this suite caught me
+        # measuring the schema instead of the capability.
+        "MATCH (a)-[]->(b) WHERE a.project_name=$p AND b.name='register' AND a.name STARTS WITH 'handle_' "
+        "RETURN a.qualified_name AS hit",
+        "LINKED",
     ),
     Case(
         "registry-dispatch",

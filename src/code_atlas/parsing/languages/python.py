@@ -303,6 +303,48 @@ def _is_stub_body(node: Node, tags: list[str]) -> bool:
     )
 
 
+def _emit_registrations(node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
+    """Link a decorated definition to the decorator that registers it.
+
+    `@register("greet")` is how a handler joins a registry, and the graph held only the
+    decorator's source text as a tag — a string, not an edge, so "what does register
+    register?" had no answer and the handler looked unreachable.
+
+    Every decorator is emitted and resolution does the filtering: it links only to a
+    Callable in this project, so `@property`, `@staticmethod` and `@dataclass` drop out on
+    their own without a hand-maintained blocklist that would need a new entry per library.
+    """
+    parent = node.parent
+    if parent is None or parent.type != "decorated_definition":
+        return
+    for child in parent.children:
+        if child.type != "decorator":
+            continue
+        expr = next((c for c in child.children if c.type in ("identifier", "attribute", "call")), None)
+        if expr is None:
+            continue
+        if expr.type == "call":
+            expr = expr.child_by_field_name("function")
+            if expr is None:
+                continue
+        if expr.type == "attribute":
+            # `@mcp.tool()` — the registry is an object, so the attribute name is the best
+            # available handle. It resolves only if the project also defines a callable of
+            # that name; otherwise it drops, which is the honest outcome.
+            expr = expr.child_by_field_name("attribute")
+            if expr is None:
+                continue
+        if expr.type != "identifier":
+            continue
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=from_qn,
+                rel_type=RelType.REGISTERED_BY,
+                to_name=node_text(expr),
+            )
+        )
+
+
 def _get_decorators(node: Node) -> list[str]:
     """Extract decorator names from a decorated_definition parent.
 
@@ -713,6 +755,8 @@ def _process_function(
             to_name=f"{project_name}:{qn}",
         )
     )
+
+    _emit_registrations(node, f"{project_name}:{qn}", relationships)
 
     # Extract USES_TYPE from parameter/return type annotations
     _extract_type_refs(node, f"{project_name}:{qn}", relationships)
