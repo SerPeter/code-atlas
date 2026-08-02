@@ -813,14 +813,13 @@ class SqliteGraphClient:
 
     # -- Relationships ------------------------------------------------------------
 
-    async def _create_relationships(  # noqa: PLR0912
+    async def _create_relationships(
         self, conn: aiosqlite.Connection, project_name: str, relationships: list[ParsedRelationship]
     ) -> None:
         if not relationships:
             return
 
         direct_rels: list[ParsedRelationship] = []
-        inherits_rels: list[ParsedRelationship] = []
         implements_rels: list[ParsedRelationship] = []
         doc_rels: list[ParsedRelationship] = []
 
@@ -834,8 +833,6 @@ class SqliteGraphClient:
                 continue
             if r.rel_type.value == "IMPLEMENTS" and ":" not in r.to_name:
                 implements_rels.append(r)
-            elif r.rel_type.value == "INHERITS":
-                inherits_rels.append(r)
             elif r.rel_type.value == "DOCUMENTS":
                 doc_rels.append(r)
             else:
@@ -853,7 +850,7 @@ class SqliteGraphClient:
                 rows,
             )
 
-        for name_rel_type, name_rels in (("INHERITS", inherits_rels), ("IMPLEMENTS", implements_rels)):
+        for name_rel_type, name_rels in (("IMPLEMENTS", implements_rels),):
             for r in name_rels:
                 cur = await conn.execute(
                     "SELECT uid FROM nodes WHERE labels = 'TypeDef' AND project_name = ? AND name = ?",
@@ -1677,6 +1674,31 @@ class SqliteGraphClient:
             project_name,
             total_unresolved,
         )
+
+    async def resolve_inherits(self, project_name: str, inherit_rels: list[ParsedRelationship]) -> None:
+        """In-project TypeDef wins; otherwise an imported ExternalSymbol of that name."""
+        if not inherit_rels:
+            return
+        conn = await self._get_conn()
+        for r in inherit_rels:
+            target = None
+            for label in ("TypeDef", "ExternalSymbol"):
+                cur = await conn.execute(
+                    "SELECT uid FROM nodes WHERE labels = ? AND project_name = ? AND name = ?",
+                    (label, project_name, r.to_name),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if row:
+                    target = row[0]
+                    break
+            if target:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) "
+                    "VALUES (?, ?, 'INHERITS', '{}')",
+                    (r.from_qualified_name, target),
+                )
+        await conn.commit()
 
     async def resolve_type_refs(  # noqa: PLR0912
         self,

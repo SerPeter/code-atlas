@@ -99,7 +99,6 @@ _UID_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
 # (link_type='citation', driven by the entity's `citations` property).
 _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
     {
-        RelType.INHERITS,
         RelType.IMPLEMENTS,
         RelType.DOCUMENTS,
     }
@@ -117,6 +116,12 @@ _POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
         RelType.USES_TYPE,
         RelType.READS_ENV,
         RelType.REFERENCES_FILE,
+        # INHERITS is here, not name-routed, because a base is very often external
+        # (StrEnum, ABC, Protocol, BaseSettings) and the ExternalSymbol it must point at
+        # is MERGEd by resolve_imports — which runs in the deferred flush, after
+        # _create_relationships. Written at create time the MATCH simply found nothing,
+        # so 43 of 45 classes with a base carried no inheritance edge at all.
+        RelType.INHERITS,
     }
 )
 
@@ -2359,6 +2364,44 @@ class GraphClient:
             total_unresolved,
         )
 
+    async def resolve_inherits(self, project_name: str, inherit_rels: list[ParsedRelationship]) -> None:
+        """Link a class to its base, whether that base is in this project or imported.
+
+        Runs post-batch rather than at create time because most bases are external. The
+        parser has always emitted ``INHERITS -> StrEnum`` / ``-> ABC`` / ``-> Protocol``;
+        the write path required the target to be an in-project ``TypeDef``, so the MATCH
+        returned nothing and the edge was discarded without an error. Measured before this
+        ran: 43 of 45 classes with a base had no inheritance edge.
+
+        An in-project ``TypeDef`` wins over an ``ExternalSymbol`` of the same name — a
+        local class shadowing an imported one is the class the code actually subclasses.
+        A base that is neither (a builtin like ``Exception``, which is never imported and
+        so has no node) stays unresolved rather than inventing a target.
+        """
+        if not inherit_rels:
+            return
+
+        params = [
+            {"from_uid": r.from_qualified_name, "to_name": r.to_name, "project": project_name} for r in inherit_rels
+        ]
+        # Two passes rather than one OR-matched query: an OR over two labels makes
+        # Memgraph scan both and would fan out to BOTH when a name exists in each.
+        await self.execute_write(
+            f"UNWIND $rels AS r "
+            f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}), "
+            f"(b:{NodeLabel.TYPE_DEF} {{project_name: r.project, name: r.to_name}}) "
+            f"MERGE (a)-[:{RelType.INHERITS}]->(b)",
+            {"rels": params},
+        )
+        await self.execute_write(
+            f"UNWIND $rels AS r "
+            f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}) "
+            f"WHERE NOT (a)-[:{RelType.INHERITS}]->(:{NodeLabel.TYPE_DEF} {{name: r.to_name}}) "
+            f"MATCH (b:{NodeLabel.EXTERNAL_SYMBOL} {{project_name: r.project, name: r.to_name}}) "
+            f"MERGE (a)-[:{RelType.INHERITS}]->(b)",
+            {"rels": params},
+        )
+
     async def resolve_type_refs(  # noqa: PLR0912
         self,
         project_name: str,
@@ -4493,12 +4536,11 @@ class GraphClient:
                 {"rels": rel_params},
             )
 
-        # Name-matched rels
-        inherits_rels = [r for r in other_rels if r.rel_type == RelType.INHERITS]
+        # Name-matched rels. INHERITS is deliberately absent — see _POST_BATCH_REL_TYPES.
         implements_rels = [r for r in other_rels if r.rel_type == RelType.IMPLEMENTS]
         doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
 
-        for name_rel_type, name_rels in ((RelType.INHERITS, inherits_rels), (RelType.IMPLEMENTS, implements_rels)):
+        for name_rel_type, name_rels in ((RelType.IMPLEMENTS, implements_rels),):
             if not name_rels:
                 continue
             params = [

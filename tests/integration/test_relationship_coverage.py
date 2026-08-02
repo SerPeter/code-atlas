@@ -337,13 +337,17 @@ CASES: tuple[Case, ...] = (
         "external-base-class",
         "what subclasses StrEnum?",
         "MATCH (a)-[:INHERITS|IMPLEMENTS]->(b) WHERE a.project_name=$p AND b.name='StrEnum' RETURN a.name AS hit",
-        "MISSING",
+        "LINKED",
     ),
     Case(
         "exception-hierarchy",
         "show me every exception type",
         "MATCH (a)-[:INHERITS|IMPLEMENTS]->(b) WHERE a.project_name=$p AND b.name='Exception' RETURN a.name AS hit",
         "MISSING",
+        "`Exception` is a builtin: never imported, so no ExternalSymbol node exists for "
+        "resolve_inherits to point at — unlike StrEnum/ABC/Protocol/BaseSettings, which "
+        "arrive via an import and now resolve. Fixing this means deciding whether builtin "
+        "bases deserve nodes at all, which is a separate call (see ADR-0020).",
     ),
     Case(
         "protocol-conformance",

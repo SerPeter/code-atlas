@@ -206,6 +206,8 @@ if TYPE_CHECKING:
 
         async def set_embedding_config(self, model: str, dimension: int) -> None: ...
 
+        async def resolve_inherits(self, project_name: str, inherit_rels: list[ParsedRelationship]) -> None: ...
+
         async def read_entity_texts(
             self,
             uids: list[str],

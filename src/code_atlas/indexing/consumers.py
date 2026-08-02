@@ -572,6 +572,7 @@ class _ParsedFileData:
     import_rels: list[ParsedRelationship]
     call_rels: list[ParsedRelationship]
     type_rels: list[ParsedRelationship]
+    inherit_rels: list[ParsedRelationship]
     member_rels: list[ParsedRelationship]
     anchor_rels: list[ParsedRelationship]
     # READS_ENV / REFERENCES_FILE. Deferred like imports because the target
@@ -592,6 +593,7 @@ _SENTINEL_DELETED = _ParsedFileData(
     import_rels=[],
     call_rels=[],
     type_rels=[],
+    inherit_rels=[],
     member_rels=[],
     anchor_rels=[],
     config_rels=[],
@@ -647,6 +649,7 @@ class ASTConsumer(TierConsumer):
         self._pending_import_rels: list[ParsedRelationship] = []
         self._pending_call_rels: list[ParsedRelationship] = []
         self._pending_type_rels: list[ParsedRelationship] = []
+        self._pending_inherit_rels: list[ParsedRelationship] = []
         self._pending_member_rels: list[ParsedRelationship] = []
         self._pending_anchor_rels: list[ParsedRelationship] = []
         self._pending_config_rels: list[ParsedRelationship] = []
@@ -726,6 +729,14 @@ class ASTConsumer(TierConsumer):
             if proj_config:
                 await self.graph.resolve_config_refs(project_name, proj_config)
 
+            # Strictly after resolve_imports: a base is usually external, and the
+            # ExternalSymbol it points at does not exist until imports are resolved.
+            proj_inherits = [
+                r for r in self._pending_inherit_rels if r.from_qualified_name.startswith(project_name + ":")
+            ]
+            if proj_inherits:
+                await self.graph.resolve_inherits(project_name, proj_inherits)
+
             if proj_calls or proj_types or proj_members:
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
                 if proj_calls:
@@ -786,6 +797,7 @@ class ASTConsumer(TierConsumer):
         self._pending_import_rels.clear()
         self._pending_call_rels.clear()
         self._pending_type_rels.clear()
+        self._pending_inherit_rels.clear()
         self._pending_member_rels.clear()
         self._pending_anchor_rels.clear()
         self._pending_config_rels.clear()
@@ -840,7 +852,7 @@ class ASTConsumer(TierConsumer):
             logger.debug("AST: unsupported language for {}", file_path)
             return None
 
-        _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE} | _CONFIG_REF_REL_TYPES
+        _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE, RelType.INHERITS} | _CONFIG_REF_REL_TYPES
 
         def _is_member(r: ParsedRelationship) -> bool:
             # Member DEFINES whose parent type may live in another file —
@@ -880,6 +892,7 @@ class ASTConsumer(TierConsumer):
             import_rels=[r for r in parsed.relationships if r.rel_type == RelType.IMPORTS],
             call_rels=[r for r in parsed.relationships if r.rel_type == RelType.CALLS],
             type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
+            inherit_rels=[r for r in parsed.relationships if r.rel_type == RelType.INHERITS],
             anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
             config_rels=[r for r in parsed.relationships if _keep_config_ref(r)],
@@ -1149,6 +1162,7 @@ class ASTConsumer(TierConsumer):
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]
                 group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
                 group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
+                group_inherit_rels = [r for pfd in parsed_files.values() for r in pfd.inherit_rels]
                 group_member_rels = [r for pfd in parsed_files.values() for r in pfd.member_rels]
                 group_anchor_rels = [r for pfd in parsed_files.values() for r in pfd.anchor_rels]
                 group_config_rels = [r for pfd in parsed_files.values() for r in pfd.config_rels]
@@ -1156,6 +1170,7 @@ class ASTConsumer(TierConsumer):
                 self._pending_import_rels.extend(group_import_rels)
                 self._pending_call_rels.extend(group_call_rels)
                 self._pending_type_rels.extend(group_type_rels)
+                self._pending_inherit_rels.extend(group_inherit_rels)
                 self._pending_member_rels.extend(group_member_rels)
                 self._pending_anchor_rels.extend(group_anchor_rels)
                 self._pending_config_rels.extend(group_config_rels)

@@ -561,6 +561,9 @@ class TestGetPatternsData:
             ),
         ]
         await client.upsert_file_entities("proj", "mod.py", [base, child, color, red], rels)
+        # INHERITS resolves post-batch now (the base is usually external and its
+        # ExternalSymbol does not exist until imports resolve), same as IMPORTS above.
+        await client.resolve_inherits("proj", [r for r in rels if r.rel_type == RelType.INHERITS])
 
         data = await client.get_patterns_data("proj", "", 20)
 
@@ -800,6 +803,9 @@ class TestGetDiagramInheritance:
         child = _entity("Child", "mod.Child", label=NodeLabel.TYPE_DEF, kind="class")
         rel = ParsedRelationship(from_qualified_name="proj:mod.Child", rel_type=RelType.INHERITS, to_name="Base")
         await client.upsert_file_entities("proj", "mod.py", [base, child], [rel])
+        # INHERITS resolves post-batch now (the base is usually external and its
+        # ExternalSymbol does not exist until imports resolve), same as IMPORTS above.
+        await client.resolve_inherits("proj", [rel])
 
         records = await client.get_diagram_inheritance("proj", "", 30)
 
@@ -838,6 +844,9 @@ class TestGetDiagramModuleDetail:
             ParsedRelationship(from_qualified_name="proj:pkg.mod.Widget", rel_type=RelType.INHERITS, to_name="Base"),
         ]
         await client.upsert_file_entities("proj", "pkg/mod.py", [module, base, widget, method], rels)
+        # INHERITS resolves post-batch now (the base is usually external and its
+        # ExternalSymbol does not exist until imports resolve), same as IMPORTS above.
+        await client.resolve_inherits("proj", [r for r in rels if r.rel_type == RelType.INHERITS])
 
         detail = await client.get_diagram_module_detail("proj", "pkg/mod", 30)
 
