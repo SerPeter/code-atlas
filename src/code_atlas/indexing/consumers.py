@@ -573,6 +573,7 @@ class _ParsedFileData:
     call_rels: list[ParsedRelationship]
     type_rels: list[ParsedRelationship]
     inherit_rels: list[ParsedRelationship]
+    ref_rels: list[ParsedRelationship]
     member_rels: list[ParsedRelationship]
     anchor_rels: list[ParsedRelationship]
     # READS_ENV / REFERENCES_FILE. Deferred like imports because the target
@@ -594,6 +595,7 @@ _SENTINEL_DELETED = _ParsedFileData(
     call_rels=[],
     type_rels=[],
     inherit_rels=[],
+    ref_rels=[],
     member_rels=[],
     anchor_rels=[],
     config_rels=[],
@@ -650,6 +652,7 @@ class ASTConsumer(TierConsumer):
         self._pending_call_rels: list[ParsedRelationship] = []
         self._pending_type_rels: list[ParsedRelationship] = []
         self._pending_inherit_rels: list[ParsedRelationship] = []
+        self._pending_ref_rels: list[ParsedRelationship] = []
         self._pending_member_rels: list[ParsedRelationship] = []
         self._pending_anchor_rels: list[ParsedRelationship] = []
         self._pending_config_rels: list[ParsedRelationship] = []
@@ -691,7 +694,7 @@ class ASTConsumer(TierConsumer):
             # buffer is already empty — see _flush_deferred_resolution).
             await self._flush_deferred_resolution(final=True)
 
-    async def _flush_deferred_resolution(self, *, final: bool = False) -> None:  # noqa: PLR0912
+    async def _flush_deferred_resolution(self, *, final: bool = False) -> None:  # noqa: PLR0912, PLR0915
         """Run resolution for all accumulated rels across batches.
 
         Citations are re-attempted whenever this flush's batches touched a
@@ -736,6 +739,10 @@ class ASTConsumer(TierConsumer):
             ]
             if proj_inherits:
                 await self.graph.resolve_inherits(project_name, proj_inherits)
+
+            proj_refs = [r for r in self._pending_ref_rels if r.from_qualified_name.startswith(project_name + ":")]
+            if proj_refs:
+                await self.graph.resolve_value_references(project_name, proj_refs)
 
             if proj_calls or proj_types or proj_members:
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
@@ -798,6 +805,7 @@ class ASTConsumer(TierConsumer):
         self._pending_call_rels.clear()
         self._pending_type_rels.clear()
         self._pending_inherit_rels.clear()
+        self._pending_ref_rels.clear()
         self._pending_member_rels.clear()
         self._pending_anchor_rels.clear()
         self._pending_config_rels.clear()
@@ -852,7 +860,13 @@ class ASTConsumer(TierConsumer):
             logger.debug("AST: unsupported language for {}", file_path)
             return None
 
-        _deferred = {RelType.IMPORTS, RelType.CALLS, RelType.USES_TYPE, RelType.INHERITS} | _CONFIG_REF_REL_TYPES
+        _deferred = {
+            RelType.IMPORTS,
+            RelType.CALLS,
+            RelType.USES_TYPE,
+            RelType.INHERITS,
+            RelType.REFERENCES,
+        } | _CONFIG_REF_REL_TYPES
 
         def _is_member(r: ParsedRelationship) -> bool:
             # Member DEFINES whose parent type may live in another file —
@@ -893,6 +907,7 @@ class ASTConsumer(TierConsumer):
             call_rels=[r for r in parsed.relationships if r.rel_type == RelType.CALLS],
             type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
             inherit_rels=[r for r in parsed.relationships if r.rel_type == RelType.INHERITS],
+            ref_rels=[r for r in parsed.relationships if r.rel_type == RelType.REFERENCES],
             anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
             config_rels=[r for r in parsed.relationships if _keep_config_ref(r)],
@@ -1163,6 +1178,7 @@ class ASTConsumer(TierConsumer):
                 group_call_rels = [r for pfd in parsed_files.values() for r in pfd.call_rels]
                 group_type_rels = [r for pfd in parsed_files.values() for r in pfd.type_rels]
                 group_inherit_rels = [r for pfd in parsed_files.values() for r in pfd.inherit_rels]
+                group_ref_rels = [r for pfd in parsed_files.values() for r in pfd.ref_rels]
                 group_member_rels = [r for pfd in parsed_files.values() for r in pfd.member_rels]
                 group_anchor_rels = [r for pfd in parsed_files.values() for r in pfd.anchor_rels]
                 group_config_rels = [r for pfd in parsed_files.values() for r in pfd.config_rels]
@@ -1171,6 +1187,7 @@ class ASTConsumer(TierConsumer):
                 self._pending_call_rels.extend(group_call_rels)
                 self._pending_type_rels.extend(group_type_rels)
                 self._pending_inherit_rels.extend(group_inherit_rels)
+                self._pending_ref_rels.extend(group_ref_rels)
                 self._pending_member_rels.extend(group_member_rels)
                 self._pending_anchor_rels.extend(group_anchor_rels)
                 self._pending_config_rels.extend(group_config_rels)

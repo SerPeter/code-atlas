@@ -331,9 +331,12 @@ CASES: tuple[Case, ...] = (
     Case(
         "callback-by-reference",
         "who uses on_complete?",
+        # "Uses" includes naming it as a value. Restricting to CALLS would measure the
+        # schema instead of the capability — and would answer "no" for a callback, which
+        # is by definition handed over rather than invoked.
         "MATCH (a)-[r]->(b) WHERE a.project_name=$p AND b.name='on_complete' "
-        "AND type(r) IN ['CALLS','USES_TYPE'] RETURN a.qualified_name AS hit",
-        "MISSING",
+        "AND type(r) IN ['CALLS','USES_TYPE','REFERENCES'] RETURN a.qualified_name AS hit",
+        "LINKED",
     ),
     Case(
         "external-base-class",

@@ -383,11 +383,25 @@ def _parse_python(
         root, path, source, project_name, module_qn, package_qn, entities, relationships, seen, enum_classes
     )
 
+    # Callables handed to a module-level registration call. This is where the registry
+    # pattern actually lives — `register_language(parse_func=_parse_python)` and
+    # `register_detector(...)` sit at module scope, below every def they name — and module
+    # scope is not a function body, so _extract_calls never sees it. Without this, every
+    # language's own entry point has no inbound edge: 15 of the 30 dead-code hits in
+    # parsing/languages were exactly that.
+    _extract_module_level_references(root, f"{project_name}:{module_qn}", relationships)
+
     # Runtime config surface. Runs after the main walk because it needs both the
     # finished entity list (to attribute each reference to its enclosing entity)
     # and the IMPORTS relationships (to know whether a bare `getenv`/`environ`
     # actually came from `os`).
     _extract_config_refs(root, source, entities, relationships)
+
+    # Most identifier arguments are ordinary values — `path`, `node`, `entities`. Emitting
+    # a reference for every one produced 379 from this file alone, so they are filtered
+    # here rather than at the call site: only now is the entity list complete enough to
+    # say which names are actually callables. Same reason _extract_config_refs runs late.
+    _filter_value_references(entities, relationships)
 
     # Post-processing: tag conditional (duplicate) definitions
     _tag_conditional_definitions(entities)
@@ -994,6 +1008,74 @@ def _local_declared_types(func_node: Node, body: Node) -> dict[str, str]:
     return types
 
 
+def _filter_value_references(entities: list[ParsedEntity], relationships: list[ParsedRelationship]) -> None:
+    """Drop REFERENCES whose name is not a callable this file can actually see.
+
+    Keeps a name defined here as a Callable, or imported by this module. A project-wide
+    match is deliberately not attempted: `foo(bar)` where `bar` is a local that happens to
+    share a name with some distant function is precisely the false edge ADR-0022 removed
+    from call resolution, and a wrong REFERENCES is worse than none now that
+    find_dead_code reads it as proof of life.
+    """
+    # Functions only, never methods. A method is unreachable by bare identifier — it needs
+    # a receiver — so matching one means a local variable merely shares its name. Measured:
+    # the `@property def name` on every detector class made every `foo(name)` in the file
+    # look like a reference to it.
+    local_callables = {e.name for e in entities if e.label == NodeLabel.CALLABLE and e.kind == CallableKind.FUNCTION}
+    imported = {r.to_name.rsplit(".", 1)[-1] for r in relationships if r.rel_type == RelType.IMPORTS}
+    known = local_callables | imported
+    relationships[:] = [r for r in relationships if r.rel_type != RelType.REFERENCES or r.to_name in known]
+
+
+def _extract_module_level_references(node: Node, module_uid: str, relationships: list[ParsedRelationship]) -> None:
+    """Scan everything OUTSIDE a function body for callables passed as values.
+
+    Attributed to the module, which is the scope that actually runs the call. Function
+    bodies are skipped because _extract_calls already covers them and would double up;
+    class bodies are included, since `field(default_factory=_ready_event)` executes at
+    class-creation time and the name it hands over is a real reference.
+    """
+    for child in node.children:
+        if child.type == "call":
+            _extract_value_references(child, module_uid, relationships)
+        if child.type not in ("function_definition", "decorated_definition"):
+            _extract_module_level_references(child, module_uid, relationships)
+
+
+def _extract_value_references(call_node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
+    """Record a callable named as a VALUE in a call's arguments, not invoked.
+
+    `run_with(on_complete)`, `field(default_factory=_ready_event)`, `register_language(
+    parse_func=_parse_python)` — the callee is handed over, never called here. The parser
+    emitted nothing for any of them, so the graph reported the handler dead: 15 of the 30
+    dead-code hits in parsing/languages were every language's own entry point, reachable
+    only through `parse_func=`.
+
+    A bare identifier only. `mod.handler` is skipped: the attribute's name is not
+    necessarily the callable's own, which is the same trap ADR-0022 recorded for calls.
+    """
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return
+    for arg in args.children:
+        target = None
+        if arg.type == "identifier":
+            target = arg
+        elif arg.type == "keyword_argument":
+            value = arg.child_by_field_name("value")
+            if value is not None and value.type == "identifier":
+                target = value
+        if target is None:
+            continue
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=from_qn,
+                rel_type=RelType.REFERENCES,
+                to_name=node_text(target),
+            )
+        )
+
+
 def _extract_calls(
     node: Node,
     source: bytes,
@@ -1004,6 +1086,7 @@ def _extract_calls(
     """Recursively extract call expressions from a function body."""
     for child in node.children:
         if child.type == "call":
+            _extract_value_references(child, from_qn, relationships)
             func = child.child_by_field_name("function")
             if func is not None:
                 if func.type == "identifier":

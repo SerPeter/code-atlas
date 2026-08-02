@@ -116,6 +116,7 @@ _POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
         RelType.USES_TYPE,
         RelType.READS_ENV,
         RelType.REFERENCES_FILE,
+        RelType.REFERENCES,
         # INHERITS is here, not name-routed, because a base is very often external
         # (StrEnum, ABC, Protocol, BaseSettings) and the ExternalSymbol it must point at
         # is MERGEd by resolve_imports — which runs in the deferred flush, after
@@ -2402,6 +2403,41 @@ class GraphClient:
             {"rels": params},
         )
 
+    async def resolve_value_references(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
+        """Link a callable named as a value to the callable it names.
+
+        Import-scope and same-file only, deliberately. A project-wide bare-name match is
+        exactly what ADR-0022 removed from call resolution: `foo(bar)` where `bar` is a
+        local variable that happens to share a name with some function elsewhere would
+        manufacture an edge, and a wrong REFERENCES edge is worse than none because
+        find_dead_code now treats it as proof of life.
+
+        Only Callables are linked. Most identifier arguments are ordinary values and
+        resolve to nothing, which is the correct outcome rather than a miss.
+        """
+        if not ref_rels:
+            return
+
+        params = [{"from_uid": r.from_qualified_name, "to_name": r.to_name, "project": project_name} for r in ref_rels]
+        # Same file as the referrer, or a module this one imports — both are scopes the
+        # name provably resolves in.
+        await self.execute_write(
+            f"UNWIND $rels AS r "
+            f"MATCH (a {{uid: r.from_uid}}), (b:{NodeLabel.CALLABLE} {{project_name: r.project, name: r.to_name}}) "
+            f"WHERE b.file_path = a.file_path AND b.uid <> a.uid "
+            f"MERGE (a)-[:{RelType.REFERENCES}]->(b)",
+            {"rels": params},
+        )
+        await self.execute_write(
+            f"UNWIND $rels AS r "
+            f"MATCH (a {{uid: r.from_uid}}), (b:{NodeLabel.CALLABLE} {{project_name: r.project, name: r.to_name}}) "
+            f"WHERE b.uid <> a.uid AND NOT (a)-[:{RelType.REFERENCES}]->(b) "
+            f"AND EXISTS {{ MATCH (m:{NodeLabel.MODULE} {{file_path: a.file_path, project_name: r.project}})"
+            f"-[:{RelType.IMPORTS}]->(b) }} "
+            f"MERGE (a)-[:{RelType.REFERENCES}]->(b)",
+            {"rels": params},
+        )
+
     async def resolve_type_refs(  # noqa: PLR0912
         self,
         project_name: str,
@@ -3808,6 +3844,9 @@ class GraphClient:
         refs = (
             f"{RelType.CALLS}|{RelType.USES_TYPE}|{RelType.IMPORTS}"
             f"|{RelType.INHERITS}|{RelType.IMPLEMENTS}|{RelType.OVERRIDES}"
+            # Handed to a registry or a callback slot counts as used, even though the
+            # call that eventually runs it is a framework's, not this codebase's.
+            f"|{RelType.REFERENCES}"
         )
         return await self.execute(
             "MATCH (n {project_name: $project}) "

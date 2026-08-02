@@ -69,6 +69,11 @@ class RelType(StrEnum):
     IMPLEMENTS = "IMPLEMENTS"
     # Call / data flow
     CALLS = "CALLS"
+    # Names a callable as a VALUE without invoking it: passed as an argument, held in a
+    # dispatch table, handed to a decorator. Deliberately not CALLS — blast_radius,
+    # find_dead_code, the outline and Leiden all read CALLS as "executes", and a callback
+    # that is registered today and invoked by a framework tomorrow did not execute here.
+    REFERENCES = "REFERENCES"
     IMPORTS = "IMPORTS"
     USES_TYPE = "USES_TYPE"
     OVERRIDES = "OVERRIDES"

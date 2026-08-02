@@ -35,6 +35,11 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.INHERITS: "Subclass -> base class",
     RelType.IMPLEMENTS: "Class -> interface/protocol it implements",
     RelType.CALLS: "Caller -> callee function/method invocation",
+    RelType.REFERENCES: (
+        "Referrer -> callable named as a VALUE, not invoked (passed as an argument, held in a "
+        "dispatch table, handed to a decorator). Use it to find who registers a handler; do NOT "
+        "read it as execution the way CALLS is read."
+    ),
     RelType.IMPORTS: "Module/entity -> imported dependency (has optional type_only=true for TYPE_CHECKING/import type)",
     RelType.USES_TYPE: "Callable -> type referenced in parameter/return annotations (auto-extracted from signatures)",
     RelType.OVERRIDES: "Method -> parent method it overrides",

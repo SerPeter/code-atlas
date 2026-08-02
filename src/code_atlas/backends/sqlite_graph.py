@@ -1675,6 +1675,28 @@ class SqliteGraphClient:
             total_unresolved,
         )
 
+    async def resolve_value_references(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
+        """Same-file only — the import-scope pass is a Memgraph EXISTS subquery."""
+        if not ref_rels:
+            return
+        conn = await self._get_conn()
+        for r in ref_rels:
+            cur = await conn.execute(
+                "SELECT b.uid FROM nodes b JOIN nodes a ON a.uid = ? "
+                "WHERE b.labels = 'Callable' AND b.project_name = ? AND b.name = ? "
+                "AND b.file_path = a.file_path AND b.uid <> a.uid LIMIT 1",
+                (r.from_qualified_name, project_name, r.to_name),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if row:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) "
+                    "VALUES (?, ?, 'REFERENCES', '{}')",
+                    (r.from_qualified_name, row[0]),
+                )
+        await conn.commit()
+
     async def resolve_inherits(self, project_name: str, inherit_rels: list[ParsedRelationship]) -> None:
         """In-project TypeDef wins; otherwise an imported ExternalSymbol of that name."""
         if not inherit_rels:
