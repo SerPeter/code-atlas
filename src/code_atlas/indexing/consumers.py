@@ -102,6 +102,13 @@ _LEASE_POLL_S = 1.0
 # healthy consumer polled beside them and never looked.
 _RECLAIM_SWEEP_S = 30.0
 
+# How long a consumer registration must go untouched before it is treated as belonging to
+# a process that is gone. This is not a poll interval: the longest legitimate silence for a
+# LIVE consumer is a long CLI index that it is standing down for (see _defer_to_foreign_lease),
+# so the threshold is in hours. Pruning early would deregister a consumer that is merely
+# waiting its turn.
+_STALE_CONSUMER_IDLE_MS = 3_600_000
+
 
 def _process_tag() -> str:
     """Short identity for this process, unique across hosts and PIDs.
@@ -141,6 +148,7 @@ class TierConsumer(ABC):
         project_filter: set[str] | None = None,
         defer_to_lease: bool = False,
         abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
+        stale_consumer_idle_ms: int = _STALE_CONSUMER_IDLE_MS,
     ) -> None:
         self.bus = bus
         self.input_topic = input_topic
@@ -160,6 +168,7 @@ class TierConsumer(ABC):
         # threshold, and an untestable recovery path is how the old shared consumer name
         # survived this long.
         self._abandoned_min_idle_ms = abandoned_min_idle_ms
+        self._stale_consumer_idle_ms = stale_consumer_idle_ms
 
     @abstractmethod
     async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:
@@ -278,6 +287,66 @@ class TierConsumer(ABC):
             await asyncio.sleep(_LEASE_POLL_S)
         self._lease_waiting = False
 
+    async def _prune_consumer_registrations(self) -> None:
+        """Deregister consumers left behind by processes that are no longer running.
+
+        Redis registers a consumer on first read and never unregisters it, so now that
+        names carry a process identity the group grows by one entry per index run —
+        measured at 10 after a single session on this repo, unbounded over a project's life.
+
+        Only entries holding nothing are removed. ``XGROUP DELCONSUMER`` destroys a PEL
+        rather than reassigning it, so pruning a consumer that still owns work would delete
+        exactly the messages the reclaim sweep exists to rescue. That ordering is the whole
+        design: the sweep adopts first, which is what empties a dead PEL and makes its
+        registration prunable on a later pass.
+        """
+        try:
+            registrations = await self.bus.consumer_registrations(self.input_topic, self.group)
+        except Exception:
+            logger.opt(exception=True).debug("{} could not list consumer registrations", self.consumer_name)
+            return
+
+        for name, pending, idle_ms in registrations:
+            if name == self.consumer_name or pending or idle_ms < self._stale_consumer_idle_ms:
+                continue
+            destroyed = await self.bus.drop_consumer(self.input_topic, self.group, name)
+            if destroyed:
+                # Raced: work landed between the listing and the delete, and is now gone.
+                logger.error(
+                    "{} destroyed {} pending message(s) deregistering {} — it took work after {}s of silence",
+                    self.consumer_name,
+                    destroyed,
+                    name,
+                    idle_ms // 1000,
+                )
+            else:
+                logger.info("{} deregistered stale consumer {} (idle {}s)", self.consumer_name, name, idle_ms // 1000)
+
+    async def _deregister_self(self) -> None:
+        """Give up this process's registration on a clean exit.
+
+        The idle-based prune above is the backstop for crashes; this is the common case,
+        and doing it here means a well-behaved process leaves nothing for an hour-long
+        timer to notice. Skipped when work is still unacked — that PEL is a crash-recovery
+        net for the reclaim sweep to adopt, and deleting it would discard the messages.
+        """
+        try:
+            for name, pending, _idle_ms in await self.bus.consumer_registrations(self.input_topic, self.group):
+                if name != self.consumer_name:
+                    continue
+                if pending:
+                    logger.warning(
+                        "{} exiting with {} unacked message(s); leaving its registration for another "
+                        "consumer to adopt from",
+                        self.consumer_name,
+                        pending,
+                    )
+                    return
+                await self.bus.drop_consumer(self.input_topic, self.group, self.consumer_name)
+                return
+        except Exception:
+            logger.opt(exception=True).debug("{} could not deregister itself", self.consumer_name)
+
     async def _ack_processed(self, events: list[Event], msg_ids: list[bytes], deferred: set[str]) -> None:
         """ACK msg_ids whose events were fully handled; deferred ones stay in the PEL."""
         ack_ids = [mid for mid, ev in zip(msg_ids, events, strict=True) if self.dedup_key(ev) not in deferred]
@@ -341,6 +410,8 @@ class TierConsumer(ABC):
                 due_for_sweep = now - last_reclaim_at >= _RECLAIM_SWEEP_S
                 if not pel_drained or self._pel_dirty or due_for_sweep:
                     self._pel_dirty = False
+                    if due_for_sweep:
+                        await self._prune_consumer_registrations()
                     last_reclaim_at = now
                     reclaimed = await self.bus.read_pending(
                         self.input_topic,
@@ -432,6 +503,7 @@ class TierConsumer(ABC):
                 window_start = None
         finally:
             await self._post_run()
+            await self._deregister_self()
 
         logger.debug("{} stopped", self.consumer_name)
 

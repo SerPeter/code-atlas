@@ -337,6 +337,42 @@ class EventBus:
         """Acknowledge messages after successful processing."""
         return await self._redis.xack(self._stream_key(topic), group, *msg_ids)
 
+    async def consumer_registrations(self, topic: Topic, group: str) -> list[tuple[str, int, int]]:
+        """``(name, pending, idle_ms)`` for every consumer registered in *group*.
+
+        A registration outlives the process that made it: Redis creates one on first read
+        and never removes it. Now that names carry a process identity, every index run
+        leaves one behind — so something has to enumerate them to clean up.
+
+        *idle_ms* is time since the consumer last issued any command, not since it last
+        got a message, so a live consumer blocking on an empty stream still reads as busy.
+        """
+        try:
+            infos = await self._redis.xinfo_consumers(self._stream_key(topic), group)
+        except aioredis.ResponseError:
+            return []  # group or stream does not exist yet
+
+        out: list[tuple[str, int, int]] = []
+        for info in infos:
+            name = info.get(b"name", info.get("name", b""))
+            if isinstance(name, bytes):
+                name = name.decode()
+            pending = info.get(b"pending", info.get("pending", 0))
+            idle_ms = info.get(b"idle", info.get("idle", 0))
+            out.append((name, int(pending), int(idle_ms)))
+        return out
+
+    async def drop_consumer(self, topic: Topic, group: str, consumer: str) -> int:
+        """Deregister *consumer*, returning how many pending entries went with it.
+
+        Destroys those entries rather than reassigning them, so callers must confirm the
+        PEL is empty first — the return value is a leak detector, not a status code.
+        """
+        try:
+            return int(await self._redis.xgroup_delconsumer(self._stream_key(topic), group, consumer))
+        except aioredis.ResponseError:
+            return 0  # group or stream does not exist yet
+
     # -- Indexer lease ---------------------------------------------------------
     #
     # Unique consumer names stop two processes corrupting each other's PEL, but they do

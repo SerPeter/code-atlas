@@ -285,6 +285,33 @@ class SqliteEventBus:
 
     _LEASE_NAME = "indexer"
 
+    async def consumer_registrations(self, topic: Topic, group: str) -> list[tuple[str, int, int]]:
+        """``(name, pending, idle_ms)`` per consumer, derived from delivery rows."""
+        conn = await self._get_conn()
+        cur = await conn.execute(
+            "SELECT consumer, SUM(acked_at IS NULL), MAX(delivered_at) FROM deliveries "
+            "WHERE topic = ? AND grp = ? GROUP BY consumer",
+            (topic.value, group),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        now = time.time()
+        return [
+            (str(name), int(pending or 0), int(max(0.0, now - (seen or now)) * 1000)) for name, pending, seen in rows
+        ]
+
+    async def drop_consumer(self, topic: Topic, group: str, consumer: str) -> int:
+        """No-op — this backend has no registration to leak.
+
+        A consumer name here is a column on per-message delivery rows, not a standing
+        registration, so it is bounded by the stream and disappears with it. Deleting
+        those rows would be actively wrong: ``_claim_new_messages`` treats a message with
+        no delivery row as undelivered, so pruning acked rows would redeliver every
+        message the consumer had already finished.
+        """
+        _ = (topic, group, consumer)
+        return 0
+
     async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
         """Take the indexer lease, or return False if a live one is held."""
         conn = await self._get_conn()

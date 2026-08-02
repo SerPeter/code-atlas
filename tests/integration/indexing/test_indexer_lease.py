@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from code_atlas.events import FileChanged, IndexerBusyError, Topic, hold_indexer_lease
+from code_atlas.indexing.consumers import BatchPolicy, TierConsumer
 
 pytestmark = [pytest.mark.integration]
 
@@ -108,3 +109,83 @@ async def test_abandoned_work_is_swept_up_after_the_owner_dies(event_bus):
     # And once adopted it is that consumer's own pending work, so a normal drain clears it.
     own = await event_bus.read_pending(topic, group, "worker-live", count=10)
     assert {mid for mid, _ in own} == {mid for mid, _ in dead}
+
+
+class _NullConsumer(TierConsumer):
+    """Bare TierConsumer — exercises the base-class registration policy, nothing else."""
+
+    async def process_batch(self, events, batch_id):
+        return None
+
+
+def _consumer(bus, group, name, **kw):
+    policy = BatchPolicy(time_window_s=0.1, max_batch_size=5)
+    return _NullConsumer(bus, Topic.FILE_CHANGED, group, name, policy, **kw)
+
+
+async def test_registrations_of_dead_processes_are_pruned(event_bus):
+    """Consumer names carry a PID, and Redis never unregisters a consumer on its own.
+
+    Measured live after one session on this repo: 10 registrations in each group, one per
+    index run, nine of them belonging to processes that had exited.
+    """
+    topic, group = Topic.FILE_CHANGED, "prune-test"
+    await event_bus.ensure_group(topic, group)
+    for name in ("ast-host-1-aaa", "ast-host-2-bbb", "ast-0"):
+        await event_bus.read_batch(topic, group, name, count=1, block_ms=10)
+
+    live = _consumer(event_bus, group, "ast-host-3-ccc", stale_consumer_idle_ms=0)
+    await event_bus.read_batch(topic, group, live.consumer_name, count=1, block_ms=10)
+    assert len(await event_bus.consumer_registrations(topic, group)) == 4
+
+    await live._prune_consumer_registrations()
+
+    # Everything but the caller's own registration is gone — including the legacy fixed name.
+    assert [n for n, _p, _i in await event_bus.consumer_registrations(topic, group)] == [live.consumer_name]
+
+
+async def test_a_registration_still_holding_work_is_never_pruned(event_bus):
+    """XGROUP DELCONSUMER destroys a PEL rather than reassigning it.
+
+    Pruning on idle alone would delete exactly the messages the reclaim sweep exists to
+    rescue, so holding work outranks looking dead.
+    """
+    topic, group = Topic.FILE_CHANGED, "prune-holds-work"
+    await event_bus.ensure_group(topic, group)
+    await event_bus.publish(topic, FileChanged(path="held.py", change_type="modified", project_name="p"))
+    dead = await event_bus.read_batch(topic, group, "ast-host-9-dead", count=1, block_ms=200)
+    assert len(dead) == 1
+
+    live = _consumer(event_bus, group, "ast-host-3-ccc", stale_consumer_idle_ms=0)
+    await live._prune_consumer_registrations()
+    assert "ast-host-9-dead" in {n for n, _p, _i in await event_bus.consumer_registrations(topic, group)}
+
+    # Once the sweep has adopted the work, the empty registration becomes prunable. That
+    # ordering — adopt, then prune — is what makes the two safe together.
+    await event_bus.reclaim_abandoned(topic, group, live.consumer_name, min_idle_ms=0, count=10)
+    await live._prune_consumer_registrations()
+    assert "ast-host-9-dead" not in {n for n, _p, _i in await event_bus.consumer_registrations(topic, group)}
+
+
+async def test_a_clean_exit_leaves_no_registration_behind(event_bus):
+    """The common case must not wait an hour for the idle sweep to notice."""
+    topic, group = Topic.FILE_CHANGED, "prune-self"
+    await event_bus.ensure_group(topic, group)
+    c = _consumer(event_bus, group, "ast-host-4-ddd")
+    await event_bus.read_batch(topic, group, c.consumer_name, count=1, block_ms=10)
+    assert [n for n, _p, _i in await event_bus.consumer_registrations(topic, group)] == [c.consumer_name]
+
+    await c._deregister_self()
+    assert await event_bus.consumer_registrations(topic, group) == []
+
+
+async def test_a_consumer_exiting_with_unacked_work_keeps_its_registration(event_bus):
+    """Its PEL is the crash-recovery net; deregistering would discard the messages."""
+    topic, group = Topic.FILE_CHANGED, "prune-self-busy"
+    await event_bus.ensure_group(topic, group)
+    await event_bus.publish(topic, FileChanged(path="inflight.py", change_type="modified", project_name="p"))
+    c = _consumer(event_bus, group, "ast-host-5-eee")
+    assert await event_bus.read_batch(topic, group, c.consumer_name, count=1, block_ms=200)
+
+    await c._deregister_self()
+    assert [n for n, _p, _i in await event_bus.consumer_registrations(topic, group)] == [c.consumer_name]
