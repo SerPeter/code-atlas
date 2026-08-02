@@ -5,6 +5,9 @@
 Accepted — amends [ADR-0014](./0014-calls-edge-confidence.md), whose `resolved`/`ambiguous` pair this splits along a
 second axis, and [ADR-0017](./0017-calls-edge-weights.md), whose weight is derived from that confidence.
 
+Extended by [ADR-0023](./0023-type-directed-call-resolution.md), which adds the receiver's declared type and closes this
+decision's gap: the damping here reached only the single-candidate case.
+
 ## Context
 
 A reader with no knowledge of this codebase, shown only a rendered `summarize_module` outline, flagged
