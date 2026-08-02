@@ -631,3 +631,69 @@ class TestManifestVersionsIntegration:
         versions = await self._external_versions(graph_client, tmp_path)
         assert "github" in versions, "the collapsed aggregate node should still be created by import resolution"
         assert versions["github"] is None
+
+
+class TestEmbeddingReconciliation:
+    """A lost embedding must not be permanent.
+
+    Measured on the live index: 144 entities across 4 files kept `embedding IS NULL`
+    through a subsequent FULL re-index, because their EmbedDirty was poison-parked
+    during a Memgraph outage and both AST-stage gates are content-based — an unchanged
+    file is never re-parsed, and in delta mode never even published, so the
+    `has_embedding` check that would have caught it is unreachable.
+    """
+
+    @pytest.fixture
+    def project_dir(self, tmp_path):
+        _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
+        _write(tmp_path, "src/utils.py", "MAGIC = 42\n\ndef add(a, b):\n    return a + b\n")
+        return tmp_path
+
+    async def test_find_unembedded_entities_sees_only_searchable_labels(
+        self, project_dir, graph_client, event_bus
+    ) -> None:
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        missing = await graph_client.find_unembedded_entities(project)
+        assert missing, "embeddings were disabled, so every embeddable entity should be reported"
+
+        # ExternalPackage/ExternalSymbol have no vector index — re-embedding them would
+        # buy a vector nothing can search, so they must stay out of the reconcile set.
+        from code_atlas.schema import _EMBEDDABLE_LABELS
+
+        embeddable = {lbl.value for lbl in _EMBEDDABLE_LABELS}
+        assert {label for _uid, label, _fp in missing} <= embeddable
+
+        # uid, not qualified_name: the embed consumer feeds this field straight into
+        # read_entity_texts(uids=...), so a bare qualified name matches nothing and the
+        # batch silently completes having embedded zero entities.
+        assert all(uid.startswith(f"{project}:") for uid, _label, _fp in missing)
+
+    async def test_reconcile_requeues_an_entity_whose_embed_was_lost(
+        self, project_dir, graph_client, event_bus
+    ) -> None:
+        from code_atlas.events import EmbedDirty, decode_event
+        from code_atlas.indexing.orchestrator import _reconcile_missing_embeddings
+
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        project = derive_project_name(project_dir)
+        await graph_client.ensure_schema()
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        before = len(await graph_client.find_unembedded_entities(project))
+        assert before
+
+        await event_bus.ensure_group(Topic.EMBED_DIRTY, "reconcile-test")
+        queued = await _reconcile_missing_embeddings(graph_client, event_bus, [project])
+        assert queued == before
+
+        published = await event_bus.read_batch(Topic.EMBED_DIRTY, "reconcile-test", "c1", count=1, block_ms=500)
+        assert published
+        event = decode_event(Topic.EMBED_DIRTY, published[0][1])
+        assert isinstance(event, EmbedDirty)
+        # The republished ref must round-trip through the same lookup the consumer uses.
+        props = await graph_client.read_entity_texts([event.entity.qualified_name])
+        assert props, "republished ref did not resolve — the consumer would no-op on it"

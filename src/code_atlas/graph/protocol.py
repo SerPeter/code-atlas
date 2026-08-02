@@ -218,6 +218,10 @@ if TYPE_CHECKING:
             self, uids: list[str], *, labels: list[str] | None = None
         ) -> dict[str, tuple[str | None, bool]]: ...
 
+        async def find_unembedded_entities(
+            self, project_name: str, *, limit: int = 5000
+        ) -> list[tuple[str, str, str]]: ...
+
         async def write_embeddings(
             self,
             items: list[tuple[str, list[float]]],

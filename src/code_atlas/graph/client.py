@@ -3013,6 +3013,22 @@ class GraphClient:
                 result[r["uid"]] = (r["embed_hash"], r["has_embedding"])
         return result
 
+    async def find_unembedded_entities(self, project_name: str, *, limit: int = 5000) -> list[tuple[str, str, str]]:
+        """``(uid, label, file_path)`` for entities that should carry a vector but do not.
+
+        Only :data:`~code_atlas.schema._EMBEDDABLE_LABELS` are considered, because that is
+        exactly the set the vector indices serve. ``DocFile``/``Package`` do get embedded by
+        the AST stage but have no vector index, so re-embedding them would cost API calls
+        for a vector nothing can search.
+        """
+        labels = "|".join(sorted(lbl.value for lbl in _EMBEDDABLE_LABELS))
+        rows = await self.execute(
+            f"MATCH (n:{labels}) WHERE n.project_name = $project AND n.embedding IS NULL AND n.uid IS NOT NULL "
+            "RETURN n.uid AS uid, labels(n)[0] AS label, n.file_path AS file_path LIMIT $limit",
+            {"project": project_name, "limit": limit},
+        )
+        return [(r["uid"], r["label"], r["file_path"] or "") for r in rows]
+
     async def write_embeddings(
         self,
         items: list[tuple[str, list[float]]],

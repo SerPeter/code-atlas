@@ -609,3 +609,58 @@ class TestProjectRm:
 
         mock_graph.delete_project_data.assert_awaited_once_with("myproject")
         mock_graph.close.assert_awaited_once()
+
+
+class TestIndexExitCode:
+    """An undrained pipeline means the graph does not match the working tree.
+
+    Two incomplete indexes read as successes this session because `Done (full)` printed
+    and the process exited 0 — the `drained` flag was surfaced only as a warning line.
+    """
+
+    @staticmethod
+    def _patch_infra(monkeypatch, tmp_path, result):
+        import contextlib
+
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        settings.embeddings.enabled = False
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.create_event_bus", AsyncMock(return_value=AsyncMock()))
+        monkeypatch.setattr("code_atlas.backends.create_graph_client", AsyncMock(return_value=AsyncMock()))
+        monkeypatch.setattr("code_atlas.indexing.orchestrator.detect_sub_projects", lambda *a, **kw: [])
+        monkeypatch.setattr(cli, "_index_single_with_spinner", AsyncMock(return_value=result))
+
+        @contextlib.asynccontextmanager
+        async def _lease(_bus):
+            yield "owner"
+
+        monkeypatch.setattr("code_atlas.events.hold_indexer_lease", _lease)
+
+    @staticmethod
+    def _result(*, drained: bool):
+        from code_atlas.indexing.orchestrator import IndexResult
+
+        return IndexResult(
+            files_scanned=3, files_published=3, entities_total=9, duration_s=1.0, mode="full", drained=drained
+        )
+
+    async def test_undrained_index_exits_nonzero(self, tmp_path, monkeypatch) -> None:
+        import pytest
+        import typer
+
+        from code_atlas import cli
+
+        self._patch_infra(monkeypatch, tmp_path, self._result(drained=False))
+        with pytest.raises(typer.Exit) as excinfo:
+            await cli._run_index(str(tmp_path), None, True, no_embed=True, no_git_check=True)
+        assert excinfo.value.exit_code == 1
+
+    async def test_drained_index_exits_zero(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+
+        self._patch_infra(monkeypatch, tmp_path, self._result(drained=True))
+        await cli._run_index(str(tmp_path), None, True, no_embed=True, no_git_check=True)

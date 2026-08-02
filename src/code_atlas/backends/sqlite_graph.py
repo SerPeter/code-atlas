@@ -2049,6 +2049,18 @@ class SqliteGraphClient:
                 result[uid] = (props.get("embed_hash"), bool(has_emb))
         return result
 
+    async def find_unembedded_entities(self, project_name: str, *, limit: int = 5000) -> list[tuple[str, str, str]]:
+        conn = await self._get_conn()
+        placeholders = ",".join("?" * len(_VEC_LABEL_VALUES))
+        cur = await conn.execute(
+            f"SELECT uid, labels, file_path FROM nodes WHERE project_name = ? AND embedding IS NULL "
+            f"AND labels IN ({placeholders}) LIMIT ?",
+            (project_name, *sorted(_VEC_LABEL_VALUES), limit),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(uid, label, file_path or "") for uid, label, file_path in rows]
+
     async def _write_embedding_row(self, conn: aiosqlite.Connection, uid: str, blob: bytes) -> None:
         cur = await conn.execute("SELECT rowid, labels FROM nodes WHERE uid = ?", (uid,))
         row = await cur.fetchone()

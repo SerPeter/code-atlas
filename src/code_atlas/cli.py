@@ -404,6 +404,11 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         raise typer.Exit(code=1) from exc
     logger.debug("Holding indexer lease ({})", owner)
 
+    # An undrained pipeline means the graph does not reflect the working tree. Printing
+    # "Done" and exiting 0 for that made two incomplete indexes read as successes, to a
+    # human and to any CI step gating on the exit code.
+    incomplete = False
+
     try:
         # Auto-detect monorepo: if sub-projects detected or --project specified → monorepo mode
         sub_projects = detect_sub_projects(project_root, settings.monorepo)
@@ -435,6 +440,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             total_entities = sum(r.entities_total for r in results)
             total_duration = max((r.duration_s for r in results), default=0.0)
 
+            incomplete = any(not r.drained for r in results)
+
             git_signals_stats = (
                 await _mine_and_write_git_signals(project_root, project_name, graph, co_change_threshold)
                 if with_git_signals
@@ -462,6 +469,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                     _echo(_git_signals_summary_line(git_signals_stats, co_change_threshold))
         else:
             result = await _index_single_with_spinner(settings, graph, bus, scope=scope, full_reindex=full_reindex)
+            incomplete = not result.drained
 
             git_signals_stats = (
                 await _mine_and_write_git_signals(project_root, project_name, graph, co_change_threshold)
@@ -495,6 +503,9 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         await lease.__aexit__(None, None, None)
         await graph.close()
         await bus.close()
+
+    if incomplete:
+        raise typer.Exit(code=1)
         shutdown_telemetry()
 
 

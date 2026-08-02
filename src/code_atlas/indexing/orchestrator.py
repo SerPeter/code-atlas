@@ -19,7 +19,7 @@ from xml.etree import ElementTree as ET
 import pathspec
 from loguru import logger
 
-from code_atlas.events import Event, EventBus, FileChanged, Topic
+from code_atlas.events import EmbedDirty, EntityRef, Event, EventBus, FileChanged, Significance, Topic
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
@@ -28,7 +28,7 @@ from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
 
     from code_atlas.graph.client import GraphClient
     from code_atlas.settings import AtlasSettings, MonorepoSettings
@@ -1359,6 +1359,21 @@ async def _run_pipeline(
             on_drain_progress=on_drain_progress,
             settle_s=2.0,
         )
+        # Only worth reconciling once the run's own work has settled, and only while
+        # these consumers are still alive to act on what it finds.
+        if (
+            drained
+            and embed is not None
+            and project_filter
+            and await _reconcile_missing_embeddings(graph, bus, project_filter)
+        ):
+            drained = await _wait_for_drain(
+                bus,
+                drain_timeout_s,
+                embed_enabled=True,
+                on_drain_progress=on_drain_progress,
+                settle_s=2.0,
+            )
     finally:
         ast_consumer.stop()
         if embed_consumer is not None:
@@ -2084,6 +2099,16 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             on_drain_progress=on_drain_progress,
             settle_s=2.0,
         )
+        if drained and embed is not None:
+            names = [pr.project_name for pr in publish_results]
+            if await _reconcile_missing_embeddings(graph, bus, names):
+                drained = await _wait_for_drain(
+                    bus,
+                    drain_timeout_s,
+                    embed_enabled=True,
+                    on_drain_progress=on_drain_progress,
+                    settle_s=2.0,
+                )
 
     finally:
         # --- Tear down consumers (once) ---
@@ -2164,6 +2189,44 @@ def _build_delta_stats(decision: _DeltaDecision, ast_stats: Any) -> DeltaStats:
         entities_deleted=ast_stats.entities_deleted if ast_stats else 0,
         entities_unchanged=ast_stats.entities_unchanged if ast_stats else 0,
     )
+
+
+async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, project_names: Iterable[str]) -> int:
+    """Republish embed work for entities that hold no vector, and return how many.
+
+    The AST stage already refuses to re-embed an entity that has one
+    (``has_embedding``, consumers.py) — but that check is downstream of two
+    content-based skips, so it is unreachable for the entities that need it most.
+    A file whose hash is unchanged is never parsed, and in delta mode (which is
+    every daemon-driven index) it is never even published. So an ``EmbedDirty``
+    lost to a poison-park or an abandoned PEL is lost for good: measured, 144
+    entities across 4 files stayed unembedded through a subsequent *full* re-index.
+
+    Fixing it at the gate cannot work, because in delta mode there is no gate —
+    the file is not in the batch at all. Reconciling desired state against actual
+    state is what makes the pipeline self-healing rather than merely retryable,
+    and it catches every cause rather than the one that happened to be found.
+    """
+    refs: list[Event] = []
+    for project_name in project_names:
+        for uid, label, file_path in await graph.find_unembedded_entities(project_name):
+            # EntityRef.qualified_name carries the *uid* — the embed consumer feeds it
+            # straight to read_entity_texts(uids=...), so a real qualified name silently
+            # matches nothing and the batch completes having done no work.
+            refs.append(
+                EmbedDirty(
+                    entity=EntityRef(qualified_name=uid, node_type=label, file_path=file_path),
+                    significance=Significance.HIGH,
+                )
+            )
+    if refs:
+        logger.warning(
+            "Re-queued {} entity(ies) that had no embedding — earlier embed work was lost, "
+            "not skipped; re-embedding now",
+            len(refs),
+        )
+        await bus.publish_many(Topic.EMBED_DIRTY, refs)
+    return len(refs)
 
 
 async def _wait_for_drain(
