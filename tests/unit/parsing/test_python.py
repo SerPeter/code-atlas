@@ -2199,3 +2199,38 @@ def test_receiver_type_is_recovered_from_annotations_and_local_construction():
     assert "receiver_type" not in props["untyped"]
     assert "receiver_type" not in props["maybe"]  # union, not a bare class name
     assert "receiver_type" not in props["helper"]  # lowercase callee, not a constructor
+
+
+def test_only_ellipsis_and_abstractmethod_count_as_stubs():
+    """Per-method, not per-class. An ABC is the standard base for ONE abstractmethod plus
+    a dozen concrete ones — TierConsumer here has 1 of 16 — and treating its real methods
+    as stubs deleted true callees, mis-resolving even `await super().run()`.
+
+    `pass` and docstring-only bodies are real no-op implementations that run and can
+    legitimately be the callee, so they are not stubs.
+    """
+    parsed = _parse(
+        "from typing import Protocol\n"
+        "from abc import ABC, abstractmethod\n"
+        "class Iface(Protocol):\n"
+        "    def go(self) -> None: ...\n"
+        "class Base(ABC):\n"
+        "    @abstractmethod\n"
+        "    def must(self) -> None: ...\n"
+        "    def real(self) -> int:\n"
+        "        return 1\n"
+        "    def hook(self) -> None:\n"
+        "        pass\n"
+        "    def doc_only(self) -> None:\n"
+        '        """Docstring."""\n'
+    )
+
+    def stub(qn_suffix: str) -> bool:
+        e = next(x for x in parsed.entities if x.qualified_name.endswith(qn_suffix))
+        return bool(e.extra_properties.get("is_stub"))
+
+    assert stub("Iface.go")
+    assert stub("Base.must")
+    assert not stub("Base.real")
+    assert not stub("Base.hook")
+    assert not stub("Base.doc_only")

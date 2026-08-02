@@ -5114,7 +5114,6 @@ async def test_resolve_calls_skips_protocol_stubs_and_resolves_the_lone_implemen
                 line_end=6,
                 file_path=fp,
                 content_hash="proto",
-                extra_properties={"is_abstract": True},
             ),
             ParsedEntity(
                 name="save",
@@ -5125,6 +5124,7 @@ async def test_resolve_calls_skips_protocol_stubs_and_resolves_the_lone_implemen
                 line_end=5,
                 file_path=fp,
                 content_hash="proto_save",
+                extra_properties={"is_stub": True},
             ),
             ParsedEntity(
                 name="RealStore",
@@ -5319,3 +5319,114 @@ async def test_resolve_calls_uses_the_receivers_declared_type(graph_client: Grap
     assert rows[0]["t"] == f"{project}:src.impls.Beta.run"
     assert rows[0]["c"] == "resolved"
     assert rows[0]["s"] == "receiver_type"
+
+
+async def test_receiver_type_never_resolves_onto_a_stub_body(graph_client: GraphClient):
+    """The regression this pins: strategy ordering let receiver_type return BEFORE the
+    stub filter, so annotating a parameter with the Protocol's own name — the entire
+    point of a Protocol — produced a resolved, full-weight edge to a `...` body.
+
+    36 such edges existed in the live graph, and they displaced the real targets, so the
+    implementations they hid read as dead code.
+    """
+    await graph_client.ensure_schema()
+    project = "stub_order"
+    fp = "src/be.py"
+    ents = [
+        ParsedEntity(
+            name="be",
+            qualified_name=f"{project}:src.be",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=40,
+            file_path=fp,
+            content_hash="m",
+        )
+    ]
+    rels = []
+    for cls, stub in (("Iface", True), ("Impl", False)):
+        ents.append(
+            ParsedEntity(
+                name=cls,
+                qualified_name=f"{project}:src.be.{cls}",
+                label=NodeLabel.TYPE_DEF,
+                kind="class",
+                line_start=3,
+                line_end=8,
+                file_path=fp,
+                content_hash=f"c{cls}",
+            )
+        )
+        ents.append(
+            ParsedEntity(
+                name="run",
+                qualified_name=f"{project}:src.be.{cls}.run",
+                label=NodeLabel.CALLABLE,
+                kind="method",
+                line_start=4,
+                line_end=6,
+                file_path=fp,
+                content_hash=f"r{cls}",
+                extra_properties={"is_stub": True} if stub else {},
+            )
+        )
+        rels.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.be.{cls}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project}:src.be.{cls}.run",
+            )
+        )
+    await graph_client.upsert_file_entities(project, fp, ents, rels)
+
+    caller_fp = "src/call.py"
+    await graph_client.upsert_file_entities(
+        project,
+        caller_fp,
+        [
+            ParsedEntity(
+                name="call",
+                qualified_name=f"{project}:src.call",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=6,
+                file_path=caller_fp,
+                content_hash="cm",
+            ),
+            ParsedEntity(
+                name="user",
+                qualified_name=f"{project}:src.call.user",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=2,
+                line_end=4,
+                file_path=caller_fp,
+                content_hash="cu",
+            ),
+        ],
+        [],
+    )
+
+    # `def user(dep: Iface)` — annotated with the PROTOCOL, the case that broke.
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.call.user",
+                rel_type=RelType.CALLS,
+                to_name="run",
+                properties={"receiver": "dep", "receiver_type": "Iface"},
+            )
+        ],
+    )
+
+    rows = await graph_client.execute(
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN b.uid AS t, r.strategy AS s, r.confidence AS c",
+        {"a": f"{project}:src.call.user"},
+    )
+    targets = {r["t"] for r in rows}
+    assert f"{project}:src.be.Iface.run" not in targets, rows  # never the stub
+    assert targets == {f"{project}:src.be.Impl.run"}
+    assert rows[0]["s"] == "polymorphic_unique"

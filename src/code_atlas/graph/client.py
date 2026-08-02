@@ -798,9 +798,9 @@ class _CallLookup:
     caller_to_parent: dict[str, str]  # callable_uid → parent TypeDef uid
     parent_children: dict[str, list[str]]  # parent_uid → [child_uids]
     uid_to_info: dict[str, tuple[str, str]]  # uid → (name, file_path)
-    # TypeDefs declared with a Protocol/ABC base. Their methods are `...` stubs that can
-    # never execute, so a call resolved to one is resolved to nothing.
-    abstract_parents: frozenset[str] = frozenset()
+    # Callables whose body is literally `...` or which are @abstractmethod. Per-method,
+    # not per-class: an ABC's concrete methods are real code and must stay resolvable.
+    stub_callables: frozenset[str] = frozenset()
 
 
 def _typedef_init_uid(typedef_uid: str, lk: _CallLookup) -> str | None:
@@ -824,8 +824,12 @@ _UNVERIFIED_STRATEGIES = frozenset({"unverified_receiver", "unverified_wide"})
 
 
 def _is_abstract_stub(uid: str, lk: _CallLookup) -> bool:
-    """Whether *uid* is a method of a Protocol/ABC declaration rather than an implementation."""
-    return bool(lk.abstract_parents) and lk.caller_to_parent.get(uid) in lk.abstract_parents
+    """Whether *uid*'s body can never be what runs — a `...` body or @abstractmethod.
+
+    Asked of the method, not its class. Asking the class conflated Protocol (all stubs)
+    with ABC (one abstractmethod among many real ones) and deleted true callees.
+    """
+    return uid in lk.stub_callables
 
 
 def _resolve_one_call(  # noqa: PLR0911, PLR0912
@@ -877,7 +881,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
             if sibling_uid == caller_uid:
                 continue
             sib_info = lk.uid_to_info.get(sibling_uid)
-            if sib_info and sib_info[0] == bare_name:
+            if sib_info and sib_info[0] == bare_name and not _is_abstract_stub(sibling_uid, lk):
                 return ([sibling_uid], "sibling")
 
     # Strategy 3: Same-file match
@@ -904,19 +908,21 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     # a name-only resolver spreads across every implementation. Knowing the type removes
     # the false edges rather than re-weighting them, which is why it leaves total graph
     # weight unchanged where a containment heuristic inflated it 16%.
+    # Drop stub candidates FIRST, before any strategy consults the list. Doing this after
+    # the receiver-type branch let 36 edges resolve straight onto a `...` Protocol body at
+    # full confidence — the exact outcome the filter exists to prevent, and worse than the
+    # ambiguity it replaced, because a resolved edge is trusted and it displaced the real
+    # target. A filter that a strategy can return past is not a filter.
+    real = [uid for uid in non_self if not _is_abstract_stub(uid, lk)]
+
     declared = str(rel.properties.get("receiver_type") or "")
-    if declared and len(non_self) > 1:
+    if declared and len(real) > 1:
         # The parent is a TypeDef, and uid_to_info holds Callables only — its class name
         # comes from the uid's last dotted segment, e.g. "proj:pkg.mod.Store" -> "Store".
-        owned = [uid for uid in non_self if lk.caller_to_parent.get(uid, "").rsplit(".", 1)[-1] == declared]
+        owned = [uid for uid in real if lk.caller_to_parent.get(uid, "").rsplit(".", 1)[-1] == declared]
         if len(owned) == 1:
             return (owned, "receiver_type")
 
-    # Drop Protocol/ABC stubs before counting. Their bodies are `...` and can never
-    # execute, so an edge to one points at nothing — 1254 edges in the reference index
-    # terminated on such a body. Removing them also shrinks the modal family from
-    # one-of-three to one-of-two without inventing any new evidence.
-    real = [uid for uid in non_self if not _is_abstract_stub(uid, lk)]
     if real and len(real) < len(non_self):
         # Exactly one implementation behind a declaration is a resolution, not a guess,
         # and must NOT fall through to the single-candidate branch below: the receiver
@@ -1246,6 +1252,8 @@ class GraphClient:
                 await self._migrate_v8_drop_unverified_calls()
             if stored < 9:  # v9 data migration threshold
                 await self._migrate_v9_clear_for_abstract_bases()
+            if stored < 10:  # v10 data migration threshold
+                await self._migrate_v10_stub_flag_moved_to_methods()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -2546,17 +2554,17 @@ class GraphClient:
         # caller_uid → parent TypeDef uid, parent → children
         parent_records = await self.execute(
             f"MATCH (td:{NodeLabel.TYPE_DEF} {{project_name: $p}})-[:{RelType.DEFINES}]->(c:{NodeLabel.CALLABLE}) "
-            "RETURN td.uid AS td_uid, c.uid AS c_uid, td.is_abstract AS td_abstract",
+            "RETURN td.uid AS td_uid, c.uid AS c_uid, c.is_stub AS c_stub",
             {"p": project_name},
         )
         caller_to_parent: dict[str, str] = {}
         parent_children: dict[str, list[str]] = {}
-        abstract_parents: set[str] = set()
+        stub_callables: set[str] = set()
         for r in parent_records:
             caller_to_parent[r["c_uid"]] = r["td_uid"]
             parent_children.setdefault(r["td_uid"], []).append(r["c_uid"])
-            if r["td_abstract"]:
-                abstract_parents.add(r["td_uid"])
+            if r["c_stub"]:
+                stub_callables.add(r["c_uid"])
 
         return _CallLookup(
             name_to_callables=name_to_callables,
@@ -2564,7 +2572,7 @@ class GraphClient:
             caller_to_parent=caller_to_parent,
             parent_children=parent_children,
             uid_to_info=uid_to_info,
-            abstract_parents=frozenset(abstract_parents),
+            stub_callables=frozenset(stub_callables),
         )
 
     async def build_resolution_lookup(self, project_name: str) -> tuple[_CallLookup, dict[str, list[tuple[str, str]]]]:
@@ -4588,6 +4596,24 @@ class GraphClient:
             "Schema v9: cleared ambiguous CALLS edges and file/git hashes — run 'atlas index' "
             "to re-resolve them against Protocol/ABC declarations"
         )
+
+    async def _migrate_v10_stub_flag_moved_to_methods(self) -> None:
+        """v10: "is this a stub" is now asked of the method, not of its class.
+
+        v9 flagged the CLASS via its bases, which conflated Protocol (all stubs) with ABC
+        (one abstractmethod among many real methods). That deleted true callees from
+        candidate sets and left same-named siblings to be promoted to resolved edges.
+        Every resolved CALLS edge decided under that rule has to be re-derived, and the
+        stale class-level flag has to go so nothing reads it again.
+        """
+        await self.execute_write(f"MATCH (t:{NodeLabel.TYPE_DEF}) WHERE t.is_abstract IS NOT NULL REMOVE t.is_abstract")
+        await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() DELETE r")
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info("Schema v10: cleared CALLS edges and the class-level is_abstract flag — run 'atlas index'")
 
     async def _reconcile_search_indices(self) -> None:
         """Recreate vector/text indices that have gone missing at the current version.

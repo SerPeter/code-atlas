@@ -269,6 +269,34 @@ def _callable_kind_for_method(name: str, node: Node) -> str:
     return CallableKind.METHOD
 
 
+def _is_stub_body(node: Node, tags: list[str]) -> bool:
+    """Whether a function can never do anything at runtime.
+
+    This is a per-METHOD question and was previously answered per-class, via the class's
+    bases. That conflated two different things: a ``Protocol`` really is all stubs, but
+    ``ABC`` is the standard base for a class with ONE abstractmethod and a dozen concrete
+    ones — TierConsumer in this repo has 1 of 16. Treating its real methods as stubs
+    deleted the true callee from candidate sets and left a same-named sibling to be
+    promoted to a resolved edge, which mis-resolved even `await super().run()`.
+
+    A body qualifies only when it is literally ``...``, or the method is decorated
+    ``@abstractmethod``. Deliberately NOT ``pass`` or a docstring alone: those are real
+    no-op implementations that run and can legitimately be the callee — TierConsumer's
+    ``_pre_run``/``_post_run`` hooks are exactly that shape.
+    """
+    if any("abstractmethod" in t for t in tags):
+        return True
+    body = node.child_by_field_name("body")
+    if body is None:
+        return False
+    statements = [c for c in body.children if c.type not in (":", "comment")]
+    return (
+        len(statements) == 1
+        and statements[0].type == "expression_statement"
+        and any(c.type == "ellipsis" for c in statements[0].children)
+    )
+
+
 def _get_decorators(node: Node) -> list[str]:
     """Extract decorator names from a decorated_definition parent.
 
@@ -640,6 +668,9 @@ def _process_function(
             source=node_text(node),
             visibility=_visibility_from_name(name),
             tags=tags,
+            # Per-method, not per-class: an ABC's concrete methods are real code and
+            # must stay resolvable. See _is_stub_body.
+            extra_properties={"is_stub": True} if _is_stub_body(node, tags) else {},
         )
     )
 
