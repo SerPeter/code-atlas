@@ -10,6 +10,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    call_receiver_props,
     node_text,
     register_language,
 )
@@ -847,10 +848,13 @@ def _extract_calls(
         elif child.type in ("member_call_expression", "scoped_call_expression"):
             name_node = child.child_by_field_name("name")
             if name_node is not None:
+                # `$obj->m()` puts the receiver on `object`; `Cls::m()` on `scope`.
+                receiver = child.child_by_field_name("object") or child.child_by_field_name("scope")
                 relationships.append(
                     ParsedRelationship(
                         from_qualified_name=from_qn,
                         rel_type=RelType.CALLS,
+                        properties=call_receiver_props(receiver),
                         to_name=node_text(name_node),
                     )
                 )

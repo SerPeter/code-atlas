@@ -23,7 +23,7 @@ from tree_sitter import Language, Parser, Query
 from code_atlas.schema import NodeLabel, RelType, Visibility
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from tree_sitter import Node
 
@@ -208,6 +208,30 @@ def node_text(node: Node) -> str:
     if text is None:
         return ""
     return text.decode("utf-8", errors="replace")
+
+
+def call_receiver_props(obj: Node | None, local_types: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Properties for a CALLS relationship whose callee was named on a receiver.
+
+    Shared across languages because the distinction it records is not Python-specific:
+    ``helper()`` must resolve in lexical scope, while ``client.scan()`` names a member of
+    a type that may never have been indexed. Recording the receiver stops the resolver
+    treating a project-wide name coincidence as identity (ADR-0022); recording its
+    declared type says which implementation is actually called (ADR-0023).
+
+    An empty dict for a bare call keeps the relationship byte-identical to what a
+    receiver-less language emits, so nothing downstream has to special-case it.
+    """
+    if obj is None:
+        return {}
+    text = node_text(obj)
+    if not text:
+        return {}
+    props: dict[str, Any] = {"receiver": text}
+    declared = (local_types or {}).get(text)
+    if declared:
+        props["receiver_type"] = declared
+    return props
 
 
 def slice_without_comments(node: Node, source: bytes, end_byte: int, comment_types: frozenset[str]) -> str:

@@ -14,6 +14,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    call_receiver_props,
     node_text,
     register_language,
 )
@@ -355,6 +356,8 @@ def _extract_calls(
                         from_qualified_name=from_qn,
                         rel_type=RelType.CALLS,
                         to_name=call_name,
+                        # Java puts the receiver on the invocation itself.
+                        properties=call_receiver_props(child.child_by_field_name("object")),
                     )
                 )
             else:
@@ -369,6 +372,7 @@ def _extract_calls(
                                     from_qualified_name=from_qn,
                                     rel_type=RelType.CALLS,
                                     to_name=node_text(name_part),
+                                    properties=call_receiver_props(func.child_by_field_name("expression")),
                                 )
                             )
                     elif func.type == "identifier":

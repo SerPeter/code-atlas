@@ -11,6 +11,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    call_receiver_props,
     node_text,
     register_language,
 )
@@ -1179,6 +1180,7 @@ def _extract_calls(
                                     from_qualified_name=from_qn,
                                     rel_type=RelType.CALLS,
                                     to_name=call_name,
+                                    properties=call_receiver_props(func.child_by_field_name("argument")),
                                 )
                             )
                 elif func.type == "qualified_identifier":
