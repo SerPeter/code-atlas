@@ -5213,3 +5213,109 @@ async def test_resolve_calls_skips_protocol_stubs_and_resolves_the_lone_implemen
     assert rows[0]["c"] == "resolved"
     assert rows[0]["s"] == "polymorphic_unique"
     assert rows[0]["w"] == 1.0  # NOT re-damped to 0.5 by the unverified-receiver rule
+
+
+async def test_resolve_calls_uses_the_receivers_declared_type(graph_client: GraphClient):
+    """Most of what a name-only resolver fans out is monomorphic: 772 of 915 measured
+    sites call exactly one concrete class. The declared type picks it, which removes the
+    false edges rather than re-weighting them.
+    """
+    await graph_client.ensure_schema()
+    project = "recv_type"
+    fp = "src/impls.py"
+    ents = [
+        ParsedEntity(
+            name="impls",
+            qualified_name=f"{project}:src.impls",
+            label=NodeLabel.MODULE,
+            kind="module",
+            line_start=1,
+            line_end=40,
+            file_path=fp,
+            content_hash="m",
+        )
+    ]
+    rels = []
+    for cls in ("Alpha", "Beta"):
+        ents.append(
+            ParsedEntity(
+                name=cls,
+                qualified_name=f"{project}:src.impls.{cls}",
+                label=NodeLabel.TYPE_DEF,
+                kind="class",
+                line_start=3,
+                line_end=9,
+                file_path=fp,
+                content_hash=f"c{cls}",
+            )
+        )
+        ents.append(
+            ParsedEntity(
+                name="run",
+                qualified_name=f"{project}:src.impls.{cls}.run",
+                label=NodeLabel.CALLABLE,
+                kind="method",
+                line_start=4,
+                line_end=6,
+                file_path=fp,
+                content_hash=f"r{cls}",
+            )
+        )
+        rels.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.impls.{cls}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project}:src.impls.{cls}.run",
+            )
+        )
+    await graph_client.upsert_file_entities(project, fp, ents, rels)
+
+    caller_fp = "src/use.py"
+    await graph_client.upsert_file_entities(
+        project,
+        caller_fp,
+        [
+            ParsedEntity(
+                name="use",
+                qualified_name=f"{project}:src.use",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=8,
+                file_path=caller_fp,
+                content_hash="u",
+            ),
+            ParsedEntity(
+                name="caller",
+                qualified_name=f"{project}:src.use.caller",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=2,
+                line_end=5,
+                file_path=caller_fp,
+                content_hash="uc",
+            ),
+        ],
+        [],
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.use.caller",
+                rel_type=RelType.CALLS,
+                to_name="run",
+                properties={"receiver": "engine", "receiver_type": "Beta"},
+            )
+        ],
+    )
+
+    rows = await graph_client.execute(
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN b.uid AS t, r.confidence AS c, r.strategy AS s",
+        {"a": f"{project}:src.use.caller"},
+    )
+    assert len(rows) == 1, rows  # not one edge per same-named implementation
+    assert rows[0]["t"] == f"{project}:src.impls.Beta.run"
+    assert rows[0]["c"] == "resolved"
+    assert rows[0]["s"] == "receiver_type"

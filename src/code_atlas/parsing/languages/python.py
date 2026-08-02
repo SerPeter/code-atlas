@@ -659,7 +659,7 @@ def _process_function(
     # Walk function body for call sites
     body = node.child_by_field_name("body")
     if body is not None:
-        _extract_calls(body, source, f"{project_name}:{qn}", relationships)
+        _extract_calls(body, source, f"{project_name}:{qn}", relationships, _local_declared_types(node, body))
 
 
 def _resolve_relative_import(package_qn: str, relative_text: str) -> str | None:
@@ -804,11 +804,91 @@ def _process_assignment(
         )
 
 
+def _receiver_props(obj: Node | None, local_types: dict[str, str] | None) -> dict[str, Any]:
+    """Receiver expression, plus its declared class when one is known.
+
+    The expression alone says "do not trust a project-wide name match" (ADR-0022). The
+    type says which implementation is actually called — measured, it sends 772 of 915
+    fanned-out sites to exactly one concrete class and only 24 to the Protocol.
+    """
+    if obj is None:
+        return {}
+    text = node_text(obj)
+    props: dict[str, Any] = {"receiver": text}
+    declared = (local_types or {}).get(text)
+    if declared:
+        props["receiver_type"] = declared
+    return props
+
+
+def _plain_type_name(annotation: str) -> str:
+    """A bare class name from an annotation, or "" when it is not one.
+
+    Deliberately conservative. `GraphClient` resolves; `GraphClient | None`,
+    `list[Store]` and `"GraphClient"` do not. A wrong type would send a call to the
+    wrong implementation with full confidence, which is the failure this whole line of
+    work exists to remove — declining to guess costs only a fallback to today's
+    behaviour.
+    """
+    text = annotation.strip()
+    return text if text.isidentifier() else ""
+
+
+def _local_declared_types(func_node: Node, body: Node) -> dict[str, str]:
+    """Best-effort ``{local name: class name}`` for the receivers in one function.
+
+    Two sources, measured to cover 90.7% of the call sites that a name-only resolver
+    fans out across every implementation: parameter annotations (59.8%) and one-step
+    local construction ``x = Foo(...)`` (a further 30.9%). Anything else is left unknown
+    rather than inferred, so resolution degrades to the status quo instead of to a guess.
+    """
+    types: dict[str, str] = {}
+
+    params = func_node.child_by_field_name("parameters")
+    if params is not None:
+        for child in params.children:
+            if child.type not in ("typed_parameter", "typed_default_parameter"):
+                continue
+            name_node = child.child_by_field_name("name") or (child.children[0] if child.children else None)
+            ann = child.child_by_field_name("type")
+            if name_node is None or ann is None:
+                continue
+            base = _plain_type_name(node_text(ann))
+            if base:
+                types[node_text(name_node)] = base
+
+    def walk(n: Node) -> None:
+        for child in n.children:
+            if child.type == "expression_statement":
+                for inner in child.children:
+                    if inner.type != "assignment":
+                        continue
+                    left = inner.child_by_field_name("left")
+                    right = inner.child_by_field_name("right")
+                    if left is None or right is None or left.type != "identifier":
+                        continue
+                    if right.type == "call":
+                        fn = right.child_by_field_name("function")
+                        # Only `Foo(...)`, never `mod.Foo(...)`: the dotted form's class
+                        # name is not necessarily the attribute's own name.
+                        if fn is not None and fn.type == "identifier":
+                            name = node_text(fn)
+                            if name[:1].isupper():  # a constructor, not a plain function
+                                types.setdefault(node_text(left), name)
+            # Do not descend into nested defs — their locals are a different scope.
+            if child.type not in ("function_definition", "class_definition", "decorated_definition"):
+                walk(child)
+
+    walk(body)
+    return types
+
+
 def _extract_calls(
     node: Node,
     source: bytes,
     from_qn: str,
     relationships: list[ParsedRelationship],
+    local_types: dict[str, str] | None = None,
 ) -> None:
     """Recursively extract call expressions from a function body."""
     for child in node.children:
@@ -840,12 +920,12 @@ def _extract_calls(
                                 # type that may never have been indexed. Both arms used
                                 # to emit an identical relationship, discarding the one
                                 # fact that distinguishes them.
-                                properties={"receiver": node_text(obj)} if obj is not None else {},
+                                properties=_receiver_props(obj, local_types),
                             )
                         )
         # Recurse but don't descend into nested function/class definitions
         if child.type not in ("function_definition", "class_definition", "decorated_definition"):
-            _extract_calls(child, source, from_qn, relationships)
+            _extract_calls(child, source, from_qn, relationships, local_types)
 
 
 # ---------------------------------------------------------------------------

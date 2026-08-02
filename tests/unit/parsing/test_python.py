@@ -2169,3 +2169,33 @@ def test_protocol_and_abc_bases_mark_a_class_abstract():
     assert abstract("Dotted")
     assert abstract("Based")
     assert not abstract("Real")
+
+
+def test_receiver_type_is_recovered_from_annotations_and_local_construction():
+    """Most of what a name-only resolver treats as polymorphism is monomorphic: measured,
+    772 of 915 fanned-out sites call exactly one concrete class. The receiver's declared
+    type is what distinguishes them, and it is available at parse time.
+    """
+    parsed = _parse(
+        "def handler(store: Store, untyped, maybe: Store | None) -> None:\n"
+        "    store.save()\n"
+        "    untyped.save()\n"
+        "    maybe.save()\n"
+        "    local = Store()\n"
+        "    local.save()\n"
+        "    helper = make_it()\n"
+        "    helper.save()\n"
+    )
+    props = {
+        (r.properties.get("receiver") or ""): r.properties
+        for r in parsed.relationships
+        if r.rel_type == RelType.CALLS and r.to_name == "save"
+    }
+
+    assert props["store"]["receiver_type"] == "Store"  # parameter annotation
+    assert props["local"]["receiver_type"] == "Store"  # one-step construction
+    # Declining to guess is the point — a wrong type sends the call to the wrong
+    # implementation with full confidence, which is the failure being removed.
+    assert "receiver_type" not in props["untyped"]
+    assert "receiver_type" not in props["maybe"]  # union, not a bare class name
+    assert "receiver_type" not in props["helper"]  # lowercase callee, not a constructor

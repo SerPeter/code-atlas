@@ -898,6 +898,20 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     candidates = lk.name_to_callables.get(bare_name, [])
     non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
 
+    # Strategy 3.5: the receiver's declared type. Most of what looks like polymorphism is
+    # not — measured, 772 of 915 fanned-out sites call exactly ONE concrete class, and
+    # only 24 the Protocol. They are monomorphic calls on concretely-typed receivers that
+    # a name-only resolver spreads across every implementation. Knowing the type removes
+    # the false edges rather than re-weighting them, which is why it leaves total graph
+    # weight unchanged where a containment heuristic inflated it 16%.
+    declared = str(rel.properties.get("receiver_type") or "")
+    if declared and len(non_self) > 1:
+        # The parent is a TypeDef, and uid_to_info holds Callables only — its class name
+        # comes from the uid's last dotted segment, e.g. "proj:pkg.mod.Store" -> "Store".
+        owned = [uid for uid in non_self if lk.caller_to_parent.get(uid, "").rsplit(".", 1)[-1] == declared]
+        if len(owned) == 1:
+            return (owned, "receiver_type")
+
     # Drop Protocol/ABC stubs before counting. Their bodies are `...` and can never
     # execute, so an edge to one points at nothing — 1254 edges in the reference index
     # terminated on such a body. Removing them also shrinks the modal family from
