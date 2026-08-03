@@ -1697,6 +1697,13 @@ class SqliteGraphClient:
                 )
         await conn.commit()
 
+    async def resolve_protocol_conformance(self, project_name: str) -> int:
+        """Not implemented on the embedded backend — the containment test needs a set
+        comparison per (protocol, class) pair, which is a join this schema makes
+        expensive. Returns 0 rather than silently claiming there are no protocols."""
+        _ = project_name
+        return 0
+
     async def resolve_inherits(self, project_name: str, inherit_rels: list[ParsedRelationship]) -> None:
         """In-project TypeDef wins; otherwise an imported ExternalSymbol of that name."""
         if not inherit_rels:

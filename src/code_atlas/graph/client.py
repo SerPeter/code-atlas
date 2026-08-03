@@ -2488,6 +2488,67 @@ class GraphClient:
             {"rels": params},
         )
 
+    async def resolve_protocol_conformance(self, project_name: str) -> int:
+        """Link a class to every self-declared Protocol whose method set it satisfies.
+
+        Python Protocol conformance is structural — `GraphClient` and `SqliteGraphClient`
+        both satisfy `GraphBackend` and neither names it — so the graph held nothing
+        implementing this codebase's central abstraction. 88 of its 102 `...`-bodied stub
+        methods had no inbound edge at all.
+
+        ADR-0023 rejected method-set containment and this is deliberately NOT that. There,
+        containment had to INFER which class in a candidate set was the interface, and it
+        elected small test doubles (`RecordingBus`, `FakeDrainBus`) for having the fewest
+        methods. Here the interface identifies itself by inheriting `Protocol`; containment
+        only answers "does this class satisfy it". Measured on this repo, that difference
+        is 90/98 precision versus 20 of 20.
+
+        Guards, each earning its place:
+        - The Protocol must declare at least one non-dunder method. A zero-method Protocol
+          is satisfied by everything.
+        - A Protocol is never recorded as an implementation of another Protocol. Two such
+          pairs showed up here (GraphBackend satisfies SearchGraph and GraphExecutor);
+          true, but not what "implements" should return.
+        - `inferred: true` on the edge, so a consumer can tell a structural match from a
+          declared one. `_fetch_community_inputs` reads CALLS only, so this stays out of
+          the Leiden weight space without needing a decision.
+        """
+        rows = await self.execute(
+            f"MATCH (p:{NodeLabel.TYPE_DEF} {{project_name: $project}})"
+            f"-[:{RelType.INHERITS}]->({{name: 'Protocol'}}) "
+            f"MATCH (p)-[:{RelType.DEFINES}]->(pm:{NodeLabel.CALLABLE}) "
+            "WHERE NOT pm.name STARTS WITH '__' "
+            "WITH p, collect(DISTINCT pm.name) AS pms "
+            "WHERE size(pms) > 0 "
+            f"MATCH (c:{NodeLabel.TYPE_DEF} {{project_name: $project}}) "
+            "WHERE c.kind = 'class' AND c.uid <> p.uid "
+            f"AND NOT (c)-[:{RelType.INHERITS}]->({{name: 'Protocol'}}) "
+            f"MATCH (c)-[:{RelType.DEFINES}]->(cm:{NodeLabel.CALLABLE}) "
+            "WITH p, pms, c, collect(DISTINCT cm.name) AS cms "
+            "WHERE all(x IN pms WHERE x IN cms) "
+            f"MERGE (c)-[e:{RelType.IMPLEMENTS}]->(p) "
+            "SET e.inferred = true "
+            "RETURN count(e) AS c",
+            {"project": project_name},
+        )
+
+        # Method level, derived from the class level rather than matched independently:
+        # once LogNotifier is known to satisfy Notifier, its `notify` is the thing that
+        # satisfies `Notifier.notify`. Deriving it means the two answers can never
+        # disagree, and "which methods implement this stub?" stops being unanswerable for
+        # the 88 GraphBackend methods that had no inbound edge at all.
+        await self.execute_write(
+            f"MATCH (c:{NodeLabel.TYPE_DEF})-[:{RelType.IMPLEMENTS}]->(p:{NodeLabel.TYPE_DEF}) "
+            "WHERE c.project_name = $project "
+            f"MATCH (p)-[:{RelType.DEFINES}]->(pm:{NodeLabel.CALLABLE}) "
+            f"MATCH (c)-[:{RelType.DEFINES}]->(cm:{NodeLabel.CALLABLE}) "
+            "WHERE cm.name = pm.name AND NOT pm.name STARTS WITH '__' "
+            f"MERGE (cm)-[e:{RelType.IMPLEMENTS}]->(pm) "
+            "SET e.inferred = true",
+            {"project": project_name},
+        )
+        return rows[0]["c"] if rows else 0
+
     async def resolve_type_refs(  # noqa: PLR0912
         self,
         project_name: str,

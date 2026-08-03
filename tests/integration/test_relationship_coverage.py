@@ -281,7 +281,7 @@ CASES: tuple[Case, ...] = (
         "which methods implement the structural Notifier.notify?",
         "MATCH (a)-[r]->(b) WHERE a.project_name=$p AND b.qualified_name ENDS WITH 'Notifier.notify' "
         "AND type(r) IN ['IMPLEMENTS','OVERRIDES'] RETURN a.qualified_name AS hit",
-        "MISSING",
+        "LINKED",
         "structural conformance: LogNotifier.notify names no base. Measured on the real repo, "
         "88 of 102 `...`-bodied stub methods are GraphBackend Protocol methods with no inbound "
         "IMPLEMENTS at all.",
@@ -359,7 +359,7 @@ CASES: tuple[Case, ...] = (
         "protocol-conformance",
         "what implements the Notifier Protocol?",
         "MATCH (a)-[:INHERITS|IMPLEMENTS]->(b) WHERE a.project_name=$p AND b.name='Notifier' RETURN a.name AS hit",
-        "MISSING",
+        "LINKED",
         "structural conformance — LogNotifier names no base",
     ),
     Case(

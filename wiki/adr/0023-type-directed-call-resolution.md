@@ -7,6 +7,10 @@ expression and named receiver-type inference as the prerequisite it was a step t
 [ADR-0014](./0014-calls-edge-confidence.md) and [ADR-0017](./0017-calls-edge-weights.md) again, with two new strategies
 and one new confidence path.
 
+Its rejection of method-set containment is **narrowed** by [ADR-0025](./0025-structural-protocol-conformance.md): that
+rejection holds for inferring _which class is the interface_, which is what this ADR needed. It does not hold for
+testing conformance against a Protocol that declares itself — measured at 20 of 20 versus 90 of 98 here.
+
 ## Context
 
 `blast_radius` reported `ambiguous_only` for every caller of `GraphClient.resolve_calls`, because the candidate set was

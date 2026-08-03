@@ -740,6 +740,11 @@ class ASTConsumer(TierConsumer):
             if proj_inherits:
                 await self.graph.resolve_inherits(project_name, proj_inherits)
 
+            # Whole-project sweep, not per-file: conformance is a property of two classes
+            # that may live anywhere, so it can only run once every file is upserted.
+            if proj_inherits:
+                await self.graph.resolve_protocol_conformance(project_name)
+
             proj_refs = [r for r in self._pending_ref_rels if r.from_qualified_name.startswith(project_name + ":")]
             if proj_refs:
                 await self.graph.resolve_value_references(project_name, proj_refs)

@@ -35,6 +35,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0022](./0022-call-resolution-requires-a-grounded-receiver.md) | Call Resolution Requires a Grounded Receiver                   | Extended by ADR-0023   | 2026-08-01 |
 | [0023](./0023-type-directed-call-resolution.md)                | Type-Directed Call Resolution                                  | Accepted               | 2026-08-02 |
 | [0024](./0024-memgraph-312-for-vector-index-gc.md)             | Upgrade to Memgraph 3.12.0 (Vector-Index GC Segfault)          | Accepted               | 2026-08-02 |
+| [0025](./0025-structural-protocol-conformance.md)              | Structural Protocol Conformance by Method-Set Containment      | Accepted               | 2026-08-03 |
 
 ## Creating a New ADR
 
