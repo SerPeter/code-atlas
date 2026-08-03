@@ -262,6 +262,50 @@ def helper(text: str) -> str:
     """Only ever called from inside a nested function."""
     return text.upper()
 ''',
+    "boot.py": '''
+"""Everything that runs at import time, which is not a function body."""
+import asyncio
+from dataclasses import dataclass, field
+
+
+class Settings:
+    """Constructed at module scope, never inside any function."""
+
+
+def _new_flag() -> asyncio.Event:
+    return asyncio.Event()
+
+
+def _validate_wiring() -> None:
+    """Called once at the foot of this module and nowhere else."""
+
+
+class Limit:
+    """Named only by a module constant's annotation."""
+
+
+SETTINGS = Settings()
+LIMITS: tuple[Limit, ...] = ()
+
+
+@dataclass
+class Boot:
+    """A DECORATED class body — the guard for decorated functions used to skip these too."""
+
+    flag: asyncio.Event = field(default_factory=_new_flag)
+
+
+class Scanner:
+    def scan(self) -> None:
+        """Hands its own bound method to a scheduler instead of calling it."""
+        asyncio.get_event_loop().run_in_executor(None, self._walk)
+
+    def _walk(self) -> None:
+        """Only ever passed as a value via `self._walk`."""
+
+
+_validate_wiring()
+''',
 }
 
 
@@ -454,6 +498,48 @@ CASES: tuple[Case, ...] = (
         "who constructs DEFAULT_SERVICE?",
         "MATCH (n:Value) WHERE n.project_name=$p AND n.name='DEFAULT_SERVICE' RETURN n.qualified_name AS hit",
         "LINKED",
+    ),
+    Case(
+        "import-time-call",
+        "what reaches _validate_wiring(), called only at the foot of its own module?",
+        # Asked as "any edge", not CALLS: the parser cannot tell an import-time invocation
+        # from a construction, so it emits both and lets each resolver claim its own.
+        "MATCH (a)-[r]->(b) WHERE a.project_name=$p AND b.name='_validate_wiring' "
+        "AND type(r) IN ['CALLS','REFERENCES','USES_TYPE'] RETURN a.qualified_name AS hit",
+        "LINKED",
+        "every CALLS edge used to have a Callable source and not one had a Module source, so "
+        "a function invoked only at import time looked unreachable.",
+    ),
+    Case(
+        "module-scope-construction",
+        "what uses Settings, constructed at module scope with no annotation?",
+        "MATCH (a)-[r]->(b) WHERE a.project_name=$p AND b.name='Settings' "
+        "AND type(r) IN ['USES_TYPE','CALLS','REFERENCES'] RETURN a.qualified_name AS hit",
+        "LINKED",
+    ),
+    Case(
+        "annotated-module-constant",
+        "what uses Limit, named only inside a module constant's annotation?",
+        "MATCH (a)-[:USES_TYPE]->(b) WHERE a.project_name=$p AND b.name='Limit' RETURN a.qualified_name AS hit",
+        "LINKED",
+        "the annotation scan was gated to class fields, so `LIMITS: tuple[Limit, ...]` said nothing.",
+    ),
+    Case(
+        "decorated-class-body-default",
+        "what reaches _new_flag, handed to field(default_factory=...) inside a @dataclass?",
+        "MATCH (a)-[:REFERENCES]->(b) WHERE a.project_name=$p AND b.name='_new_flag' RETURN a.qualified_name AS hit",
+        "LINKED",
+        "the decorated_definition guard exists to skip decorated FUNCTIONS; it skipped decorated "
+        "classes too, and @dataclass is how most classes here are written.",
+    ),
+    Case(
+        "self-method-as-value",
+        "what reaches Scanner._walk, only ever passed as `self._walk`?",
+        "MATCH (a)-[:REFERENCES]->(b) WHERE a.project_name=$p AND b.qualified_name ENDS WITH 'Scanner._walk' "
+        "RETURN a.qualified_name AS hit",
+        "LINKED",
+        "`self.` pins the name to one class, so the methods-only exclusion (which exists because a "
+        "BARE name matching a method is coincidence) does not apply.",
     ),
 )
 

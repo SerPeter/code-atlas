@@ -1772,7 +1772,9 @@ class SqliteGraphClient:
             caller_qn = from_uid.split(":", 1)[1] if ":" in from_uid else from_uid
             parts = caller_qn.split(".")
             module_uid: str | None = None
-            for i in range(len(parts) - 1, 0, -1):
+            # Same rule as _resolve_one_call: a source that is not a Callable is the module
+            # itself, so its own uid is the import scope rather than one segment up.
+            for i in range(len(parts) if from_uid not in lookup.uid_to_info else len(parts) - 1, 0, -1):
                 candidate = f"{project_name}:{'.'.join(parts[:i])}"
                 if candidate in lookup.import_map:
                     module_uid = candidate

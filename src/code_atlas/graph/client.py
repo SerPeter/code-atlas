@@ -901,11 +901,16 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     if receiver_type and lk.typedef_names and receiver_type not in lk.typedef_names:
         return None
 
-    # Derive caller's module uid — find the longest module prefix in import_map
+    # Derive caller's module uid — find the longest module prefix in import_map.
+    # A caller absent from uid_to_info is not a Callable, so it IS the module (a call at
+    # module scope): start one segment higher and let its own uid match. Stripping a
+    # segment first, as a Callable caller must, walked `pkg.mod` up to the PACKAGE and
+    # silently read another module's imports — which is the one thing standing between a
+    # module-scope `Field(...)` and a wrong edge onto a same-named project function.
     caller_qn = caller_uid.split(":", 1)[1] if ":" in caller_uid else caller_uid
     parts = caller_qn.split(".")
     module_uid: str | None = None
-    for i in range(len(parts) - 1, 0, -1):
+    for i in range(len(parts) if caller_uid not in lk.uid_to_info else len(parts) - 1, 0, -1):
         candidate = f"{project_name}:{'.'.join(parts[:i])}"
         if candidate in lk.import_map:
             module_uid = candidate
@@ -2142,8 +2147,12 @@ class GraphClient:
                 for (f, t), facts in edges.items()
             ]
             await self.execute_write(
+                # Source is deliberately unlabelled: a call at module scope runs at import
+                # time and belongs to the Module, and constraining the source to :Callable
+                # dropped those edges without an error. The TARGET stays :Callable — only a
+                # Callable can be executed.
                 f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.CALLABLE} {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
+                f"MATCH (a {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
                 f"MERGE (a)-[e:{RelType.CALLS}]->(b) "
                 f"SET e.confidence = r.confidence, e.strategy = r.strategy, "
                 f"e.candidate_count = r.candidate_count, e.from_test = r.from_test, e.weight = r.weight",
@@ -2677,7 +2686,9 @@ class GraphClient:
             caller_qn = from_uid.split(":", 1)[1] if ":" in from_uid else from_uid
             parts = caller_qn.split(".")
             module_uid: str | None = None
-            for i in range(len(parts) - 1, 0, -1):
+            # Same rule as _resolve_one_call: a source that is not a Callable is the module
+            # itself, so its own uid is the import scope rather than one segment up.
+            for i in range(len(parts) if from_uid not in lookup.uid_to_info else len(parts) - 1, 0, -1):
                 candidate = f"{project_name}:{'.'.join(parts[:i])}"
                 if candidate in lookup.import_map:
                     module_uid = candidate

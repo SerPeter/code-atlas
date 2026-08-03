@@ -915,7 +915,7 @@ def _process_self_attributes(
                                 from_qualified_name=f"{project_name}:{qn}",
                                 rel_type=RelType.USES_TYPE,
                                 to_name=type_name,
-                                properties={"on": "field"},
+                                properties={"on": "value"},
                             )
                         )
             if child.type not in ("function_definition", "class_definition", "decorated_definition"):
@@ -1137,13 +1137,13 @@ def _process_assignment(
         # resolves in the field's own scope rather than through the Callable lookup that
         # signature-derived USES_TYPE uses — a Value is not in that lookup at all.
         annotation = child.child_by_field_name("type")
-        if annotation is not None and kind == ValueKind.FIELD:
+        if annotation is not None:
             relationships.extend(
                 ParsedRelationship(
                     from_qualified_name=f"{project_name}:{qn}",
                     rel_type=RelType.USES_TYPE,
                     to_name=type_name,
-                    properties={"on": "field"},
+                    properties={"on": "value"},
                 )
                 for type_name in _collect_type_names_from_annotation(annotation)
             )
@@ -1273,12 +1273,23 @@ def _filter_value_references(entities: list[ParsedEntity], relationships: list[P
     # filter. It is kept on a different ground: the name came from a subscript CALL, which
     # is unambiguous about being a lookup rather than an incidental identifier.
     known_tables = {e.name for e in entities if e.label == NodeLabel.VALUE}
-    relationships[:] = [
-        r
-        for r in relationships
-        if r.rel_type != RelType.REFERENCES
-        or (r.to_name in known_tables if r.properties.get("via") == "table" else r.to_name in known)
-    ]
+    # `self.x` survives the methods-only exclusion above for the reason that exclusion
+    # exists: it was there because a BARE name matching a method is coincidence. An
+    # explicit `self.` receiver is not a coincidence, so a method is exactly what it
+    # should match — but only one declared in this same file.
+    local_methods = {e.name for e in entities if e.label == NodeLabel.CALLABLE}
+
+    def _keep(r: ParsedRelationship) -> bool:
+        if r.rel_type != RelType.REFERENCES:
+            return True
+        via = r.properties.get("via")
+        if via == "table":
+            return r.to_name in known_tables
+        if via == "self":
+            return r.to_name in local_methods
+        return r.to_name in known
+
+    relationships[:] = [r for r in relationships if _keep(r)]
 
 
 def _extract_table_references(node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
@@ -1312,14 +1323,72 @@ def _extract_module_level_references(node: Node, module_uid: str, relationships:
     bodies are skipped because _extract_calls already covers them and would double up;
     class bodies are included, since `field(default_factory=_ready_event)` executes at
     class-creation time and the name it hands over is a real reference.
+
+    A `decorated_definition` is only skipped when it wraps a FUNCTION. Skipping it wholesale
+    also skipped every decorated class, so an undecorated `class Plain` emitted
+    `REFERENCES -> _ready_event` and the identical `@dataclass class AppContext` emitted
+    nothing — and `@dataclass` is how this codebase writes most of its classes.
     """
     for child in node.children:
         if child.type == "call":
             _extract_value_references(child, module_uid, relationships)
+            _extract_module_level_call(child, module_uid, relationships)
         elif child.type == "dictionary":
             _extract_table_references(child, module_uid, relationships)
-        if child.type not in ("function_definition", "decorated_definition"):
+        if not _is_decorated_function(child) and child.type != "function_definition":
             _extract_module_level_references(child, module_uid, relationships)
+
+
+def _extract_module_level_call(call_node: Node, module_uid: str, relationships: list[ParsedRelationship]) -> None:
+    """A call that runs at import time, attributed to the module that runs it.
+
+    Bare identifiers ONLY. `_validate_schema_completeness()` at the foot of a module is
+    lexically grounded exactly as `helper()` is inside a function, so the same reasoning
+    that lets ADR-0022 trust one lets it trust the other. `re.compile(...)`,
+    `app.add_typer(...)` and the other 109 dotted call sites are the case that ADR
+    refuses to guess at — the receiver is a module-level name with no declared type, so
+    the attribute says nothing about which class is being called.
+
+    Without this, `_extract_calls` never saw module scope at all: every one of the 9,023
+    CALLS edges had a Callable source and not one had a Module source, so a function
+    called only at import time looked unreachable.
+
+    Emits BOTH a call and a type use, because the name alone cannot say which it is:
+    `_validate_schema_completeness()` invokes a function, `OutputMode()` constructs a
+    class, and both parse identically. Each resolver constrains its own target — CALLS
+    must land on a Callable, USES_TYPE on a TypeDef — so at most one of the pair can
+    resolve, and a builtin like `frozenset()` matches neither and resolves to nothing.
+    Guessing from capitalisation instead would miss every lowercase factory class.
+    """
+    func = call_node.child_by_field_name("function")
+    if func is None or func.type != "identifier":
+        return
+    name = node_text(func)
+    relationships.append(
+        ParsedRelationship(
+            from_qualified_name=module_uid,
+            rel_type=RelType.CALLS,
+            to_name=name,
+        )
+    )
+    relationships.append(
+        ParsedRelationship(
+            from_qualified_name=module_uid,
+            rel_type=RelType.USES_TYPE,
+            to_name=name,
+            # Same routing as an annotated Value: resolved in module scope by
+            # resolve_value_references, not through the Callable lookup.
+            properties={"on": "value"},
+        )
+    )
+
+
+def _is_decorated_function(node: Node) -> bool:
+    """A `decorated_definition` wrapping a function rather than a class."""
+    if node.type != "decorated_definition":
+        return False
+    target = node.child_by_field_name("definition")
+    return target is None or target.type == "function_definition"
 
 
 def _extract_value_references(call_node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
@@ -1331,20 +1400,24 @@ def _extract_value_references(call_node: Node, from_qn: str, relationships: list
     dead-code hits in parsing/languages were every language's own entry point, reachable
     only through `parse_func=`.
 
-    A bare identifier only. `mod.handler` is skipped: the attribute's name is not
-    necessarily the callable's own, which is the same trap ADR-0022 recorded for calls.
+    A bare identifier, or `self.<name>` / `cls.<name>`. Any other attribute is skipped:
+    `mod.handler`'s name is not necessarily the callable's own, which is the same trap
+    ADR-0022 recorded for calls. `self` is not that case — it pins the name to the
+    enclosing class, so `asyncio.to_thread(self._walk_dir, d)` names exactly one method.
     """
     args = call_node.child_by_field_name("arguments")
     if args is None:
         return
     for arg in args.children:
-        target = None
-        if arg.type == "identifier":
-            target = arg
-        elif arg.type == "keyword_argument":
-            value = arg.child_by_field_name("value")
-            if value is not None and value.type == "identifier":
-                target = value
+        node = arg.child_by_field_name("value") if arg.type == "keyword_argument" else arg
+        if node is None:
+            continue
+        if node.type == "identifier":
+            target, via = node, ""
+        elif node.type == "attribute" and _is_self_attribute(node):
+            target, via = node.child_by_field_name("attribute"), "self"
+        else:
+            continue
         if target is None:
             continue
         relationships.append(
@@ -1352,8 +1425,18 @@ def _extract_value_references(call_node: Node, from_qn: str, relationships: list
                 from_qualified_name=from_qn,
                 rel_type=RelType.REFERENCES,
                 to_name=node_text(target),
+                properties={"via": via} if via else {},
             )
         )
+
+
+def _is_self_attribute(node: Node) -> bool:
+    """``self.x`` / ``cls.x`` — an attribute whose receiver is the enclosing instance."""
+    obj = node.child_by_field_name("object")
+    return obj is not None and obj.type == "identifier" and node_text(obj) in _SELF_RECEIVER_NAMES
+
+
+_SELF_RECEIVER_NAMES: frozenset[str] = frozenset({"self", "cls"})
 
 
 def _extract_calls(
