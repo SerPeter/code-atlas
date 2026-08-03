@@ -262,6 +262,14 @@ def helper(text: str) -> str:
     """Only ever called from inside a nested function."""
     return text.upper()
 ''',
+    "sinks.py": '''
+"""A second `flush` implementation, deliberately in a different file from drain()."""
+
+
+class BackupSink:
+    def flush(self) -> None:
+        """Same name as PrimarySink.flush, different file — the duck-typed twin."""
+''',
     "boot.py": '''
 """Everything that runs at import time, which is not a function body."""
 import asyncio
@@ -302,6 +310,16 @@ class Scanner:
 
     def _walk(self) -> None:
         """Only ever passed as a value via `self._walk`."""
+
+
+class PrimarySink:
+    def flush(self) -> None:
+        """Co-located with the only caller, which does NOT mean it is the callee."""
+
+
+def drain(sink) -> None:
+    """`sink` is untyped, so `sink.flush()` must not bind to the same-file PrimarySink."""
+    sink.flush()
 
 
 _validate_wiring()
@@ -531,6 +549,16 @@ CASES: tuple[Case, ...] = (
         "LINKED",
         "the decorated_definition guard exists to skip decorated FUNCTIONS; it skipped decorated "
         "classes too, and @dataclass is how most classes here are written.",
+    ),
+    Case(
+        "duck-typed-twin-not-stolen-by-co-location",
+        "does sink.flush() reach the OTHER implementation, not just the co-located one?",
+        "MATCH (a)-[:CALLS]->(b) WHERE a.project_name=$p AND a.qualified_name ENDS WITH 'boot.drain' "
+        "AND b.name='flush' AND NOT b.qualified_name CONTAINS 'PrimarySink' RETURN b.qualified_name AS hit",
+        "LINKED",
+        "same-file matching is a LEXICAL lookup, and `sink.flush()` is not looked up lexically. "
+        "Ungated it awarded the call to the co-located class at confidence 'resolved', so the real "
+        "implementation in another file read dead while the wrong one absorbed its only caller.",
     ),
     Case(
         "self-method-as-value",

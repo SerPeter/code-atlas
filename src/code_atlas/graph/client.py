@@ -830,6 +830,14 @@ def _typedef_init_uid(typedef_uid: str, lk: _CallLookup) -> str | None:
 # indexer may never have seen.
 _SELF_RECEIVERS = frozenset({"self", "cls", "this"})
 
+# Receivers a name is looked up THROUGH lexically rather than on some object whose type
+# the indexer may never have seen. `super()` belongs here and `self` does not cover it:
+# it names the caller's own base, so it is a lexical reference in exactly the sense that
+# matters. Excluding it sent all 8 `super().__init__()` sites to a 47-way project-wide
+# fanout — 376 edges asserting nothing, and the largest single source of noise the
+# receiver gate would otherwise have introduced.
+_GROUNDED_RECEIVERS = _SELF_RECEIVERS | {"super()"}
+
 # Strategies whose match is a name coincidence rather than a lexical resolution. Kept as
 # edges (ADR-0014 materializes rather than discards) but never marked resolved.
 _UNVERIFIED_STRATEGIES = frozenset({"unverified_receiver", "unverified_wide"})
@@ -901,6 +909,15 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     if receiver_type and lk.typedef_names and receiver_type not in lk.typedef_names:
         return None
 
+    # Strategies 2 and 3 are LEXICAL lookups, and only a grounded receiver is looked up
+    # lexically. `bus.acquire_indexer_lease()` is not: co-location in one file is a
+    # coincidence, not evidence of identity — the very reasoning ADR-0022 used to damp
+    # project-wide matches. Ungated, Strategy 3 awarded that call to the same-file
+    # `EventBus` twin at confidence "resolved" and full weight, so `SqliteEventBus`'s
+    # method read dead while the wrong twin absorbed its only caller.
+    receiver = str(rel.properties.get("receiver") or "")
+    grounded_receiver = not receiver or receiver in _GROUNDED_RECEIVERS
+
     # Derive caller's module uid — find the longest module prefix in import_map.
     # A caller absent from uid_to_info is not a Callable, so it IS the module (a call at
     # module scope): start one segment higher and let its own uid match. Stripping a
@@ -931,7 +948,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
             return ([init_uid], "import")
 
     # Strategy 2: Same-class sibling
-    if caller_uid in lk.caller_to_parent:
+    if grounded_receiver and caller_uid in lk.caller_to_parent:
         parent_uid = lk.caller_to_parent[caller_uid]
         for sibling_uid in lk.parent_children.get(parent_uid, []):
             if sibling_uid == caller_uid:
@@ -943,7 +960,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     # Strategy 3: Same-file match
     caller_info = lk.uid_to_info.get(caller_uid)
     caller_fp = caller_info[1] if caller_info else ""
-    if caller_fp:
+    if grounded_receiver and caller_fp:
         for uid, fp, _vis in lk.name_to_callables.get(bare_name, []):
             if fp == caller_fp and uid != caller_uid and not _is_abstract_stub(uid, lk):
                 return ([uid], "same_file")
@@ -996,7 +1013,6 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
         # the best guess available — but it must not claim to be resolved. Verified in
         # the field: EmbedCache.clear called Valkey's .scan() and this branch pointed it
         # at FileScope.scan with confidence "resolved" and full weight.
-        receiver = str(rel.properties.get("receiver") or "")
         if receiver and receiver not in _SELF_RECEIVERS:
             return (non_self, "unverified_receiver")
         return (non_self, "project_unique")

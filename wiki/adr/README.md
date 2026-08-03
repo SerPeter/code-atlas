@@ -37,6 +37,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0024](./0024-memgraph-312-for-vector-index-gc.md)             | Upgrade to Memgraph 3.12.0 (Vector-Index GC Segfault)          | Accepted               | 2026-08-02 |
 | [0025](./0025-structural-protocol-conformance.md)              | Structural Protocol Conformance by Method-Set Containment      | Accepted               | 2026-08-03 |
 | [0026](./0026-resolution-is-replayed-not-batch-final.md)       | Resolution Is Replayed, Not Batch-Final                        | Accepted               | 2026-08-03 |
+| [0027](./0027-lexical-strategies-need-a-grounded-receiver.md)  | The Lexical Strategies Need a Grounded Receiver Too            | Accepted               | 2026-08-04 |
 
 ## Creating a New ADR
 

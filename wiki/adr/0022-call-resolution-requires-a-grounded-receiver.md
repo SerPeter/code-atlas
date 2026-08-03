@@ -11,6 +11,10 @@ decision's gap: the damping here reached only the single-candidate case.
 Amended by [ADR-0026](./0026-resolution-is-replayed-not-batch-final.md): the strategies below are only as good as the
 graph they run against, and a batch-local run produced exactly the confidently-wrong edge this ADR exists to prevent.
 
+Completed by [ADR-0027](./0027-lexical-strategies-need-a-grounded-receiver.md): the receiver test below was applied to
+the project-wide strategies only, and the same-file strategy went on binding attribute calls to whatever shared the
+caller's file — at full confidence, which is worse than the ambiguity this ADR set out to mark.
+
 ## Context
 
 A reader with no knowledge of this codebase, shown only a rendered `summarize_module` outline, flagged
