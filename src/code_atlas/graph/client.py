@@ -834,6 +834,35 @@ _SELF_RECEIVERS = frozenset({"self", "cls", "this"})
 # edges (ADR-0014 materializes rather than discards) but never marked resolved.
 _UNVERIFIED_STRATEGIES = frozenset({"unverified_receiver", "unverified_wide"})
 
+# Strategies whose answer the caller's own file already settles: a sibling method or a
+# same-file definition is upserted in the same batch as the caller, so no later batch can
+# change it. Every other strategy reads the project-wide candidate list and is therefore
+# only as good as the graph at that instant. `unverified_receiver` is the sharp edge:
+# it fires when exactly ONE candidate name exists, so a callee whose class has not been
+# indexed yet leaves a confident edge pointing at the wrong implementation, which nothing
+# later revisits. Resolution against a partial graph is stale in the same way an
+# unresolved call is, and the consumer replays both — see ASTConsumer._retry_rels.
+_FILE_LOCAL_STRATEGIES = frozenset({"sibling", "same_file"})
+
+
+@dataclass(frozen=True)
+class ReplayableRels:
+    """What a resolver could not settle for good, split by what replaying it costs.
+
+    ``unresolved`` matched nothing. It may match once a later batch upserts the
+    target, and a replay that still fails writes nothing at all — cheap enough to
+    redo on every flush, which is also what lets a running daemon link an existing
+    caller to a function added afterwards.
+
+    ``stale_candidates`` *did* resolve, but through the project-wide candidate
+    list, so the answer is only as good as the graph at that instant. Replaying
+    one rewrites every edge it owns, so the whole class is worth redoing exactly
+    once — at the end of a run, when the candidate list is finally complete.
+    """
+
+    unresolved: list[ParsedRelationship] = field(default_factory=list)
+    stale_candidates: list[ParsedRelationship] = field(default_factory=list)
+
 
 def _is_abstract_stub(uid: str, lk: _CallLookup) -> bool:
     """Whether *uid*'s body can never be what runs — a `...` body or @abstractmethod.
@@ -1751,15 +1780,22 @@ class GraphClient:
         self,
         project_name: str,
         import_rels: list[ParsedRelationship],
-    ) -> None:
+    ) -> ReplayableRels:
         """Resolve IMPORTS relationships after all files in a batch have been upserted.
 
         Classifies each import as internal (target exists in graph) or external
         (no match → create ExternalPackage/ExternalSymbol stubs), then creates
         IMPORTS edges for both.
+
+        Every rel whose exact dotted name matched nothing comes back as a
+        ``stale_candidate``: it is either genuinely external, or an in-project
+        target that had not been upserted yet, and nothing here can tell those
+        apart. Both cases resolve to *something* — a stub, or the dotted-prefix
+        fallback below — so a replay would rewrite edges either way, which is why
+        none of them go in ``unresolved``.
         """
         if not import_rels:
-            return
+            return ReplayableRels()
 
         # 1. Query all internal entity qualified_name → uid.
         #    Every referenced-not-defined label is excluded: their
@@ -1784,6 +1820,7 @@ class GraphClient:
         import_edges: list[dict[str, Any]] = []  # [{from_uid, to_uid, type_only?}]
         ext_packages: dict[str, dict[str, str]] = {}  # top_level → {uid, name, qn, project_name}
         ext_symbols: dict[str, dict[str, str]] = {}  # dotted_path → {uid, name, qn, package, project_name}
+        inexact: list[ParsedRelationship] = []
 
         for rel in import_rels:
             to_name = rel.to_name
@@ -1798,11 +1835,17 @@ class GraphClient:
             # a different namespace than path-derived qualified_names, so a
             # prefix hit there would misclassify an external import as internal.
             target_uid = internal_map.get(to_name)
-            if target_uid is None and from_uid in py_importers:
-                prefix = to_name
-                while target_uid is None and "." in prefix:
-                    prefix = prefix.rsplit(".", 1)[0]
-                    target_uid = internal_map.get(prefix)
+            if target_uid is None:
+                # Retry later: the name may belong to a module this run has not
+                # upserted yet. The prefix fallback below hides that — it lands
+                # on the root Package, which looks like a resolved import and is
+                # useless for the import-match strategy in _resolve_one_call.
+                inexact.append(rel)
+                if from_uid in py_importers:
+                    prefix = to_name
+                    while target_uid is None and "." in prefix:
+                        prefix = prefix.rsplit(".", 1)[0]
+                        target_uid = internal_map.get(prefix)
             if target_uid is not None:
                 edge: dict[str, Any] = {"from_uid": from_uid, "to_uid": target_uid}
                 if is_type_only:
@@ -1902,11 +1945,13 @@ class GraphClient:
             )
 
         logger.debug(
-            "Resolved {} imports ({} packages, {} symbols created)",
+            "Resolved {} imports ({} packages, {} symbols created, {} inexact)",
             len(import_rels),
             len(ext_packages),
             len(ext_symbols),
+            len(inexact),
         )
+        return ReplayableRels(stale_candidates=inexact)
 
     async def resolve_config_refs(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
         """MERGE EnvVar/ResourceFile nodes and their READS_ENV/REFERENCES_FILE edges.
@@ -1998,7 +2043,7 @@ class GraphClient:
         lookup: _CallLookup | None = None,
         name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
         test_patterns: Sequence[str] | None = None,
-    ) -> None:
+    ) -> ReplayableRels:
         """Resolve CALLS relationships after all files in a batch have been upserted.
 
         Each call rel has a bare name (e.g. ``"some_func"``) as ``to_name``.
@@ -2022,9 +2067,14 @@ class GraphClient:
         ``None`` uses ``SearchSettings``' defaults. A caller whose uid is absent
         from the lookup (not yet upserted, or a NULL file_path) has no path to
         match and is treated as non-test.
+
+        Returns every rel whose answer could still change: the ones that matched
+        nothing, plus the ones a project-wide strategy answered — see
+        ``_FILE_LOCAL_STRATEGIES`` for why those two are the same problem, and
+        ``ASTConsumer._retry_rels`` for what replays them.
         """
         if not call_rels:
-            return
+            return ReplayableRels()
 
         if lookup is None:
             lookup = await self._build_call_lookup(project_name)
@@ -2046,13 +2096,15 @@ class GraphClient:
         edges: dict[tuple[str, str], _CallEdgeFacts] = {}
         resolved = 0
         ambiguous = 0
-        unresolved = 0
+        replay = ReplayableRels()
         for rel in call_rels:
             result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
             if result is None:
-                unresolved += 1
+                replay.unresolved.append(rel)
                 continue
             candidate_uids, strategy = result
+            if strategy not in _FILE_LOCAL_STRATEGIES:
+                replay.stale_candidates.append(rel)
             # A lone candidate is not enough on its own: an unverified receiver yields
             # exactly one name match and still cannot be trusted, so candidate_count 1
             # with confidence "ambiguous" is a real and informative combination.
@@ -2098,7 +2150,10 @@ class GraphClient:
                 {"rels": edge_params},
             )
 
-        logger.debug("Resolved {} CALLS edges ({} ambiguous, {} unresolved)", resolved, ambiguous, unresolved)
+        logger.debug(
+            "Resolved {} CALLS edges ({} ambiguous, {} unresolved)", resolved, ambiguous, len(replay.unresolved)
+        )
+        return replay
 
     async def build_anchor_lookup(self) -> _AnchorLookup:
         """Build the cross-project lookup tables needed for anchor resolution."""
@@ -2578,7 +2633,7 @@ class GraphClient:
         *,
         lookup: _CallLookup | None = None,
         name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
-    ) -> None:
+    ) -> ReplayableRels:
         """Resolve USES_TYPE relationships after all files in a batch have been upserted.
 
         Each type rel has a bare name (e.g. ``"MyClass"``) as ``to_name``.
@@ -2586,10 +2641,13 @@ class GraphClient:
         1. **Import match** — caller's module imports something with that name.
         2. **Same-file TypeDef** — a TypeDef with that name in the same file.
         3. **Project-wide TypeDef** — any TypeDef with that name (unique only).
-        4. **Unresolved** — skip silently (builtins, generic types).
+        4. **Unresolved** — no match at all.
+
+        Returns every rel that strategy 2 did not settle, for the caller to
+        replay once later batches have upserted more of the project.
         """
         if not type_rels:
-            return
+            return ReplayableRels()
 
         if lookup is None:
             lookup = await self._build_call_lookup(project_name)
@@ -2605,6 +2663,7 @@ class GraphClient:
                 name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
 
         edges: set[tuple[str, str]] = set()
+        replay = ReplayableRels()
         resolved = 0
         for rel in type_rels:
             from_uid = rel.from_qualified_name
@@ -2625,6 +2684,7 @@ class GraphClient:
                     break
 
             target_uid: str | None = None
+            file_local = False
 
             # Strategy 1: Import match
             if module_uid and type_name in lookup.import_map.get(module_uid, {}):
@@ -2635,6 +2695,7 @@ class GraphClient:
                 for uid, fp in name_to_typedefs.get(type_name, []):
                     if fp == caller_fp:
                         target_uid = uid
+                        file_local = True
                         break
 
             # Strategy 3: Project-wide unique TypeDef
@@ -2643,9 +2704,17 @@ class GraphClient:
                 if len(candidates) == 1:
                     target_uid = candidates[0][0]
 
-            if target_uid is not None:
+            if target_uid is None:
+                replay.unresolved.append(rel)
+            else:
                 edges.add((from_uid, target_uid))
                 resolved += 1
+                if not file_local:
+                    # Same reasoning as resolve_calls: only the same-file match is
+                    # settled by the caller's own batch. The import map is repaired
+                    # by a later resolve_imports, and "project-wide *unique*" stops
+                    # being unique the moment a second definition is upserted.
+                    replay.stale_candidates.append(rel)
 
         if edges:
             edge_params = [{"f": f, "t": t} for f, t in edges]
@@ -2656,7 +2725,8 @@ class GraphClient:
                 {"rels": edge_params},
             )
 
-        logger.debug("Resolved {} USES_TYPE edges", resolved)
+        logger.debug("Resolved {} USES_TYPE edges ({} unresolved)", resolved, len(replay.unresolved))
+        return replay
 
     async def resolve_member_defines(
         self,

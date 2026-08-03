@@ -1014,6 +1014,103 @@ async def test_deferred_calls_lost_if_process_dies_before_flush(
 
 
 @pytest.mark.usefixtures("_clean_streams")
+async def test_a_callee_indexed_after_its_caller_still_gets_the_edge(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """Resolution reads the graph as it stands at that flush, and the hash gate
+    then makes the caller unreadable for the rest of the run — so a callee that
+    arrives in a LATER batch used to lose its inbound edge permanently.
+
+    Measured on this repo before the replay buffer existed: ``consumers.py`` had
+    ZERO edges of any type to ``events.py``, and nine of the twenty-seven
+    ``find_dead_code`` hits were functions in that one file.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(
+        settings.project_root,
+        "late_caller.py",
+        "from late_callee import work\n\n\ndef run():\n    return work()\n",
+    )
+    _write_python_file(settings.project_root, "late_callee.py", "def work():\n    return 1\n")
+
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    # Separate batches, caller first: the ordering the bug needs. One batch would
+    # upsert both files before either resolves, and prove nothing.
+    await consumer.process_batch([_file_changed(settings, "late_caller.py", "created")], "batch-0")
+    await consumer._flush_deferred_resolution()
+    await consumer.process_batch([_file_changed(settings, "late_callee.py", "created")], "batch-1")
+    await consumer._flush_deferred_resolution(final=True)
+
+    rows = await graph_client.execute(
+        "MATCH (a:Callable {project_name: $p, name: 'run'})-[:CALLS]->(b:Callable {name: 'work'}) RETURN count(*) AS n",
+        {"p": project_name},
+    )
+    assert rows[0]["n"] == 1, "caller resolved before its callee existed and was never revisited"
+
+    imports = await graph_client.execute(
+        "MATCH (m:Module {project_name: $p})-[:IMPORTS]->(t:Callable {name: 'work'}) RETURN count(*) AS n",
+        {"p": project_name},
+    )
+    assert imports[0]["n"] == 1, "the import fell back to the root package instead of the real target"
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_a_lone_candidate_is_revisited_when_a_second_one_appears(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """The other half of stale resolution, and the sharper one: a call that DID
+    resolve, to the only candidate that existed at the time.
+
+    ``unverified_receiver`` fires on exactly one name match, so a partial graph
+    yields a confident edge to whichever implementation happened to be indexed
+    first — worse than a missing edge, because a resolved edge is trusted. The
+    real callee's class arriving later must widen it, not be ignored.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(
+        settings.project_root,
+        "dispatch.py",
+        "def fan_out(sink):\n    return sink.emit()\n",
+    )
+    _write_python_file(settings.project_root, "sink_a.py", "class SinkA:\n    def emit(self):\n        return 'a'\n")
+    _write_python_file(settings.project_root, "sink_b.py", "class SinkB:\n    def emit(self):\n        return 'b'\n")
+
+    consumer = ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+    )
+    await consumer.process_batch(
+        [_file_changed(settings, "dispatch.py", "created"), _file_changed(settings, "sink_a.py", "created")],
+        "batch-0",
+    )
+    await consumer._flush_deferred_resolution()
+    await consumer.process_batch([_file_changed(settings, "sink_b.py", "created")], "batch-1")
+    await consumer._flush_deferred_resolution(final=True)
+
+    rows = await graph_client.execute(
+        "MATCH (a:Callable {project_name: $p, name: 'fan_out'})-[:CALLS]->(b:Callable {name: 'emit'}) "
+        "RETURN b.uid AS uid ORDER BY uid",
+        {"p": project_name},
+    )
+    assert len(rows) == 2, f"expected both sinks once SinkB exists, got {[r['uid'] for r in rows]}"
+
+
+@pytest.mark.usefixtures("_clean_streams")
 async def test_anchor_only_file_hash_withheld_until_flush(
     event_bus: EventBus,
     graph_client: GraphClient,

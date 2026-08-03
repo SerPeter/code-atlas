@@ -8,6 +8,9 @@ second axis, and [ADR-0017](./0017-calls-edge-weights.md), whose weight is deriv
 Extended by [ADR-0023](./0023-type-directed-call-resolution.md), which adds the receiver's declared type and closes this
 decision's gap: the damping here reached only the single-candidate case.
 
+Amended by [ADR-0026](./0026-resolution-is-replayed-not-batch-final.md): the strategies below are only as good as the
+graph they run against, and a batch-local run produced exactly the confidently-wrong edge this ADR exists to prevent.
+
 ## Context
 
 A reader with no knowledge of this codebase, shown only a rendered `summarize_module` outline, flagged

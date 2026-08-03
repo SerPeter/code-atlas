@@ -24,7 +24,14 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
     from typing import Protocol
 
-    from code_atlas.graph.client import CallStats, UpsertResult, _AnchorLookup, _CallLookup, _CitationLookup
+    from code_atlas.graph.client import (
+        CallStats,
+        ReplayableRels,
+        UpsertResult,
+        _AnchorLookup,
+        _CallLookup,
+        _CitationLookup,
+    )
     from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
     from code_atlas.parsing.detectors import PropertyEnrichment
 
@@ -98,7 +105,13 @@ if TYPE_CHECKING:
 
         # -- Cross-file resolution -------------------------------------------
 
-        async def resolve_imports(self, project_name: str, import_rels: list[ParsedRelationship]) -> None: ...
+        # These three return the rels they could not settle for good. Resolution
+        # reads the graph as it stands at that flush, so a callee upserted by a
+        # *later* batch is invisible and the hash gate then never re-parses the
+        # caller — the edge would be lost for the life of the index. See
+        # ReplayableRels for the two ways that goes wrong and what each costs to
+        # replay; ASTConsumer._retry_rels is what replays them.
+        async def resolve_imports(self, project_name: str, import_rels: list[ParsedRelationship]) -> ReplayableRels: ...
 
         async def resolve_calls(
             self,
@@ -108,7 +121,7 @@ if TYPE_CHECKING:
             lookup: _CallLookup | None = None,
             name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
             test_patterns: Sequence[str] | None = None,
-        ) -> None: ...
+        ) -> ReplayableRels: ...
 
         async def build_anchor_lookup(self) -> _AnchorLookup: ...
 
@@ -169,7 +182,7 @@ if TYPE_CHECKING:
             *,
             lookup: _CallLookup | None = None,
             name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
-        ) -> None: ...
+        ) -> ReplayableRels: ...
 
         async def resolve_member_defines(
             self,

@@ -50,6 +50,22 @@ _tracer = get_tracer(__name__)
 _COLLAPSE_BLANK_RE = re.compile(rb"\n{3,}")
 
 
+def _retry_key(rel: ParsedRelationship) -> tuple[str, str, str, str, str]:
+    """Identity of a call/import/type site, for deduplicating ``ASTConsumer._retry_rels``.
+
+    Everything ``_resolve_one_call`` reads: re-parsing an unchanged file must
+    produce the same key so the buffer stays the size of the codebase rather
+    than growing once per re-index.
+    """
+    return (
+        str(rel.rel_type),
+        rel.from_qualified_name,
+        rel.to_name,
+        str(rel.properties.get("receiver") or ""),
+        str(rel.properties.get("receiver_type") or ""),
+    )
+
+
 def _compute_file_hash(source: bytes, *, strip_whitespace: bool = True) -> str:
     """Compute a short SHA-256 hash of file contents.
 
@@ -667,6 +683,28 @@ class ASTConsumer(TierConsumer):
         # Survives every flush: _pending_project_names is cleared each time, so a
         # final-flush-only sweep would iterate an empty set and silently do nothing.
         self._projects_seen: set[str] = set()
+        # IMPORTS/CALLS/USES_TYPE rels that resolution could not settle for good.
+        # It reads the graph as it stands at that flush, and set_batch_file_hashes
+        # then makes the hash gate skip the caller for good — so a callee upserted
+        # by a LATER batch loses its edge permanently, and "no inbound edge"
+        # degrades from "unreachable" into "nothing was resolvable the moment that
+        # file was last indexed". Measured on this repo: consumers.py had ZERO
+        # edges of any type to events.py.
+        #
+        # Two buffers because replaying them costs different amounts — see
+        # ReplayableRels. Both are keyed rather than appended so re-parsing a call
+        # site replaces its entry instead of adding one; most entries never
+        # resolve (builtins, external libraries) and an unkeyed list would grow
+        # without bound in a long-running daemon.
+        # Reindex mode only, on both counts: it is the mode whose ordering causes
+        # the staleness (a bulk run resolves most files before the modules they
+        # call into), and the only one that reliably reaches a final flush to
+        # spend the buffer on. A daemon resolves against an already-complete
+        # graph, so retaining this there would be megabytes held for nothing.
+        self._retry_rels: dict[str, dict[tuple[str, str, str, str, str], ParsedRelationship]] = {}
+        self._stale_candidate_rels: dict[str, dict[tuple[str, str, str, str, str], ParsedRelationship]] | None = (
+            {} if is_reindex else None
+        )
         # Every project that has ever contributed a citation in this consumer's
         # lifetime — NOT cleared per flush. The end-of-run retry sweep needs it
         # because a citation's target document is usually indexed in a LATER
@@ -711,6 +749,14 @@ class ASTConsumer(TierConsumer):
         rather than merge-only. The two retry sweeps deliberately pass no scope:
         they cover the whole project and reparse nothing, so a delete there
         would wipe citations for files nobody touched.
+
+        IMPORTS/CALLS/USES_TYPE additionally carry ``_retry_rels`` forward — see
+        that attribute for why a batch-local resolution alone loses edges for
+        good. ``_stale_candidate_rels`` rides along only on the *final* flush,
+        because every earlier replay of it is superseded by this one and each
+        costs a full rewrite of the edges it owns. Projects with a backlog are
+        visited even when this flush parsed nothing for them, which is what lets
+        the final flush close out a full-index run.
         """
         if self._pending_anchor_rels:
             # Anchors may target code in any project (uid/project-prefixed/
@@ -718,7 +764,10 @@ class ASTConsumer(TierConsumer):
             # than per-project like CALLS/IMPORTS/USES_TYPE below.
             await self.graph.resolve_anchors(self._pending_anchor_rels)
 
-        for project_name in self._pending_project_names:
+        backlog = {p for p, r in self._retry_rels.items() if r}
+        if final and self._stale_candidate_rels is not None:
+            backlog |= {p for p, r in self._stale_candidate_rels.items() if r}
+        for project_name in self._pending_project_names | backlog:
             proj_imports = [
                 r for r in self._pending_import_rels if r.from_qualified_name.startswith(project_name + ":")
             ]
@@ -729,8 +778,20 @@ class ASTConsumer(TierConsumer):
             ]
             proj_config = [r for r in self._pending_config_rels if r.from_qualified_name.startswith(project_name + ":")]
 
+            retry = self._retry_rels.setdefault(project_name, {})
+            all_stale = self._stale_candidate_rels
+            stale = None if all_stale is None else all_stale.setdefault(project_name, {})
+            replayed = list(retry.values()) + (list(stale.values()) if final and stale else [])
+            proj_imports += [r for r in replayed if r.rel_type == RelType.IMPORTS]
+            proj_calls += [r for r in replayed if r.rel_type == RelType.CALLS]
+            proj_types += [r for r in replayed if r.rel_type == RelType.USES_TYPE]
+            unresolved: list[ParsedRelationship] = []
+            stale_candidates: list[ParsedRelationship] = []
+
             if proj_imports:
-                await self.graph.resolve_imports(project_name, proj_imports)
+                replay = await self.graph.resolve_imports(project_name, proj_imports)
+                unresolved += replay.unresolved
+                stale_candidates += replay.stale_candidates
 
             if proj_config:
                 await self.graph.resolve_config_refs(project_name, proj_config)
@@ -748,23 +809,46 @@ class ASTConsumer(TierConsumer):
                 await self.graph.resolve_value_references(project_name, proj_refs)
 
             if proj_calls or proj_types or proj_members:
+                # Built after resolve_imports above, so a retried import that only
+                # just became resolvable is already in this lookup's import_map —
+                # strategy 1 of _resolve_one_call reads exactly that.
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
                 if proj_calls:
-                    await self.graph.resolve_calls(
+                    replay = await self.graph.resolve_calls(
                         project_name,
                         proj_calls,
                         lookup=shared_lookup,
                         name_to_typedefs=td_map,
                         test_patterns=self.settings.search.test_patterns,
                     )
+                    unresolved += replay.unresolved
+                    stale_candidates += replay.stale_candidates
                 if proj_types:
-                    await self.graph.resolve_type_refs(
+                    replay = await self.graph.resolve_type_refs(
                         project_name, proj_types, lookup=shared_lookup, name_to_typedefs=td_map
                     )
+                    unresolved += replay.unresolved
+                    stale_candidates += replay.stale_candidates
                 if proj_members:
                     await self.graph.resolve_member_defines(
                         project_name, proj_members, lookup=shared_lookup, name_to_typedefs=td_map
                     )
+
+            # Rebuild rather than update: the whole backlog was just replayed, so
+            # a rel that resolved this time is absent from `unresolved` and has to
+            # drop out. Updating in place would keep it forever.
+            retry.clear()
+            for rel in unresolved:
+                retry[_retry_key(rel)] = rel
+            if stale is not None:
+                if final:
+                    # Just replayed against the complete graph: spent, not carried.
+                    stale.clear()
+                else:
+                    # Accumulated across flushes — never cleared here, or a rel
+                    # first seen two flushes ago would drop out before the replay.
+                    for rel in stale_candidates:
+                        stale[_retry_key(rel)] = rel
 
             proj_citations = self._pending_citations.pop(project_name, None)
             citation_files = self._pending_citation_files.pop(project_name, None)

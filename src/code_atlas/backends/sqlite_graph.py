@@ -54,11 +54,13 @@ from code_atlas.graph.client import (
     _CODE_ENTITY_KINDS,
     _DEFAULT_EDGE_WEIGHT,
     _DEFAULT_TEST_PATTERNS,
+    _FILE_LOCAL_STRATEGIES,
     _POST_BATCH_REL_TYPES,
     _UNVERIFIED_STRATEGIES,
     SCHEMA_VERSION,
     CallStats,
     EntityHashData,
+    ReplayableRels,
     UpsertResult,
     _AnchorLookup,
     _BatchClassification,
@@ -1177,12 +1179,15 @@ class SqliteGraphClient:
         name_to_typedefs = await self._name_to_typedefs(project_name)
         return lookup, name_to_typedefs
 
-    async def resolve_imports(self, project_name: str, import_rels: list[ParsedRelationship]) -> None:
+    async def resolve_imports(self, project_name: str, import_rels: list[ParsedRelationship]) -> ReplayableRels:
         """Simplified vs. ``GraphClient.resolve_imports`` — exact ``qualified_name``
         match only (no Python dotted-prefix fallback for re-exported names).
+
+        Returns the rels with no exact in-project match, for the caller to retry
+        once later batches have upserted more of the project.
         """
         if not import_rels:
-            return
+            return ReplayableRels()
         conn = await self._get_conn()
         cur = await conn.execute(
             "SELECT qualified_name, uid FROM nodes WHERE project_name = ? "
@@ -1197,6 +1202,7 @@ class SqliteGraphClient:
         import_edges: list[tuple[str, str, bool]] = []
         ext_packages: dict[str, dict[str, str]] = {}
         ext_symbols: dict[str, dict[str, str]] = {}
+        inexact: list[ParsedRelationship] = []
 
         for rel in import_rels:
             to_name = rel.to_name
@@ -1206,6 +1212,7 @@ class SqliteGraphClient:
             if target_uid is not None:
                 import_edges.append((from_uid, target_uid, is_type_only))
                 continue
+            inexact.append(rel)
 
             top_level = to_name.split(".")[0]
             if not top_level:
@@ -1248,11 +1255,13 @@ class SqliteGraphClient:
             )
         await conn.commit()
         logger.debug(
-            "Resolved {} imports ({} packages, {} symbols created)",
+            "Resolved {} imports ({} packages, {} symbols created, {} inexact)",
             len(import_rels),
             len(ext_packages),
             len(ext_symbols),
+            len(inexact),
         )
+        return ReplayableRels(stale_candidates=inexact)
 
     async def resolve_config_refs(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
         """Full-parity port of ``GraphClient.resolve_config_refs``.
@@ -1353,15 +1362,17 @@ class SqliteGraphClient:
         lookup: _CallLookup | None = None,
         name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
         test_patterns: Sequence[str] | None = None,
-    ) -> None:
+    ) -> ReplayableRels:
         """Full-parity port — reuses ``_resolve_one_call`` (all 5 matching strategies),
         ``_combine_call_edge_facts`` and ``_call_edge_weight`` from ``graph.client``
         verbatim; only the lookup-building queries are SQL. Writes the same five
         edge properties as the Memgraph path (``confidence``, ``strategy``,
         ``candidate_count``, ``from_test``, ``weight``).
+
+        Returns the unmatched rels, for the caller to retry on a later flush.
         """
         if not call_rels:
-            return
+            return ReplayableRels()
         conn = await self._get_conn()
         if lookup is None:
             lookup = await self._build_call_lookup(project_name)
@@ -1371,13 +1382,16 @@ class SqliteGraphClient:
         patterns = list(_DEFAULT_TEST_PATTERNS if test_patterns is None else test_patterns)
         caller_is_test: dict[str, bool] = {}
         edges: dict[tuple[str, str], _CallEdgeFacts] = {}
-        resolved = ambiguous = unresolved = 0
+        resolved = ambiguous = 0
+        replay = ReplayableRels()
         for rel in call_rels:
             result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
             if result is None:
-                unresolved += 1
+                replay.unresolved.append(rel)
                 continue
             candidate_uids, strategy = result
+            if strategy not in _FILE_LOCAL_STRATEGIES:
+                replay.stale_candidates.append(rel)
             # A lone candidate is not enough on its own: an unverified receiver yields
             # exactly one name match and still cannot be trusted, so candidate_count 1
             # with confidence "ambiguous" is a real and informative combination.
@@ -1422,7 +1436,10 @@ class SqliteGraphClient:
                 rows,
             )
             await conn.commit()
-        logger.debug("Resolved {} CALLS edges ({} ambiguous, {} unresolved)", resolved, ambiguous, unresolved)
+        logger.debug(
+            "Resolved {} CALLS edges ({} ambiguous, {} unresolved)", resolved, ambiguous, len(replay.unresolved)
+        )
+        return replay
 
     async def build_anchor_lookup(self) -> _AnchorLookup:
         conn = await self._get_conn()
@@ -1736,9 +1753,9 @@ class SqliteGraphClient:
         *,
         lookup: _CallLookup | None = None,
         name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
-    ) -> None:
+    ) -> ReplayableRels:
         if not type_rels:
-            return
+            return ReplayableRels()
         conn = await self._get_conn()
         if lookup is None:
             lookup = await self._build_call_lookup(project_name)
@@ -1746,6 +1763,7 @@ class SqliteGraphClient:
             name_to_typedefs = await self._name_to_typedefs(project_name)
 
         edges: set[tuple[str, str]] = set()
+        replay = ReplayableRels()
         for rel in type_rels:
             from_uid = rel.from_qualified_name
             type_name = rel.to_name
@@ -1761,19 +1779,25 @@ class SqliteGraphClient:
                     break
 
             target_uid: str | None = None
+            file_local = False
             if module_uid and type_name in lookup.import_map.get(module_uid, {}):
                 target_uid = lookup.import_map[module_uid][type_name]
             if target_uid is None and caller_fp:
                 for uid, fp in name_to_typedefs.get(type_name, []):
                     if fp == caller_fp:
                         target_uid = uid
+                        file_local = True
                         break
             if target_uid is None:
                 candidates = name_to_typedefs.get(type_name, [])
                 if len(candidates) == 1:
                     target_uid = candidates[0][0]
-            if target_uid is not None:
+            if target_uid is None:
+                replay.unresolved.append(rel)
+            else:
                 edges.add((from_uid, target_uid))
+                if not file_local:
+                    replay.stale_candidates.append(rel)
 
         if edges:
             rows = [(f, t, "USES_TYPE", "{}") for f, t in edges]
@@ -1781,7 +1805,8 @@ class SqliteGraphClient:
                 "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, ?)", rows
             )
             await conn.commit()
-        logger.debug("Resolved {} USES_TYPE edges", len(edges))
+        logger.debug("Resolved {} USES_TYPE edges ({} unresolved)", len(edges), len(replay.unresolved))
+        return replay
 
     async def resolve_member_defines(  # noqa: PLR0912
         self,
