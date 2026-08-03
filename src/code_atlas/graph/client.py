@@ -7,6 +7,7 @@ Uses the neo4j async driver (Bolt protocol) which is compatible with Memgraph.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextlib
 import contextvars
 import re
@@ -2405,6 +2406,25 @@ class GraphClient:
             {"rels": params},
         )
 
+        # Builtin bases have no node to point at because they are never imported —
+        # `class StorageError(Exception)` names something that appears in no import
+        # statement anywhere. So "show me every exception type" answered nothing while
+        # StrEnum and ABC answered fine. The node is created here rather than at parse
+        # time, and only for names Python actually defines, so a typo or a generic
+        # (`Generic[T]`) still resolves to nothing instead of minting a node for itself.
+        builtin_params = [p for p in params if hasattr(builtins, p["to_name"])]
+        if builtin_params:
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}) "
+                f"WHERE NOT (a)-[:{RelType.INHERITS}]->({{name: r.to_name}}) "
+                f"MERGE (b:{NodeLabel.EXTERNAL_SYMBOL} {{uid: r.project + ':ext/builtins.' + r.to_name}}) "
+                f"ON CREATE SET b.project_name = r.project, b.name = r.to_name, "
+                f"b.qualified_name = 'builtins.' + r.to_name "
+                f"MERGE (a)-[:{RelType.INHERITS}]->(b)",
+                {"rels": builtin_params},
+            )
+
     async def resolve_value_references(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
         """Link a callable named as a value to the callable it names.
 
@@ -2426,6 +2446,17 @@ class GraphClient:
                 {"from_uid": r.from_qualified_name, "to_name": r.to_name, "project": project_name}
             )
         for rel_type, params in by_type.items():
+            if rel_type == RelType.EXPORTS:
+                # A re-export resolves through the module's own IMPORTS edge, which is
+                # proof it can see the name — no label constraint, since __all__ lists
+                # functions, classes and constants alike.
+                await self.execute_write(
+                    f"UNWIND $rels AS r "
+                    f"MATCH (m {{uid: r.from_uid}})-[:{RelType.IMPORTS}]->(t {{name: r.to_name}}) "
+                    f"MERGE (m)-[:{RelType.EXPORTS}]->(t)",
+                    {"rels": params},
+                )
+                continue
             # A field's declared type resolves to a TypeDef; a referenced or registering
             # name resolves to a Callable. Same scope rules either way.
             target = NodeLabel.TYPE_DEF if rel_type == RelType.USES_TYPE else NodeLabel.CALLABLE
