@@ -2179,17 +2179,22 @@ class ModuleExportsDetector:
             )
         ]
 
-        relationships: list[ParsedRelationship] = []
-        for exp_name in exported_names:
-            target_qn = name_to_qn.get(exp_name)
-            if target_qn:
-                relationships.append(
-                    ParsedRelationship(
-                        from_qualified_name=module_entity.qualified_name,
-                        rel_type=RelType.EXPORTS,
-                        to_name=target_qn,
-                    )
-                )
+        # A name defined here gets its uid straight away. A RE-EXPORT — which is what
+        # `__all__` in an `__init__.py` almost always is — is defined in a submodule, so
+        # the bare name goes out and resolution links it post-batch against what this
+        # module imports. Before this, 5 of the 6 `__all__` declarations in this repo
+        # produced no edge at all, because name_to_qn only ever held local definitions.
+        relationships: list[ParsedRelationship] = [
+            ParsedRelationship(
+                from_qualified_name=module_entity.qualified_name,
+                rel_type=RelType.EXPORTS,
+                to_name=name_to_qn.get(exp_name) or exp_name,
+                # A local definition already carries its uid; a re-export leaves a bare
+                # name for post-batch resolution against this module's imports.
+                properties={} if exp_name in name_to_qn else {"by_name": True},
+            )
+            for exp_name in exported_names
+        ]
 
         return DetectorResult(enrichments=enrichments, relationships=relationships)
 

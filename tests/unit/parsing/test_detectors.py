@@ -658,7 +658,15 @@ async def test_module_exports_no_all():
 
 
 async def test_module_exports_unresolved_name():
-    """Exported name not in file entities → no EXPORTS rel for that name."""
+    """A name not defined in this file leaves the parser as a bare name, not as nothing.
+
+    It is almost always a RE-EXPORT — `__all__` in an `__init__.py` listing what the
+    submodules define — and the old "skip if not local" rule meant 5 of the 6 `__all__`
+    declarations in this repo produced no edge at all. The name goes out marked `by_name`
+    and resolution links it against what the module imports; a name that is neither local
+    nor imported still reaches the graph as nothing, but that is resolution's call to
+    make, not the parser's.
+    """
     module = _make_entity(
         name="app",
         qn="proj:src.app",
@@ -680,7 +688,10 @@ async def test_module_exports_unresolved_name():
     result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
     assert len(result.enrichments) == 1
     assert result.enrichments[0].properties["public_api"] == ["missing_func"]
-    assert result.relationships == []
+    assert len(result.relationships) == 1
+    rel = result.relationships[0]
+    assert rel.to_name == "missing_func"
+    assert rel.properties == {"by_name": True}
 
 
 # ---------------------------------------------------------------------------

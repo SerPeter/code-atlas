@@ -1085,7 +1085,16 @@ class ASTConsumer(TierConsumer):
                     #     rels — merged with the original parser rels, since TX2
                     #     deletes then recreates each file's rel set (a partial
                     #     rewrite would drop the parser rels just written in step 3).
-                    det_rel_files = {fp: det.relationships for fp, det in det_results.items() if det.relationships}
+                    # A re-exported name has no uid yet — its target lives in a submodule
+                    # this one imports, which only exists after resolve_imports. Split it
+                    # out of the uid-routed write and resolve it with the rest.
+                    for det in det_results.values():
+                        self._pending_ref_rels.extend(r for r in det.relationships if r.properties.get("by_name"))
+                    det_rel_files = {
+                        fp: [r for r in det.relationships if not r.properties.get("by_name")]
+                        for fp, det in det_results.items()
+                        if any(not r.properties.get("by_name") for r in det.relationships)
+                    }
                     if det_rel_files:
                         second_file_data = {
                             fp: (parsed_files[fp].entities, parsed_files[fp].non_import_rels + rels)
