@@ -664,6 +664,9 @@ class ASTConsumer(TierConsumer):
         # whose stale citation edge has to be cleared.
         self._pending_citation_files: dict[str, set[str]] = {}  # project_name -> {file_path}
         self._pending_project_names: set[str] = set()
+        # Survives every flush: _pending_project_names is cleared each time, so a
+        # final-flush-only sweep would iterate an empty set and silently do nothing.
+        self._projects_seen: set[str] = set()
         # Every project that has ever contributed a citation in this consumer's
         # lifetime — NOT cleared per flush. The end-of-run retry sweep needs it
         # because a citation's target document is usually indexed in a LATER
@@ -740,11 +743,6 @@ class ASTConsumer(TierConsumer):
             if proj_inherits:
                 await self.graph.resolve_inherits(project_name, proj_inherits)
 
-            # Whole-project sweep, not per-file: conformance is a property of two classes
-            # that may live anywhere, so it can only run once every file is upserted.
-            if proj_inherits:
-                await self.graph.resolve_protocol_conformance(project_name)
-
             proj_refs = [r for r in self._pending_ref_rels if r.from_qualified_name.startswith(project_name + ":")]
             if proj_refs:
                 await self.graph.resolve_value_references(project_name, proj_refs)
@@ -803,6 +801,16 @@ class ASTConsumer(TierConsumer):
         # just deleted produces no config rels at all, and that is precisely
         # the case that orphans a node. Cost is two label-index scans over the
         # two smallest labels in the graph — bounded by them, not by the graph.
+        if final:
+            # Whole-project sweep, and ONLY once every batch has been written. Run per
+            # batch, the edges it writes run FROM a concrete method in some OTHER file, so
+            # the next batch to re-process that file deletes them again in its
+            # delete-then-recreate phase. Measured both ways: per batch, IMPLEMENTS
+            # collapsed 261 -> 42 and GraphBackend went back to zero implementers.
+            for project_name in self._projects_seen:
+                await self.graph.resolve_protocol_conformance(project_name)
+            self._projects_seen.clear()
+
         if self._pending_project_names:
             await self.graph.gc_orphaned_reference_nodes()
 
@@ -1217,6 +1225,7 @@ class ASTConsumer(TierConsumer):
                 self._pending_anchor_rels.extend(group_anchor_rels)
                 self._pending_config_rels.extend(group_config_rels)
                 self._pending_project_names.add(project_name)
+                self._projects_seen.add(project_name)
 
                 group_citations = {uid: raws for pfd in parsed_files.values() for uid, raws in pfd.citations.items()}
                 # The scope covers every re-parsed file, citations or not: it is
