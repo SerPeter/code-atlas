@@ -1070,6 +1070,23 @@ _DEFAULT_TEST_PATTERNS: tuple[str, ...] = tuple(SearchSettings().test_patterns)
 #
 # Plain ``str`` values, not enum members: this set is handed to the Bolt driver
 # and to sqlite3 as a query parameter.
+_FRAMEWORK_HOOK_DECORATORS: frozenset[str] = frozenset(
+    {
+        # Invoked by the library, never by this codebase — so a by-name test can only ever
+        # report them dead. Bare names: `decorator_name` holds the last component.
+        "model_validator",
+        "field_validator",
+        "field_serializer",
+        "model_serializer",
+        "computed_field",
+        "validator",
+        "root_validator",
+        "fixture",
+        "hookimpl",
+    }
+)
+
+
 _CODE_ENTITY_KINDS: frozenset[str] = frozenset(str(k) for k in (*CallableKind, *TypeDefKind))
 
 
@@ -3949,7 +3966,12 @@ class GraphClient:
         labels as real code but can never receive a CALLS edge, so a label-only
         filter reports every one of them as dead.
         """
-        params: dict[str, Any] = {"project": project, "path": path, "code_kinds": sorted(_CODE_ENTITY_KINDS)}
+        params: dict[str, Any] = {
+            "project": project,
+            "path": path,
+            "code_kinds": sorted(_CODE_ENTITY_KINDS),
+            "hook_decorators": sorted(_FRAMEWORK_HOOK_DECORATORS),
+        }
         pa = " AND n.file_path STARTS WITH $path" if path else ""
         # "Unused" cannot mean "no CALLS edge". A class is used by being annotated,
         # subclassed or imported, and instantiating it calls its __init__ rather than the
@@ -3982,6 +4004,26 @@ class GraphClient:
             # A registered handler is reached by whatever owns the registry. The edge runs
             # FROM the handler ("registered by"), so liveness is an outbound test here.
             f"AND NOT (n)-[:{RelType.REGISTERED_BY}]->() "
+            # An override is reached through its base. The graph already HELD this fact and
+            # the predicate discarded it: EmbedConsumer._pre_run overrides
+            # TierConsumer._pre_run, which TierConsumer.run calls. The template-method hook
+            # was 100% false-positive.
+            f"AND NOT (n)-[:{RelType.OVERRIDES}]->() "
+            # A decorator with a registration argument IS the inbound edge, whoever owns the
+            # registry. `@app.command("mine-git-history")` reduces to the bare attribute
+            # `command`, which names no project callable, so REGISTERED_BY is dropped and
+            # every Typer command and @mcp.tool() handler looked dead — while the node
+            # carried the proof as a property the predicate never read.
+            # decorator_NAME, not decorator_arg: `@app.command()` with bare parens has no
+            # string, and testing the argument left `status`/`health`/`doctor`/`watch`
+            # listed while the three renamed commands were excluded. The name is set for
+            # any CALLED decorator, which is exactly the registration signal.
+            "AND n.decorator_name IS NULL "
+            # A framework calls these by convention, never by name.
+            "AND NOT coalesce(n.decorator_name, '') IN $hook_decorators "
+            # A property is READ (`obj.ok`), and an attribute read is not a call, so zero
+            # inbound edges is the expected state for one rather than evidence about it.
+            "AND n.kind <> 'property' "
             # Same shape for a Protocol implementation: SqliteGraphClient's methods are
             # called through GraphBackend, never by name, and the IMPLEMENTS edge runs FROM
             # the concrete method TO the stub. Sampling the output found the top 10 hits
