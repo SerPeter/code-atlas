@@ -54,11 +54,8 @@ max_caller_depth = 1
 [detectors]
 # Enabled pattern detectors
 enabled = [
-    "decorator_routing",
-    "event_handlers",
     "test_mapping",
     "class_overrides",
     "di_injection",
-    "cli_commands",
     "module_exports",
 ]

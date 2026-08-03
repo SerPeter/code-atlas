@@ -182,6 +182,31 @@ def dispatch(name: str, payload: str) -> str:
 TABLE = {"greet": handle_greet, "farewell": handle_farewell}
 """A dict of callables, the other common registry shape."""
 ''',
+    "endpoints.py": '''
+"""Registration surfaces from four different frameworks, none of them known to the parser."""
+
+
+@app.get("/users/{id}")
+def read_user(id: int) -> dict:
+    """FastAPI: the verb is in the decorator name, the path is the string."""
+    return {}
+
+
+@app.route("/legacy", methods=["GET"])
+def legacy() -> dict:
+    """Flask: the verb is a kwarg, so a first-string rule gets the path only."""
+    return {}
+
+
+@cli.command("mine-git-history")
+def mine_git_history() -> None:
+    """Typer: the command name differs from the function name."""
+
+
+@celery.task(name="send.email")
+def send_email() -> None:
+    """Celery: the surface key arrives as a keyword argument."""
+''',
     "composition.py": '''
 """Composition: nested config objects, the shape every settings tree has."""
 from dataclasses import dataclass, field
@@ -324,6 +349,23 @@ CASES: tuple[Case, ...] = (
         "MATCH (a)-[]->(b) WHERE a.project_name=$p AND b.name='register' AND a.name STARTS WITH 'handle_' "
         "RETURN a.qualified_name AS hit",
         "LINKED",
+    ),
+    Case(
+        "framework-route-surface",
+        "what serves /users/{id}?",
+        # No framework knowledge anywhere: the parser records "decorated by X with string
+        # Y" and the FRAMEWORK is a filter written here, at query time. A new framework
+        # needs no parser change — which is the whole point of the generic extraction.
+        "MATCH (n:Callable) WHERE n.project_name=$p AND n.decorator_arg = '/users/{id}' RETURN n.name AS hit",
+        "LINKED",
+    ),
+    Case(
+        "framework-cli-surface",
+        "which function handles the `mine-git-history` command?",
+        "MATCH (n:Callable) WHERE n.project_name=$p AND n.decorator_name ENDS WITH '.command' "
+        "AND n.decorator_arg = 'mine-git-history' RETURN n.name AS hit",
+        "LINKED",
+        "The decorator argument differs from the function name, which is the case a name-based guess gets wrong.",
     ),
     Case(
         "registry-dispatch",

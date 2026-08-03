@@ -48,12 +48,22 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.DEPENDS_ON: "Project -> project dependency (monorepo)",
     RelType.DOCUMENTS: "Doc section/Note -> code entity it documents (or Note anchor)",
     RelType.SIMILAR_TO: "Entity -> semantically similar entity (embedding cosine)",
-    RelType.HANDLES_ROUTE: "Callable -> HTTP route it handles (pattern-detected)",
-    RelType.HANDLES_EVENT: "Callable -> event it handles (pattern-detected)",
+    RelType.HANDLES_ROUTE: (
+        "RESERVED, never written. Use the decorator_name/decorator_arg properties instead: "
+        "a route handler is a Callable whose decorator_name ends in .get/.post/.route and "
+        "whose decorator_arg is the path."
+    ),
+    RelType.HANDLES_EVENT: "RESERVED, never written. See HANDLES_ROUTE — same decorator_arg approach.",
     RelType.REGISTERED_BY: "Entity -> factory/registry that registers it (pattern-detected)",
-    RelType.INJECTED_INTO: "Dependency -> class it is injected into (pattern-detected)",
+    RelType.INJECTED_INTO: (
+        "RESERVED, never written. Constructor injection is modelled as a field: "
+        "(class)-[:DEFINES]->(field)-[:USES_TYPE]->(dependency)."
+    ),
     RelType.TESTS: "Test function -> entity it tests (pattern-detected)",
-    RelType.HANDLES_COMMAND: "Callable -> CLI/bot command it handles (pattern-detected)",
+    RelType.HANDLES_COMMAND: (
+        "RESERVED, never written. A CLI handler is a Callable whose decorator_name ends in "
+        ".command and whose decorator_arg is the command name."
+    ),
     RelType.EXPORTS: "Module -> entity listed in __all__ (pattern-detected)",
     RelType.LINKS_TO: "Note -> Note/DocSection it [[wikilinks]] to",
     RelType.DERIVED_FROM: "Note -> Note it was merged/promoted/summarized from (dream-mode provenance)",

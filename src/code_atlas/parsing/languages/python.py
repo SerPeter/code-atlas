@@ -345,6 +345,63 @@ def _emit_registrations(node: Node, from_qn: str, relationships: list[ParsedRela
         )
 
 
+def _decorator_surface(node: Node) -> dict[str, str]:
+    """The registration surface a decorator declares, without knowing the framework.
+
+    `@app.get("/users/{id}")`, `@app.command("mine-git-history")`, `@celery.task(
+    name="send.email")` and `@register("greet")` are one shape: a decorator expression
+    plus a string that names the thing being registered. Three separate detectors used to
+    extract exactly this and write it under three different property names, each gated on
+    a hard-coded framework list that goes stale the moment a new framework appears.
+
+    The parser records the shape and never decides what it MEANS. `app.get` versus
+    `app.command` versus `celery.task` is a classification the caller makes at query time,
+    where adding a framework is a filter you write rather than a detector someone has to
+    ship. That also disposes of the false-positive problem: `@pytest.mark.parametrize(
+    "a,b", ...)` is recorded honestly as "decorated by parametrize with 'a,b'" instead of
+    needing a blocklist entry to stop it being called a route.
+
+    A decorator that is CALLED is always recorded, string argument or not: `@app.command()`
+    with bare parens is a registration too, and its surface key is the function's own name.
+    Supplying that default is the caller's job — "an unnamed Typer command takes the
+    function name" is framework knowledge, and keeping it out here is the point. Dropping
+    the no-argument form outright would have lost 8 of this repo's 11 CLI commands.
+
+    First decorator carrying a string literal wins, falling back to the first called
+    decorator — a handler has one registration decorator and any number of plain modifiers.
+    """
+    parent = node.parent
+    if parent is None or parent.type != "decorated_definition":
+        return {}
+    fallback = ""
+    for child in parent.children:
+        if child.type != "decorator":
+            continue
+        call = next((c for c in child.children if c.type == "call"), None)
+        if call is None:
+            continue
+        func = call.child_by_field_name("function")
+        if func is None:
+            continue
+        fallback = fallback or node_text(func)
+        args = call.child_by_field_name("arguments")
+        if args is None:
+            continue
+        for arg in args.children:
+            literal = arg
+            if arg.type == "keyword_argument":
+                value = arg.child_by_field_name("value")
+                if value is None:
+                    continue
+                literal = value
+            if literal.type != "string":
+                continue
+            text = _plain_string_value(literal)
+            if text:
+                return {"decorator_name": node_text(func), "decorator_arg": text}
+    return {"decorator_name": fallback} if fallback else {}
+
+
 def _get_decorators(node: Node) -> list[str]:
     """Extract decorator names from a decorated_definition parent.
 
@@ -742,7 +799,7 @@ def _process_function(
             tags=tags,
             # Per-method, not per-class: an ABC's concrete methods are real code and
             # must stay resolvable. See _is_stub_body.
-            extra_properties={"is_stub": True} if _is_stub_body(node, tags) else {},
+            extra_properties=(({"is_stub": True} if _is_stub_body(node, tags) else {}) | _decorator_surface(node)),
         )
     )
 
@@ -1864,76 +1921,6 @@ _EVENT_PATTERNS: dict[str, str] = {
 }
 
 
-class DecoratorRoutingDetector:
-    """Detect HTTP route handlers from framework decorators."""
-
-    @property
-    def name(self) -> str:
-        return "decorator_routing"
-
-    async def detect(
-        self,
-        parsed: ParsedFile,
-        project_name: str,  # noqa: ARG002
-        graph: GraphClient,  # noqa: ARG002
-    ) -> DetectorResult:
-        enrichments: list[PropertyEnrichment] = []
-        for entity in parsed.entities:
-            for tag in entity.tags:
-                dec_name, args_text = _parse_decorator_tag(tag)
-                if not dec_name:
-                    continue
-                # Check if decorator ends with a route suffix
-                for suffix, method in _SUFFIX_TO_METHOD.items():
-                    if dec_name.endswith(suffix):
-                        route_path = _extract_first_string_arg(args_text) if args_text else None
-                        if route_path is None:
-                            break
-                        enrichments.append(
-                            PropertyEnrichment(
-                                qualified_name=entity.qualified_name,
-                                properties={"route_path": route_path, "http_method": method},
-                            )
-                        )
-                        break
-        return DetectorResult(enrichments=enrichments)
-
-
-class EventHandlerDetector:
-    """Detect event/task handlers from framework decorators."""
-
-    @property
-    def name(self) -> str:
-        return "event_handlers"
-
-    async def detect(
-        self,
-        parsed: ParsedFile,
-        project_name: str,  # noqa: ARG002
-        graph: GraphClient,  # noqa: ARG002
-    ) -> DetectorResult:
-        enrichments: list[PropertyEnrichment] = []
-        for entity in parsed.entities:
-            for tag in entity.tags:
-                dec_name, args_text = _parse_decorator_tag(tag)
-                if not dec_name:
-                    continue
-                framework = _EVENT_PATTERNS.get(dec_name)
-                if framework is None:
-                    continue
-                event_name = _extract_first_string_arg(args_text) if args_text else None
-                if event_name is None:
-                    # Celery tasks use the function name as the task name
-                    event_name = entity.name
-                enrichments.append(
-                    PropertyEnrichment(
-                        qualified_name=entity.qualified_name,
-                        properties={"event_name": event_name, "event_framework": framework},
-                    )
-                )
-        return DetectorResult(enrichments=enrichments)
-
-
 class TestMappingDetector:
     """Map test classes/functions to their subjects via naming conventions."""
 
@@ -2074,49 +2061,6 @@ class DIInjectionDetector:
         return DetectorResult(relationships=relationships, enrichments=enrichments)
 
 
-class CLICommandDetector:
-    """Detect CLI command handlers from click/typer decorators."""
-
-    @property
-    def name(self) -> str:
-        return "cli_commands"
-
-    async def detect(
-        self,
-        parsed: ParsedFile,
-        project_name: str,  # noqa: ARG002
-        graph: GraphClient,  # noqa: ARG002
-    ) -> DetectorResult:
-        # Check relationships for typer imports (e.g. `import typer`, `from typer import ...`)
-        has_typer_import = any(
-            rel.rel_type == RelType.IMPORTS and rel.to_name.startswith("typer") for rel in parsed.relationships
-        )
-
-        enrichments: list[PropertyEnrichment] = []
-        for entity in parsed.entities:
-            for tag in entity.tags:
-                dec_name, args_text = _parse_decorator_tag(tag)
-                if not dec_name:
-                    continue
-                if not dec_name.endswith(".command"):
-                    continue
-                command_name = _extract_first_string_arg(args_text) if args_text else None
-                if command_name is None:
-                    command_name = entity.name
-                framework = "typer" if has_typer_import or "typer" in dec_name.lower() else "click"
-                enrichments.append(
-                    PropertyEnrichment(
-                        qualified_name=entity.qualified_name,
-                        properties={
-                            "command_name": command_name,
-                            "cli_framework": framework,
-                        },
-                    )
-                )
-                break  # One command decorator per entity is enough
-        return DetectorResult(enrichments=enrichments)
-
-
 _DATACLASS_TAGS: dict[str, tuple[str, list[str]]] = {
     "dataclass": ("dataclasses", ["__init__", "__repr__", "__eq__"]),
     "dataclasses.dataclass": ("dataclasses", ["__init__", "__repr__", "__eq__"]),
@@ -2124,6 +2068,7 @@ _DATACLASS_TAGS: dict[str, tuple[str, list[str]]] = {
     "attr.define": ("attrs", ["__init__", "__repr__", "__eq__"]),
     "attr.attrs": ("attrs", ["__init__", "__repr__", "__eq__", "__hash__"]),
 }
+
 
 _PYDANTIC_BASES: frozenset[str] = frozenset({"BaseModel"})
 
@@ -2256,12 +2201,9 @@ class ModuleExportsDetector:
 # Auto-registration
 # ---------------------------------------------------------------------------
 
-register_detector(DecoratorRoutingDetector())
-register_detector(EventHandlerDetector())
 register_detector(TestMappingDetector())
 register_detector(ClassOverridesDetector())
 register_detector(DIInjectionDetector())
-register_detector(CLICommandDetector())
 register_detector(DataclassSynthesisDetector())
 register_detector(ModuleExportsDetector())
 

@@ -354,12 +354,9 @@ class DetectorSettings(BaseModel):
 
     enabled: list[str] = Field(
         default_factory=lambda: [
-            "decorator_routing",
-            "event_handlers",
             "test_mapping",
             "class_overrides",
             "di_injection",
-            "cli_commands",
             # Emits EXPORTS (Module -> the Callable/TypeDef named in __all__). Registered
             # since it was written but never enabled, so the public-API surface every
             # __all__ already declares was captured as a property and never as an edge.

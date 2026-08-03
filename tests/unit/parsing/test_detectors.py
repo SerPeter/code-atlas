@@ -16,11 +16,8 @@ from code_atlas.parsing.detectors import (
 )
 from code_atlas.parsing.languages.python import (
     ClassOverridesDetector,
-    CLICommandDetector,
     DataclassSynthesisDetector,
-    DecoratorRoutingDetector,
     DIInjectionDetector,
-    EventHandlerDetector,
     ModuleExportsDetector,
     TestMappingDetector,
     _extract_depends_names,
@@ -295,97 +292,6 @@ def _make_parsed(
         entities=entities or [],
         relationships=relationships or [],
     )
-
-
-async def test_routing_fastapi_get():
-    """Entity with app.get('/users') tag → enrichment with route_path and http_method."""
-    entity = _make_entity(tags=["decorator:app.get('/users')"])
-    parsed = _make_parsed(entities=[entity])
-    det = DecoratorRoutingDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert len(result.enrichments) == 1
-    assert result.enrichments[0].properties["route_path"] == "/users"
-    assert result.enrichments[0].properties["http_method"] == "GET"
-
-
-async def test_routing_post():
-    """POST route detected correctly."""
-    entity = _make_entity(tags=['decorator:router.post("/items")'])
-    parsed = _make_parsed(entities=[entity])
-    det = DecoratorRoutingDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert len(result.enrichments) == 1
-    assert result.enrichments[0].properties["http_method"] == "POST"
-
-
-async def test_routing_missing_path():
-    """Decorator without a string arg → no enrichment."""
-    entity = _make_entity(tags=["decorator:app.get()"])
-    parsed = _make_parsed(entities=[entity])
-    det = DecoratorRoutingDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert result.enrichments == []
-
-
-async def test_routing_non_route_decorator():
-    """Non-route decorator → no enrichment."""
-    entity = _make_entity(tags=["decorator:app.middleware('http')"])
-    parsed = _make_parsed(entities=[entity])
-    det = DecoratorRoutingDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert result.enrichments == []
-
-
-async def test_event_handler_celery_task():
-    """Celery @app.task decorator → event enrichment."""
-    entity = _make_entity(name="send_email", tags=["decorator:app.task"])
-    parsed = _make_parsed(entities=[entity])
-    det = EventHandlerDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert len(result.enrichments) == 1
-    assert result.enrichments[0].properties["event_framework"] == "celery"
-    assert result.enrichments[0].properties["event_name"] == "send_email"
-
-
-async def test_event_handler_django_receiver():
-    """Django receiver with signal name → event enrichment."""
-    entity = _make_entity(tags=["decorator:receiver('post_save')"])
-    parsed = _make_parsed(entities=[entity])
-    det = EventHandlerDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert len(result.enrichments) == 1
-    assert result.enrichments[0].properties["event_framework"] == "django"
-    assert result.enrichments[0].properties["event_name"] == "post_save"
-
-
-async def test_cli_command_typer():
-    """Typer @app.command('build') → command enrichment."""
-    entity = _make_entity(tags=["decorator:app.command('build')"])
-    parsed = _make_parsed(entities=[entity])
-    det = CLICommandDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert len(result.enrichments) == 1
-    assert result.enrichments[0].properties["command_name"] == "build"
-    assert result.enrichments[0].properties["cli_framework"] == "click"
-
-
-async def test_cli_command_no_arg_uses_function_name():
-    """@app.command() without string arg → function name as command_name."""
-    entity = _make_entity(name="deploy", tags=["decorator:app.command()"])
-    parsed = _make_parsed(entities=[entity])
-    det = CLICommandDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert len(result.enrichments) == 1
-    assert result.enrichments[0].properties["command_name"] == "deploy"
-
-
-async def test_cli_command_typer_framework():
-    """@typer_app.command() → cli_framework = 'click' (no 'typer' in name)."""
-    entity = _make_entity(tags=["decorator:typer.command('run')"])
-    parsed = _make_parsed(entities=[entity])
-    det = CLICommandDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
-    assert result.enrichments[0].properties["cli_framework"] == "typer"
 
 
 async def test_di_injection_depends():
