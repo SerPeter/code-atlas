@@ -2440,12 +2440,20 @@ class GraphClient:
         if not ref_rels:
             return
 
-        by_type: dict[str, list[dict[str, str]]] = {}
+        # Keyed by (rel type, target label). A dispatch table is a Value, not a Callable,
+        # so `_HANDLERS[name](...)` needs a different target than everything else here.
+        by_type: dict[tuple[str, NodeLabel], list[dict[str, str]]] = {}
         for r in ref_rels:
-            by_type.setdefault(str(r.rel_type), []).append(
+            if r.properties.get("via") == "table":
+                label = NodeLabel.VALUE
+            elif r.rel_type == RelType.USES_TYPE:
+                label = NodeLabel.TYPE_DEF
+            else:
+                label = NodeLabel.CALLABLE
+            by_type.setdefault((str(r.rel_type), label), []).append(
                 {"from_uid": r.from_qualified_name, "to_name": r.to_name, "project": project_name}
             )
-        for rel_type, params in by_type.items():
+        for (rel_type, target), params in by_type.items():
             if rel_type == RelType.EXPORTS:
                 # A re-export resolves through the module's own IMPORTS edge, which is
                 # proof it can see the name — no label constraint, since __all__ lists
@@ -2457,9 +2465,6 @@ class GraphClient:
                     {"rels": params},
                 )
                 continue
-            # A field's declared type resolves to a TypeDef; a referenced or registering
-            # name resolves to a Callable. Same scope rules either way.
-            target = NodeLabel.TYPE_DEF if rel_type == RelType.USES_TYPE else NodeLabel.CALLABLE
             await self._link_named_callable(rel_type, params, target)
 
     async def _link_named_callable(

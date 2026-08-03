@@ -1195,7 +1195,40 @@ def _filter_value_references(entities: list[ParsedEntity], relationships: list[P
     local_callables = {e.name for e in entities if e.label == NodeLabel.CALLABLE and e.kind == CallableKind.FUNCTION}
     imported = {r.to_name.rsplit(".", 1)[-1] for r in relationships if r.rel_type == RelType.IMPORTS}
     known = local_callables | imported
-    relationships[:] = [r for r in relationships if r.rel_type != RelType.REFERENCES or r.to_name in known]
+    # A dispatch table is a Value, not a Callable, so it would never survive the callable
+    # filter. It is kept on a different ground: the name came from a subscript CALL, which
+    # is unambiguous about being a lookup rather than an incidental identifier.
+    known_tables = {e.name for e in entities if e.label == NodeLabel.VALUE}
+    relationships[:] = [
+        r
+        for r in relationships
+        if r.rel_type != RelType.REFERENCES
+        or (r.to_name in known_tables if r.properties.get("via") == "table" else r.to_name in known)
+    ]
+
+
+def _extract_table_references(node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
+    """Record the callables a dict literal holds — the other registry shape.
+
+    `TABLE = {"greet": handle_greet}` and `parse_func=_parse_python` are the same idea
+    written two ways, and only the second was captured. A handler reachable solely through
+    a table had no inbound edge at all, so find_dead_code called it dead and blast_radius
+    reported nothing downstream of the dispatcher.
+
+    Values only, never keys: `{"greet": ...}` names a string, not a callable.
+    """
+    for child in node.children:
+        if child.type != "pair":
+            continue
+        value = child.child_by_field_name("value")
+        if value is not None and value.type == "identifier":
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=from_qn,
+                    rel_type=RelType.REFERENCES,
+                    to_name=node_text(value),
+                )
+            )
 
 
 def _extract_module_level_references(node: Node, module_uid: str, relationships: list[ParsedRelationship]) -> None:
@@ -1209,6 +1242,8 @@ def _extract_module_level_references(node: Node, module_uid: str, relationships:
     for child in node.children:
         if child.type == "call":
             _extract_value_references(child, module_uid, relationships)
+        elif child.type == "dictionary":
+            _extract_table_references(child, module_uid, relationships)
         if child.type not in ("function_definition", "decorated_definition"):
             _extract_module_level_references(child, module_uid, relationships)
 
@@ -1256,6 +1291,8 @@ def _extract_calls(
 ) -> None:
     """Recursively extract call expressions from a function body."""
     for child in node.children:
+        if child.type == "dictionary":
+            _extract_table_references(child, from_qn, relationships)
         if child.type == "call":
             _extract_value_references(child, from_qn, relationships)
             func = child.child_by_field_name("function")
@@ -1269,6 +1306,22 @@ def _extract_calls(
                             to_name=call_name,
                         )
                     )
+                elif func.type == "subscript":
+                    # `_HANDLERS[name](payload)` — the callee is a lookup, so there is no
+                    # name to resolve against. Link to the TABLE and let the table's own
+                    # references reach the members: fanning out to all of them would hand
+                    # one call site as many full-confidence edges as the table has
+                    # entries, which is ADR-0022's failure rebuilt from the other side.
+                    base = func.child_by_field_name("value")
+                    if base is not None and base.type == "identifier":
+                        relationships.append(
+                            ParsedRelationship(
+                                from_qualified_name=from_qn,
+                                rel_type=RelType.REFERENCES,
+                                to_name=node_text(base),
+                                properties={"via": "table"},
+                            )
+                        )
                 elif func.type == "attribute":
                     attr = func.child_by_field_name("attribute")
                     obj = func.child_by_field_name("object")

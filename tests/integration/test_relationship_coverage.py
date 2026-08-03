@@ -327,11 +327,18 @@ CASES: tuple[Case, ...] = (
     ),
     Case(
         "registry-dispatch",
-        "who can dispatch() actually reach?",
-        "MATCH (a)-[:CALLS]->(b) WHERE a.project_name=$p AND a.qualified_name ENDS WITH 'dispatch' "
-        "AND b.name STARTS WITH 'handle_' RETURN b.qualified_name AS hit",
-        "MISSING",
-        "table-driven dispatch: the target is a value, not a name",
+        "what does dispatch() dispatch through?",
+        # A subscript callee has no name to resolve, so the honest edge runs to the TABLE.
+        # Never CALLS, and never fanned out: collapsing this into direct edges would give
+        # one call site as many full-confidence targets as the table has entries.
+        "MATCH (a)-[:REFERENCES]->(tbl) WHERE a.project_name=$p AND a.name = 'dispatch' RETURN tbl.name AS hit",
+        "LINKED",
+        "Reaching the MEMBERS of `_HANDLERS` is a separate matter and stays unanswered on "
+        "purpose: it is populated at runtime by the decorator (`_HANDLERS[name] = fn` "
+        "inside a closure), so no static pass can know its contents without executing it. "
+        "A dict LITERAL is decidable and is covered — the module references handle_greet "
+        "and handle_farewell through TABLE — and the decorator path is covered by "
+        "REGISTERED_BY. Only the runtime-populated shape is out of reach.",
     ),
     Case(
         "callback-by-reference",
