@@ -942,6 +942,14 @@ def _process_nested_functions(
     attribute to the enclosing function, which is where a reader would look for them.
     """
     for child in body.children:
+        # Descend through compound statements first. A `def` inside `with`/`if`/`try`/`for`
+        # is not a direct child of the body, and walking only direct children missed
+        # EmbedClient._embed_call and _build_kwargs — the product's only litellm call path.
+        if child.type not in ("function_definition", "class_definition", "decorated_definition"):
+            _process_nested_functions(
+                child, path, source, project_name, module_qn, enclosing_qn, entities, relationships
+            )
+
         target = child
         if child.type == "decorated_definition":
             inner = child.child_by_field_name("definition")
@@ -1158,6 +1166,13 @@ def _receiver_props(obj: Node | None, local_types: dict[str, str] | None) -> dic
     return props
 
 
+# Annotations that name no concrete class. Left in, each one silently DELETED every call on
+# that receiver: the external-receiver guard drops a call whose declared type matches no
+# project class, and `Any` matches none anywhere. An `Any` annotation was strictly worse
+# than no annotation, which is the opposite of what an annotation should ever do.
+_OPAQUE_TYPE_NAMES: frozenset[str] = frozenset({"Any", "object", "Self", "type", "None", "Optional"})
+
+
 def _plain_type_name(annotation: str) -> str:
     """A bare class name from an annotation, or "" when it is not one.
 
@@ -1168,6 +1183,8 @@ def _plain_type_name(annotation: str) -> str:
     behaviour.
     """
     text = annotation.strip()
+    if text in _OPAQUE_TYPE_NAMES:
+        return ""
     if text.isidentifier():
         return text
     # `set[str]` / `dict[str, int]` -> the base. The subscript does not change which
