@@ -378,9 +378,13 @@ CASES: tuple[Case, ...] = (
     Case(
         "dataclass-composition",
         "what is AppConfig made of?",
-        "MATCH (a)-[r]->(b) WHERE a.project_name=$p AND a.name='AppConfig' AND b.name IN ['DbConfig','CacheConfig'] "
-        "AND type(r) <> 'CONTAINS' RETURN b.name AS hit",
-        "MISSING",
+        # Two hops, deliberately: the type edge hangs off the FIELD, not the class. A
+        # direct class->class edge would answer "made of a DbConfig" while losing WHICH
+        # field holds it, and a class with three fields of the same type would collapse to
+        # one indistinguishable edge. DEFINES->USES_TYPE keeps the attribution.
+        "MATCH (a:TypeDef {name: 'AppConfig'})-[:DEFINES]->(f)-[:USES_TYPE]->(b) "
+        "WHERE a.project_name=$p AND b.name IN ['DbConfig','CacheConfig'] RETURN b.name AS hit",
+        "LINKED",
     ),
     Case(
         "nested-function-entity",

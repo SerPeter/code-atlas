@@ -537,7 +537,7 @@ def _walk_python_node(
             continue
 
         if child.type == "expression_statement":
-            _process_assignment(child, path, project_name, module_qn, node, entities, seen, enum_classes)
+            _process_assignment(child, path, project_name, module_qn, node, entities, relationships, seen, enum_classes)
             continue
 
         # Recurse into blocks (if, for, try, with, etc.) but not into functions/classes
@@ -909,6 +909,7 @@ def _process_assignment(
     module_qn: str,
     parent: Node,
     entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
     enum_classes: set[str],
 ) -> None:
@@ -955,6 +956,37 @@ def _process_assignment(
                 visibility=_visibility_from_name(name),
             )
         )
+
+        if class_name is not None:
+            # A class never claimed its own fields. That is the other half of why 433 of
+            # 450 field nodes had zero edges of ANY kind — not merely no type edge, no
+            # owner either — so a field was unreachable from the class that declares it
+            # and the class looked like it had nothing but methods.
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=f"{project_name}:{module_qn}.{class_name}",
+                    rel_type=RelType.DEFINES,
+                    to_name=f"{project_name}:{qn}",
+                )
+            )
+
+        # A field's declared type is what a class is BUILT FROM, and it was being
+        # discarded: 433 of 450 field nodes in this repo had no edge of any kind, so
+        # AtlasSettings' only outgoing edge was DEFINES to one method despite fields typed
+        # MemgraphSettings/RedisSettings/EmbeddingSettings. Marked `on: field` because it
+        # resolves in the field's own scope rather than through the Callable lookup that
+        # signature-derived USES_TYPE uses — a Value is not in that lookup at all.
+        annotation = child.child_by_field_name("type")
+        if annotation is not None and kind == ValueKind.FIELD:
+            relationships.extend(
+                ParsedRelationship(
+                    from_qualified_name=f"{project_name}:{qn}",
+                    rel_type=RelType.USES_TYPE,
+                    to_name=type_name,
+                    properties={"on": "field"},
+                )
+                for type_name in _collect_type_names_from_annotation(annotation)
+            )
 
 
 def _receiver_props(obj: Node | None, local_types: dict[str, str] | None) -> dict[str, Any]:

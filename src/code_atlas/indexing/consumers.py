@@ -906,9 +906,19 @@ class ASTConsumer(TierConsumer):
             ],
             import_rels=[r for r in parsed.relationships if r.rel_type == RelType.IMPORTS],
             call_rels=[r for r in parsed.relationships if r.rel_type == RelType.CALLS],
-            type_rels=[r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE],
+            # Signature-derived USES_TYPE resolves through the Callable lookup; a field's
+            # cannot, because a Value is not in that lookup. Split so each reaches the
+            # resolver that can actually see its source.
+            type_rels=[
+                r for r in parsed.relationships if r.rel_type == RelType.USES_TYPE and r.properties.get("on") != "field"
+            ],
             inherit_rels=[r for r in parsed.relationships if r.rel_type == RelType.INHERITS],
-            ref_rels=[r for r in parsed.relationships if r.rel_type in (RelType.REFERENCES, RelType.REGISTERED_BY)],
+            ref_rels=[
+                r
+                for r in parsed.relationships
+                if r.rel_type in (RelType.REFERENCES, RelType.REGISTERED_BY)
+                or (r.rel_type == RelType.USES_TYPE and r.properties.get("on") == "field")
+            ],
             anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
             config_rels=[r for r in parsed.relationships if _keep_config_ref(r)],

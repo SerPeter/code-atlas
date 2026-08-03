@@ -2426,24 +2426,30 @@ class GraphClient:
                 {"from_uid": r.from_qualified_name, "to_name": r.to_name, "project": project_name}
             )
         for rel_type, params in by_type.items():
-            await self._link_named_callable(rel_type, params)
+            # A field's declared type resolves to a TypeDef; a referenced or registering
+            # name resolves to a Callable. Same scope rules either way.
+            target = NodeLabel.TYPE_DEF if rel_type == RelType.USES_TYPE else NodeLabel.CALLABLE
+            await self._link_named_callable(rel_type, params, target)
 
-    async def _link_named_callable(self, rel_type: str, params: list[dict[str, str]]) -> None:
-        """Link a bare name to a Callable, in the referrer's file or its import scope.
+    async def _link_named_callable(
+        self, rel_type: str, params: list[dict[str, str]], target: NodeLabel = NodeLabel.CALLABLE
+    ) -> None:
+        """Link a bare name to an entity, in the referrer's file or its import scope.
 
-        Shared by REFERENCES and REGISTERED_BY: both name a callable rather than uid it,
-        and both must resolve in a scope the name provably reaches.
+        Shared by REFERENCES, REGISTERED_BY and field-level USES_TYPE: all three name their
+        target rather than uid it, and all must resolve in a scope the name provably
+        reaches. A project-wide match is what ADR-0022 removed from call resolution.
         """
         await self.execute_write(
             f"UNWIND $rels AS r "
-            f"MATCH (a {{uid: r.from_uid}}), (b:{NodeLabel.CALLABLE} {{project_name: r.project, name: r.to_name}}) "
+            f"MATCH (a {{uid: r.from_uid}}), (b:{target} {{project_name: r.project, name: r.to_name}}) "
             f"WHERE b.file_path = a.file_path AND b.uid <> a.uid "
             f"MERGE (a)-[:{rel_type}]->(b)",
             {"rels": params},
         )
         await self.execute_write(
             f"UNWIND $rels AS r "
-            f"MATCH (a {{uid: r.from_uid}}), (b:{NodeLabel.CALLABLE} {{project_name: r.project, name: r.to_name}}) "
+            f"MATCH (a {{uid: r.from_uid}}), (b:{target} {{project_name: r.project, name: r.to_name}}) "
             f"WHERE b.uid <> a.uid AND NOT (a)-[:{rel_type}]->(b) "
             f"AND EXISTS {{ MATCH (m:{NodeLabel.MODULE} {{file_path: a.file_path, project_name: r.project}})"
             f"-[:{RelType.IMPORTS}]->(b) }} "
