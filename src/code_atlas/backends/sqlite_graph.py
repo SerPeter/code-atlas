@@ -2951,6 +2951,8 @@ class SqliteGraphClient:
             "WHERE d.from_uid = n.uid AND d.rel_type = 'DEFINES' AND c.rel_type = 'CALLS') "
             "AND NOT EXISTS (SELECT 1 FROM edges d JOIN nodes p ON p.uid = d.from_uid "
             "WHERE d.to_uid = n.uid AND d.rel_type = 'DEFINES' AND p.labels = 'Callable') "
+            "AND NOT EXISTS (SELECT 1 FROM edges i WHERE i.from_uid = n.uid "
+            "AND i.rel_type IN ('IMPLEMENTS', 'REGISTERED_BY')) "
             "ORDER BY file_path, json_extract(props_json, '$.line_start')",
             [project, *code_kinds, *extra],
         )

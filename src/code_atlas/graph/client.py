@@ -3982,6 +3982,11 @@ class GraphClient:
             # A registered handler is reached by whatever owns the registry. The edge runs
             # FROM the handler ("registered by"), so liveness is an outbound test here.
             f"AND NOT (n)-[:{RelType.REGISTERED_BY}]->() "
+            # Same shape for a Protocol implementation: SqliteGraphClient's methods are
+            # called through GraphBackend, never by name, and the IMPLEMENTS edge runs FROM
+            # the concrete method TO the stub. Sampling the output found the top 10 hits
+            # were all this one class — 16 of 77 — reachable and reported dead.
+            f"AND NOT (n)-[:{RelType.IMPLEMENTS}]->() "
             "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
             "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
             "ORDER BY n.file_path, n.line_start",
