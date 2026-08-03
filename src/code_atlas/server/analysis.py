@@ -970,6 +970,15 @@ async def _analyze_dead_code(
     reflection, and framework entry points (CLI commands, route handlers,
     test fixtures invoked by name) are invisible to static CALLS resolution
     and can still false-positive as dead code.
+
+    One shape is permanently unresolvable rather than merely unresolved: a
+    method overriding a base this project does not contain. Its only caller is
+    the library — pydantic calls ``AtlasSettings.settings_customise_sources``
+    on every construction — and the base is an ExternalSymbol with no members,
+    so no OVERRIDES edge is even producible. Left visible on purpose. The
+    exclusion that would silence it (a class inheriting an ExternalSymbol)
+    covers 46 TypeDefs here including ``TierConsumer(abc.ABC)``, and would hide
+    real rot in all of them to remove one known row.
     """
     t0 = time.monotonic()
     raw = await graph.get_dead_code_candidates(project, path)
