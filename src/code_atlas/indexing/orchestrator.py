@@ -1274,7 +1274,21 @@ async def _create_package_hierarchy(
 # The wait is normally instant: ``stop()`` is observed at the top of the next
 # loop iteration and the only blocking await in between is a bounded
 # ``read_batch``. The ceiling only matters for a genuinely slow final flush.
-_CONSUMER_TEARDOWN_S = 60.0
+#
+# Raised 60 -> 600 when ADR-0026 gave the final flush real work: it now replays
+# every rel a project-wide strategy resolved, which on this repo is ~14k rels and
+# ~10k CALLS writes and takes just over a minute. At 60s the cancel landed inside
+# the flush, `suppress(CancelledError)` swallowed it, and the protocol-conformance
+# sweep after it silently never ran — IMPLEMENTS 258 -> 11 and find_dead_code
+# 15 -> 120, with nothing in the output saying so but one buried warning. That is
+# the SECOND time this ceiling has truncated that sweep; if it happens a third
+# time, stop raising the number and make teardown wait on a consumer that is
+# still making progress instead.
+#
+# It is a ceiling on a consumer that has already been told to stop, so a larger
+# value costs nothing in the normal case — it only bounds how long a genuinely
+# stuck consumer can wedge the CLI.
+_CONSUMER_TEARDOWN_S = 600.0
 
 
 async def _stop_consumer_tasks(tasks: Sequence[asyncio.Task[None] | None]) -> None:
