@@ -770,6 +770,101 @@ def _process_function(
         # repo, 0 of 64 nested functions existed and 458 call expressions in server/mcp.py
         # alone were dropped, taking all 23 @mcp.tool handlers with them.
         _process_nested_functions(body, path, source, project_name, module_qn, qn, entities, relationships)
+        if is_method and name == "__init__" and class_name is not None:
+            _process_self_attributes(
+                body,
+                path,
+                project_name,
+                f"{module_qn}.{class_name}",
+                _local_declared_types(node, body),
+                entities,
+                relationships,
+            )
+
+
+def _process_self_attributes(
+    body: Node,
+    path: str,
+    project_name: str,
+    class_qn: str,
+    local_types: dict[str, str],
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Turn `self.x = <injected>` in a constructor into a typed field of the class.
+
+    Constructor injection is how most of this codebase is wired — `self.graph = graph`,
+    `self.bus = bus` — and none of it existed: ASTConsumer.graph was not a node at all, so
+    "what does ASTConsumer depend on?" could not be asked even though the parameter it
+    comes from is annotated and USES_TYPE already resolves that same annotation for the
+    method.
+
+    Only `__init__`, and only a plain `self.name = ...`. The type comes from the parameter
+    annotation the value was handed from, or from a one-step `self.x = Foo()` — the same
+    two sources ADR-0023 measured at 90.7%. An unannotated assignment stays untyped rather
+    than guessed.
+    """
+    seen_attrs: set[str] = set()
+
+    def walk(n: Node) -> None:
+        for child in n.children:
+            if child.type == "expression_statement":
+                for inner in child.children:
+                    if inner.type != "assignment":
+                        continue
+                    left = inner.child_by_field_name("left")
+                    if left is None or left.type != "attribute":
+                        continue
+                    obj = left.child_by_field_name("object")
+                    attr = left.child_by_field_name("attribute")
+                    if obj is None or attr is None or node_text(obj) != "self":
+                        continue
+                    name = node_text(attr)
+                    if name in seen_attrs:
+                        continue
+                    seen_attrs.add(name)
+                    qn = f"{class_qn}.{name}"
+                    entities.append(
+                        ParsedEntity(
+                            name=name,
+                            qualified_name=f"{project_name}:{qn}",
+                            label=NodeLabel.VALUE,
+                            kind=ValueKind.FIELD,
+                            line_start=inner.start_point[0] + 1,
+                            line_end=inner.end_point[0] + 1,
+                            file_path=path,
+                            source=node_text(inner),
+                            visibility=_visibility_from_name(name),
+                        )
+                    )
+                    relationships.append(
+                        ParsedRelationship(
+                            from_qualified_name=f"{project_name}:{class_qn}",
+                            rel_type=RelType.DEFINES,
+                            to_name=f"{project_name}:{qn}",
+                        )
+                    )
+                    right = inner.child_by_field_name("right")
+                    type_name = ""
+                    if right is not None and right.type == "identifier":
+                        type_name = local_types.get(node_text(right), "")
+                    elif right is not None and right.type == "call":
+                        fn = right.child_by_field_name("function")
+                        if fn is not None and fn.type == "identifier" and node_text(fn)[:1].isupper():
+                            type_name = node_text(fn)
+                    if type_name:
+                        relationships.append(
+                            ParsedRelationship(
+                                from_qualified_name=f"{project_name}:{qn}",
+                                rel_type=RelType.USES_TYPE,
+                                to_name=type_name,
+                                properties={"on": "field"},
+                            )
+                        )
+            if child.type not in ("function_definition", "class_definition", "decorated_definition"):
+                walk(child)
+
+    walk(body)
 
 
 def _process_nested_functions(

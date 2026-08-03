@@ -371,7 +371,7 @@ CASES: tuple[Case, ...] = (
         "what collaborator does a Service instance hold?",
         "MATCH (n) WHERE n.project_name=$p AND n.qualified_name ENDS WITH 'Service.repo' "
         "RETURN n.qualified_name AS hit",
-        "MISSING",
+        "LINKED",
         "`self.repo = repo` produces no node at all — measured on the real repo, "
         "ASTConsumer.graph and TierConsumer.bus are both absent.",
     ),
