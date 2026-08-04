@@ -47,7 +47,25 @@ _VALID_DIAGRAM_TYPES = frozenset({"packages", "imports", "inheritance", "module_
 # edge sets — trace_path follows any structural/call relationship, blast_radius
 # is specifically about call impact so it defaults to CALLS only.
 _DEFAULT_TRACE_EDGE_TYPES = ("CALLS", "IMPORTS", "USES_TYPE")
-_DEFAULT_BLAST_EDGE_TYPES = ("CALLS",)
+# What "affected" means. CALLS alone answered "who EXECUTES this", which is a different
+# and much smaller question than the one this tool exists for — and a class is never
+# called, it is annotated, constructed and implemented. Measured on this repo, CALLS-only
+# left 289 of 1,568 src entities (18%) with zero visible dependents, including GraphClient,
+# whose 239 dependents it reported as none.
+#
+# DEFINES and CONTAINS are deliberately absent. They are containment, not dependency:
+# including DEFINES would make changing one method "affect" its class and transitively
+# everything the class touches, which is how a blast radius stops meaning anything.
+_DEFAULT_BLAST_EDGE_TYPES = (
+    "CALLS",
+    "USES_TYPE",
+    "IMPLEMENTS",
+    "OVERRIDES",
+    "INHERITS",
+    "REFERENCES",
+    "REGISTERED_BY",
+    "IMPORTS",
+)
 
 # Quality analysis thresholds (v1 — hardcoded for medium Python projects)
 _GOD_MODULE_ENTITY_THRESHOLD = 30
@@ -276,6 +294,10 @@ async def blast_radius(
 
     "callers" traverses incoming edges (who transitively depends on *uid*),
     "callees" traverses outgoing edges (what *uid* transitively depends on).
+    Each entry carries ``via`` — the edge types incident to *uid* on the paths
+    that reach it — so a dependent found through REFERENCES or USES_TYPE is not
+    read as a caller. That distinction is ADR-0099\'s, and it belongs in the
+    output rather than in an omission that hid every type in the codebase.
     Each affected entity is flagged ``ambiguous_only: true`` when no path made
     entirely of ``confidence: "resolved"`` CALLS edges (ADR-0014) reaches it
     within ``max_depth`` — a heuristic signal, not a guarantee (e.g. an

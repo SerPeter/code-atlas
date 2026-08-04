@@ -2085,12 +2085,17 @@ def _register_traversal_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         description=(
             "Depth-limited transitive closure of callers/callees/both from an entity — "
-            "'what would be affected if I change this'. Traverses CALLS edges by default "
-            "(override with edge_types). Flags entities reachable only via an ambiguous "
-            "CALLS edge as ambiguous_only=true — a heuristic, not a guarantee (see ADR-0014): "
-            "no path made entirely of confidence:'resolved' edges reaches it within max_depth. "
+            "'what would be affected if I change this'. Traverses the dependency edges by "
+            "default — CALLS, USES_TYPE, IMPLEMENTS, OVERRIDES, INHERITS, REFERENCES, "
+            "REGISTERED_BY, IMPORTS (override with edge_types). Each hit carries `via`, the "
+            "edge types by which it reaches the entity, so a dependent found through "
+            "USES_TYPE is not read as a caller. Containment (DEFINES/CONTAINS) is excluded: "
+            "it would make changing one method 'affect' everything its class touches. "
+            "Flags entities reachable only via an ambiguous edge as ambiguous_only=true — a "
+            "heuristic, not a guarantee (see ADR-0014): no path made entirely of "
+            "confidence:'resolved' edges reaches it within max_depth. "
             "Returns: {uid, direction, max_depth, affected_count, affected: [{uid, name, "
-            "qualified_name, label, file_path, min_depth, direction, ambiguous_only}], "
+            "qualified_name, label, file_path, min_depth, direction, via, ambiguous_only}], "
             "truncated, query_ms}."
         ),
     )

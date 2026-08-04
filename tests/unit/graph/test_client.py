@@ -779,7 +779,10 @@ class TestWeightAwareTraversalQueries:
         assert "max(reduce(w = 1.0" in all_query
         assert "coalesce(r.weight, 1.0)" in all_query
         assert "AS confidence_score" in all_query
-        assert "r.confidence = 'resolved'" in resolved_query
+        # coalesce, not a bare equality: an absent confidence means STRUCTURAL (ADR-0028),
+        # and since blast_radius widened past CALLS most hops legitimately carry none. A
+        # bare `r.confidence = 'resolved'` marked every one of them ambiguous.
+        assert "coalesce(r.confidence, 'resolved') = 'resolved'" in resolved_query
         assert "NOT coalesce(r.from_test, false)" in production_query
         assert results[0]["confidence_score"] == 0.25
         assert results[0]["ambiguous_only"] is True

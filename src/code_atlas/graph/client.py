@@ -3888,12 +3888,20 @@ class GraphClient:
             "labels(affected)[0] AS label, affected.file_path AS file_path, "
             "min(length(p)) AS min_depth, "
             f"max(reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}))) "
-            "AS confidence_score",
+            "AS confidence_score, "
+            # The hop incident to `start` — how the dependency actually lands on it.
+            # relationships(p) runs in path order from start, so [0] is that edge in
+            # both directions.
+            "collect(DISTINCT type(relationships(p)[0])) AS via",
             {"uid": uid},
         )
         resolved_raw = await self.execute(
             f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
-            "WHERE affected.uid <> $uid AND all(r IN relationships(p) WHERE r.confidence = 'resolved') "
+            # coalesce, because an absent confidence means STRUCTURAL (ADR-0028): DEFINES
+            # and IMPORTS are facts, not guesses. Resolvers that guess now say so, so a
+            # bare edge is exactly the one that should count as resolved.
+            "WHERE affected.uid <> $uid "
+            "AND all(r IN relationships(p) WHERE coalesce(r.confidence, 'resolved') = 'resolved') "
             "RETURN DISTINCT affected.uid AS uid",
             {"uid": uid},
         )
@@ -3916,6 +3924,7 @@ class GraphClient:
                 "file_path": r["file_path"],
                 "min_depth": r["min_depth"],
                 "direction": direction_kind,
+                "via": sorted(r.get("via") or []),
                 "ambiguous_only": r["uid"] not in resolved_uids,
                 "confidence_score": r["confidence_score"],
                 "test_only": r["uid"] not in production_uids,

@@ -551,6 +551,16 @@ CASES: tuple[Case, ...] = (
         "classes too, and @dataclass is how most classes here are written.",
     ),
     Case(
+        "impact-of-changing-a-type",
+        "what would be affected if I changed Repository — the question blast_radius exists for?",
+        # A class is never CALLED; it is annotated, constructed and implemented. Reading
+        # CALLS only, this answered ZERO for every type in the codebase — on the real repo
+        # that was 18% of src entities, GraphClient's 239 dependents among them.
+        "MATCH (a)-[r:CALLS|USES_TYPE|IMPLEMENTS|OVERRIDES|INHERITS|REFERENCES|IMPORTS]->(b) "
+        "WHERE a.project_name=$p AND b.name='Repository' RETURN a.qualified_name AS hit",
+        "LINKED",
+    ),
+    Case(
         "duck-typed-twin-not-stolen-by-co-location",
         "does sink.flush() reach the OTHER implementation, not just the co-located one?",
         "MATCH (a)-[:CALLS]->(b) WHERE a.project_name=$p AND a.qualified_name ENDS WITH 'boot.drain' "
