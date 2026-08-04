@@ -26,6 +26,7 @@ from code_atlas.graph.client import (
     _fuse_bm25_results,
     _resolve_one_call,
     _sanitize_bm25_query,
+    _test_callable_uids,
     _validate_relationship_routing,
 )
 from code_atlas.parsing.ast import ParsedRelationship
@@ -299,6 +300,111 @@ class TestResolveOneCall:
         rel = self._rel(f"{self.PROJECT}:mod.func", "print")
         result = _resolve_one_call(self.PROJECT, rel, lookup, {})
         assert result is None
+
+
+class TestTestCandidateHygiene:
+    """Production code cannot depend on test code, so a non-test call site must not
+    resolve onto a test definition (ATL-103).
+
+    The filter is deliberately ASYMMETRIC. "Production does not depend on tests" is an
+    architectural invariant; "tests do not call production" is the opposite of true, so a
+    test caller filters nothing. Graphify (round-3 competitor read) applies a symmetric
+    preference; that half is not grounded in an invariant and is not copied.
+
+    The damage this prevents is not only a wrong edge. `candidate_count` is the surviving
+    list's length and `weight` is 1/candidate_count, so one same-named fixture also halves
+    the weight of the RIGHT edge — which is what reaches Leiden and blast_radius ranking.
+    """
+
+    PROJECT = "proj"
+    PROD_UID = "proj:mod.helper"
+    TEST_UID = "proj:tests.test_mod.helper"
+
+    def _rel(self, from_uid: str, to_name: str) -> ParsedRelationship:
+        return ParsedRelationship(from_qualified_name=from_uid, rel_type=RelType.CALLS, to_name=to_name)
+
+    def _lookup(self) -> _CallLookup:
+        return _CallLookup(
+            name_to_callables={
+                "helper": [
+                    (self.PROD_UID, "src/mod.py", "public"),
+                    (self.TEST_UID, "tests/test_mod.py", "public"),
+                ]
+            },
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={
+                self.PROD_UID: ("helper", "src/mod.py"),
+                self.TEST_UID: ("helper", "tests/test_mod.py"),
+            },
+        )
+
+    def test_a_production_call_site_ignores_a_same_named_test_definition(self):
+        """The real edge resolves alone — so candidate_count is 1 and weight stays 1.0."""
+        lookup = self._lookup()
+        test_callables = _test_callable_uids(lookup, ["tests/", "test_*.py"])
+        assert test_callables == frozenset({self.TEST_UID})
+
+        rel = self._rel("proj:src.other.caller", "helper")
+        result = _resolve_one_call(self.PROJECT, rel, lookup, None, test_callables)
+        assert result == ([self.PROD_UID], "project_unique")
+        # Without the filter this is the regression: two candidates, so the production
+        # edge is tagged ambiguous and its weight halved.
+        assert _resolve_one_call(self.PROJECT, rel, lookup, None, frozenset()) == (
+            [self.PROD_UID, self.TEST_UID],
+            "project_wide",
+        )
+
+    def test_a_test_call_site_is_not_filtered_at_all(self):
+        """Calling production code is what a test is FOR — the invariant only runs one way.
+
+        The caller is a distinct uid from either candidate AND lives in a different test
+        file, so neither ``non_self`` nor the same-file rung can account for the result:
+        both definitions survive precisely because no filter ran.
+
+        (Co-locate the caller with the test definition instead and Strategy 3 resolves it
+        to that definition on its own — which is why the symmetric "prefer test candidates
+        for test callers" half of Graphify's rule buys nothing here.)
+        """
+        caller_uid = "proj:tests.test_other.test_something"
+        lookup = self._lookup()
+        lookup.uid_to_info[caller_uid] = ("test_something", "tests/test_other.py")
+        test_callables = _test_callable_uids(lookup, ["tests/", "test_*.py"])
+        assert caller_uid in test_callables
+
+        rel = self._rel(caller_uid, "helper")
+        result = _resolve_one_call(self.PROJECT, rel, lookup, None, test_callables)
+        assert result == ([self.PROD_UID, self.TEST_UID], "project_wide")
+
+    def test_an_all_test_candidate_set_still_produces_an_edge(self):
+        """Falling back beats dropping: a diluted edge outranks a silent absence."""
+        lookup = _CallLookup(
+            name_to_callables={"fixture_only": [(self.TEST_UID, "tests/test_mod.py", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={self.TEST_UID: ("fixture_only", "tests/test_mod.py")},
+        )
+        test_callables = _test_callable_uids(lookup, ["tests/", "test_*.py"])
+        assert test_callables == frozenset({self.TEST_UID})
+
+        rel = self._rel("proj:src.other.caller", "fixture_only")
+        result = _resolve_one_call(self.PROJECT, rel, lookup, None, test_callables)
+        assert result == ([self.TEST_UID], "project_unique")
+
+    def test_the_filter_follows_the_configured_patterns_not_the_defaults(self):
+        """A project that configures its own test_patterns filters by the same rule that
+        decides from_test — which is why the uid set is derived from the effective list."""
+        lookup = _CallLookup(
+            name_to_callables={"helper": [("proj:spec.mod.helper", "spec/mod.py", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={"proj:spec.mod.helper": ("helper", "spec/mod.py")},
+        )
+        assert _test_callable_uids(lookup, ["tests/"]) == frozenset()
+        assert _test_callable_uids(lookup, ["spec/"]) == frozenset({"proj:spec.mod.helper"})
 
 
 class TestNonCallEdgeQuality:

@@ -324,6 +324,29 @@ def drain(sink) -> None:
 
 _validate_wiring()
 ''',
+    "ledger.py": '''
+"""A production method whose name a test double also uses."""
+
+
+class Ledger:
+    def commit(self) -> None:
+        """The real implementation, and the only legitimate target of submit()."""
+
+
+def submit(ledger) -> None:
+    """`ledger` is untyped, so the receiver is ungrounded: strategies 2 and 3 are skipped
+    and resolution falls through to the project-wide pool — which is exactly where a
+    same-named test double would otherwise compete for the edge."""
+    ledger.commit()
+''',
+    "test_doubles.py": '''
+"""A test double. The FILENAME is what marks it — it matches the default `test_*` pattern."""
+
+
+class FakeLedger:
+    def commit(self) -> None:
+        """Same method name as Ledger.commit, and must never absorb a production call."""
+''',
 }
 
 
@@ -579,6 +602,16 @@ CASES: tuple[Case, ...] = (
         "`self.` pins the name to one class, so the methods-only exclusion (which exists because a "
         "BARE name matching a method is coincidence) does not apply.",
     ),
+    Case(
+        "production-call-skips-the-test-double",
+        "does submit reach the production Ledger.commit?",
+        "MATCH (a)-[:CALLS]->(b) WHERE a.project_name=$p AND a.qualified_name ENDS WITH 'submit' "
+        "AND b.qualified_name CONTAINS 'Ledger.commit' AND NOT b.qualified_name CONTAINS 'FakeLedger' "
+        "RETURN b.qualified_name AS hit",
+        "LINKED",
+        "ATL-103: production code cannot depend on test code, so a test definition is dropped from "
+        "the candidate pool before the name-matching strategies read it.",
+    ),
 )
 
 # Ratchet: the share of pattern questions the graph can answer today. Raising this is the
@@ -673,6 +706,29 @@ async def test_known_gap_is_still_a_gap(indexed_corpus, case: Case):
     assert not hits, (
         f"FIXED — {case.question!r} now returns {hits[:3]}. "
         f"Promote case {case.name!r} to status='LINKED' to lock it in."
+    )
+
+
+async def test_a_test_double_never_absorbs_a_production_call(indexed_corpus):
+    """The other half of ATL-103, which the LINKED/MISSING harness cannot express.
+
+    A LINKED case proves the right edge EXISTS; it says nothing about a wrong edge sitting
+    beside it. The candidate_count assertion is the half that actually bites: leave the
+    fixture in the pool and the production edge is written at candidate_count 2, so
+    ``weight`` is 0.5 and the real call reaches Leiden and blast_radius ranking at half
+    strength — a quiet mis-ranking rather than a visibly wrong answer.
+    """
+    client, project = indexed_corpus
+    rows = await client.execute(
+        "MATCH (a)-[r:CALLS]->(b) WHERE a.project_name=$p AND a.qualified_name ENDS WITH 'submit' "
+        "AND b.name='commit' RETURN b.qualified_name AS target, r.candidate_count AS candidates",
+        {"p": project},
+    )
+    targets = {r["target"] for r in rows}
+    assert targets, "submit -> commit did not resolve at all; this test proves nothing as written"
+    assert not any("FakeLedger" in t for t in targets), f"a test double absorbed a production call: {sorted(targets)}"
+    assert all(r["candidates"] == 1 for r in rows), (
+        f"the test double still inflated candidate_count, halving the real edge's weight: {rows}"
     )
 
 

@@ -886,6 +886,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     rel: ParsedRelationship,
     lk: _CallLookup,
     name_to_typedefs: dict[str, list[tuple[str, str]]] | None = None,
+    test_callables: frozenset[str] = frozenset(),
 ) -> tuple[list[str], str] | None:
     """Resolve a single CALLS relationship to one or more candidate target uids.
 
@@ -895,6 +896,11 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     name matched multiple candidates that could not be disambiguated (the caller
     tags every resulting edge ``confidence: "ambiguous"`` instead of discarding
     them, per ADR-0014).
+
+    *test_callables* holds the uids of Callables defined in test code (see
+    ``_test_callable_uids``); it gates the candidate-hygiene filter on the
+    name-matching strategies.  Defaulting to empty disables that filter, which
+    is why both production call sites pass it explicitly.
     """
     caller_uid = rel.from_qualified_name
     bare_name = rel.to_name
@@ -973,6 +979,25 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     # materializes an edge to each candidate, tagged confidence:"ambiguous"
     # by the caller instead of being discarded (ADR-0014).
     candidates = lk.name_to_callables.get(bare_name, [])
+
+    # Candidate hygiene, before any of the name-matching strategies read the list.
+    # Production code cannot depend on test code — an architectural invariant, not a
+    # preference — so a non-test call site never resolves onto a test definition. The
+    # converse is NOT an invariant (calling production code is what a test is for), so a
+    # test caller filters nothing and keeps reaching production definitions.
+    #
+    # This has to happen here rather than inside a strategy, for the same reason the stub
+    # filter does: the surviving count becomes `candidate_count`, which drives every
+    # edge's weight (ADR-0014). A same-named fixture left in the pool does not merely add
+    # a wrong edge, it halves the weight of the right one.
+    if test_callables and caller_uid not in test_callables:
+        production = [c for c in candidates if c[0] not in test_callables]
+        # Fall back rather than drop: when every definition of this name lives in test
+        # code, that IS the best available answer. Emptying the pool would trade a
+        # diluted-but-present edge for a silent absence — the failure mode ADR-0014
+        # exists to avoid, and the one Graphify's drop-on-ambiguity design walks into.
+        candidates = production or candidates
+
     non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
 
     # Strategy 3.5: the receiver's declared type. Most of what looks like polymorphism is
@@ -1101,6 +1126,24 @@ _VECTOR_PAGE_MAX = 1000
 # from the search layer's rule; resolve_calls takes an override for projects
 # that configure their own patterns.
 _DEFAULT_TEST_PATTERNS: tuple[str, ...] = tuple(SearchSettings().test_patterns)
+
+
+def _test_callable_uids(lk: _CallLookup, patterns: list[str]) -> frozenset[str]:
+    """Uids of Callables whose definition lives in test code.
+
+    Derived from the *effective* patterns a caller passed to ``resolve_calls``
+    rather than from ``_DEFAULT_TEST_PATTERNS``, so a project that configures its
+    own ``search.test_patterns`` filters candidates by the same rule that decides
+    ``from_test``.  Computed once per resolution pass — ``uid_to_info`` is already
+    ``uid → (name, file_path)``, which is exactly ``matches_test_pattern``'s input.
+
+    Note the Module gap this inherits: module-scope callers are absent from
+    ``uid_to_info`` (that absence is how ``_resolve_one_call`` detects them), so an
+    import-time call in a test file is treated as production code here, exactly as
+    it already is for ``from_test``.
+    """
+    return frozenset(uid for uid, (name, fp) in lk.uid_to_info.items() if matches_test_pattern(fp, name, patterns))
+
 
 # Both weight numbers above are heuristics, not measurements — they are
 # expected to be retuned once there is evidence about what ranks well.
@@ -2146,13 +2189,14 @@ class GraphClient:
         # Resolve each call. Several call sites can produce the same (from,to)
         # pair; _combine_call_edge_facts decides what the single stored edge says.
         patterns = list(_DEFAULT_TEST_PATTERNS if test_patterns is None else test_patterns)
+        test_callables = _test_callable_uids(lookup, patterns)
         caller_is_test: dict[str, bool] = {}
         edges: dict[tuple[str, str], _CallEdgeFacts] = {}
         resolved = 0
         ambiguous = 0
         replay = ReplayableRels()
         for rel in call_rels:
-            result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
+            result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs, test_callables)
             if result is None:
                 replay.unresolved.append(rel)
                 continue

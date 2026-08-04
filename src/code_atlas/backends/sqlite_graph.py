@@ -79,6 +79,7 @@ from code_atlas.graph.client import (
     _render_citation_key,
     _resolve_one_call,
     _resolve_one_path_anchor,
+    _test_callable_uids,
 )
 from code_atlas.graph.client import (
     _classify_file as _classify_file_delta,
@@ -1382,12 +1383,13 @@ class SqliteGraphClient:
             name_to_typedefs = await self._name_to_typedefs(project_name)
 
         patterns = list(_DEFAULT_TEST_PATTERNS if test_patterns is None else test_patterns)
+        test_callables = _test_callable_uids(lookup, patterns)
         caller_is_test: dict[str, bool] = {}
         edges: dict[tuple[str, str], _CallEdgeFacts] = {}
         resolved = ambiguous = 0
         replay = ReplayableRels()
         for rel in call_rels:
-            result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs)
+            result = _resolve_one_call(project_name, rel, lookup, name_to_typedefs, test_callables)
             if result is None:
                 replay.unresolved.append(rel)
                 continue
