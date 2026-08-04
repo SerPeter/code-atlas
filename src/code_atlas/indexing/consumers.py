@@ -173,6 +173,7 @@ class TierConsumer(ABC):
         self.policy = policy
         self._project_filter = project_filter
         self._stop = False
+        self._progress_at: float = 0.0
         self._pel_dirty = False
         self._fail_counts: dict[bytes, int] = {}  # msg_id → failed-batch count (poison cap)
         # Long-lived consumers (daemon, MCP server) stand down while a CLI index holds the
@@ -257,6 +258,21 @@ class TierConsumer(ABC):
     def stop(self) -> None:
         """Signal the consumer to stop after the current iteration."""
         self._stop = True
+
+    def note_progress(self) -> None:
+        """Record that real work just completed.
+
+        Teardown reads this to tell a consumer that is slow from one that is stuck.
+        The final flush is unbounded work — it scales with the project — so any fixed
+        grace period is wrong at some size, and being wrong means the whole-project
+        sweeps at the end of that flush are cancelled and silently skipped.
+        """
+        self._progress_at = asyncio.get_event_loop().time()
+
+    @property
+    def progress_at(self) -> float:
+        """Loop-clock timestamp of the last :meth:`note_progress`, 0.0 if never."""
+        return self._progress_at
 
     @property
     def stopped(self) -> bool:
@@ -390,6 +406,7 @@ class TierConsumer(ABC):
             with logger.contextualize(consumer=self.consumer_name):
                 deferred = await self.process_batch(events, batch_id) or set()
             await self._ack_processed(events, msg_ids, deferred)
+            self.note_progress()
         except Exception:
             logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
             self._note_batch_failure(msg_ids)
@@ -763,6 +780,7 @@ class ASTConsumer(TierConsumer):
             # absolute path forms) — resolved once, cross-project, rather
             # than per-project like CALLS/IMPORTS/USES_TYPE below.
             await self.graph.resolve_anchors(self._pending_anchor_rels)
+            self.note_progress()
 
         backlog = {p for p, r in self._retry_rels.items() if r}
         if final and self._stale_candidate_rels is not None:
@@ -790,11 +808,13 @@ class ASTConsumer(TierConsumer):
 
             if proj_imports:
                 replay = await self.graph.resolve_imports(project_name, proj_imports)
+                self.note_progress()
                 unresolved += replay.unresolved
                 stale_candidates += replay.stale_candidates
 
             if proj_config:
                 await self.graph.resolve_config_refs(project_name, proj_config)
+                self.note_progress()
 
             # Strictly after resolve_imports: a base is usually external, and the
             # ExternalSymbol it points at does not exist until imports are resolved.
@@ -803,10 +823,12 @@ class ASTConsumer(TierConsumer):
             ]
             if proj_inherits:
                 await self.graph.resolve_inherits(project_name, proj_inherits)
+                self.note_progress()
 
             proj_refs = [r for r in self._pending_ref_rels if r.from_qualified_name.startswith(project_name + ":")]
             if proj_refs:
                 await self.graph.resolve_value_references(project_name, proj_refs)
+                self.note_progress()
 
             if proj_calls or proj_types or proj_members:
                 # Built after resolve_imports above, so a retried import that only
@@ -833,6 +855,7 @@ class ASTConsumer(TierConsumer):
                     await self.graph.resolve_member_defines(
                         project_name, proj_members, lookup=shared_lookup, name_to_typedefs=td_map
                     )
+                self.note_progress()
 
             # Rebuild rather than update: the whole backlog was just replayed, so
             # a rel that resolved this time is absent from `unresolved` and has to
@@ -893,6 +916,7 @@ class ASTConsumer(TierConsumer):
             # collapsed 261 -> 42 and GraphBackend went back to zero implementers.
             for project_name in self._projects_seen:
                 await self.graph.resolve_protocol_conformance(project_name)
+                self.note_progress()
             self._projects_seen.clear()
 
         if self._pending_project_names:

@@ -1604,13 +1604,75 @@ class TestStopConsumerTasks:
         assert flushed.is_set()
         assert not task.cancelled()
 
-    async def test_a_straggler_is_still_cancelled_at_the_ceiling(self, monkeypatch):
-        monkeypatch.setattr(orchestrator_module, "_CONSUMER_TEARDOWN_S", 0.05)
+    async def test_a_straggler_is_still_cancelled_when_it_stops_progressing(self, monkeypatch):
+        monkeypatch.setattr(orchestrator_module, "_CONSUMER_STALL_S", 0.05)
+        monkeypatch.setattr(orchestrator_module, "_TEARDOWN_POLL_S", 0.01)
         task = asyncio.create_task(asyncio.sleep(30))
 
-        await _stop_consumer_tasks([task])
+        finished = await _stop_consumer_tasks([task])
 
         assert task.cancelled()
+        assert finished is False, "a truncated flush must be reported, not pass as success"
+
+    async def test_a_slow_but_progressing_consumer_is_not_cancelled(self, monkeypatch):
+        """The regression that made this a mechanism instead of a number.
+
+        A final flush scales with the project, so it will always outgrow any fixed
+        grace period. Twice, the cancel landed inside it and the whole-project
+        conformance sweep was skipped in silence — IMPLEMENTS 258 -> 11.
+        """
+        monkeypatch.setattr(orchestrator_module, "_CONSUMER_STALL_S", 0.2)
+        monkeypatch.setattr(orchestrator_module, "_TEARDOWN_POLL_S", 0.01)
+
+        swept = asyncio.Event()
+
+        class _Beating:
+            """Heartbeats while it works, exactly as TierConsumer.note_progress does."""
+
+            def __init__(self) -> None:
+                self.progress_at = 0.0
+
+        consumer = _Beating()
+
+        async def work() -> None:
+            # Ten steps at 0.1s each: 1s total, five times the stall window, but no
+            # single gap exceeds it.
+            for _ in range(10):
+                await asyncio.sleep(0.1)
+                consumer.progress_at = asyncio.get_event_loop().time()
+            swept.set()
+
+        task = asyncio.create_task(work())
+
+        finished = await _stop_consumer_tasks([task], [consumer])
+
+        assert swept.is_set(), "cancelled a consumer that was still doing real work"
+        assert not task.cancelled()
+        assert finished is True
+
+    async def test_the_absolute_cap_still_bounds_a_forever_heartbeat(self, monkeypatch):
+        """A consumer that heartbeats but never finishes must not wedge the CLI."""
+        monkeypatch.setattr(orchestrator_module, "_CONSUMER_STALL_S", 30.0)
+        monkeypatch.setattr(orchestrator_module, "_CONSUMER_TEARDOWN_CAP_S", 0.1)
+        monkeypatch.setattr(orchestrator_module, "_TEARDOWN_POLL_S", 0.01)
+
+        class _Beating:
+            def __init__(self) -> None:
+                self.progress_at = 0.0
+
+        consumer = _Beating()
+
+        async def forever() -> None:
+            while True:
+                await asyncio.sleep(0.01)
+                consumer.progress_at = asyncio.get_event_loop().time()
+
+        task = asyncio.create_task(forever())
+
+        finished = await _stop_consumer_tasks([task], [consumer])
+
+        assert task.cancelled()
+        assert finished is False
 
     async def test_no_tasks_is_a_no_op(self):
         await _stop_consumer_tasks([None])

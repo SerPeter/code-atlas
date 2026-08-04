@@ -29,6 +29,18 @@ from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
+    from typing import Protocol
+
+    class _HasProgress(Protocol):
+        """Anything teardown can ask "are you still working?".
+
+        Structural on purpose: only the heartbeat is read, so the waiter does not
+        need to import a concrete consumer, and a test double is a legitimate
+        implementation rather than something to cast around.
+        """
+
+        @property
+        def progress_at(self) -> float: ...
 
     from code_atlas.graph.client import GraphClient
     from code_atlas.settings import AtlasSettings, MonorepoSettings
@@ -1271,49 +1283,78 @@ async def _create_package_hierarchy(
 # routinely landed *inside* that flush; ``contextlib.suppress(CancelledError)``
 # then swallowed it, so the sweep silently never completed.
 #
-# The wait is normally instant: ``stop()`` is observed at the top of the next
-# loop iteration and the only blocking await in between is a bounded
-# ``read_batch``. The ceiling only matters for a genuinely slow final flush.
+# How long a stopped consumer may go WITHOUT completing a step before teardown
+# gives up on it. Not a budget for the whole final flush: that flush is unbounded
+# work — since ADR-0026 it replays every rel a project-wide strategy resolved —
+# so any fixed ceiling is wrong at some project size, and being wrong means the
+# whole-project sweeps at the end of it are cancelled and silently skipped.
 #
-# Raised 60 -> 600 when ADR-0026 gave the final flush real work: it now replays
-# every rel a project-wide strategy resolved, which on this repo is ~14k rels and
-# ~10k CALLS writes and takes just over a minute. At 60s the cancel landed inside
-# the flush, `suppress(CancelledError)` swallowed it, and the protocol-conformance
-# sweep after it silently never ran — IMPLEMENTS 258 -> 11 and find_dead_code
-# 15 -> 120, with nothing in the output saying so but one buried warning. That is
-# the SECOND time this ceiling has truncated that sweep; if it happens a third
-# time, stop raising the number and make teardown wait on a consumer that is
-# still making progress instead.
-#
-# It is a ceiling on a consumer that has already been told to stop, so a larger
-# value costs nothing in the normal case — it only bounds how long a genuinely
-# stuck consumer can wedge the CLI.
-_CONSUMER_TEARDOWN_S = 600.0
+# That has now happened twice, both times invisibly. At 60s the cancel landed
+# inside the flush, ``suppress(CancelledError)`` swallowed it, and the
+# protocol-conformance sweep never ran: IMPLEMENTS 258 -> 11 and find_dead_code
+# 15 -> 120, with nothing in the output saying so but one warning buried in the
+# progress display. Raising the number only moves the cliff, so teardown now
+# measures progress instead — a consumer that completed a resolver step or a
+# batch inside this window is working, not wedged, and is left alone.
+_CONSUMER_STALL_S = 120.0
+# Absolute backstop so a consumer that heartbeats forever cannot wedge the CLI.
+_CONSUMER_TEARDOWN_CAP_S = 3600.0
+_TEARDOWN_POLL_S = 2.0
 
 
-async def _stop_consumer_tasks(tasks: Sequence[asyncio.Task[None] | None]) -> None:
+async def _stop_consumer_tasks(
+    tasks: Sequence[asyncio.Task[None] | None],
+    consumers: Sequence[_HasProgress | None] = (),
+) -> bool:
     """Let already-stopped consumers finish their final flush, then cancel stragglers.
 
     Callers must have invoked ``stop()`` on every consumer first — this only
     waits. Exceptions propagate exactly as they did before (only
     ``CancelledError`` is suppressed).
+
+    Returns True when every task finished on its own. False means at least one was
+    cancelled mid-flush, so its end-of-run whole-project sweeps did not run and the
+    graph is missing edges the next full index would restore — the caller is
+    expected to say so out loud rather than let it pass as success.
+
+    *consumers* is optional only so existing callers keep working; without it there
+    is no heartbeat to read and the stall window becomes a flat timeout.
     """
     live = [t for t in tasks if t is not None]
     if not live:
-        return
-    _done, still_running = await asyncio.wait(live, timeout=_CONSUMER_TEARDOWN_S)
-    if still_running:
+        return True
+    watched = [c for c in consumers if c is not None]
+
+    loop = asyncio.get_event_loop()
+    started = loop.time()
+    last_progress = started
+    while True:
+        _done, still_running = await asyncio.wait(live, timeout=_TEARDOWN_POLL_S)
+        if not still_running:
+            return True
+        # A heartbeat from ANY watched consumer counts: they are torn down together
+        # and one still writing means the graph is still being completed.
+        newest = max((c.progress_at for c in watched), default=0.0)
+        last_progress = max(last_progress, newest)
+        now = loop.time()
+        stalled = now - last_progress
+        if stalled < _CONSUMER_STALL_S and (now - started) < _CONSUMER_TEARDOWN_CAP_S:
+            continue
+
         logger.warning(
-            "{} consumer task(s) still running {}s after stop() — cancelling; "
-            "the final resolution flush may be incomplete",
+            "{} consumer task(s) made no progress for {:.0f}s after stop() — cancelling. "
+            "The final resolution flush is INCOMPLETE: the end-of-run protocol-conformance "
+            "and citation sweeps did not run, so the graph is missing edges until the next "
+            "full index.",
             len(still_running),
-            _CONSUMER_TEARDOWN_S,
+            stalled,
         )
         for task in still_running:
             task.cancel()
-    for task in live:
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        for task in live:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        return False
 
 
 async def _run_pipeline(
@@ -1392,7 +1433,9 @@ async def _run_pipeline(
         ast_consumer.stop()
         if embed_consumer is not None:
             embed_consumer.stop()
-        await _stop_consumer_tasks([ast_task, embed_task])
+        finished = await _stop_consumer_tasks([ast_task, embed_task], [ast_consumer, embed_consumer])
+        if not finished:
+            drained = False
         if cache is not None:
             await cache.close()
 
@@ -2129,7 +2172,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         ast_consumer.stop()
         if embed_consumer is not None:
             embed_consumer.stop()
-        await _stop_consumer_tasks(consumer_tasks)
+        await _stop_consumer_tasks(consumer_tasks, [ast_consumer, embed_consumer])
         if cache is not None:
             await cache.close()
 
