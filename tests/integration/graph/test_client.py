@@ -442,16 +442,55 @@ async def test_write_and_search_embeddings(graph_client: GraphClient):
     vector = [1.0] + [0.0] * (dim - 1)
     await graph_client.write_embeddings([("vec:proj.my_func", vector)])
 
-    # Search with same vector — should find our node with high similarity
-    records = await graph_client.execute(
-        "CALL vector_search.search('vec_callable', 5, $vector) "
-        "YIELD node, similarity "
-        "RETURN node.uid AS uid, similarity",
-        {"vector": vector},
-    )
+    # Through the public API, not raw Cypher. The raw form reads `node.uid` straight off
+    # whatever the index returns, and Memgraph 3.12 keeps handing back deleted nodes — so
+    # this test aborted with "Trying to get a property from a deleted object" whenever a
+    # churn-heavy suite ran before it, testing the one path no caller uses.
+    records = await graph_client.vector_search(vector, label="Callable", limit=5)
     assert len(records) >= 1
-    assert records[0]["uid"] == "vec:proj.my_func"
+    assert records[0]["node"]["uid"] == "vec:proj.my_func"
     assert records[0]["similarity"] > 0.9
+
+
+async def test_vector_search_survives_an_index_full_of_deleted_nodes(graph_client: GraphClient):
+    """A polluted index must not silently return fewer results than it holds.
+
+    Memgraph 3.12 leaves entries for deleted nodes in the vector index and still ranks
+    them, so they consume the fetch budget and the liveness guard then drops them. The
+    result is a short answer with nothing to say it was short — worse than an error,
+    because semantic search just quietly stops finding things after a re-index.
+    """
+    await graph_client.ensure_schema()
+    dim = graph_client._dimension
+    vector = [1.0] + [0.0] * (dim - 1)
+    # The tombstones match the query EXACTLY and the live rows only partially, so the
+    # dead entries outrank them deterministically. Giving both the same vector leaves the
+    # order among ties to the index, and a live row can land in the first page by luck —
+    # which is how the first version of this test passed with the escalation disabled.
+    live_vector = [0.6, 0.8] + [0.0] * (dim - 2)
+
+    # Bury the live rows under enough tombstones to swamp any single page.
+    for i in range(40):
+        uid = f"dead:n{i}"
+        await graph_client.execute_write(
+            f"CREATE (:{NodeLabel.CALLABLE} {{uid: $uid, project_name: 'dead', name: $n, "
+            "qualified_name: $n, kind: 'function', file_path: 'f.py', content_hash: 'h'})",
+            {"uid": uid, "n": f"n{i}"},
+        )
+        await graph_client.write_embeddings([(uid, vector)])
+    await graph_client.execute_write("MATCH (n {project_name: 'dead'}) DETACH DELETE n")
+
+    for i in range(2):
+        uid = f"live:n{i}"
+        await graph_client.execute_write(
+            f"CREATE (:{NodeLabel.CALLABLE} {{uid: $uid, project_name: 'live', name: $n, "
+            "qualified_name: $n, kind: 'function', file_path: 'f.py', content_hash: 'h'})",
+            {"uid": uid, "n": f"n{i}"},
+        )
+        await graph_client.write_embeddings([(uid, live_vector)])
+
+    records = await graph_client.vector_search(vector, label="Callable", limit=2, project="live")
+    assert len(records) == 2, f"live rows crowded out by tombstones: got {[r['node']['uid'] for r in records]}"
 
 
 async def test_vector_search_scope_filter(graph_client: GraphClient):
@@ -480,23 +519,15 @@ async def test_vector_search_scope_filter(graph_client: GraphClient):
         )
         await graph_client.write_embeddings([(uid, vec)])
 
-    # Search both — should get two results
-    records = await graph_client.execute(
-        "CALL vector_search.search('vec_callable', 10, $vector) "
-        "YIELD node, similarity "
-        # 3.12's DROP VECTOR INDEX returns before its state is cleaned, so entries for
-        # nodes an earlier test deleted still come back — and reading any property off
-        # one aborts the query. Same id() guard GraphClient.vector_search applies.
-        "WITH node, similarity MATCH (live) WHERE id(live) = id(node) WITH live AS node, similarity "
-        "RETURN node.uid AS uid, node.project_name AS project_name, similarity",
-        {"vector": vector_a},
-    )
-    assert len(records) == 2
+    # Through the public API: it owns the scope filter, and the raw procedure returns
+    # entries for nodes deleted by earlier tests which crowd the live rows out of a
+    # fixed page. Assert on uids rather than a bare count so a foreign row cannot pass.
+    records = await graph_client.vector_search(vector_a, label="Callable", limit=10)
+    uids = {r["node"]["uid"] for r in records}
+    assert {"alpha:func_a", "beta:func_b"} <= uids
 
-    # Python-side scope filter (mirrors what mcp_server.vector_search does)
-    alpha_only = [r for r in records if r["project_name"] == "alpha"]
-    assert len(alpha_only) == 1
-    assert alpha_only[0]["uid"] == "alpha:func_a"
+    scoped = await graph_client.vector_search(vector_a, label="Callable", limit=10, project="alpha")
+    assert [r["node"]["uid"] for r in scoped] == ["alpha:func_a"]
 
 
 async def test_vector_search_threshold(graph_client: GraphClient):
@@ -519,23 +550,12 @@ async def test_vector_search_threshold(graph_client: GraphClient):
         )
         await graph_client.write_embeddings([(uid, vec)])
 
-    # Search with vector_a — both results returned
-    records = await graph_client.execute(
-        "CALL vector_search.search('vec_callable', 10, $vector) "
-        "YIELD node, similarity "
-        # 3.12's DROP VECTOR INDEX returns before its state is cleaned, so entries for
-        # nodes an earlier test deleted still come back — and reading any property off
-        # one aborts the query. Same id() guard GraphClient.vector_search applies.
-        "WITH node, similarity MATCH (live) WHERE id(live) = id(node) WITH live AS node, similarity "
-        "RETURN node.uid AS uid, similarity",
-        {"vector": vector_a},
-    )
-    assert len(records) == 2
+    # Through the public API, which owns the threshold filter.
+    records = await graph_client.vector_search(vector_a, label="Callable", limit=10, project="thresh")
+    assert {r["node"]["uid"] for r in records} == {"thresh:near", "thresh:far"}
 
-    # Apply threshold — only high-similarity result survives
-    high_sim = [r for r in records if r["similarity"] >= 0.9]
-    assert len(high_sim) == 1
-    assert high_sim[0]["uid"] == "thresh:near"
+    high_sim = await graph_client.vector_search(vector_a, label="Callable", limit=10, project="thresh", threshold=0.9)
+    assert [r["node"]["uid"] for r in high_sim] == ["thresh:near"]
 
 
 # ---------------------------------------------------------------------------
