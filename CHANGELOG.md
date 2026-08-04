@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-08-04)
+
+### Bug Fixes
+
+- **graph**: Stop vector search under-returning against a polluted index
+  ([`87898f8`](https://github.com/SerPeter/code-atlas/commit/87898f838bb6a926a88c20d2cfe979f3c2fa7464))
+
+- **server**: Make blast_radius traverse dependency, not execution (ADR-0029)
+  ([`a5c387d`](https://github.com/SerPeter/code-atlas/commit/a5c387d1379581b072f321e35464448fb8e9a3bc))
+
+### Features
+
+- **graph**: Make every resolved edge state its evidence (ADR-0028)
+  ([`26e5d16`](https://github.com/SerPeter/code-atlas/commit/26e5d16974eeab7a2c9bc41a01b9d879bc95dd4f))
+
+
 ## v0.5.0 (2026-08-04)
 
 ### Bug Fixes
