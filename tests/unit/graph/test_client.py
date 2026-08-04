@@ -10,9 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from code_atlas.graph.client import (
     _CODE_ENTITY_KINDS,
+    _INFERRED_IMPLEMENTS_WEIGHT,
     _NAME_ROUTED_REL_TYPES,
     _OUT_OF_BAND_REL_TYPES,
     _POST_BATCH_REL_TYPES,
+    _TYPE_REF_FACTS,
+    _TYPE_REF_RANK,
     _UID_ROUTED_REL_TYPES,
     GraphClient,
     _call_edge_weight,
@@ -296,6 +299,43 @@ class TestResolveOneCall:
         rel = self._rel(f"{self.PROJECT}:mod.func", "print")
         result = _resolve_one_call(self.PROJECT, rel, lookup, {})
         assert result is None
+
+
+class TestNonCallEdgeQuality:
+    """Weight was scoped to CALLS because only that resolver had a candidate set.
+
+    That reasoning never covered USES_TYPE strategy 3 (project-wide *uniqueness* —
+    the shape ADR-0022 demoted for calls) or an inferred IMPLEMENTS (derived from
+    method-set containment, declared nowhere). Both were written indistinguishable
+    from a structural fact, so anything scoring a path read them as certainties.
+    """
+
+    def test_a_guessed_type_use_is_not_worth_an_exact_import_match(self):
+        import_conf, import_w = _TYPE_REF_FACTS["import"]
+        guess_conf, guess_w = _TYPE_REF_FACTS["project_unique"]
+
+        assert import_conf == "resolved"
+        assert guess_conf == "ambiguous", "project-wide uniqueness is a guess, not a resolution"
+        assert guess_w < import_w, "a guessed type-use outranking an import match is ADR-0022's failure"
+
+    def test_a_same_file_type_use_is_as_good_as_an_import(self):
+        """Both are lexically grounded — the name was looked up in a namespace that
+        actually contains it, which is exactly ADR-0022's test."""
+        assert _TYPE_REF_FACTS["same_file"] == _TYPE_REF_FACTS["import"]
+
+    def test_every_strategy_is_ranked_and_scored(self):
+        """A rung with no entry would KeyError at write time, on a path only some
+        codebases reach — so pin the two tables against each other instead."""
+        assert set(_TYPE_REF_RANK) == set(_TYPE_REF_FACTS)
+
+    def test_rank_runs_strongest_first(self):
+        weights = [_TYPE_REF_FACTS[st][1] for st in _TYPE_REF_RANK]
+        assert weights == sorted(weights, reverse=True)
+
+    def test_an_inferred_conformance_edge_is_damped(self):
+        """ADR-0025 derives IMPLEMENTS from method-set containment. It is the best
+        evidence available and may not claim to be a fact."""
+        assert _call_edge_weight(1, from_test=False) > _INFERRED_IMPLEMENTS_WEIGHT
 
 
 class TestCallEdgeWeight:

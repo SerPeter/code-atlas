@@ -2,6 +2,10 @@
 
 ## Status
 
+Extended by [ADR-0028](./0028-every-resolved-edge-states-its-evidence.md): the weight defined here was scoped to CALLS
+because only that resolver matched against a candidate set. That left USES_TYPE's project-wide-uniqueness rung and
+inferred IMPLEMENTS indistinguishable from structural facts, which any path scorer reads as certainties.
+
 Accepted — amends [ADR-0014](./0014-calls-edge-confidence.md); itself amended by
 [ADR-0019](./0019-module-granularity-community-detection.md), which replaced weighted Leiden with module-granularity
 clustering. The weights below are unchanged and still the input — ADR-0019 sums them per module pair instead of handing

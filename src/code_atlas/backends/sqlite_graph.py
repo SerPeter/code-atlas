@@ -56,6 +56,8 @@ from code_atlas.graph.client import (
     _DEFAULT_TEST_PATTERNS,
     _FILE_LOCAL_STRATEGIES,
     _POST_BATCH_REL_TYPES,
+    _TYPE_REF_FACTS,
+    _TYPE_REF_RANK,
     _UNVERIFIED_STRATEGIES,
     SCHEMA_VERSION,
     CallStats,
@@ -1762,7 +1764,7 @@ class SqliteGraphClient:
         if name_to_typedefs is None:
             name_to_typedefs = await self._name_to_typedefs(project_name)
 
-        edges: set[tuple[str, str]] = set()
+        edges: dict[tuple[str, str], str] = {}
         replay = ReplayableRels()
         for rel in type_rels:
             from_uid = rel.from_qualified_name
@@ -1781,28 +1783,47 @@ class SqliteGraphClient:
                     break
 
             target_uid: str | None = None
-            file_local = False
+            strategy = ""
             if module_uid and type_name in lookup.import_map.get(module_uid, {}):
                 target_uid = lookup.import_map[module_uid][type_name]
+                strategy = "import"
             if target_uid is None and caller_fp:
                 for uid, fp in name_to_typedefs.get(type_name, []):
                     if fp == caller_fp:
                         target_uid = uid
-                        file_local = True
+                        strategy = "same_file"
                         break
             if target_uid is None:
                 candidates = name_to_typedefs.get(type_name, [])
                 if len(candidates) == 1:
                     target_uid = candidates[0][0]
+                    strategy = "project_unique"
             if target_uid is None:
                 replay.unresolved.append(rel)
             else:
-                edges.add((from_uid, target_uid))
-                if not file_local:
+                key = (from_uid, target_uid)
+                prior = edges.get(key)
+                if prior is None or _TYPE_REF_RANK.index(strategy) < _TYPE_REF_RANK.index(prior):
+                    edges[key] = strategy
+                if strategy != "same_file":
                     replay.stale_candidates.append(rel)
 
         if edges:
-            rows = [(f, t, "USES_TYPE", "{}") for f, t in edges]
+            rows = [
+                (
+                    f,
+                    t,
+                    "USES_TYPE",
+                    json.dumps(
+                        {
+                            "strategy": st,
+                            "confidence": _TYPE_REF_FACTS[st][0],
+                            "weight": _TYPE_REF_FACTS[st][1],
+                        }
+                    ),
+                )
+                for (f, t), st in edges.items()
+            ]
             await conn.executemany(
                 "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, ?)", rows
             )

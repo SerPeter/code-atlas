@@ -1089,6 +1089,13 @@ _MIN_CALL_WEIGHT = 1e-6
 # written before this change).
 _DEFAULT_EDGE_WEIGHT = 1.0
 
+# How far vector search will re-ask when a polluted index crowds live rows out of the
+# page. Bounded rather than open-ended: each escalation is another index scan, and an
+# index that is mostly tombstones is a re-index problem, not something to page through.
+_VECTOR_PAGE_ESCALATIONS = 2
+_VECTOR_PAGE_GROWTH = 8
+_VECTOR_PAGE_MAX = 1000
+
 # Default test-path patterns behind the `from_test` flag. Single-sourced from
 # SearchSettings rather than re-listed here so the graph layer cannot drift
 # from the search layer's rule; resolve_calls takes an override for projects
@@ -1097,6 +1104,32 @@ _DEFAULT_TEST_PATTERNS: tuple[str, ...] = tuple(SearchSettings().test_patterns)
 
 # Both weight numbers above are heuristics, not measurements — they are
 # expected to be retuned once there is evidence about what ranks well.
+
+# What a USES_TYPE edge is worth, by how it was resolved. Weight was scoped to CALLS
+# because only that resolver matched a bare name against a candidate SET — but that
+# reasoning never held here: strategy 3 below is project-wide *uniqueness*, exactly the
+# shape ADR-0022 demoted for calls, and all 1,640 edges were written indistinguishable
+# from an exact import match. The resolver computed which rung fired and dropped it at
+# write time — the same fact-computed-then-discarded pattern ADR-0022 and ADR-0023 record.
+#
+# Reuses the two existing tiers rather than inventing a third: an unverified name match is
+# "at best an even split between the name and something outside the graph", and that is as
+# true of a type annotation as of a receiver.
+_TYPE_REF_FACTS: dict[str, tuple[str, float]] = {
+    "import": ("resolved", _CALL_WEIGHT_BASE),
+    "same_file": ("resolved", _CALL_WEIGHT_BASE),
+    "project_unique": ("ambiguous", _CALL_WEIGHT_BASE * _CALL_WEIGHT_UNVERIFIED_DAMPING),
+}
+# Strongest first — one (source, target) pair can be resolved by several rels, and the best
+# evidence should describe the single stored edge (mirrors _combine_call_edge_facts).
+_TYPE_REF_RANK = ("import", "same_file", "project_unique")
+
+# A structural conformance match (ADR-0025) is declared nowhere in the source: it is derived
+# from method-set containment. Damped for the same reason as an unverified call — it is the
+# best evidence available and may not claim to be a fact. ADR-0025 measured it at 20 of 20
+# here, which argues this tier is too harsh; used anyway rather than minting a third,
+# unmeasured tier. Retune when there is evidence about what ranks well.
+_INFERRED_IMPLEMENTS_WEIGHT = _CALL_WEIGHT_BASE * _CALL_WEIGHT_UNVERIFIED_DAMPING
 
 # Callable/TypeDef kinds that denote *invocable code*, i.e. entities for which
 # "nothing calls this" is evidence rather than a tautology.
@@ -2569,26 +2602,35 @@ class GraphClient:
     ) -> None:
         """Link a bare name to an entity, in the referrer's file or its import scope.
 
-        Shared by REFERENCES, REGISTERED_BY and field-level USES_TYPE: all three name their
+        Shared by REFERENCES, REGISTERED_BY and Value-scoped USES_TYPE: all three name their
         target rather than uid it, and all must resolve in a scope the name provably
         reaches. A project-wide match is what ADR-0022 removed from call resolution.
+
+        Both passes stamp the same quality vocabulary ``resolve_type_refs`` uses. Neither is
+        a guess — same-file and import scope are the two rungs that ADR-0022's test passes —
+        but saying so is what lets a path scorer tell them from an edge that never recorded
+        anything. Left bare, these 326 USES_TYPE and 278 REFERENCES edges read to
+        ``blast_radius``/``trace_path`` exactly like an unmarked one.
         """
-        await self.execute_write(
-            f"UNWIND $rels AS r "
-            f"MATCH (a {{uid: r.from_uid}}), (b:{target} {{project_name: r.project, name: r.to_name}}) "
-            f"WHERE b.file_path = a.file_path AND b.uid <> a.uid "
-            f"MERGE (a)-[:{rel_type}]->(b)",
-            {"rels": params},
-        )
-        await self.execute_write(
-            f"UNWIND $rels AS r "
-            f"MATCH (a {{uid: r.from_uid}}), (b:{target} {{project_name: r.project, name: r.to_name}}) "
-            f"WHERE b.uid <> a.uid AND NOT (a)-[:{rel_type}]->(b) "
-            f"AND EXISTS {{ MATCH (m:{NodeLabel.MODULE} {{file_path: a.file_path, project_name: r.project}})"
-            f"-[:{RelType.IMPORTS}]->(b) }} "
-            f"MERGE (a)-[:{rel_type}]->(b)",
-            {"rels": params},
-        )
+        for strategy in ("same_file", "import"):
+            confidence, weight = _TYPE_REF_FACTS[strategy]
+            scope = (
+                "WHERE b.file_path = a.file_path AND b.uid <> a.uid "
+                if strategy == "same_file"
+                else (
+                    f"WHERE b.uid <> a.uid AND NOT (a)-[:{rel_type}]->(b) "
+                    f"AND EXISTS {{ MATCH (m:{NodeLabel.MODULE} {{file_path: a.file_path, project_name: r.project}})"
+                    f"-[:{RelType.IMPORTS}]->(b) }} "
+                )
+            )
+            await self.execute_write(
+                f"UNWIND $rels AS r "
+                f"MATCH (a {{uid: r.from_uid}}), (b:{target} {{project_name: r.project, name: r.to_name}}) "
+                f"{scope}"
+                f"MERGE (a)-[e:{rel_type}]->(b) "
+                f"SET e.strategy = '{strategy}', e.confidence = '{confidence}', e.weight = {weight}",
+                {"rels": params},
+            )
 
     async def resolve_protocol_conformance(self, project_name: str) -> int:
         """Link a class to every self-declared Protocol whose method set it satisfies.
@@ -2629,7 +2671,7 @@ class GraphClient:
             "WITH p, pms, c, collect(DISTINCT cm.name) AS cms "
             "WHERE all(x IN pms WHERE x IN cms) "
             f"MERGE (c)-[e:{RelType.IMPLEMENTS}]->(p) "
-            "SET e.inferred = true "
+            f"SET e.inferred = true, e.confidence = 'inferred', e.weight = {_INFERRED_IMPLEMENTS_WEIGHT} "
             "RETURN count(e) AS c",
             {"project": project_name},
         )
@@ -2646,12 +2688,12 @@ class GraphClient:
             f"MATCH (c)-[:{RelType.DEFINES}]->(cm:{NodeLabel.CALLABLE}) "
             "WHERE cm.name = pm.name AND NOT pm.name STARTS WITH '__' "
             f"MERGE (cm)-[e:{RelType.IMPLEMENTS}]->(pm) "
-            "SET e.inferred = true",
+            f"SET e.inferred = true, e.confidence = 'inferred', e.weight = {_INFERRED_IMPLEMENTS_WEIGHT}",
             {"project": project_name},
         )
         return rows[0]["c"] if rows else 0
 
-    async def resolve_type_refs(  # noqa: PLR0912
+    async def resolve_type_refs(  # noqa: PLR0912, PLR0915
         self,
         project_name: str,
         type_rels: list[ParsedRelationship],
@@ -2667,6 +2709,10 @@ class GraphClient:
         2. **Same-file TypeDef** — a TypeDef with that name in the same file.
         3. **Project-wide TypeDef** — any TypeDef with that name (unique only).
         4. **Unresolved** — no match at all.
+
+        Which rung fired is recorded on the edge as ``strategy``/``confidence``/
+        ``weight`` (see ``_TYPE_REF_FACTS``): rung 3 is a guess and used to be
+        written indistinguishable from rung 1.
 
         Returns every rel that strategy 2 did not settle, for the caller to
         replay once later batches have upserted more of the project.
@@ -2687,7 +2733,7 @@ class GraphClient:
             for r in td_records:
                 name_to_typedefs.setdefault(r["name"], []).append((r["uid"], r["fp"] or ""))
 
-        edges: set[tuple[str, str]] = set()
+        edges: dict[tuple[str, str], str] = {}
         replay = ReplayableRels()
         resolved = 0
         for rel in type_rels:
@@ -2711,18 +2757,19 @@ class GraphClient:
                     break
 
             target_uid: str | None = None
-            file_local = False
+            strategy = ""
 
             # Strategy 1: Import match
             if module_uid and type_name in lookup.import_map.get(module_uid, {}):
                 target_uid = lookup.import_map[module_uid][type_name]
+                strategy = "import"
 
             # Strategy 2: Same-file TypeDef
             if target_uid is None and caller_fp:
                 for uid, fp in name_to_typedefs.get(type_name, []):
                     if fp == caller_fp:
                         target_uid = uid
-                        file_local = True
+                        strategy = "same_file"
                         break
 
             # Strategy 3: Project-wide unique TypeDef
@@ -2730,13 +2777,17 @@ class GraphClient:
                 candidates = name_to_typedefs.get(type_name, [])
                 if len(candidates) == 1:
                     target_uid = candidates[0][0]
+                    strategy = "project_unique"
 
             if target_uid is None:
                 replay.unresolved.append(rel)
             else:
-                edges.add((from_uid, target_uid))
+                key = (from_uid, target_uid)
+                prior = edges.get(key)
+                if prior is None or _TYPE_REF_RANK.index(strategy) < _TYPE_REF_RANK.index(prior):
+                    edges[key] = strategy
                 resolved += 1
-                if not file_local:
+                if strategy != "same_file":
                     # Same reasoning as resolve_calls: only the same-file match is
                     # settled by the caller's own batch. The import map is repaired
                     # by a later resolve_imports, and "project-wide *unique*" stops
@@ -2744,11 +2795,15 @@ class GraphClient:
                     replay.stale_candidates.append(rel)
 
         if edges:
-            edge_params = [{"f": f, "t": t} for f, t in edges]
+            edge_params = [
+                {"f": f, "t": t, "strategy": st, "confidence": _TYPE_REF_FACTS[st][0], "weight": _TYPE_REF_FACTS[st][1]}
+                for (f, t), st in edges.items()
+            ]
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 f"MATCH (a {{uid: r.f}}), (b:{NodeLabel.TYPE_DEF} {{uid: r.t}}) "
-                f"MERGE (a)-[:{RelType.USES_TYPE}]->(b)",
+                f"MERGE (a)-[e:{RelType.USES_TYPE}]->(b) "
+                f"SET e.strategy = r.strategy, e.confidence = r.confidence, e.weight = r.weight",
                 {"rels": edge_params},
             )
 
@@ -3576,27 +3631,50 @@ class GraphClient:
             filtering = bool(filter_projects) or threshold > 0.0
             fetch_limit = limit * 3 if filtering else limit
 
-            async def _vs_one(idx: str) -> list[dict[str, Any]]:
+            async def _vs_page(idx: str, page: int) -> tuple[list[dict[str, Any]], int]:
                 # Memgraph 3.12's vector index is not purged synchronously on delete, so a
                 # search can hand back nodes that are already gone. Touching one is fatal to
                 # the whole query — `node.uid` raises "Trying to get a property from a
                 # deleted object", and `node:Label` raises the same for labels — which after
                 # a full re-index would take out semantic search entirely rather than drop a
-                # row. Re-matching on id() is the guard: id() is the one thing still legal to
-                # read off a dead node, and the MATCH yields nothing when it no longer exists.
+                # row. id() is the one thing still legal to read off a dead node, so the
+                # OPTIONAL MATCH is the guard: a dead entry comes back as a null `node`.
+                #
+                # OPTIONAL rather than a plain MATCH so the caller can still see how many
+                # rows the index returned. Filtering them away inside the query hid the one
+                # fact needed to tell "the index only holds 3 things" from "the page was
+                # entirely dead entries", and the second case has more results waiting.
                 cypher = (
-                    f"CALL vector_search.search('{idx}', {fetch_limit}, $vector) "
+                    f"CALL vector_search.search('{idx}', {page}, $vector) "
                     "YIELD node, similarity "
                     "WITH node, similarity "
-                    "MATCH (live) WHERE id(live) = id(node) "
+                    "OPTIONAL MATCH (live) WHERE id(live) = id(node) "
                     "RETURN live AS node, similarity "
-                    f"ORDER BY similarity DESC LIMIT {fetch_limit}"
+                    f"ORDER BY similarity DESC LIMIT {page}"
                 )
                 try:
-                    return await self.execute(cypher, {"vector": vector})
+                    rows = await self.execute(cypher, {"vector": vector})
                 except Exception as exc:
                     logger.warning("Vector search on {} failed: {}", idx, exc)
-                    return []
+                    return [], 0
+                return [r for r in rows if r.get("node") is not None], len(rows)
+
+            async def _vs_one(idx: str) -> list[dict[str, Any]]:
+                # A polluted index crowds live results out of the page: the dead entries are
+                # still ranked, so they consume the budget and the guard then drops them,
+                # leaving fewer rows than asked for. Silently under-returning is the failure
+                # this escalation removes — re-ask for a bigger page, but only when the page
+                # came back FULL, since a short page means the index simply holds no more.
+                page = fetch_limit
+                for _ in range(_VECTOR_PAGE_ESCALATIONS):
+                    live, raw = await _vs_page(idx, page)
+                    if len(live) >= fetch_limit or raw < page:
+                        return live
+                    page = min(page * _VECTOR_PAGE_GROWTH, _VECTOR_PAGE_MAX)
+                    if page == _VECTOR_PAGE_MAX:
+                        break
+                live, _raw = await _vs_page(idx, page)
+                return live
 
             results_per_index = await asyncio.gather(*(_vs_one(idx) for idx in indices))
             all_results: list[dict[str, Any]] = [r for batch in results_per_index for r in batch]

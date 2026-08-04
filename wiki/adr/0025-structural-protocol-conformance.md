@@ -2,6 +2,10 @@
 
 ## Status
 
+Amended by [ADR-0028](./0028-every-resolved-edge-states-its-evidence.md): the conformance edge defined here is a
+structural inference, and `inferred: true` is a boolean no consumer scores. It now carries a damped `weight` and
+`confidence: "inferred"` so a path scorer can tell it from a declared relationship.
+
 Accepted — revisits and narrows the rejection recorded in [ADR-0023](./0023-type-directed-call-resolution.md)'s
 "Alternatives Considered". That rejection stands for the question it was asked; this applies the same technique to a
 different question, and the measurement is what separates them.
