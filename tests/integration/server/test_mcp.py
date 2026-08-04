@@ -181,7 +181,9 @@ class TestCypherQuery:
             app_ctx, "cypher_query", query="MATCH (n:Callable {name: 'foo'}) RETURN n.uid AS uid", limit=20
         )
         assert result["count"] == 20
-        assert result["truncated"] is True
+        assert result["truncated"]["shown"] == 20
+        assert result["truncated"]["cut"] == result["truncated"]["total"] - 20
+        assert result["truncated"]["cut"] > 0
 
     async def test_cypher_query_not_truncated_when_matches_fit(self, app_ctx, graph_client):
         await graph_client.ensure_schema()
@@ -270,7 +272,12 @@ class TestGetNode:
         )
         result = await _invoke_tool(app_ctx, "get_node", name="shared_name", limit=20)
         assert result["count"] == 20
-        assert result["truncated"] is True
+        assert result["truncated"] == {
+            "shown": 20,
+            "total": 25,
+            "cut": 5,
+            "remedy": "raise `limit` (max 100), or narrow the query",
+        }
 
     async def test_get_node_truncated_false_when_matches_fit(self, app_ctx, graph_client):
         await graph_client.ensure_schema()

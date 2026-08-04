@@ -526,7 +526,8 @@ class TestTruncatedField:
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["count"] == 20
-        assert result["truncated"] is True
+        assert result["truncated"]["cut"] > 0
+        assert result["truncated"]["shown"] + result["truncated"]["cut"] == result["truncated"]["total"]
 
     async def test_text_search_truncated_false_when_results_fit(self, settings):
         available = [{"node": {"uid": f"p:e{i}", "name": "e"}, "score": 1.0} for i in range(5)]
@@ -557,7 +558,8 @@ class TestTruncatedField:
         with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=[0.1] * 768):
             result = await _invoke_tool(app, "vector_search", query="e", limit=20)
         assert result["count"] == 20
-        assert result["truncated"] is True
+        assert result["truncated"]["cut"] > 0
+        assert result["truncated"]["shown"] + result["truncated"]["cut"] == result["truncated"]["total"]
 
     async def test_hybrid_search_truncated_true_when_more_results_than_limit(self, settings):
         from code_atlas.search.engine import SearchResult
@@ -589,7 +591,8 @@ class TestTruncatedField:
         with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
             result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
         assert result["count"] == 20
-        assert result["truncated"] is True
+        assert result["truncated"]["cut"] > 0
+        assert result["truncated"]["shown"] + result["truncated"]["cut"] == result["truncated"]["total"]
 
     async def test_hybrid_search_not_truncated_when_results_fit(self, settings):
         from code_atlas.search.engine import SearchResult

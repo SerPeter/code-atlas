@@ -64,7 +64,12 @@ from code_atlas.search.guidance import (
     validate_cypher_explain,
     validate_cypher_static,
 )
-from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES, _DEFAULT_TRACE_EDGE_TYPES, _padded_limit
+from code_atlas.server.analysis import (
+    _DEFAULT_BLAST_EDGE_TYPES,
+    _DEFAULT_TRACE_EDGE_TYPES,
+    _padded_limit,
+    truncation_notice,
+)
 from code_atlas.server.analysis import analyze_repo as _analyze_repo
 from code_atlas.server.analysis import blast_radius as _blast_radius
 from code_atlas.server.analysis import generate_diagram as _generate_diagram
@@ -427,12 +432,26 @@ def _compact_node_to_dict(node: CompactNode, *, include_source: bool = True) -> 
     return out
 
 
-def _result(records: list[dict[str, Any]], *, limit: int, query_ms: float, total: int | None = None) -> dict[str, Any]:
-    """Consistent result envelope."""
+def _result(
+    records: list[dict[str, Any]],
+    *,
+    limit: int,
+    query_ms: float,
+    total: int | None = None,
+    remedy: str = "raise `limit` (max 100), or narrow the query",
+) -> dict[str, Any]:
+    """Consistent result envelope.
+
+    ``truncated`` is ``False`` when nothing was cut and a
+    ``{shown, total, cut, remedy}`` payload when something was — see
+    ``analysis.truncation_notice``. Callers that cannot know *total* leave it
+    ``None`` and get ``False``, which is the pre-existing behaviour: claiming
+    completeness we have not established is the one thing this must not do.
+    """
     return {
         "results": records,
         "count": len(records),
-        "truncated": total is not None and total > limit,
+        "truncated": False if total is None else truncation_notice(min(limit, total), total, remedy),
         "query_ms": round(query_ms, 1),
     }
 
@@ -793,7 +812,9 @@ def create_mcp_server(  # noqa: PLR0915
             "Use hybrid_search as the primary search tool. "
             "Use get_node to find entities by name, get_context to expand neighborhoods. "
             "Use schema_info for Cypher examples, validate_cypher to check queries before running them. "
-            "Call get_usage_guide('guidelines') for tips on structuring code for better search results."
+            "Call get_usage_guide('guidelines') for tips on structuring code for better search results. "
+            "A result's `truncated` is false when nothing was withheld, otherwise an object carrying "
+            "{shown, total, cut, remedy} — read `cut` before concluding a short list is a complete one."
         ),
         host=host,
         port=port,

@@ -635,7 +635,12 @@ async def test_blast_radius_respects_limit_and_reports_truncated():
 
     assert result["affected_count"] == 3
     assert len(result["affected"]) == 2
-    assert result["truncated"] is True
+    # Not a bare flag: an agent that only learns "something was cut" cannot tell one
+    # withheld entity from three hundred, and reads the short list as the whole impact.
+    assert result["truncated"]["shown"] == 2
+    assert result["truncated"]["total"] == 3
+    assert result["truncated"]["cut"] == 1
+    assert "limit" in result["truncated"]["remedy"]
 
 
 async def test_blast_radius_excludes_test_entities_and_corrects_the_count():
@@ -835,7 +840,12 @@ async def test_dead_code_respects_limit_and_reports_truncated():
 
     assert result["dead_code_count"] == 3
     assert len(result["dead_code"]) == 2
-    assert result["truncated"] is True
+    assert result["truncated"] == {
+        "shown": 2,
+        "total": 3,
+        "cut": 1,
+        "remedy": "raise `limit`, or scope with `path`. `dead_code_count` is the true total.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2011,7 +2021,11 @@ async def test_module_summary_flags_truncation_at_the_entity_cap():
 
     result = await analyze_repo(graph, "module_summary", "proj", path="pkg", limit=1)
 
-    assert result["truncated"] is True
+    # No `total`/`cut` here, deliberately: these lists were cut by the QUERY's own cap, so
+    # the true total was never fetched. Naming the cap that fired is the honest report —
+    # a fabricated count would be worse than the bare boolean it replaces.
+    assert result["truncated"]["caps_hit"] == ["entities"]
+    assert "narrow `path`" in result["truncated"]["remedy"]
     assert "TRUNCATED" in result["outline"]
 
 

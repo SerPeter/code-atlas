@@ -13,7 +13,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.search.engine import matches_test_pattern
@@ -150,6 +150,25 @@ def _padded_limit(limit: int, test_patterns: tuple[str, ...]) -> int:
     after filtering) avoids that under-delivery.
     """
     return min(limit * 5, _TEST_FILTER_FETCH_CAP) if test_patterns else limit
+
+
+def truncation_notice(shown: int, total: int, remedy: str) -> Literal[False] | dict[str, Any]:
+    """What a capped result withheld, or ``False`` when nothing was cut.
+
+    A bare ``truncated: true`` says something is missing but not whether it is one
+    row or three hundred, and hands the caller no lever. That gap has a specific
+    failure mode: an agent reads a capped list as a complete one and reports "X has
+    no callers" — silence read as absence. Reporting *cut* alongside a concrete
+    *remedy* is what makes the omission actionable rather than merely flagged.
+
+    Returns ``False`` rather than an empty dict when nothing was cut, so the
+    existing ``if result["truncated"]:`` contract keeps working unchanged and only
+    the informative case grows a payload.
+    """
+    cut = total - shown
+    if cut <= 0:
+        return False
+    return {"shown": shown, "total": total, "cut": cut, "remedy": remedy}
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +380,12 @@ async def blast_radius(
         "max_depth": max_depth,
         "affected_count": total,
         "affected": results[:limit],
-        "truncated": total > limit,
+        "truncated": truncation_notice(
+            min(limit, total),
+            total,
+            "raise `limit`, or narrow with `edge_types` / a smaller `max_depth`. "
+            "The cut entries are the lowest-impact ones; `affected_count` is the true total.",
+        ),
         "query_ms": round(elapsed, 1),
     }
 
@@ -1027,7 +1051,11 @@ async def _analyze_dead_code(
         "project": project,
         "dead_code_count": total,
         "dead_code": candidates[:limit],
-        "truncated": total > limit,
+        "truncated": truncation_notice(
+            min(limit, total),
+            total,
+            "raise `limit`, or scope with `path`. `dead_code_count` is the true total.",
+        ),
         "query_ms": round(elapsed, 1),
     }
 
@@ -2384,12 +2412,21 @@ async def _analyze_module_summary(
         }
 
     prefix = _common_dotted_prefix([m["qn"] for m in modules if m["qn"]])
-    truncated = (
-        len(raw["entities"]) >= entity_limit
-        or len(raw["internal_edges"]) >= edge_limit
-        or len(raw["fan_in"]) >= edge_limit
-        or len(raw["fan_out"]) >= edge_limit
-    )
+    # Unlike blast_radius/dead_code, these lists were cut by the QUERY's own cap, so the
+    # true total was never fetched and cannot be reported. Naming which caps were hit is
+    # the honest equivalent — a fabricated `cut` count would be worse than the bare
+    # boolean it replaces.
+    caps_hit = [
+        name
+        for name, hit in (
+            ("entities", len(raw["entities"]) >= entity_limit),
+            ("internal_edges", len(raw["internal_edges"]) >= edge_limit),
+            ("fan_in", len(raw["fan_in"]) >= edge_limit),
+            ("fan_out", len(raw["fan_out"]) >= edge_limit),
+        )
+        if hit
+    ]
+    truncated = bool(caps_hit)
     # An entity in a package __init__ has no Module row (those are Package nodes), so
     # fall back to its file path rather than to its own qualified name — the latter
     # would leave it ungrouped and defeat the aggregation.
@@ -2447,7 +2484,18 @@ async def _analyze_module_summary(
             if tier == _TIER_DETAIL
             else f"Detail was reduced to {tier} to fit. Narrow `path` to a sub-package or single file for more."
         ),
-        "truncated": truncated or size_capped,
+        "truncated": (
+            {
+                "caps_hit": caps_hit,
+                "size_capped": size_capped,
+                "remedy": (
+                    "narrow `path` to a sub-package or single file. The listed collections hit their "
+                    "query cap, so their true totals are HIGHER than the counts reported above."
+                ),
+            }
+            if truncated or size_capped
+            else False
+        ),
         "outline": outline,
         "query_ms": round(elapsed, 1),
     }
