@@ -2,6 +2,302 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-08-04)
+
+### Bug Fixes
+
+- **graph**: A method that implements a Protocol is not dead code
+  ([`f581e0c`](https://github.com/SerPeter/code-atlas/commit/f581e0c1d4f620df503fd050795f6417ab641a75))
+
+- **graph**: Ask "is this a stub" of the method, not of its class
+  ([`8e7d7e0`](https://github.com/SerPeter/code-atlas/commit/8e7d7e092b4705ecb5056cb19f1472b9799a58ac))
+
+- **graph**: Damp the weight of an unverified-receiver call edge
+  ([`0c8c9b2`](https://github.com/SerPeter/code-atlas/commit/0c8c9b21c1d501f852d3c4f6d17203e4d97ee944))
+
+- **graph**: Five more dead-code exclusions from the triage fanout
+  ([`ce29b60`](https://github.com/SerPeter/code-atlas/commit/ce29b60e5c83b610f143698017a8053880ee046a))
+
+- **graph**: Give ResourceFile nodes their path and stop capturing directories
+  ([`c856083`](https://github.com/SerPeter/code-atlas/commit/c8560835c4a3b2c3a382edc48607d5d906b333c1))
+
+- **graph**: Recreate search indices that vanish at the current schema version
+  ([`c17993d`](https://github.com/SerPeter/code-atlas/commit/c17993d4506e4a7d6619660788c65a13abe316d6))
+
+- **graph**: Replay resolution that ran against a partial graph (ADR-0026)
+  ([`d86f137`](https://github.com/SerPeter/code-atlas/commit/d86f1371e0ec9639f91abb6d01cdaf6075be9d2a))
+
+- **graph**: Require a grounded receiver for the lexical strategies (ADR-0027)
+  ([`c8edd3b`](https://github.com/SerPeter/code-atlas/commit/c8edd3b65a310b500f29cbc095e4ad42e746bd64))
+
+- **graph**: Resolve a class's base even when the base is imported
+  ([`fac5d1f`](https://github.com/SerPeter/code-atlas/commit/fac5d1f6235cec1158d5a11bec8b3c4f22575258))
+
+- **graph**: Stop calling a nested function dead because nothing calls it by name
+  ([`89a91e1`](https://github.com/SerPeter/code-atlas/commit/89a91e126afa4d4d11897bdf55298759440ae54f))
+
+- **graph**: Stop resolving a call whose receiver was never identified
+  ([`404ebf8`](https://github.com/SerPeter/code-atlas/commit/404ebf8f99b5f1844374c5ba1f5a280fde324175))
+
+- **graph**: Write and read every file hash in a batch, not just the first
+  ([`50a1bee`](https://github.com/SerPeter/code-atlas/commit/50a1bee077d6469505a5bbf085b9690bf5cb6e5f))
+
+- **indexing**: Deregister consumers instead of leaking one per index run
+  ([`3e333c4`](https://github.com/SerPeter/code-atlas/commit/3e333c4b3ab7d84a5ed71a72d732b3d6884f260d))
+
+- **indexing**: Keep sweeping for abandoned work, and stop guessing past a known receiver type
+  ([`70d060a`](https://github.com/SerPeter/code-atlas/commit/70d060a4a3556ecb625ae97c95023e633729d284))
+
+- **indexing**: Port git-signals write path to GraphBackend
+  ([`8fc1f18`](https://github.com/SerPeter/code-atlas/commit/8fc1f18147fb6df5998461f4af5598c42e9f0b6d))
+
+- **indexing**: Reconcile lost embeddings, and fail the exit code when the index is incomplete
+  ([`2164370`](https://github.com/SerPeter/code-atlas/commit/2164370cc752869afe4b805b4269ea016513e77e))
+
+- **indexing**: Run protocol conformance once, after every batch is written
+  ([`d012670`](https://github.com/SerPeter/code-atlas/commit/d0126703d887a5b73bf4c3332f60046b67e8f1c9))
+
+- **indexing**: Stop a crash from stranding a stale citation edge
+  ([`b67b19c`](https://github.com/SerPeter/code-atlas/commit/b67b19c330fb144719ae0114ed6972587f229f07))
+
+- **indexing**: Stop the teardown timeout truncating the final flush
+  ([`68ecddd`](https://github.com/SerPeter/code-atlas/commit/68ecddd26d473a8ac81f8fe94d8b3ef9a8d6a916))
+
+- **indexing**: Stop two processes sharing one consumer identity
+  ([`52430a0`](https://github.com/SerPeter/code-atlas/commit/52430a047cb162bf30774d496a39125b019e2e75))
+
+- **indexing**: Wait on consumer progress instead of a teardown deadline
+  ([`6b30b76`](https://github.com/SerPeter/code-atlas/commit/6b30b7699d8a94349a11e46b6f3efe1a66c57ed8))
+
+- **indexing**: Withhold every file hash until the deferred flush
+  ([`2671499`](https://github.com/SerPeter/code-atlas/commit/26714992ae3b29f3dd48feab0d5d751928a5d542))
+
+- **parsing**: Resolve a re-exported name, not just a locally defined one
+  ([`dc46ab4`](https://github.com/SerPeter/code-atlas/commit/dc46ab415738cba5cfcba374fe83cada3f5f3876))
+
+- **parsing**: Stop hash from meaning three things in one outline line
+  ([`fc1d69f`](https://github.com/SerPeter/code-atlas/commit/fc1d69fdacfb9b98485c95d19a5c878184dde80b))
+
+- **parsing**: Walk the whole body for nested defs, and stop reading Any as a class
+  ([`b45750b`](https://github.com/SerPeter/code-atlas/commit/b45750b927830f0e562ba7e98782d9458ba736e8))
+
+- **search**: Apply test/stub/generated filters to text_search and vector_search
+  ([`a62b760`](https://github.com/SerPeter/code-atlas/commit/a62b760c2a2e485b37cd43055780812a8a32c3ad))
+
+- **search**: Retry embedding API calls on transient provider errors
+  ([`d2a7cc1`](https://github.com/SerPeter/code-atlas/commit/d2a7cc1b5afd4ca4527778af02efa30dd3f4fe0c))
+
+- **server**: Apply test_filter consistently across all analyze_repo sub-analyses
+  ([`a1b1d5c`](https://github.com/SerPeter/code-atlas/commit/a1b1d5c4a5904759560e49214a7e484607edf181))
+
+- **server**: Correct outline defects found by blind-reading the format
+  ([`ed5587a`](https://github.com/SerPeter/code-atlas/commit/ed5587a2c59a85b15f160c6790f4e19611cf1e55))
+
+- **server**: Distinguish an unpartitionable subgraph from a missing MAGE procedure
+  ([`a700b38`](https://github.com/SerPeter/code-atlas/commit/a700b38a366abea7beed6da9a5b22e4c0f1aa6ee))
+
+- **server**: Exclude ExternalSymbol/ExternalPackage nodes from community detection
+  ([`5d2c20d`](https://github.com/SerPeter/code-atlas/commit/5d2c20dd117d7f8516e884aac5117bad5892eada))
+
+- **server**: Exclude test entities from Leiden's input graph, not just its output
+  ([`384f94d`](https://github.com/SerPeter/code-atlas/commit/384f94dcd9beba7da5351db9f2d3860c8bebaf1a))
+
+- **server**: Exclude test modules from analyze_repo quality scoring
+  ([`bc39f16`](https://github.com/SerPeter/code-atlas/commit/bc39f1690d7c109a91669b6acd28923dc06b026e))
+
+- **server**: Get_node no longer silently hides fuzzy-match siblings
+  ([`6dd60f2`](https://github.com/SerPeter/code-atlas/commit/6dd60f245a7614b7ad5873d8d3f56c73af79a25d))
+
+- **server**: Make module_summary's header and legend match what it rendered
+  ([`755dbc5`](https://github.com/SerPeter/code-atlas/commit/755dbc50e66336836ab2681c2a14180466bca0a2))
+
+- **server**: Report the real .env path from the MCP health check
+  ([`36111ce`](https://github.com/SerPeter/code-atlas/commit/36111ce78e589e6a855fbb12e88e13f53e5dff66))
+
+- **server**: Run MCP daemon startup catchup in the background
+  ([`3e7aa42`](https://github.com/SerPeter/code-atlas/commit/3e7aa42d0698cc3fc17b01896de29616c8cc3702))
+
+- **server**: Stop config-derived entities swamping dead-code analysis
+  ([`dfbd90e`](https://github.com/SerPeter/code-atlas/commit/dfbd90ebdc3b73850d7db8c74d4b59337915427a))
+
+- **server**: Stop find_dead_code calling live classes dead
+  ([`0b73107`](https://github.com/SerPeter/code-atlas/commit/0b7310704addc2f82aa72b5d1de463db244ddb7c))
+
+- **tests**: Make infra fixtures reachable from the bench tier
+  ([`84f9c71`](https://github.com/SerPeter/code-atlas/commit/84f9c713cf93999fd7cab12b94dc601a7068abed))
+
+### Build System
+
+- **ci**: Stop the ty pre-commit hook from re-syncing the venv
+  ([`a87c79a`](https://github.com/SerPeter/code-atlas/commit/a87c79a129731a870dbc25b28825ba1c1900acc8))
+
+- **deps**: Lock the new tree-sitter grammar extras
+  ([`67fd7cc`](https://github.com/SerPeter/code-atlas/commit/67fd7cce59a21961b5ff2c89ecc9fcbd0e6003fb))
+
+- **infra**: Upgrade Memgraph 3.7.2 -> 3.12.0 to stop the vector-index GC segfault
+  ([`2d59778`](https://github.com/SerPeter/code-atlas/commit/2d5977887de69f9f9f57719fe41a13f0aef7d783))
+
+### Chores
+
+- Point local planning at .specs/ instead of .tasks/
+  ([`0ba1737`](https://github.com/SerPeter/code-atlas/commit/0ba17372106f760586635026830d56ccb9b3afd3))
+
+- **deps**: Upgrade dependencies, cap litellm and ty at known-good versions
+  ([`af3e47b`](https://github.com/SerPeter/code-atlas/commit/af3e47b8557f79efbfbf20d41c9f335b628a2b77))
+
+### Code Style
+
+- **docs**: Apply prettier formatting to ADR-0016
+  ([`b064f86`](https://github.com/SerPeter/code-atlas/commit/b064f8672eda956652d9fd50d26d74ca03813221))
+
+### Documentation
+
+- Fix docs/->wiki path references dropped from the rename commit
+  ([`1e585de`](https://github.com/SerPeter/code-atlas/commit/1e585de68c5254caab95030d578be1675d1d38ff))
+
+- Record how to run the test suite without burning hours
+  ([`36c814c`](https://github.com/SerPeter/code-atlas/commit/36c814c688df7a20a4ca984e848770c5f1d5ce38))
+
+- Rename docs/ vault to wiki/, add ADR-0012
+  ([`2a3ed86`](https://github.com/SerPeter/code-atlas/commit/2a3ed86625a7fdecdebec25491a85685f3e39132))
+
+- **adr**: Add ADR-0015 for the embedded SQLite backend option
+  ([`8beeb7a`](https://github.com/SerPeter/code-atlas/commit/8beeb7ac01e19b218dae30e14cc802a4cda4d65b))
+
+- **adr**: Add ADR-0018 for non-code file parsing
+  ([`ff0d3c8`](https://github.com/SerPeter/code-atlas/commit/ff0d3c8840e5bfbfa1f23a444bb8ddd2f043d7f5))
+
+- **adr**: Record the outline changes the blind-read evaluation produced
+  ([`dd160da`](https://github.com/SerPeter/code-atlas/commit/dd160dafbc646d2da8017f8a3f49a15f011425b6))
+
+- **adr**: Record type-directed call resolution
+  ([`dbee463`](https://github.com/SerPeter/code-atlas/commit/dbee46379af8be1e1c0299dbbc2972b5412938dc))
+
+- **server**: Record the dead-code shape that is permanently unresolvable
+  ([`87278f8`](https://github.com/SerPeter/code-atlas/commit/87278f851a3e0b25d82f00dda928112193afd099))
+
+### Features
+
+- **backends**: Add SQLite-backed embedded graph and queue as a Memgraph/Valkey fallback
+  ([`ecbe1f7`](https://github.com/SerPeter/code-atlas/commit/ecbe1f7f5ec15a22617eaaff4f720f6124ca0e67))
+
+- **cli**: Add --with-git-signals flag to atlas index
+  ([`aaa4bc4`](https://github.com/SerPeter/code-atlas/commit/aaa4bc4e1fbee62dece3f70f2f0a431fe7d6b8e5))
+
+- **graph**: Env-var and referenced-file nodes, citation edges, manifest parity
+  ([`2d09467`](https://github.com/SerPeter/code-atlas/commit/2d094672e957ba0066154beb5464bf545e37669d))
+
+- **graph**: Follow a dispatch table to its handlers, without fanning out
+  ([`0178c08`](https://github.com/SerPeter/code-atlas/commit/0178c084387486edbf7fd42787331c302e6594e5))
+
+- **graph**: Give a builtin base class a node so exception hierarchies are visible
+  ([`28ac31b`](https://github.com/SerPeter/code-atlas/commit/28ac31b24d1abed22c0746e438c231296a03682f))
+
+- **graph**: Recognise structural Protocol conformance (ADR-0025)
+  ([`198f03c`](https://github.com/SerPeter/code-atlas/commit/198f03c41884b2e9ae5905730968c910b6924383))
+
+- **graph**: Record a callable named as a value, distinct from calling it
+  ([`a38d204`](https://github.com/SerPeter/code-atlas/commit/a38d204e2dc038d7d8f545e4edbc571cafd98b32))
+
+- **graph**: Resolve a call through its receiver's declared type
+  ([`e91ccf9`](https://github.com/SerPeter/code-atlas/commit/e91ccf9a1281ef2b3771976c2dd2fd0a639ce374))
+
+- **graph**: Resolve calls past Protocol stubs, and damp every unverified receiver
+  ([`3ab3a68`](https://github.com/SerPeter/code-atlas/commit/3ab3a6800c591aba7c43110b2383868aa9002829))
+
+- **graph**: Resolve constructor calls (ClassName(...)) to __init__
+  ([`244d4b9`](https://github.com/SerPeter/code-atlas/commit/244d4b9ea1fcebbc50732ec0c900893fb41215fc))
+
+- **graph**: Surface CALLS edge resolution confidence instead of discarding ambiguous matches
+  ([`3015c5a`](https://github.com/SerPeter/code-atlas/commit/3015c5ac13519a301b5f95ba517b49acd2c6b2d9))
+
+- **graph**: Weighted CALLS edges, module summaries, and rationale extraction
+  ([`b12b31d`](https://github.com/SerPeter/code-atlas/commit/b12b31dfd1e24db7153a4c7734e4cd641ce408cf))
+
+- **indexing**: Mine git-derived signals (hotspots, bus factor, co-change) via GitPython
+  ([`1a2bd1a`](https://github.com/SerPeter/code-atlas/commit/1a2bd1a8bcfe802698565b0333f6e41fa6136ed4))
+
+- **infra**: Swap Memgraph image to memgraph-mage for community-detection support
+  ([`6568f63`](https://github.com/SerPeter/code-atlas/commit/6568f639f97754fb8607ec723791f3b196072f31))
+
+- **parsing**: Add HCL, shell, Dockerfile, SQL and context-aware config parsers
+  ([`d922fb0`](https://github.com/SerPeter/code-atlas/commit/d922fb0ef4f753494717c0e53782e8964da58310))
+
+- **parsing**: Add Salesforce support via a Java-grammar shim
+  ([`d26ecd7`](https://github.com/SerPeter/code-atlas/commit/d26ecd71f4418a2bae260f069e053da502244c74))
+
+- **parsing**: Enable the module_exports detector so __all__ becomes an edge
+  ([`aa9e98c`](https://github.com/SerPeter/code-atlas/commit/aa9e98cd8cb7e26b1be973850a303eb8acd064c4))
+
+- **parsing**: Give a class its fields, and give a field its type
+  ([`26add0d`](https://github.com/SerPeter/code-atlas/commit/26add0da252b19e3ef8f23b576be942949d65158))
+
+- **parsing**: Index functions defined inside other functions
+  ([`a23d528`](https://github.com/SerPeter/code-atlas/commit/a23d5283d11b7242aa7435a1522ac5874981e319))
+
+- **parsing**: Link a decorated definition to the decorator that registers it
+  ([`5fab287`](https://github.com/SerPeter/code-atlas/commit/5fab287f950dbdcccc57533c476e7f3cf01a8bb3))
+
+- **parsing**: Make a constructor-injected collaborator a typed field
+  ([`cbd4743`](https://github.com/SerPeter/code-atlas/commit/cbd474327abb73337885ed9d49d3bd627fbc2b06))
+
+- **parsing**: Record the call receiver in seven more languages
+  ([`1335006`](https://github.com/SerPeter/code-atlas/commit/133500623653b8d0b50c76e388f12c23566d24c8))
+
+- **parsing**: See the code that runs at import time
+  ([`04c2ce1`](https://github.com/SerPeter/code-atlas/commit/04c2ce1705cf2d158a02193770f885baa40df100))
+
+- **server**: Add exclude_tests to blast_radius and get_node
+  ([`4afc9cc`](https://github.com/SerPeter/code-atlas/commit/4afc9cca43d5b9880acff8f821fa0e2fb5ec7b0c))
+
+- **server**: Add offset pagination to hybrid_search, text_search, vector_search, get_node
+  ([`5fc50eb`](https://github.com/SerPeter/code-atlas/commit/5fc50ebbfc430e6e470822b4d0284dffef69e875))
+
+- **server**: Add trace_path/blast_radius and dead-code/complexity/community analyses
+  ([`819356c`](https://github.com/SerPeter/code-atlas/commit/819356c4e150d249b6d143172236b73da167a338))
+
+- **server**: Cluster communities at module granularity
+  ([`a00410e`](https://github.com/SerPeter/code-atlas/commit/a00410e92306a05586f9e8bc0d86e41529580443))
+
+- **server**: Drop Mermaid for grouped adjacency on large import graphs
+  ([`02beb10`](https://github.com/SerPeter/code-atlas/commit/02beb10785a09e8de3c73f5320b8b741389af1d0))
+
+- **server**: Hide find_communities from tools/list on the sqlite backend
+  ([`704a7a0`](https://github.com/SerPeter/code-atlas/commit/704a7a06ae9004b2e8fc1ad8683a6675cbdc0e38))
+
+- **server**: Make the outline boundary sections answer the question asked of them
+  ([`9755101`](https://github.com/SerPeter/code-atlas/commit/9755101c29e5e38149982e3ebafd3441c904029a))
+
+- **server**: Pick module_summary detail by rendered size, not by scope shape
+  ([`bf0d5fe`](https://github.com/SerPeter/code-atlas/commit/bf0d5fe976e6432029fd62388ff2f011c8b1bb68))
+
+- **server**: Surface cycles, file locations and scope in the import diagram
+  ([`68c0e7f`](https://github.com/SerPeter/code-atlas/commit/68c0e7f0c54a5bbaa41a71e52adb6bb6011d2b57))
+
+- **server**: Surface live indexing backlog in staleness reporting
+  ([`7d5927c`](https://github.com/SerPeter/code-atlas/commit/7d5927ce83492fe613fa6b1d59217ec9a6e53bb9))
+
+- **settings**: Add config-driven backend selection
+  ([`449be65`](https://github.com/SerPeter/code-atlas/commit/449be651956a5ee75d15d4be3c3d6d0a9b3d6c42))
+
+- **settings**: Default the knowledge vault to wiki/ instead of docs/
+  ([`07a64b3`](https://github.com/SerPeter/code-atlas/commit/07a64b397403cbb14bff2fbbca460e0e354d30f5))
+
+### Refactoring
+
+- **parsing**: Record a decorator's registration surface generically, delete three framework
+  detectors
+  ([`739f140`](https://github.com/SerPeter/code-atlas/commit/739f140c783d3b06db19b6d9ab6dac1aac0d9c27))
+
+### Testing
+
+- **integration**: Measure which Python design patterns the graph can actually answer
+  ([`74c3b1e`](https://github.com/SerPeter/code-atlas/commit/74c3b1edbf9ecea289f45714ef5bef583712e710))
+
+- **parsing**: Assemble the PEM marker so detect-private-key stays useful
+  ([`8ecf469`](https://github.com/SerPeter/code-atlas/commit/8ecf46931345045666231690a719246792795f33))
+
+
 ## v0.4.1 (2026-07-15)
 
 ### Bug Fixes
