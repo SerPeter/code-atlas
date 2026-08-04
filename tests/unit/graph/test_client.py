@@ -22,6 +22,7 @@ from code_atlas.graph.client import (
     _CallEdgeFacts,
     _CallLookup,
     _combine_call_edge_facts,
+    _direct_call_lines,
     _format_path_hops,
     _fuse_bm25_results,
     _resolve_one_call,
@@ -300,6 +301,49 @@ class TestResolveOneCall:
         rel = self._rel(f"{self.PROJECT}:mod.func", "print")
         result = _resolve_one_call(self.PROJECT, rel, lookup, {})
         assert result is None
+
+
+class TestCallSiteProvenance:
+    """A CALLS edge records where the CALL happens, not where the caller is defined
+    (ATL-105). In any caller longer than a few statements those are different lines, and
+    the caller's `def` is the less useful of the two.
+    """
+
+    def test_the_first_call_site_wins_and_the_count_accumulates(self):
+        """`line` deliberately does not follow the best-evidenced observation — "which
+        evidence is strongest" and "where does this first appear" are different questions.
+        """
+        first = _CallEdgeFacts("ambiguous", "project_wide", 3, False, line=90, site_count=1)
+        second = _CallEdgeFacts("resolved", "same_file", 1, False, line=12, site_count=1)
+
+        combined = _combine_call_edge_facts(first, second)
+
+        # Strategy/confidence follow the BEST evidence (candidate_count 1)...
+        assert (combined.confidence, combined.strategy, combined.candidate_count) == ("resolved", "same_file", 1)
+        # ...while the line is the EARLIEST site, regardless of which one won above.
+        assert combined.line == 12
+        assert combined.site_count == 2
+
+    def test_a_missing_line_never_masks_a_known_one(self):
+        """Languages other than Python do not record a line yet, so None must be absorbed
+        rather than compared — min() over a None would raise, and defaulting it to 0 would
+        beat every real line."""
+        known = _CallEdgeFacts("resolved", "import", 1, False, line=7, site_count=1)
+        unknown = _CallEdgeFacts("resolved", "import", 1, False, line=None, site_count=1)
+
+        assert _combine_call_edge_facts(known, unknown).line == 7
+        assert _combine_call_edge_facts(unknown, known).line == 7
+        assert _combine_call_edge_facts(unknown, unknown).line is None
+
+    def test_call_lines_are_reported_only_for_direct_dependents(self):
+        """At depth 1 the incident edge starts at the affected entity, so its lines are
+        that entity's own. Deeper, the same edge belongs to an intermediate hop and its
+        lines name a DIFFERENT file — misleading rather than merely imprecise."""
+        assert _direct_call_lines({"min_depth": 1, "via_lines": [42, 17, 42]}) == {"at_lines": [17, 42]}
+        assert _direct_call_lines({"min_depth": 2, "via_lines": [42]}) == {}
+        # Absent, not null: an absent key reads as "not applicable", null as "we looked".
+        assert _direct_call_lines({"min_depth": 1, "via_lines": [None]}) == {}
+        assert _direct_call_lines({"min_depth": 1}) == {}
 
 
 class TestTestCandidateHygiene:
@@ -778,6 +822,8 @@ class TestResolveCallsEdgeProperties:
         assert "e.candidate_count = r.candidate_count" in query
         assert "e.from_test = r.from_test" in query
         assert "e.weight = r.weight" in query
+        assert "e.line = r.line" in query
+        assert "e.site_count = r.site_count" in query
         assert rels == [
             {
                 "f": "proj:mod.caller",
@@ -787,6 +833,11 @@ class TestResolveCallsEdgeProperties:
                 "candidate_count": 1,
                 "from_test": False,
                 "weight": 1.0,
+                # This fixture builds relationships directly rather than parsing source,
+                # so there is no call site to record — None is the honest value, and the
+                # parser-fed path is covered by the integration corpus.
+                "line": None,
+                "site_count": 1,
             }
         ]
 

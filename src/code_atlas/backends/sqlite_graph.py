@@ -1410,7 +1410,14 @@ class SqliteGraphClient:
                 caller_name, caller_fp = lookup.uid_to_info.get(caller_uid, ("", ""))
                 from_test = matches_test_pattern(caller_fp, caller_name, patterns)
                 caller_is_test[caller_uid] = from_test
-            observed = _CallEdgeFacts(confidence, strategy, len(candidate_uids), from_test)
+            site_line = rel.properties.get("line")
+            observed = _CallEdgeFacts(
+                confidence,
+                strategy,
+                len(candidate_uids),
+                from_test,
+                site_line if isinstance(site_line, int) else None,
+            )
             for target_uid in candidate_uids:
                 key = (caller_uid, target_uid)
                 prior = edges.get(key)
@@ -1429,6 +1436,8 @@ class SqliteGraphClient:
                             "candidate_count": facts.candidate_count,
                             "from_test": facts.from_test,
                             "weight": _call_edge_weight(facts.candidate_count, facts.from_test, facts.strategy),
+                            "line": facts.line,
+                            "site_count": facts.site_count,
                         }
                     ),
                 )

@@ -732,6 +732,30 @@ async def test_a_test_double_never_absorbs_a_production_call(indexed_corpus):
     )
 
 
+async def test_a_calls_edge_points_at_the_call_not_the_def(indexed_corpus):
+    """ATL-105 end to end: parser -> ParsedRelationship.properties -> edge property.
+
+    `submit` is a two-line function, so `line` landing on its `def` rather than on the
+    call would be indistinguishable from correct. The assertion is therefore relative:
+    the recorded line must be INSIDE the caller and strictly after its own start line.
+    """
+    client, project = indexed_corpus
+    rows = await client.execute(
+        "MATCH (a)-[r:CALLS]->(b) WHERE a.project_name=$p AND a.qualified_name ENDS WITH 'submit' "
+        "AND b.name='commit' RETURN r.line AS line, r.site_count AS sites, "
+        "a.line_start AS caller_start, a.line_end AS caller_end",
+        {"p": project},
+    )
+    assert rows, "submit -> commit did not resolve; this test proves nothing as written"
+    for row in rows:
+        assert row["line"] is not None, "CALLS edge carries no call-site line"
+        assert row["caller_start"] < row["line"] <= row["caller_end"], (
+            f"line {row['line']} is not inside submit ({row['caller_start']}-{row['caller_end']}); "
+            "a line equal to caller_start means it recorded the `def`, not the call"
+        )
+        assert row["sites"] == 1
+
+
 async def test_pattern_coverage_ratchet(indexed_corpus):
     """The headline number, so coverage is a measurement and not an anecdote."""
     client, project = indexed_corpus

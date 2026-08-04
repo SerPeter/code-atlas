@@ -1369,6 +1369,7 @@ def _extract_module_level_call(call_node: Node, module_uid: str, relationships: 
             from_qualified_name=module_uid,
             rel_type=RelType.CALLS,
             to_name=name,
+            properties={"line": call_node.start_point[0] + 1},
         )
     )
     relationships.append(
@@ -1461,6 +1462,7 @@ def _extract_calls(
                             from_qualified_name=from_qn,
                             rel_type=RelType.CALLS,
                             to_name=call_name,
+                            properties={"line": child.start_point[0] + 1},
                         )
                     )
                 elif func.type == "subscript":
@@ -1495,7 +1497,7 @@ def _extract_calls(
                                 # type that may never have been indexed. Both arms used
                                 # to emit an identical relationship, discarding the one
                                 # fact that distinguishes them.
-                                properties=_receiver_props(obj, local_types),
+                                properties=_receiver_props(obj, local_types) | {"line": child.start_point[0] + 1},
                             )
                         )
         # Recurse but don't descend into nested function/class definitions

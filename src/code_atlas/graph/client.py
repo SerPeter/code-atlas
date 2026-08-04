@@ -324,6 +324,13 @@ def _format_path_hops(path_nodes: list[Any], path_rels: list[Any]) -> list[dict[
             hop["weight"] = rel_props["weight"]
         if "from_test" in rel_props:
             hop["from_test"] = rel_props["from_test"]
+        # Where the call happens, not where the caller is defined (ATL-105). Reported on
+        # the hop rather than the node because it is a property of the EDGE — the same
+        # caller reaches different callees from different lines.
+        if rel_props.get("line") is not None:
+            hop["at_line"] = rel_props["line"]
+            if rel_props.get("site_count", 1) > 1:
+                hop["site_count"] = rel_props["site_count"]
         hops.append(hop)
     return hops
 
@@ -1247,6 +1254,30 @@ class _CallEdgeFacts(NamedTuple):
     strategy: str
     candidate_count: int
     from_test: bool
+    # Where the CALL happens, not where the caller is defined. "Who calls X" pointed at
+    # the caller's `def` line, which is the wrong line in any caller longer than a few
+    # statements. ``line`` is the FIRST such site (lowest line) and ``site_count`` says
+    # how many collapsed into this edge, so a reader knows whether one is the whole story.
+    line: int | None = None
+    site_count: int = 1
+
+
+def _direct_call_lines(row: dict[str, Any]) -> dict[str, Any]:
+    """``at_lines`` for a DIRECT dependent, or nothing at all.
+
+    The collected lines come from the path's first relationship — the hop incident to the
+    queried entity. At ``min_depth`` 1 that edge starts at the affected entity, so its
+    lines are that entity's own call sites and pointing a reader there is correct. Deeper,
+    the same edge belongs to some intermediate hop and its line numbers name a DIFFERENT
+    file, so reporting them would be actively misleading rather than merely imprecise.
+
+    Omitted entirely rather than emitted as null: an absent key reads as "not applicable",
+    a null reads as "we looked and there is none".
+    """
+    if row.get("min_depth") != 1:
+        return {}
+    lines = sorted({ln for ln in (row.get("via_lines") or []) if isinstance(ln, int)})
+    return {"at_lines": lines} if lines else {}
 
 
 def _combine_call_edge_facts(existing: _CallEdgeFacts, observed: _CallEdgeFacts) -> _CallEdgeFacts:
@@ -1259,10 +1290,21 @@ def _combine_call_edge_facts(existing: _CallEdgeFacts, observed: _CallEdgeFacts)
     ties keep the one seen first, so the result is order-stable), and treats
     ``from_test`` as true only when *every* observed call site was in test code
     — one production caller is enough to make the edge production-relevant.
+
+    ``line`` deliberately does NOT follow ``best``: the best-evidenced observation
+    and the first call site are different questions, and a reader following the edge
+    wants the earliest place the call appears. ``site_count`` sums so a single
+    reported line never implies a single call.
     """
     best = observed if observed.candidate_count < existing.candidate_count else existing
+    lines = [ln for ln in (existing.line, observed.line) if ln is not None]
     return _CallEdgeFacts(
-        best.confidence, best.strategy, best.candidate_count, existing.from_test and observed.from_test
+        best.confidence,
+        best.strategy,
+        best.candidate_count,
+        existing.from_test and observed.from_test,
+        min(lines) if lines else None,
+        existing.site_count + observed.site_count,
     )
 
 
@@ -1403,22 +1445,7 @@ class GraphClient:
         elif stored < SCHEMA_VERSION:
             logger.info("Migrating schema v{} → v{}", stored, SCHEMA_VERSION)
             await self._migrate_indices()
-            if stored < 3:  # v3 data migration threshold
-                await self._migrate_v3_clear_freshness_markers()
-            if stored < 4:  # v4 data migration threshold
-                await self._migrate_v4_clear_freshness_markers()
-            if stored < 5:  # v5 data migration threshold
-                await self._migrate_v5_clear_freshness_markers()
-            if stored < 6:  # v6 data migration threshold
-                await self._migrate_v6_clear_freshness_markers()
-            if stored < 7:  # v7 data migration threshold
-                await self._migrate_v7_clear_freshness_markers()
-            if stored < 8:  # v8 data migration threshold
-                await self._migrate_v8_drop_unverified_calls()
-            if stored < 9:  # v9 data migration threshold
-                await self._migrate_v9_clear_for_abstract_bases()
-            if stored < 10:  # v10 data migration threshold
-                await self._migrate_v10_stub_flag_moved_to_methods()
+            await self._run_data_migrations(stored)
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -2219,7 +2246,14 @@ class GraphClient:
                 caller_name, caller_fp = lookup.uid_to_info.get(caller_uid, ("", ""))
                 from_test = matches_test_pattern(caller_fp, caller_name, patterns)
                 caller_is_test[caller_uid] = from_test
-            observed = _CallEdgeFacts(confidence, strategy, len(candidate_uids), from_test)
+            site_line = rel.properties.get("line")
+            observed = _CallEdgeFacts(
+                confidence,
+                strategy,
+                len(candidate_uids),
+                from_test,
+                site_line if isinstance(site_line, int) else None,
+            )
             for target_uid in candidate_uids:
                 key = (caller_uid, target_uid)
                 prior = edges.get(key)
@@ -2236,6 +2270,8 @@ class GraphClient:
                     "candidate_count": facts.candidate_count,
                     "from_test": facts.from_test,
                     "weight": _call_edge_weight(facts.candidate_count, facts.from_test, facts.strategy),
+                    "line": facts.line,
+                    "site_count": facts.site_count,
                 }
                 for (f, t), facts in edges.items()
             ]
@@ -2248,7 +2284,8 @@ class GraphClient:
                 f"MATCH (a {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
                 f"MERGE (a)-[e:{RelType.CALLS}]->(b) "
                 f"SET e.confidence = r.confidence, e.strategy = r.strategy, "
-                f"e.candidate_count = r.candidate_count, e.from_test = r.from_test, e.weight = r.weight",
+                f"e.candidate_count = r.candidate_count, e.from_test = r.from_test, e.weight = r.weight, "
+                f"e.line = r.line, e.site_count = r.site_count",
                 {"rels": edge_params},
             )
 
@@ -3936,7 +3973,11 @@ class GraphClient:
             # The hop incident to `start` — how the dependency actually lands on it.
             # relationships(p) runs in path order from start, so [0] is that edge in
             # both directions.
-            "collect(DISTINCT type(relationships(p)[0])) AS via",
+            "collect(DISTINCT type(relationships(p)[0])) AS via, "
+            # Only meaningful at depth 1, where the edge incident to `start` IS the
+            # affected entity's own call site; deeper, it is a line in some intermediate
+            # hop and would name the wrong file. Filtered to direct dependents below.
+            "collect(DISTINCT relationships(p)[0].line) AS via_lines",
             {"uid": uid},
         )
         resolved_raw = await self.execute(
@@ -3972,6 +4013,7 @@ class GraphClient:
                 "ambiguous_only": r["uid"] not in resolved_uids,
                 "confidence_score": r["confidence_score"],
                 "test_only": r["uid"] not in production_uids,
+                **_direct_call_lines(r),
             }
             for r in all_raw
         ]
@@ -5321,6 +5363,52 @@ class GraphClient:
         logger.info(
             "Schema v7: cleared stored file/git hashes — run 'atlas index' to extract "
             "environment-variable and referenced-file nodes"
+        )
+
+    async def _run_data_migrations(self, stored: int) -> None:
+        """Apply every data migration newer than *stored*, oldest first.
+
+        A table rather than a chain of ``if`` statements: the ladder only ever grows, and
+        inlined it pushed ``ensure_schema`` past the branch limit for what is really one
+        loop. Order is significant — each entry assumes its predecessors have run.
+        """
+        migrations: tuple[tuple[int, Callable[[], Awaitable[None]]], ...] = (
+            (3, self._migrate_v3_clear_freshness_markers),
+            (4, self._migrate_v4_clear_freshness_markers),
+            (5, self._migrate_v5_clear_freshness_markers),
+            (6, self._migrate_v6_clear_freshness_markers),
+            (7, self._migrate_v7_clear_freshness_markers),
+            (8, self._migrate_v8_drop_unverified_calls),
+            (9, self._migrate_v9_clear_for_abstract_bases),
+            (10, self._migrate_v10_stub_flag_moved_to_methods),
+            (11, self._migrate_v11_clear_for_call_site_lines),
+        )
+        for threshold, migrate in migrations:
+            if stored < threshold:
+                await migrate()
+
+    async def _migrate_v11_clear_for_call_site_lines(self) -> None:
+        """v11: CALLS edges gained ``line`` (where the call happens) and ``site_count``.
+
+        Same reason as v7, not an analogy with it: the line number exists only in the
+        source text, so nothing already in the graph can derive it. A pre-v11 index has
+        CALLS edges whose ``line`` is permanently null, and the file-hash gate would skip
+        every unchanged file forever, so the property would never appear.
+
+        Nothing is deleted. Unlike v8's purge, a lineless CALLS edge is not WRONG — it is
+        the same edge missing one property, and consumers already treat a null ``line`` as
+        "not recorded" (`_format_path_hops` omits the key, `_direct_call_lines` returns
+        nothing). Re-parsing fills it in; deleting first would lose real edges for a
+        cosmetic gain.
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v11: cleared stored file/git hashes — run 'atlas index' so CALLS edges "
+            "record the line the call is written on"
         )
 
     async def _set_schema_version(self, version: int) -> None:
