@@ -4,6 +4,11 @@ target-version = "py314"
 line-length = 120
 src = ["src", "tests"]
 
+# Vendored third-party sources measured by the extraction-coverage floors. They
+# must stay byte-identical to upstream — reformatting them would silently change
+# what the walkers are being measured against.
+extend-exclude = ["tests/fixtures"]
+
 [format]
 docstring-code-format = true
 quote-style = "double"

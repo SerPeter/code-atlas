@@ -41,6 +41,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0028](./0028-every-resolved-edge-states-its-evidence.md)         | Every Resolved Edge States Its Evidence                        | Accepted               | 2026-08-04 |
 | [0029](./0029-blast-radius-traverses-dependency-not-execution.md) | blast_radius Traverses Dependency, Not Execution               | Accepted               | 2026-08-04 |
 | [0030](./0030-candidate-hygiene-is-asymmetric.md)                 | Candidate Hygiene Is Asymmetric                                | Accepted               | 2026-08-05 |
+| [0031](./0031-anonymous-callables-attribute-upward.md)            | Anonymous Callables Attribute Their Calls Upward               | Accepted               | 2026-08-05 |
 
 ## Creating a New ADR
 

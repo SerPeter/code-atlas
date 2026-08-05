@@ -7,8 +7,13 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      # Vendored corpus is excluded from every whitespace-normalising hook:
+      # the coverage floors measure upstream code as it is actually written,
+      # and a stripped trailing space is a silent edit to the thing under test.
       - id: trailing-whitespace
+        exclude: "^tests/fixtures/"
       - id: end-of-file-fixer
+        exclude: "^tests/fixtures/"
       - id: check-yaml
       - id: check-toml
       - id: check-json
@@ -37,7 +42,7 @@ repos:
     hooks:
       - id: prettier
         types_or: [markdown, yaml]
-        exclude: 'CHANGELOG\.md'
+        exclude: 'CHANGELOG\.md|^tests/fixtures/'
 
   # --------------------------------------------------------------------------
   # Python — ty (type checking, local — no official pre-commit hook yet)

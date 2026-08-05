@@ -1,0 +1,11 @@
+{
+  "lang": "python",
+  "named_funcs": 1.0,
+  "calls": 0.96,
+  "source_repo": "pallets/click",
+  "source_commit": "00e592cea702e0b2caa0dee42489fdb1c22cd845",
+  "license": "BSD-3-Clause",
+  "files": ["decorators.py", "globals.py", "formatting.py", "_compat.py"],
+  "measured": { "named_funcs": 1.0, "calls": 0.966 },
+  "rationale": "Python is the reference implementation the other languages are measured against, so its named-function floor is exact 1.0 rather than a margin below measurement: every `def` is an entity, including nested ones (ATL-096, commit a23d528). Lambdas are anonymous and get no entity by design; their calls attribute to the enclosing function, which is why `calls` is high despite 8 uncaptured lambda nodes. The 3.4% call shortfall is entirely module-scope: 0 call nodes sit inside a function that produced no entity, and 11 of the 14 module-scope calls are unemitted."
+}

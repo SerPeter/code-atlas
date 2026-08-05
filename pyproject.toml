@@ -138,6 +138,9 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "-q",
+    # Vendored corpus for the extraction-coverage floors — real third-party
+    # sources, not tests. Some are named test_*.py upstream.
+    "--ignore=tests/fixtures",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -157,6 +160,10 @@ filterwarnings = [
 # --------------------------------------------------------------------------- #
 [tool.ty.environment]
 python-version = "3.14"
+
+[tool.ty.src]
+# Vendored third-party corpus — measured, never imported. See ruff.toml.
+exclude = ["tests/fixtures"]
 
 [tool.ty.analysis]
 # OTel packages are optional (`[otel]` extra) — not present in the base venv.
