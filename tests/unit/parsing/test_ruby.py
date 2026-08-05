@@ -695,3 +695,287 @@ end
     assert method.source is not None
     assert "def bar" in method.source
     assert "42" in method.source
+
+
+# ---------------------------------------------------------------------------
+# 19. Blocks are not scopes (ADR-0031)
+# ---------------------------------------------------------------------------
+
+
+def test_calls_inside_a_block_attribute_to_the_enclosing_method():
+    parsed = _parse("""\
+class Worker
+  def perform
+    items.each do |item|
+      transform(item)
+    end
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, "lib.example.Worker.perform", RelType.CALLS)}
+    assert "transform" in called
+
+
+def test_calls_in_a_block_pyramid_all_reach_the_enclosing_method():
+    """A call several callbacks deep still belongs to the def that passed them."""
+    parsed = _parse("""\
+class Worker
+  def perform
+    rows.each do |row|
+      row.cells.map { |cell| normalize(cell) }
+    end
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, "lib.example.Worker.perform", RelType.CALLS)}
+    assert {"each", "cells", "map", "normalize"} <= called
+
+
+def test_calls_in_a_dsl_block_at_class_scope_attribute_to_the_module():
+    """`get '/' do ... end` has no enclosing def, so its calls belong to the module."""
+    parsed = _parse("""\
+class App
+  get '/' do
+    render_index
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, ":lib.example", RelType.CALLS)}
+    assert "get" in called
+    assert "render_index" in called
+
+
+def test_class_body_call_attributes_to_the_module():
+    parsed = _parse("""\
+class App
+  set :views, 'views'
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, ":lib.example", RelType.CALLS)}
+    assert "set" in called
+
+
+def test_module_scope_call_attributes_to_the_module():
+    parsed = _parse("""\
+configure_app
+Widget.new
+""")
+    called = {r.to_name for r in _rels_from(parsed, ":lib.example", RelType.CALLS)}
+    assert "configure_app" in called
+    assert "new" in called
+
+
+def test_block_produces_no_callable_entity():
+    """ADR-0031: an anonymous form has no name to be looked up by, so it gets no node."""
+    parsed = _parse("""\
+class App
+  get '/' do
+    helper
+  end
+
+  configure { setup }
+
+  handler = lambda { |x| x }
+end
+""")
+    callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    assert callables == [], f"a block became a Callable: {[e.name for e in callables]}"
+
+
+def test_assignment_inside_a_block_is_not_a_value_entity():
+    """A block's assignments bind locals; only a class body declares fields."""
+    parsed = _parse("""\
+class App
+  LIMIT = 10
+
+  get '/' do
+    scratch = 1
+  end
+end
+""")
+    names = {e.name for e in parsed.entities if e.label == NodeLabel.VALUE}
+    assert "LIMIT" in names
+    assert "scratch" not in names, "a block local became a Value entity"
+
+
+# ---------------------------------------------------------------------------
+# 20. Named definitions the walker used to step over
+# ---------------------------------------------------------------------------
+
+
+def test_singleton_class_methods_are_static():
+    parsed = _parse("""\
+class Config
+  class << self
+    def load(path)
+    end
+  end
+end
+""")
+    method = _entity_by_name(parsed, "load")
+    assert method.label == NodeLabel.CALLABLE
+    assert method.kind == CallableKind.STATIC_METHOD
+    assert method.qualified_name == f"{PROJECT}:lib.example.Config.load"
+
+
+def test_singleton_class_body_defines_from_the_reopened_class():
+    parsed = _parse("""\
+class Config
+  class << self
+    def load(path)
+    end
+  end
+end
+""")
+    defines = _rels_from(parsed, "lib.example.Config", RelType.DEFINES)
+    assert any(r.to_name == f"{PROJECT}:lib.example.Config.load" for r in defines)
+
+
+def test_def_inside_a_block_is_an_entity():
+    parsed = _parse("""\
+describe 'Delegator' do
+  def delegation_agent
+    Object.new
+  end
+end
+""")
+    method = _entity_by_name(parsed, "delegation_agent")
+    assert method.label == NodeLabel.CALLABLE
+    assert method.qualified_name == f"{PROJECT}:lib.example.delegation_agent"
+
+
+def test_def_inside_a_block_has_a_line_independent_uid():
+    """A uid must survive re-indexing, so it cannot encode where the block sat."""
+    top = _parse("""\
+describe 'x' do
+  def helper
+  end
+end
+""")
+    moved = _parse("""\
+# a leading comment
+
+puts 1
+
+describe 'x' do
+  def helper
+  end
+end
+""")
+    assert _entity_by_name(top, "helper").qualified_name == _entity_by_name(moved, "helper").qualified_name
+
+
+def test_singleton_def_inside_a_block_is_an_entity():
+    parsed = _parse("""\
+describe JsonCsrf do
+  def self.env_for(url)
+  end
+end
+""")
+    method = _entity_by_name(parsed, "env_for")
+    assert method.kind == CallableKind.STATIC_METHOD
+
+
+def test_def_inside_a_class_level_block_belongs_to_the_class():
+    parsed = _parse("""\
+class Base
+  class_eval do
+    def settings
+    end
+  end
+end
+""")
+    method = _entity_by_name(parsed, "settings")
+    assert method.kind == CallableKind.METHOD
+    assert method.qualified_name == f"{PROJECT}:lib.example.Base.settings"
+
+    defines = _rels_from(parsed, "lib.example.Base", RelType.DEFINES)
+    assert any(r.to_name == f"{PROJECT}:lib.example.Base.settings" for r in defines)
+
+
+def test_def_in_a_conditional_branch_is_an_entity():
+    parsed = _parse("""\
+module Sinatra
+  class Cookies
+    if RUBY_VERSION >= '3.0'
+      def modern_each
+      end
+    end
+  end
+end
+""")
+    method = _entity_by_name(parsed, "modern_each")
+    assert method.kind == CallableKind.METHOD
+    assert method.qualified_name == f"{PROJECT}:lib.example.Sinatra.Cookies.modern_each"
+
+
+def test_def_behind_an_if_modifier_is_an_entity():
+    parsed = _parse("""\
+class IndifferentHash
+  def except(*keys)
+  end if RUBY_VERSION < '3.0'
+end
+""")
+    method = _entity_by_name(parsed, "except")
+    assert method.kind == CallableKind.METHOD
+    assert method.qualified_name == f"{PROJECT}:lib.example.IndifferentHash.except"
+
+
+def test_require_inside_a_rescue_guard_is_an_import():
+    parsed = _parse("""\
+begin
+  require 'yajl'
+rescue LoadError
+  require 'json'
+end
+""")
+    imported = {r.to_name for r in parsed.relationships if r.rel_type == RelType.IMPORTS}
+    assert imported == {"yajl", "json"}
+
+
+# ---------------------------------------------------------------------------
+# 21. Edges the walker must NOT invent
+# ---------------------------------------------------------------------------
+
+
+def test_bare_local_variable_read_is_not_a_call():
+    """`result` alone reads a local; `content_type` alone calls a method."""
+    parsed = _parse("""\
+class Worker
+  def perform
+    result = compute
+    content_type
+    result
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, "lib.example.Worker.perform", RelType.CALLS)}
+    assert "content_type" in called
+    assert "result" not in called, "a local variable read became a CALLS edge"
+
+
+def test_block_parameter_read_is_not_a_call():
+    parsed = _parse("""\
+class Worker
+  def perform
+    items.each do |item|
+      item
+    end
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, "lib.example.Worker.perform", RelType.CALLS)}
+    assert "item" not in called, "a block parameter read became a CALLS edge"
+
+
+def test_mixin_with_a_receiver_is_not_an_inherits():
+    """`base.include Helpers` names a receiver the walker cannot resolve to a type."""
+    parsed = _parse("""\
+class Installer
+  def self.installed(base)
+    base.include Helpers
+  end
+end
+""")
+    inherits = [r for r in parsed.relationships if r.rel_type == RelType.INHERITS]
+    assert inherits == [], f"invented INHERITS from a call with a receiver: {[r.to_name for r in inherits]}"
