@@ -1,0 +1,32 @@
+{
+  "lang": "cpp",
+  "named_funcs": 0.71,
+  "calls": 0.96,
+  "source_repo": "fmtlib/fmt",
+  "source_commit": "60ccad511fd680cb91d8b60a315759f71c67bef9",
+  "license": "MIT",
+  "files": [
+    "args.h",
+    "args-test.cc",
+    "base-test.cc",
+    "c-test.c",
+    "color.h",
+    "fmt-c.cc",
+    "fmt-c.h",
+    "gtest-extra.cc",
+    "gtest-extra.h",
+    "mock-allocator.h",
+    "os.cc",
+    "os.h",
+    "ostream.h",
+    "scan.h",
+    "util.cc",
+    "util.h"
+  ],
+  "measured": {
+    "named_funcs": 0.72,
+    "calls": 0.965
+  },
+  "rationale": "C++ has a genuinely low ceiling and this floor is deliberately not near 1.0. tree-sitter has no preprocessor, so every unexpandable macro is a token the grammar must guess at, and fmt is macro-dense (FMT_BEGIN_NAMESPACE, FMT_CONSTEXPR, FMT_API, gtest's TEST_F). 41 of the full repo's 72 files contain ERROR nodes. The remaining 82 uncaptured named functions here are ALL stranded behind a compound_statement or ERROR in their ancestor chain \u2014 that is, the enclosing namespace or class failed to parse and collapsed into a bare block, so the function survives but its scope does not. Emitting entities for them was rejected: the name is recoverable but the qualified name is not, and a Callable with a wrong qn resolves to the wrong target rather than to nothing. Their calls are still recovered, because _extract_calls descends into that debris and attributes to the nearest scope that did survive (ADR-0031) \u2014 which is why calls sits at 0.965 while named_funcs sits at 0.72. Measured on the full 72-file checkout the same walker scores named_funcs 0.653 / calls 0.971; this fixture reads 0.07 higher on named_funcs only because fmt's four giant headers (base.h, format.h, chrono.h, format-inl.h \u2014 418KB, scoring 0.50-0.70) dominate the repo by weight and cannot be vendored within the size budget. The 3.5% call shortfall is 258 C++ named casts (static_cast/reinterpret_cast/const_cast/dynamic_cast), which the grammar shapes exactly like calls but which are keywords, not callables \u2014 an edge to one could never resolve; the rest is calls with no static callee name at all (fp[i](), (*fp)(), chained f()()). NOTE for whoever reads this next: the single largest cause of the low number is NOT macros. .h is registered to the C grammar (_C_EXTENSIONS in parsing/languages/cpp.py) but fmt's headers are C++, so 23 of 25 fail to parse; under the C++ grammar the same headers yield 2968 function_definition nodes instead of 1454. Re-routing .h lifts the repo to named_funcs 0.710 with 3531 Callables instead of 2229 and drops module-scope calls from 15.5% to 2.2%. That was left alone deliberately \u2014 it changes how every existing C project's headers are labelled and there was no C corpus here to prove it is not a regression. TEMPORARY CEILING -- 70 uids collide, 60 of them a single shape: gtest's `TEST(Suite, Name) { ... }` parses as a function definition whose declarator name is `TEST`, so every case in a file collapses into one node claiming to be 47 different tests. Naming them from the macro arguments (`FormatTest.Escape`) is both correct and uid-stable. The remaining 10 are genuine C++ overloads (`file::dup2`, `convert_rwcount`, two constructors) which need a signature in the uid to separate -- cross-cutting, filed as follow-up.",
+  "max_duplicate_uids": 70
+}

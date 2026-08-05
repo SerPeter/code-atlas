@@ -1073,3 +1073,260 @@ class TestCppNestedScopeOutOfLine:
         assert len(ctor) == 1
         assert ctor[0].kind == CallableKind.CONSTRUCTOR
         assert ctor[0].qualified_name == f"{PROJECT}:src.nested.Outer.Inner.Inner"
+
+
+# ---------------------------------------------------------------------------
+# 32. Preprocessor-conditional regions
+# ---------------------------------------------------------------------------
+
+
+class TestPreprocessorConditionals:
+    """tree-sitter has no preprocessor, so ``#ifdef`` does not vanish — it nests.
+
+    Everything between the directive and its ``#endif`` becomes a child of a
+    ``preproc_ifdef``/``preproc_if`` node instead of sitting at file scope. A
+    walker that only looks at its immediate children therefore misses the
+    entire body of any guarded region, which in a header wrapped in an include
+    guard is the whole file.
+    """
+
+    def test_ifdef_guarded_function_is_an_entity(self):
+        parsed = _parse("#ifdef HAVE_POSIX\nvoid reap(void) { waitpid(); }\n#endif\n")
+        reap = _entity_by_name(parsed, "reap")
+        assert reap.label == NodeLabel.CALLABLE
+        assert reap.qualified_name == f"{PROJECT}:src.example.reap"
+
+    def test_include_guard_does_not_hide_the_whole_file(self):
+        parsed = _parse(
+            "#ifndef UTIL_H\n#define UTIL_H\nvoid helper(void) { inner(); }\n#endif\n",
+            path="include/util.h",
+        )
+        helper = _entity_by_name(parsed, "helper")
+        assert helper.label == NodeLabel.CALLABLE
+        calls = _rels_from(parsed, "include.util.helper", RelType.CALLS)
+        assert [r.to_name for r in calls] == ["inner"]
+
+    def test_both_arms_of_an_if_else_are_indexed(self):
+        """Without a preprocessor there is no way to know which arm the build picks."""
+        parsed = _parse("#if FMT_USE_INT128\nvoid alpha(void) {}\n#else\nvoid beta(void) {}\n#endif\n")
+        names = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+        assert names == {"alpha", "beta"}
+
+    def test_elif_arm_is_indexed(self):
+        parsed = _parse("#if A\nvoid alpha(void) {}\n#elif B\nvoid gamma(void) {}\n#endif\n")
+        assert _entity_by_name(parsed, "gamma").label == NodeLabel.CALLABLE
+
+    def test_ifdef_inside_a_class_body_keeps_class_scope(self):
+        parsed = _parse(
+            "class Widget {\n public:\n#ifdef _WIN32\n  void win_only() { native(); }\n#endif\n};\n",
+            path="src/widget.cpp",
+        )
+        method = _entity_by_name(parsed, "win_only")
+        assert method.kind == CallableKind.METHOD
+        assert method.qualified_name == f"{PROJECT}:src.widget.Widget.win_only"
+        assert method.visibility == Visibility.PUBLIC
+
+
+# ---------------------------------------------------------------------------
+# 33. extern "C" linkage blocks
+# ---------------------------------------------------------------------------
+
+
+class TestLinkageSpecification:
+    def test_extern_c_block_function_is_an_entity(self):
+        parsed = _parse(
+            'extern "C" {\nint c_api(int x) { return helper(x); }\n}\n',
+            path="src/api.cpp",
+        )
+        fn = _entity_by_name(parsed, "c_api")
+        assert fn.label == NodeLabel.CALLABLE
+        assert fn.qualified_name == f"{PROJECT}:src.api.c_api"
+        assert [r.to_name for r in _rels_from(parsed, "src.api.c_api", RelType.CALLS)] == ["helper"]
+
+    def test_extern_c_single_declaration_still_works(self):
+        parsed = _parse('extern "C" void bare(void) { go(); }\n', path="src/api.cpp")
+        assert _entity_by_name(parsed, "bare").label == NodeLabel.CALLABLE
+
+
+# ---------------------------------------------------------------------------
+# 34. friend declarations
+# ---------------------------------------------------------------------------
+
+
+class TestFriendDeclaration:
+    def test_friend_function_defined_in_class_belongs_to_the_enclosing_scope(self):
+        """A friend is found by ADL — ``Point::distance`` does not name it."""
+        parsed = _parse(
+            "struct Point {\n  friend auto distance(Point p) -> double { return compute(p); }\n};\n",
+            path="src/point.cpp",
+        )
+        fn = _entity_by_name(parsed, "distance")
+        assert fn.label == NodeLabel.CALLABLE
+        assert fn.qualified_name == f"{PROJECT}:src.point.distance"
+        assert "Point" not in fn.qualified_name
+        assert [r.to_name for r in _rels_from(parsed, "src.point.distance", RelType.CALLS)] == ["compute"]
+
+
+# ---------------------------------------------------------------------------
+# 35. Conversion operators
+# ---------------------------------------------------------------------------
+
+
+class TestConversionOperators:
+    """``operator_cast`` names itself with a type, and its ``declarator`` field
+    points at the (necessarily nameless) parameter list — so the generic
+    declarator descent walks straight past the name and returns None."""
+
+    def test_conversion_operator_is_a_named_method(self):
+        parsed = _parse(
+            "class Handle {\n public:\n  explicit operator bool() const { return valid(); }\n};\n",
+            path="src/handle.cpp",
+        )
+        op = _entity_by_name(parsed, "operator bool")
+        assert op.label == NodeLabel.CALLABLE
+        assert op.kind == CallableKind.METHOD
+        assert op.qualified_name == f"{PROJECT}:src.handle.Handle.operator bool"
+
+    def test_conversion_operator_to_a_qualified_template_type(self):
+        parsed = _parse(
+            "class View {\n public:\n  operator std::basic_string_view<char>() const { return {}; }\n};\n",
+            path="src/view.cpp",
+        )
+        assert _entity_by_name(parsed, "operator std::basic_string_view<char>").label == NodeLabel.CALLABLE
+
+    def test_out_of_line_conversion_operator_name_excludes_the_parameter_list(self):
+        parsed = _parse("Handle::operator bool() const { return true; }\n", path="src/handle.cpp")
+        op = _entity_by_name(parsed, "operator bool")
+        assert op.qualified_name == f"{PROJECT}:src.handle.Handle.operator bool"
+        assert "(" not in op.name
+
+
+# ---------------------------------------------------------------------------
+# 36. Types nested inside a class body
+# ---------------------------------------------------------------------------
+
+
+class TestNestedTypeInClassBody:
+    """At file scope a type definition is wrapped in a ``declaration``; inside a
+    class body it is wrapped in a ``field_declaration`` instead, which needs the
+    same unwrapping or the nested type and every method on it disappears."""
+
+    def test_nested_struct_and_its_methods_are_captured(self):
+        parsed = _parse(
+            "class Outer {\n  struct Inner {\n    void go() { work(); }\n  };\n};\n",
+            path="src/outer.cpp",
+        )
+        inner = _entity_by_name(parsed, "Inner")
+        assert inner.label == NodeLabel.TYPE_DEF
+        assert inner.kind == TypeDefKind.STRUCT
+        assert inner.qualified_name == f"{PROJECT}:src.outer.Outer.Inner"
+
+        go = _entity_by_name(parsed, "go")
+        assert go.qualified_name == f"{PROJECT}:src.outer.Outer.Inner.go"
+        assert [r.to_name for r in _rels_from(parsed, "src.outer.Outer.Inner.go", RelType.CALLS)] == ["work"]
+
+    def test_nested_struct_is_not_also_emitted_as_a_field(self):
+        parsed = _parse("class Outer {\n  struct Inner {\n    int x;\n  };\n};\n", path="src/outer.cpp")
+        assert [e.label for e in parsed.entities if e.name == "Inner"] == [NodeLabel.TYPE_DEF]
+
+
+# ---------------------------------------------------------------------------
+# 37. Call attribution to the nearest enclosing named scope (ADR-0031)
+# ---------------------------------------------------------------------------
+
+
+class TestCallAttribution:
+    def test_module_scope_call_attributes_to_the_module(self):
+        parsed = _parse("int g = compute(1);\n")
+        assert [r.to_name for r in _rels_from(parsed, "src.example", RelType.CALLS)] == ["compute"]
+
+    def test_call_inside_a_lambda_attributes_to_the_enclosing_function(self):
+        parsed = _parse("void run() {\n  auto f = [] { inner(); };\n}\n", path="src/run.cpp")
+        assert [r.to_name for r in _rels_from(parsed, "src.run.run", RelType.CALLS)] == ["inner"]
+
+    def test_call_inside_a_file_scope_lambda_attributes_to_the_module(self):
+        parsed = _parse("auto handler = [] { setup(); };\n", path="src/run.cpp")
+        assert [r.to_name for r in _rels_from(parsed, "src.run", RelType.CALLS)] == ["setup"]
+
+    def test_call_inside_a_local_class_method_attributes_to_the_enclosing_function(self):
+        """A local class gets no entity, so ADR-0031 sends its calls up to ``outer``."""
+        parsed = _parse(
+            "void outer() {\n  struct Local {\n    void go() { deep(); }\n  };\n}\n",
+            path="src/local.cpp",
+        )
+        assert [r.to_name for r in _rels_from(parsed, "src.local.outer", RelType.CALLS)] == ["deep"]
+
+    def test_field_initializer_call_reaches_the_graph(self):
+        parsed = _parse("struct S {\n  int n = build();\n};\n", path="src/s.cpp")
+        assert [r.to_name for r in _rels_from(parsed, "src.s", RelType.CALLS)] == ["build"]
+
+    def test_calls_stranded_by_a_macro_misparse_still_reach_the_module(self):
+        """The shape ADR-0031's module fallback exists for.
+
+        ``FMT_BEGIN_NAMESPACE`` is not expandable, so tree-sitter mis-parses the
+        specialisation that follows and leaves its body as a bare block at file
+        scope. The enclosing scope is unrecoverable — no entity can honestly be
+        emitted for ``format`` — but the call inside it is still real.
+        """
+        parsed = _parse(
+            "FMT_BEGIN_NAMESPACE\n"
+            "template <> struct formatter<my_type> {\n"
+            "  auto format() -> int { return copy(); }\n"
+            "};\n"
+            "FMT_END_NAMESPACE\n",
+            path="src/dbg.cpp",
+        )
+        assert [r.to_name for r in _rels_from(parsed, "src.dbg", RelType.CALLS)] == ["copy"]
+
+    def test_a_call_is_emitted_exactly_once(self):
+        """The structural walk and the call walk must not both claim a subtree."""
+        parsed = _parse("void run() {\n  helper();\n}\n", path="src/run.cpp")
+        assert [r.to_name for r in parsed.relationships if r.rel_type == RelType.CALLS] == ["helper"]
+
+    def test_inline_struct_definition_calls_are_not_double_counted(self):
+        parsed = _parse("struct S {\n  void m() { work(); }\n} instance;\n", path="src/s.cpp")
+        calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+        assert [(r.from_qualified_name, r.to_name) for r in calls] == [(f"{PROJECT}:src.s.S.m", "work")]
+
+
+# ---------------------------------------------------------------------------
+# 38. Callee shapes
+# ---------------------------------------------------------------------------
+
+
+class TestCalleeShapes:
+    def test_template_function_call_uses_the_template_name(self):
+        parsed = _parse("void caller() {\n  auto v = max_value<int>();\n}\n", path="src/c.cpp")
+        assert [r.to_name for r in _rels_from(parsed, "src.c.caller", RelType.CALLS)] == ["max_value"]
+
+    def test_named_casts_are_not_calls(self):
+        """``static_cast<T>(x)`` is shaped exactly like a call but is a keyword.
+
+        Negative assertion on purpose: this suppresses output that the
+        template_function handling above would otherwise produce, so a positive
+        assertion elsewhere could never show the suppression had stopped working.
+        """
+        parsed = _parse(
+            "void caller(void* p) {\n"
+            "  auto a = static_cast<int>(1);\n"
+            "  auto b = reinterpret_cast<char*>(p);\n"
+            "  auto c = const_cast<int*>(p);\n"
+            "  auto d = dynamic_cast<int*>(p);\n"
+            "}\n",
+            path="src/c.cpp",
+        )
+        assert [r.to_name for r in _rels_from(parsed, "src.c.caller", RelType.CALLS)] == []
+
+    def test_parenthesized_callee_is_unwrapped(self):
+        """``(T::min)()`` — the idiom for dodging the Windows min/max macros.
+
+        Only the no-argument spelling reaches here: with arguments,
+        ``(std::min)(a, b)`` is genuinely ambiguous with a C-style cast, and the
+        grammar resolves it to ``cast_expression`` rather than to a call.
+        """
+        parsed = _parse("int caller() {\n  return (T::min)();\n}\n", path="src/c.cpp")
+        assert [r.to_name for r in _rels_from(parsed, "src.c.caller", RelType.CALLS)] == ["T::min"]
+
+    def test_callee_with_no_static_name_is_not_a_call(self):
+        parsed = _parse("void caller() {\n  handlers[i]();\n}\n", path="src/c.cpp")
+        assert [r.to_name for r in _rels_from(parsed, "src.c.caller", RelType.CALLS)] == []

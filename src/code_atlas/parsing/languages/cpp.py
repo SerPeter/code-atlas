@@ -60,8 +60,41 @@ _CPP_EXTENSIONS = frozenset({".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"})
 # Node types that represent type definitions with a body
 _TYPE_DEF_NODES = frozenset({"struct_specifier", "enum_specifier", "union_specifier", "class_specifier"})
 
+# `static_cast<T>(x)` parses as a call_expression whose function is a
+# template_function, but a named cast is a keyword, not a callable — an edge to
+# one could never resolve to anything.
+_NAMED_CASTS = frozenset({"static_cast", "reinterpret_cast", "const_cast", "dynamic_cast"})
+
 # Tags derived from storage class / qualifier specifiers
 _TAG_KEYWORDS = frozenset({"virtual", "override", "static", "const", "inline", "extern"})
+
+# Nodes whose children belong to the enclosing scope rather than to a scope of
+# their own — recurse through them without changing namespace, class or
+# visibility.
+#
+# The preprocessor conditionals dominate.  tree-sitter has no preprocessor, so
+# an ``#ifdef``-guarded declaration is not lifted to file scope: it stays nested
+# under a ``preproc_ifdef``/``preproc_if`` node, along with every declaration
+# after it up to the ``#endif``.  In a header that opens with an include guard
+# that is the *entire file*.  ``#ifndef`` also produces ``preproc_ifdef``.
+#
+# Both arms of an ``#if``/``#else`` are walked.  Without a preprocessor there is
+# no way to know which one the build selects, and indexing the arm that happens
+# to be listed first would be a guess; C++ overloading already means a qualified
+# name is not unique within a file, so the arms collide no worse than overloads
+# already do.
+_TRANSPARENT_CONTAINERS = frozenset(
+    {
+        "preproc_ifdef",
+        "preproc_ifndef",
+        "preproc_if",
+        "preproc_else",
+        "preproc_elif",
+        "linkage_specification",  # extern "C" { ... }
+        "declaration_list",  # body of the above
+        "template_declaration",  # the declared class/function is a child
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +253,22 @@ _LEAF_DECLARATOR_TYPES = frozenset(
 )
 
 
+def _conversion_operator_name(declarator: Node) -> str | None:
+    """Name a conversion operator — ``operator bool``, ``operator T``.
+
+    ``operator_cast`` names itself with its target *type*, not with an
+    identifier, and its ``declarator`` field points at an
+    ``abstract_function_declarator`` (the parameter list, which by definition
+    carries no name).  The generic descent therefore walks straight past the
+    name and returns None, dropping every conversion operator in the file.
+    """
+    type_node = declarator.child_by_field_name("type")
+    if type_node is None:
+        return None
+    text = node_text(type_node).strip()
+    return f"operator {text}" if text else None
+
+
 def _get_declarator_name(declarator: Node) -> str | None:
     """Recursively extract the identifier name from a declarator tree.
 
@@ -227,6 +276,9 @@ def _get_declarator_name(declarator: Node) -> str | None:
     """
     if declarator.type in _LEAF_DECLARATOR_TYPES:
         return node_text(declarator)
+
+    if declarator.type == "operator_cast":
+        return _conversion_operator_name(declarator)
 
     # function_declarator, pointer_declarator, etc.: has a `declarator` child
     inner = declarator.child_by_field_name("declarator")
@@ -294,11 +346,17 @@ def _get_qualified_declarator_name(declarator: Node) -> tuple[list[str], str | N
         if name_node is not None and name_node.type == "qualified_identifier":
             inner_scope_parts, name = _get_qualified_declarator_name(name_node)
             return (scope_parts + inner_scope_parts, name)
+        if name_node is not None and name_node.type == "operator_cast":
+            # `Widget::operator bool() const` — node_text would take the whole
+            # thing, parameter list and trailing qualifiers included.
+            return (scope_parts, _conversion_operator_name(name_node))
         name = node_text(name_node) if name_node is not None else None
         return (scope_parts, name)
 
-    # function_declarator wrapping a qualified_identifier
-    inner = declarator.child_by_field_name("declarator")
+    # function_declarator wrapping a qualified_identifier.  operator_cast is
+    # excluded: its `declarator` field is the nameless parameter list, so
+    # following it loses the name — _get_declarator_name reads it directly.
+    inner = None if declarator.type == "operator_cast" else declarator.child_by_field_name("declarator")
     if inner is not None:
         if inner.type == "qualified_identifier":
             return _get_qualified_declarator_name(inner)
@@ -411,11 +469,60 @@ def _walk_translation_unit(  # noqa: PLR0912
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
 ) -> None:
-    """Recursively walk the AST and extract entities/relationships."""
+    """Recursively walk the AST and extract entities/relationships.
+
+    This is the *structural* traversal: it visits declaration-level constructs
+    and never enters a function body — ``_process_function`` hands bodies to
+    ``_extract_calls`` instead.  That split is what lets ``_extract_calls`` be
+    fully transparent without double-counting anything.
+    """
+    # Calls that are not inside any function belong to the module (ADR-0031).
+    # A class or namespace is not a callable, so the fallback never narrows
+    # below the module as the walker descends.
+    module_scope_qn = f"{project_name}:{module_qn}"
+
     for child in node.children:
         # ----- #include -----
         if child.type == "preproc_include":
             _process_include(child, project_name, module_qn, namespace_parts, class_stack, relationships)
+            continue
+
+        # ----- scope-transparent wrappers (#ifdef, extern "C", template) -----
+        if child.type in _TRANSPARENT_CONTAINERS:
+            _walk_translation_unit(
+                child,
+                path=path,
+                source=source,
+                project_name=project_name,
+                module_qn=module_qn,
+                is_cpp=is_cpp,
+                namespace_parts=namespace_parts,
+                class_stack=class_stack,
+                current_visibility=current_visibility,
+                entities=entities,
+                relationships=relationships,
+            )
+            continue
+
+        # ----- friend declaration (C++ only) -----
+        if is_cpp and child.type == "friend_declaration":
+            # A friend function defined inside a class belongs to the enclosing
+            # namespace, not to the class — it is found by ADL, and
+            # `Class::friend_fn` does not name it.  So drop one level of class
+            # stack before recursing.
+            _walk_translation_unit(
+                child,
+                path=path,
+                source=source,
+                project_name=project_name,
+                module_qn=module_qn,
+                is_cpp=is_cpp,
+                namespace_parts=namespace_parts,
+                class_stack=class_stack[:-1],
+                current_visibility=Visibility.PUBLIC,
+                entities=entities,
+                relationships=relationships,
+            )
             continue
 
         # ----- namespace (C++ only) -----
@@ -429,25 +536,6 @@ def _walk_translation_unit(  # noqa: PLR0912
                 is_cpp=is_cpp,
                 namespace_parts=namespace_parts,
                 class_stack=class_stack,
-                entities=entities,
-                relationships=relationships,
-            )
-            continue
-
-        # ----- template wrapper (C++ only) -----
-        if is_cpp and child.type == "template_declaration":
-            # The declared class/function is a child of the wrapper — recurse so
-            # the existing dispatch branches process it.
-            _walk_translation_unit(
-                child,
-                path=path,
-                source=source,
-                project_name=project_name,
-                module_qn=module_qn,
-                is_cpp=is_cpp,
-                namespace_parts=namespace_parts,
-                class_stack=class_stack,
-                current_visibility=current_visibility,
                 entities=entities,
                 relationships=relationships,
             )
@@ -516,7 +604,7 @@ def _walk_translation_unit(  # noqa: PLR0912
 
         # ----- declaration (global variables, forward declarations) -----
         if child.type == "declaration":
-            _process_declaration(
+            claimed_by_type_def = _process_declaration(
                 child,
                 path=path,
                 source=source,
@@ -529,15 +617,22 @@ def _walk_translation_unit(  # noqa: PLR0912
                 entities=entities,
                 relationships=relationships,
             )
+            if not claimed_by_type_def:
+                # `static auto x = make();` — the initializer runs, so the call
+                # is real.  Skipped when the declaration was really an inline
+                # type definition, because that subtree was walked structurally
+                # and its method bodies already extracted their own calls.
+                _extract_calls(child, module_scope_qn, relationships)
             continue
 
         # ----- field_declaration (struct/class fields) -----
         if child.type == "field_declaration":
-            _process_field_declaration(
+            claimed_by_type_def = _process_field_declaration(
                 child,
                 path=path,
                 source=source,
                 project_name=project_name,
+                is_cpp=is_cpp,
                 module_qn=module_qn,
                 namespace_parts=namespace_parts,
                 class_stack=class_stack,
@@ -545,7 +640,17 @@ def _walk_translation_unit(  # noqa: PLR0912
                 entities=entities,
                 relationships=relationships,
             )
+            if not claimed_by_type_def:
+                # Default member initializer: `std::string s = build();`
+                _extract_calls(child, module_scope_qn, relationships)
             continue
+
+        # ----- anything else -----
+        # Static initializers, expression statements at file scope, and the
+        # debris tree-sitter leaves where an unexpandable macro defeated it.
+        # None of these define an entity, but the calls inside them are real
+        # and belong to the module (ADR-0031).
+        _extract_calls(child, module_scope_qn, relationships)
 
 
 def _include_path_text(path_node: Node) -> str:
@@ -1000,11 +1105,15 @@ def _process_declaration(
     current_visibility: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
-) -> None:
+) -> bool:
     """Process a declaration node (global variables, forward declarations, etc.).
 
     Also handles function declarations embedded inside declarations and
     struct/class/enum specifiers within declarations.
+
+    Returns True when the declaration was really an inline type definition and
+    its subtree has been walked structurally — the caller must then not extract
+    calls from it again.
     """
     # Check if this declaration contains a type specifier with a body (inline struct/enum/union/class def)
     for child in node.children:
@@ -1022,28 +1131,28 @@ def _process_declaration(
                 entities=entities,
                 relationships=relationships,
             )
-            return
+            return True
 
     # Check if this is a function declaration (has a function_declarator but no body on this node)
     # We only care about actual variable declarations here
     for child in node.children:
         if child.type == "function_declarator":
             # This is a function forward declaration — skip (we only track definitions)
-            return
+            return False
 
     # Extract declarator name for variable declarations
     declarator = node.child_by_field_name("declarator")
     if declarator is None:
-        return
+        return False
 
     # Skip function declarations, including pointer/reference-returning prototypes
     # (`int* alloc(int);` wraps the function_declarator in a pointer_declarator)
     if declarator.type == "function_declarator" or _prototype_declarator(declarator) is not None:
-        return
+        return False
 
     name = _get_declarator_name(declarator)
     if not name:
-        return
+        return False
 
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
@@ -1078,6 +1187,7 @@ def _process_declaration(
             to_name=f"{project_name}:{qn}",
         )
     )
+    return False
 
 
 def _process_field_declaration(
@@ -1086,20 +1196,47 @@ def _process_field_declaration(
     path: str,
     source: bytes,
     project_name: str,
+    is_cpp: bool,
     module_qn: str,
     namespace_parts: list[str],
     class_stack: list[str],
     current_visibility: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
-) -> None:
-    """Process a field_declaration inside a struct/class body."""
+) -> bool:
+    """Process a field_declaration inside a struct/class body.
+
+    Returns True when the field_declaration was really a nested type definition
+    and its subtree has been walked structurally — the caller must then not
+    extract calls from it again.
+    """
+    # A type nested inside a class body arrives wrapped in a field_declaration
+    # rather than the `declaration` that wraps one at file scope, so it needs
+    # the same unwrapping — otherwise the nested type and all its methods
+    # vanish.
+    for child in node.children:
+        if child.type in _TYPE_DEF_NODES and child.child_by_field_name("body") is not None:
+            _process_type_def(
+                child,
+                path=path,
+                source=source,
+                project_name=project_name,
+                module_qn=module_qn,
+                is_cpp=is_cpp,
+                namespace_parts=namespace_parts,
+                class_stack=class_stack,
+                current_visibility=current_visibility,
+                entities=entities,
+                relationships=relationships,
+            )
+            return True
+
     declarator = node.child_by_field_name("declarator")
     if declarator is None:
-        return
+        return False
     name = _get_declarator_name(declarator)
     if not name:
-        return
+        return False
 
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
@@ -1147,6 +1284,61 @@ def _process_field_declaration(
             to_name=f"{project_name}:{qn}",
         )
     )
+    return False
+
+
+def _call_relationship(func: Node | None, from_qn: str) -> ParsedRelationship | None:
+    """Build the CALLS relationship for a call's ``function`` expression.
+
+    Returns None when the callee has no name that could ever resolve —
+    ``fp[i]()``, ``(*fp)()``, a chained ``f()()`` — or when it is a C++ named
+    cast, which the grammar shapes exactly like a call but which is a keyword,
+    not a callable.
+    """
+    if func is None:
+        return None
+
+    # `(T::min)()` — parenthesised to dodge a min/max macro. Common enough in
+    # Windows-targeting C++ to be worth unwrapping.
+    while func.type == "parenthesized_expression":
+        inner = func.named_children[0] if func.named_children else None
+        if inner is None:
+            return None
+        func = inner
+
+    if func.type == "template_function":
+        # `max_value<T>()` — the callee is the template's name; the angle
+        # brackets are type arguments, not part of it.
+        name_node = func.child_by_field_name("name")
+        if name_node is None or node_text(name_node) in _NAMED_CASTS:
+            return None
+        func = name_node
+
+    if func.type in ("identifier", "qualified_identifier"):
+        # qualified: ns::func() keeps the full path, which is what resolution matches on
+        call_name = node_text(func)
+        return (
+            ParsedRelationship(from_qualified_name=from_qn, rel_type=RelType.CALLS, to_name=call_name)
+            if call_name
+            else None
+        )
+
+    if func.type == "field_expression":
+        # obj.method() — extract method name
+        field = func.child_by_field_name("field")
+        call_name = node_text(field) if field is not None else None
+        return (
+            ParsedRelationship(
+                from_qualified_name=from_qn,
+                rel_type=RelType.CALLS,
+                to_name=call_name,
+                properties=call_receiver_props(func.child_by_field_name("argument")),
+            )
+            if call_name
+            else None
+        )
+
+    return None
 
 
 def _extract_calls(
@@ -1154,49 +1346,25 @@ def _extract_calls(
     from_qn: str,
     relationships: list[ParsedRelationship],
 ) -> None:
-    """Recursively extract call expressions from a function body."""
+    """Recursively extract every call under *node*, attributed to *from_qn*.
+
+    Descends into everything, including lambda bodies, local classes, and the
+    nested ``function_definition`` nodes tree-sitter produces where an
+    unexpandable macro defeated it.  A call is always attributed to the nearest
+    enclosing named scope (ADR-0031), and for anything reachable from here that
+    scope is *from_qn* — legal C++ cannot nest a function definition inside a
+    function body, so a nested one is either a GNU extension or parse debris,
+    and in both cases the calls belong to whoever wrote the enclosing code.
+
+    Callers must not also walk this subtree structurally; ``_walk_translation_unit``
+    guarantees that by never entering a function body itself.
+    """
     for child in node.children:
         if child.type == "call_expression":
-            func = child.child_by_field_name("function")
-            if func is not None:
-                if func.type == "identifier":
-                    call_name = node_text(func)
-                    if call_name:
-                        relationships.append(
-                            ParsedRelationship(
-                                from_qualified_name=from_qn,
-                                rel_type=RelType.CALLS,
-                                to_name=call_name,
-                            )
-                        )
-                elif func.type == "field_expression":
-                    # obj.method() — extract method name
-                    field = func.child_by_field_name("field")
-                    if field is not None:
-                        call_name = node_text(field)
-                        if call_name:
-                            relationships.append(
-                                ParsedRelationship(
-                                    from_qualified_name=from_qn,
-                                    rel_type=RelType.CALLS,
-                                    to_name=call_name,
-                                    properties=call_receiver_props(func.child_by_field_name("argument")),
-                                )
-                            )
-                elif func.type == "qualified_identifier":
-                    # ns::func() — extract full qualified name
-                    call_name = node_text(func)
-                    if call_name:
-                        relationships.append(
-                            ParsedRelationship(
-                                from_qualified_name=from_qn,
-                                rel_type=RelType.CALLS,
-                                to_name=call_name,
-                            )
-                        )
-        # Recurse but don't descend into nested function definitions
-        if child.type not in ("function_definition", "class_specifier", "struct_specifier"):
-            _extract_calls(child, from_qn, relationships)
+            rel = _call_relationship(child.child_by_field_name("function"), from_qn)
+            if rel is not None:
+                relationships.append(rel)
+        _extract_calls(child, from_qn, relationships)
 
 
 # ---------------------------------------------------------------------------
