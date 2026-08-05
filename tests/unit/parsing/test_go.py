@@ -1033,3 +1033,154 @@ func Plain() {}
     for entity in parsed.entities:
         assert entity.rationale is None
         assert entity.citations == []
+
+
+# ---------------------------------------------------------------------------
+# 24. Calls inside func literals (ADR-0031)
+# ---------------------------------------------------------------------------
+
+
+def test_calls_inside_func_literal_attribute_to_enclosing_function():
+    """A closure has no entity, so its calls belong to the function that defines it."""
+    parsed = _parse("""\
+package main
+
+func run() {
+	defer wrapUp()
+	register(func(x int) {
+		handle(x)
+	})
+}
+""")
+    calls = _rels_from(parsed, "src.example.run", RelType.CALLS)
+    assert {r.to_name for r in calls} == {"wrapUp", "register", "handle"}
+
+
+def test_calls_inside_nested_func_literal_walk_up_to_the_named_function():
+    """A literal inside a literal attributes to the nearest enclosing *named* scope.
+
+    Go has no nested named function form, so however many literals deep a call sits,
+    the answer is the same function declaration -- there is no intermediate owner to
+    stop at.
+    """
+    parsed = _parse("""\
+package main
+
+func outer() {
+	t.Run("case", func() {
+		group.Go(func() {
+			deepest()
+		})
+	})
+}
+""")
+    calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+    assert {r.to_name for r in calls} == {"Run", "Go", "deepest"}
+    assert {r.from_qualified_name for r in calls} == {f"{PROJECT}:src.example.outer"}
+
+
+def test_calls_inside_func_literal_in_method_attribute_to_the_method():
+    parsed = _parse("""\
+package main
+
+func (s *Server) Start() {
+	s.pool.Submit(func() {
+		s.serve()
+	})
+}
+""")
+    calls = _rels_from(parsed, "src.example.Server.Start", RelType.CALLS)
+    assert {r.to_name for r in calls} == {"Submit", "serve"}
+
+
+def test_selector_call_inside_func_literal_keeps_receiver_evidence():
+    """Descending into a literal must not lose the receiver a resolver needs (ADR-0022)."""
+    parsed = _parse("""\
+package main
+
+func run() {
+	register(func() {
+		logger.Warn("boom")
+	})
+}
+""")
+    warns = [r for r in _rels_from(parsed, "src.example.run", RelType.CALLS) if r.to_name == "Warn"]
+    assert len(warns) == 1
+    assert warns[0].properties.get("receiver") == "logger"
+
+
+def test_immediately_invoked_literal_emits_only_the_calls_inside_it():
+    """The IIFE's own call node names no callee, so it must contribute no edge."""
+    parsed = _parse("""\
+package main
+
+func run() {
+	func() {
+		inner()
+	}()
+}
+""")
+    calls = _rels_from(parsed, "src.example.run", RelType.CALLS)
+    assert {r.to_name for r in calls} == {"inner"}
+
+
+def test_func_literal_produces_no_callable_entity():
+    """The other half of ADR-0031: reaching into a closure must not create one.
+
+    Negative by construction -- an entity per literal would still satisfy every
+    call-attribution assertion above while inflating node counts and handing
+    ``find_dead_code`` a callback nobody can look up by name.
+    """
+    parsed = _parse("""\
+package main
+
+func run() {
+	register(func() {
+		handle()
+	})
+}
+""")
+    callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    assert [e.name for e in callables] == ["run"]
+
+
+def test_module_level_var_initializer_calls_attribute_to_the_module():
+    """A package-level initializer runs with no enclosing callable, so the module owns it."""
+    parsed = _parse("""\
+package main
+
+import "regexp"
+
+var namePattern = regexp.MustCompile(`[A-Z]`)
+""")
+    calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+    assert [(r.from_qualified_name, r.to_name) for r in calls] == [(f"{PROJECT}:src.example", "MustCompile")]
+
+
+def test_module_level_func_literal_calls_attribute_to_the_module():
+    parsed = _parse("""\
+package main
+
+var startup = func() {
+	bootstrap()
+}
+""")
+    calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+    assert [(r.from_qualified_name, r.to_name) for r in calls] == [(f"{PROJECT}:src.example", "bootstrap")]
+
+
+def test_local_var_initializer_call_is_not_counted_twice():
+    """``_extract_calls`` already walks a function body, so the module pass must not overlap."""
+    parsed = _parse("""\
+package main
+
+func run() {
+	value := compute()
+	var other = compute()
+	_ = value
+	_ = other
+}
+""")
+    calls = [r for r in parsed.relationships if r.rel_type == RelType.CALLS]
+    assert [r.to_name for r in calls] == ["compute", "compute"]
+    assert {r.from_qualified_name for r in calls} == {f"{PROJECT}:src.example.run"}

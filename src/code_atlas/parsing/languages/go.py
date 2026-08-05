@@ -210,7 +210,20 @@ def _extract_calls(
     from_qn: str,
     relationships: list[ParsedRelationship],
 ) -> None:
-    """Recursively extract call expressions from a function body."""
+    """Recursively extract call expressions, attributing every one to *from_qn*.
+
+    ``func_literal`` bodies are walked like any other block. A literal gets no entity of
+    its own (ADR-0031), so stopping at one did not attribute its calls to something
+    coarse -- it attributed them to nobody, and 445 of cobra's 4,430 call sites (10.0%)
+    simply vanished. Since Go has no nested *named* function form, the nearest enclosing
+    named scope of anything reachable from here is always *from_qn*, however many
+    literals deep it sits.
+
+    The callee's own name is what gets recorded, so an immediately-invoked literal
+    (``func() { ... }()``) and a call on a returned function (``c.UsageFunc()(c)``)
+    contribute nothing at their outer node -- there is no name to record -- while the
+    calls inside them are ordinary nodes and are picked up here.
+    """
     for child in node.children:
         if child.type == "call_expression":
             func = child.child_by_field_name("function")
@@ -237,9 +250,7 @@ def _extract_calls(
                                 properties=call_receiver_props(func.child_by_field_name("operand")),
                             )
                         )
-        # Recurse but don't descend into nested function literals
-        if child.type != "func_literal":
-            _extract_calls(child, from_qn, relationships)
+        _extract_calls(child, from_qn, relationships)
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +947,17 @@ def _process_const_var_spec(
     the ``name`` field, but tree-sitter-go also tags the separating commas with that same
     field -- so filter direct children by node type (``identifier``) rather than trusting
     the field alone, mirroring the ``field_identifier`` filter already used for struct fields.
+
+    A package-level initializer runs before any function does, so its calls have no
+    enclosing named callable and belong to the module (ADR-0031) -- ``var re =
+    regexp.MustCompile(...)`` and ``var _ = register(thing)`` are both this shape.
+    Function-local ``var x = f()`` sits inside a block ``_extract_calls`` already walks,
+    and only top-level declarations reach here, so this cannot double-count.
     """
+    value = spec.child_by_field_name("value")
+    if value is not None:
+        _extract_calls(value, f"{project_name}:{module_qn}", relationships)
+
     name_nodes = [child for child in spec.children if child.type == "identifier"]
     if not name_nodes:
         return
