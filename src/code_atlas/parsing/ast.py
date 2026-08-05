@@ -115,11 +115,34 @@ class LanguageConfig:
     ``extract_rationale``. Languages opt in at registration rather than the
     framework guessing, because node-type naming differs per grammar.
     """
+    ambiguous_extensions: frozenset[str] = frozenset()
+    """Extensions this language is registered for but does not exclusively own.
+
+    ``.h`` is the only one today: it is the standard C header extension and
+    also what most C++ projects call their headers, and nothing in the name
+    says which. Files with such a suffix have their language decided by
+    ``resolve_dialect`` rather than by the suffix alone.
+    """
+    resolve_dialect: Callable[[bytes], str] | None = None
+    """Given a file's bytes, return the registered language name to parse it as.
+
+    Consulted only for suffixes listed in ``ambiguous_extensions``, so a
+    language that leaves both fields empty pays nothing. Returning this
+    language's own name keeps the registered default — which is what an
+    undecidable file must get, because the registered default is the status quo
+    and the status quo is the safe answer.
+    """
 
 
 _LANGUAGES: dict[str, LanguageConfig] = {}
 _EXTENSION_MAP: dict[str, str] = {}
 _FILENAME_MAP: dict[str, str] = {}
+_AMBIGUOUS_EXTENSIONS: set[str] = set()
+"""Suffixes whose language is decided by content — see ``resolve_dialect``.
+
+Held here rather than read back off the matched config so that lookup for every
+other extension is untouched, and costs one set membership test.
+"""
 
 
 def register_language(config: LanguageConfig) -> None:
@@ -129,15 +152,23 @@ def register_language(config: LanguageConfig) -> None:
         _EXTENSION_MAP[ext] = config.name
     for filename in config.filenames:
         _FILENAME_MAP[filename] = config.name
+    if config.resolve_dialect is not None:
+        _AMBIGUOUS_EXTENSIONS.update(config.ambiguous_extensions)
 
 
-def get_language_for_file(path: str) -> LanguageConfig | None:
+def get_language_for_file(path: str, source: bytes | None = None) -> LanguageConfig | None:
     """Look up language config by exact basename, then by file extension.
 
     Basename wins so that extensionless formats (``Dockerfile``,
     ``Containerfile``) are reachable at all. It is a *whole-basename* match, so
     ``dockerfile.txt`` does not route to the container language — that file's
     basename is ``dockerfile.txt`` and its suffix is ``.txt``.
+
+    For a suffix two languages share (``.h``), the winner is decided by the
+    file's content — see ``LanguageConfig.resolve_dialect``. Pass *source* when
+    you have it; callers that do not are read from disk, because the answer must
+    not depend on who is asking. A caller that only needs "is this file
+    indexable at all" can ignore this entirely: both candidates are non-None.
 
     Triggers plugin discovery on first call so that built-in and
     external languages are available.
@@ -148,11 +179,35 @@ def get_language_for_file(path: str) -> LanguageConfig | None:
 
     posix_path = PurePosixPath(path)
     lang_name = _FILENAME_MAP.get(posix_path.name.lower())
+    matched_by_name = lang_name is not None
+    suffix = posix_path.suffix.lower()
     if lang_name is None:
-        lang_name = _EXTENSION_MAP.get(posix_path.suffix.lower())
+        lang_name = _EXTENSION_MAP.get(suffix)
     if lang_name is None:
         return None
-    return _LANGUAGES.get(lang_name)
+    config = _LANGUAGES.get(lang_name)
+    if matched_by_name or suffix not in _AMBIGUOUS_EXTENSIONS or config is None:
+        return config
+
+    if source is None:
+        source = _read_for_dialect(path)
+        if source is None:
+            # Undecidable — keep the registered default rather than guess.
+            return config
+    return _LANGUAGES.get(config.resolve_dialect(source), config) if config.resolve_dialect else config
+
+
+def _read_for_dialect(path: str) -> bytes | None:
+    """Read a file solely to disambiguate its language. None if unreadable.
+
+    Only reached for a shared suffix whose caller passed no source. ``parse_file``
+    always passes one, so this costs nothing on the indexing path.
+    """
+    try:
+        with open(path, "rb") as fh:  # noqa: PTH123
+            return fh.read()
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +818,7 @@ def parse_file(
     ``rationale`` configures intent-comment extraction; ``None`` uses the
     shipped defaults (NOTE/WHY/HACK plus ADR/RFC citations, no TODO/FIXME).
     """
-    lang_config = get_language_for_file(path)
+    lang_config = get_language_for_file(path, source)
     if lang_config is None:
         return None
 

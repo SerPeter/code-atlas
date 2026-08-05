@@ -1452,3 +1452,116 @@ class TestMacroDiscriminatorDoesNotEatRealCode:
         """A return type means it is a function, whatever it is called."""
         parsed = _parse("int TEST(int a, int b) {\n  return add(a, b);\n}\n", path="src/t.cpp")
         assert _entity_by_name(parsed, "TEST").label == NodeLabel.CALLABLE
+
+
+# ---------------------------------------------------------------------------
+# 40. .h is shared between C and C++ — routed by content
+# ---------------------------------------------------------------------------
+
+_C_HEADER = b"""\
+#ifndef UTIL_H
+#define UTIL_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+struct point { int x; int y; };
+int add(int a, int b);
+#ifdef __cplusplus
+}
+#endif
+#endif
+"""
+
+_CPP_HEADER = b"""\
+#ifndef WIDGET_H
+#define WIDGET_H
+namespace app {
+class Widget {
+ public:
+  void draw() const { paint(); }
+};
+}  // namespace app
+#endif
+"""
+
+
+def _dialect(path: str, source: bytes | None = None) -> str:
+    """Which grammar does the router pick for this file?"""
+    cfg = get_language_for_file(path, source) if source is not None else get_language_for_file(path)
+    assert cfg is not None, f"no language registered for {path}"
+    return cfg.name
+
+
+class TestHeaderDialectRouting:
+    """``.h`` is the standard C header extension *and* what most C++ projects
+    call their headers. Routing it to C unconditionally left 23 of fmt's 25
+    headers unparseable; routing it to C++ unconditionally would put the risk on
+    C users, who are the status quo. So the content decides, and anything
+    undecidable stays C.
+    """
+
+    def test_cpp_header_routes_to_the_cpp_grammar(self):
+        assert _dialect("include/widget.h", _CPP_HEADER) == "cpp"
+
+    def test_c_header_stays_on_the_c_grammar(self):
+        """`extern "C"` is a C-header idiom, not a C++ marker — 216 of CPython's
+        283 headers use it."""
+        assert _dialect("include/util.h", _C_HEADER) == "c"
+
+    def test_cpp_header_reports_itself_as_cpp(self):
+        """The grammar and the recorded language have to agree, or the walker's
+        C++ branches stay off for a file parsed as C++."""
+        parsed = _parse(_CPP_HEADER.decode(), path="include/widget.h")
+        assert parsed.language == "cpp"
+
+    def test_c_header_still_reports_itself_as_c(self):
+        parsed = _parse(_C_HEADER.decode(), path="include/util.h")
+        assert parsed.language == "c"
+
+    def test_cpp_header_yields_its_namespaced_members(self):
+        """The point of the routing: under the C grammar none of this parses."""
+        parsed = _parse(_CPP_HEADER.decode(), path="include/widget.h")
+        draw = _entity_by_name(parsed, "draw")
+        assert draw.qualified_name == f"{PROJECT}:include.widget.app.Widget.draw"
+        assert [r.to_name for r in _rels_from(parsed, "app.Widget.draw", RelType.CALLS)] == ["paint"]
+
+    def test_c_header_extraction_is_unchanged(self):
+        parsed = _parse(_C_HEADER.decode(), path="include/util.h")
+        assert _entity_by_name(parsed, "point").label == NodeLabel.TYPE_DEF
+
+    # -- ambiguity resolves to C ------------------------------------------
+
+    def test_a_comment_mentioning_class_does_not_flip_a_c_header(self):
+        source = b"// Former class object interface\n/* a C++ class would go here */\nint f(void);\n"
+        assert _dialect("include/note.h", source) == "c"
+
+    def test_a_string_literal_mentioning_namespace_does_not_flip_a_c_header(self):
+        source = b'static const char *msg = "namespace foo::bar";\nint f(void);\n'
+        assert _dialect("include/msg.h", source) == "c"
+
+    def test_cpp_words_used_as_c_identifiers_do_not_flip_a_header(self):
+        """C reserves none of these, and CPython really does ship
+        `namespaceSeparator` and `class_id` style fields."""
+        source = b"struct s {\n  char *namespaceSeparator;\n  int class_id;\n  int template_count;\n};\n"
+        assert _dialect("include/ident.h", source) == "c"
+
+    def test_an_empty_header_stays_on_c(self):
+        assert _dialect("include/empty.h", b"") == "c"
+
+    # -- the mechanism ----------------------------------------------------
+
+    def test_source_is_read_from_disk_when_the_caller_supplies_none(self, tmp_path):
+        """The answer must not depend on who is asking — a caller that passes no
+        source still has to agree with `parse_file`, or a measurement built on
+        one and entities built on the other silently disagree."""
+        header = tmp_path / "widget.h"
+        header.write_bytes(_CPP_HEADER)
+        assert _dialect(str(header)) == "cpp"
+
+    def test_an_unreadable_path_falls_back_to_c(self, tmp_path):
+        assert _dialect(str(tmp_path / "missing.h")) == "c"
+
+    def test_unambiguous_extensions_are_not_sniffed(self):
+        """`.hpp`/`.cpp`/`.c` say what they are; content must not override."""
+        assert _dialect("include/w.hpp", _C_HEADER) == "cpp"
+        assert _dialect("src/m.c", _CPP_HEADER) == "c"

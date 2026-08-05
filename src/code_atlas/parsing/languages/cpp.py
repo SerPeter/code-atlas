@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -126,10 +127,99 @@ def _module_qualified_name(file_path: str) -> str:
     return ".".join(parts)
 
 
-def _is_cpp_file(path: str) -> bool:
-    """Return True if path has a C++ extension."""
+# Cheap pre-filter. If none of these byte sequences occurs anywhere then no
+# marker below can match either, so the file skips the comment strip entirely.
+# A pure C header — the case that must stay fast and must not change behaviour
+# — takes this exit.
+_CPP_HINT_BYTES = (
+    b"namespace",
+    b"template",
+    b"class",
+    b"public",
+    b"private",
+    b"protected",
+    b"virtual",
+    b"typename",
+    b"operator",
+    b"::",
+    b'"C++"',
+)
+
+# Constructs that cannot appear in valid C. Each demands syntactic context
+# rather than a bare keyword, because C does not reserve any of these words:
+# `class`, `template` and `namespace` are legal C identifiers, so `int class;`
+# and `struct template *t;` must not flip a file. `extern "C"` is deliberately
+# absent — it is a *C header* idiom (216 of CPython's 283 headers use it); only
+# `extern "C++"` is C++-only.
+_CPP_MARKERS = re.compile(
+    r"""
+      \bnamespace(?:\s+\w|\s*\{)                            # namespace foo / namespace {
+    | \btemplate\s*<                                        # template <
+    | \bclass\s+\w                                          # class Foo
+    | \b(?:public|private|protected)\s*:                    # access specifier
+    | \bvirtual\s+\w                                        # virtual void
+    | \btypename\s+\w                                       # typename T
+    | \boperator\s*(?:[(\[]|\bnew\b|\bdelete\b|[-+*/%^&|~!=<>])  # operator overload
+    | ::                                                    # scope resolution
+    | \bextern\s*"C\+\+"                                    # extern "C++"
+    """,
+    re.VERBOSE,
+)
+
+
+# Alternation order is the whole trick: whichever construct opens first wins the
+# scan, so a quote inside a `//` comment cannot open a literal and a `//` inside
+# a literal cannot open a comment. An unterminated block comment runs to EOF
+# rather than being left in place.
+_COMMENT_OR_LITERAL = re.compile(
+    r"""
+      //[^\n]*                      # line comment
+    | /\*.*?(?:\*/|\Z)              # block comment, unterminated tolerated
+    | "(?:\\.|[^"\\\n])*"           # string literal
+    | '(?:\\.|[^'\\\n])*'           # character literal
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def _strip_comments_and_literals(text: str) -> str:
+    """Blank out comments and string/char literals, preserving length.
+
+    Without this a C header whose *prose* mentions "class" or "namespace"
+    routes itself to C++. That is not hypothetical: across CPython's headers,
+    every occurrence of those words outside the genuinely dual-language ones is
+    inside a comment.
+    """
+    return _COMMENT_OR_LITERAL.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def sniff_header_is_cpp(source: bytes) -> bool:
+    """Does this ``.h`` file contain C++-only constructs?
+
+    ``.h`` is the standard C header extension *and* the extension most C++
+    projects use for headers, and nothing in the name says which. Sending it to
+    C unconditionally is what left 23 of fmt's 25 headers unparseable; sending
+    it to C++ unconditionally puts the risk on C users, who are the status quo.
+    So sniff, and resolve every ambiguity to C.
+    """
+    if not any(hint in source for hint in _CPP_HINT_BYTES):
+        return False
+    text = _strip_comments_and_literals(source.decode("utf-8", errors="replace"))
+    return _CPP_MARKERS.search(text) is not None
+
+
+def _is_cpp_file(path: str, source: bytes | None = None) -> bool:
+    """Return True if this file should be treated as C++ rather than C.
+
+    ``.h`` is claimed by both languages, so for that extension alone the answer
+    comes from the content. Every other extension is unambiguous.
+    """
     suffix = PurePosixPath(path.replace("\\", "/")).suffix.lower()
-    return suffix in _CPP_EXTENSIONS
+    if suffix in _CPP_EXTENSIONS:
+        return True
+    if suffix == ".h" and source is not None:
+        return sniff_header_is_cpp(source)
+    return False
 
 
 def _extract_doxygen_comment(node: Node, source: bytes) -> str | None:
@@ -407,7 +497,10 @@ def _parse_cpp(
     project_name: str,
 ) -> ParsedFile:
     """Extract entities and relationships from a C or C++ parse tree."""
-    is_cpp = _is_cpp_file(path)
+    # Sniffed here as well as in the router, so the walker's C++ branches and
+    # the recorded language agree however this handler was reached. The sniff
+    # short-circuits on a pure C header, so the repeat is nearly free.
+    is_cpp = _is_cpp_file(path, source)
     module_qn = _module_qualified_name(path)
     lang = "cpp" if is_cpp else "c"
 
@@ -1447,6 +1540,16 @@ def _extract_calls(
 # Language registration
 # ---------------------------------------------------------------------------
 
+
+def _resolve_header_dialect(source: bytes) -> str:
+    """Route a ``.h`` file to the C++ grammar only if it contains C++.
+
+    Registered on the C config because C owns ``.h`` by default; anything the
+    sniff cannot call is left exactly where it was.
+    """
+    return "cpp" if (_CPP_AVAILABLE and sniff_header_is_cpp(source)) else "c"
+
+
 if _C_AVAILABLE:
     register_language(
         LanguageConfig(
@@ -1455,6 +1558,8 @@ if _C_AVAILABLE:
             language=_C_LANGUAGE,
             query=_C_QUERY,
             parse_func=_parse_cpp,
+            ambiguous_extensions=frozenset({".h"}),
+            resolve_dialect=_resolve_header_dialect,
         )
     )
 
