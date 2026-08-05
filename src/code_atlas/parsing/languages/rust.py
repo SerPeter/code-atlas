@@ -232,7 +232,7 @@ def _parse_rust(
     )
 
 
-def _walk_rust_items(
+def _walk_rust_items(  # noqa: PLR0912
     node: Node,
     path: str,
     source: bytes,
@@ -264,6 +264,14 @@ def _walk_rust_items(
             _process_const_static(child, path, project_name, module_qn, owner_name, entities, relationships)
         elif child.type == "mod_item":
             _process_mod(child, path, source, project_name, module_qn, entities, relationships)
+        elif child.type == "macro_definition":
+            _process_macro_definition(child, path, project_name, module_qn, entities, relationships)
+        else:
+            # Anything else standing at item position — a bare `lazy_static! { … }`,
+            # a `fuzz_target!(…)`, an `expression_statement` wrapping one — runs
+            # outside any named callable, so per ADR-0031 its calls belong to the
+            # module.  Items handled above extract their own calls.
+            _extract_calls(child, f"{project_name}:{module_qn}", relationships)
 
 
 # ---------------------------------------------------------------------------
@@ -590,12 +598,20 @@ def _process_function(
     relationships: list[ParsedRelationship],
     *,
     from_impl: bool = False,
+    enclosing_qn: str | None = None,
 ) -> None:
     """Process a ``function_item`` node.
 
     ``owner_name`` is the type/trait name when the function is inside an
     impl or trait block, None for top-level functions.  ``from_impl`` marks
     impl-block members, whose owner type may be defined in another file.
+
+    ``enclosing_qn`` is set when this ``fn`` is written inside another function's
+    body and makes it own its parent's qualified name the way a method owns its
+    type's — ``…forward_packedpair.find``, mirroring Python's nested-``def``
+    handling.  It is a lexical path, not a position, so it survives re-indexing:
+    memchr nests a ``fn find`` inside seven different test functions and only the
+    parent name tells them apart.
     """
     name_node = node.child_by_field_name("name")
     if name_node is None:
@@ -611,12 +627,12 @@ def _process_function(
     if _is_unsafe_fn(node):
         tags = [*tags, "unsafe"]
 
-    if owner_name is not None:
+    if enclosing_qn is not None:
+        qn = f"{enclosing_qn}.{name}"
+        kind: str = CallableKind.FUNCTION
+    elif owner_name is not None:
         qn = f"{module_qn}.{owner_name}.{name}"
-        if _has_self_param(node):
-            kind: str = CallableKind.METHOD
-        else:
-            kind = CallableKind.STATIC_METHOD
+        kind = CallableKind.METHOD if _has_self_param(node) else CallableKind.STATIC_METHOD
     else:
         qn = f"{module_qn}.{name}"
         kind = CallableKind.FUNCTION
@@ -637,7 +653,16 @@ def _process_function(
             tags=tags,
         )
     )
-    if from_impl and owner_name is not None:
+    if enclosing_qn is not None:
+        # DEFINES: enclosing function -> nested function
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{enclosing_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qn}",
+            )
+        )
+    elif from_impl and owner_name is not None:
         # DEFINES: impl'd type -> method.  The type may be defined in another
         # file, so emit its NAME for post-batch resolution via
         # GraphClient.resolve_member_defines, with this file's module as the
@@ -661,10 +686,53 @@ def _process_function(
             )
         )
 
-    # Extract CALLS from the function body
+    # Extract CALLS from the function body, then the `fn`s that body encloses.
+    # _extract_calls deliberately stops at a nested function_item, so without the
+    # second pass its calls would belong to nobody — the same hole the Python
+    # walker had.
     body = node.child_by_field_name("body")
     if body is not None:
         _extract_calls(body, f"{project_name}:{qn}", relationships)
+        _process_nested_definitions(body, path, source, project_name, module_qn, qn, entities, relationships)
+
+
+def _process_nested_definitions(
+    body: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    module_qn: str,
+    enclosing_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Index the ``fn``s and ``macro_rules!``es written inside a function body.
+
+    Rust allows either anywhere a statement can go, so the search descends through
+    blocks, `if`/`match` arms and closure bodies rather than reading direct
+    children only.  It stops exactly where ``_extract_calls`` stops, which is what
+    keeps a nested function's calls attributed once rather than twice.
+    """
+    for child in body.children:
+        if child.type == "function_item":
+            _process_function(
+                child,
+                path,
+                source,
+                project_name,
+                module_qn,
+                None,
+                entities,
+                relationships,
+                enclosing_qn=enclosing_qn,
+            )
+            # _process_function recurses into its own body; descending again here
+            # would give the grandchild two parents.
+            continue
+        if child.type == "macro_definition":
+            _process_macro_definition(child, path, project_name, enclosing_qn, entities, relationships)
+            continue
+        _process_nested_definitions(child, path, source, project_name, module_qn, enclosing_qn, entities, relationships)
 
 
 def _process_function_signature(
@@ -979,6 +1047,80 @@ def _process_const_static(
         )
     )
 
+    # A const/static initialiser runs at load time and is not itself a callable,
+    # so its calls attribute to the module (ADR-0031).  memchr builds its
+    # substring test corpus this way: 91 call nodes in one `const` array.
+    value = node.child_by_field_name("value")
+    if value is not None:
+        _extract_calls(value, f"{project_name}:{module_qn}", relationships)
+
+
+# ---------------------------------------------------------------------------
+# macro_rules! definitions
+# ---------------------------------------------------------------------------
+
+
+def _process_macro_definition(
+    node: Node,
+    path: str,
+    project_name: str,
+    parent_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Process a ``macro_definition`` (``macro_rules! name { … }``).
+
+    A macro is invoked by name and expands into the caller's body, so the graph
+    treats it as a Callable: without an entity the CALLS edges ``_extract_calls``
+    emits for `macro_invocation` would have no target at all.  Measured on memchr,
+    30% of macro invocations name a `macro_rules!` declared in the repo.
+
+    ``parent_qn`` is the module — or, for a macro declared inside a function body,
+    that function.  Rust scopes `macro_rules!` textually, and memchr's
+    ``assert_suffix_min``/``assert_suffix_max`` are declared and used entirely
+    inside one test `fn`; hoisting them to module scope would collide the two
+    copies that live in the same file.
+
+    ``kind`` is ``function`` because :class:`CallableKind` has no macro member and
+    that enum is shared across every language; the ``macro`` tag is what
+    distinguishes one.  Worth reconciling centrally if other languages grow the
+    same need.
+    """
+    name_node = node.child_by_field_name("name")
+    if name_node is None:
+        return
+    name = node_text(name_node)
+    qn = f"{parent_qn}.{name}"
+    tags = [*_extract_attributes(node), "macro"]
+    # `macro_rules!` takes no visibility modifier; `#[macro_export]` is what lifts
+    # it out of the defining module, and without this every exported macro would
+    # be recorded private and read as dead code.
+    vis = Visibility.PUBLIC if any(t.startswith("attribute:macro_export") for t in tags) else Visibility.PRIVATE
+
+    entities.append(
+        ParsedEntity(
+            name=name,
+            qualified_name=f"{project_name}:{qn}",
+            label=NodeLabel.CALLABLE,
+            kind=CallableKind.FUNCTION,
+            line_start=node.start_point[0] + 1,
+            line_end=node.end_point[0] + 1,
+            file_path=path,
+            docstring=_extract_doc_comments(node),
+            signature=f"macro_rules! {name}",
+            source=node_text(node),
+            visibility=vis,
+            tags=tags,
+        )
+    )
+    relationships.append(
+        ParsedRelationship(
+            from_qualified_name=f"{project_name}:{parent_qn}",
+            rel_type=RelType.DEFINES,
+            to_name=f"{project_name}:{qn}",
+        )
+    )
+
 
 # ---------------------------------------------------------------------------
 # Struct fields
@@ -1132,29 +1274,65 @@ def _process_mod(
 # ---------------------------------------------------------------------------
 
 
+#: Subtrees ``_extract_calls`` must not enter.  A ``function_item`` is an entity in
+#: its own right and extracts its own calls (see ``_process_nested_functions``), so
+#: descending would attribute them twice.  A ``macro_definition`` body is an
+#: unparsed ``token_tree`` — measured over memchr it holds no call nodes at all, and
+#: whatever it expands to is a fact about the invocation site, not the definition.
+#:
+#: ``closure_expression`` is deliberately absent.  A closure gets no entity
+#: (ADR-0031), so refusing to walk it attributed its calls to nobody: 706 call
+#: expressions, 17.3% of every call node in memchr, reached the graph from nowhere.
+_CALL_WALK_STOPS: frozenset[str] = frozenset({"function_item", "macro_definition"})
+
+
 def _extract_calls(
     node: Node,
     from_qn: str,
     relationships: list[ParsedRelationship],
 ) -> None:
-    """Recursively extract call expressions from a block."""
-    for child in node.children:
-        if child.type == "call_expression":
-            func = child.child_by_field_name("function")
-            if func is not None:
-                call_name = _call_target_name(func)
-                if call_name:
-                    relationships.append(
-                        ParsedRelationship(
-                            from_qualified_name=from_qn,
-                            rel_type=RelType.CALLS,
-                            to_name=call_name,
-                            properties=call_receiver_props(func.child_by_field_name("value")),
-                        )
+    """Extract every call in *node*'s subtree, attributed to *from_qn*.
+
+    *node* itself is examined, so this can be handed a lone ``macro_invocation``
+    standing at item position as well as a function's body block.
+
+    Per ADR-0031 every call belongs to the nearest enclosing *named* scope. The
+    walk therefore enters anonymous bodies and stops only at the forms listed in
+    ``_CALL_WALK_STOPS``.
+    """
+    if node.type == "call_expression":
+        func = node.child_by_field_name("function")
+        if func is not None:
+            call_name = _call_target_name(func)
+            if call_name:
+                relationships.append(
+                    ParsedRelationship(
+                        from_qualified_name=from_qn,
+                        rel_type=RelType.CALLS,
+                        to_name=call_name,
+                        properties=call_receiver_props(func.child_by_field_name("value")),
                     )
-        # Recurse but don't descend into nested function definitions or closures
-        if child.type not in ("function_item", "closure_expression"):
-            _extract_calls(child, from_qn, relationships)
+                )
+    elif node.type == "macro_invocation":
+        macro_name = _macro_target_name(node)
+        if macro_name:
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=from_qn,
+                    rel_type=RelType.CALLS,
+                    to_name=macro_name,
+                    # Marks an edge the resolver may well never match: over half of
+                    # Rust's macro invocations name a std/core construct (`assert!`,
+                    # `vec!`, `write!`) that no project Callable can satisfy. See the
+                    # fixture's floor.json rationale for the measured split.
+                    properties={"via": "macro"},
+                )
+            )
+
+    for child in node.children:
+        if child.type in _CALL_WALK_STOPS:
+            continue
+        _extract_calls(child, from_qn, relationships)
 
 
 def _call_target_name(node: Node) -> str | None:
@@ -1177,6 +1355,21 @@ def _call_target_name(node: Node) -> str | None:
         if func is not None:
             return _call_target_name(func)
     return None
+
+
+def _macro_target_name(node: Node) -> str | None:
+    """Name of the macro a ``macro_invocation`` expands.
+
+    ``anyhow::bail!`` yields ``bail``, matching how ``_call_target_name`` reduces a
+    ``scoped_identifier`` — the resolver matches on the bare name either way.
+    """
+    macro = node.child_by_field_name("macro")
+    if macro is None:
+        return None
+    text = node_text(macro).strip()
+    if not text:
+        return None
+    return text.rsplit("::", 1)[-1]
 
 
 # ---------------------------------------------------------------------------

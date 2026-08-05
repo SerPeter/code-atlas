@@ -992,3 +992,317 @@ impl std::fmt::Display for Foo {
     assert ":" not in impl_rels[0].to_name
     assert impl_rels[0].from_qualified_name == f"{PROJECT}:src.example.Foo"
     assert impl_rels[0].properties == {}
+
+
+# ---------------------------------------------------------------------------
+# 13. ADR-0031 — anonymous callables attribute their calls upward
+# ---------------------------------------------------------------------------
+
+
+def _call_names(parsed: ParsedFile, from_qn_suffix: str) -> list[str]:
+    return [r.to_name for r in _rels_from(parsed, from_qn_suffix, RelType.CALLS)]
+
+
+def _calls(parsed: ParsedFile) -> list[tuple[str, str]]:
+    """Every CALLS edge as (from_qualified_name, to_name) — exact, no suffix match."""
+    return [(r.from_qualified_name, r.to_name) for r in parsed.relationships if r.rel_type == RelType.CALLS]
+
+
+def test_calls_inside_a_closure_attribute_to_the_enclosing_function():
+    """A closure body is walked; its calls belong to the `fn` that defines it.
+
+    Measured on memchr this was 706 call expressions — 17.3% of every call node in
+    the repo — reaching the graph from nowhere.
+    """
+    parsed = _parse(
+        """\
+fn outer(xs: &[u8]) -> usize {
+    xs.iter().map(|b| transform(*b)).filter(|b| keep(*b)).count()
+}
+"""
+    )
+    names = _call_names(parsed, ":src.example.outer")
+    assert "transform" in names
+    assert "keep" in names
+
+
+def test_calls_nested_two_closures_deep_still_reach_the_enclosing_function():
+    """ADR-0031 flattens depth deliberately — the innermost call still lands."""
+    parsed = _parse(
+        """\
+fn outer() {
+    run(|| {
+        again(|| {
+            deep_target();
+        });
+    });
+}
+"""
+    )
+    assert "deep_target" in _call_names(parsed, ":src.example.outer")
+
+
+def test_a_closure_produces_no_callable_entity():
+    """Negative assertion: category 3 in ADR-0031 gets no entity, only edges.
+
+    Descending into closure bodies must not be implemented by giving each closure
+    a synthesised name — a positional uid would churn the graph on every edit
+    above it, which is why the ADR rejected that option.
+    """
+    parsed = _parse(
+        """\
+fn outer() {
+    let f = |x: u8| helper(x);
+    f(1);
+}
+"""
+    )
+    callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    assert [e.name for e in callables] == ["outer"]
+    assert not any("closure" in (e.kind or "") for e in callables)
+    assert not any("<" in e.qualified_name or "@" in e.qualified_name for e in parsed.entities)
+
+
+# ---------------------------------------------------------------------------
+# 14. `fn` nested inside another function's body
+# ---------------------------------------------------------------------------
+
+
+def test_nested_fn_becomes_an_entity_scoped_to_its_parent():
+    parsed = _parse(
+        """\
+fn forward_packedpair() {
+    fn find(haystack: &[u8]) -> Option<usize> {
+        locate(haystack)
+    }
+    run(find)
+}
+"""
+    )
+    find = _entity_by_name(parsed, "find")
+    assert find.label == NodeLabel.CALLABLE
+    assert find.kind == CallableKind.FUNCTION
+    assert find.qualified_name == f"{PROJECT}:src.example.forward_packedpair.find"
+
+
+def test_nested_fn_qualified_name_carries_no_line_number():
+    """A uid must survive re-indexing — see ADR-0031's rejected alternative.
+
+    Shifting the whole body down by one line must not change a single uid.
+    """
+    body = """\
+fn outer() {
+    fn inner() {
+        work();
+    }
+}
+"""
+    first = {e.qualified_name for e in _parse(body).entities}
+    shifted = {e.qualified_name for e in _parse("// a new leading comment\n" + body).entities}
+    assert first == shifted
+    assert f"{PROJECT}:src.example.outer.inner" in first
+
+
+def test_two_nested_fns_of_the_same_name_stay_distinct():
+    """memchr nests a `fn find` inside seven different test functions."""
+    parsed = _parse(
+        """\
+fn forward() {
+    fn find() { a(); }
+    find()
+}
+
+fn reverse() {
+    fn find() { b(); }
+    find()
+}
+"""
+    )
+    qns = sorted(e.qualified_name for e in parsed.entities if e.name == "find")
+    assert qns == [
+        f"{PROJECT}:src.example.forward.find",
+        f"{PROJECT}:src.example.reverse.find",
+    ]
+
+
+def test_nested_fn_is_defined_by_its_enclosing_function():
+    parsed = _parse(
+        """\
+fn outer() {
+    fn inner() {}
+}
+"""
+    )
+    defines = _rels_from(parsed, ":src.example.outer", RelType.DEFINES)
+    assert [r.to_name for r in defines] == [f"{PROJECT}:src.example.outer.inner"]
+
+
+def test_nested_fn_calls_are_not_also_charged_to_the_enclosing_function():
+    """Negative assertion — the double-count the two-pass walk must not create.
+
+    `_extract_calls` stops at a nested `function_item` and `_process_nested_definitions`
+    picks it up. If the stop were dropped, `only_inner` would be charged to `outer`
+    as well, inflating every callback-heavy caller's fan-out.
+    """
+    parsed = _parse(
+        """\
+fn outer() {
+    only_outer();
+    fn inner() {
+        only_inner();
+    }
+    inner()
+}
+"""
+    )
+    outer_calls = _call_names(parsed, ":src.example.outer")
+    assert "only_inner" not in outer_calls
+    assert sorted(outer_calls) == ["inner", "only_outer"]
+    assert _call_names(parsed, ":src.example.outer.inner") == ["only_inner"]
+
+
+def test_fn_nested_inside_a_closure_inside_a_fn_is_still_found():
+    """Rust allows an item anywhere a statement can go, including a closure body."""
+    parsed = _parse(
+        """\
+fn outer() {
+    run(|| {
+        fn helper() { work(); }
+        helper()
+    })
+}
+"""
+    )
+    helper = _entity_by_name(parsed, "helper")
+    assert helper.qualified_name == f"{PROJECT}:src.example.outer.helper"
+    assert _call_names(parsed, ":src.example.outer.helper") == ["work"]
+
+
+# ---------------------------------------------------------------------------
+# 15. Macros — invocations are calls, `macro_rules!` is their target
+# ---------------------------------------------------------------------------
+
+
+def test_macro_invocation_emits_a_call():
+    parsed = _parse(
+        """\
+fn outer() {
+    defraw!(load(ptr));
+}
+"""
+    )
+    by_name = {r.to_name: r for r in _rels_from(parsed, ":src.example.outer", RelType.CALLS)}
+    assert "defraw" in by_name
+    assert by_name["defraw"].properties == {"via": "macro"}
+
+
+def test_macro_invocation_path_is_reduced_to_its_bare_name():
+    """`anyhow::bail!` resolves on `bail`, the same reduction a scoped call gets."""
+    parsed = _parse(
+        """\
+fn outer() {
+    anyhow::bail!("nope");
+}
+"""
+    )
+    assert "bail" in _call_names(parsed, ":src.example.outer")
+
+
+def test_macro_rules_becomes_a_callable_entity():
+    parsed = _parse(
+        """\
+macro_rules! trace {
+    ($($tt:tt)*) => {};
+}
+"""
+    )
+    trace = _entity_by_name(parsed, "trace")
+    assert trace.label == NodeLabel.CALLABLE
+    assert "macro" in trace.tags
+    assert trace.signature == "macro_rules! trace"
+    assert trace.qualified_name == f"{PROJECT}:src.example.trace"
+
+
+def test_macro_export_marks_the_macro_public():
+    """Without this every `#[macro_export]` macro reads as private, hence dead."""
+    parsed = _parse(
+        """\
+#[macro_export]
+macro_rules! shared {
+    () => {};
+}
+
+macro_rules! internal {
+    () => {};
+}
+"""
+    )
+    assert _entity_by_name(parsed, "shared").visibility == Visibility.PUBLIC
+    assert _entity_by_name(parsed, "internal").visibility == Visibility.PRIVATE
+
+
+def test_function_local_macro_rules_is_scoped_to_the_function():
+    """memchr declares `assert_suffix_min` twice in one file, inside two `fn`s.
+
+    Hoisting either to module scope would collide them.
+    """
+    parsed = _parse(
+        """\
+fn suffix_forward() {
+    macro_rules! assert_suffix_min {
+        ($($tt:tt)*) => {};
+    }
+    assert_suffix_min!(b"a");
+}
+
+fn suffix_reverse() {
+    macro_rules! assert_suffix_min {
+        ($($tt:tt)*) => {};
+    }
+    assert_suffix_min!(b"b");
+}
+"""
+    )
+    qns = sorted(e.qualified_name for e in parsed.entities if e.name == "assert_suffix_min")
+    assert qns == [
+        f"{PROJECT}:src.example.suffix_forward.assert_suffix_min",
+        f"{PROJECT}:src.example.suffix_reverse.assert_suffix_min",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 16. Module-scope calls (ADR-0031: no enclosing callable -> the module)
+# ---------------------------------------------------------------------------
+
+
+def test_item_position_macro_invocation_is_called_by_the_module():
+    parsed = _parse("define_memchr_quickcheck!(super::simple_memchr);\n")
+    assert _calls(parsed) == [(f"{PROJECT}:src.example", "define_memchr_quickcheck")]
+
+
+def test_const_initialiser_calls_belong_to_the_module():
+    """memchr builds its substring test corpus this way — 91 call nodes in one const."""
+    parsed = _parse(
+        """\
+const SEARCHES: &[Search] = &[
+    Search::new("a", "b"),
+    Search::new("c", "d"),
+];
+"""
+    )
+    assert _calls(parsed) == [
+        (f"{PROJECT}:src.example", "new"),
+        (f"{PROJECT}:src.example", "new"),
+    ]
+
+
+def test_module_scope_calls_inside_an_inline_mod_belong_to_that_mod():
+    """The nearest enclosing named scope is the inline `mod`, not the file."""
+    parsed = _parse(
+        """\
+mod tests {
+    define_memchr_quickcheck!(naive);
+}
+"""
+    )
+    assert _calls(parsed) == [(f"{PROJECT}:src.example.tests", "define_memchr_quickcheck")]
