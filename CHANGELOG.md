@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.7.0 (2026-08-05)
+
+### Bug Fixes
+
+- **graph**: Stop test fixtures from diluting real call edges (ATL-103)
+  ([`5d38d61`](https://github.com/SerPeter/code-atlas/commit/5d38d61c5622dd5fb933b443bd3b2a1101a904b5))
+
+### Features
+
+- **graph**: Point CALLS edges at the call site, not the def (ATL-105)
+  ([`4ec2a1c`](https://github.com/SerPeter/code-atlas/commit/4ec2a1c6ecd65e364e0e3b2b8fd35c6841018288))
+
+- **server**: Say what a truncated result withheld (ATL-104)
+  ([`e7ed769`](https://github.com/SerPeter/code-atlas/commit/e7ed769e6fd64dd9e76370f20bf25f6046911429))
+
+
 ## v0.6.0 (2026-08-04)
 
 ### Bug Fixes
