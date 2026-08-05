@@ -1,0 +1,21 @@
+{
+  "lang": "php",
+  "named_funcs": 1.0,
+  "calls": 0.94,
+  "source_repo": "nikic/FastRoute",
+  "source_commit": "1c961398bef1ff6ecd8b273bef651d7afe90312b",
+  "license": "BSD-3-Clause",
+  "files": [
+    "functions.php",
+    "FastRoute.php",
+    "BadRouteException.php",
+    "FileCache.php",
+    "FastRouteTest.php",
+    "RouteCollectorTest.php",
+    "Psr16CacheTest.php",
+    "DispatcherTestCase.php",
+    "DispatcherForBenchmark.php"
+  ],
+  "measured": { "named_funcs": 1.0, "calls": 0.951 },
+  "rationale": "The named-function floor is exact 1.0: every function_definition and method_declaration is an entity, including the two that PHP hides behind an `if (! function_exists(...))` guard and the four that belong to anonymous classes (`new class implements Cache {}`), which are nameless containers holding named methods. Anonymous functions get an entity only when a binding recovers a name (ADR-0031 category 2) -- 32 of 45 here -- and the remaining 13 plus both arrow functions are callback arguments with no name at all, so they are excluded from this ratio by design while their calls still attribute to the enclosing named scope. The 4.9% call shortfall is 20 of 412 nodes and every one of them names its target at runtime rather than in the source: 12 dynamic instantiations (`new $this->routesConfiguration()` x6, `new $options['routeCollector']()` x5, `new $cache()` x1), 5 dynamic invocations (`$loader()` x4, `($this->routeDefinitionCallback)()` x1), and 3 `new class {}` expressions whose class has no name to point a CALLS edge at -- though those three do produce a TypeDef, an IMPLEMENTS edge and entities for their methods. Extracting any of the remaining 17 would require resolving a property, an array subscript or a local variable to a class name, which is type inference, not parsing. This selection is deliberately harder than the repo as a whole (0.951 here vs 0.968 across all 47 files) because it concentrates the dynamic-dispatch files; the fixture is the conservative measurement."
+}

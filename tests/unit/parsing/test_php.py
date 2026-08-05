@@ -815,6 +815,384 @@ class Factory {
 
 
 # ---------------------------------------------------------------------------
+# 24b. Conditionally declared top-level functions (ATL-096)
+#
+# `if (! function_exists('ns\\fn')) { function fn() {...} }` is how a PHP library
+# ships polyfillable functions. The walker stopped at the `if`, so FastRoute's whole
+# src/functions.php produced no Callable at all.
+# ---------------------------------------------------------------------------
+
+
+def test_function_inside_conditional_block():
+    parsed = _parse("""\
+<?php
+if (! function_exists('helper')) {
+    function helper(): void {
+        process();
+    }
+}
+""")
+    func = _entity_by_name(parsed, "helper")
+    assert func.label == NodeLabel.CALLABLE
+    assert func.kind == CallableKind.FUNCTION
+    assert func.qualified_name == f"{PROJECT}:src.Example.helper"
+
+    calls = _rels_from(parsed, "src.Example.helper", RelType.CALLS)
+    assert {r.to_name for r in calls} == {"process"}
+
+
+def test_class_inside_conditional_block():
+    parsed = _parse("""\
+<?php
+if (PHP_VERSION_ID < 80000) {
+    class Polyfill {
+        public function apply(): void {}
+    }
+}
+""")
+    cls = _entity_by_name(parsed, "Polyfill")
+    assert cls.label == NodeLabel.TYPE_DEF
+    _entity_by_name(parsed, "apply")
+
+
+def test_function_inside_try_block():
+    parsed = _parse("""\
+<?php
+try {
+    function fallback(): void {}
+} catch (Throwable $e) {
+    function recover(): void {}
+}
+""")
+    assert _entity_by_name(parsed, "fallback").kind == CallableKind.FUNCTION
+    assert _entity_by_name(parsed, "recover").kind == CallableKind.FUNCTION
+
+
+# ---------------------------------------------------------------------------
+# 24c. Module-scope calls (ADR-0031)
+#
+# A call with no enclosing named callable belongs to the Module. PHP files run at
+# include time, so this is not an edge case for scripts.
+# ---------------------------------------------------------------------------
+
+
+def test_module_scope_calls_attribute_to_module():
+    parsed = _parse("""\
+<?php
+bootstrap();
+Logger::info("started");
+""")
+    calls = _rels_from(parsed, "src.Example", RelType.CALLS)
+    assert {r.to_name for r in calls} == {"bootstrap", "info"}
+
+
+def test_module_scope_call_in_condition():
+    """The `if` condition is module-level code even when its body declares things."""
+    parsed = _parse("""\
+<?php
+if (! function_exists('helper')) {
+    function helper(): void {}
+}
+""")
+    calls = _rels_from(parsed, "src.Example", RelType.CALLS)
+    assert {r.to_name for r in calls} == {"function_exists"}
+
+
+# ---------------------------------------------------------------------------
+# 24d. Anonymous callables (ADR-0031)
+#
+# Truly anonymous closures get NO entity, but their bodies must still be walked so
+# the calls inside them reach the graph, attributed to the enclosing named scope.
+# A closure bound to a variable is category 2 and DOES get an entity.
+# ---------------------------------------------------------------------------
+
+
+def test_unbound_closure_calls_attribute_to_enclosing_method():
+    parsed = _parse("""\
+<?php
+class Router {
+    public function register(): void {
+        $this->on('GET', function () {
+            handleRequest();
+        });
+    }
+}
+""")
+    calls = _rels_from(parsed, "src.Example.Router.register", RelType.CALLS)
+    assert "handleRequest" in {r.to_name for r in calls}
+
+
+def test_unbound_closure_gets_no_entity():
+    """Category 3: a callback argument has no name, so it must not become a Callable."""
+    parsed = _parse("""\
+<?php
+class Router {
+    public function register(): void {
+        dispatch(function () {
+            handleRequest();
+        });
+    }
+}
+""")
+    callables = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+    assert callables == {"register"}, f"anonymous closure leaked an entity: {callables}"
+
+
+def test_unbound_arrow_function_attributes_upward_without_entity():
+    parsed = _parse("""\
+<?php
+class Mapper {
+    public function run(array $xs): array {
+        return array_map(fn ($x) => transform($x), $xs);
+    }
+}
+""")
+    calls = _rels_from(parsed, "src.Example.Mapper.run", RelType.CALLS)
+    assert {"array_map", "transform"} <= {r.to_name for r in calls}
+
+    callables = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+    assert callables == {"run"}, f"anonymous arrow function leaked an entity: {callables}"
+
+
+def test_bound_closure_becomes_entity_named_from_binding():
+    parsed = _parse("""\
+<?php
+class Factory {
+    public function build(): callable {
+        $loader = static function (): array {
+            return collect();
+        };
+
+        return $loader;
+    }
+}
+""")
+    closure = _entity_by_name(parsed, "loader")
+    assert closure.label == NodeLabel.CALLABLE
+    assert closure.kind == CallableKind.CLOSURE
+    assert closure.qualified_name == f"{PROJECT}:src.Example.Factory.build.loader"
+    assert closure.signature is not None
+    assert "static function" in closure.signature
+
+    # Its body's calls belong to it, not to the enclosing method.
+    assert {r.to_name for r in _rels_from(parsed, "Factory.build.loader", RelType.CALLS)} == {"collect"}
+    assert "collect" not in {r.to_name for r in _rels_from(parsed, "src.Example.Factory.build", RelType.CALLS)}
+
+    # DEFINES from the enclosing scope is what keeps it out of find_dead_code.
+    defines = _rels_from(parsed, "src.Example.Factory.build", RelType.DEFINES)
+    assert f"{PROJECT}:src.Example.Factory.build.loader" in {r.to_name for r in defines}
+
+
+def test_bound_arrow_function_becomes_entity():
+    parsed = _parse("""\
+<?php
+$formatter = fn (string $s): string => strtoupper($s);
+""")
+    closure = _entity_by_name(parsed, "formatter")
+    assert closure.kind == CallableKind.CLOSURE
+    assert closure.qualified_name == f"{PROJECT}:src.Example.formatter"
+    assert {r.to_name for r in _rels_from(parsed, "src.Example.formatter", RelType.CALLS)} == {"strtoupper"}
+
+
+def test_closure_nested_in_closure_attributes_to_nearest_named_scope():
+    parsed = _parse("""\
+<?php
+class Pipeline {
+    public function run(): void {
+        each(function () {
+            each(function () {
+                deeplyNested();
+            });
+        });
+    }
+}
+""")
+    calls = _rels_from(parsed, "src.Example.Pipeline.run", RelType.CALLS)
+    assert "deeplyNested" in {r.to_name for r in calls}
+
+
+# ---------------------------------------------------------------------------
+# 24e. Anonymous classes (ATL-096)
+#
+# `new class implements Cache {}` is a nameless container whose methods are named,
+# so the methods are entities. The class is named after the contract it satisfies,
+# which stays stable across edits in a way a line number would not.
+# ---------------------------------------------------------------------------
+
+
+def test_anonymous_class_methods_become_entities():
+    parsed = _parse("""\
+<?php
+class Test {
+    public function useCache(): void {
+        $cache = new class () implements Cache {
+            public function get(string $key): array {
+                return fetch($key);
+            }
+        };
+    }
+}
+""")
+    method = _entity_by_name(parsed, "get")
+    assert method.label == NodeLabel.CALLABLE
+    assert method.kind == CallableKind.METHOD
+    assert method.qualified_name == f"{PROJECT}:src.Example.Test.useCache.Cache@anonymous.get"
+
+    cls = _entity_by_name(parsed, "Cache@anonymous")
+    assert cls.label == NodeLabel.TYPE_DEF
+    assert cls.kind == TypeDefKind.CLASS
+
+    impl = [r for r in parsed.relationships if r.rel_type == RelType.IMPLEMENTS]
+    assert {r.to_name for r in impl} == {"Cache"}
+
+    # The method's body is its own scope, not the enclosing method's.
+    assert {r.to_name for r in _rels_from(parsed, "Cache@anonymous.get", RelType.CALLS)} == {"fetch"}
+
+
+def test_returned_anonymous_class_methods_become_entities():
+    """No binding to take a name from -- the base clause still names it."""
+    parsed = _parse("""\
+<?php
+class Builder {
+    public function make(): DataGenerator {
+        return new class extends BaseGenerator {
+            public function generate(): void {}
+            public function reset(): void {}
+        };
+    }
+}
+""")
+    assert _entity_by_name(parsed, "generate").kind == CallableKind.METHOD
+    assert _entity_by_name(parsed, "reset").kind == CallableKind.METHOD
+    assert _entity_by_name(parsed, "BaseGenerator@anonymous").label == NodeLabel.TYPE_DEF
+
+    inherits = [r for r in parsed.relationships if r.rel_type == RelType.INHERITS]
+    assert "BaseGenerator" in {r.to_name for r in inherits}
+
+
+def test_bare_anonymous_class_still_named():
+    parsed = _parse("""\
+<?php
+class Holder {
+    public function build(): object {
+        return new class {
+            public function ping(): void {}
+        };
+    }
+}
+""")
+    assert _entity_by_name(parsed, "ping").kind == CallableKind.METHOD
+    assert _entity_by_name(parsed, "class@anonymous").label == NodeLabel.TYPE_DEF
+
+
+# ---------------------------------------------------------------------------
+# 24f. Object creation is a call (ATL-096)
+#
+# `new Foo()` runs Foo's constructor -- the same edge the JVM walker emits for
+# Java's object_creation_expression. 76 of FastRoute's 688 call nodes are this form.
+# ---------------------------------------------------------------------------
+
+
+def test_object_creation_emits_calls():
+    parsed = _parse("""\
+<?php
+class Service {
+    public function boot(): void {
+        $x = new Repository();
+    }
+}
+""")
+    calls = _rels_from(parsed, "src.Example.Service.boot", RelType.CALLS)
+    assert "Repository" in {r.to_name for r in calls}
+
+
+def test_object_creation_qualified_name_reduced_to_bare_name():
+    """CALLS resolution matches a bare entity name, so the namespace must be dropped."""
+    parsed = _parse("""\
+<?php
+class Service {
+    public function boot(): void {
+        $x = new GenerateUri\\GeneratedUri("/");
+    }
+}
+""")
+    calls = _rels_from(parsed, "src.Example.Service.boot", RelType.CALLS)
+    to_names = {r.to_name for r in calls}
+    assert "GeneratedUri" in to_names
+    assert not any("\\" in n for n in to_names), to_names
+
+
+def test_qualified_function_call_reduced_to_bare_name():
+    parsed = _parse("""\
+<?php
+function outer(): void {
+    \\FastRoute\\cachedDispatcher($cb);
+}
+""")
+    calls = _rels_from(parsed, "src.Example.outer", RelType.CALLS)
+    to_names = {r.to_name for r in calls}
+    assert "cachedDispatcher" in to_names
+    assert not any("\\" in n for n in to_names), to_names
+
+
+def test_new_self_resolves_to_enclosing_class():
+    """`new self()` is how PHP writes a named constructor -- 14 of FastRoute's 76."""
+    parsed = _parse("""\
+<?php
+class BadRouteException {
+    public static function tooManyOptionalParts(): self {
+        return new self("boom");
+    }
+}
+""")
+    calls = _rels_from(parsed, "src.Example.BadRouteException.tooManyOptionalParts", RelType.CALLS)
+    to_names = {r.to_name for r in calls}
+    assert "BadRouteException" in to_names
+    assert "self" not in to_names, "the reserved word leaked out as a target name"
+
+
+def test_new_static_resolves_to_enclosing_class():
+    parsed = _parse("""\
+<?php
+class Model {
+    public static function make(): static {
+        return new static();
+    }
+}
+""")
+    to_names = {r.to_name for r in _rels_from(parsed, "src.Example.Model.make", RelType.CALLS)}
+    assert "Model" in to_names
+    assert "static" not in to_names
+
+
+def test_dynamic_object_creation_emits_nothing():
+    """`new $cls()` names its class at runtime. A guessed target is worse than none."""
+    parsed = _parse("""\
+<?php
+class Service {
+    public function boot(array $options): void {
+        $a = new $options['dispatcher']();
+        $b = new $this->handler();
+        $c = new $cls();
+    }
+}
+""")
+    calls = _rels_from(parsed, "src.Example.Service.boot", RelType.CALLS)
+    assert [r.to_name for r in calls] == [], [r.to_name for r in calls]
+
+
+def test_new_self_outside_a_class_emits_nothing():
+    parsed = _parse("""\
+<?php
+function orphan(): void {
+    $x = new self();
+}
+""")
+    calls = _rels_from(parsed, "src.Example.orphan", RelType.CALLS)
+    assert [r.to_name for r in calls] == [], [r.to_name for r in calls]
+
+
+# ---------------------------------------------------------------------------
 # 25. Content hash determinism
 # ---------------------------------------------------------------------------
 
