@@ -50,6 +50,17 @@ def test_extraction_coverage_holds_its_floor(fixture: Path) -> None:
         f"{cov.calls_in_missed} call(s) sit inside a function that produced no entity."
     )
 
+    # A uid is the graph's identity. Two definitions emitting the same one merge
+    # into a single node with an arbitrary winner's source and the union of both
+    # edge sets — a confident wrong answer, which is worse than the silence of a
+    # missing entity. Ceilings are declared per language and ratchet downward;
+    # absent means zero.
+    ceiling = floor.get("max_duplicate_uids", 0)
+    assert cov.duplicate_uids <= ceiling, (
+        f"{fixture.name}: {cov.duplicate_uids} colliding uid(s), ceiling is {ceiling}. "
+        f"Worst: {cov.worst_collisions[:3]}. Two definitions are merging into one graph node."
+    )
+
 
 @pytest.mark.parametrize("fixture", _fixture_dirs(), ids=lambda p: p.name)
 def test_floor_records_its_provenance(fixture: Path) -> None:

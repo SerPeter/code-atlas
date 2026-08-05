@@ -163,6 +163,25 @@ class Coverage:
     calls_in_missed: int = 0
     calls_at_module: int = 0
     sites: list[FuncSite] = field(default_factory=list)
+    uids: Counter[str] = field(default_factory=Counter)
+
+    @property
+    def duplicate_uids(self) -> int:
+        """Callable entities sharing a qualified name with another.
+
+        A uid is the graph's identity: two definitions emitting the same one
+        upsert into a single node carrying an arbitrary winner's source and the
+        union of both edge sets. That is worse than a missing entity, because a
+        missing entity is silence and a merged one is a confident wrong answer.
+
+        Counted as occurrences beyond the first, so N definitions sharing a name
+        contribute N-1.
+        """
+        return sum(n - 1 for n in self.uids.values() if n > 1)
+
+    @property
+    def worst_collisions(self) -> list[tuple[str, int]]:
+        return [(uid, n) for uid, n in self.uids.most_common(10) if n > 1]
 
     @property
     def named_sites(self) -> list[FuncSite]:
@@ -246,8 +265,10 @@ def measure(root: Path, lang: str) -> Coverage:
         tree = parsers[config.name].parse(src)
         cov.files += 1
 
-        spans = [(e.line_start, e.line_end) for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+        callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+        spans = [(e.line_start, e.line_end) for e in callables]
         cov.callables += len(spans)
+        cov.uids.update(e.qualified_name for e in callables)
         cov.calls_emitted += sum(1 for r in parsed.relationships if r.rel_type == RelType.CALLS)
         rel = path.relative_to(root).as_posix()
 
@@ -284,7 +305,11 @@ def _pct(a: int, b: int) -> str:
 def _report(cov: Coverage) -> None:
     spec = LANGS[cov.lang]
     print(f"files: {cov.files} parsed, {cov.failed} failed   Callables emitted: {cov.callables}")
-    print(f"named_funcs: {cov.named_funcs:.3f}    calls: {cov.calls:.3f}")
+    print(f"named_funcs: {cov.named_funcs:.3f}    calls: {cov.calls:.3f}    duplicate_uids: {cov.duplicate_uids}")
+    if cov.worst_collisions:
+        print("\ncolliding uids (two definitions merging into one graph node):")
+        for uid, n in cov.worst_collisions:
+            print(f"  {n:4d}x  {uid.rsplit(':', 1)[-1]}")
     print("\nper form:")
     total: Counter[str] = Counter(s.form for s in cov.sites)
     ok: Counter[str] = Counter(s.form for s in cov.sites if s.captured)
