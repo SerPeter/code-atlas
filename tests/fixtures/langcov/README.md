@@ -51,6 +51,32 @@ are still visible in `calls`, which is what catches a walker that skips a callba
 A floor is a per-language ratchet against that language's own past. It is not a score, and a lower number is
 not a worse walker.
 
+### `named_funcs` rewards emitting entities, including wrong ones
+
+It counts nodes captured over nodes present. It cannot see whether the entity produced was _correct_, and
+three languages hit that from three directions during ATL-096:
+
+- **C#** — 50 of 62 `local_function_statement` nodes in Newtonsoft.Json are tree-sitter recovering
+  `else if (x) { }` at the head of a `#if` branch as a local function named `if`. Capturing them scores
+  0.993; rejecting them scores 0.988. **The higher number was bought with Callables named `if`.**
+- **C++** — suppressing 40 macro invocations that no metric could know the preprocessor deletes
+  (`FMT_CATCH(...) { }`) moved `named_funcs` **down**, 0.653 → 0.641. Removing a confidently-wrong node
+  reads as a coverage regression.
+- **TypeScript** — declining an entity for an unbound object-literal method took it from 1.000 to 0.254,
+  while `calls` did not move by a thousandth. The decline was correct.
+
+So do not read `named_funcs` alone, and do not maximise it. The three numbers are a set:
+
+| number           | pressure                                            |
+| ---------------- | --------------------------------------------------- |
+| `named_funcs`    | rewards capturing more                              |
+| `duplicate_uids` | punishes capturing things that cannot be told apart |
+| `calls`          | form-agnostic, and unmoved by any naming decision   |
+
+`calls` is the honest one when a change is about naming rather than reach: if it holds steady while entity
+counts drop, entities were declined, not lost. That is the argument TypeScript and PHP both used, and it is
+checkable rather than assertable.
+
 ### Known limit: name-bound anonymous forms are not asserted
 
 ADR-0031 category 2 — `var handler = func() {...}`, `$loader = static function () {}` — is an entity, but the
