@@ -196,49 +196,173 @@ def _get_decorator_tags(node: Node) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _extract_calls(
+_TRANSPARENT_CALLEE_WRAPPERS = frozenset({"await_expression", "non_null_expression"})
+"""Nodes that sit between a call and the name it calls without renaming it."""
+
+_NAME_BOUND_FUNCTION_TYPES = frozenset({"arrow_function", "function_expression", "generator_function"})
+"""Anonymous function forms that become entities when bound to a name (ADR-0031)."""
+
+
+def _binding_path(node: Node) -> list[str] | None:
+    """The names a developer would chain to reach *node*, or ``None`` if there are none.
+
+    ``const handlers = {…}`` gives ``["handlers"]`` and ``const cfg = {hooks: {…}}``
+    gives ``["cfg", "hooks"]``. An object in argument position, in an array, or
+    returned inline has no such chain and yields ``None`` — nothing names it, so
+    nothing inside it is nameable through it either.
+    """
+    parts: list[str] = []
+    cur = node
+    while True:
+        parent = cur.parent
+        if parent is None:
+            return None
+        if parent.type in ("variable_declarator", "public_field_definition"):
+            name_node = parent.child_by_field_name("name")
+            # A destructuring pattern binds no single name — and parses as
+            # object_pattern, so it is never the node we walked up from.
+            if name_node is None or name_node.type not in ("identifier", "property_identifier"):
+                return None
+            parts.append(node_text(name_node))
+            parts.reverse()
+            return parts
+        if parent.type != "pair":
+            return None
+        key = parent.child_by_field_name("key")
+        if key is None or key.type not in ("property_identifier", "string"):
+            return None
+        parts.append(node_text(key) if key.type == "property_identifier" else _get_string_content(key))
+        cur = parent.parent
+        if cur is None or cur.type != "object":
+            return None
+
+
+def _object_method_prefix(node: Node, owner_qn: str) -> str | None:
+    """Qualified-name prefix for a ``method_definition`` outside a class body.
+
+    ADR-0031's test is whether a developer has a name for the thing, and the
+    grammar node's spelling is not that test: ``foo({async fetch() {…}})``
+    produces a ``method_definition``, but the method hangs off an anonymous
+    inline object and nothing can refer to it — it is a callback, exactly like
+    the arrow it could have been written as. Only when the enclosing object
+    literal (or anonymous ``class`` expression) is itself bound to a name does
+    the method inherit one, and then it is named through that binding:
+    ``handlers.fetch``.
+
+    ``None`` means unbound, which means no entity.
+    """
+    container = node.parent
+    if container is not None and container.type == "class_body":
+        # A *named* class expression goes through _process_class and never
+        # arrives here; an anonymous one is nameable only via its container.
+        container = container.parent
+    if container is None or container.type not in ("object", "class"):
+        return None
+    path = _binding_path(container)
+    return ".".join([owner_qn, *path]) if path is not None else None
+
+
+def _callee(node: Node | None) -> Node | None:
+    """Strip the wrappers a grammar puts between a call and its callee.
+
+    ``x!()`` wraps the callee in ``non_null_expression``, and with explicit type
+    arguments the TS grammar puts ``await`` *inside* the call —
+    ``await ky.get(u).json<T>()`` parses as
+    ``call_expression(function: await_expression(member_expression))``. Both wrap
+    a name that is still there; ``(fn())()`` and ``obj[key]()`` do not name
+    anything statically and are left unresolved on purpose.
+    """
+    while node is not None and node.type in _TRANSPARENT_CALLEE_WRAPPERS:
+        named = [c for c in node.children if c.is_named]
+        node = named[-1] if named else None
+    return node
+
+
+def _emit_call(node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
+    """Emit the CALLS relationship for one ``call_expression`` or ``new_expression``.
+
+    ``new Foo()`` is a call to ``Foo``, the same edge ``jvm.py`` emits for
+    ``object_creation_expression`` — without it 8% of TypeScript's call nodes
+    have no edge at all.
+    """
+    field = "constructor" if node.type == "new_expression" else "function"
+    target = _callee(node.child_by_field_name(field))
+    if target is None:
+        return
+    if target.type == "identifier":
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=from_qn,
+                rel_type=RelType.CALLS,
+                to_name=node_text(target),
+            )
+        )
+    elif target.type == "member_expression":
+        prop = target.child_by_field_name("property")
+        if prop is not None:
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=from_qn,
+                    rel_type=RelType.CALLS,
+                    to_name=node_text(prop),
+                    properties=call_receiver_props(target.child_by_field_name("object")),
+                )
+            )
+
+
+def _visit(
     node: Node,
+    path: str,
     source: bytes,
-    from_qn: str,
+    project_name: str,
+    owner_qn: str,
+    entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    seen: set[tuple[int, str]],
 ) -> None:
-    """Recursively extract call expressions from a function body."""
+    """Handle one node inside *owner_qn*'s scope, then descend.
+
+    A form that carries a name of its own opens a new scope and is handed to its
+    processor; everything else — an arrow passed as a callback, an object
+    literal, an ``if`` block — is descended into with the scope unchanged, so its
+    calls attribute to the nearest enclosing *named* scope (ADR-0031).
+    """
+    kind = node.type
+    if kind in _SCOPE_BOUNDARY_TYPES:
+        _process_node(node, path, source, project_name, owner_qn, entities, relationships, seen)
+        return
+    if kind == "class" and node.child_by_field_name("name") is not None:
+        # A named class expression: `globalThis.Headers = class Headers {...}`.
+        _process_class(node, path, source, project_name, owner_qn, entities, relationships, seen)
+        return
+    if kind == "method_definition":
+        # An object-literal method — `{async fetch() {...}}`, `{get duplex() {...}}`.
+        # Class bodies are consumed by _process_class_body and never reach here,
+        # except for an anonymous `class {...}` expression.
+        prefix = _object_method_prefix(node, owner_qn)
+        if prefix is not None:
+            _process_method(node, path, source, project_name, owner_qn, entities, relationships, seen, qn_prefix=prefix)
+            return
+        # Unbound: a callback with a method's spelling. No entity, and its calls
+        # belong to the scope that wrote it — the same treatment an arrow gets.
+    if kind in ("call_expression", "new_expression"):
+        _emit_call(node, f"{project_name}:{owner_qn}", relationships)
+    _walk_scope(node, path, source, project_name, owner_qn, entities, relationships, seen)
+
+
+def _walk_scope(
+    node: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    owner_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+    seen: set[tuple[int, str]],
+) -> None:
+    """Visit every child of *node* in *owner_qn*'s scope."""
     for child in node.children:
-        if child.type == "call_expression":
-            func = child.child_by_field_name("function")
-            if func is not None:
-                if func.type == "identifier":
-                    call_name = node_text(func)
-                    relationships.append(
-                        ParsedRelationship(
-                            from_qualified_name=from_qn,
-                            rel_type=RelType.CALLS,
-                            to_name=call_name,
-                        )
-                    )
-                elif func.type == "member_expression":
-                    prop = func.child_by_field_name("property")
-                    if prop is not None:
-                        call_name = node_text(prop)
-                        relationships.append(
-                            ParsedRelationship(
-                                from_qualified_name=from_qn,
-                                rel_type=RelType.CALLS,
-                                to_name=call_name,
-                                properties=call_receiver_props(func.child_by_field_name("object")),
-                            )
-                        )
-        # Recurse but don't descend into nested function/class definitions —
-        # arrow_function IS recursed into: unlike named function/class
-        # declarations, arrow functions passed as callback arguments are never
-        # processed as their own entities, so their calls must attribute to
-        # the enclosing entity or they are silently dropped.
-        if child.type not in (
-            "function_declaration",
-            "class_declaration",
-            "abstract_class_declaration",
-        ):
-            _extract_calls(child, source, from_qn, relationships)
+        _visit(child, path, source, project_name, owner_qn, entities, relationships, seen)
 
 
 def _process_import(
@@ -337,12 +461,12 @@ def _process_class(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
 ) -> None:
-    """Process a class_declaration or abstract_class_declaration node."""
+    """Process a class_declaration, abstract_class_declaration, or named class expression."""
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
@@ -355,7 +479,7 @@ def _process_class(
         return
     seen.add(key)
 
-    qn = f"{module_qn}.{name}"
+    qn = f"{owner_qn}.{name}"
     docstring = _extract_jsdoc_from_export(node, source)
     tags = _get_decorator_tags(node)
 
@@ -381,10 +505,10 @@ def _process_class(
         )
     )
 
-    # DEFINES relationship from module -> class
+    # DEFINES relationship from the enclosing scope -> class
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
+            from_qualified_name=f"{project_name}:{owner_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -395,7 +519,7 @@ def _process_class(
     # Process class body
     body = node.child_by_field_name("body")
     if body is not None:
-        _process_class_body(body, path, source, project_name, module_qn, qn, entities, relationships, seen)
+        _process_class_body(body, path, source, project_name, qn, entities, relationships, seen)
 
 
 def _process_class_body(
@@ -403,7 +527,6 @@ def _process_class_body(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
     class_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
@@ -412,11 +535,11 @@ def _process_class_body(
     """Process members of a class body."""
     for child in body.children:
         if child.type == "method_definition":
-            _process_method(child, path, source, project_name, module_qn, class_qn, entities, relationships, seen)
+            _process_method(child, path, source, project_name, class_qn, entities, relationships, seen)
         elif child.type == "abstract_method_signature":
-            _process_abstract_method(child, path, source, project_name, module_qn, class_qn, entities, relationships)
+            _process_abstract_method(child, path, project_name, class_qn, entities, relationships)
         elif child.type == "public_field_definition":
-            _process_class_field(child, path, project_name, module_qn, class_qn, entities, relationships, seen)
+            _process_class_field(child, path, source, project_name, class_qn, entities, relationships, seen)
 
 
 def _process_method(
@@ -424,13 +547,20 @@ def _process_method(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,  # noqa: ARG001
-    class_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    *,
+    qn_prefix: str | None = None,
 ) -> None:
-    """Process a method_definition in a class body."""
+    """Process a method_definition — a class member, or a bound object-literal method.
+
+    ``qn_prefix`` names the method when the thing that owns it is not the thing
+    that declares it: an object literal held by ``const handlers`` is named
+    ``handlers.fetch``, but it is the enclosing *scope* that defines it, since
+    the binding itself may be a local with no node of its own.
+    """
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
@@ -465,7 +595,7 @@ def _process_method(
 
     docstring = _extract_jsdoc(node, source)
     signature = _extract_signature(node, source)
-    qn = f"{class_qn}.{name}"
+    qn = f"{qn_prefix or owner_qn}.{name}"
 
     entities.append(
         ParsedEntity(
@@ -484,10 +614,10 @@ def _process_method(
         )
     )
 
-    # DEFINES relationship from class -> method
+    # DEFINES relationship from the owning class (or enclosing scope) -> method
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{class_qn}",
+            from_qualified_name=f"{project_name}:{owner_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -496,18 +626,14 @@ def _process_method(
     # Extract USES_TYPE from parameter/return type annotations
     _extract_type_refs_ts(node, f"{project_name}:{qn}", relationships)
 
-    # Extract CALLS from method body
-    body = node.child_by_field_name("body")
-    if body is not None:
-        _extract_calls(body, source, f"{project_name}:{qn}", relationships)
+    # CALLS from the whole method, so a default parameter value counts too
+    _walk_scope(node, path, source, project_name, qn, entities, relationships, seen)
 
 
 def _process_abstract_method(
     node: Node,
     path: str,
-    source: bytes,  # noqa: ARG001
     project_name: str,
-    module_qn: str,  # noqa: ARG001
     class_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
@@ -552,8 +678,8 @@ def _process_abstract_method(
 def _process_class_field(
     node: Node,
     path: str,
+    source: bytes,
     project_name: str,
-    module_qn: str,  # noqa: ARG001
     class_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
@@ -597,13 +723,19 @@ def _process_class_field(
         )
     )
 
+    # A field initialiser runs when the class is constructed, so its calls — and
+    # any callback it installs — belong to the class.
+    value_node = node.child_by_field_name("value")
+    if value_node is not None:
+        _visit(value_node, path, source, project_name, class_qn, entities, relationships, seen)
+
 
 def _process_interface(
     node: Node,
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
@@ -621,7 +753,7 @@ def _process_interface(
         return
     seen.add(key)
 
-    qn = f"{module_qn}.{name}"
+    qn = f"{owner_qn}.{name}"
     docstring = _extract_jsdoc_from_export(node, source)
     tags: list[str] = []
     if _is_exported(node):
@@ -644,7 +776,7 @@ def _process_interface(
 
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
+            from_qualified_name=f"{project_name}:{owner_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -658,7 +790,7 @@ def _process_enum(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
@@ -676,7 +808,7 @@ def _process_enum(
         return
     seen.add(key)
 
-    qn = f"{module_qn}.{name}"
+    qn = f"{owner_qn}.{name}"
     docstring = _extract_jsdoc_from_export(node, source)
     tags: list[str] = []
     if _is_exported(node):
@@ -699,7 +831,7 @@ def _process_enum(
 
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
+            from_qualified_name=f"{project_name}:{owner_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -746,7 +878,7 @@ def _process_type_alias(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
@@ -764,7 +896,7 @@ def _process_type_alias(
         return
     seen.add(key)
 
-    qn = f"{module_qn}.{name}"
+    qn = f"{owner_qn}.{name}"
     docstring = _extract_jsdoc_from_export(node, source)
     tags: list[str] = []
     if _is_exported(node):
@@ -788,7 +920,7 @@ def _process_type_alias(
 
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
+            from_qualified_name=f"{project_name}:{owner_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -800,12 +932,17 @@ def _process_function(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
 ) -> None:
-    """Process a function_declaration node."""
+    """Process a function_declaration or generator_function_declaration node.
+
+    Nested declarations reach here too — ``owner_qn`` is then the enclosing
+    function rather than the module, so ``function abortHandler()`` declared
+    inside ``delay`` is named ``…delay.abortHandler``.
+    """
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return
@@ -818,7 +955,7 @@ def _process_function(
         return
     seen.add(key)
 
-    qn = f"{module_qn}.{name}"
+    qn = f"{owner_qn}.{name}"
     docstring = _extract_jsdoc_from_export(node, source)
     signature = _extract_signature(node, source)
     tags: list[str] = []
@@ -851,7 +988,7 @@ def _process_function(
 
     relationships.append(
         ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
+            from_qualified_name=f"{project_name}:{owner_qn}",
             rel_type=RelType.DEFINES,
             to_name=f"{project_name}:{qn}",
         )
@@ -860,10 +997,8 @@ def _process_function(
     # Extract USES_TYPE from parameter/return type annotations
     _extract_type_refs_ts(node, f"{project_name}:{qn}", relationships)
 
-    # CALLS from function body
-    body = node.child_by_field_name("body")
-    if body is not None:
-        _extract_calls(body, source, f"{project_name}:{qn}", relationships)
+    # CALLS from the whole declaration, so a default parameter value counts too
+    _walk_scope(node, path, source, project_name, qn, entities, relationships, seen)
 
 
 def _process_lexical_declaration(
@@ -871,14 +1006,14 @@ def _process_lexical_declaration(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
     *,
     is_exported: bool = False,
 ) -> None:
-    """Process a lexical_declaration (const/let) node at module level."""
+    """Process a lexical_declaration (const/let) node."""
     # Determine const vs let
     is_const = False
     for child in node.children:
@@ -894,7 +1029,7 @@ def _process_lexical_declaration(
                 path,
                 source,
                 project_name,
-                module_qn,
+                owner_qn,
                 entities,
                 relationships,
                 seen,
@@ -908,14 +1043,14 @@ def _process_variable_declaration(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
     *,
     is_exported: bool = False,
 ) -> None:
-    """Process a variable_declaration (var) node at module level."""
+    """Process a variable_declaration (var) node."""
     for child in node.children:
         if child.type == "variable_declarator":
             _process_variable_declarator(
@@ -924,7 +1059,7 @@ def _process_variable_declaration(
                 path,
                 source,
                 project_name,
-                module_qn,
+                owner_qn,
                 entities,
                 relationships,
                 seen,
@@ -939,7 +1074,7 @@ def _process_variable_declarator(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
@@ -947,24 +1082,33 @@ def _process_variable_declarator(
     is_const: bool,
     is_exported: bool,
 ) -> None:
-    """Process a single variable_declarator within a lexical/variable declaration."""
+    """Process a single variable_declarator within a lexical/variable declaration.
+
+    Three outcomes, in the order the checks run:
+
+    * bound to a function form — a Callable, wherever the declaration sits. The
+      grammar calls the value anonymous; the codebase calls it by the binding
+      (ADR-0031 category 2).
+    * bound to anything else at module scope — a Value, as before.
+    * anything else — no entity. A local ``const`` is not worth a graph node,
+      but its initialiser still runs, so the tail below walks it either way.
+    """
     name_node = node.child_by_field_name("name")
-    if name_node is None or name_node.type != "identifier":
-        return
-    name = node_text(name_node)
     value_node = node.child_by_field_name("value")
+    name = node_text(name_node) if name_node is not None and name_node.type == "identifier" else None
 
     line_start = parent_decl.start_point[0] + 1
     line_end = parent_decl.end_point[0] + 1
 
-    key = (line_start, name)
-    if key in seen:
+    if name is None or (line_start, name) in seen:
+        # A destructuring pattern names no single thing, and a re-declaration is
+        # already recorded — but the initialiser's calls are still made.
+        _walk_value(node, path, source, project_name, owner_qn, entities, relationships, seen)
         return
-    seen.add(key)
+    seen.add((line_start, name))
 
-    # Check if value is an arrow function → treat as function
-    if value_node is not None and value_node.type == "arrow_function":
-        qn = f"{module_qn}.{name}"
+    if value_node is not None and value_node.type in _NAME_BOUND_FUNCTION_TYPES:
+        qn = f"{owner_qn}.{name}"
         docstring = _extract_jsdoc_from_export(parent_decl, source)
         signature = _extract_signature(value_node, source)
         # Prepend the name to the signature for readability
@@ -1000,50 +1144,71 @@ def _process_variable_declarator(
 
         relationships.append(
             ParsedRelationship(
-                from_qualified_name=f"{project_name}:{module_qn}",
+                from_qualified_name=f"{project_name}:{owner_qn}",
                 rel_type=RelType.DEFINES,
                 to_name=f"{project_name}:{qn}",
             )
         )
 
-        # Extract USES_TYPE from arrow function type annotations
+        # Extract USES_TYPE from the function's type annotations
         _extract_type_refs_ts(value_node, f"{project_name}:{qn}", relationships)
 
-        # Extract CALLS from arrow function body
-        body = value_node.child_by_field_name("body")
-        if body is not None:
-            _extract_calls(body, source, f"{project_name}:{qn}", relationships)
+        # CALLS from the function itself, which now owns everything inside it
+        _walk_scope(value_node, path, source, project_name, qn, entities, relationships, seen)
         return
 
-    # Regular value (const/let/var)
-    qn = f"{module_qn}.{name}"
-    kind = ValueKind.CONSTANT if is_const else ValueKind.VARIABLE
-    tags_val: list[str] = []
-    if is_exported:
-        tags_val.append("exported")
+    if _at_module_scope(parent_decl):
+        qn = f"{owner_qn}.{name}"
+        kind = ValueKind.CONSTANT if is_const else ValueKind.VARIABLE
+        tags_val: list[str] = []
+        if is_exported:
+            tags_val.append("exported")
 
-    entities.append(
-        ParsedEntity(
-            name=name,
-            qualified_name=f"{project_name}:{qn}",
-            label=NodeLabel.VALUE,
-            kind=kind,
-            line_start=line_start,
-            line_end=line_end,
-            file_path=path,
-            source=node_text(parent_decl),
-            visibility=Visibility.PUBLIC,
-            tags=tags_val,
+        entities.append(
+            ParsedEntity(
+                name=name,
+                qualified_name=f"{project_name}:{qn}",
+                label=NodeLabel.VALUE,
+                kind=kind,
+                line_start=line_start,
+                line_end=line_end,
+                file_path=path,
+                source=node_text(parent_decl),
+                visibility=Visibility.PUBLIC,
+                tags=tags_val,
+            )
         )
-    )
 
-    relationships.append(
-        ParsedRelationship(
-            from_qualified_name=f"{project_name}:{module_qn}",
-            rel_type=RelType.DEFINES,
-            to_name=f"{project_name}:{qn}",
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{owner_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qn}",
+            )
         )
-    )
+
+    _walk_value(node, path, source, project_name, owner_qn, entities, relationships, seen)
+
+
+def _walk_value(
+    declarator: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    owner_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+    seen: set[tuple[int, str]],
+) -> None:
+    """Walk a declarator's initialiser, attributing its calls to *owner_qn*.
+
+    An initialiser that is not itself a function runs in the scope that declares
+    it — ``const x = compute()`` at module scope is a call the module makes, and
+    ``export const supports = (() => {…})()`` is a whole IIFE of them.
+    """
+    value_node = declarator.child_by_field_name("value")
+    if value_node is not None:
+        _visit(value_node, path, source, project_name, owner_qn, entities, relationships, seen)
 
 
 # ---------------------------------------------------------------------------
@@ -1147,11 +1312,30 @@ _DECLARATION_TYPES = frozenset(
         "enum_declaration",
         "type_alias_declaration",
         "function_declaration",
+        "generator_function_declaration",
         "lexical_declaration",
         "variable_declaration",
         "import_statement",
     }
 )
+
+# What _visit hands to _process_node instead of walking through. Every one of
+# these carries its own name, so it opens a scope; anything else is transparent
+# and its calls belong to whatever encloses it.
+_SCOPE_BOUNDARY_TYPES = _DECLARATION_TYPES | {"export_statement"}
+
+
+def _at_module_scope(node: Node) -> bool:
+    """Is *node* a statement of the program itself, rather than of some body?
+
+    Only these declare something the module owns. A ``const`` inside a function
+    (or inside a top-level ``if``) is a local: walked for its calls, but not
+    worth a graph node of its own.
+    """
+    parent = node.parent
+    if parent is not None and parent.type == "export_statement":
+        parent = parent.parent
+    return parent is not None and parent.type == "program"
 
 
 def _process_export_statement(
@@ -1159,7 +1343,7 @@ def _process_export_statement(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
@@ -1172,7 +1356,7 @@ def _process_export_statement(
             path,
             source,
             project_name,
-            module_qn,
+            owner_qn,
             entities,
             relationships,
             seen,
@@ -1186,7 +1370,7 @@ def _process_export_statement(
     if source_node is not None:
         relationships.append(
             ParsedRelationship(
-                from_qualified_name=f"{project_name}:{module_qn}",
+                from_qualified_name=f"{project_name}:{owner_qn}",
                 rel_type=RelType.IMPORTS,
                 to_name=_get_string_content(source_node),
             )
@@ -1200,12 +1384,16 @@ def _process_export_statement(
                 path,
                 source,
                 project_name,
-                module_qn,
+                owner_qn,
                 entities,
                 relationships,
                 seen,
                 is_exported=True,
             )
+        else:
+            # `export default <expression>` declares nothing, but the expression
+            # is real code — an arrow, a call, an object full of methods.
+            _visit(child, path, source, project_name, owner_qn, entities, relationships, seen)
 
 
 def _process_node(
@@ -1213,16 +1401,16 @@ def _process_node(
     path: str,
     source: bytes,
     project_name: str,
-    module_qn: str,
+    owner_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
     *,
     is_exported: bool = False,
 ) -> None:
-    """Dispatch processing for a single top-level node."""
+    """Dispatch processing for one declaration inside *owner_qn*'s scope."""
     node_type = node.type
-    args = (node, path, source, project_name, module_qn, entities, relationships, seen)
+    args = (node, path, source, project_name, owner_qn, entities, relationships, seen)
 
     if node_type == "export_statement":
         _process_export_statement(*args)
@@ -1234,14 +1422,16 @@ def _process_node(
         _process_enum(*args)
     elif node_type == "type_alias_declaration":
         _process_type_alias(*args)
-    elif node_type == "function_declaration":
+    elif node_type in ("function_declaration", "generator_function_declaration"):
         _process_function(*args)
     elif node_type == "lexical_declaration":
         _process_lexical_declaration(*args, is_exported=is_exported)
     elif node_type == "variable_declaration":
         _process_variable_declaration(*args, is_exported=is_exported)
     elif node_type == "import_statement":
-        _process_import(node, project_name, module_qn, relationships)
+        # An import statement only ever appears at the top level, so the scope
+        # that owns it is the module.
+        _process_import(node, project_name, owner_qn, relationships)
 
 
 # ---------------------------------------------------------------------------
@@ -1281,9 +1471,10 @@ def _parse_typescript(
         )
     )
 
-    # Walk top-level children
-    for child in root.children:
-        _process_node(child, path, source, project_name, module_qn, entities, relationships, seen)
+    # Walk the whole tree. The module owns every call that no named callable
+    # encloses — import-time work, test-file setup, an IIFE's insides — which on
+    # a real codebase is 9% of all call sites (ADR-0031).
+    _walk_scope(root, path, source, project_name, module_qn, entities, relationships, seen)
 
     return ParsedFile(
         file_path=path,

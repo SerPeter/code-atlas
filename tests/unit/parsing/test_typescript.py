@@ -1151,3 +1151,390 @@ def test_other_salesforce_pseudo_modules_are_left_alone():
 
 def test_ordinary_imports_are_unaffected():
     assert _lwc_imports("import { LightningElement } from 'lwc';\n") == {"lwc"}
+
+
+# ---------------------------------------------------------------------------
+# Scope walking: every call reaches a named owner (ADR-0031)
+#
+# Measured on sindresorhus/ky before this existed: 22.9% of the named function
+# forms became entities and 8.5% of the call nodes became edges, because the
+# walker only ever looked at the program's direct children.
+# ---------------------------------------------------------------------------
+
+
+def _calls_from(parsed: ParsedFile, from_qn_suffix: str) -> set[str]:
+    return {r.to_name for r in _rels_from(parsed, from_qn_suffix, RelType.CALLS)}
+
+
+def _callable_names(parsed: ParsedFile) -> set[str]:
+    return {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+
+
+def test_module_scope_calls_belong_to_the_module():
+    """Import-time work is nobody's function, so it used to be nobody's edge."""
+    parsed = _parse("""\
+setupGlobals();
+const config = loadConfig();
+""")
+    assert _calls_from(parsed, "src.example") == {"setupGlobals", "loadConfig"}
+
+
+def test_calls_in_a_module_level_callback_attribute_to_the_module():
+    parsed = _parse("""\
+items.forEach((item) => {
+  doWork(item);
+});
+""")
+    assert _calls_from(parsed, "src.example") == {"forEach", "doWork"}
+
+
+def test_a_module_level_callback_gets_no_entity():
+    """Category 3 is edges-only: an anonymous arrow must not inflate the node count."""
+    parsed = _parse("""\
+items.forEach((item) => {
+  doWork(item);
+});
+""")
+    assert _callable_names(parsed) == set()
+
+
+def test_object_literal_method_is_an_entity():
+    parsed = _parse("""\
+const handlers = {
+  async fetch(request) {
+    return send(request);
+  },
+  get duplex() {
+    return this.mode;
+  },
+};
+""")
+    fetch = _entity_by_name(parsed, "fetch")
+    assert fetch.label == NodeLabel.CALLABLE
+    assert fetch.kind == CallableKind.METHOD
+    assert "async" in fetch.tags
+    # Named through the binding, because that is how a developer reaches it.
+    assert fetch.qualified_name == f"{PROJECT}:src.example.handlers.fetch"
+    assert _entity_by_name(parsed, "duplex").label == NodeLabel.CALLABLE
+
+
+def test_object_literal_method_is_named_through_a_nested_property_chain():
+    parsed = _parse("""\
+const config = {
+  hooks: {
+    beforeRequest(request) {
+      return tag(request);
+    },
+  },
+};
+""")
+    beforerequest = _entity_by_name(parsed, "beforeRequest")
+    assert beforerequest.qualified_name == f"{PROJECT}:src.example.config.hooks.beforeRequest"
+
+
+def test_object_literal_method_owns_its_own_calls():
+    parsed = _parse("""\
+const handlers = {
+  async fetch(request) {
+    return send(request);
+  },
+};
+""")
+    assert _calls_from(parsed, "src.example.handlers.fetch") == {"send"}
+    # ...and the enclosing scope is not credited with them.
+    assert "send" not in _calls_from(parsed, "src.example")
+
+
+def test_object_literal_method_in_argument_position_gets_no_entity():
+    """The shape ky uses 179 times. It is spelled `method_definition`, but the object it
+    hangs off is an anonymous argument, so no name reaches it — it is a callback, and
+    ADR-0031's test is the name, not the grammar node."""
+    parsed = _parse("""\
+test('retries', async t => {
+  await ky('https://x.invalid', {
+    async fetch(request) {
+      return stub(request);
+    },
+  });
+});
+""")
+    assert _callable_names(parsed) == set()
+    assert _calls_from(parsed, "src.example") == {"test", "ky", "stub"}
+
+
+def test_repeated_unbound_object_methods_do_not_collide_on_one_uid():
+    """Two callbacks of the same shape must not merge into one node. A positive
+    assertion cannot catch this — the entity 'exists' either way, and the second
+    silently overwrites the first at upsert time."""
+    parsed = _parse("""\
+test('one', async t => {
+  await ky(url, {async fetch(r) { return first(r); }});
+});
+test('two', async t => {
+  await ky(url, {async fetch(r) { return second(r); }});
+});
+""")
+    qns = [e.qualified_name for e in parsed.entities]
+    assert len(qns) == len(set(qns)), f"duplicate uid: {sorted(qns)}"
+    # Both bodies still reach the graph, attributed upward.
+    assert {"first", "second"} <= _calls_from(parsed, "src.example")
+
+
+def test_two_bound_objects_with_the_same_method_name_stay_distinct():
+    parsed = _parse("""\
+const alpha = {run() { one(); }};
+const beta = {run() { two(); }};
+""")
+    qns = [e.qualified_name for e in parsed.entities]
+    assert len(qns) == len(set(qns)), f"duplicate uid: {sorted(qns)}"
+    assert _calls_from(parsed, "src.example.alpha.run") == {"one"}
+    assert _calls_from(parsed, "src.example.beta.run") == {"two"}
+
+
+def test_object_method_on_a_class_field_is_named_through_the_field():
+    parsed = _parse("""\
+class Widget {
+  handlers = {
+    refresh() {
+      redraw();
+    },
+  };
+}
+""")
+    refresh = _entity_by_name(parsed, "refresh")
+    assert refresh.qualified_name == f"{PROJECT}:src.example.Widget.handlers.refresh"
+
+
+def test_method_on_an_inline_returned_object_gets_no_entity():
+    """`(request) => ({get headers() {...}})` — the object is a return value, not a
+    binding, so `headers` is reachable only through whatever the caller does with it."""
+    parsed = _parse("""\
+const createRequestLike = (request) => ({
+  get headers() {
+    return request.headers;
+  },
+});
+""")
+    assert _callable_names(parsed) == {"createRequestLike"}
+
+
+def test_nested_function_declaration_is_named_after_its_enclosing_function():
+    parsed = _parse("""\
+export function delay(ms) {
+  return new Promise((resolve, reject) => {
+    function abortHandler() {
+      clearTimeout(timeoutId);
+    }
+    signal.addEventListener('abort', abortHandler);
+  });
+}
+""")
+    handler = _entity_by_name(parsed, "abortHandler")
+    assert handler.label == NodeLabel.CALLABLE
+    assert handler.qualified_name == f"{PROJECT}:src.example.delay.abortHandler"
+    assert _calls_from(parsed, "src.example.delay.abortHandler") == {"clearTimeout"}
+    # The nested body's calls are the nested function's, not delay's.
+    assert "clearTimeout" not in _calls_from(parsed, "src.example.delay")
+
+
+def test_arrow_bound_to_a_local_const_is_an_entity():
+    parsed = _parse("""\
+test('decodes', async t => {
+  const customFetch = async () => {
+    return build();
+  };
+  await use(customFetch);
+});
+""")
+    fn = _entity_by_name(parsed, "customFetch")
+    assert fn.label == NodeLabel.CALLABLE
+    assert fn.kind == CallableKind.FUNCTION
+    assert _calls_from(parsed, "src.example.customFetch") == {"build"}
+
+
+def test_a_local_const_holding_a_plain_value_gets_no_entity():
+    """Only module-level bindings are worth a node; a local would be one per line."""
+    parsed = _parse("""\
+function outer() {
+  const scratch = 41;
+  return scratch;
+}
+""")
+    assert [e.name for e in parsed.entities if e.name == "scratch"] == []
+
+
+def test_a_local_const_initialiser_still_reports_its_calls():
+    parsed = _parse("""\
+function outer() {
+  const value = compute();
+  return value;
+}
+""")
+    assert _calls_from(parsed, "src.example.outer") == {"compute"}
+
+
+def test_destructured_binding_gets_no_entity_but_keeps_its_calls():
+    parsed = _parse("const {alpha, beta} = loadPair();\n")
+    assert _callable_names(parsed) == set()
+    assert _calls_from(parsed, "src.example") == {"loadPair"}
+
+
+def test_iife_body_calls_belong_to_the_module():
+    """`export const x = (() => {...})()` — the shape ky opens constants.ts with."""
+    parsed = _parse("""\
+export const supported = (() => {
+  probeFeature();
+  return true;
+})();
+""")
+    assert _calls_from(parsed, "src.example") == {"probeFeature"}
+    assert _entity_by_name(parsed, "supported").label == NodeLabel.VALUE
+
+
+def test_new_expression_is_a_call():
+    parsed = _parse("""\
+function build() {
+  return new Widget(1);
+}
+""")
+    assert _calls_from(parsed, "src.example.build") == {"Widget"}
+
+
+def test_new_expression_on_a_namespace_records_the_receiver():
+    parsed = _parse("""\
+function build() {
+  return new globalThis.Request('https://x.invalid');
+}
+""")
+    rels = _rels_from(parsed, "src.example.build", RelType.CALLS)
+    assert [(r.to_name, r.properties.get("receiver")) for r in rels] == [("Request", "globalThis")]
+
+
+def test_awaited_call_with_type_arguments_still_names_its_callee():
+    """With explicit type arguments the grammar puts `await` *inside* the call, so the
+    callee sits one hop further down than it does for `await ky.get(u).json()`."""
+    parsed = _parse("""\
+async function run() {
+  return await ky.get(url).json<Payload>();
+}
+""")
+    assert "json" in _calls_from(parsed, "src.example.run")
+
+
+def test_non_null_assertion_before_a_call_still_names_its_callee():
+    parsed = _parse("""\
+function run() {
+  return options.parseJson!(text);
+}
+""")
+    assert "parseJson" in _calls_from(parsed, "src.example.run")
+
+
+def test_generator_function_declaration_is_an_entity():
+    parsed = _parse("""\
+function* pages() {
+  yield fetchPage();
+}
+""")
+    gen = _entity_by_name(parsed, "pages")
+    assert gen.label == NodeLabel.CALLABLE
+    assert _calls_from(parsed, "src.example.pages") == {"fetchPage"}
+
+
+def test_named_class_expression_is_an_entity_with_its_methods():
+    """`globalThis.Headers = class Headers extends Base {...}` — a real ky test shape."""
+    parsed = _parse("""\
+globalThis.Headers = class Headers extends OriginalHeaders {
+  constructor(init) {
+    super(init);
+    record(init);
+  }
+};
+""")
+    cls = _entity_by_name(parsed, "Headers")
+    assert cls.label == NodeLabel.TYPE_DEF
+    ctor = _entity_by_name(parsed, "constructor")
+    assert ctor.qualified_name == f"{PROJECT}:src.example.Headers.constructor"
+    assert "record" in _calls_from(parsed, "src.example.Headers.constructor")
+
+
+def test_export_default_expression_keeps_its_calls():
+    parsed = _parse("""\
+export default () => {
+  boot();
+};
+""")
+    assert _calls_from(parsed, "src.example") == {"boot"}
+
+
+def test_class_field_initialiser_calls_belong_to_the_class():
+    parsed = _parse("""\
+class Widget {
+  private handler = () => {
+    refresh();
+  };
+}
+""")
+    assert _calls_from(parsed, "src.example.Widget") == {"refresh"}
+
+
+def test_deeply_nested_callbacks_attribute_to_the_nearest_named_scope():
+    """ADR-0031 accepts losing the intermediate structure — but not the edge."""
+    parsed = _parse("""\
+function outer() {
+  a(() => {
+    b(() => {
+      c(() => {
+        deep();
+      });
+    });
+  });
+}
+""")
+    assert _calls_from(parsed, "src.example.outer") == {"a", "b", "c", "deep"}
+
+
+def test_js_scope_walking():
+    """.js/.mjs share this walker, and the JS grammar is a separate grammar object."""
+    if get_language_for_file("src/example.js") is None:
+        pytest.skip("tree-sitter-javascript not installed")
+    parsed = _parse(
+        """\
+register(handler);
+const boot = () => {
+  start();
+};
+module.exports = {
+  run() {
+    go();
+  },
+};
+""",
+        path="src/example.js",
+    )
+    assert _calls_from(parsed, "src.example.boot") == {"start"}
+    # `module.exports = {...}` is an assignment, not a binding this walker names,
+    # so `run` is a callback: no entity, and `go` belongs to the module.
+    assert _calls_from(parsed, "src.example") == {"register", "go"}
+    assert _callable_names(parsed) == {"boot"}
+
+
+def test_js_function_expression_bound_to_a_name_is_an_entity():
+    """`const f = function () {}` is the pre-arrow spelling of the same binding."""
+    if get_language_for_file("src/example.js") is None:
+        pytest.skip("tree-sitter-javascript not installed")
+    parsed = _parse("const legacy = function () {\n  work();\n};\n", path="src/example.js")
+    assert _entity_by_name(parsed, "legacy").label == NodeLabel.CALLABLE
+    assert _calls_from(parsed, "src.example.legacy") == {"work"}
+
+
+def test_tsx_callback_inside_jsx_keeps_its_calls():
+    parsed = _parse(
+        """\
+export function Panel() {
+  return <button onClick={() => track('click')}>go</button>;
+}
+""",
+        path="src/Panel.tsx",
+    )
+    assert "track" in _calls_from(parsed, "src.Panel.Panel")
