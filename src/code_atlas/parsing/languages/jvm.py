@@ -21,6 +21,8 @@ from code_atlas.parsing.ast import (
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind, ValueKind, Visibility
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
+
     from tree_sitter import Node
 
 # ---------------------------------------------------------------------------
@@ -273,10 +275,15 @@ def _normalize_type_text(text: str) -> str:
     return _TYPE_QUALIFIER_RE.sub("", "".join(text.split()))
 
 
-def _overloaded_callable_names(node: Node) -> frozenset[str]:
-    """Names declared by 2+ method/constructor declarations among *node*'s direct children."""
+def _overloaded_callable_names(children: Iterable[Node]) -> frozenset[str]:
+    """Names declared by 2+ method/constructor declarations among *children*.
+
+    Takes the member sequence rather than the container so C# can pass the
+    ``#if``-flattened view (see ``_cs_members``): an overload set split across a
+    conditional-compilation boundary is still one overload set.
+    """
     counts: Counter[str] = Counter()
-    for child in node.children:
+    for child in children:
         if child.type in _OVERLOADABLE_MEMBER_TYPES:
             name_node = child.child_by_field_name("name")
             if name_node is not None:
@@ -338,73 +345,118 @@ def _overload_suffix(node: Node, param_types: str) -> str:
     return f"{tp_text}({param_types})"
 
 
+def _defines_source(parent_qn: str | None, module_qn: str) -> str:
+    """The qn a DEFINES edge should originate from, given a naming scope.
+
+    An anonymous inner class contributes a ``$Base`` segment to the qualified
+    names of the members it declares, but has no node of its own (ADR-0031: no
+    entity for a form with no name a developer could refer to). An edge from
+    that segment would point at nothing, so it is stripped back to the nearest
+    scope that was actually emitted — the enclosing method, field or type.
+    """
+    if parent_qn is None:
+        return module_qn
+    parts = parent_qn.split(".")
+    while parts and parts[-1].startswith("$"):
+        parts.pop()
+    return ".".join(parts) or module_qn
+
+
+# Nodes that own their members' calls themselves, so a containing body must not
+# claim them: a nested declaration is walked separately and gets its own from_qn.
+_CALL_SCOPE_BOUNDARIES: frozenset[str] = frozenset(
+    {
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "record_declaration",
+        "record_struct_declaration",
+        "annotation_type_declaration",
+        "struct_declaration",
+        "method_declaration",
+        "constructor_declaration",
+        # Java: the body of `new Base() { ... }`. Its methods are named and become
+        # entities of their own, so their calls are not the enclosing method's.
+        "class_body",
+        # C# local functions carry a name, so ADR-0031 makes each one an entity.
+        "local_function_statement",
+    }
+)
+
+
+def _emit_call(node: Node, from_qn: str, relationships: list[ParsedRelationship]) -> None:
+    """Emit a CALLS edge if *node* is itself a call or an instantiation."""
+    if node.type in ("method_invocation", "invocation_expression"):
+        # Java: method_invocation has name field or object.method pattern
+        name_node = node.child_by_field_name("name")
+        if name_node is not None:
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=from_qn,
+                    rel_type=RelType.CALLS,
+                    to_name=node_text(name_node),
+                    # Java puts the receiver on the invocation itself.
+                    properties=call_receiver_props(node.child_by_field_name("object")),
+                )
+            )
+            return
+        # Handle C# invocation expressions via function field
+        func = node.child_by_field_name("function")
+        if func is None:
+            return
+        if func.type == "member_access_expression":
+            name_part = func.child_by_field_name("name")
+            if name_part is not None:
+                relationships.append(
+                    ParsedRelationship(
+                        from_qualified_name=from_qn,
+                        rel_type=RelType.CALLS,
+                        to_name=node_text(name_part),
+                        properties=call_receiver_props(func.child_by_field_name("expression")),
+                    )
+                )
+        elif func.type == "identifier":
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=from_qn,
+                    rel_type=RelType.CALLS,
+                    to_name=node_text(func),
+                )
+            )
+        return
+
+    # Java's object creation: `new Foo()`
+    if node.type == "object_creation_expression":
+        type_node = node.child_by_field_name("type")
+        if type_node is not None:
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=from_qn,
+                    rel_type=RelType.CALLS,
+                    to_name=node_text(type_node),
+                )
+            )
+
+
 def _extract_calls(
     node: Node,
     source: bytes,
     from_qn: str,
     relationships: list[ParsedRelationship],
 ) -> None:
-    """Recursively extract call expressions (method_invocation / invocation_expression)."""
+    """Recursively extract call expressions (method_invocation / invocation_expression).
+
+    *node* itself is a candidate, not just its children: a field initializer is
+    handed here as the expression it assigns, and ``Foo f = new Foo();`` passes
+    the ``new`` in as the root. Checking children only dropped every such call.
+
+    Lambdas and anonymous methods are walked *through*, not stopped at: their
+    calls attribute to the nearest enclosing named scope (ADR-0031).
+    """
+    _emit_call(node, from_qn, relationships)
     for child in node.children:
-        if child.type in ("method_invocation", "invocation_expression"):
-            # Java: method_invocation has name field or object.method pattern
-            name_node = child.child_by_field_name("name")
-            if name_node is not None:
-                call_name = node_text(name_node)
-                relationships.append(
-                    ParsedRelationship(
-                        from_qualified_name=from_qn,
-                        rel_type=RelType.CALLS,
-                        to_name=call_name,
-                        # Java puts the receiver on the invocation itself.
-                        properties=call_receiver_props(child.child_by_field_name("object")),
-                    )
-                )
-            else:
-                # Handle C# invocation expressions via function field
-                func = child.child_by_field_name("function")
-                if func is not None:
-                    if func.type == "member_access_expression":
-                        name_part = func.child_by_field_name("name")
-                        if name_part is not None:
-                            relationships.append(
-                                ParsedRelationship(
-                                    from_qualified_name=from_qn,
-                                    rel_type=RelType.CALLS,
-                                    to_name=node_text(name_part),
-                                    properties=call_receiver_props(func.child_by_field_name("expression")),
-                                )
-                            )
-                    elif func.type == "identifier":
-                        relationships.append(
-                            ParsedRelationship(
-                                from_qualified_name=from_qn,
-                                rel_type=RelType.CALLS,
-                                to_name=node_text(func),
-                            )
-                        )
-        # Also handle Java's object creation: `new Foo()`
-        if child.type == "object_creation_expression":
-            type_node = child.child_by_field_name("type")
-            if type_node is not None:
-                relationships.append(
-                    ParsedRelationship(
-                        from_qualified_name=from_qn,
-                        rel_type=RelType.CALLS,
-                        to_name=node_text(type_node),
-                    )
-                )
-        # Recurse but don't descend into nested type/method declarations
-        if child.type not in (
-            "class_declaration",
-            "interface_declaration",
-            "enum_declaration",
-            "record_declaration",
-            "annotation_type_declaration",
-            "struct_declaration",
-            "method_declaration",
-            "constructor_declaration",
-        ):
+        # Recurse but don't descend into nested declarations that own their own calls
+        if child.type not in _CALL_SCOPE_BOUNDARIES:
             _extract_calls(child, source, from_qn, relationships)
 
 
@@ -530,7 +582,7 @@ def _walk_java_node(
     parent_qn: str | None,
 ) -> None:
     """Recursively walk Java AST nodes to extract entities."""
-    overloaded = _overloaded_callable_names(node)
+    overloaded = _overloaded_callable_names(node.children)
     for child in node.children:
         # Type declarations (class, interface, enum, annotation, record)
         if child.type in _JAVA_TYPE_NODES:
@@ -551,19 +603,114 @@ def _walk_java_node(
             )
             continue
 
-        # Fields
-        if child.type == "field_declaration":
+        # Fields. An interface's fields are `constant_declaration`, not
+        # `field_declaration` — same shape, different node type.
+        if child.type in ("field_declaration", "constant_declaration"):
             _process_java_field(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
             continue
 
         # Enum constants
         if child.type == "enum_constant":
-            _process_java_enum_constant(child, path, project_name, module_qn, entities, relationships, parent_qn)
+            _process_java_enum_constant(
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn
+            )
             continue
 
-        # Recurse into class_body, enum_body, interface_body, annotation_type_body
-        if child.type in ("class_body", "enum_body", "interface_body", "annotation_type_body"):
+        # Static and instance initializer blocks run as part of constructing the
+        # type, so what they call is the type's, not nobody's.
+        if child.type in ("static_initializer", "block"):
+            owner = _defines_source(parent_qn, module_qn)
+            _extract_calls(child, source, f"{project_name}:{owner}", relationships)
+            _scan_java_nested(child, path, source, project_name, module_qn, entities, relationships, owner)
+            continue
+
+        # Recurse into class_body, enum_body, interface_body, annotation_type_body.
+        # `enum_body_declarations` holds everything after an enum's constants — its
+        # methods, constructors and nested types were invisible without it.
+        if child.type in (
+            "class_body",
+            "enum_body",
+            "enum_body_declarations",
+            "interface_body",
+            "annotation_type_body",
+        ):
             _walk_java_node(child, path, source, project_name, module_qn, entities, relationships, parent_qn)
+
+
+def _java_anon_scope(node: Node, seen: Counter[str]) -> str:
+    """Naming segment for the anonymous class in ``new Base(...) { ... }``.
+
+    The base type is the only stable handle the source offers — Java's own
+    ``Outer$1`` numbering and any line-derived name churn the uid on every edit
+    above the expression, which a uid may not do. Generics and package
+    qualifiers are dropped so the segment stays a single dot-free token.
+
+    One owner can instantiate the same base twice (``UnsafeAllocator.create``
+    tries four ``new UnsafeAllocator()`` bodies in sequence), so repeats within
+    that owner take a ``$2``, ``$3`` suffix. That counter is source order inside
+    one scope, not a line number: editing anything outside the owner leaves it
+    alone, which is the property ADR-0031 requires of a uid.
+    """
+    type_node = node.child_by_field_name("type")
+    name = "anon"
+    if type_node is not None:
+        text = node_text(type_node).split("<", 1)[0].strip().rsplit(".", 1)[-1].strip()
+        name = text or "anon"
+    seen[name] += 1
+    return f"${name}" if seen[name] == 1 else f"${name}${seen[name]}"
+
+
+def _scan_java_nested(
+    node: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    module_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+    owner_qn: str,
+    seen: Counter[str] | None = None,
+) -> None:
+    """Find named declarations buried inside a Java statement or expression body.
+
+    ``_walk_java_node`` only reaches members of a type body, which leaves three
+    real shapes uncaptured: a local class declared inside a method, a record or
+    class declared inside a lambda, and — the largest by an order of magnitude —
+    the methods of an anonymous inner class. Those methods carry names, so
+    ADR-0031 makes them entities; the class holding them does not, so it
+    contributes a ``$Base`` naming segment and no node.
+
+    *seen* counts anonymous bases already named under this owner and is created
+    per owner, so the disambiguating suffix cannot leak between methods.
+    """
+    if seen is None:
+        seen = Counter()
+
+    if node.type in _JAVA_TYPE_NODES:
+        _process_java_type(node, path, source, project_name, module_qn, entities, relationships, owner_qn)
+        return
+
+    if node.type == "object_creation_expression":
+        body = next((c for c in node.children if c.type == "class_body"), None)
+        if body is not None:
+            _walk_java_node(
+                body,
+                path,
+                source,
+                project_name,
+                module_qn,
+                entities,
+                relationships,
+                parent_qn=f"{owner_qn}.{_java_anon_scope(node, seen)}",
+            )
+        # A second anonymous class can sit in the constructor arguments of the first.
+        args = node.child_by_field_name("arguments")
+        if args is not None:
+            _scan_java_nested(args, path, source, project_name, module_qn, entities, relationships, owner_qn, seen)
+        return
+
+    for child in node.children:
+        _scan_java_nested(child, path, source, project_name, module_qn, entities, relationships, owner_qn, seen)
 
 
 def _process_java_type(
@@ -608,7 +755,7 @@ def _process_java_type(
     )
 
     # DEFINES relationship from parent -> this type
-    parent_full_qn = f"{project_name}:{parent_qn}" if parent_qn else f"{project_name}:{module_qn}"
+    parent_full_qn = f"{project_name}:{_defines_source(parent_qn, module_qn)}"
     relationships.append(
         ParsedRelationship(
             from_qualified_name=parent_full_qn,
@@ -692,7 +839,7 @@ def _process_java_method(
     )
 
     # DEFINES relationship
-    define_from = f"{project_name}:{parent_qn}" if parent_qn else f"{project_name}:{module_qn}"
+    define_from = f"{project_name}:{_defines_source(parent_qn, module_qn)}"
     relationships.append(
         ParsedRelationship(
             from_qualified_name=define_from,
@@ -705,6 +852,7 @@ def _process_java_method(
     body = node.child_by_field_name("body")
     if body is not None:
         _extract_calls(body, source, full_qn, relationships)
+        _scan_java_nested(body, path, source, project_name, module_qn, entities, relationships, qn)
 
 
 def _process_java_constructor(
@@ -752,7 +900,7 @@ def _process_java_constructor(
         )
     )
 
-    define_from = f"{project_name}:{parent_qn}" if parent_qn else f"{project_name}:{module_qn}"
+    define_from = f"{project_name}:{_defines_source(parent_qn, module_qn)}"
     relationships.append(
         ParsedRelationship(
             from_qualified_name=define_from,
@@ -764,25 +912,29 @@ def _process_java_constructor(
     body = node.child_by_field_name("body")
     if body is not None:
         _extract_calls(body, source, full_qn, relationships)
+        _scan_java_nested(body, path, source, project_name, module_qn, entities, relationships, qn)
 
 
 def _process_java_field(
     node: Node,
     path: str,
-    source: bytes,  # noqa: ARG001
+    source: bytes,
     project_name: str,
     module_qn: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     parent_qn: str | None,
 ) -> None:
-    """Process a Java field_declaration."""
+    """Process a Java field_declaration or interface constant_declaration."""
     mod_tags = _extract_modifier_tags(node)
-    is_static = "static" in mod_tags
-    is_final = "final" in mod_tags
+    # An interface's fields are implicitly public static final, and say so by
+    # carrying no modifiers at all.
+    in_interface = node.type == "constant_declaration"
+    is_static = in_interface or "static" in mod_tags
+    is_final = in_interface or "final" in mod_tags
 
     kind = ValueKind.CONSTANT if (is_static and is_final) else ValueKind.FIELD
-    visibility = _extract_visibility(node, default=Visibility.INTERNAL)
+    visibility = _extract_visibility(node, default=Visibility.PUBLIC if in_interface else Visibility.INTERNAL)
     tags = mod_tags + _extract_annotations_java(node)
 
     # field_declaration -> declarator: variable_declarator with name
@@ -813,7 +965,7 @@ def _process_java_field(
                 )
             )
 
-            define_from = f"{project_name}:{parent_qn}" if parent_qn else f"{project_name}:{module_qn}"
+            define_from = f"{project_name}:{_defines_source(parent_qn, module_qn)}"
             relationships.append(
                 ParsedRelationship(
                     from_qualified_name=define_from,
@@ -822,10 +974,20 @@ def _process_java_field(
                 )
             )
 
+            # An initializer runs when the type is constructed or loaded, and it is
+            # where `new Base() { ... }` most often appears — the field is the
+            # nearest named scope, so it owns both the calls and the anonymous
+            # class's members.
+            value = child.child_by_field_name("value")
+            if value is not None:
+                _extract_calls(value, source, full_qn, relationships)
+                _scan_java_nested(value, path, source, project_name, module_qn, entities, relationships, qn)
+
 
 def _process_java_enum_constant(
     node: Node,
     path: str,
+    source: bytes,
     project_name: str,
     module_qn: str,
     entities: list[ParsedEntity],
@@ -856,7 +1018,7 @@ def _process_java_enum_constant(
         )
     )
 
-    define_from = f"{project_name}:{parent_qn}" if parent_qn else f"{project_name}:{module_qn}"
+    define_from = f"{project_name}:{_defines_source(parent_qn, module_qn)}"
     relationships.append(
         ParsedRelationship(
             from_qualified_name=define_from,
@@ -864,6 +1026,16 @@ def _process_java_enum_constant(
             to_name=full_qn,
         )
     )
+
+    # `CONSTANT { ... }` is a per-constant subclass. Its methods are named and the
+    # constant is, so they nest under it rather than needing an anonymous segment.
+    body = node.child_by_field_name("body")
+    if body is not None:
+        _walk_java_node(body, path, source, project_name, module_qn, entities, relationships, parent_qn=qn)
+    args = node.child_by_field_name("arguments")
+    if args is not None:
+        _extract_calls(args, source, full_qn, relationships)
+        _scan_java_nested(args, path, source, project_name, module_qn, entities, relationships, qn)
 
 
 # ---------------------------------------------------------------------------
@@ -941,6 +1113,60 @@ def _extract_csharp_usings(
                     break
 
 
+# `#if` / `#else` / `#elif` are not statements in tree-sitter-c-sharp — everything a
+# region guards is nested *inside* the preproc node. A walker that reads direct
+# children therefore stops at the `#if` and never sees the namespace, type or member
+# behind it, which on Newtonsoft.Json hid 2,777 of 7,339 named declarations.
+_CS_PREPROC_BRANCHES: frozenset[str] = frozenset({"preproc_if", "preproc_else", "preproc_elif"})
+
+
+def _cs_members(node: Node) -> Iterator[Node]:
+    """*node*'s children with conditional-compilation regions flattened away.
+
+    Every branch is walked, not just the first: which one compiles depends on a
+    build configuration the indexer does not have, and a graph of one
+    configuration is the wrong graph for whoever is reading the other.
+    """
+    for child in node.children:
+        if child.type in _CS_PREPROC_BRANCHES:
+            yield from _cs_members(child)
+        else:
+            yield child
+
+
+def _walk_csharp_namespace(
+    node: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    module_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+    parent_qn: str | None,
+    current_ns_qn: str,
+) -> str:
+    """Walk a namespace declaration; return the naming scope its siblings inherit.
+
+    The namespace name folds into a naming prefix for any top-level (non-nested)
+    type declared within. Namespaces have no graph node of their own (unlike
+    Python packages), so DEFINES/parent_qn semantics are unaffected — the module
+    (file) entity stays the structural parent; only the *naming* prefix changes
+    (fixes same-named types in different namespaces colliding on uid).
+    """
+    name_node = node.child_by_field_name("name")
+    ns_name = node_text(name_node) if name_node is not None else None
+    child_ns_qn = f"{current_ns_qn}.{ns_name}" if current_ns_qn and ns_name else (ns_name or current_ns_qn)
+    body = node.child_by_field_name("body")
+    if body is None:
+        # File-scoped namespace ('namespace Foo;', no braces): there is no body
+        # node — the declarations it covers are the remaining siblings, so the
+        # caller extends its scope instead of recursing.
+        return child_ns_qn
+    # Braced namespace: recurse into its own scope only.
+    _walk_csharp_node(body, path, source, project_name, module_qn, entities, relationships, parent_qn, child_ns_qn)
+    return current_ns_qn
+
+
 def _walk_csharp_node(
     node: Node,
     path: str,
@@ -953,31 +1179,14 @@ def _walk_csharp_node(
     namespace_qn: str = "",
 ) -> None:
     """Recursively walk C# AST nodes to extract entities."""
-    overloaded = _overloaded_callable_names(node)
+    members = list(_cs_members(node))
+    overloaded = _overloaded_callable_names(members)
     current_ns_qn = namespace_qn
-    for child in node.children:
-        # Namespace declarations — fold the namespace name into a naming prefix for
-        # any top-level (non-nested) type declared within. Namespaces have no
-        # graph node of their own (unlike Python packages), so DEFINES/parent_qn
-        # semantics are unaffected — the module (file) entity stays the structural
-        # parent; only the *naming* prefix changes (fixes same-named types in
-        # different namespaces colliding on uid).
+    for child in members:
         if child.type in ("namespace_declaration", "file_scoped_namespace_declaration"):
-            name_node = child.child_by_field_name("name")
-            ns_name = node_text(name_node) if name_node is not None else None
-            child_ns_qn = f"{current_ns_qn}.{ns_name}" if current_ns_qn and ns_name else (ns_name or current_ns_qn)
-            body = child.child_by_field_name("body")
-            if body is not None:
-                # Braced namespace: recurse into its own scope only.
-                _walk_csharp_node(
-                    body, path, source, project_name, module_qn, entities, relationships, parent_qn, child_ns_qn
-                )
-            else:
-                # File-scoped namespace ('namespace Foo;', no braces): there is no
-                # body node — the declarations it covers are the remaining
-                # siblings in this same node, so extend scope for the rest of
-                # this loop instead of recursing.
-                current_ns_qn = child_ns_qn
+            current_ns_qn = _walk_csharp_namespace(
+                child, path, source, project_name, module_qn, entities, relationships, parent_qn, current_ns_qn
+            )
             continue
 
         # Type declarations
@@ -1021,11 +1230,118 @@ def _walk_csharp_node(
             _process_csharp_enum_member(child, path, project_name, module_qn, entities, relationships, parent_qn)
             continue
 
+        # Operators, conversions and indexers get no entity of their own, but their
+        # bodies are full of calls. The nearest named scope enclosing them is the
+        # type, so that is where those calls belong (ADR-0031).
+        if child.type in (
+            "operator_declaration",
+            "conversion_operator_declaration",
+            "indexer_declaration",
+            "event_declaration",
+        ):
+            _extract_calls(child, source, f"{project_name}:{parent_qn or module_qn}", relationships)
+            continue
+
         # Recurse into declaration_list and similar containers
         if child.type in ("declaration_list", "global_statement"):
             _walk_csharp_node(
                 child, path, source, project_name, module_qn, entities, relationships, parent_qn, current_ns_qn
             )
+
+
+# A C# declaration can never be named with a reserved word, so one that is did not
+# come from a declaration. tree-sitter-c-sharp recovers `else if (x) { ... }` at the
+# head of a `#if` branch as a local_function_statement returning `else` and named
+# `if` — 15 times across Newtonsoft.Json (DictionaryWrapper.cs:131, JsonArrayContract
+# .cs:189, IsoDateTimeConverter.cs:94, ...). Emitting those raises the measured
+# capture rate while putting Callables named `if` in the graph, which is worse than
+# the miss.
+_CS_RESERVED_NAMES: frozenset[str] = frozenset(
+    {
+        "if",
+        "else",
+        "for",
+        "foreach",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "try",
+        "catch",
+        "finally",
+        "return",
+        "lock",
+        "using",
+        "fixed",
+        "checked",
+        "unchecked",
+    }
+)
+
+
+def _scan_csharp_local_functions(
+    node: Node,
+    path: str,
+    source: bytes,
+    project_name: str,
+    module_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+    owner_qn: str,
+) -> None:
+    """Emit entities for the ``local_function_statement`` nodes inside a body.
+
+    A C# local function has a name callers in that scope use, so ADR-0031 makes
+    it an entity — the same treatment Python's nested ``def`` already gets. It
+    nests under the callable that declares it, and its own body is scanned in
+    turn, so ``Outer.Inner.Innermost`` falls out of the recursion.
+    """
+    for child in node.children:
+        if child.type in _CS_TYPE_NODES or child.type == "method_declaration":
+            continue
+        if child.type == "local_function_statement":
+            name_node = child.child_by_field_name("name")
+            name = node_text(name_node) if name_node is not None else ""
+            if not name or name in _CS_RESERVED_NAMES:
+                # Not a declaration — a recovered statement. It still holds real
+                # calls, and `_extract_calls` will not enter it on the owner's
+                # behalf (local_function_statement is a call-scope boundary), so
+                # attribute them here before moving on.
+                _extract_calls(child, source, f"{project_name}:{owner_qn}", relationships)
+                _scan_csharp_local_functions(
+                    child, path, source, project_name, module_qn, entities, relationships, owner_qn
+                )
+                continue
+            qn = f"{owner_qn}.{name}"
+            full_qn = f"{project_name}:{qn}"
+            entities.append(
+                ParsedEntity(
+                    name=name,
+                    qualified_name=full_qn,
+                    label=NodeLabel.CALLABLE,
+                    kind=CallableKind.FUNCTION,
+                    line_start=child.start_point[0] + 1,
+                    line_end=child.end_point[0] + 1,
+                    file_path=path,
+                    signature=_extract_signature_from_node(child, source),
+                    source=node_text(child),
+                    visibility=Visibility.PRIVATE,
+                    tags=_extract_modifier_tags(child),
+                )
+            )
+            relationships.append(
+                ParsedRelationship(
+                    from_qualified_name=f"{project_name}:{owner_qn}",
+                    rel_type=RelType.DEFINES,
+                    to_name=full_qn,
+                )
+            )
+            body = child.child_by_field_name("body")
+            if body is not None:
+                _extract_calls(body, source, full_qn, relationships)
+                _scan_csharp_local_functions(body, path, source, project_name, module_qn, entities, relationships, qn)
+            continue
+        _scan_csharp_local_functions(child, path, source, project_name, module_qn, entities, relationships, owner_qn)
 
 
 def _process_csharp_type(
@@ -1199,6 +1515,7 @@ def _process_csharp_method(
     body = node.child_by_field_name("body")
     if body is not None:
         _extract_calls(body, source, full_qn, relationships)
+        _scan_csharp_local_functions(body, path, source, project_name, module_qn, entities, relationships, qn)
 
 
 def _process_csharp_constructor(
@@ -1255,9 +1572,12 @@ def _process_csharp_constructor(
         )
     )
 
+    # A constructor's initializer (`: base(...)` / `: this(...)`) is a call, and it
+    # sits outside the body — scanning the whole node covers both.
+    _extract_calls(node, source, full_qn, relationships)
     body = node.child_by_field_name("body")
     if body is not None:
-        _extract_calls(body, source, full_qn, relationships)
+        _scan_csharp_local_functions(body, path, source, project_name, module_qn, entities, relationships, qn)
 
 
 def _process_csharp_destructor(
@@ -1306,6 +1626,10 @@ def _process_csharp_destructor(
             to_name=full_qn,
         )
     )
+
+    body = node.child_by_field_name("body")
+    if body is not None:
+        _extract_calls(body, source, full_qn, relationships)
 
 
 def _process_csharp_property(
@@ -1358,11 +1682,16 @@ def _process_csharp_property(
         )
     )
 
+    # A property is already a Callable here, so its accessors' calls have an owner
+    # to attribute to. Scanning the whole node also picks up an expression body
+    # (`=> Foo()`) and an initializer, both of which live outside `accessor_list`.
+    _extract_calls(node, source, full_qn, relationships)
+
 
 def _process_csharp_field(
     node: Node,
     path: str,
-    source: bytes,  # noqa: ARG001
+    source: bytes,
     project_name: str,
     module_qn: str,
     entities: list[ParsedEntity],
@@ -1422,6 +1751,17 @@ def _process_csharp_field(
                             to_name=full_qn,
                         )
                     )
+
+                    # An initializer runs at construction or type-load time. The field
+                    # is the nearest named scope, so it owns what the initializer calls.
+                    # The value is spliced straight after the `=` token — there is no
+                    # wrapper node to hand to `_extract_calls`.
+                    after_eq = False
+                    for vc in var_decl.children:
+                        if after_eq:
+                            _extract_calls(vc, source, full_qn, relationships)
+                        elif vc.type == "=":
+                            after_eq = True
 
 
 def _process_csharp_enum_member(

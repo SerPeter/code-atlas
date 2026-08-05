@@ -1,0 +1,20 @@
+{
+  "lang": "java",
+  "named_funcs": 1.0,
+  "calls": 0.99,
+  "source_repo": "google/gson",
+  "source_commit": "8b8628c65699bc4421696183c62ae0c1b9b281dc",
+  "license": "Apache-2.0",
+  "files": [
+    "TypeAdapters.java",
+    "ReflectionAccessFilter.java",
+    "FieldNamingPolicy.java",
+    "UnsafeAllocator.java",
+    "ArrayTypeAdapter.java",
+    "ReflectionAccessFilterHelper.java",
+    "ReadersWritersTest.java",
+    "RuntimeTypeAdapterFactory.java"
+  ],
+  "measured": { "named_funcs": 1.0, "calls": 1.0 },
+  "rationale": "Java reaches both ratios exactly, so the floor is the measurement rather than a margin below it; only `calls` keeps a hair of slack against a grammar update introducing a call node type the walker has not seen. The files were chosen for the shapes that were broken before ATL-096, and the pre-fix walker scores 0.381 / 0.370 on this same directory: anonymous inner classes in a field initializer (ArrayTypeAdapter, TypeAdapters), in an interface constant (ReflectionAccessFilter), as a call argument and a return value (RuntimeTypeAdapterFactory), four instantiations of the same base inside one method (UnsafeAllocator, which is what forces the `$Base$2` suffix), an enum whose constants carry bodies and whose members follow them in `enum_body_declarations` (FieldNamingPolicy), and local classes declared inside method bodies (ReadersWritersTest). 565 lambdas across the full gson checkout get no entity by design (ADR-0031) and are excluded from `named_funcs`; their calls are attributed to the enclosing method, which is why `calls` is 1.0 despite them. On the full 264-file checkout the walker is also 1.000 / 1.000 — every method_invocation and object_creation_expression node in gson becomes a CALLS relationship, verified file by file with no file over- or under-emitting."
+}

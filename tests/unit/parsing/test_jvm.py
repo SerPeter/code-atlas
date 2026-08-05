@@ -1142,3 +1142,379 @@ class TestCSharpRecord:
         rec = _entity_by_name(parsed, "Point")
         assert rec.label == NodeLabel.TYPE_DEF
         assert rec.kind == TypeDefKind.RECORD
+
+
+# ===========================================================================
+# ATL-096 — shapes that were invisible to the walkers (ADR-0031)
+# ===========================================================================
+
+
+def _callables(parsed: ParsedFile) -> dict[str, str]:
+    """Map bare name -> qualified_name for every Callable in *parsed*."""
+    return {e.name: e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+
+
+def _calls_from(parsed: ParsedFile, from_qn: str) -> set[str]:
+    return {
+        r.to_name
+        for r in parsed.relationships
+        if r.rel_type == RelType.CALLS and r.from_qualified_name == f"{PROJECT}:{from_qn}"
+    }
+
+
+class TestJavaAnonymousInnerClass:
+    @pytest.fixture(autouse=True)
+    def _require_java(self):
+        pytest.importorskip("tree_sitter_java")
+
+    def test_anonymous_class_methods_become_entities(self):
+        """The class is anonymous but `run` is not, so it is an entity scoped by the base type."""
+        source = """\
+class Holder {
+  void install() {
+    register(new Runnable() {
+      @Override public void run() { doWork(); }
+    });
+  }
+}
+"""
+        parsed = _parse(source)
+        assert _callables(parsed)["run"] == f"{PROJECT}:Example.Holder.install.$Runnable.run"
+
+    def test_anonymous_class_defines_comes_from_the_enclosing_method(self):
+        """The `$Runnable` segment names nothing, so an edge from it would dangle."""
+        source = """\
+class Holder {
+  void install() {
+    register(new Runnable() {
+      @Override public void run() {}
+    });
+  }
+}
+"""
+        parsed = _parse(source)
+        defines = _rels_from(parsed, "Example.Holder.install", RelType.DEFINES)
+        assert {r.to_name for r in defines} == {f"{PROJECT}:Example.Holder.install.$Runnable.run"}
+        assert not _rels_from(parsed, "$Runnable", RelType.DEFINES)
+
+    def test_repeated_base_under_one_owner_gets_distinct_names(self):
+        """UnsafeAllocator.create tries four `new UnsafeAllocator()` bodies in a row;
+        without a suffix all four collapse onto one uid."""
+        source = """\
+class Holder {
+  Object create() {
+    try {
+      return new Maker() { Object make() { return a(); } };
+    } catch (Exception e) {
+      return new Maker() { Object make() { return b(); } };
+    }
+  }
+}
+"""
+        parsed = _parse(source)
+        makes = sorted(e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.name == "make")
+        assert makes == [
+            f"{PROJECT}:Example.Holder.create.$Maker$2.make",
+            f"{PROJECT}:Example.Holder.create.$Maker.make",
+        ]
+
+    def test_calls_inside_an_anonymous_method_are_not_the_outer_methods(self):
+        source = """\
+class Holder {
+  void install() {
+    outerCall();
+    register(new Runnable() {
+      @Override public void run() { innerCall(); }
+    });
+  }
+}
+"""
+        parsed = _parse(source)
+        assert _calls_from(parsed, "Example.Holder.install") == {"outerCall", "register", "Runnable"}
+        assert _calls_from(parsed, "Example.Holder.install.$Runnable.run") == {"innerCall"}
+
+    def test_anonymous_class_in_a_field_initializer_is_owned_by_the_field(self):
+        """TypeAdapters declares dozens of `new TypeAdapterFactory() {}` fields in one
+        class; scoping them by the class rather than the field collides every one."""
+        source = """\
+class Holder {
+  static final Factory A = new Factory() { Object make() { return null; } };
+  static final Factory B = new Factory() { Object make() { return null; } };
+}
+"""
+        parsed = _parse(source)
+        makes = sorted(e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.name == "make")
+        assert makes == [
+            f"{PROJECT}:Example.Holder.A.$Factory.make",
+            f"{PROJECT}:Example.Holder.B.$Factory.make",
+        ]
+
+    def test_anonymous_class_in_an_interface_constant(self):
+        """An interface's fields are `constant_declaration`, not `field_declaration`."""
+        source = """\
+interface Filter {
+  Filter BLOCK = new Filter() {
+    @Override public int check() { return 0; }
+  };
+}
+"""
+        parsed = _parse(source)
+        assert _callables(parsed)["check"] == f"{PROJECT}:Example.Filter.BLOCK.$Filter.check"
+
+
+class TestJavaNestedScopes:
+    @pytest.fixture(autouse=True)
+    def _require_java(self):
+        pytest.importorskip("tree_sitter_java")
+
+    def test_local_class_in_a_method_body(self):
+        source = """\
+class Holder {
+  void run() {
+    class Helper {
+      void help() { work(); }
+    }
+    new Helper().help();
+  }
+}
+"""
+        parsed = _parse(source)
+        helper = _entity_by_name(parsed, "Helper")
+        assert helper.qualified_name == f"{PROJECT}:Example.Holder.run.Helper"
+        assert _callables(parsed)["help"] == f"{PROJECT}:Example.Holder.run.Helper.help"
+
+    def test_enum_members_after_the_constants(self):
+        """Everything after an enum's constants lives in `enum_body_declarations`,
+        which the walker never descended into."""
+        source = """\
+enum Policy {
+  A, B;
+  String translate(String s) { return s.trim(); }
+}
+"""
+        parsed = _parse(source)
+        assert _callables(parsed)["translate"] == f"{PROJECT}:Example.Policy.translate"
+        assert _calls_from(parsed, "Example.Policy.translate") == {"trim"}
+
+    def test_enum_constant_with_a_body(self):
+        source = """\
+enum Policy {
+  UPPER {
+    @Override String translate(String s) { return s.toUpperCase(); }
+  };
+  abstract String translate(String s);
+}
+"""
+        parsed = _parse(source)
+        on_line_3 = [e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.line_start == 3]
+        assert on_line_3 == [f"{PROJECT}:Example.Policy.UPPER.translate"]
+
+    def test_static_initializer_calls_belong_to_the_type(self):
+        source = """\
+class Holder {
+  static { configure(); }
+}
+"""
+        parsed = _parse(source)
+        assert _calls_from(parsed, "Example.Holder") == {"configure"}
+
+    def test_field_initializer_that_is_itself_a_call(self):
+        """`_extract_calls` was handed the initializer expression and only looked at
+        its children, so a bare `new Foo()` initializer emitted nothing."""
+        source = """\
+class Holder {
+  private final Thing thing = new Thing();
+  private final int size = compute();
+}
+"""
+        parsed = _parse(source)
+        assert _calls_from(parsed, "Example.Holder.thing") == {"Thing"}
+        assert _calls_from(parsed, "Example.Holder.size") == {"compute"}
+
+    def test_lambda_calls_attribute_to_the_enclosing_method(self):
+        source = """\
+class Holder {
+  void run() {
+    list.forEach(item -> handle(item));
+  }
+}
+"""
+        parsed = _parse(source)
+        assert _calls_from(parsed, "Example.Holder.run") == {"forEach", "handle"}
+
+
+class TestCSharpConditionalCompilation:
+    @pytest.fixture(autouse=True)
+    def _require_csharp(self):
+        pytest.importorskip("tree_sitter_c_sharp")
+
+    def test_namespace_behind_a_file_level_if(self):
+        """BinaryConverter.cs wraps its whole namespace in `#if HAVE_LINQ`; the walker
+        stopped at the `#if` and produced nothing for the file."""
+        source = """\
+#if HAVE_LINQ
+namespace MyApp
+{
+    public class Converter
+    {
+        public void Write() { Emit(); }
+    }
+}
+#endif
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert _callables(parsed)["Write"] == f"{PROJECT}:src.Example.MyApp.Converter.Write"
+        assert _calls_from(parsed, "src.Example.MyApp.Converter.Write") == {"Emit"}
+
+    def test_both_branches_of_an_if_else_are_walked(self):
+        """Which branch compiles depends on a build configuration the indexer does
+        not have, so indexing only the first would be indexing the wrong codebase."""
+        source = """\
+public class C
+{
+#if NET6_0
+    public void Modern() { A(); }
+#else
+    public void Legacy() { B(); }
+#endif
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert set(_callables(parsed)) == {"Modern", "Legacy"}
+
+    def test_overload_set_split_across_a_preprocessor_branch(self):
+        """The two arms are one overload set; computing it per-branch loses the
+        disambiguating suffix and collapses both onto one uid."""
+        source = """\
+public class C
+{
+    public void Send(int x) { }
+#if ASYNC
+    public void Send(string x) { }
+#endif
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        sends = sorted(e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE and e.name == "Send")
+        assert sends == [
+            f"{PROJECT}:src.Example.C.Send(int)",
+            f"{PROJECT}:src.Example.C.Send(string)",
+        ]
+
+
+class TestCSharpLocalFunctions:
+    @pytest.fixture(autouse=True)
+    def _require_csharp(self):
+        pytest.importorskip("tree_sitter_c_sharp")
+
+    def test_local_function_is_an_entity_nested_under_its_method(self):
+        source = """\
+public class C
+{
+    public void Outer()
+    {
+        void Inner() { Work(); }
+        Inner();
+    }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert _callables(parsed)["Inner"] == f"{PROJECT}:src.Example.C.Outer.Inner"
+        assert _calls_from(parsed, "src.Example.C.Outer") == {"Inner"}
+        assert _calls_from(parsed, "src.Example.C.Outer.Inner") == {"Work"}
+
+    def test_local_function_defines_comes_from_the_method(self):
+        source = """\
+public class C
+{
+    public void Outer()
+    {
+        void Inner() { }
+    }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        defines = _rels_from(parsed, "src.Example.C.Outer", RelType.DEFINES)
+        assert {r.to_name for r in defines} == {f"{PROJECT}:src.Example.C.Outer.Inner"}
+
+    def test_a_recovered_else_if_does_not_become_a_callable(self):
+        """tree-sitter recovers `else if (...)` at the head of a `#if` branch as a
+        local function returning `else` and named `if` — 50 of the 62
+        `local_function_statement` nodes in Newtonsoft.Json are this artifact. A
+        declaration is never named with a reserved word, so it must not be emitted."""
+        source = """\
+public class C
+{
+    public void Outer()
+    {
+        if (a)
+        {
+            First();
+        }
+#if HAVE_X
+        else if (b)
+        {
+            Second();
+        }
+#endif
+    }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert not [e for e in parsed.entities if e.name in ("if", "else")]
+        # ...and the calls it contains still reach the graph, via the real method.
+        assert _calls_from(parsed, "src.Example.C.Outer") == {"First", "Second"}
+
+
+class TestCSharpMemberCallOwnership:
+    @pytest.fixture(autouse=True)
+    def _require_csharp(self):
+        pytest.importorskip("tree_sitter_c_sharp")
+
+    def test_property_accessor_calls_belong_to_the_property(self):
+        source = """\
+public class C
+{
+    public int Count
+    {
+        get { return Compute(); }
+    }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert _calls_from(parsed, "src.Example.C.Count") == {"Compute"}
+
+    def test_operator_and_indexer_calls_belong_to_the_type(self):
+        """Neither gets an entity of its own, so the nearest named scope is the type."""
+        source = """\
+public class C
+{
+    public static C operator +(C a, C b) { return Combine(a, b); }
+    public int this[int i] { get { return Lookup(i); } }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert _calls_from(parsed, "src.Example.C") == {"Combine", "Lookup"}
+
+    def test_field_initializer_calls_belong_to_the_field(self):
+        source = """\
+public class C
+{
+    private readonly Thing _thing = new Thing();
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert _calls_from(parsed, "src.Example.C._thing") == {"Thing"}
+
+    def test_lambda_calls_attribute_to_the_enclosing_method(self):
+        source = """\
+public class C
+{
+    public void Run()
+    {
+        items.ForEach(x => Handle(x));
+    }
+}
+"""
+        parsed = _parse(source, path="src/Example.cs")
+        assert _calls_from(parsed, "src.Example.C.Run") == {"ForEach", "Handle"}

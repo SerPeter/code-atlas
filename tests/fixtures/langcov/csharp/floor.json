@@ -1,0 +1,23 @@
+{
+  "lang": "csharp",
+  "named_funcs": 0.97,
+  "calls": 0.97,
+  "source_repo": "JamesNK/Newtonsoft.Json",
+  "source_commit": "4f73e74372445108d2c1bda37b36e6f5e43402e0",
+  "license": "MIT",
+  "files": [
+    "BinaryConverter.cs",
+    "DateTimeUtils.cs",
+    "DiscriminatedUnionConverter.cs",
+    "IsoDateTimeConverter.cs",
+    "Issue2638.cs",
+    "JArray.cs",
+    "JsonArrayContract.cs",
+    "JsonException.cs",
+    "KeyValuePairConverter.cs",
+    "StringUtils.cs",
+    "TypeExtensions.cs"
+  ],
+  "measured": { "named_funcs": 0.983, "calls": 0.991 },
+  "rationale": "The remaining 1.7% of named forms is three `local_function_statement` nodes that are not local functions. tree-sitter-c-sharp recovers `else if (x) { ... }` at the head of a `#if` branch as a local function returning `else` and named `if` (IsoDateTimeConverter.cs:94, JsonArrayContract.cs:189 and :210); across the full 945-file checkout 50 of the 62 `local_function_statement` nodes are this artifact and only 12 are declarations. The walker rejects a callable named with a reserved word and attributes the calls in that block to the enclosing method instead, so the shortfall is deliberate: emitting them would raise this number to 1.0 by putting Callables named `if` in the graph. The full checkout scores 0.988 / 0.993 for the same reason plus one file, Newtonsoft.Json.Tests/TestFixtureBase.cs, where a `#if`/`#else` splits a method header from its body (line 279) and tree-sitter produces a 390-line ERROR node that swallows 39 declarations; no walker can recover from that and the file is not vendored here. The 0.9% call shortfall is calls in attribute arguments and inside those same recovered regions. Files were chosen for the shapes ATL-096 fixed and the pre-fix walker scores 0.606 / 0.593 on this directory: a whole namespace nested inside a file-level `#if` (BinaryConverter), `#if`/`#else` alternative method bodies (DateTimeUtils, TypeExtensions), a constructor behind `#if` (JsonException), real local functions (Issue2638, JsonArrayContract), and lambdas whose calls must attribute upward (DiscriminatedUnionConverter, JArray). 897 lambdas and anonymous methods in the full checkout get no entity by design (ADR-0031)."
+}
