@@ -31,12 +31,16 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tree_sitter import Node, Parser
 
 from code_atlas.parsing.ast import get_language_for_file, parse_file
 from code_atlas.parsing.languages import discover_plugins
 from code_atlas.schema import NodeLabel, RelType
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 @dataclass(frozen=True)
@@ -54,9 +58,41 @@ class LangSpec:
     calls: tuple[str, ...] = ()
     skip: tuple[str, ...] = ()
 
+    named_requires_ancestor: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """A form in ``named`` that only carries a referable name under some ancestor.
+
+    TypeScript's ``method_definition`` is the case: inside a ``class_body`` it is
+    a class method and must be an entity, but in an inline object literal passed
+    as an argument there is no name a developer could use to reach it, so
+    ADR-0031 makes it category 3. Both spell the same grammar node. Asserting
+    capture on the second kind measures the opposite of the decision — in `ky`,
+    179 of the 240 nodes in the named bucket are exactly the ones the walker is
+    supposed to decline.
+
+    Forms failing the constraint drop out of ``named_funcs`` entirely rather
+    than moving to ``anon``: capture is neither required nor forbidden, and a
+    bound object literal's method is still emitted.
+    """
+
+    calls_require_parent: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """A node type that is only a call in statement position.
+
+    Ruby needs this: a bare ``identifier`` alone on a line is an implicit
+    ``self`` call (``content_type``, ``pass``), and the walker rightly emits one
+    — but every parameter and variable read is the same node type, so the form
+    can only be counted where it stands as a statement. Without it the
+    denominator omits calls the numerator contains and the ratio exceeds 1.0.
+    """
+
     @property
     def funcs(self) -> frozenset[str]:
         return frozenset(self.named + self.anon + self.decl_only)
+
+    def counts_as_call(self, node: Node) -> bool:
+        required = self.calls_require_parent.get(node.type)
+        if required is None:
+            return True
+        return node.parent is not None and node.parent.type in required
 
 
 # Node types verified with --census against the corpus repo named in each
@@ -69,6 +105,7 @@ LANGS: dict[str, LangSpec] = {
         decl_only=("function_signature", "method_signature"),
         calls=("call_expression", "new_expression"),
         skip=("node_modules", "/dist/", ".d.ts"),
+        named_requires_ancestor={"method_definition": ("class_body",)},
     ),
     "javascript": LangSpec(
         exts=(".js", ".jsx", ".mjs", ".cjs"),
@@ -95,8 +132,11 @@ LANGS: dict[str, LangSpec] = {
         exts=(".rb",),
         named=("method", "singleton_method"),
         anon=("do_block", "block", "lambda"),
-        calls=("call",),
+        calls=("call", "identifier"),
         skip=("/vendor/",),
+        calls_require_parent={
+            "identifier": ("body_statement", "then", "else", "do", "block_body", "program", "begin_block"),
+        },
     ),
     "go": LangSpec(
         exts=(".go",),
@@ -149,6 +189,9 @@ class FuncSite:
     captured: bool
     parent: str
     chain: str
+    name_bearing: bool = True
+    """False when the form is in ``named`` but failed its ancestor constraint —
+    same grammar node, no referable name, so capture is not asserted."""
 
 
 @dataclass
@@ -186,7 +229,7 @@ class Coverage:
     @property
     def named_sites(self) -> list[FuncSite]:
         spec = LANGS[self.lang]
-        return [s for s in self.sites if s.form in spec.named]
+        return [s for s in self.sites if s.form in spec.named and s.name_bearing]
 
     @property
     def named_funcs(self) -> float:
@@ -204,6 +247,18 @@ def _walk(node: Node):
         n = stack.pop()
         yield n
         stack.extend(reversed(n.children))
+
+
+def _has_ancestor(node: Node, required: tuple[str, ...] | None) -> bool:
+    """True when *node* sits under one of *required*, or nothing is required."""
+    if not required:
+        return True
+    cur = node.parent
+    while cur is not None:
+        if cur.type in required:
+            return True
+        cur = cur.parent
+    return False
 
 
 def _enclosing(node: Node, funcs: frozenset[str]) -> Node | None:
@@ -283,9 +338,10 @@ def measure(root: Path, lang: str) -> Coverage:
                         captured=_captured_by(spans, start, end),
                         parent=node.parent.type if node.parent else "-",
                         chain=_chain(node),
+                        name_bearing=_has_ancestor(node, spec.named_requires_ancestor.get(node.type)),
                     )
                 )
-            elif node.type in calls:
+            elif node.type in calls and spec.counts_as_call(node):
                 cov.ast_calls += 1
                 owner = _enclosing(node, funcs)
                 if owner is None:
@@ -313,11 +369,15 @@ def _report(cov: Coverage) -> None:
     print("\nper form:")
     total: Counter[str] = Counter(s.form for s in cov.sites)
     ok: Counter[str] = Counter(s.form for s in cov.sites if s.captured)
+    asserted: Counter[str] = Counter(s.form for s in cov.named_sites)
     for form, n in total.most_common():
         bucket = "named" if form in spec.named else ("anon" if form in spec.anon else "decl")
-        print(f"  {form:40s} {ok[form]:6d} / {n:6d}  {_pct(ok[form], n)}  [{bucket}]")
+        note = ""
+        if form in spec.named_requires_ancestor and asserted[form] != n:
+            note = f"  ({asserted[form]} asserted, {n - asserted[form]} not name-bearing)"
+        print(f"  {form:40s} {ok[form]:6d} / {n:6d}  {_pct(ok[form], n)}  [{bucket}]{note}")
 
-    missed = [s for s in cov.sites if not s.captured and s.form in spec.named]
+    missed = [s for s in cov.sites if not s.captured and s.form in spec.named and s.name_bearing]
     if missed:
         print("\nmissed NAMED forms, by immediate parent:")
         for (form, parent), n in Counter((s.form, s.parent) for s in missed).most_common(12):
