@@ -1330,3 +1330,125 @@ class TestCalleeShapes:
     def test_callee_with_no_static_name_is_not_a_call(self):
         parsed = _parse("void caller() {\n  handlers[i]();\n}\n", path="src/c.cpp")
         assert [r.to_name for r in _rels_from(parsed, "src.c.caller", RelType.CALLS)] == []
+
+
+# ---------------------------------------------------------------------------
+# 39. Function-like macros that parse as function definitions
+# ---------------------------------------------------------------------------
+
+
+class TestGtestCaseNaming:
+    """``TEST(Suite, Case) { ... }`` is a macro, but the grammar cannot tell it
+    from a function definition whose name is ``TEST``.
+
+    Left alone, every case in a file emits the same qualified name and upserts
+    into one graph node carrying an arbitrary body and the union of every
+    case's edges. fmt's base-test.cc alone had 47 of them. The macro arguments
+    are the real name, and they are stable across edits in a way a line number
+    would not be — ``Suite.Case`` is also exactly what gtest's own runner
+    prints and what ``--gtest_filter`` accepts.
+    """
+
+    def test_gtest_case_is_named_from_its_macro_arguments(self):
+        parsed = _parse("TEST(FormatTest, Escape) {\n  check();\n}\n", path="test/format-test.cc")
+        case = _entity_by_name(parsed, "FormatTest.Escape")
+        assert case.label == NodeLabel.CALLABLE
+        assert case.qualified_name == f"{PROJECT}:test.format-test.FormatTest.Escape"
+        assert "test" in case.tags
+        assert [r.to_name for r in _rels_from(parsed, "FormatTest.Escape", RelType.CALLS)] == ["check"]
+
+    def test_no_entity_is_named_after_the_macro(self):
+        """Negative assertion: a positive one cannot catch a collision.
+
+        Two cases in one file both being present says nothing — the failure
+        being guarded is that they share a name, which only shows up as the
+        *absence* of the macro-named node and the presence of two distinct ones.
+        """
+        parsed = _parse(
+            "TEST(FormatTest, Escape) {\n  a();\n}\nTEST(FormatTest, Width) {\n  b();\n}\n",
+            path="test/format-test.cc",
+        )
+        assert [e.name for e in parsed.entities if e.name == "TEST"] == []
+        names = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+        assert names == {"FormatTest.Escape", "FormatTest.Width"}
+
+    def test_two_cases_in_one_file_get_distinct_qualified_names(self):
+        parsed = _parse(
+            "TEST(FormatTest, Escape) {\n  a();\n}\nTEST(FormatTest, Width) {\n  b();\n}\n",
+            path="test/format-test.cc",
+        )
+        qns = [e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+        assert len(qns) == len(set(qns)), f"colliding uids: {qns}"
+
+    @pytest.mark.parametrize("macro", ["TEST", "TEST_F", "TEST_P", "TYPED_TEST", "TYPED_TEST_P"])
+    def test_every_gtest_case_macro_is_named_from_its_arguments(self, macro):
+        parsed = _parse(f"{macro}(SuiteName, CaseName) {{\n  go();\n}}\n", path="test/x-test.cc")
+        assert _entity_by_name(parsed, "SuiteName.CaseName").label == NodeLabel.CALLABLE
+
+    def test_a_stray_macro_before_the_case_does_not_hide_it(self):
+        """fmt closes every file with ``FMT_END_NAMESPACE``, which the grammar
+        absorbs as the following definition's *return type* — so the case no
+        longer looks like a definition with no return type at all."""
+        parsed = _parse(
+            "FMT_END_NAMESPACE\nTEST(FormatTest, Escape) {\n  check();\n}\n",
+            path="test/format-test.cc",
+        )
+        assert _entity_by_name(parsed, "FormatTest.Escape").label == NodeLabel.CALLABLE
+        assert [e.name for e in parsed.entities if e.name == "TEST"] == []
+
+
+class TestUnnameableMacroInvocations:
+    """A function-like macro with no arguments worth reading gets no entity.
+
+    ``FMT_CATCH(...) { ... }`` and gtest's ``GTEST_LOCK_EXCLUDED_(mu) { ... }``
+    parse as definitions named after the macro. There is no sound name to give
+    them, so they follow the same rule as a function stranded behind a
+    mis-parse: emit nothing rather than something confidently wrong.
+    """
+
+    def test_macro_invocation_gets_no_entity(self):
+        parsed = _parse("FMT_CATCH(...) {\n  report();\n}\n", path="src/fmt-c.cc")
+        assert [e.name for e in parsed.entities if e.name == "FMT_CATCH"] == []
+        assert [e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE] == []
+
+    def test_macro_invocation_body_still_reports_its_calls(self):
+        """Suppressing the entity must not suppress the work it wraps."""
+        parsed = _parse("FMT_CATCH(...) {\n  report();\n}\n", path="src/fmt-c.cc")
+        assert [r.to_name for r in _rels_from(parsed, "src.fmt-c", RelType.CALLS)] == ["report"]
+
+    def test_two_invocations_of_the_same_macro_do_not_collide(self):
+        parsed = _parse(
+            "FMT_CATCH(...) {\n  a();\n}\nFMT_CATCH(...) {\n  b();\n}\n",
+            path="src/fmt-c.cc",
+        )
+        qns = [e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+        assert qns == []
+        assert {r.to_name for r in _rels_from(parsed, "src.fmt-c", RelType.CALLS)} == {"a", "b"}
+
+
+class TestMacroDiscriminatorDoesNotEatRealCode:
+    """The three C++ forms that legitimately have no return type must survive."""
+
+    def test_in_class_constructor_survives(self):
+        parsed = _parse("class Widget {\n public:\n  Widget() { init(); }\n};\n", path="src/w.cpp")
+        # `Widget` names both the class TypeDef and its constructor.
+        ctors = [e for e in parsed.entities if e.name == "Widget" and e.label == NodeLabel.CALLABLE]
+        assert [e.kind for e in ctors] == [CallableKind.CONSTRUCTOR]
+        assert [r.to_name for r in _rels_from(parsed, "src.w.Widget.Widget", RelType.CALLS)] == ["init"]
+
+    def test_out_of_line_constructor_survives(self):
+        parsed = _parse("Widget::Widget() { init(); }\n", path="src/w.cpp")
+        assert _entity_by_name(parsed, "Widget").kind == CallableKind.CONSTRUCTOR
+
+    def test_destructor_survives(self):
+        parsed = _parse("class Widget {\n public:\n  ~Widget() { drop(); }\n};\n", path="src/w.cpp")
+        assert _entity_by_name(parsed, "~Widget").kind == CallableKind.DESTRUCTOR
+
+    def test_conversion_operator_survives(self):
+        parsed = _parse("class H {\n public:\n  operator bool() { return ok(); }\n};\n", path="src/h.cpp")
+        assert _entity_by_name(parsed, "operator bool").label == NodeLabel.CALLABLE
+
+    def test_a_real_function_named_like_a_test_macro_is_untouched(self):
+        """A return type means it is a function, whatever it is called."""
+        parsed = _parse("int TEST(int a, int b) {\n  return add(a, b);\n}\n", path="src/t.cpp")
+        assert _entity_by_name(parsed, "TEST").label == NodeLabel.CALLABLE

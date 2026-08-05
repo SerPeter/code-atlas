@@ -65,6 +65,13 @@ _TYPE_DEF_NODES = frozenset({"struct_specifier", "enum_specifier", "union_specif
 # one could never resolve to anything.
 _NAMED_CASTS = frozenset({"static_cast", "reinterpret_cast", "const_cast", "dynamic_cast"})
 
+# googletest declares a test case with a function-like macro followed by a
+# block, which the grammar cannot tell from a function definition — so every
+# case in a file arrives named after the macro. gtest itself identifies a case
+# as `Suite.Case` (that is what `--gtest_filter` takes and what the runner
+# prints), so that is the name used here.
+_GTEST_CASE_MACROS = frozenset({"TEST", "TEST_F", "TEST_P", "TYPED_TEST", "TYPED_TEST_P"})
+
 # Tags derived from storage class / qualifier specifiers
 _TAG_KEYWORDS = frozenset({"virtual", "override", "static", "const", "inline", "extern"})
 
@@ -994,6 +1001,58 @@ def _process_typedef(
     )
 
 
+def _macro_invocation_name(node: Node, declarator: Node, class_stack: list[str]) -> str | None:
+    """Return the macro name if this ``function_definition`` is really a
+    function-like macro followed by a block, rather than a function.
+
+    Only a constructor, a destructor or a conversion operator may omit its
+    return type, and all three are distinguishable: a destructor declarator is
+    a ``destructor_name``, a conversion operator is an ``operator_cast``, and a
+    constructor's name is either the enclosing class or is qualified with
+    ``Class::``. Anything else with no return type is a macro the preprocessor
+    would have removed.
+    """
+    if node.child_by_field_name("type") is not None:
+        return None
+    if declarator.type != "function_declarator":
+        return None
+    inner = declarator.child_by_field_name("declarator")
+    if inner is None or inner.type != "identifier":
+        return None
+    name = node_text(inner)
+    if not name or (class_stack and name == class_stack[-1]):
+        return None
+    return name
+
+
+def _gtest_case_name(declarator: Node) -> str | None:
+    """Name a googletest case ``Suite.Case`` from the macro's arguments.
+
+    The arguments parse as parameter declarations carrying only a type, since
+    ``TEST(FormatTest, Escape)`` is indistinguishable from a two-parameter
+    prototype. Anything that does not look like two bare identifiers is not a
+    shape worth guessing at.
+
+    Checked before the missing-return-type test rather than after it, because a
+    stray macro on the preceding line — fmt ends every file with
+    ``FMT_END_NAMESPACE`` — is absorbed as the definition's *return type*, and
+    the case would otherwise fall through and collide as ``TEST``.
+    """
+    if declarator.type != "function_declarator":
+        return None
+    inner = declarator.child_by_field_name("declarator")
+    if inner is None or inner.type != "identifier" or node_text(inner) not in _GTEST_CASE_MACROS:
+        return None
+    params = declarator.child_by_field_name("parameters")
+    if params is None:
+        return None
+    args = [node_text(p).strip() for p in params.named_children]
+    expected_args = 2
+    if len(args) != expected_args or not all(a.isidentifier() for a in args):
+        return None
+    return f"{args[0]}.{args[1]}"
+
+
 def _process_function(
     node: Node,
     *,
@@ -1017,7 +1076,24 @@ def _process_function(
     template_parent = _template_wrapper(node)
     if template_parent is not None:
         tags.append("template")
-    scope_parts, name = _get_qualified_declarator_name(declarator)
+
+    gtest_case = _gtest_case_name(declarator)
+    if gtest_case is not None:
+        scope_parts, name = [], gtest_case
+        tags.append("test")
+    elif _macro_invocation_name(node, declarator, class_stack) is not None:
+        # A function-like macro whose expansion we cannot see. The only name
+        # available is the macro's own, which every invocation in the file
+        # shares — and one graph node claiming to be forty-seven definitions,
+        # carrying an arbitrary body and the union of their edges, is worse
+        # than forty-seven absences. Emit nothing; the body's calls are still
+        # real and attribute to the module (ADR-0031).
+        body = node.child_by_field_name("body")
+        if body is not None:
+            _extract_calls(body, f"{project_name}:{module_qn}", relationships)
+        return
+    else:
+        scope_parts, name = _get_qualified_declarator_name(declarator)
 
     if name is None:
         return
