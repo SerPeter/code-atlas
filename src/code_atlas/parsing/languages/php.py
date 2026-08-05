@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -112,6 +112,12 @@ class _BodyScope:
     seen: set[tuple[int, str]]
     self_name: str | None = None
     """Class ``self``/``static`` resolves to here, so ``new self()`` names a real target."""
+    local: bool = True
+    """Whether a variable bound in this body dies when the call returns.
+
+    True inside a function, method or closure body. Defaults to the answer that
+    mints no entity, so a new call site cannot widen category 2 by omission.
+    """
 
 
 def _module_qualified_name(file_path: str) -> str:
@@ -362,7 +368,7 @@ def _walk_php_node(
                 _process_expression_statement(child, project_name, file_qn, relationships)
             _extract_calls(
                 child,
-                _BodyScope(path, source, project_name, entities, relationships, seen),
+                _BodyScope(path, source, project_name, entities, relationships, seen, local=False),
                 file_qn,
             )
 
@@ -953,9 +959,8 @@ def _object_creation_target(node: Node, self_name: str | None) -> str | None:
 def _closure_binding_name(node: Node) -> str | None:
     """Variable a closure is bound to — ``$handler = function () {}`` -> ``handler``.
 
-    A bound closure is ADR-0031 category 2: anonymous in the grammar, but the code
-    around it refers to it by the binding, so it earns an entity. A closure handed
-    straight to a call is category 3 and earns none.
+    Only the binding itself is read here; whether that binding *outlives the call*
+    is `_BodyScope.local`, and `_process_closure` is where the two meet.
     """
     parent = node.parent
     if parent is None or parent.type not in ("assignment_expression", "augmented_assignment_expression"):
@@ -969,11 +974,25 @@ def _closure_binding_name(node: Node) -> str | None:
 
 
 def _process_closure(node: Node, ctx: _BodyScope, scope_qn: str) -> str:
-    """Emit an entity for a name-bound closure; return the scope its body belongs to.
+    """Emit an entity for a closure bound at a scope that outlives the call.
 
-    An unbound closure returns *scope_qn* unchanged, which is what attributes its
-    calls to the nearest enclosing named scope.
+    ADR-0031's test is "a name a developer could use to refer to it", which means
+    referable from outside. A local ``$callback = function () {}`` is not: the
+    binding dies when the call returns, and PHP code reassigns it freely — three of
+    FastRoute's data providers rebind ``$callback`` 18, 7 and 3 times inside one
+    method. Minting an entity per binding collapsed all 18 bodies onto one uid,
+    which upserts into a single node holding an arbitrary winner's source and the
+    union of every edge set. That is a confident wrong answer, and worse than the
+    silence of no entity at all. So a local binding is category 3 after all.
+
+    A module-level binding survives the file and keeps its entity, matching the
+    rule the TypeScript walker already applies to `const foo = () => {}`.
+
+    Either way the return value is the scope the body's calls belong to, so a
+    declined closure attributes them to the nearest enclosing named scope.
     """
+    if ctx.local:
+        return scope_qn
     name = _closure_binding_name(node)
     if name is None:
         return scope_qn
@@ -1121,9 +1140,12 @@ def _extract_calls(node: Node, ctx: _BodyScope, scope_qn: str) -> None:
                 )
 
         if child.type in _ANONYMOUS_FUNCTION_TYPES:
-            # Descending is mandatory (ADR-0031): an unbound closure's calls belong to
-            # the enclosing named scope, and a bound one becomes a scope of its own.
-            _extract_calls(child, ctx, _process_closure(child, ctx, scope_qn))
+            # Descending is mandatory (ADR-0031): a declined closure's calls belong to
+            # the enclosing named scope, and an accepted one becomes a scope of its own.
+            # A closure body is itself a call frame, so anything bound inside it is local
+            # however the closure was reached.
+            body_scope = _process_closure(child, ctx, scope_qn)
+            _extract_calls(child, ctx if ctx.local else replace(ctx, local=True), body_scope)
         elif child.type == "anonymous_class":
             # Nameless container, named methods. `_walk_class_body` re-enters
             # `_extract_calls` per method, so this subtree is fully covered.

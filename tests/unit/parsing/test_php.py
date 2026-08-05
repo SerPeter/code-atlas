@@ -954,7 +954,8 @@ class Mapper {
     assert callables == {"run"}, f"anonymous arrow function leaked an entity: {callables}"
 
 
-def test_bound_closure_becomes_entity_named_from_binding():
+def test_local_bound_closure_gets_no_entity():
+    """A local binding dies with the call, so it is not a name anything can refer to."""
     parsed = _parse("""\
 <?php
 class Factory {
@@ -967,23 +968,74 @@ class Factory {
     }
 }
 """)
+    callables = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+    assert callables == {"build"}, f"a local closure binding leaked an entity: {callables}"
+
+    # Its calls attribute upward to the enclosing method instead.
+    assert "collect" in {r.to_name for r in _rels_from(parsed, "src.Example.Factory.build", RelType.CALLS)}
+
+
+def test_reassigned_local_closure_does_not_collide_on_uid():
+    """The shape that forced the local/non-local split.
+
+    FastRoute's data providers rebind one `$callback` up to 18 times in a single
+    method. An entity per binding gives every body the same qualified name, and
+    same-uid entities upsert into one graph node carrying an arbitrary winner's
+    source and the union of both edge sets. Asserting that the right entity exists
+    cannot catch that -- one of a colliding pair always *is* the right entity -- so
+    this asserts that no two Callables share a uid at all.
+    """
+    parsed = _parse("""\
+<?php
+class DispatcherTestCase {
+    public function provideFoundDispatchCases(): array {
+        $callback = static function () { first(); };
+        $cases[] = ['/', $callback];
+
+        $callback = static function () { second(); };
+        $cases[] = ['/a', $callback];
+
+        $callback = static function () { third(); };
+        $cases[] = ['/b', $callback];
+
+        return $cases;
+    }
+}
+""")
+    qns = [e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    duplicates = {q for q in qns if qns.count(q) > 1}
+    assert not duplicates, f"{len(qns) - len(set(qns))} colliding uid(s): {duplicates}"
+
+    # Nothing was dropped to achieve that -- all three bodies still reach the graph.
+    calls = {r.to_name for r in _rels_from(parsed, "provideFoundDispatchCases", RelType.CALLS)}
+    assert {"first", "second", "third"} <= calls
+
+
+def test_module_bound_closure_becomes_entity():
+    """A module-level binding outlives the call, so it stays category 2."""
+    parsed = _parse("""\
+<?php
+$loader = static function (): array {
+    return collect();
+};
+""")
     closure = _entity_by_name(parsed, "loader")
     assert closure.label == NodeLabel.CALLABLE
     assert closure.kind == CallableKind.CLOSURE
-    assert closure.qualified_name == f"{PROJECT}:src.Example.Factory.build.loader"
+    assert closure.qualified_name == f"{PROJECT}:src.Example.loader"
     assert closure.signature is not None
     assert "static function" in closure.signature
 
-    # Its body's calls belong to it, not to the enclosing method.
-    assert {r.to_name for r in _rels_from(parsed, "Factory.build.loader", RelType.CALLS)} == {"collect"}
-    assert "collect" not in {r.to_name for r in _rels_from(parsed, "src.Example.Factory.build", RelType.CALLS)}
+    # Its body's calls belong to it, not to the module.
+    assert {r.to_name for r in _rels_from(parsed, "src.Example.loader", RelType.CALLS)} == {"collect"}
+    assert "collect" not in {r.to_name for r in _rels_from(parsed, "src.Example", RelType.CALLS)}
 
     # DEFINES from the enclosing scope is what keeps it out of find_dead_code.
-    defines = _rels_from(parsed, "src.Example.Factory.build", RelType.DEFINES)
-    assert f"{PROJECT}:src.Example.Factory.build.loader" in {r.to_name for r in defines}
+    defines = _rels_from(parsed, "src.Example", RelType.DEFINES)
+    assert f"{PROJECT}:src.Example.loader" in {r.to_name for r in defines}
 
 
-def test_bound_arrow_function_becomes_entity():
+def test_module_bound_arrow_function_becomes_entity():
     parsed = _parse("""\
 <?php
 $formatter = fn (string $s): string => strtoupper($s);
@@ -992,6 +1044,20 @@ $formatter = fn (string $s): string => strtoupper($s);
     assert closure.kind == CallableKind.CLOSURE
     assert closure.qualified_name == f"{PROJECT}:src.Example.formatter"
     assert {r.to_name for r in _rels_from(parsed, "src.Example.formatter", RelType.CALLS)} == {"strtoupper"}
+
+
+def test_closure_nested_in_module_closure_is_local():
+    """A closure body is itself a call frame, so a binding inside one is local again."""
+    parsed = _parse("""\
+<?php
+$outer = function () {
+    $inner = function () { work(); };
+    $inner();
+};
+""")
+    callables = {e.name for e in parsed.entities if e.label == NodeLabel.CALLABLE}
+    assert callables == {"outer"}, f"a closure inside a closure leaked an entity: {callables}"
+    assert "work" in {r.to_name for r in _rels_from(parsed, "src.Example.outer", RelType.CALLS)}
 
 
 def test_closure_nested_in_closure_attributes_to_nearest_named_scope():
