@@ -36,6 +36,29 @@ Anonymous forms — arrows, lambdas, closures, blocks, func literals — are exc
 purpose: they get no entity, and their calls attribute to the nearest named enclosing scope (ADR-0031). They
 are still visible in `calls`, which is what catches a walker that skips a callback body.
 
+### Do not compare these numbers across languages
+
+`calls` measures **walker reach, not edge usefulness**, and the languages are not on the same scale:
+
+- Go spells type conversions and builtins as `call_expression`, so `len`, `append` and `make` count as
+  covered and emit edges that resolve to nothing. Its 0.99 is easier than it looks.
+- Rust counts `macro_invocation`, 9.6% of its denominator, of which only ~30% name a macro declared in the
+  repo. Excluding macros its number would read 0.903 rather than 0.999.
+- Ruby's denominator excludes bare-identifier implicit calls that the walker nonetheless emits, so its ratio
+  can legitimately exceed 1.0.
+- C++ has a genuine ceiling below the others because tree-sitter has no preprocessor.
+
+A floor is a per-language ratchet against that language's own past. It is not a score, and a lower number is
+not a worse walker.
+
+### Known limit: name-bound anonymous forms are not asserted
+
+ADR-0031 category 2 — `var handler = func() {...}`, `$loader = static function () {}` — is an entity, but the
+harness places the whole grammar form in `anon`, so `named_funcs` never asserts its capture. Go shows 10 of
+207 `func_literal` nodes captured: correct behaviour, invisible to the floor. Detecting bindability needs
+per-language logic in the measurement, which would make the harness a second parser to keep in sync. `calls`
+still catches the part that matters, since an unwalked body loses its calls either way.
+
 ## Vendored code is not ours
 
 Each directory's sources keep their upstream license, recorded in `floor.json` and reproduced in

@@ -15,24 +15,37 @@ A walker meets four kinds of function form:
 3. **Truly anonymous forms** — a callback argument, a Ruby block, a Go `func_literal`, a C++ lambda.
 4. **Signatures with no body** — TypeScript ambient declarations, trait method declarations.
 
-Measured over eight real repositories (2026-08-05), forms 2 and 3 dominate real code and were the largest source of
-missing graph edges — but almost none of the loss was the missing _entity_. It was the calls inside the body:
+Measured over eight real repositories (2026-08-05), forms 2 and 3 dominate real code — and almost none of the loss they
+caused was the missing _entity_. It was the calls inside the body:
 
-| language   | call nodes inside a function that produced no entity |
-| ---------- | ---------------------------------------------------: |
-| TypeScript |                                                83.5% |
-| Ruby       |                                                77.3% |
-| C#         |                                                42.2% |
-| C++        |                                                33.0% |
-| PHP        |                                                26.5% |
-| Rust       |                                                17.3% |
-| Go         |                                                10.0% |
-| Java       |                                                 7.9% |
+| language   | call nodes lexically inside a function that produced no entity |
+| ---------- | -------------------------------------------------------------: |
+| TypeScript |                                                          83.5% |
+| Ruby       |                                                          77.3% |
+| C#         |                                                          42.2% |
+| C++        |                                                          33.0% |
+| PHP        |                                                          26.5% |
+| Rust       |                                                          17.3% |
+| Go         |                                                          10.0% |
+| Java       |                                                           7.9% |
 
-Every walker except Python's stops recursing at an anonymous form —
-`# Recurse but don't descend into nested function literals` appears near-verbatim in `rust.py`, `go.py`, `cpp.py`,
-`ruby.py` and `php.py`. The calls in those bodies are not attributed to something wrong; they are attributed to nobody,
-and vanish.
+**Read that column as an upper bound on the loss, not as the loss.** It measures lexical containment: a call node sits
+inside a function form that produced no entity. Whether the call actually reached the graph depends on a second thing —
+whether anything ever walked that region. The two come apart, and the per-language work confirmed it: PHP's real loss
+was 12.8%, not 26.5%, because its walker already descended into anonymous function bodies.
+
+There are two independent mechanisms behind the number, and only the first is what the phrase "doesn't descend into
+closures" describes:
+
+1. **`_extract_calls` explicitly refuses the anonymous form.** True of `rust.py` (`closure_expression`) and `go.py`
+   (`func_literal`) only. Here the calls are not attributed to something coarse — they are attributed to nobody.
+2. **The entity walker never reaches the enclosing construct**, so `_extract_calls` is never invoked for that region at
+   all. This is the larger cause. TypeScript walks only `root.children`; Ruby's `_extract_calls` would happily descend
+   into a `do_block` but nothing handed it one; C++ never enters a `#ifdef`; C# never enters a namespace's
+   `declaration_list`.
+
+Both are fixed by the same rule, which is why the decision below is phrased as _where a call must end up_ rather than
+_which nodes to recurse through_. A rule about recursion would have fixed only the first mechanism.
 
 Two other options were considered for the anonymous forms:
 
