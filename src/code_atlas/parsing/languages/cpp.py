@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -14,11 +15,14 @@ from code_atlas.parsing.ast import (
     ParsedRelationship,
     call_receiver_props,
     node_text,
+    normalize_type_text,
     register_language,
 )
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind, ValueKind, Visibility
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from tree_sitter import Node
 
 _log = logging.getLogger(__name__)
@@ -568,6 +572,7 @@ def _walk_translation_unit(  # noqa: PLR0912
     current_visibility: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    overloaded: frozenset[str] | None = None,
 ) -> None:
     """Recursively walk the AST and extract entities/relationships.
 
@@ -575,7 +580,18 @@ def _walk_translation_unit(  # noqa: PLR0912
     and never enters a function body — ``_process_function`` hands bodies to
     ``_extract_calls`` instead.  That split is what lets ``_extract_calls`` be
     fully transparent without double-counting anything.
+
+    *overloaded* is the scope's set of ambiguous qualified names (ADR-0032).
+    ``None`` means *node* opens a new naming scope, so the set is computed here;
+    a recursion that only steps through a scope-transparent wrapper passes the
+    set it already has, because an ``#ifdef`` arm is not a scope of its own and
+    its members must be weighed against their siblings outside the arm.
     """
+    if overloaded is None:
+        overloaded = _overloaded_qns(
+            node, module_qn=module_qn, namespace_parts=namespace_parts, class_stack=class_stack
+        )
+
     # Calls that are not inside any function belong to the module (ADR-0031).
     # A class or namespace is not a callable, so the fallback never narrows
     # below the module as the walker descends.
@@ -601,6 +617,7 @@ def _walk_translation_unit(  # noqa: PLR0912
                 current_visibility=current_visibility,
                 entities=entities,
                 relationships=relationships,
+                overloaded=overloaded,
             )
             continue
 
@@ -622,6 +639,7 @@ def _walk_translation_unit(  # noqa: PLR0912
                 current_visibility=Visibility.PUBLIC,
                 entities=entities,
                 relationships=relationships,
+                overloaded=overloaded,
             )
             continue
 
@@ -699,6 +717,7 @@ def _walk_translation_unit(  # noqa: PLR0912
                 current_visibility=current_visibility,
                 entities=entities,
                 relationships=relationships,
+                overloaded=overloaded,
             )
             continue
 
@@ -739,6 +758,7 @@ def _walk_translation_unit(  # noqa: PLR0912
                 current_visibility=current_visibility,
                 entities=entities,
                 relationships=relationships,
+                overloaded=overloaded,
             )
             if not claimed_by_type_def:
                 # Default member initializer: `std::string s = build();`
@@ -1146,6 +1166,213 @@ def _gtest_case_name(declarator: Node) -> str | None:
     return f"{args[0]}.{args[1]}"
 
 
+# ---------------------------------------------------------------------------
+# Overload disambiguation (ADR-0032)
+# ---------------------------------------------------------------------------
+
+# Parameter forms inside a `parameter_list`. A bare `...` (C variadic) is an
+# anonymous token, so it is matched by literal type rather than listed here.
+_PARAM_NODES = frozenset({"parameter_declaration", "optional_parameter_declaration", "variadic_parameter_declaration"})
+
+# Trailing qualifiers on a function_declarator that C++ resolves overloads on.
+# `noexcept` is not one of them and is deliberately absent.
+_QUALIFIER_NODES = frozenset({"type_qualifier", "ref_qualifier"})
+
+
+def _function_name_parts(node: Node, declarator: Node, class_stack: list[str]) -> tuple[list[str], str, bool] | None:
+    """``(extra scope parts, name, is_gtest_case)`` for a ``function_definition``.
+
+    ``None`` where the definition claims no qualified name at all: a
+    function-like macro the preprocessor would have removed, or a declarator
+    with no recoverable identifier.  Those two want different handling of the
+    body, so ``_process_function`` re-asks which one it was — that path is rare,
+    and the alternative is a second return channel nobody else needs.
+    """
+    gtest_case = _gtest_case_name(declarator)
+    if gtest_case is not None:
+        return [], gtest_case, True
+    if _macro_invocation_name(node, declarator, class_stack) is not None:
+        return None
+    scope_parts, name = _get_qualified_declarator_name(declarator)
+    return None if name is None else (scope_parts, name, False)
+
+
+def _declared_qn(member: Node, class_stack: list[str], *, module_qn: str, namespace_parts: list[str]) -> str | None:
+    """The unsuffixed qualified name *member* would claim as a Callable, if any.
+
+    Mirrors the only two places that emit one: ``_process_function`` for a
+    ``function_definition`` — which is also how the grammar shapes ``= delete``,
+    so a deleted copy constructor counts — and ``_process_field_declaration``
+    for a body-less method declaration.  A prototype at namespace or file scope
+    is deliberately absent, because the walker emits no entity for one.
+    """
+    declarator = member.child_by_field_name("declarator")
+    if declarator is None:
+        return None
+    if member.type == "function_definition":
+        parts = _function_name_parts(member, declarator, class_stack)
+        if parts is None:
+            return None
+        scope_parts, name, _ = parts
+    elif member.type == "field_declaration":
+        if _prototype_declarator(declarator) is None:
+            return None
+        scope_parts = []
+        name = _get_declarator_name(declarator) or ""
+        if not name:
+            return None
+    else:
+        return None
+    stack = scope_parts if (not class_stack and scope_parts) else class_stack
+    return _build_qn(module_qn, namespace_parts, stack, name)
+
+
+def _scope_members(node: Node, class_stack: list[str]) -> Iterator[tuple[Node, list[str]]]:
+    """*node*'s declarations, each paired with the class stack it is named under.
+
+    Flattens exactly what ``_walk_translation_unit`` recurses through without
+    changing scope, so an overload set split across an ``#ifdef`` boundary or
+    wrapped in ``template <...>`` is still one overload set.  A ``friend``
+    function belongs to the enclosing namespace rather than to the class, so it
+    is yielded with the class dropped — the same adjustment the walker makes.
+    """
+    for child in node.children:
+        if child.type in _TRANSPARENT_CONTAINERS:
+            yield from _scope_members(child, class_stack)
+        elif child.type == "friend_declaration":
+            yield from _scope_members(child, class_stack[:-1])
+        else:
+            yield child, class_stack
+
+
+def _overloaded_qns(
+    node: Node,
+    *,
+    module_qn: str,
+    namespace_parts: list[str],
+    class_stack: list[str],
+) -> frozenset[str]:
+    """Qualified names claimed by two or more Callables declared directly in this scope.
+
+    C++ permits two definitions of one name in one scope, so a repeated name is
+    an overload set and each member needs its own uid (ADR-0032).  A name
+    declared once keeps its plain uid, which is what bounds the churn to the
+    names that were already ambiguous.
+    """
+    counts: Counter[str] = Counter()
+    for member, stack in _scope_members(node, class_stack):
+        qn = _declared_qn(member, stack, module_qn=module_qn, namespace_parts=namespace_parts)
+        if qn is not None:
+            counts[qn] += 1
+    return frozenset(qn for qn, n in counts.items() if n > 1)
+
+
+def _normalize_cpp_type(text: str) -> str:
+    """Normalize a C++ type for an overload suffix — dot-free, whitespace-free, unqualified.
+
+    A parameter pack or C variadic is rendered ``[]`` rather than ``...``, for
+    the reason ``jvm.py`` renders Java varargs the same way: a dot in a
+    qualified_name separates scope segments, so an ellipsis in the suffix would
+    manufacture two fake ones.  The collapse is done before qualifier stripping,
+    because ``T...`` otherwise looks like a qualified ``T.`` to that regex.
+    Anything else that survives with a dot in it — a floating-point default
+    template argument is the only real source — loses it for the same reason.
+    """
+    return normalize_type_text("".join(text.split()).replace("...", "[]")).replace(".", "")
+
+
+def _declarator_identifier(declarator: Node | None) -> Node | None:
+    """The parameter-name identifier inside a declarator, or None when unnamed.
+
+    Only declarator-shaped children are followed, so a function-pointer
+    parameter's own parameter list cannot be mistaken for the name.
+    """
+    if declarator is None:
+        return None
+    if declarator.type == "identifier":
+        return declarator
+    inner = declarator.child_by_field_name("declarator")
+    if inner is not None:
+        return _declarator_identifier(inner)
+    for child in declarator.named_children:
+        if child.type == "identifier" or child.type.endswith("declarator"):
+            found = _declarator_identifier(child)
+            if found is not None:
+                return found
+    return None
+
+
+def _param_type_text(param: Node) -> str:
+    """One parameter's type, with its name and any default value removed.
+
+    C++ overloads on the whole parameter type, so ``const S&`` must not reduce
+    to ``S``: neither the ``const`` nor the ``&`` is inside the ``type`` field —
+    they are a sibling ``type_qualifier`` and part of the declarator.  Taking the
+    node's own bytes and cutting the name out is what keeps them.  The default
+    value goes because it is not part of the signature, and an out-of-line
+    definition repeats the parameter without it.
+    """
+    raw = param.text
+    if raw is None:
+        return ""
+    base = param.start_byte
+    eq = next((c for c in param.children if c.type == "="), None)
+    if eq is not None:
+        raw = raw[: eq.start_byte - base]
+    name = _declarator_identifier(param.child_by_field_name("declarator"))
+    if name is not None and name.end_byte - base <= len(raw):
+        raw = raw[: name.start_byte - base] + raw[name.end_byte - base :]
+    return _normalize_cpp_type(raw.decode("utf-8", errors="replace"))
+
+
+def _parameter_list(declarator: Node) -> Node | None:
+    """The ``parameter_list`` of a function declarator, unwrapping pointer/reference returns."""
+    node = declarator
+    while node.type in ("pointer_declarator", "reference_declarator", "operator_cast"):
+        inner = node.child_by_field_name("declarator") or next(
+            (c for c in node.named_children if c.type.endswith("declarator")), None
+        )
+        if inner is None:
+            return None
+        node = inner
+    return node.child_by_field_name("parameters")
+
+
+def _overload_suffix(node: Node, declarator: Node) -> str:
+    """Disambiguating qn suffix for an overloaded callable.
+
+    ``<template params>(<param types>)<cv/ref qualifiers>`` — everything C++
+    resolves an overload on, and nothing it does not.
+
+    The template parameter list is in because overloads differing only there are
+    real and common: fmt's ``test_value`` is two zero-argument templates told
+    apart solely by an ``enable_if_t`` in the template header, and two of
+    scan.h's eight ``read`` overloads take identical parameters and differ only
+    by ``is_signed`` versus ``is_unsigned``.
+
+    The trailing ``const``/``&``/``&&`` are in for the same reason:
+    ranges-test.cc declares ``value() &``, ``value() const&``, ``value() &&``
+    and ``value() const&&`` on one type.  ``noexcept`` is deliberately out — C++
+    does not overload on it, so a header that spells it where the out-of-line
+    definition does not would split one function into two nodes.
+    """
+    template = _template_wrapper(node)
+    tp = template.child_by_field_name("parameters") if template is not None else None
+    tp_text = _normalize_cpp_type(node_text(tp)) if tp is not None else ""
+    params = _parameter_list(declarator)
+    if params is None:
+        return f"{tp_text}()"
+    types: list[str] = []
+    for child in params.children:
+        if child.type in _PARAM_NODES:
+            types.append(_param_type_text(child))
+        elif child.type == "...":
+            types.append("[]")
+    fn = params.parent
+    quals = "" if fn is None else "".join(node_text(c) for c in fn.children if c.type in _QUALIFIER_NODES)
+    return f"{tp_text}({','.join(types)}){quals}"
+
+
 def _process_function(
     node: Node,
     *,
@@ -1159,6 +1386,7 @@ def _process_function(
     current_visibility: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    overloaded: frozenset[str],
 ) -> None:
     """Process a function_definition node."""
     declarator = node.child_by_field_name("declarator")
@@ -1170,26 +1398,29 @@ def _process_function(
     if template_parent is not None:
         tags.append("template")
 
-    gtest_case = _gtest_case_name(declarator)
-    if gtest_case is not None:
-        scope_parts, name = [], gtest_case
+    parts = _function_name_parts(node, declarator, class_stack)
+    if parts is None:
+        if _macro_invocation_name(node, declarator, class_stack) is not None:
+            # A function-like macro whose expansion we cannot see. The only name
+            # available is the macro's own, which every invocation in the file
+            # shares — and one graph node claiming to be forty-seven definitions,
+            # carrying an arbitrary body and the union of their edges, is worse
+            # than forty-seven absences. Emit nothing; the body's calls are still
+            # real and attribute to the module (ADR-0031).
+            body = node.child_by_field_name("body")
+            if body is not None:
+                _extract_calls(body, f"{project_name}:{module_qn}", relationships)
+        return
+    scope_parts, name, is_gtest_case = parts
+    if is_gtest_case:
         tags.append("test")
-    elif _macro_invocation_name(node, declarator, class_stack) is not None:
-        # A function-like macro whose expansion we cannot see. The only name
-        # available is the macro's own, which every invocation in the file
-        # shares — and one graph node claiming to be forty-seven definitions,
-        # carrying an arbitrary body and the union of their edges, is worse
-        # than forty-seven absences. Emit nothing; the body's calls are still
-        # real and attribute to the module (ADR-0031).
-        body = node.child_by_field_name("body")
-        if body is not None:
-            _extract_calls(body, f"{project_name}:{module_qn}", relationships)
-        return
-    else:
-        scope_parts, name = _get_qualified_declarator_name(declarator)
 
-    if name is None:
-        return
+    # An overloaded name cannot identify one definition on its own, so it takes
+    # its signature into the uid (ADR-0032). A name declared once does not.
+    naming_stack = scope_parts if (not class_stack and scope_parts) else class_stack
+    qn_name = name
+    if _build_qn(module_qn, namespace_parts, naming_stack, name) in overloaded:
+        qn_name = f"{name}{_overload_suffix(node, declarator)}"
 
     line_start = node.start_point[0] + 1
     line_end = node.end_point[0] + 1
@@ -1214,16 +1445,16 @@ def _process_function(
             # file's Module (namespaces have no nodes).  parent_type_name is
             # the bare innermost class name (last scope part) — the resolver
             # matches on TypeDef name, not a '::'-qualified chain.
-            qn = _build_qn(module_qn, namespace_parts, scope_parts, name)
+            qn = _build_qn(module_qn, namespace_parts, scope_parts, qn_name)
             parent_qn_str = f"{project_name}:{module_qn}"
             parent_type_name = scope_parts[-1]
         else:
-            qn = _build_qn(module_qn, namespace_parts, class_stack, name)
+            qn = _build_qn(module_qn, namespace_parts, class_stack, qn_name)
             parent_qn_str = _parent_qn(project_name, module_qn, namespace_parts, class_stack)
         visibility = current_visibility
     else:
         kind = CallableKind.FUNCTION
-        qn = _build_qn(module_qn, namespace_parts, class_stack, name)
+        qn = _build_qn(module_qn, namespace_parts, class_stack, qn_name)
         parent_qn_str = _parent_qn(project_name, module_qn, namespace_parts, class_stack)
         # File-scope static → PRIVATE (internal linkage)
         visibility = Visibility.PRIVATE if "static" in tags and not class_stack else current_visibility
@@ -1372,6 +1603,7 @@ def _process_field_declaration(
     current_visibility: str,
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
+    overloaded: frozenset[str],
 ) -> bool:
     """Process a field_declaration inside a struct/class body.
 
@@ -1414,6 +1646,8 @@ def _process_field_declaration(
     if _prototype_declarator(declarator) is not None:
         # Method declaration without a body (`void draw() const;`) — a Callable,
         # not a field.  Function-pointer members stay on the field path.
+        if qn in overloaded:
+            qn = _build_qn(module_qn, namespace_parts, class_stack, f"{name}{_overload_suffix(node, declarator)}")
         tags = _extract_tags(node)
         kind = _method_callable_kind(name, class_stack[-1] if class_stack else "", tags)
         entities.append(

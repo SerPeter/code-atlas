@@ -1565,3 +1565,218 @@ class TestHeaderDialectRouting:
         """`.hpp`/`.cpp`/`.c` say what they are; content must not override."""
         assert _dialect("include/w.hpp", _C_HEADER) == "cpp"
         assert _dialect("src/m.c", _CPP_HEADER) == "c"
+
+
+# ---------------------------------------------------------------------------
+# Overload uids (ADR-0032)
+# ---------------------------------------------------------------------------
+
+_OVERLOAD_SOURCE = """
+#include <string>
+
+namespace detail {
+auto read(int v) -> int { return v; }
+auto read(const std::string& s) -> int { return 0; }
+template <typename T> auto read(T& v) -> int { return 0; }
+auto only_once(int a) -> int { return a; }
+}  // namespace detail
+
+class Widget {
+ public:
+  Widget() {}
+  Widget(int w) {}
+  Widget(const Widget& other) {}
+  Widget(Widget&& other) {}
+  void draw() const {}
+  auto value() & -> int { return 0; }
+  auto value() const& -> int { return 0; }
+};
+
+#ifdef _WIN32
+void probe(int a) {}
+#else
+void probe(double a) {}
+#endif
+
+template <typename... T>
+void pack(T&... args) {}
+void pack(int a) {}
+"""
+
+
+_OUT_OF_LINE_SOURCE = """
+class Widget {
+ public:
+  void resize(int w, int h = 10);
+  void resize(int w);
+  void dup2(int fd);
+  void dup2(int fd, std::error_code& ec);
+};
+
+void Widget::resize(int w, int h) {}
+void Widget::dup2(int fd) {}
+void Widget::dup2(int fd, std::error_code& ec) {}
+"""
+
+
+def _callable_uids(parsed: ParsedFile) -> list[str]:
+    return [e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+
+
+def _uid_ending(parsed: ParsedFile, suffix: str) -> str:
+    matches = [u for u in _callable_uids(parsed) if u.endswith(suffix)]
+    assert len(matches) == 1, f"expected exactly one uid ending {suffix!r}, got {matches}"
+    return matches[0]
+
+
+class TestOverloadUids:
+    """C++ permits two definitions of one name in one scope, so a name alone
+    cannot be a uid (ADR-0032). An overloaded name takes its signature into the
+    qualified name; a name declared once keeps the uid it always had, which is
+    what bounds the churn to what was already ambiguous.
+    """
+
+    def test_no_two_definitions_share_a_uid(self):
+        """The load-bearing assertion, and it has to be a negative one: a
+        positive check that some expected uid is present cannot notice that a
+        second definition claimed it too and merged into the same graph node.
+        """
+        uids = _callable_uids(_parse(_OVERLOAD_SOURCE, path="src/example.cpp"))
+        assert len(uids) == len(set(uids)), sorted(u for u in uids if uids.count(u) > 1)
+
+    def test_a_name_declared_once_keeps_its_plain_uid(self):
+        """The churn bound. Suffixing every callable would rewrite the uid of
+        every unambiguous function in every C++ file for no gain, so a name
+        declared once has to come out exactly as it did before.
+        """
+        uids = _callable_uids(_parse(_OVERLOAD_SOURCE, path="src/example.cpp"))
+        assert f"{PROJECT}:src.example.detail.only_once" in uids
+        assert f"{PROJECT}:src.example.Widget.draw" in uids
+
+    def test_overloaded_constructors_get_one_uid_each(self):
+        """The largest group in real C++ — 9 `basic_scan_arg` constructors in
+        fmt's scan.h alone. They are named for their class, so they collide with
+        each other rather than with anything else.
+        """
+        uids = _callable_uids(_parse(_OVERLOAD_SOURCE, path="src/example.cpp"))
+        assert f"{PROJECT}:src.example.Widget.Widget()" in uids
+        assert f"{PROJECT}:src.example.Widget.Widget(int)" in uids
+        assert f"{PROJECT}:src.example.Widget.Widget(constWidget&)" in uids
+        assert f"{PROJECT}:src.example.Widget.Widget(Widget&&)" in uids
+
+    def test_overload_scope_is_not_only_the_class_body(self):
+        """`detail::read` and the file-scope `pack` are namespace- and
+        translation-unit-level overload sets. A rule that only looked at class
+        members would leave both merged.
+        """
+        uids = _callable_uids(_parse(_OVERLOAD_SOURCE, path="src/example.cpp"))
+        assert f"{PROJECT}:src.example.detail.read(int)" in uids
+        assert f"{PROJECT}:src.example.detail.read(string&)" in uids
+        assert f"{PROJECT}:src.example.pack(int)" in uids
+
+    def test_an_ifdef_split_overload_set_is_still_one_set(self):
+        """Both arms are walked because the build configuration is unknown, so
+        the two `probe` definitions are siblings for naming purposes even though
+        the grammar nests each under its own `preproc_ifdef`.
+        """
+        uids = _callable_uids(_parse(_OVERLOAD_SOURCE, path="src/example.cpp"))
+        assert f"{PROJECT}:src.example.probe(int)" in uids
+        assert f"{PROJECT}:src.example.probe(double)" in uids
+
+    def test_template_parameters_separate_identical_signatures(self):
+        """fmt's base-test.cc is two zero-argument `test_value` templates told
+        apart solely by an `enable_if_t` in the template header. Parameters
+        alone would leave them merged.
+        """
+        parsed = _parse(
+            """
+template <typename T, std::enable_if_t<std::is_integral<T>::value, int> = 0>
+auto test_value() -> T { return T(); }
+template <typename T, std::enable_if_t<std::is_floating_point<T>::value, int> = 0>
+auto test_value() -> T { return T(); }
+""",
+            path="src/example.cpp",
+        )
+        uids = _callable_uids(parsed)
+        assert len(uids) == len(set(uids)), uids
+        assert any("is_integral" in u for u in uids)
+        assert any("is_floating_point" in u for u in uids)
+
+    def test_a_parameter_qualifier_is_part_of_the_suffix(self):
+        """`f(int)` and `f(const int&)` are different overloads, and neither the
+        `const` nor the `&` is inside the parameter's `type` field — one is a
+        sibling qualifier, the other lives in the declarator.
+        """
+        parsed = _parse("void f(int v) {}\nvoid f(const int& v) {}\nvoid f(int* v) {}\n", path="src/example.cpp")
+        assert sorted(_callable_uids(parsed)) == sorted(
+            [
+                f"{PROJECT}:src.example.f(int)",
+                f"{PROJECT}:src.example.f(constint&)",
+                f"{PROJECT}:src.example.f(int*)",
+            ]
+        )
+
+    def test_trailing_cv_and_ref_qualifiers_separate_overloads(self):
+        """fmt's ranges-test.cc declares `value() &`, `value() const&`,
+        `value() &&` and `value() const&&` on one type — four definitions with
+        identical parameter lists.
+        """
+        uids = _callable_uids(_parse(_OVERLOAD_SOURCE, path="src/example.cpp"))
+        assert f"{PROJECT}:src.example.Widget.value()&" in uids
+        assert f"{PROJECT}:src.example.Widget.value()const&" in uids
+
+    def test_the_suffix_carries_no_dot(self):
+        """A dot separates scope segments in a qualified name, so one inside the
+        suffix would manufacture a scope that does not exist. A namespace
+        qualifier and a parameter pack are the two things that would leave one.
+        """
+        uids = _callable_uids(_parse(_OVERLOAD_SOURCE, path="src/example.cpp"))
+        for uid in uids:
+            assert "." not in uid.partition("(")[2], uid
+        assert f"{PROJECT}:src.example.pack<typename[]T>(T&[])" in uids
+
+    def test_a_default_argument_does_not_reach_the_suffix(self):
+        """A declaration spells the default and its out-of-line definition does
+        not, so keeping it would put two different suffixes on one function.
+        """
+        uids = _callable_uids(_parse(_OUT_OF_LINE_SOURCE, path="src/example.cpp"))
+        assert f"{PROJECT}:src.example.Widget.resize(int,int)" in uids
+        assert f"{PROJECT}:src.example.Widget.resize(int)" in uids
+        assert not any("10" in u for u in uids)
+
+    def test_out_of_line_definitions_are_weighed_against_their_own_scope(self):
+        """A known limit, pinned rather than claimed correct.
+
+        The overload set is per scope, and a class body and the file scope
+        holding an out-of-line definition are two of them. ``Widget::resize``
+        defined once outside the class therefore keeps its plain uid even though
+        the class declares two, so it no longer merges with its own declaration.
+        Nothing is lost — both nodes exist and carry their own edges, and the
+        three-way merge this replaced was worse — but a declaration and its
+        definition are two nodes where they used to be one.
+
+        Closing it needs the set keyed per *file* rather than per scope, which
+        means walking every function body twice. Two out-of-line definitions of
+        one name in one file are still weighed against each other, which is the
+        shape that actually occurs (``file::dup2`` in fmt's src/os.cc).
+        """
+        uids = _callable_uids(_parse(_OUT_OF_LINE_SOURCE, path="src/example.cpp"))
+        assert f"{PROJECT}:src.example.Widget.resize" in uids
+        assert f"{PROJECT}:src.example.Widget.dup2(int)" in uids
+        assert f"{PROJECT}:src.example.Widget.dup2(int,error_code&)" in uids
+
+    def test_defines_points_at_the_suffixed_uid(self):
+        """The entity and its DEFINES edge have to agree, or the parent's edge
+        dangles at a uid nothing ever emitted.
+        """
+        parsed = _parse(_OVERLOAD_SOURCE, path="src/example.cpp")
+        defined = {r.to_name for r in parsed.relationships if r.rel_type == RelType.DEFINES}
+        assert _uid_ending(parsed, "Widget.Widget(int)") in defined
+        assert _uid_ending(parsed, "detail.read(int)") in defined
+
+    def test_the_display_name_stays_unsuffixed(self):
+        """The suffix disambiguates the uid, not what a reader searches for."""
+        parsed = _parse(_OVERLOAD_SOURCE, path="src/example.cpp")
+        reads = [e for e in parsed.entities if e.qualified_name.rsplit(".", 1)[-1].startswith("read(")]
+        assert len(reads) == 2
+        assert {e.name for e in reads} == {"read"}

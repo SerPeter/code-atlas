@@ -16,6 +16,7 @@ from code_atlas.parsing.ast import (
     ParsedRelationship,
     call_receiver_props,
     node_text,
+    normalize_type_text,
     register_language,
 )
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind, ValueKind, Visibility
@@ -267,13 +268,6 @@ def _extract_signature_from_node(node: Node, source: bytes) -> str | None:
 # Node types whose same-named siblings form an overload set (Java and C# share these).
 _OVERLOADABLE_MEMBER_TYPES: frozenset[str] = frozenset({"method_declaration", "constructor_declaration"})
 
-_TYPE_QUALIFIER_RE = re.compile(r"[\w$]+(?:\.|::)")
-
-
-def _normalize_type_text(text: str) -> str:
-    """Normalize a parameter type for overload suffixes: strip whitespace and package/namespace qualifiers."""
-    return _TYPE_QUALIFIER_RE.sub("", "".join(text.split()))
-
 
 def _overloaded_callable_names(children: Iterable[Node]) -> frozenset[str]:
     """Names declared by 2+ method/constructor declarations among *children*.
@@ -301,7 +295,7 @@ def _java_param_types(node: Node) -> str:
         if child.type == "formal_parameter":
             t = child.child_by_field_name("type")
             if t is not None:
-                types.append(_normalize_type_text(node_text(t)))
+                types.append(normalize_type_text(node_text(t)))
         elif child.type == "spread_parameter":
             # No fields in the grammar: type is the first named child that isn't modifiers/declarator.
             # Varargs render as 'T[]', not 'T...': the suffix must stay dot-free (dots in
@@ -309,7 +303,7 @@ def _java_param_types(node: Node) -> str:
             # T[] overload next to T..., so '[]' can never collide within an overload set.
             for sc in child.named_children:
                 if sc.type not in ("modifiers", "variable_declarator"):
-                    types.append(_normalize_type_text(node_text(sc)) + "[]")
+                    types.append(normalize_type_text(node_text(sc)) + "[]")
                     break
     return ",".join(types)
 
@@ -327,13 +321,13 @@ def _csharp_param_types(node: Node) -> str:
             if t is None:
                 continue
             mods = [node_text(m) for m in child.children if m.type == "modifier"]
-            types.append(" ".join([*mods, _normalize_type_text(node_text(t))]))
+            types.append(" ".join([*mods, normalize_type_text(node_text(t))]))
         elif child.type == "params":
             pending_params = True
         elif params.field_name_for_child(i) == "type":
             # `params T[] name` is spliced directly into parameter_list (tree-sitter-c-sharp 0.23)
             prefix = "params " if pending_params else ""
-            types.append(prefix + _normalize_type_text(node_text(child)))
+            types.append(prefix + normalize_type_text(node_text(child)))
             pending_params = False
     return ",".join(types)
 

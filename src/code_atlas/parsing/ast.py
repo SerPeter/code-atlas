@@ -265,6 +265,19 @@ def node_text(node: Node) -> str:
     return text.decode("utf-8", errors="replace")
 
 
+_TYPE_QUALIFIER_RE = re.compile(r"[\w$]+(?:\.|::)")
+
+
+def normalize_type_text(text: str) -> str:
+    """Normalize a type for an overload suffix: strip whitespace and package/namespace qualifiers.
+
+    Shared by every language that lets two definitions share a name in one scope
+    (ADR-0032), so ``java.util.List<String>`` and ``std::error_code&`` reduce the
+    same way and the suffix reads as source rather than as a linker symbol.
+    """
+    return _TYPE_QUALIFIER_RE.sub("", "".join(text.split()))
+
+
 def call_receiver_props(obj: Node | None, local_types: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Properties for a CALLS relationship whose callee was named on a receiver.
 
