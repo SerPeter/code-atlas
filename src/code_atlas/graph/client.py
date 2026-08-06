@@ -13,7 +13,7 @@ import contextvars
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from itertools import groupby
+from itertools import batched, groupby
 from operator import attrgetter
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
@@ -109,6 +109,11 @@ _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
 # resolve_config_refs) — not part of _create_relationships at all.
 # READS_ENV/REFERENCES_FILE belong here because their *target* node does not
 # exist until resolution MERGEs it, exactly like an ExternalPackage stub.
+# Rows per CALLS-edge write. The sweep is project-wide (ADR-0026), so its size
+# tracks the codebase, not a batch — fmtlib/fmt alone resolves tens of thousands
+# of edges. Chunking keeps any single transaction well inside the write timeout.
+_CALLS_WRITE_CHUNK = 2000
+
 _POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
     {
         RelType.CALLS,
@@ -2275,24 +2280,49 @@ class GraphClient:
                 }
                 for (f, t), facts in edges.items()
             ]
-            await self.execute_write(
-                # Source is deliberately unlabelled: a call at module scope runs at import
-                # time and belongs to the Module, and constraining the source to :Callable
-                # dropped those edges without an error. The TARGET stays :Callable — only a
-                # Callable can be executed.
-                f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
-                f"MERGE (a)-[e:{RelType.CALLS}]->(b) "
-                f"SET e.confidence = r.confidence, e.strategy = r.strategy, "
-                f"e.candidate_count = r.candidate_count, e.from_test = r.from_test, e.weight = r.weight, "
-                f"e.line = r.line, e.site_count = r.site_count",
-                {"rels": edge_params},
-            )
+            await self._write_call_edges(edge_params, lookup)
 
         logger.debug(
             "Resolved {} CALLS edges ({} ambiguous, {} unresolved)", resolved, ambiguous, len(replay.unresolved)
         )
         return replay
+
+    async def _write_call_edges(self, edge_params: list[dict[str, Any]], lookup: _CallLookup) -> None:
+        """Write resolved CALLS edges, one labelled and chunked pass per source label.
+
+        A call source is a Callable or, for a call made at import time, the Module.
+        Constraining the match to ``:Callable`` once dropped every module-scope edge
+        without an error, so it was made unlabelled — but an unlabelled ``{uid: ...}``
+        match can use no label-property index, and Memgraph then scans every node once
+        per row. Measured on a 26k-node graph: **2.809s against 0.048s** for 200
+        lookups, 58x, which timed the write out entirely partway through fmtlib/fmt.
+
+        Partitioning restores the index without narrowing what is written.
+        ``uid_to_info`` holds every Callable uid, and absence from it is the same signal
+        ``_resolve_one_call`` uses to detect module scope, so the split is exact rather
+        than a heuristic. The target was always labelled: only a Callable can be
+        executed.
+
+        Chunked as well, because this sweep is project-wide (ADR-0026) and its size
+        tracks the codebase rather than a batch — indexing must not fail on a project
+        merely for being large.
+        """
+        by_label: dict[str, list[dict[str, Any]]] = {NodeLabel.CALLABLE: [], NodeLabel.MODULE: []}
+        for param in edge_params:
+            label = NodeLabel.CALLABLE if param["f"] in lookup.uid_to_info else NodeLabel.MODULE
+            by_label[label].append(param)
+
+        for source_label, params in by_label.items():
+            for chunk in batched(params, _CALLS_WRITE_CHUNK, strict=False):
+                await self.execute_write(
+                    f"UNWIND $rels AS r "
+                    f"MATCH (a:{source_label} {{uid: r.f}}), (b:{NodeLabel.CALLABLE} {{uid: r.t}}) "
+                    f"MERGE (a)-[e:{RelType.CALLS}]->(b) "
+                    f"SET e.confidence = r.confidence, e.strategy = r.strategy, "
+                    f"e.candidate_count = r.candidate_count, e.from_test = r.from_test, "
+                    f"e.weight = r.weight, e.line = r.line, e.site_count = r.site_count",
+                    {"rels": list(chunk)},
+                )
 
     async def build_anchor_lookup(self) -> _AnchorLookup:
         """Build the cross-project lookup tables needed for anchor resolution."""
