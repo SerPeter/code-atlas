@@ -51,7 +51,7 @@ from code_atlas.settings import SearchSettings
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 
     from neo4j import AsyncDriver
 
@@ -1935,13 +1935,28 @@ class GraphClient:
             f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
             f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
             f"AND NOT n:{NodeLabel.SCHEMA_VERSION} AND NOT n:{NodeLabel.PROJECT} "
-            "RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp",
+            "RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp, labels(n)[0] AS lbl",
             {"p": project_name},
         )
         internal_map: dict[str, str] = {}
         py_importers: set[str] = set()  # uids of Python-file entities (prefix fallback is Python-only)
+        # uid -> label, so the IMPORTS write can match on a label-property index
+        # instead of scanning. Read from the graph rather than guessed: an importer
+        # is a Module in every language observed, but labelling by assumption is
+        # what once dropped every module-scope CALLS edge with no error at all.
+        # A uid missing here is safe — `_write_labelled_edges` falls back to the
+        # unlabelled form for its group.
+        #
+        # `labels(n)[0]` is exact only because a node carries exactly one label.
+        # That invariant is already load-bearing across the read surface (every
+        # `labels(n)[0] AS label` in this file returns a node's type), and it is
+        # why a shared marker label cannot be added to make these lookups
+        # uniformly indexable: a second label would make the choice arbitrary
+        # here, and would silently drop the edge rather than merely slow it down.
+        uid_label: dict[str, str] = {}
         for r in records:
             internal_map[r["qn"]] = r["uid"]
+            uid_label[r["uid"]] = r["lbl"]
             if (r["fp"] or "").endswith((".py", ".pyi")):
                 py_importers.add(r["uid"])
 
@@ -2003,6 +2018,7 @@ class GraphClient:
                 if is_type_only:
                     edge["type_only"] = True
                 import_edges.append(edge)
+                uid_label[pkg_uid] = NodeLabel.EXTERNAL_PACKAGE
             else:
                 # Symbol import (e.g. `from loguru import logger`) → ExternalSymbol
                 sym_uid = f"{project_name}:ext/{to_name}"
@@ -2019,6 +2035,7 @@ class GraphClient:
                 if is_type_only:
                     edge["type_only"] = True
                 import_edges.append(edge)
+                uid_label[sym_uid] = NodeLabel.EXTERNAL_SYMBOL
 
         # 3. MERGE ExternalPackage nodes
         if ext_packages:
@@ -2059,18 +2076,24 @@ class GraphClient:
         type_only_edges = [e for e in import_edges if e.get("type_only")]
 
         if normal_edges:
-            await self.execute_write(
-                f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                f"MERGE (a)-[:{RelType.IMPORTS}]->(b)",
-                {"rels": normal_edges},
+            await self._write_labelled_edges(
+                normal_edges,
+                uid_label,
+                lambda a, b: (
+                    f"UNWIND $rels AS r "
+                    f"MATCH (a{a} {{uid: r.from_uid}}), (b{b} {{uid: r.to_uid}}) "
+                    f"MERGE (a)-[:{RelType.IMPORTS}]->(b)"
+                ),
             )
         if type_only_edges:
-            await self.execute_write(
-                f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
-                f"MERGE (a)-[e:{RelType.IMPORTS}]->(b) ON CREATE SET e.type_only = true",
-                {"rels": type_only_edges},
+            await self._write_labelled_edges(
+                type_only_edges,
+                uid_label,
+                lambda a, b: (
+                    f"UNWIND $rels AS r "
+                    f"MATCH (a{a} {{uid: r.from_uid}}), (b{b} {{uid: r.to_uid}}) "
+                    f"MERGE (a)-[e:{RelType.IMPORTS}]->(b) ON CREATE SET e.type_only = true"
+                ),
             )
 
         logger.debug(
@@ -2286,6 +2309,39 @@ class GraphClient:
             "Resolved {} CALLS edges ({} ambiguous, {} unresolved)", resolved, ambiguous, len(replay.unresolved)
         )
         return replay
+
+    async def _write_labelled_edges(
+        self,
+        edges: list[dict[str, Any]],
+        uid_label: Mapping[str, str],
+        make_query: Callable[[str, str], str],
+        *,
+        from_key: str = "from_uid",
+        to_key: str = "to_uid",
+    ) -> None:
+        """Write uid-keyed edges, grouped so each endpoint matches on its own index.
+
+        An unlabelled ``{uid: ...}`` match can use no label-property index, so
+        Memgraph scans every node once per row — measured at 4.289s against 0.055s
+        for 300 rows with both endpoints unlabelled, 78x, on a 26k-node graph.
+
+        Labelling by assumption is not an option here: constraining a source to the
+        label it "obviously" has is exactly what once dropped every module-scope
+        CALLS edge with no error at all. So the label comes from *observed* data —
+        a scan this method's callers already perform — and **any uid absent from
+        ``uid_label`` falls back to the unlabelled form for its group alone**. A
+        missing entry costs speed, never an edge.
+        """
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for edge in edges:
+            a = uid_label.get(edge[from_key], "")
+            b = uid_label.get(edge[to_key], "")
+            grouped[(a, b)].append(edge)
+
+        for (a_label, b_label), group in grouped.items():
+            query = make_query(f":{a_label}" if a_label else "", f":{b_label}" if b_label else "")
+            for chunk in batched(group, _CALLS_WRITE_CHUNK, strict=False):
+                await self.execute_write(query, {"rels": list(chunk)})
 
     async def _write_call_edges(self, edge_params: list[dict[str, Any]], lookup: _CallLookup) -> None:
         """Write resolved CALLS edges, one labelled and chunked pass per source label.
