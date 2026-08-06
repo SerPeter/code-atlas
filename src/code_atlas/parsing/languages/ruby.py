@@ -236,6 +236,19 @@ class _Ctx:
     """``"class"``, ``"module"``, ``"singleton"`` (a ``class << self`` body) or
     ``"top"``. Decides what kind a ``def`` produces."""
     scope: tuple[str, ...] = ()
+    anonymous: bool = False
+    """True once a block sits between here and the nearest named owner.
+
+    A ``def`` here gets no entity: ``superclass.class_eval do def call ... end``
+    attaches the method to the receiver, not to the lexical class, so no scope
+    path names it and every such ``def`` in the file would claim the same uid
+    (ADR-0032). The body is still walked and its calls attribute upward.
+
+    A ``class`` or ``module`` clears it, because Ruby resolves the constant it
+    declares against the lexical nesting and a block is transparent to that — a
+    ``class TestApp`` inside a ``describe`` block really is scoped by whatever
+    encloses the block. A ``class << self`` does not clear it: its ``self`` is
+    the block's receiver, which is exactly what cannot be named."""
     callable_qn: str | None = None
     """Nearest enclosing named callable. ``None`` inside a class or module body,
     including inside a DSL block in one — a block opens no named scope."""
@@ -300,9 +313,10 @@ def _dispatch(child: Node, ctx: _Ctx, vis: list[str]) -> None:
     elif kind == "identifier":
         _dispatch_identifier(child, ctx, vis)
     elif kind in _BLOCK_NODES:
-        # No entity and no new call scope — only value extraction stops, because
-        # a block's assignments bind locals rather than declaring fields.
-        _walk(child, replace(ctx, declarative=False), vis)
+        # No entity and no new call scope. Value extraction stops, because a
+        # block's assignments bind locals rather than declaring fields, and
+        # anything defined below here loses its claim to a qualified name.
+        _walk(child, replace(ctx, declarative=False, anonymous=True), vis)
     elif kind == "assignment":
         if ctx.declarative:
             _process_ruby_assignment(child, ctx)
@@ -513,12 +527,29 @@ def _process_singleton_class(node: Node, ctx: _Ctx) -> None:
     """
     _walk(
         node,
-        _body_ctx(ctx, node, parent_qn=ctx.parent_qn, parent_type="singleton", scope=ctx.scope),
+        # `anonymous` carries through: `class << self` inside a block reopens the
+        # singleton of the block's receiver, which is the thing we cannot name.
+        _body_ctx(
+            ctx,
+            node,
+            parent_qn=ctx.parent_qn,
+            parent_type="singleton",
+            scope=ctx.scope,
+            anonymous=ctx.anonymous,
+        ),
         [Visibility.PUBLIC],
     )
 
 
-def _body_ctx(ctx: _Ctx, node: Node, *, parent_qn: str, parent_type: str, scope: tuple[str, ...]) -> _Ctx:
+def _body_ctx(
+    ctx: _Ctx,
+    node: Node,
+    *,
+    parent_qn: str,
+    parent_type: str,
+    scope: tuple[str, ...],
+    anonymous: bool = False,
+) -> _Ctx:
     """Context for the body of a class, module or ``class << self``.
 
     ``callable_qn`` resets: a class body is not executed by whatever ``def`` may
@@ -530,10 +561,46 @@ def _body_ctx(ctx: _Ctx, node: Node, *, parent_qn: str, parent_type: str, scope:
         parent_qn=parent_qn,
         parent_type=parent_type,
         scope=scope,
+        anonymous=anonymous,
         callable_qn=None,
         declarative=True,
         locals=_local_names(body) if body is not None else frozenset(),
     )
+
+
+def _def_scope(ctx: _Ctx, name: str, *, singleton: bool) -> tuple[str, ...]:
+    """Scope path for a ``def``.
+
+    A singleton method takes an extra ``self`` segment, so ``def self.settings``
+    and ``def settings`` in one class stop sharing a uid (ADR-0032). The instance
+    method keeps the shorter path because it is the commoner of the two, which
+    bounds the churn; and ``self`` is a Ruby keyword, so the segment can never
+    collide with a class or module a developer could actually declare.
+    """
+    if singleton:
+        return (*ctx.scope, "self", name)
+    return (*ctx.scope, name)
+
+
+def _has_self_receiver(node: Node) -> bool:
+    """True for ``def self.foo``, false for ``def enc.foo`` or ``def @@x.foo``.
+
+    Only ``self`` names the enclosing class. An arbitrary receiver is a runtime
+    object this walker cannot resolve, so it earns no segment.
+    """
+    obj = node.child_by_field_name("object")
+    return obj is not None and obj.type == "self"
+
+
+def _declined_ctx(ctx: _Ctx, node: Node) -> _Ctx:
+    """Context for the body of a ``def`` that got no entity.
+
+    ``callable_qn`` and ``scope`` stay put, so the calls inside land on the
+    nearest named enclosing scope rather than on nobody (ADR-0031). Only the
+    local bindings change: they are the declined ``def``'s own, since Ruby does
+    not close a ``def`` over the locals around it.
+    """
+    return replace(ctx, declarative=False, locals=_local_names(node))
 
 
 def _callable_kind(name: str, ctx: _Ctx) -> str:
@@ -555,7 +622,13 @@ def _process_ruby_method(node: Node, ctx: _Ctx, visibility: str) -> None:
         return
     name = node_text(name_node)
 
-    new_scope = (*ctx.scope, name)
+    if ctx.anonymous:
+        _walk(node, _declined_ctx(ctx, node), [Visibility.PUBLIC])
+        return
+
+    # `def foo` inside `class << self` is a singleton method wearing the instance
+    # spelling, and takes the same `self` segment as `def self.foo`.
+    new_scope = _def_scope(ctx, name, singleton=ctx.parent_type == "singleton")
     qn = f"{ctx.module_qn}.{'.'.join(new_scope)}"
 
     # Merge name-based visibility with tracked visibility
@@ -595,7 +668,11 @@ def _process_ruby_singleton_method(node: Node, ctx: _Ctx, visibility: str) -> No
         return
     name = node_text(name_node)
 
-    new_scope = (*ctx.scope, name)
+    if ctx.anonymous:
+        _walk(node, _declined_ctx(ctx, node), [Visibility.PUBLIC])
+        return
+
+    new_scope = _def_scope(ctx, name, singleton=_has_self_receiver(node))
     qn = f"{ctx.module_qn}.{'.'.join(new_scope)}"
 
     effective_vis = visibility if visibility != Visibility.PUBLIC else _visibility_from_name(name)

@@ -815,7 +815,7 @@ end
     method = _entity_by_name(parsed, "load")
     assert method.label == NodeLabel.CALLABLE
     assert method.kind == CallableKind.STATIC_METHOD
-    assert method.qualified_name == f"{PROJECT}:lib.example.Config.load"
+    assert method.qualified_name == f"{PROJECT}:lib.example.Config.self.load"
 
 
 def test_singleton_class_body_defines_from_the_reopened_class():
@@ -828,69 +828,7 @@ class Config
 end
 """)
     defines = _rels_from(parsed, "lib.example.Config", RelType.DEFINES)
-    assert any(r.to_name == f"{PROJECT}:lib.example.Config.load" for r in defines)
-
-
-def test_def_inside_a_block_is_an_entity():
-    parsed = _parse("""\
-describe 'Delegator' do
-  def delegation_agent
-    Object.new
-  end
-end
-""")
-    method = _entity_by_name(parsed, "delegation_agent")
-    assert method.label == NodeLabel.CALLABLE
-    assert method.qualified_name == f"{PROJECT}:lib.example.delegation_agent"
-
-
-def test_def_inside_a_block_has_a_line_independent_uid():
-    """A uid must survive re-indexing, so it cannot encode where the block sat."""
-    top = _parse("""\
-describe 'x' do
-  def helper
-  end
-end
-""")
-    moved = _parse("""\
-# a leading comment
-
-puts 1
-
-describe 'x' do
-  def helper
-  end
-end
-""")
-    assert _entity_by_name(top, "helper").qualified_name == _entity_by_name(moved, "helper").qualified_name
-
-
-def test_singleton_def_inside_a_block_is_an_entity():
-    parsed = _parse("""\
-describe JsonCsrf do
-  def self.env_for(url)
-  end
-end
-""")
-    method = _entity_by_name(parsed, "env_for")
-    assert method.kind == CallableKind.STATIC_METHOD
-
-
-def test_def_inside_a_class_level_block_belongs_to_the_class():
-    parsed = _parse("""\
-class Base
-  class_eval do
-    def settings
-    end
-  end
-end
-""")
-    method = _entity_by_name(parsed, "settings")
-    assert method.kind == CallableKind.METHOD
-    assert method.qualified_name == f"{PROJECT}:lib.example.Base.settings"
-
-    defines = _rels_from(parsed, "lib.example.Base", RelType.DEFINES)
-    assert any(r.to_name == f"{PROJECT}:lib.example.Base.settings" for r in defines)
+    assert any(r.to_name == f"{PROJECT}:lib.example.Config.self.load" for r in defines)
 
 
 def test_def_in_a_conditional_branch_is_an_entity():
@@ -979,3 +917,287 @@ end
 """)
     inherits = [r for r in parsed.relationships if r.rel_type == RelType.INHERITS]
     assert inherits == [], f"invented INHERITS from a call with a receiver: {[r.to_name for r in inherits]}"
+
+
+# ---------------------------------------------------------------------------
+# 22. A uid must identify exactly one definition (ADR-0032)
+# ---------------------------------------------------------------------------
+
+
+def _callable_uids(parsed: ParsedFile) -> list[str]:
+    return [e.qualified_name for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+
+
+def _duplicate_uids(parsed: ParsedFile) -> list[str]:
+    uids = _callable_uids(parsed)
+    return sorted({u for u in uids if uids.count(u) > 1})
+
+
+def test_singleton_and_instance_method_of_one_name_get_distinct_uids():
+    """sinatra's `Base.settings` / `Base#settings` — two definitions, one uid."""
+    parsed = _parse("""\
+class Base
+  def self.settings
+    self
+  end
+
+  def settings
+    self.class.settings
+  end
+end
+""")
+    assert _duplicate_uids(parsed) == []
+    uids = set(_callable_uids(parsed))
+    assert uids == {f"{PROJECT}:lib.example.Base.self.settings", f"{PROJECT}:lib.example.Base.settings"}
+
+
+def test_class_self_and_instance_method_of_one_name_get_distinct_uids():
+    """The other spelling: `def foo` inside `class << self` is still a singleton method."""
+    parsed = _parse("""\
+class Base
+  class << self
+    def call(env)
+    end
+  end
+
+  def call(env)
+  end
+end
+""")
+    assert _duplicate_uids(parsed) == []
+    uids = set(_callable_uids(parsed))
+    assert uids == {f"{PROJECT}:lib.example.Base.self.call", f"{PROJECT}:lib.example.Base.call"}
+
+
+def test_no_two_definitions_in_one_file_share_a_uid():
+    """The negative form: a positive assertion cannot catch a merge it did not name."""
+    parsed = _parse("""\
+module Sinatra
+  class Base
+    def self.settings
+    end
+
+    def settings
+    end
+
+    class << self
+      def force_encoding(data)
+      end
+    end
+
+    def force_encoding(data)
+    end
+  end
+
+  class IndifferentHash
+    def self.[](*args)
+    end
+
+    def [](key)
+    end
+  end
+end
+
+shared_examples_for 'protection' do
+  def call(env)
+  end
+end
+
+shared_examples_for 'other' do
+  def call(env)
+  end
+end
+""")
+    assert _duplicate_uids(parsed) == []
+
+
+def test_instance_method_in_a_plain_class_keeps_its_uid():
+    """The churn bound: only the rarer singleton form moves."""
+    parsed = _parse("""\
+module Sinatra
+  class Base
+    def initialize(app = nil)
+    end
+
+    def call(env)
+    end
+  end
+end
+""")
+    uids = set(_callable_uids(parsed))
+    assert uids == {
+        f"{PROJECT}:lib.example.Sinatra.Base.initialize",
+        f"{PROJECT}:lib.example.Sinatra.Base.call",
+    }
+
+
+def test_singleton_method_on_a_non_self_receiver_takes_no_self_segment():
+    """`def enc.generate` defines on a runtime object, not on the enclosing class.
+
+    A `self` segment would claim the class owns it. This pins the current
+    behaviour so that changing it stays a decision rather than a side effect.
+    """
+    parsed = _parse("""\
+class Encoder
+  def enc.generate(obj)
+  end
+end
+""")
+    assert _callable_uids(parsed) == [f"{PROJECT}:lib.example.Encoder.generate"]
+
+
+# --- category C: an entity needs every enclosing scope to be named -----------
+
+
+def test_def_inside_a_block_produces_no_entity():
+    """Reverses ATL-096. A block names nothing, so no scope path reaches the def."""
+    parsed = _parse("""\
+describe 'Delegator' do
+  def delegation_agent
+    Object.new
+  end
+end
+""")
+    callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    assert callables == [], f"a block-nested def became a Callable: {[e.name for e in callables]}"
+
+
+def test_singleton_def_inside_a_block_produces_no_entity():
+    parsed = _parse("""\
+describe JsonCsrf do
+  def self.env_for(url)
+  end
+end
+""")
+    callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    assert callables == [], f"a block-nested singleton def became a Callable: {[e.name for e in callables]}"
+
+
+def test_def_inside_a_class_level_block_produces_no_entity():
+    """`superclass.class_eval do def call ... end` attaches to the receiver, not the class."""
+    parsed = _parse("""\
+class Base
+  class_eval do
+    def call(env)
+    end
+  end
+
+  def call(env)
+  end
+end
+""")
+    assert _callable_uids(parsed) == [f"{PROJECT}:lib.example.Base.call"]
+    defines = _rels_from(parsed, "lib.example.Base", RelType.DEFINES)
+    assert len(defines) == 1, f"a declined def still got a DEFINES edge: {[r.to_name for r in defines]}"
+
+
+def test_sibling_block_defs_of_one_name_produce_no_entity():
+    """rack-protection's shared_examples.rb: three `def call`s, one uid between them."""
+    parsed = _parse("""\
+shared_examples_for 'protection' do
+  def call(env)
+    a
+  end
+
+  it 'x' do
+    def call(env)
+      b
+    end
+  end
+
+  def call(env)
+    c
+  end
+end
+""")
+    callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    assert callables == [], f"sibling block defs became Callables: {[e.name for e in callables]}"
+
+
+def test_declining_a_def_keeps_its_calls():
+    """Declining relocates a call to the enclosing scope; it must not drop it."""
+    parsed = _parse("""\
+describe 'Delegator' do
+  def delegation_agent
+    Object.new
+    normalize(1)
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, ":lib.example", RelType.CALLS)}
+    assert {"new", "normalize"} <= called
+
+
+def test_declining_a_def_attributes_its_calls_to_the_enclosing_method():
+    parsed = _parse("""\
+class Worker
+  def perform
+    items.each do
+      def handler
+        transform
+      end
+    end
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, "lib.example.Worker.perform", RelType.CALLS)}
+    assert "transform" in called
+
+
+def test_declined_def_parameters_are_still_local_reads():
+    """The declined body keeps its own bindings, so a parameter is not an implicit call."""
+    parsed = _parse("""\
+describe 'x' do
+  def handler(payload)
+    payload
+    content_type
+  end
+end
+""")
+    called = {r.to_name for r in _rels_from(parsed, ":lib.example", RelType.CALLS)}
+    assert "content_type" in called
+    assert "payload" not in called, "a declined def's parameter became a CALLS edge"
+
+
+def test_def_nested_in_a_named_method_is_still_an_entity():
+    """Only an anonymous link in the scope chain disqualifies."""
+    parsed = _parse("""\
+class Worker
+  def perform
+    def helper
+    end
+  end
+end
+""")
+    uids = set(_callable_uids(parsed))
+    assert f"{PROJECT}:lib.example.Worker.perform.helper" in uids
+
+
+def test_def_in_a_named_class_inside_a_block_is_an_entity():
+    """A `class` re-anchors the chain: Ruby resolves its constant lexically, past the block."""
+    parsed = _parse("""\
+class BaseTest
+  describe 'subclasses' do
+    class TestApp < Sinatra::Base
+      def initialize(argument:)
+      end
+    end
+  end
+end
+""")
+    uids = set(_callable_uids(parsed))
+    assert uids == {f"{PROJECT}:lib.example.BaseTest.TestApp.initialize"}
+
+
+def test_class_self_inside_a_block_produces_no_entity():
+    """`class << self` in a block reopens the singleton of the block's receiver."""
+    parsed = _parse("""\
+mock_app do
+  class << self
+    def configure!
+    end
+  end
+end
+""")
+    callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
+    assert callables == [], f"a block-nested `class << self` def became a Callable: {[e.name for e in callables]}"
