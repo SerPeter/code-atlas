@@ -5382,6 +5382,7 @@ class GraphClient:
             (9, self._migrate_v9_clear_for_abstract_bases),
             (10, self._migrate_v10_stub_flag_moved_to_methods),
             (11, self._migrate_v11_clear_for_call_site_lines),
+            (12, self._migrate_v12_clear_for_uid_discriminators),
         )
         for threshold, migrate in migrations:
             if stored < threshold:
@@ -5409,6 +5410,39 @@ class GraphClient:
         logger.info(
             "Schema v11: cleared stored file/git hashes — run 'atlas index' so CALLS edges "
             "record the line the call is written on"
+        )
+
+    async def _migrate_v12_clear_for_uid_discriminators(self) -> None:
+        """v12: some Callables changed uid, and some stopped being entities (ADR-0032).
+
+        A C++ overload set now carries a parameter-type suffix and a Ruby singleton
+        method a ``self`` segment, so `file::dup2` becomes two nodes and
+        `Base.settings` splits from `Base.self.settings`. Separately, a binding local
+        to an anonymous callback no longer produces an entity at all.
+
+        A hash clear, not a purge — and the distinction was checked rather than
+        assumed. ``_classify_file`` compares a re-parse against the uids the graph
+        already holds for that file and emits the difference as deletions, so the old
+        node disappears the moment the file is read again. Clearing file and git
+        hashes is what forces that read; deleting here as well would only race the
+        re-parse to the same result.
+
+        This is why it cannot be skipped: the hash gate would otherwise treat every
+        unchanged file as done, the split would never happen, and the graph would keep
+        serving one node for two functions indefinitely.
+
+        Only projects containing C++, Ruby or TypeScript are materially affected. The
+        clear is repo-wide because it is cheap and a per-language clear would need to
+        know which files a project holds before reading them.
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v12: cleared stored file/git hashes — run 'atlas index' so overloaded "
+            "C++ functions and Ruby singleton methods stop sharing one node"
         )
 
     async def _set_schema_version(self, version: int) -> None:
