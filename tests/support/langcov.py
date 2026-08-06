@@ -84,9 +84,41 @@ class LangSpec:
     denominator omits calls the numerator contains and the ratio exceeds 1.0.
     """
 
+    named_blocked_by_scope: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """A form whose nearest enclosing scope may be anonymous, making it unqualifiable.
+
+    The mirror of ``named_requires_ancestor``: that one names where a form DOES
+    carry a name, this one names where it stops. Ruby needs it — a ``def`` inside
+    a ``do_block`` cannot be qualified, because a block has no name and eight
+    sibling blocks each defining ``call`` would claim one uid (ADR-0032).
+
+    Resolved against ``named_scope_anchors``, not by "has such an ancestor
+    anywhere": a named class or module inside a block re-anchors the chain, and
+    its methods are genuinely qualifiable. Ruby resolves constants against
+    lexical nesting and a block is transparent to it, so 33 classes and 20
+    modules under blocks in sinatra hold real methods that must stay asserted.
+    """
+
+    named_scope_anchors: tuple[str, ...] = ()
+    """Ancestor types that re-anchor a qualified name, ending the search above."""
+
     @property
     def funcs(self) -> frozenset[str]:
         return frozenset(self.named + self.anon + self.decl_only)
+
+    def is_qualifiable(self, node: Node) -> bool:
+        """False when the nearest scope-defining ancestor is an anonymous one."""
+        blockers = self.named_blocked_by_scope.get(node.type)
+        if not blockers:
+            return True
+        cur = node.parent
+        while cur is not None:
+            if cur.type in blockers:
+                return False
+            if cur.type in self.named_scope_anchors:
+                return True
+            cur = cur.parent
+        return True
 
     def counts_as_call(self, node: Node) -> bool:
         required = self.calls_require_parent.get(node.type)
@@ -134,6 +166,11 @@ LANGS: dict[str, LangSpec] = {
         anon=("do_block", "block", "lambda"),
         calls=("call", "identifier"),
         skip=("/vendor/",),
+        named_blocked_by_scope={
+            "method": ("do_block", "block"),
+            "singleton_method": ("do_block", "block"),
+        },
+        named_scope_anchors=("class", "module"),
         calls_require_parent={
             "identifier": ("body_statement", "then", "else", "do", "block_body", "program", "begin_block"),
         },
@@ -338,7 +375,10 @@ def measure(root: Path, lang: str) -> Coverage:
                         captured=_captured_by(spans, start, end),
                         parent=node.parent.type if node.parent else "-",
                         chain=_chain(node),
-                        name_bearing=_has_ancestor(node, spec.named_requires_ancestor.get(node.type)),
+                        name_bearing=(
+                            _has_ancestor(node, spec.named_requires_ancestor.get(node.type))
+                            and spec.is_qualifiable(node)
+                        ),
                     )
                 )
             elif node.type in calls and spec.counts_as_call(node):

@@ -62,15 +62,30 @@ A definition inside an anonymous callback has no qualifiable path. `const custom
 produce eight claims on `http-error.customFetch`. ADR-0031's own test already rejects it: a name a developer could use
 to refer to it means referable from outside.
 
-So an entity requires **every enclosing scope to be named**. A nested function inside a _named_ function is still an
-entity — Python's `module.outer.inner` is unaffected — because that path is qualifiable. Only an anonymous link in the
-chain disqualifies.
-
-This is the rule PHP already applies to a closure bound to a local, arrived at from the other direction: a local binding
-dies with the call, and rebinding proves the name does not identify a function.
+So an entity requires a qualifiable path. A nested function inside a _named_ function is still an entity — Python's
+`module.outer.inner` is unaffected. This is the rule PHP already applies to a closure bound to a local, arrived at from
+the other direction: a local binding dies with the call, and rebinding proves the name does not identify a function.
 
 Category C emits no entity and is therefore **not a uid change**: the body is still walked and its calls still attribute
 to the nearest named enclosing scope.
+
+**How far the decline reaches is decided per language by measurement, not by the strictest reading.** This replaces an
+earlier draft of this ADR that required every enclosing scope to be named; implementing it showed that rule costs real
+entities to prevent collisions that do not occur.
+
+- **TypeScript declines only forms that borrow their name from a binding** (ADR-0031 category 2). A `function foo() {}`
+  declares its own name, and `abortHandler` in `source/utils/delay.ts` sits inside `delay`'s
+  `new Promise((resolve, reject) => {...})` callback — the strict rule would drop it. Measured: strict costs
+  `named_funcs` 1.000 → 0.949 on ky and removes **zero** additional collisions.
+- **Ruby declines every definition under an anonymous block**, because there the collisions are observed — three sibling
+  `def call`s in one spec file, and a `def call` inside `superclass.class_eval do`. A named class or module inside a
+  block re-anchors the chain and is kept: Ruby resolves constants against lexical nesting, and a block is transparent to
+  it.
+
+The asymmetry is deliberate. The residual hole in the narrow rule — two sibling anonymous callbacks each declaring
+`function helper() {}` — is reachable in TypeScript and appears in neither corpus. **The `duplicate_uids` ceiling is the
+backstop.** If that shape ever lands, the floor test fails and names it, which is a better trade than preemptively
+deleting real named functions from every codebase to prevent it.
 
 ## Consequences
 
