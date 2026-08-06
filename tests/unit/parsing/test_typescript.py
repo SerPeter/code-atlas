@@ -1337,7 +1337,22 @@ export function delay(ms) {
     assert "clearTimeout" not in _calls_from(parsed, "src.example.delay")
 
 
-def test_arrow_bound_to_a_local_const_is_an_entity():
+# ---------------------------------------------------------------------------
+# A uid must identify exactly one definition (ADR-0032)
+#
+# ADR-0031 category 2 says a name-bound arrow earns an entity. ADR-0032 adds the
+# condition that makes the name usable: every scope enclosing the binding must
+# itself be named, or the qualified name names the enclosing scope instead of
+# the definition. `const customFetch = …` inside sibling `test(…)` callbacks is
+# the shape — 65 bodies sharing 8 uids across ky's test tree.
+#
+# Category 1 is untouched. A `function`/`class` declares its own name rather
+# than borrowing a variable's, so it stays an entity wherever it sits; see
+# test_nested_function_declaration_is_named_after_its_enclosing_function.
+# ---------------------------------------------------------------------------
+
+
+def test_arrow_bound_to_a_const_inside_a_callback_gets_no_entity():
     parsed = _parse("""\
 test('decodes', async t => {
   const customFetch = async () => {
@@ -1346,10 +1361,124 @@ test('decodes', async t => {
   await use(customFetch);
 });
 """)
-    fn = _entity_by_name(parsed, "customFetch")
-    assert fn.label == NodeLabel.CALLABLE
-    assert fn.kind == CallableKind.FUNCTION
-    assert _calls_from(parsed, "src.example.customFetch") == {"build"}
+    assert _callable_names(parsed) == set()
+    # The body is still walked; its calls attribute to the nearest named scope.
+    assert _calls_from(parsed, "src.example") == {"test", "build", "use"}
+
+
+def test_repeated_const_arrows_in_sibling_callbacks_do_not_collide_on_one_uid():
+    """The measured failure: eight `const customFetch` in one file, one uid.
+
+    A positive assertion cannot catch this — an entity named `customFetch` exists
+    either way, and the second upsert silently overwrites the first, leaving one
+    node with an arbitrary winner's source and the union of both edge sets.
+    """
+    parsed = _parse("""\
+test('one', async t => {
+  const customFetch = async () => first();
+  await use(customFetch);
+});
+test('two', async t => {
+  const customFetch = async () => second();
+  await use(customFetch);
+});
+""")
+    qns = [e.qualified_name for e in parsed.entities]
+    assert len(qns) == len(set(qns)), f"duplicate uid: {sorted(qns)}"
+    assert {"first", "second"} <= _calls_from(parsed, "src.example")
+
+
+def test_bound_object_literal_inside_a_callback_gets_no_entity():
+    """ky's `const schema = {'~standard': {validate() {…}}}` inside a test callback.
+
+    The binding chain is intact but starts inside an anonymous scope, so the
+    chain names nothing reachable and the same collision applies.
+    """
+    parsed = _parse("""\
+test('validates', async t => {
+  const schema = {
+    inner: {
+      validate(value) {
+        return check(value);
+      },
+    },
+  };
+  await use(schema);
+});
+""")
+    assert _callable_names(parsed) == set()
+    assert "check" in _calls_from(parsed, "src.example")
+
+
+def test_arrow_bound_to_a_const_in_a_named_function_is_still_an_entity():
+    """Every enclosing scope is named, so `outer.helper` names one definition."""
+    parsed = _parse("""\
+export function outer() {
+  const helper = () => {
+    return build();
+  };
+  return helper;
+}
+""")
+    helper = _entity_by_name(parsed, "helper")
+    assert helper.label == NodeLabel.CALLABLE
+    assert helper.qualified_name == f"{PROJECT}:src.example.outer.helper"
+    assert _calls_from(parsed, "src.example.outer.helper") == {"build"}
+
+
+def test_function_declaration_inside_a_callback_keeps_its_entity():
+    """Category 1 declares its own name, so ADR-0032's condition does not apply.
+
+    This is what holds langcov's `named_funcs` at 1.0: ky has three such nested
+    declarations, `abortHandler` in `source/utils/delay.ts` among them.
+    """
+    parsed = _parse("""\
+test('leaks', async t => {
+  function isLeaking() {
+    return probe();
+  }
+  await use(isLeaking);
+});
+""")
+    fn = _entity_by_name(parsed, "isLeaking")
+    assert fn.qualified_name == f"{PROJECT}:src.example.isLeaking"
+    assert _calls_from(parsed, "src.example.isLeaking") == {"probe"}
+
+
+def test_class_declared_inside_a_callback_keeps_its_methods():
+    """Class methods are named through the class, which declares its own name."""
+    parsed = _parse("""\
+test('subclasses', async t => {
+  class Stub extends Base {
+    send(request) {
+      return deliver(request);
+    }
+  }
+  await use(Stub);
+});
+""")
+    send = _entity_by_name(parsed, "send")
+    assert send.qualified_name == f"{PROJECT}:src.example.Stub.send"
+    assert _calls_from(parsed, "src.example.Stub.send") == {"deliver"}
+
+
+def test_js_function_expression_bound_inside_a_callback_gets_no_entity():
+    """The rule is about the binding's reachability, not the arrow spelling."""
+    if get_language_for_file("src/example.js") is None:
+        pytest.skip("tree-sitter-javascript not installed")
+    parsed = _parse(
+        """\
+describe('legacy', function () {
+  var handler = function () {
+    work();
+  };
+  run(handler);
+});
+""",
+        path="src/example.js",
+    )
+    assert _callable_names(parsed) == set()
+    assert "work" in _calls_from(parsed, "src.example")
 
 
 def test_a_local_const_holding_a_plain_value_gets_no_entity():

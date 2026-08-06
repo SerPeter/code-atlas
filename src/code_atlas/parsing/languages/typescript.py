@@ -319,6 +319,8 @@ def _visit(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    *,
+    qualifiable: bool = True,
 ) -> None:
     """Handle one node inside *owner_qn*'s scope, then descend.
 
@@ -326,10 +328,17 @@ def _visit(
     processor; everything else — an arrow passed as a callback, an object
     literal, an ``if`` block — is descended into with the scope unchanged, so its
     calls attribute to the nearest enclosing *named* scope (ADR-0031).
+
+    ``qualifiable`` is False once an anonymous scope stands between here and
+    *owner_qn*, which is what ADR-0032 keys on: the binding a category-2 callable
+    owes its name to is then unreachable from *owner_qn*, so the qualified name
+    it would take names the enclosing scope rather than the definition.
     """
     kind = node.type
     if kind in _SCOPE_BOUNDARY_TYPES:
-        _process_node(node, path, source, project_name, owner_qn, entities, relationships, seen)
+        _process_node(
+            node, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=qualifiable
+        )
         return
     if kind == "class" and node.child_by_field_name("name") is not None:
         # A named class expression: `globalThis.Headers = class Headers {...}`.
@@ -339,15 +348,25 @@ def _visit(
         # An object-literal method — `{async fetch() {...}}`, `{get duplex() {...}}`.
         # Class bodies are consumed by _process_class_body and never reach here,
         # except for an anonymous `class {...}` expression.
-        prefix = _object_method_prefix(node, owner_qn)
+        prefix = _object_method_prefix(node, owner_qn) if qualifiable else None
         if prefix is not None:
             _process_method(node, path, source, project_name, owner_qn, entities, relationships, seen, qn_prefix=prefix)
             return
-        # Unbound: a callback with a method's spelling. No entity, and its calls
-        # belong to the scope that wrote it — the same treatment an arrow gets.
+        # Unbound, or bound only inside an anonymous scope: a callback with a
+        # method's spelling. No entity, and its calls belong to the scope that
+        # wrote it — the same treatment an arrow gets. The body is itself an
+        # anonymous scope, so nothing declared inside it is qualifiable either.
+        _walk_scope(node, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=False)
+        return
     if kind in ("call_expression", "new_expression"):
         _emit_call(node, f"{project_name}:{owner_qn}", relationships)
-    _walk_scope(node, path, source, project_name, owner_qn, entities, relationships, seen)
+    if kind in _NAME_BOUND_FUNCTION_TYPES:
+        # Reached transparently, so no declarator claimed it: this is a callback,
+        # and everything lexically inside it is one anonymous link away from
+        # *owner_qn*.
+        _walk_scope(node, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=False)
+        return
+    _walk_scope(node, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=qualifiable)
 
 
 def _walk_scope(
@@ -359,10 +378,12 @@ def _walk_scope(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    *,
+    qualifiable: bool = True,
 ) -> None:
     """Visit every child of *node* in *owner_qn*'s scope."""
     for child in node.children:
-        _visit(child, path, source, project_name, owner_qn, entities, relationships, seen)
+        _visit(child, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=qualifiable)
 
 
 def _process_import(
@@ -726,8 +747,15 @@ def _process_class_field(
     # A field initialiser runs when the class is constructed, so its calls — and
     # any callback it installs — belong to the class.
     value_node = node.child_by_field_name("value")
-    if value_node is not None:
-        _visit(value_node, path, source, project_name, class_qn, entities, relationships, seen)
+    if value_node is None:
+        return
+    if value_node.type in _NAME_BOUND_FUNCTION_TYPES:
+        # `handler = () => {…}` is named through the field, so the arrow is not
+        # an anonymous link: walk its body rather than routing it back through
+        # _visit, which would read it as an unclaimed callback.
+        _walk_scope(value_node, path, source, project_name, class_qn, entities, relationships, seen)
+        return
+    _visit(value_node, path, source, project_name, class_qn, entities, relationships, seen)
 
 
 def _process_interface(
@@ -1012,6 +1040,7 @@ def _process_lexical_declaration(
     seen: set[tuple[int, str]],
     *,
     is_exported: bool = False,
+    qualifiable: bool = True,
 ) -> None:
     """Process a lexical_declaration (const/let) node."""
     # Determine const vs let
@@ -1035,6 +1064,7 @@ def _process_lexical_declaration(
                 seen,
                 is_const=is_const,
                 is_exported=is_exported,
+                qualifiable=qualifiable,
             )
 
 
@@ -1049,6 +1079,7 @@ def _process_variable_declaration(
     seen: set[tuple[int, str]],
     *,
     is_exported: bool = False,
+    qualifiable: bool = True,
 ) -> None:
     """Process a variable_declaration (var) node."""
     for child in node.children:
@@ -1065,6 +1096,7 @@ def _process_variable_declaration(
                 seen,
                 is_const=False,
                 is_exported=is_exported,
+                qualifiable=qualifiable,
             )
 
 
@@ -1081,14 +1113,17 @@ def _process_variable_declarator(
     *,
     is_const: bool,
     is_exported: bool,
+    qualifiable: bool = True,
 ) -> None:
     """Process a single variable_declarator within a lexical/variable declaration.
 
-    Three outcomes, in the order the checks run:
+    Four outcomes, in the order the checks run:
 
-    * bound to a function form — a Callable, wherever the declaration sits. The
+    * bound to a function form under a chain of named scopes — a Callable. The
       grammar calls the value anonymous; the codebase calls it by the binding
       (ADR-0031 category 2).
+    * bound to a function form inside an anonymous scope — no entity (ADR-0032),
+      see below.
     * bound to anything else at module scope — a Value, as before.
     * anything else — no entity. A local ``const`` is not worth a graph node,
       but its initialiser still runs, so the tail below walks it either way.
@@ -1103,11 +1138,36 @@ def _process_variable_declarator(
     if name is None or (line_start, name) in seen:
         # A destructuring pattern names no single thing, and a re-declaration is
         # already recorded — but the initialiser's calls are still made.
-        _walk_value(node, path, source, project_name, owner_qn, entities, relationships, seen)
+        _walk_value(node, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=qualifiable)
         return
     seen.add((line_start, name))
 
     if value_node is not None and value_node.type in _NAME_BOUND_FUNCTION_TYPES:
+        if not qualifiable:
+            # ADR-0032: the binding is real, but every scope between it and
+            # *owner_qn* must be named for the binding to name a definition, and
+            # one of them is a callback. `test('a', async t => {const customFetch
+            # = …})` written eight times in a file yields eight bodies and one
+            # uid, which upsert into a single node holding an arbitrary winner's
+            # source and the union of every edge set — a confident wrong answer,
+            # worse than the silence of no entity. ADR-0031 forbids the escape of
+            # a positional name, so the entity is declined instead.
+            #
+            # The body is still walked, so its calls reach the graph attributed
+            # to the nearest named scope; only the node and its USES_TYPE edges
+            # go, which is the same treatment an unbound object method gets.
+            _walk_scope(
+                value_node,
+                path,
+                source,
+                project_name,
+                owner_qn,
+                entities,
+                relationships,
+                seen,
+                qualifiable=False,
+            )
+            return
         qn = f"{owner_qn}.{name}"
         docstring = _extract_jsdoc_from_export(parent_decl, source)
         signature = _extract_signature(value_node, source)
@@ -1187,7 +1247,7 @@ def _process_variable_declarator(
             )
         )
 
-    _walk_value(node, path, source, project_name, owner_qn, entities, relationships, seen)
+    _walk_value(node, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=qualifiable)
 
 
 def _walk_value(
@@ -1199,6 +1259,8 @@ def _walk_value(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    *,
+    qualifiable: bool = True,
 ) -> None:
     """Walk a declarator's initialiser, attributing its calls to *owner_qn*.
 
@@ -1208,7 +1270,7 @@ def _walk_value(
     """
     value_node = declarator.child_by_field_name("value")
     if value_node is not None:
-        _visit(value_node, path, source, project_name, owner_qn, entities, relationships, seen)
+        _visit(value_node, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=qualifiable)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1409,8 @@ def _process_export_statement(
     entities: list[ParsedEntity],
     relationships: list[ParsedRelationship],
     seen: set[tuple[int, str]],
+    *,
+    qualifiable: bool = True,
 ) -> None:
     """Unwrap an export_statement and process the inner declaration."""
     decl = node.child_by_field_name("declaration")
@@ -1361,6 +1425,7 @@ def _process_export_statement(
             relationships,
             seen,
             is_exported=True,
+            qualifiable=qualifiable,
         )
         return
 
@@ -1389,11 +1454,12 @@ def _process_export_statement(
                 relationships,
                 seen,
                 is_exported=True,
+                qualifiable=qualifiable,
             )
         else:
             # `export default <expression>` declares nothing, but the expression
             # is real code — an arrow, a call, an object full of methods.
-            _visit(child, path, source, project_name, owner_qn, entities, relationships, seen)
+            _visit(child, path, source, project_name, owner_qn, entities, relationships, seen, qualifiable=qualifiable)
 
 
 def _process_node(
@@ -1407,13 +1473,22 @@ def _process_node(
     seen: set[tuple[int, str]],
     *,
     is_exported: bool = False,
+    qualifiable: bool = True,
 ) -> None:
-    """Dispatch processing for one declaration inside *owner_qn*'s scope."""
+    """Dispatch processing for one declaration inside *owner_qn*'s scope.
+
+    ``qualifiable`` reaches only the binding-named forms. A ``function``,
+    ``class``, ``interface``, ``enum`` or ``type`` declares its own name rather
+    than borrowing a variable's, so ADR-0031 category 1 keeps its entity wherever
+    it sits — ``delay``'s ``function abortHandler()`` lives inside a callback and
+    is still ``delay.abortHandler`` — and it reopens a named scope for whatever
+    it contains.
+    """
     node_type = node.type
     args = (node, path, source, project_name, owner_qn, entities, relationships, seen)
 
     if node_type == "export_statement":
-        _process_export_statement(*args)
+        _process_export_statement(*args, qualifiable=qualifiable)
     elif node_type in ("class_declaration", "abstract_class_declaration"):
         _process_class(*args)
     elif node_type == "interface_declaration":
@@ -1425,9 +1500,9 @@ def _process_node(
     elif node_type in ("function_declaration", "generator_function_declaration"):
         _process_function(*args)
     elif node_type == "lexical_declaration":
-        _process_lexical_declaration(*args, is_exported=is_exported)
+        _process_lexical_declaration(*args, is_exported=is_exported, qualifiable=qualifiable)
     elif node_type == "variable_declaration":
-        _process_variable_declaration(*args, is_exported=is_exported)
+        _process_variable_declaration(*args, is_exported=is_exported, qualifiable=qualifiable)
     elif node_type == "import_statement":
         # An import statement only ever appears at the top level, so the scope
         # that owns it is the module.
