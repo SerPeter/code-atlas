@@ -1676,3 +1676,46 @@ class TestStopConsumerTasks:
 
     async def test_no_tasks_is_a_no_op(self):
         await _stop_consumer_tasks([None])
+
+
+class TestGrammarGapReporting:
+    """The scan records what it dropped for want of a grammar (ATL-110)."""
+
+    def test_scan_records_files_no_grammar_could_read(self, tmp_path, monkeypatch):
+        from code_atlas.indexing.orchestrator import FileScope
+
+        (tmp_path / "a.py").write_text("x = 1", encoding="utf-8")
+        (tmp_path / "b.ts").write_text("const x = 1", encoding="utf-8")
+        (tmp_path / "c.ts").write_text("const y = 2", encoding="utf-8")
+
+        # Simulate TypeScript's grammar not being installed. Capture the real function
+        # BEFORE patching — resolving it through the module afterwards recurses.
+        import code_atlas.indexing.orchestrator as orch
+
+        real_lookup = orch.get_language_for_file
+
+        def _no_ts(path: str):
+            return None if path.endswith(".ts") else real_lookup(path)
+
+        monkeypatch.setattr(orch, "get_language_for_file", _no_ts)
+
+        scope = FileScope(tmp_path, _make_settings(tmp_path))
+        files = scope.scan()
+
+        assert "a.py" in files
+        assert "b.ts" not in files
+        assert scope.skipped_no_grammar == {".ts": 2}
+
+    def test_the_counter_is_reset_per_scan(self, tmp_path, monkeypatch):
+        """A scope is reusable, so a stale count must not outlive the scan it describes."""
+        import code_atlas.indexing.orchestrator as orch
+        from code_atlas.indexing.orchestrator import FileScope
+
+        (tmp_path / "b.ts").write_text("const x = 1", encoding="utf-8")
+        monkeypatch.setattr(orch, "get_language_for_file", lambda _p: None)
+
+        scope = FileScope(tmp_path, _make_settings(tmp_path))
+        scope.scan()
+        assert scope.skipped_no_grammar == {".ts": 1}
+        scope.scan()
+        assert scope.skipped_no_grammar == {".ts": 1}, "counts must not accumulate across scans"

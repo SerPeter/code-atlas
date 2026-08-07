@@ -11,8 +11,9 @@ import re
 import subprocess
 import time
 import tomllib
+from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
 
@@ -406,6 +407,10 @@ class IndexResult:
     mode: str = "full"  # "full" | "delta"
     delta_stats: DeltaStats | None = None
     drained: bool = True  # False when the pipeline drain timed out; git_hash was NOT advanced
+    # extension -> count of files the scope wanted but no installed grammar could read.
+    # Empty on a complete install; non-empty means the index is partial BY INSTALL, which
+    # the caller must say out loud rather than reporting a clean run (ATL-110).
+    skipped_no_grammar: dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +445,10 @@ class FileScope:
         # Nested gitignore specs, discovered lazily (see _check_nested_gitignore)
         self._nested_specs: dict[str, pathspec.PathSpec] = {}
         self._nested_checked: set[str] = set()
+        # extension -> files the scope wanted but no installed grammar could read.
+        # Populated by scan(); read by the caller to tell "no code here" apart from
+        # "you did not install the extra" (ATL-110).
+        self.skipped_no_grammar: Counter[str] = Counter()
 
     # -- public API ----------------------------------------------------------
 
@@ -448,7 +457,12 @@ class FileScope:
 
         Files are filtered through the global ignore spec, nested
         ``.gitignore`` files, include-path prefixes, and language support.
+
+        Also refreshes :attr:`skipped_no_grammar`, so a caller can report a partial
+        index rather than a clean one. Reset per call — a scope is reusable, and a
+        stale count would outlive the scan it describes.
         """
+        self.skipped_no_grammar.clear()
         result: list[str] = []
 
         for dirpath, dirnames, filenames in os.walk(self._root):
@@ -478,6 +492,10 @@ class FileScope:
                     continue
                 # Language support check (not in is_included — watcher may skip this)
                 if get_language_for_file(rel_path) is None:
+                    # Recorded, not merely skipped. A file the scope WANTED and no
+                    # grammar could read is the difference between "this repo has no
+                    # code" and "you did not install the extra" (ATL-110).
+                    self.skipped_no_grammar[PurePosixPath(rel_path).suffix.lower()] += 1
                     continue
                 result.append(rel_path)
 
@@ -605,8 +623,28 @@ def scan_files(
 
     Returns a sorted list of **relative POSIX paths** (forward slashes,
     relative to *project_root*).  Delegates to :class:`FileScope`.
+
+    Use :func:`scan_files_reporting_gaps` where the caller needs to know what was
+    skipped for want of a grammar; this signature stays list-only because 27 of its
+    28 call sites want exactly that and should not pay for the one that does not.
     """
     return FileScope(project_root, settings, scope_paths).scan()
+
+
+def scan_files_reporting_gaps(
+    project_root: str | Path,
+    settings: AtlasSettings,
+    scope_paths: list[str] | None = None,
+) -> tuple[list[str], dict[str, int]]:
+    """:func:`scan_files`, plus the extensions no installed grammar could read.
+
+    The second element is empty on a complete install. Non-empty means the index is
+    partial **by install choice**, which is a different thing from an empty repository
+    and has to be said out loud -- see :class:`IndexResult.skipped_no_grammar`.
+    """
+    scope = FileScope(project_root, settings, scope_paths)
+    files = scope.scan()
+    return files, dict(scope.skipped_no_grammar)
 
 
 def _read_ignore_file(path: Path) -> list[str]:
@@ -1783,7 +1821,7 @@ async def _index_project_inner(  # noqa: PLR0915
     project_root = (project_root or Path(settings.project_root)).resolve()
 
     # 1. Scan files
-    files = scan_files(project_root, settings, scope_paths=scope_paths)
+    files, skipped_no_grammar = scan_files_reporting_gaps(project_root, settings, scope_paths)
     logger.debug("Scanned {} indexable files", len(files))
     # Deliberately no early return on `not files`: an empty scan (all source
     # files deleted/moved, or a scope misconfiguration) must still flow through
@@ -1894,6 +1932,7 @@ async def _index_project_inner(  # noqa: PLR0915
         mode=decision.mode,
         delta_stats=delta_stats,
         drained=drained,
+        skipped_no_grammar=skipped_no_grammar,
     )
 
 

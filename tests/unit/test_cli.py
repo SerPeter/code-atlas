@@ -664,3 +664,26 @@ class TestIndexExitCode:
 
         self._patch_infra(monkeypatch, tmp_path, self._result(drained=True))
         await cli._run_index(str(tmp_path), None, True, no_embed=True, no_git_check=True)
+
+
+class TestProjectRootOutsideAGitRepo:
+    """Read commands must work where the README says to run them (ATL-110).
+
+    `_default_project_root` used to raise "Run from inside a git repo or pass an explicit
+    path" — advice no user could follow, because `status` accepts no path. The commands
+    that genuinely need a repo (`index`, `watch`, `mine-git-history`) enforce it
+    themselves via `_resolve_project_root`, each with `--no-git-check`.
+    """
+
+    def test_falls_back_to_cwd_when_there_is_no_git_root(self, tmp_path, monkeypatch):
+        from code_atlas import settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "find_git_root", lambda *a, **k: None)
+        monkeypatch.chdir(tmp_path)
+        assert settings_mod._default_project_root() == tmp_path
+
+    def test_prefers_the_git_root_when_there_is_one(self, tmp_path, monkeypatch):
+        from code_atlas import settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "find_git_root", lambda *a, **k: tmp_path / "repo")
+        assert settings_mod._default_project_root() == tmp_path / "repo"
