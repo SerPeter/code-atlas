@@ -25,8 +25,17 @@ _PRESETS: dict[str, dict[str, int]] = {
 def generate_synthetic_codebase(root: Path, preset: str = "small") -> list[str]:
     """Generate a deterministic Python project and return relative file paths.
 
-    Each file contains classes with methods, module-level functions,
-    cross-file imports, and docstrings — exercising all parser paths.
+    Each file contains classes with methods, module-level functions, cross-file
+    imports, and docstrings — exercising all parser paths.
+
+    **Call sites must resolve to project callables.** Until 2026-08-07 every
+    generated body called only ``len()`` and ``sum()``, so the corpus had full
+    node scale and no resolvable calls at all: `_resolve_one_call` found neither
+    name in the project lookup, the CALLS write received an empty set, and the
+    query never ran. That is why the ``large`` preset — 5,000 files, ~35,000
+    callables — still failed to expose a CALLS write that timed out on a real
+    72-file C++ project. A benchmark with node scale but no edge density measures
+    the wrong half of indexing.
     """
     cfg = _PRESETS[preset]
     n_files = cfg["files"]
@@ -76,12 +85,21 @@ def generate_synthetic_codebase(root: Path, preset: str = "small") -> list[str]:
                 mname = f"method_{m}"
                 lines.append(f"    def {mname}(self, x: int, y: str = 'default') -> bool:")
                 lines.append(f'        """Compute {mname} for {cname}."""')
-                lines.append(f"        return len(y) > x + {m}")
+                # Calls a function defined in THIS module, so it resolves to a
+                # project Callable. `len(y)` alone left the corpus with call
+                # sites whose only targets were builtins — see below.
+                lines.append(f"        return module_func_{i}([x]) > len(y) + {m}")
                 lines.append("")
 
-        # Module-level function
+        # Module-level function. When there is a previous module, instantiate its
+        # class and call a method on it: that is the cross-file, receiver-typed
+        # shape the resolver actually has to work for.
         lines.append(f"def module_func_{i}(data: list[int]) -> int:")
         lines.append(f'    """Process data in module {i}."""')
+        if i > 0:
+            lines.append(f"    helper = Class0_{i - 1}()")
+            lines.append('    if helper.method_0(len(data), "x"):')
+            lines.append("        return sum(data) + 1")
         lines.append("    return sum(data)")
         lines.append("")
 
