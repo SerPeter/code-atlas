@@ -516,3 +516,44 @@ def test_dot_in_a_directory_name_does_not_collide_with_real_nesting(language: st
         return roots[0].qualified_name
 
     assert root_uid(dotted) != root_uid(nested), f"uid collision: {root_uid(dotted)}"
+
+
+class TestMissingGrammarReporting:
+    """A grammar behind an uninstalled extra must be reported, never silently skipped.
+
+    A default install ships only the Python and Markdown grammars. Every language module
+    swallows its own ImportError so one absent wheel cannot take the others down,
+    `_DEFAULT_INCLUDE` still lists the extensions, and `parse_file` returns None with no
+    log at any level — so a TypeScript repo produced `Done - 4823 files, 0 entities` and
+    exit 0 (ATL-110).
+    """
+
+    def test_an_unregistered_extension_maps_to_the_extra_that_provides_it(self, monkeypatch):
+        from code_atlas.parsing import languages as lang_mod
+
+        # Simulate a default install: nothing is registered.
+        monkeypatch.setattr("code_atlas.parsing.ast.get_language_for_file", lambda _p: None)
+        assert lang_mod.missing_grammar_extras({".ts"}) == {".ts": "typescript"}
+        assert lang_mod.missing_grammar_extras({".go", ".rs"}) == {".go": "go", ".rs": "rust"}
+
+    def test_a_registered_extension_is_not_reported(self):
+        from code_atlas.parsing.languages import discover_plugins, missing_grammar_extras
+
+        discover_plugins()
+        # Python ships in the base dependencies, so it is never an install problem.
+        assert missing_grammar_extras({".py"}) == {}
+
+    def test_an_unsupported_extension_is_omitted_rather_than_guessed_at(self, monkeypatch):
+        """Telling a user to install something that would not help is worse than silence."""
+        from code_atlas.parsing import languages as lang_mod
+
+        monkeypatch.setattr("code_atlas.parsing.ast.get_language_for_file", lambda _p: None)
+        assert lang_mod.missing_grammar_extras({".zzz", ".kt"}) == {}
+
+    def test_the_install_hint_collapses_once_it_is_most_of_them(self):
+        from code_atlas.parsing.languages import install_hint
+
+        assert install_hint(["typescript"]) == "typescript"
+        assert install_hint(["go", "typescript"]) == "go,typescript"
+        # Four or more is where naming each one stops helping.
+        assert install_hint(["typescript", "go", "rust", "java"]) == "all-languages"

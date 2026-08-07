@@ -15,6 +15,7 @@ from rich.console import Console
 
 if TYPE_CHECKING:
     from code_atlas.graph.protocol import GraphBackend
+    from code_atlas.indexing.orchestrator import IndexResult
     from code_atlas.settings import AtlasSettings
 
 _dotenv_path = find_dotenv(usecwd=True)  # '' when not found
@@ -88,6 +89,41 @@ def _echo(msg: str) -> None:
     """Print a message to stderr (visible in default mode, suppressed by --json/--quiet)."""
     if not _output.json and not _output.quiet:
         typer.echo(msg, err=True)
+
+
+def _warn_partial_index(result: IndexResult) -> None:
+    """Say so when an index is partial, instead of reporting a clean run.
+
+    Two distinct silences, both of which produced `Done - 4823 files, 0 entities`
+    with exit 0 on a TypeScript repo (ATL-110):
+
+    * files the scope wanted that no installed grammar could read -- a default install
+      ships only the Python and Markdown grammars, and every other language sits behind
+      an extra that is documented nowhere a user would look;
+    * a scan that found files and produced nothing, which is either the above or a
+      scope so narrow it matched no code. Either way it is not success.
+
+    Written to stderr like the rest of the summary, so `--json` and `--quiet` still get
+    a clean stream; the counts ride in the JSON payload instead.
+    """
+    # Local, matching this module's lazy-import style: the CLI keeps startup cheap by
+    # importing the heavy packages only on the paths that need them.
+    from code_atlas.parsing.languages import install_hint, missing_grammar_extras
+
+    if result.skipped_no_grammar:
+        total = sum(result.skipped_no_grammar.values())
+        by_ext = ", ".join(
+            f"{ext} x{count}" for ext, count in sorted(result.skipped_no_grammar.items(), key=lambda kv: -kv[1])
+        )
+        extras = missing_grammar_extras(result.skipped_no_grammar)
+        _echo(f"  ! {total} file(s) skipped - no grammar installed: {by_ext}")
+        if extras:
+            _echo(f"    install with: pip install 'code-atlas-mcp[{install_hint(extras.values())}]'")
+
+    if result.files_scanned > 0 and result.entities_total == 0:
+        _echo("  ! Scanned files but produced no entities - the index is empty.")
+        if not result.skipped_no_grammar:
+            _echo("    Check the [scope] section of atlas.toml, or run 'atlas doctor'.")
 
 
 def _json_output(payload: dict[str, Any]) -> None:
@@ -487,6 +523,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                     f"Done ({result.mode}) — {result.files_scanned} files,"
                     f" {result.entities_total} entities in {result.duration_s:.1f}s"
                 )
+                _warn_partial_index(result)
                 if result.delta_stats is not None:
                     ds = result.delta_stats
                     _echo(
@@ -520,7 +557,7 @@ async def _index_monorepo_with_progress(
     """Run monorepo indexing with a Rich progress bar (unless --json or --quiet)."""
     from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
-    from code_atlas.indexing.orchestrator import IndexResult, index_monorepo
+    from code_atlas.indexing.orchestrator import index_monorepo
 
     show_progress = not _output.json and not _output.quiet
 

@@ -136,12 +136,24 @@ def derive_project_name(project_root: Path) -> str:
 
 
 def _default_project_root() -> Path:
-    """Git root if found, otherwise raise."""
-    root = find_git_root()
-    if root is None:
-        msg = f"No git repository found at or above {Path.cwd()}. Run from inside a git repo or pass an explicit path."
-        raise RuntimeError(msg)
-    return root
+    """Git root if found, otherwise the current directory.
+
+    This used to raise, and the raise was both redundant and actively harmful. The
+    commands that genuinely need a repository — ``index``, ``watch``,
+    ``mine-git-history`` — enforce it themselves through ``_resolve_project_root``, each
+    with a ``--no-git-check`` escape hatch. Raising here only reached the commands that
+    do NOT need one.
+
+    The cost was concrete: the README's own quickstart has you `curl` a compose file into
+    a fresh directory and then run ``atlas status``, which exited 1 with "Run from inside
+    a git repo or pass an explicit path" — advice no user could follow, because ``status``
+    accepts no path. ``atlas mcp`` failed the same way, and an MCP client launches it from
+    whatever directory it likes, so a globally-registered server simply would not start.
+
+    Falling back to the working directory is what the caller meant in every one of those
+    cases: operate on wherever I am.
+    """
+    return find_git_root() or Path.cwd()
 
 
 @dataclass(frozen=True)

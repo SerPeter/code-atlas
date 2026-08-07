@@ -16,6 +16,10 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 _log = logging.getLogger(__name__)
 
@@ -72,3 +76,85 @@ def discover_plugins() -> None:
             _log.warning("Failed to load language plugin %r", ep.name, exc_info=True)
 
     _discovered = True
+
+
+# ---------------------------------------------------------------------------
+# Optional-grammar reporting
+# ---------------------------------------------------------------------------
+#
+# Only `tree-sitter-python` and `tree-sitter-markdown` are base dependencies; every
+# other grammar lives behind an extra (see [project.optional-dependencies]). A missing
+# grammar is not an error — it is a deliberate install choice — but it must never be
+# SILENT. Each language module swallows its own ImportError so one absent wheel cannot
+# take the others down, `_DEFAULT_INCLUDE` still lists the extensions, and `parse_file`
+# then returns None with no log at any level. The result was `Done - 4823 files, 0
+# entities`, exit 0, on a TypeScript repo (ATL-110).
+#
+# Keyed by extension rather than by language name because that is what a scan has in
+# hand, and mapped to the extra rather than the wheel because the extra is what a user
+# types.
+_EXTENSION_EXTRAS: dict[str, str] = {
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".js": "typescript",
+    ".jsx": "typescript",
+    ".mjs": "typescript",
+    ".cjs": "typescript",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".cs": "csharp",
+    ".c": "cpp",
+    ".h": "cpp",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".tf": "terraform",
+    ".tfvars": "terraform",
+    ".hcl": "terraform",
+    ".sh": "shell",
+    ".bash": "shell",
+    ".zsh": "shell",
+    ".sql": "sql",
+    ".yaml": "config",
+    ".yml": "config",
+    ".json": "config",
+    ".toml": "config",
+    ".xml": "config",
+}
+
+_ALL_LANGUAGES_EXTRA = "all-languages"
+
+
+def missing_grammar_extras(extensions: Iterable[str]) -> dict[str, str]:
+    """Map each extension in *extensions* with no registered language to its extra.
+
+    An extension absent from ``_EXTENSION_EXTRAS`` is omitted rather than guessed at:
+    a file type this project simply does not support is not an install problem, and
+    telling a user to install something that would not help is worse than silence.
+    """
+    # Local: ast.py imports discover_plugins from this module (ast.py:176), so a
+    # top-level import here would close the cycle. Same reason, same direction.
+    from code_atlas.parsing.ast import get_language_for_file  # noqa: PLC0415
+
+    missing: dict[str, str] = {}
+    for ext in extensions:
+        extra = _EXTENSION_EXTRAS.get(ext.lower())
+        if extra is not None and get_language_for_file(f"probe{ext}") is None:
+            missing[ext.lower()] = extra
+    return missing
+
+
+def install_hint(extras: Iterable[str]) -> str:
+    """The `pip install` suffix that would add *extras*, collapsed when it is most of them."""
+    wanted = sorted(set(extras))
+    if len(wanted) >= 4:
+        return _ALL_LANGUAGES_EXTRA
+    return ",".join(wanted)
