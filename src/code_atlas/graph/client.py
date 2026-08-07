@@ -995,25 +995,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
     # unambiguous (len==1) resolves normally; ambiguous (len>1) still
     # materializes an edge to each candidate, tagged confidence:"ambiguous"
     # by the caller instead of being discarded (ADR-0014).
-    candidates = lk.name_to_callables.get(bare_name, [])
-
-    # Candidate hygiene, before any of the name-matching strategies read the list.
-    # Production code cannot depend on test code — an architectural invariant, not a
-    # preference — so a non-test call site never resolves onto a test definition. The
-    # converse is NOT an invariant (calling production code is what a test is for), so a
-    # test caller filters nothing and keeps reaching production definitions.
-    #
-    # This has to happen here rather than inside a strategy, for the same reason the stub
-    # filter does: the surviving count becomes `candidate_count`, which drives every
-    # edge's weight (ADR-0014). A same-named fixture left in the pool does not merely add
-    # a wrong edge, it halves the weight of the right one.
-    if test_callables and caller_uid not in test_callables:
-        production = [c for c in candidates if c[0] not in test_callables]
-        # Fall back rather than drop: when every definition of this name lives in test
-        # code, that IS the best available answer. Emptying the pool would trade a
-        # diluted-but-present edge for a silent absence — the failure mode ADR-0014
-        # exists to avoid, and the one Graphify's drop-on-ambiguity design walks into.
-        candidates = production or candidates
+    candidates = _narrow_candidates(lk.name_to_callables.get(bare_name, []), caller_uid, caller_fp, test_callables)
 
     non_self = [uid for uid, _fp, _vis in candidates if uid != caller_uid]
 
@@ -1143,6 +1125,110 @@ _VECTOR_PAGE_MAX = 1000
 # from the search layer's rule; resolve_calls takes an override for projects
 # that configure their own patterns.
 _DEFAULT_TEST_PATTERNS: tuple[str, ...] = tuple(SearchSettings().test_patterns)
+
+
+# A call can only resolve to a definition in the same *namespace group* — not the same
+# language. The two differ, and the difference is the whole point of the grouping:
+#
+#   * TypeScript and JavaScript share one namespace. A `.ts` file genuinely calls a
+#     function defined in a `.js` file; splitting them would drop real edges.
+#   * C and C++ share one. They interoperate by design, and `.h` is routed to either
+#     grammar by a content sniff, so the split is not even stable per file.
+#   * Java and C# do NOT, despite sharing `jvm.py`. Sharing a walker is an
+#     implementation detail; sharing a call namespace is a language fact.
+#
+# Derived from the extension rather than from a stored property, deliberately. The
+# language a file was parsed as is not persisted, and adding it would mean a schema
+# bump and a full re-index for a distinction this map already makes correctly —
+# grouping is coarser than the grammar choice, so the one case where extension and
+# grammar can disagree (`.h`) lands in the same group either way.
+_NAMESPACE_GROUPS: dict[str, str] = {
+    ".py": "python",
+    ".pyi": "python",
+    ".ts": "js",
+    ".tsx": "js",
+    ".mts": "js",
+    ".cts": "js",
+    ".js": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".c": "cfamily",
+    ".h": "cfamily",
+    ".cpp": "cfamily",
+    ".cc": "cfamily",
+    ".cxx": "cfamily",
+    ".hpp": "cfamily",
+    ".hh": "cfamily",
+    ".hxx": "cfamily",
+    ".java": "java",
+    ".cs": "csharp",
+    ".go": "go",
+    ".rs": "rust",
+    ".rb": "ruby",
+    ".php": "php",
+    ".cls": "apex",
+    ".trigger": "apex",
+}
+
+
+def _namespace_group(file_path: str) -> str:
+    """The call-namespace group *file_path* belongs to, or ``""`` when unknown.
+
+    An empty string means "do not partition on this" — an unmapped extension must
+    never cause a candidate to be filtered out, only to go unfiltered.
+    """
+    suffix = PurePosixPath(file_path.replace("\\", "/")).suffix.lower()
+    return _NAMESPACE_GROUPS.get(suffix, "")
+
+
+def _narrow_candidates(
+    candidates: list[tuple[str, str, str]],
+    caller_uid: str,
+    caller_fp: str,
+    test_callables: frozenset[str],
+) -> list[tuple[str, str, str]]:
+    """Drop candidates a call at *caller_uid* could not possibly be reaching.
+
+    Runs before any name-matching strategy reads the list, and that placement is
+    load-bearing rather than tidy: the surviving count becomes ``candidate_count``,
+    which drives every edge's weight (ADR-0014). A candidate left in the pool does not
+    merely add a wrong edge — it halves the weight of the right one.
+
+    The two filters differ in what they do when narrowing empties the pool, and the
+    difference is the point rather than an inconsistency.
+
+    *Namespace group* — **strict; an empty result stays empty.** A TypeScript ``render``
+    and a Python ``render`` are different functions sharing a name. Worse than the extra
+    candidate: with only one language's definition present, ``project_unique`` reports
+    the cross-language match as confidence "resolved" rather than ambiguous, which is a
+    confident wrong edge. There is no reading under which a Python function is "the best
+    available answer" for a TypeScript call site — it cannot be reached in-process at
+    all — so no candidate is the correct answer. This is ADR-0030's bug on a second
+    axis; that ADR deferred this variant as near-zero value on a pure-Python repo, and
+    indexing a polyglot project ends the deferral.
+
+    Safe by construction when the mapping does not know a language: an unmapped
+    extension yields ``""`` for the caller, and the filter does not run at all.
+
+    *Test provenance* (ADR-0030) — **falls back to the unfiltered pool.** Production code
+    cannot depend on test code, an architectural invariant rather than a preference, so a
+    non-test call site never resolves onto a test definition. But where every definition
+    of a name lives in test code, that genuinely IS the best available answer — a
+    production→test call is unusual, not impossible — so emptying the pool would trade a
+    diluted-but-present edge for a silent absence, the failure ADR-0014 exists to
+    prevent. The converse is not an invariant either, since calling the code under test
+    is what a test is for, so a test caller filters nothing.
+    """
+    caller_group = _namespace_group(caller_fp)
+    if caller_group:
+        candidates = [c for c in candidates if _namespace_group(c[1]) == caller_group]
+
+    if test_callables and caller_uid not in test_callables:
+        production = [c for c in candidates if c[0] not in test_callables]
+        candidates = production or candidates
+
+    return candidates
 
 
 def _test_callable_uids(lk: _CallLookup, patterns: list[str]) -> frozenset[str]:

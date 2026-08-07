@@ -968,3 +968,151 @@ class TestWeightAwareTraversalQueries:
         assert results[0]["ambiguous_only"] is False
         assert results[0]["test_only"] is False
         assert results[0]["confidence_score"] == 1.0
+
+
+class TestCrossLanguageCandidateHygiene:
+    """A call resolves only within its own call-namespace group (ATL-113, ADR-0030 axis 2).
+
+    The pool was keyed by bare name alone, so a TypeScript ``render`` and a Python
+    ``render`` competed for the same call. The quiet damage is not the extra candidate:
+    where only one language's definition exists, ``project_unique`` fires and reports the
+    cross-language match as confidence "resolved" — a confidently wrong edge rather than
+    an ambiguous one.
+
+    Unlike the test filter, this one is STRICT. Falling back to the unfiltered pool is
+    right when every definition lives in test code (a production→test call is unusual,
+    not impossible); it is wrong across languages, because a Python function cannot be
+    reached from a TypeScript call site under any reading.
+    """
+
+    PROJECT = "proj"
+    PY_UID = "proj:app.views.render"
+    TS_UID = "proj:web.ui.render"
+    TS_CALLER = "proj:web.page.mount"
+    PY_CALLER = "proj:app.main.boot"
+
+    def _rel(self, from_uid: str, to_name: str) -> ParsedRelationship:
+        return ParsedRelationship(from_qualified_name=from_uid, rel_type=RelType.CALLS, to_name=to_name)
+
+    def _lookup(self, *, with_ts: bool = True) -> _CallLookup:
+        callables = [(self.PY_UID, "app/views.py", "public")]
+        if with_ts:
+            callables.append((self.TS_UID, "web/ui.ts", "public"))
+        info = {
+            self.PY_UID: ("render", "app/views.py"),
+            self.TS_CALLER: ("mount", "web/page.ts"),
+            self.PY_CALLER: ("boot", "app/main.py"),
+        }
+        if with_ts:
+            info[self.TS_UID] = ("render", "web/ui.ts")
+        return _CallLookup(
+            name_to_callables={"render": callables},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info=info,
+        )
+
+    def test_a_typescript_call_picks_the_typescript_definition(self):
+        """Both definitions exist; only the same-group one survives, so weight stays 1.0."""
+        lookup = self._lookup()
+        result = _resolve_one_call(self.PROJECT, self._rel(self.TS_CALLER, "render"), lookup)
+        assert result == ([self.TS_UID], "project_unique")
+
+    def test_a_python_call_picks_the_python_definition(self):
+        lookup = self._lookup()
+        result = _resolve_one_call(self.PROJECT, self._rel(self.PY_CALLER, "render"), lookup)
+        assert result == ([self.PY_UID], "project_unique")
+
+    def test_a_cross_language_only_match_resolves_to_nothing(self):
+        """The load-bearing case, and it needs a NEGATIVE assertion.
+
+        Only a Python ``render`` exists and a TypeScript file calls ``render``. Before
+        this filter the call resolved to the Python definition as ``project_unique`` —
+        strategy name "unique", confidence "resolved". A wrong edge wearing full
+        confidence is worse than no edge, so the correct answer is None.
+        """
+        lookup = self._lookup(with_ts=False)
+        assert _resolve_one_call(self.PROJECT, self._rel(self.TS_CALLER, "render"), lookup) is None
+
+    def test_an_unmapped_extension_disables_the_filter_rather_than_emptying_it(self):
+        """A language the map does not know must lose precision, never edges."""
+        lookup = _CallLookup(
+            name_to_callables={"render": [(self.PY_UID, "app/views.py", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={
+                self.PY_UID: ("render", "app/views.py"),
+                "proj:weird.caller": ("caller", "src/thing.zzz"),
+            },
+        )
+        result = _resolve_one_call(self.PROJECT, self._rel("proj:weird.caller", "render"), lookup)
+        assert result == ([self.PY_UID], "project_unique")
+
+    def test_typescript_and_javascript_share_one_namespace(self):
+        """Grouping is by namespace, not grammar — a .ts file really does call into .js."""
+        lookup = _CallLookup(
+            name_to_callables={"helper": [("proj:lib.helper", "lib/helper.js", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={
+                "proj:lib.helper": ("helper", "lib/helper.js"),
+                self.TS_CALLER: ("mount", "web/page.ts"),
+            },
+        )
+        result = _resolve_one_call(self.PROJECT, self._rel(self.TS_CALLER, "helper"), lookup)
+        assert result == (["proj:lib.helper"], "project_unique")
+
+    def test_c_and_cpp_share_one_namespace(self):
+        """`.h` is routed to either grammar by a content sniff, so the split is unstable
+        per file — and C/C++ interoperate by design. One group is the correct answer."""
+        lookup = _CallLookup(
+            name_to_callables={"buf_init": [("proj:buf.buf_init", "src/buf.c", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={
+                "proj:buf.buf_init": ("buf_init", "src/buf.c"),
+                "proj:app.run": ("run", "src/app.cpp"),
+            },
+        )
+        result = _resolve_one_call(self.PROJECT, self._rel("proj:app.run", "buf_init"), lookup)
+        assert result == (["proj:buf.buf_init"], "project_unique")
+
+    def test_java_and_csharp_do_not_share_a_namespace(self):
+        """They share jvm.py. Sharing a walker is an implementation detail; sharing a
+        call namespace is a language fact, and they do not."""
+        lookup = _CallLookup(
+            name_to_callables={"Parse": [("proj:J.Parse", "src/J.java", "public")]},
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={
+                "proj:J.Parse": ("Parse", "src/J.java"),
+                "proj:C.Run": ("Run", "src/C.cs"),
+            },
+        )
+        assert _resolve_one_call(self.PROJECT, self._rel("proj:C.Run", "Parse"), lookup) is None
+
+    def test_a_single_language_project_is_unaffected(self):
+        """The churn bound: with one language present nothing is filtered."""
+        lookup = _CallLookup(
+            name_to_callables={
+                "helper": [
+                    ("proj:a.helper", "src/a.py", "public"),
+                    ("proj:b.helper", "src/b.py", "public"),
+                ]
+            },
+            import_map={},
+            caller_to_parent={},
+            parent_children={},
+            uid_to_info={
+                "proj:a.helper": ("helper", "src/a.py"),
+                "proj:b.helper": ("helper", "src/b.py"),
+                "proj:c.caller": ("caller", "src/c.py"),
+            },
+        )
+        result = _resolve_one_call(self.PROJECT, self._rel("proj:c.caller", "helper"), lookup)
+        assert result == (["proj:a.helper", "proj:b.helper"], "project_wide")
