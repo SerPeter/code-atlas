@@ -781,9 +781,14 @@ class _CitationLookup:
 
     ``by_key[("ADR", 14)]`` is a list of ``(rank, uid)`` candidates — see
     ``_document_citation_keys`` for what the ranks mean.
+
+    ``uid_label`` keeps the label the lookup scan already read, so the DOCUMENTS
+    write can match the document side on a label-property index instead of
+    scanning every node once per row.
     """
 
     by_key: dict[tuple[str, int], list[tuple[int, str]]]
+    uid_label: dict[str, str] = field(default_factory=dict)
 
 
 def _pick_citation_target(key: tuple[str, int], lookup: _CitationLookup) -> tuple[str, float] | None:
@@ -2516,11 +2521,13 @@ class GraphClient:
             {"p": project_name},
         )
         by_key: dict[tuple[str, int], list[tuple[int, str]]] = {}
+        uid_label: dict[str, str] = {}
         for r in records:
             keys = _document_citation_keys(r["label"] or "", r["name"] or "", r["fp"] or "", r["lvl"])
+            uid_label[r["uid"]] = r["label"] or ""
             for key, rank in keys:
                 by_key.setdefault(key, []).append((rank, r["uid"]))
-        return _CitationLookup(by_key=by_key)
+        return _CitationLookup(by_key=by_key, uid_label=uid_label)
 
     async def resolve_citations(
         self,
@@ -2603,14 +2610,21 @@ class GraphClient:
             )
 
         pending: dict[str, list[str]] = {uid: list(raws) for uid, raws in citations_by_uid.items()}
+        # uid -> label for the citing side. Only the retry sweep can supply it —
+        # a batch's own citations arrive from the parser with no label — and the
+        # retry sweep is precisely the project-wide one whose row count grows
+        # with the codebase. Anything missing here falls back to the unlabelled
+        # match for its group alone, so a gap costs speed, never an edge.
+        entity_label: dict[str, str] = {}
         if retry_unresolved:
             records = await self.execute(
                 "MATCH (n {project_name: $p}) "
                 "WHERE n.unresolved_citations IS NOT NULL AND size(n.unresolved_citations) > 0 "
-                "RETURN n.uid AS uid, n.citations AS citations",
+                "RETURN n.uid AS uid, n.citations AS citations, labels(n)[0] AS lbl",
                 {"p": project_name},
             )
             for r in records:
+                entity_label[r["uid"]] = r["lbl"] or ""
                 # ``citations`` is the evidence; ``unresolved_citations`` is
                 # only bookkeeping. Re-reading the former means an entity whose
                 # citation comment was deleted gets its stale bookkeeping
@@ -2642,13 +2656,18 @@ class GraphClient:
                 )
 
         if resolved:
-            await self.execute_write(
-                f"UNWIND $rels AS r "
-                f"MATCH (doc {{uid: r.doc_uid}}) "
-                f"MATCH (entity {{uid: r.entity_uid}}) "
-                f"MERGE (doc)-[e:{RelType.DOCUMENTS} {{link_type: 'citation'}}]->(entity) "
-                f"SET e.confidence = r.confidence, e.citation = r.citation",
-                {"rels": resolved},
+            await self._write_labelled_edges(
+                resolved,
+                {**lookup.uid_label, **entity_label},
+                lambda a, b: (
+                    f"UNWIND $rels AS r "
+                    f"MATCH (doc{a} {{uid: r.doc_uid}}) "
+                    f"MATCH (entity{b} {{uid: r.entity_uid}}) "
+                    f"MERGE (doc)-[e:{RelType.DOCUMENTS} {{link_type: 'citation'}}]->(entity) "
+                    f"SET e.confidence = r.confidence, e.citation = r.citation"
+                ),
+                from_key="doc_uid",
+                to_key="entity_uid",
             )
 
         entity_updates = [{"uid": uid, "unresolved": unresolved_by_uid.get(uid, [])} for uid in pending]
