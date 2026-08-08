@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -207,7 +207,28 @@ def _find_atlas_toml(start: Path | None = None) -> _ConfigFileMatch | None:
         current = parent
 
 
-class ScopeSettings(BaseModel):
+class StrictSection(BaseModel):
+    """Base for every ``atlas.toml`` section: an unknown key is an error, not a no-op.
+
+    The root settings model has always been ``extra="forbid"``, but a nested
+    ``BaseModel`` defaults to ``ignore`` — so a typo *inside* a section vanished
+    without a word. Measured before the fix::
+
+        ScopeSettings(include_paths=[...], exclude_patterns=[...])
+        -> {'paths': [], 'include': None, 'exclude': None}
+
+    Both values silently dropped; the real fields are ``paths``/``include``/``exclude``.
+    Someone scoping indexing to three services would have indexed the whole monorepo and
+    been told nothing (ATL-111).
+
+    Inherited rather than repeated on seventeen classes, so a section added later is
+    strict by default instead of strict only if its author remembered.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ScopeSettings(StrictSection):
     """File scope and ignore settings (ruff-style include/exclude semantics)."""
 
     paths: list[str] = Field(
@@ -232,14 +253,14 @@ class ScopeSettings(BaseModel):
     )
 
 
-class LibrarySettings(BaseModel):
+class LibrarySettings(StrictSection):
     """Library and dependency indexing settings."""
 
     full_index: list[str] = Field(default_factory=list, description="Libraries to fully parse and index.")
     stub_index: list[str] = Field(default_factory=list, description="Libraries to index at type-stub level only.")
 
 
-class MonorepoSettings(BaseModel):
+class MonorepoSettings(StrictSection):
     """Monorepo detection and scoping settings."""
 
     auto_detect: bool = Field(default=True, description="Auto-detect sub-projects by project markers.")
@@ -271,7 +292,7 @@ _PROVIDER_DEFAULTS: dict[str, dict[str, int]] = {
 }
 
 
-class EmbeddingSettings(BaseModel):
+class EmbeddingSettings(StrictSection):
     """Embedding settings — routes through litellm for any provider."""
 
     enabled: bool = Field(
@@ -302,7 +323,7 @@ class EmbeddingSettings(BaseModel):
         return self
 
 
-class BackendSettings(BaseModel):
+class BackendSettings(StrictSection):
     """Backend selection for the graph store and event queue.
 
     ``"auto"`` probes the network backend at startup (``GraphClient.ping()`` /
@@ -323,7 +344,7 @@ class BackendSettings(BaseModel):
     )
 
 
-class MemgraphSettings(BaseModel):
+class MemgraphSettings(StrictSection):
     """Memgraph connection settings."""
 
     host: str = Field(default="localhost", description="Memgraph host.")
@@ -334,7 +355,7 @@ class MemgraphSettings(BaseModel):
     write_timeout_s: float = Field(default=60.0, description="Timeout in seconds for write queries.")
 
 
-class SearchSettings(BaseModel):
+class SearchSettings(StrictSection):
     """Search and retrieval settings."""
 
     default_token_budget: int = Field(default=8000, description="Default token budget for context assembly.")
@@ -361,7 +382,7 @@ class SearchSettings(BaseModel):
     )
 
 
-class DetectorSettings(BaseModel):
+class DetectorSettings(StrictSection):
     """Pattern detector settings."""
 
     enabled: list[str] = Field(
@@ -378,7 +399,7 @@ class DetectorSettings(BaseModel):
     )
 
 
-class RationaleSettings(BaseModel):
+class RationaleSettings(StrictSection):
     """Extraction of intent-bearing comments (``# NOTE:``, ``# WHY:``, ``# HACK:``).
 
     Matched comments are attached to the smallest enclosing entity as the
@@ -411,7 +432,7 @@ class RationaleSettings(BaseModel):
     )
 
 
-class IndexSettings(BaseModel):
+class IndexSettings(StrictSection):
     """Indexing delta settings."""
 
     delta_threshold: float = Field(
@@ -435,7 +456,7 @@ class IndexSettings(BaseModel):
     )
 
 
-class ObservabilitySettings(BaseModel):
+class ObservabilitySettings(StrictSection):
     """OpenTelemetry observability settings (requires ``[otel]`` extra)."""
 
     enabled: bool = Field(default=False, description="Enable OpenTelemetry tracing and metrics.")
@@ -445,7 +466,7 @@ class ObservabilitySettings(BaseModel):
     sample_rate: float = Field(default=1.0, description="Trace sample rate (1.0 = all, 0.1 = 10%).")
 
 
-class WatcherSettings(BaseModel):
+class WatcherSettings(StrictSection):
     """File watcher debounce settings."""
 
     debounce_s: float = Field(default=5.0, description="Debounce timer in seconds (resets per change).")
@@ -453,7 +474,7 @@ class WatcherSettings(BaseModel):
     cooldown_s: float = Field(default=10.0, description="Per-file cooldown after processing (seconds). 0 disables.")
 
 
-class McpSettings(BaseModel):
+class McpSettings(StrictSection):
     """MCP server settings."""
 
     host: str = Field(default="127.0.0.1", description="Bind address for HTTP transports (ignored for stdio).")
@@ -462,7 +483,7 @@ class McpSettings(BaseModel):
     strict: bool = Field(default=False, description="Refuse to start if embedding model mismatch.")
 
 
-class RedisSettings(BaseModel):
+class RedisSettings(StrictSection):
     """Redis/Valkey connection settings for event bus."""
 
     host: str = Field(default="localhost", description="Redis/Valkey host.")
@@ -477,7 +498,7 @@ class RedisSettings(BaseModel):
     )
 
 
-class ProjectSettings(BaseModel):
+class ProjectSettings(StrictSection):
     """Project identity overrides."""
 
     name: str | None = Field(
@@ -488,7 +509,7 @@ class ProjectSettings(BaseModel):
     )
 
 
-class ExtraVaultSettings(BaseModel):
+class ExtraVaultSettings(StrictSection):
     """A knowledge vault indexed as a sibling project alongside this repo's own vault.
 
     Used for the overspanning (cross-project) vault and the Claude Code
@@ -500,7 +521,7 @@ class ExtraVaultSettings(BaseModel):
     project_name: str = Field(description="Project name this vault indexes under (see derive_project_name).")
 
 
-class KnowledgeSettings(BaseModel):
+class KnowledgeSettings(StrictSection):
     """Knowledge vault settings — the Obsidian-compatible note vault living alongside code."""
 
     vault_path: str = Field(
