@@ -164,11 +164,32 @@ def truncation_notice(shown: int, total: int, remedy: str) -> Literal[False] | d
     Returns ``False`` rather than an empty dict when nothing was cut, so the
     existing ``if result["truncated"]:`` contract keeps working unchanged and only
     the informative case grows a payload.
+
+    *total* must be a real count. Where the caller cannot afford one — a search that
+    fetched ``limit + 1`` rows knows more exist but not how many — use
+    :func:`more_available_notice` instead of passing a bounded stand-in.
     """
     cut = total - shown
     if cut <= 0:
         return False
     return {"shown": shown, "total": total, "cut": cut, "remedy": remedy}
+
+
+def more_available_notice(shown: int, remedy: str) -> dict[str, Any]:
+    """Rows were withheld and the true count was never computed.
+
+    ``total`` and ``cut`` are ``None`` rather than absent, so a caller reading
+    ``truncated["cut"]`` gets "unknown" instead of a number — which is the whole
+    point. The search tools fetch ``limit + 1`` rows to learn *whether* more exist;
+    reporting that as ``total`` made ``cut`` arithmetically incapable of exceeding 1,
+    so a repo with 5,000 matches answered ``{"shown": 20, "total": 21, "cut": 1}``
+    while the MCP instruction told agents to "read `cut` before concluding a short
+    list is a complete one" (ATL-111).
+
+    A real count would mean running every channel unbounded on every query. Saying
+    "more, count unknown" is cheap and true; a bounded number is neither.
+    """
+    return {"shown": shown, "total": None, "cut": None, "has_more": True, "remedy": remedy}
 
 
 # ---------------------------------------------------------------------------

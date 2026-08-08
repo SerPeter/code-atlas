@@ -508,11 +508,23 @@ class TestHybridSearchZeroMatchScope:
 
 
 # ---------------------------------------------------------------------------
-# `truncated` field correctness (no DB needed) — was always False before the fix
+# `truncated` field correctness (no DB needed) — was always False before ATL-104,
+# and reported a fabricated total between then and ATL-111
 # ---------------------------------------------------------------------------
 
 
 class TestTruncatedField:
+    """The contract: `truncated` is False only when nothing was withheld.
+
+    These assertions used to read ``shown + cut == total``, which the fabricated
+    numbers satisfied — a search fetching ``limit + 1`` reported ``total = 21`` for
+    ``limit = 20``, so 20 + 1 == 21 held while the repo had 5,000 matches. The test
+    checked arithmetic consistency, not truth, and passed throughout (ATL-111).
+
+    A search cannot afford a real count, so it now says so: ``total`` and ``cut`` are
+    ``None`` and ``has_more`` is True. "Unknown" is a fact; 1 was not.
+    """
+
     async def test_text_search_truncated_true_when_more_results_than_limit(self, settings):
         available = [{"node": {"uid": f"p:e{i}", "name": "e"}, "score": 1.0} for i in range(30)]
 
@@ -526,8 +538,12 @@ class TestTruncatedField:
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["count"] == 20
-        assert result["truncated"]["cut"] > 0
-        assert result["truncated"]["shown"] + result["truncated"]["cut"] == result["truncated"]["total"]
+        assert result["truncated"]["has_more"] is True
+        assert result["truncated"]["shown"] == 20
+        # The load-bearing pair: a count that was never computed must read as unknown,
+        # not as a number bounded by the fetch size.
+        assert result["truncated"]["total"] is None
+        assert result["truncated"]["cut"] is None
 
     async def test_text_search_truncated_false_when_results_fit(self, settings):
         available = [{"node": {"uid": f"p:e{i}", "name": "e"}, "score": 1.0} for i in range(5)]
@@ -558,8 +574,12 @@ class TestTruncatedField:
         with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=[0.1] * 768):
             result = await _invoke_tool(app, "vector_search", query="e", limit=20)
         assert result["count"] == 20
-        assert result["truncated"]["cut"] > 0
-        assert result["truncated"]["shown"] + result["truncated"]["cut"] == result["truncated"]["total"]
+        assert result["truncated"]["has_more"] is True
+        assert result["truncated"]["shown"] == 20
+        # The load-bearing pair: a count that was never computed must read as unknown,
+        # not as a number bounded by the fetch size.
+        assert result["truncated"]["total"] is None
+        assert result["truncated"]["cut"] is None
 
     async def test_hybrid_search_truncated_true_when_more_results_than_limit(self, settings):
         from code_atlas.search.engine import SearchResult
@@ -591,8 +611,12 @@ class TestTruncatedField:
         with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
             result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
         assert result["count"] == 20
-        assert result["truncated"]["cut"] > 0
-        assert result["truncated"]["shown"] + result["truncated"]["cut"] == result["truncated"]["total"]
+        assert result["truncated"]["has_more"] is True
+        assert result["truncated"]["shown"] == 20
+        # The load-bearing pair: a count that was never computed must read as unknown,
+        # not as a number bounded by the fetch size.
+        assert result["truncated"]["total"] is None
+        assert result["truncated"]["cut"] is None
 
     async def test_hybrid_search_not_truncated_when_results_fit(self, settings):
         from code_atlas.search.engine import SearchResult
@@ -625,6 +649,35 @@ class TestTruncatedField:
             result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
         assert result["count"] == 5
         assert result["truncated"] is False
+
+    async def test_cut_is_never_a_number_bounded_by_the_fetch_size(self, settings):
+        """The regression this exists to catch, stated as a negative.
+
+        With 5,000 matches and limit 20 the old code answered
+        ``{"shown": 20, "total": 21, "cut": 1}`` — while the MCP server instruction
+        told agents to "read `cut` before concluding a short list is a complete one".
+        Any small integer here is a lie; only None is honest.
+        """
+        available = [{"node": {"uid": f"p:e{i}", "name": "e"}, "score": 1.0} for i in range(5000)]
+
+        async def _fake_text_search(query, label="", limit=20, project="", projects=None):
+            return available[:limit]
+
+        graph = AsyncMock(spec=GraphClient)
+        graph.text_search = AsyncMock(side_effect=_fake_text_search)
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=graph, settings=settings, embed=embed)
+
+        result = await _invoke_tool(app, "text_search", query="e", limit=20)
+        assert result["truncated"]["cut"] is None, "a fetch-bounded count must not be reported as `cut`"
+        assert result["truncated"]["total"] is None
+
+    async def test_a_result_that_knows_nothing_was_withheld_still_reports_false(self, settings):
+        """`truncated: False` must keep meaning "complete" — agents depend on it."""
+        from code_atlas.server.mcp import _result
+
+        envelope = _result([{"a": 1}], limit=20, query_ms=1.0)
+        assert envelope["truncated"] is False
 
 
 # ---------------------------------------------------------------------------
