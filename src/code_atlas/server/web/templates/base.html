@@ -1,198 +1,66 @@
+{# The application shell: 52px header, optional 272px sidebar, and the view.
+
+   The visual system lives in static/design.css, extracted verbatim from the Claude
+   Design output (.specs/research/, 2026-08-09). Nothing here re-declares a colour or a
+   size the stylesheet owns — if a screen looks wrong, fix the token, not a local
+   override.
+
+   Blocks a view fills:
+     title     browser title
+     subtitle  the muted line beside the project name in the header
+     nav       the top-level view links (override only to suppress them)
+     sidebar   the left rail; omit it and the view takes the full width
+     content   the view itself
+     scripts   per-view asset delivery — the server links, the export inlines
+#}
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="{{ theme | default('auto') }}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{% block title %}code-atlas{% endblock %}</title>
-    <style>
-      :root {
-        color-scheme: light dark;
-        --fg: #1a1a1a;
-        --muted: #666;
-        --line: #d8d8d8;
-        --bg: #fff;
-      }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --fg: #e8e8e8;
-          --muted: #999;
-          --line: #333;
-          --bg: #16181a;
-        }
-      }
-      body {
-        margin: 0;
-        font:
-          15px/1.5 ui-sans-serif,
-          system-ui,
-          sans-serif;
-        color: var(--fg);
-        background: var(--bg);
-      }
-      header {
-        border-bottom: 1px solid var(--line);
-        padding: 0.75rem 1.25rem;
-        display: flex;
-        gap: 1rem;
-        align-items: baseline;
-      }
-      header b {
-        font-weight: 600;
-      }
-      main {
-        padding: 1.25rem;
-        max-width: 60rem;
-      }
-      .muted {
-        color: var(--muted);
-      }
-      .caveat {
-        border-left: 3px solid #d08770;
-        padding: 0.5rem 0.75rem;
-        margin: 1rem 0;
-        background: color-mix(in srgb, #d08770 8%, transparent);
-      }
-      table {
-        border-collapse: collapse;
-      }
-      .resolved {
-        color: #4a7c59;
-        font-weight: 600;
-      }
-      .guess {
-        color: #b5761f;
-        font-weight: 600;
-      }
-      .structural {
-        color: #5a6a86;
-        font-weight: 600;
-      }
-      .dsm {
-        border-collapse: collapse;
-      }
-      .dsm td {
-        width: 11px;
-        height: 11px;
-        padding: 0;
-        border: 1px solid var(--line);
-      }
-      .dsm .dsm-label {
-        width: auto;
-        height: auto;
-        padding: 0 0.4rem;
-        border: none;
-        font-size: 11px;
-        text-align: right;
-        white-space: nowrap;
-      }
-      .dsm .dsm-diag {
-        background: var(--line);
-      }
-      .dsm .dsm-dep {
-        background: #5a6a86;
-      }
-      .dsm .dsm-cycle {
-        background: #c0574a;
-      }
-      code.via {
-        font-size: 0.8em;
-        padding: 0.05rem 0.3rem;
-        border: 1px solid var(--line);
-        margin-right: 0.2rem;
-      }
-      .impact-form {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.75rem 1.25rem;
-        align-items: flex-end;
-        margin-bottom: 1rem;
-      }
-      .impact-form label {
-        display: flex;
-        flex-direction: column;
-        font-size: 0.85em;
-        gap: 0.2rem;
-      }
-      .impact-form label.inline {
-        flex-direction: row;
-        align-items: center;
-        gap: 0.35rem;
-      }
-      table.impact {
-        width: 100%;
-        border-collapse: collapse;
-      }
-      table.impact th {
-        border-bottom: 1px solid var(--line);
-      }
-      ol.hops li {
-        margin-bottom: 0.35rem;
-      }
-      .map-canvas {
-        width: 100%;
-        height: 60vh;
-        min-height: 420px;
-        border: 1px solid var(--line);
-        margin: 0.75rem 0;
-      }
-      ul.communities {
-        list-style: none;
-        padding: 0;
-      }
-      ul.communities li {
-        margin-bottom: 0.6rem;
-      }
-      .community-focus {
-        background: none;
-        border: 0;
-        padding: 0;
-        color: inherit;
-        font: inherit;
-        cursor: pointer;
-        text-decoration: underline dotted;
-      }
-      .community-members {
-        font-size: 0.85em;
-        word-break: break-word;
-      }
-      details.cycle {
-        border-left: 3px solid #c0574a;
-        padding: 0.35rem 0 0.35rem 0.75rem;
-        margin: 0.5rem 0;
-      }
-      details.cycle summary {
-        cursor: pointer;
-      }
-      ul.cycle-edges {
-        margin: 0.5rem 0 0;
-      }
-      pre {
-        background: color-mix(in srgb, var(--fg) 6%, transparent);
-        padding: 0.5rem 0.75rem;
-        overflow-x: auto;
-      }
-      td,
-      th {
-        text-align: left;
-        padding: 0.25rem 1.25rem 0.25rem 0;
-      }
-    </style>
+    <title>{% block title %}Code Atlas{% endblock %}</title>
+    {% block stylesheet %}
+    <link rel="stylesheet" href="/static/design.css" />
+    {% endblock %}
   </head>
   <body>
-    <header>
-      <b>code-atlas</b>
-      {% block nav %}
-      <a href="/">overview</a>
-      <a href="/search">search</a>
-      <a href="/map">map</a>
-      <a href="/impact">impact</a>
-      <a href="/architecture">architecture</a>
-      {% endblock %}
-      <span class="muted">{% block subtitle %}{% endblock %}</span>
-    </header>
-    <main>{% block content %}{% endblock %}</main>
-    {# Each renderer delivers assets its own way: the server links them, the static
-       export inlines them. The markup above stays identical either way. #}
+    <div class="app">
+      <header class="app-header">
+        <div class="brand">Code Atlas</div>
+
+        {# A link, not a button: the static export has no server to open a dialog
+           against, and a link still resolves there. #}
+        {% block projectswitch %}
+        <a class="project-switch" href="/projects">
+          <span class="project-name">{{ project | default('—') }}</span>
+          <span class="project-meta">{% block subtitle %}{% endblock %}</span>
+        </a>
+        {% endblock %}
+
+        <nav class="app-nav">
+          {% block nav %}
+          {% set current = active | default('') %}
+          {% for href, key, label in [
+            ('/', 'map', 'Map'),
+            ('/search', 'search', 'Search'),
+            ('/impact', 'impact', 'Impact'),
+            ('/architecture/', 'architecture', 'Architecture')
+          ] %}
+            {% if key == current %}
+          <a class="app-nav-item is-active" href="{{ href }}" aria-current="page">{{ label }}</a>
+            {% else %}
+          <a class="app-nav-item" href="{{ href }}">{{ label }}</a>
+            {% endif %}
+          {% endfor %}
+          {% endblock %}
+        </nav>
+      </header>
+
+      <div class="app-body">
+        {% block sidebar %}{% endblock %}
+        <main class="app-main">{% block content %}{% endblock %}</main>
+      </div>
+    </div>
     {% block scripts %}{% endblock %}
   </body>
 </html>
