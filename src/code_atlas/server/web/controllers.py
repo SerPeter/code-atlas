@@ -13,6 +13,7 @@ client-side island fed by fetch — that is the one part of this UI HTMX cannot 
 from __future__ import annotations
 
 from litestar import Controller, get
+from litestar.di import NamedDependency  # noqa: TC002 — see the runtime-import note below
 from litestar.exceptions import NotFoundException
 from litestar.response import Template
 
@@ -23,8 +24,13 @@ from litestar.response import Template
 # under TYPE_CHECKING raises `NameError: name 'ProjectViewService' is not defined`
 # before the app finishes constructing. Any type appearing in a handler signature has to
 # be importable for real.
-from code_atlas.server.web.schemas import ProjectOverview  # noqa: TC001
-from code_atlas.server.web.services import ProjectNotIndexedError, ProjectViewService
+from code_atlas.server.web.schemas import EntityDetail, ProjectOverview, SearchPage  # noqa: TC001
+from code_atlas.server.web.services import (
+    EntityNotFoundError,
+    ProjectNotIndexedError,
+    ProjectViewService,
+    SearchViewService,
+)
 
 
 class ProjectController(Controller):
@@ -33,7 +39,7 @@ class ProjectController(Controller):
     path = "/"
 
     @get("/", name="index")
-    async def index(self, view_service: ProjectViewService) -> Template:
+    async def index(self, view_service: NamedDependency[ProjectViewService]) -> Template:
         """Landing page — the project this server was started from."""
         try:
             overview = await view_service.overview()
@@ -48,7 +54,7 @@ class ProjectController(Controller):
         return Template("index.html", context={"overview": overview})
 
     @get("/api/overview", name="api_overview")
-    async def api_overview(self, view_service: ProjectViewService) -> ProjectOverview:
+    async def api_overview(self, view_service: NamedDependency[ProjectViewService]) -> ProjectOverview:
         """The same view model as JSON, for the client-side canvas."""
         try:
             return await view_service.overview()
@@ -62,5 +68,42 @@ class HealthController(Controller):
     path = "/healthz"
 
     @get("/", name="healthz")
-    async def healthz(self, view_service: ProjectViewService) -> dict[str, str]:
+    async def healthz(self, view_service: NamedDependency[ProjectViewService]) -> dict[str, str]:
         return {"status": "ok", "project": view_service.project}
+
+
+class SearchController(Controller):
+    """Search, and the entity a result leads to.
+
+    The way in: without it every other view needs you to already know an entity name.
+    """
+
+    path = "/"
+
+    @get("/search", name="search")
+    async def search(
+        self, search_service: NamedDependency[SearchViewService], q: str = "", limit: int = 20
+    ) -> Template:
+        page = await search_service.search(q, limit=min(max(limit, 1), 100))
+        return Template("search.html", context={"page": page})
+
+    @get("/entity/{uid:path}", name="entity")
+    async def entity(self, search_service: NamedDependency[SearchViewService], uid: str) -> Template:
+        try:
+            detail = await search_service.detail(uid.lstrip("/"))
+        except EntityNotFoundError as exc:
+            return Template("not_found.html", context={"uid": exc.uid}, status_code=404)
+        return Template("entity.html", context={"detail": detail})
+
+    @get("/api/search", name="api_search")
+    async def api_search(
+        self, search_service: NamedDependency[SearchViewService], q: str = "", limit: int = 20
+    ) -> SearchPage:
+        return await search_service.search(q, limit=min(max(limit, 1), 100))
+
+    @get("/api/entity/{uid:path}", name="api_entity")
+    async def api_entity(self, search_service: NamedDependency[SearchViewService], uid: str) -> EntityDetail:
+        try:
+            return await search_service.detail(uid.lstrip("/"))
+        except EntityNotFoundError as exc:
+            raise NotFoundException(detail=f"No entity with uid {exc.uid!r}") from exc

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% from "_related.html" import related_table %}
+{% block title %}{{ detail.name }} — code-atlas{% endblock %}
+{% block subtitle %}{{ detail.file_path }}{% endblock %}
+{% block content %}
+  <h1>{{ detail.name }} <span class="muted">{{ detail.kind }}</span></h1>
+  <p class="muted">{{ detail.qualified_name }}</p>
+  {% if detail.signature %}<pre>{{ detail.signature }}</pre>{% endif %}
+  {% if detail.docstring %}<p>{{ detail.docstring }}</p>{% endif %}
+
+  <p class="muted">
+    {{ detail.file_path }}{% if detail.line_start %}:{{ detail.line_start }}{% endif %}
+    {%- if detail.parent %} · in <a href="/entity/{{ detail.parent.uid }}">{{ detail.parent.name }}</a>{% endif %}
+  </p>
+
+  {# An edge that is a guess must look different from one that is a fact — that
+     distinction is the thing this project has that competitors do not. #}
+  {{ related_table("Callers", detail.callers, "Nothing calls this — or nothing the resolver could pin down.") }}
+  {{ related_table("Calls", detail.callees, "No outgoing calls recorded.") }}
+  {{ related_table("Documentation", detail.docs, "No linked notes or docs.") }}
+{% endblock %}

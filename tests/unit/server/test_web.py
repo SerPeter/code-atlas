@@ -13,7 +13,12 @@ import pytest
 from litestar.testing import TestClient
 
 from code_atlas.server.web.app import create_app
-from code_atlas.server.web.services import ProjectNotIndexedError, ProjectViewService
+from code_atlas.server.web.services import (
+    EntityNotFoundError,
+    ProjectNotIndexedError,
+    ProjectViewService,
+    SearchViewService,
+)
 
 if TYPE_CHECKING:
     from code_atlas.graph.protocol import GraphBackend
@@ -56,6 +61,36 @@ class FakeGraph:
 
     async def get_structure_overview(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
         return {"counts": self._counts, "largest_modules": [], "packages": []}
+
+    async def get_module_summary(
+        self, project: str, path: str, limit: int, edge_limit: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        # Shapes match the real backends: every edge row carries a decoded `props`
+        # dict, which is where ADR-0028's evidence lives.
+        return {
+            "modules": [],
+            "entities": [],
+            "internal_edges": [
+                {
+                    "from_qn": "app.caller",
+                    "to_qn": "app.target",
+                    "rel_type": "CALLS",
+                    "props": {"strategy": "import", "confidence": "resolved", "weight": 1.0, "line": 12},
+                }
+            ],
+            "fan_in": [
+                {
+                    "from_qn": "other.guesser",
+                    "to_qn": "app.target",
+                    "rel_type": "CALLS",
+                    "props": {"strategy": "project_wide", "confidence": "ambiguous", "weight": 0.25},
+                }
+            ],
+            "fan_out": [
+                {"from_qn": "app.target", "to_qn": "app.helper", "rel_type": "CALLS", "props": {}},
+            ],
+            "docs": [],
+        }
 
     async def close(self) -> None: ...
 
@@ -160,3 +195,156 @@ class TestWebApp:
             response = client.get("/api/overview")
 
         assert response.status_code == 404
+
+
+class _Node:
+    """Stands in for a CompactNode."""
+
+    def __init__(self, uid: str, name: str, qn: str, **kw: Any) -> None:
+        self.uid, self.name, self.qualified_name = uid, name, qn
+        self.kind = kw.get("kind", "function")
+        self.file_path = kw.get("file_path", "app.py")
+        self.line_start = kw.get("line_start", 1)
+        self.line_end = kw.get("line_end", 2)
+        self.signature = kw.get("signature", "")
+        self.docstring = kw.get("docstring", "")
+        self.labels = kw.get("labels", ["Callable"])
+
+
+class _Context:
+    def __init__(self, target: _Node, callers: list[_Node], callees: list[_Node]) -> None:
+        self.target, self.callers, self.callees = target, callers, callees
+        self.parent = None
+        self.docs: list[_Node] = []
+        self.siblings: list[_Node] = []
+
+
+def _search_service(graph: FakeGraph, project: str = "demo") -> SearchViewService:
+    from code_atlas.settings import SearchSettings
+
+    return SearchViewService(cast("GraphBackend", graph), project, search_settings=SearchSettings())
+
+
+class TestEntityDetailEvidence:
+    """Every edge shown carries the claim behind it (ATL-116, ADR-0028).
+
+    A caller found by matching an import and one found by matching a bare name across
+    the project are very different claims, and a picture that renders them identically
+    is worse than a list — it looks authoritative.
+    """
+
+    @staticmethod
+    def _patch_context(monkeypatch, context):
+        async def _fake_expand(graph, uid, **kwargs):
+            return context
+
+        monkeypatch.setattr("code_atlas.search.engine.expand_context", _fake_expand)
+
+    async def test_a_resolved_edge_carries_its_strategy_and_line(self, monkeypatch):
+        target = _Node("u:target", "target", "app.target")
+        self._patch_context(monkeypatch, _Context(target, [_Node("u:caller", "caller", "app.caller")], []))
+
+        detail = await _search_service(FakeGraph()).detail("u:target")
+
+        [caller] = detail.callers
+        assert caller.evidence is not None
+        assert caller.evidence.strategy == "import"
+        assert caller.evidence.confidence == "resolved"
+        assert caller.evidence.line == 12
+        assert not caller.evidence.is_guess
+
+    async def test_an_ambiguous_edge_is_marked_as_a_guess(self, monkeypatch):
+        """The distinction the whole view exists for."""
+        target = _Node("u:target", "target", "app.target")
+        self._patch_context(monkeypatch, _Context(target, [_Node("u:g", "guesser", "other.guesser")], []))
+
+        detail = await _search_service(FakeGraph()).detail("u:target")
+
+        [caller] = detail.callers
+        assert caller.evidence is not None
+        assert caller.evidence.is_guess, "an ambiguous edge must be distinguishable from a resolved one"
+        assert caller.evidence.weight == 0.25
+
+    async def test_an_edge_with_no_recorded_props_is_structural_not_resolved(self, monkeypatch):
+        """Absent evidence means structural (ADR-0029), which is a fact, not a guess."""
+        target = _Node("u:target", "target", "app.target")
+        self._patch_context(monkeypatch, _Context(target, [], [_Node("u:h", "helper", "app.helper")]))
+
+        detail = await _search_service(FakeGraph()).detail("u:target")
+
+        [callee] = detail.callees
+        assert callee.evidence is not None
+        assert callee.evidence.is_structural
+        assert not callee.evidence.is_guess
+
+    async def test_a_missing_entity_is_not_an_empty_one(self, monkeypatch):
+        async def _none(graph, uid, **kwargs):
+            return None
+
+        monkeypatch.setattr("code_atlas.search.engine.expand_context", _none)
+
+        with pytest.raises(EntityNotFoundError):
+            await _search_service(FakeGraph()).detail("u:nope")
+
+
+class TestSearchHonesty:
+    """A list on screen reads as the whole answer, so it must say when it is not."""
+
+    @staticmethod
+    def _patch_search(monkeypatch, results):
+        async def _fake(graph, embed, settings, query, **kwargs):
+            limit = kwargs.get("limit", 20)
+            return results[:limit]
+
+        monkeypatch.setattr("code_atlas.search.engine.hybrid_search", _fake)
+
+    def _hits(self, n: int) -> list[Any]:
+        from code_atlas.search.engine import SearchResult
+
+        return [
+            SearchResult(
+                uid=f"u:{i}",
+                name=f"e{i}",
+                qualified_name=f"app.e{i}",
+                kind="function",
+                file_path="app.py",
+                line_start=i,
+                line_end=i,
+                signature="",
+                docstring="",
+                labels=["Callable"],
+                rrf_score=1.0 / (i + 1),
+                sources={"bm25": i},
+            )
+            for i in range(n)
+        ]
+
+    async def test_more_results_than_the_page_are_reported_without_inventing_a_count(self, monkeypatch):
+        self._patch_search(monkeypatch, self._hits(500))
+
+        page = await _search_service(FakeGraph()).search("e", limit=5)
+
+        assert len(page.hits) == 5
+        assert page.more_available is True
+        # There is deliberately no `total`: the search fetched limit+1 and knows only
+        # that more exist. Reporting the fetch size as a count is the ATL-111 bug.
+        assert not hasattr(page, "total")
+
+    async def test_a_complete_page_says_so(self, monkeypatch):
+        self._patch_search(monkeypatch, self._hits(3))
+
+        page = await _search_service(FakeGraph()).search("e", limit=5)
+
+        assert len(page.hits) == 3
+        assert page.more_available is False
+
+    async def test_an_empty_query_does_not_hit_the_engine(self, monkeypatch):
+        async def _explode(*a, **k):
+            raise AssertionError("hybrid_search must not run for an empty query")
+
+        monkeypatch.setattr("code_atlas.search.engine.hybrid_search", _explode)
+
+        page = await _search_service(FakeGraph()).search("   ")
+
+        assert page.hits == ()
+        assert page.more_available is False

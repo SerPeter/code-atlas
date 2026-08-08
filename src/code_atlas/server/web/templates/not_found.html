@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Not found — code-atlas{% endblock %}
+{% block content %}
+  <h1>No entity with that uid</h1>
+  <p class="muted"><code>{{ uid }}</code></p>
+  <p>It may belong to another project, or the index may predate it. <a href="/search">Search instead</a>.</p>
+{% endblock %}
