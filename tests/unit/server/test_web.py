@@ -397,8 +397,18 @@ class TestArchitectureView:
         health = await _architecture_service(graph).health()
 
         assert any(row < col for row, col in health.dsm_marks), "a cycle must break the triangle"
-        assert health.cycles == (("a", "b"),)
+        assert [c.members for c in health.cycles] == [("a", "b")]
         assert health.core_size == 1.0
+
+    async def test_a_cycle_names_the_edges_that_close_it(self):
+        """Members alone say a subsystem is tangled; edges say which import to cut."""
+        graph = FakeGraph(imports=[("a", "b"), ("b", "a"), ("a", "outside")])
+
+        [cycle] = (await _architecture_service(graph).health()).cycles
+
+        assert cycle.members == ("a", "b")
+        assert cycle.edges == (("a", "b"), ("b", "a"))
+        assert ("a", "outside") not in cycle.edges, "an edge leaving the cycle does not close it"
 
     async def test_propagation_cost_matches_the_hand_worked_value(self):
         """app reaches 2, service reaches 1, repo reaches 0 — 3/(3*2) = 0.5."""
@@ -463,3 +473,14 @@ class TestArchitectureEndpoint:
         assert payload["propagation_cost"] == pytest.approx(0.5)
         assert payload["dsm_order"] == ["repo", "service", "app"]
         assert payload["largest_cycle"] == 1
+
+    def test_the_page_names_the_edges_closing_each_cycle(self):
+        """The drill-down has to reach the page, not just the view model."""
+        graph = FakeGraph(imports=[("billing", "orders"), ("orders", "billing")])
+
+        with _client(graph, "demo") as client:
+            body = client.get("/architecture/").text
+
+        assert "billing" in body
+        assert "orders" in body
+        assert "cycle-edges" in body, "the specific edges must render, not only the member list"
