@@ -42,11 +42,25 @@
     return PALETTE[node.community % PALETTE.length];
   }
 
-  fetch("/map/api")
-    .then(function (response) {
+  /* The static export embeds its payload in the document; the live server serves it.
+     One code path either way — a second renderer that fetched differently would be a
+     second implementation, and the export would be the one that quietly drifts.
+
+     This is also what makes `file://` safe: with the blob present, no request is ever
+     issued. A static export has an empty hostname, so "skip localhost" style guards do
+     not protect it (ADR-0033). */
+  function loadMap() {
+    var embedded = document.getElementById("map-data");
+    if (embedded) {
+      return Promise.resolve(JSON.parse(embedded.textContent));
+    }
+    return fetch("/map/api").then(function (response) {
       if (!response.ok) throw new Error("HTTP " + response.status);
       return response.json();
-    })
+    });
+  }
+
+  loadMap()
     .then(function (data) {
       var graph = new graphology.Graph({ type: "directed", multi: false });
 

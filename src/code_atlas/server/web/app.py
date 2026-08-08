@@ -7,7 +7,6 @@ below this module reaches out to construct its own dependencies.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from litestar import Litestar
@@ -15,6 +14,7 @@ from litestar.di import Provide
 from litestar.static_files import create_static_files_router
 from litestar.template.config import TemplateConfig
 
+from code_atlas.server.web import STATIC_DIR, TEMPLATES_DIR
 from code_atlas.server.web.controllers import (
     ArchitectureController,
     HealthController,
@@ -35,10 +35,6 @@ if TYPE_CHECKING:
     from code_atlas.graph.protocol import GraphBackend
     from code_atlas.search.engine import EmbedOne
     from code_atlas.settings import SearchSettings
-
-_WEB_ROOT = Path(__file__).parent
-TEMPLATES_DIR = _WEB_ROOT / "templates"
-STATIC_DIR = _WEB_ROOT / "static"
 
 
 def create_app(

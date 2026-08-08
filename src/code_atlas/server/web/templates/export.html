@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ overview.project }} — code-atlas snapshot{% endblock %}
+{% block subtitle %}snapshot{% endblock %}
+{% block nav %}
+      <a href="#overview">overview</a>
+      <a href="#map">map</a>
+      <a href="#architecture">architecture</a>
+{% endblock %}
+{% block content %}
+  {# A snapshot that does not say when it was taken is a trap: it looks like the
+     current state forever. Provenance goes first, not in a footer. #}
+  <p class="caveat">
+    <b>Static snapshot.</b>
+    Project <b>{{ overview.project }}</b>,
+    commit <code>{{ (overview.git_hash or "unknown")[:12] }}</code>,
+    generated <b>{{ generated_at }}</b>{% if indexed_at %}, indexed {{ indexed_at }}{% endif %}.
+    This file reflects the graph at that moment and will not update.
+  </p>
+
+  {# Named rather than silently absent. A missing view reads as "nothing to show";
+     a disabled one reads as "this needs the server", which is the truth. #}
+  <p class="muted">
+    Search, entity detail and the impact explorer are <b>not included</b>: each runs a query
+    against the graph for whatever you ask it, so there is nothing to precompute.
+    Run <code>atlas ui</code> for those.
+  </p>
+
+  <h2 id="overview">Overview</h2>
+  {% include "_overview_section.html" %}
+
+  <h2 id="map">Map</h2>
+  {% include "_map_section.html" %}
+
+  <h2 id="architecture">Architecture</h2>
+  {% include "_architecture_section.html" %}
+{% endblock %}
+{% block scripts %}
+{# Inlined, not linked. A linked asset would make the file non-portable, and a CDN
+   would make it phone home from a file:// origin. #}
+<script>{{ vendor_js }}</script>
+<script>{{ map_js }}</script>
+{% endblock %}
