@@ -930,6 +930,41 @@ class TestWithStaleness:
             assert "error" not in annotated
             assert annotated["stale"] is False
 
+    async def test_lock_mode_refuses_when_freshness_cannot_be_verified(self, settings):
+        """`lock` must fail CLOSED (ATL-111).
+
+        Its whole purpose is refusing answers from a stale index. Serving one because the
+        check timed out defeats the setting the user deliberately chose — the one place
+        where carrying on is the wrong default.
+        """
+        import asyncio
+
+        from code_atlas.indexing.orchestrator import StalenessChecker
+
+        lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings)
+        app = AppContext(graph=AsyncMock(), settings=lock_settings, embed=embed, staleness=checker)
+
+        async def _slow_check(*_args, **_kwargs):
+            await asyncio.sleep(60)
+
+        with patch.object(checker, "check", side_effect=_slow_check):
+            annotated = await _with_staleness(app, {"results": [{"uid": "t:f"}]}, scope="myproject")
+
+        assert annotated["code"] == "STALE_UNKNOWN"
+        assert "results" not in annotated, "a locked query must not return rows it could not vouch for"
+
+    async def test_stale_mode_rejects_an_unknown_value(self):
+        """A typo used to fall through to warn, silently disabling `lock`."""
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            # Deliberately invalid. The Literal makes ty reject it statically too,
+            # which is the fix working rather than a problem with the test.
+            IndexSettings(stale_mode="lcok")  # ty: ignore[invalid-argument-type]
+
     async def test_ignore_mode_skips_check(self, settings):
         """Ignore mode skips staleness check entirely — result unchanged, check not called."""
         from code_atlas.indexing.orchestrator import StalenessChecker
@@ -943,11 +978,18 @@ class TestWithStaleness:
         with patch.object(checker, "check", new_callable=AsyncMock) as mock_check:
             result = {"results": []}
             annotated = await _with_staleness(app, result, scope="myproject")
+            # `ignore` returns before the check runs at all, so the envelope is
+            # genuinely untouched — unlike the timeout path, which must say so.
+            assert annotated == result
             assert "stale" not in annotated
             mock_check.assert_not_called()
 
-    async def test_staleness_timeout_returns_original_result(self, settings):
-        """If staleness check times out, the original result is returned unmodified."""
+    async def test_staleness_timeout_says_the_check_did_not_run(self, settings):
+        """A check that could not run must not read as "verified fresh" (ATL-111).
+
+        This previously asserted the envelope came back untouched. An absent `stale` key
+        is indistinguishable from a confirmed-fresh one, so "unmodified" was the bug.
+        """
         import asyncio
 
         from code_atlas.indexing.orchestrator import StalenessChecker
@@ -964,10 +1006,12 @@ class TestWithStaleness:
             result = {"results": [{"uid": "test:foo"}]}
             annotated = await _with_staleness(app, result, scope="myproject")
             # Timeout fires (5s) — original result returned without stale keys
-            assert "stale" not in annotated
+            # Explicitly "unknown", not absent — absent is what read as fresh.
+            assert annotated["stale"] is None
+            assert annotated["stale_check"] == "timed_out"
             assert annotated["results"] == [{"uid": "test:foo"}]
 
-    async def test_staleness_query_timeout_returns_original_result(self, settings):
+    async def test_staleness_query_timeout_says_the_check_did_not_run(self, settings):
         """QueryTimeoutError (raised by checker.check -> graph.execute on a slow DB query)
         must be caught alongside plain TimeoutError — not propagate and discard results."""
         from code_atlas.indexing.orchestrator import StalenessChecker
@@ -980,7 +1024,9 @@ class TestWithStaleness:
         with patch.object(checker, "check", side_effect=QueryTimeoutError(5.0, "get_project_git_hash")):
             result = {"results": [{"uid": "test:foo"}]}
             annotated = await _with_staleness(app, result, scope="myproject")
-            assert "stale" not in annotated
+            # Explicitly "unknown", not absent — absent is what read as fresh.
+            assert annotated["stale"] is None
+            assert annotated["stale_check"] == "timed_out"
             assert annotated["results"] == [{"uid": "test:foo"}]
 
 

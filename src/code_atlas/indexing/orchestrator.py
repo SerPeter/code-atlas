@@ -24,7 +24,7 @@ from code_atlas.events import EmbedDirty, EntityRef, Event, EventBus, FileChange
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
-from code_atlas.search.embeddings import EmbedCache, EmbedClient
+from code_atlas.search.embeddings import EmbedCache, EmbedClient, EmbeddingError
 from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
@@ -967,12 +967,49 @@ class StalenessChecker:
 
 
 async def _resolve_dimension(embed: EmbedClient, configured: int | None) -> int:
-    """Return the embedding dimension, auto-detecting from the model if not configured."""
-    if configured is not None:
+    """Return the embedding dimension, verified against the service that will produce it.
+
+    A configured dimension used to be returned on faith, never probed. That is how the
+    shipped defaults could disagree with each other and nothing noticed: ``atlas.toml``
+    hardcodes ``dimension = 768``, ``settings.embeddings.model`` defaults to
+    ``nomic-ai/nomic-embed-code``, and the bundled TEI container serves
+    ``Qwen/Qwen3-Embedding-0.6B`` — three values, no two of which have to agree, and TEI
+    ignores the requested model name entirely so nothing downstream could tell (ATL-111).
+
+    The consequence was not a bad number in a report. A dimension that disagrees with the
+    vector index fails every embed batch, which the consumer retries five times and then
+    parks as poison — while indexing reports success.
+
+    So: always probe, and treat a disagreement as fatal. The service is the authority on
+    what it emits; the config is a claim about it. When the probe itself fails the claim
+    cannot be checked, which is a reason to warn and continue rather than to stop —
+    embeddings may simply be unreachable right now, and that is already handled downstream.
+    """
+    try:
+        detected = await embed.detect_dimension()
+    except EmbeddingError as exc:
+        if configured is None:
+            raise
+        logger.warning(
+            "Could not verify embedding dimension against the service ({}); trusting the configured {}",
+            exc,
+            configured,
+        )
         return configured
-    detected = await embed.detect_dimension()
-    logger.info("Auto-detected embedding dimension: {}", detected)
-    return detected
+
+    if configured is None:
+        logger.info("Auto-detected embedding dimension: {}", detected)
+        return detected
+
+    if configured != detected:
+        msg = (
+            f"Configured embedding dimension {configured} does not match the {detected} "
+            f"the service actually returns. Every embed batch would fail and be parked as "
+            f"poison while indexing reported success. Either unset [embeddings] dimension "
+            f"to auto-detect, or point the service at a model that emits {configured}."
+        )
+        raise RuntimeError(msg)
+    return configured
 
 
 async def _check_model_lock(

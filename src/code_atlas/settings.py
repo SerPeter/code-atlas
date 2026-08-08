@@ -438,7 +438,7 @@ class IndexSettings(StrictSection):
     delta_threshold: float = Field(
         default=0.3, description="If more than this fraction of files changed, fall back to full re-index."
     )
-    stale_mode: str = Field(
+    stale_mode: Literal["warn", "lock", "ignore"] = Field(
         default="warn",
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
     )
