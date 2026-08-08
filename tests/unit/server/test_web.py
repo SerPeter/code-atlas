@@ -70,7 +70,9 @@ class FakeGraph:
         )
 
     async def get_project_status(self, project_name: str | None = None) -> list[dict[str, Any]]:
-        return self._projects
+        # Both shapes at once: the overview reads the row directly, the snapshot loader
+        # reads it under "n" the way the real backends return it.
+        return [{**p, "n": p} for p in self._projects]
 
     async def get_structure_overview(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
         return {"counts": self._counts, "largest_modules": [], "packages": []}
@@ -104,6 +106,32 @@ class FakeGraph:
             ],
             "docs": [],
         }
+
+    def with_snapshots(self, runs: list[float] | list[tuple[float, int]]) -> FakeGraph:
+        """Attach a recorded architecture history to the Project node.
+
+        Each run is a propagation cost, or a ``(propagation, module_count)`` pair when the
+        test needs the coverage to move as well.
+        """
+        from code_atlas.server.architecture_history import Snapshot, encode
+
+        pairs = [r if isinstance(r, tuple) else (r, 100) for r in runs]
+        self._projects[0]["architecture_snapshots"] = encode(
+            [
+                Snapshot(
+                    at=f"2026-08-0{i + 1}T00:00:00+00:00",
+                    commit=f"c{i}",
+                    modules=modules,
+                    edges=modules,
+                    propagation_cost=cost,
+                    core_size=0.1,
+                    largest_cycle=1,
+                    fan_in_gini=0.2,
+                )
+                for i, (cost, modules) in enumerate(pairs)
+            ]
+        )
+        return self
 
     async def get_module_import_edges(self, project: str, path: str) -> dict[str, list[dict[str, Any]]]:
         return {
@@ -484,3 +512,55 @@ class TestArchitectureEndpoint:
         assert "billing" in body
         assert "orders" in body
         assert "cycle-edges" in body, "the specific edges must render, not only the member list"
+
+
+class TestArchitectureTrend:
+    """Trajectory is what the mud view is for (ATL-121)."""
+
+    async def test_no_history_means_no_trend_rather_than_a_flat_line(self):
+        health = await _architecture_service(FakeGraph()).health()
+
+        assert health.trend is None
+
+    async def test_a_single_run_is_not_a_trend(self):
+        health = await _architecture_service(FakeGraph().with_snapshots([0.08])).health()
+
+        assert health.trend is None
+
+    async def test_a_rising_cost_is_reported_as_worse(self):
+        graph = FakeGraph().with_snapshots([0.06, 0.07, 0.084])
+
+        health = await _architecture_service(graph).health()
+
+        assert health.trend is not None
+        assert health.trend.has_trend
+        assert health.trend.direction == "worse"
+        assert health.trend.propagation_delta_pct == "+2.4%"
+        assert len(health.trend.points) == 3
+
+    async def test_a_coverage_change_refuses_to_call_it_decay(self):
+        graph = FakeGraph().with_snapshots([(0.06, 100), (0.12, 200)])
+
+        health = await _architecture_service(graph).health()
+
+        assert health.trend is not None
+        assert health.trend.coverage_changed
+        assert health.trend.direction == "unclear"
+
+    async def test_the_retention_bound_is_stated(self):
+        """A window silently capped at fifty runs reads as the whole history."""
+        graph = FakeGraph().with_snapshots([0.05, 0.06])
+
+        health = await _architecture_service(graph).health()
+
+        assert health.trend is not None
+        assert "50" in health.trend.note
+
+    def test_the_trend_renders_on_the_page(self):
+        graph = FakeGraph().with_snapshots([0.06, 0.084])
+
+        with _client(graph, "demo") as client:
+            body = client.get("/architecture/").text
+
+        assert "Trend" in body
+        assert "+2.4%" in body

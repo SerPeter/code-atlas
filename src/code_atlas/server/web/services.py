@@ -28,6 +28,7 @@ from code_atlas.server.web.layout import layout_communities, node_size
 from code_atlas.server.web.schemas import (
     AffectedEntity,
     ArchitectureHealth,
+    ArchitectureTrend,
     BlastRadiusView,
     CommunityRef,
     CoverageCaveat,
@@ -45,6 +46,7 @@ from code_atlas.server.web.schemas import (
     SearchHit,
     SearchPage,
     TracePathView,
+    TrendPoint,
 )
 
 if TYPE_CHECKING:
@@ -377,6 +379,44 @@ class ArchitectureViewService:
             dsm_marks=marks,
             dsm_truncated=len(metrics.order) > len(shown),
             caveat=_architecture_caveat(metrics.module_count),
+            trend=await self._trend(),
+        )
+
+    async def _trend(self) -> ArchitectureTrend | None:
+        """How these numbers have moved across recorded index runs.
+
+        Read-only here. Snapshots are written on the index path (ATL-121), because a
+        history written when someone opens a page would record who looked at it rather
+        than how the code changed.
+        """
+        from code_atlas.server.architecture_history import MAX_SNAPSHOTS, load, trend  # noqa: PLC0415
+
+        try:
+            snapshots = await load(self._graph, self._project)
+        except Exception:  # a missing history costs the trend, never the view
+            return None
+
+        movement = trend(snapshots)
+        if movement is None:
+            return None
+
+        return ArchitectureTrend(
+            points=tuple(
+                TrendPoint(
+                    at=s.at,
+                    commit=s.commit[:12],
+                    modules=s.modules,
+                    propagation_cost=s.propagation_cost,
+                    core_size=s.core_size,
+                    largest_cycle=s.largest_cycle,
+                )
+                for s in snapshots[-movement.count :]
+            ),
+            direction=movement.direction,
+            propagation_delta=movement.propagation_delta,
+            core_delta=movement.core_delta,
+            coverage_changed=movement.coverage_changed,
+            note=(f"Comparing the last {movement.count} index runs; at most {MAX_SNAPSHOTS} are kept."),
         )
 
 
