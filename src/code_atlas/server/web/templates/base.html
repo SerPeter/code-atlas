@@ -181,13 +181,18 @@
   <body>
     <header>
       <b>code-atlas</b>
+      {% block nav %}
       <a href="/">overview</a>
       <a href="/search">search</a>
       <a href="/map">map</a>
       <a href="/impact">impact</a>
       <a href="/architecture">architecture</a>
+      {% endblock %}
       <span class="muted">{% block subtitle %}{% endblock %}</span>
     </header>
     <main>{% block content %}{% endblock %}</main>
+    {# Each renderer delivers assets its own way: the server links them, the static
+       export inlines them. The markup above stays identical either way. #}
+    {% block scripts %}{% endblock %}
   </body>
 </html>
