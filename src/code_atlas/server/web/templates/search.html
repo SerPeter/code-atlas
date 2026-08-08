@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Search — code-atlas{% endblock %}
+{% block content %}
+  <form method="get" action="/search">
+    <input name="q" value="{{ page.query }}" placeholder="Search entities…" autofocus size="40" />
+    <button type="submit">Search</button>
+  </form>
+
+  {% if page.query %}
+    <p class="muted">
+      {{ page.hits | length }} result{{ "" if page.hits | length == 1 else "s" }}
+      {% if page.more_available %}
+        — <b>more exist</b>, count unknown. Narrow the query or raise the limit.
+      {% endif %}
+    </p>
+
+    <table>
+      <tr><th>Name</th><th>Kind</th><th>File</th><th>Channels</th></tr>
+      {% for hit in page.hits %}
+        <tr>
+          <td><a href="/entity/{{ hit.uid }}">{{ hit.name }}</a></td>
+          <td class="muted">{{ hit.kind }}</td>
+          <td class="muted">{{ hit.file_path }}{% if hit.line_start %}:{{ hit.line_start }}{% endif %}</td>
+          <td class="muted">{{ hit.channels | join(", ") }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
+{% endblock %}

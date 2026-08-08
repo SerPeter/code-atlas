@@ -51,3 +51,93 @@ class ProjectOverview(msgspec.Struct, frozen=True):
     label_counts: dict[str, int]
     other_projects: tuple[ProjectRef, ...]
     caveat: CoverageCaveat
+
+
+class SearchHit(msgspec.Struct, frozen=True):
+    """One fused search result."""
+
+    uid: str
+    name: str
+    qualified_name: str
+    kind: str
+    label: str
+    file_path: str
+    line_start: int | None
+    signature: str
+    score: float
+    channels: tuple[str, ...]
+
+
+class SearchPage(msgspec.Struct, frozen=True):
+    """A page of results, and an honest statement of what it left out.
+
+    ``more_available`` rather than a count: the search fetches one row beyond the page
+    to learn *whether* more exist, which is not the same as knowing how many. Reporting
+    the fetch size as a total is exactly the lie ATL-111 removed from the MCP tools, and
+    a UI repeating it would be worse — a list on screen reads as the whole answer.
+    """
+
+    query: str
+    hits: tuple[SearchHit, ...]
+    more_available: bool
+
+
+class EdgeEvidence(msgspec.Struct, frozen=True):
+    """Why the graph believes one entity reaches another (ADR-0028).
+
+    A caller found by matching an import is a very different claim from one found by
+    matching a bare name across the whole project, and until this view existed a human
+    had no way to see which they were looking at.
+
+    ``strategy`` empty and ``confidence`` empty means a **structural** edge — DEFINES,
+    IMPORTS, INHERITS. Those are facts rather than guesses, which is why an absent
+    confidence coalesces to "resolved" everywhere else in the codebase (ADR-0029).
+    """
+
+    rel_type: str
+    strategy: str = ""
+    confidence: str = ""
+    weight: float | None = None
+    line: int | None = None
+    site_count: int | None = None
+
+    @property
+    def is_structural(self) -> bool:
+        return not self.confidence and not self.strategy
+
+    @property
+    def is_guess(self) -> bool:
+        """True when the resolver could not pin this down to one target."""
+        return self.confidence == "ambiguous"
+
+
+class RelatedEntity(msgspec.Struct, frozen=True):
+    """A neighbour of the entity being viewed, with the edge that reached it."""
+
+    uid: str
+    name: str
+    qualified_name: str
+    kind: str
+    file_path: str
+    line_start: int | None
+    evidence: EdgeEvidence | None = None
+
+
+class EntityDetail(msgspec.Struct, frozen=True):
+    """Everything the graph knows about one entity."""
+
+    uid: str
+    name: str
+    qualified_name: str
+    kind: str
+    label: str
+    file_path: str
+    line_start: int | None
+    line_end: int | None
+    signature: str
+    docstring: str
+    parent: RelatedEntity | None
+    callers: tuple[RelatedEntity, ...]
+    callees: tuple[RelatedEntity, ...]
+    docs: tuple[RelatedEntity, ...]
+    caveat: CoverageCaveat

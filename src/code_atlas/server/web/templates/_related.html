@@ -1,0 +1,34 @@
+{# One neighbour row, with the evidence behind the edge that reached it (ADR-0028). #}
+{% macro related_table(title, items, empty) %}
+  <h2>{{ title }}</h2>
+  {% if items %}
+    <table>
+      <tr><th>Entity</th><th>Edge</th><th>Evidence</th></tr>
+      {% for item in items %}
+        <tr>
+          <td><a href="/entity/{{ item.uid }}">{{ item.name }}</a></td>
+          <td class="muted">{{ item.evidence.rel_type if item.evidence else "—" }}</td>
+          <td>
+            {% if not item.evidence %}
+              <span class="muted">not recorded</span>
+            {% elif item.evidence.is_structural %}
+              <span class="structural">structural</span>
+            {% else %}
+              <span class="{{ 'guess' if item.evidence.is_guess else 'resolved' }}">
+                {{ item.evidence.confidence or "resolved" }}
+              </span>
+              <span class="muted">
+                via {{ item.evidence.strategy or "?" }}
+                {%- if item.evidence.weight is not none %}, weight {{ "%.2f"|format(item.evidence.weight) }}{% endif %}
+                {%- if item.evidence.line %}, line {{ item.evidence.line }}{% endif %}
+                {%- if item.evidence.site_count and item.evidence.site_count > 1 %}, {{ item.evidence.site_count }} sites{% endif %}
+              </span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ empty }}</p>
+  {% endif %}
+{% endmacro %}
