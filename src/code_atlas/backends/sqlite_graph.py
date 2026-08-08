@@ -203,6 +203,25 @@ def _prefix_clause(column: str, path: str) -> tuple[str, list[Any]]:
     return f" AND substr({column}, 1, ?) = ?", [len(path), path]
 
 
+# LIKE's own wildcards. Backslash first, or escaping it again would double the ones the
+# other two rules just inserted.
+_LIKE_ESCAPES = (("\\", "\\\\"), ("%", "\\%"), ("_", "\\_"))
+
+
+def _like_literal(value: str) -> str:
+    """Escape *value* for use inside a ``LIKE`` pattern.
+
+    ``_`` and ``%`` are wildcards, and both are ordinary characters in the identifiers
+    this backend searches: ``get_node`` would otherwise match ``getXnode``, and a query
+    containing ``%`` would match everything. ``_prefix_clause`` already solved this for
+    file paths by avoiding LIKE entirely; these call sites need real substring matching,
+    so they escape instead and pair it with a ``LIKE ... ESCAPE`` clause.
+    """
+    for char, replacement in _LIKE_ESCAPES:
+        value = value.replace(char, replacement)
+    return value
+
+
 def _prefix_clause_either(col_a: str, col_b: str, path: str) -> tuple[str, list[Any]]:
     """Like ``_prefix_clause``, but matching if *either* column has the prefix."""
     if not path:
@@ -886,9 +905,9 @@ class SqliteGraphClient:
             )
             if props.get("is_file_ref"):
                 cur = await conn.execute(
-                    "SELECT uid FROM nodes WHERE project_name = ? AND file_path LIKE ? "
+                    "SELECT uid FROM nodes WHERE project_name = ? AND file_path LIKE ? ESCAPE '\\' "
                     "AND labels NOT IN ('Note', 'DocSection')",
-                    (project_name, f"%{r.to_name}"),
+                    (project_name, f"%{_like_literal(r.to_name)}"),
                 )
             else:
                 cur = await conn.execute(
@@ -2279,14 +2298,16 @@ class SqliteGraphClient:
             3.0,
         )
         await _run(
-            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE qualified_name LIKE ? {label_clause}{proj_sql} LIMIT ?",
-            [f"%.{query}", *label_params, *proj_params, fetch_limit],
+            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE qualified_name LIKE ? ESCAPE '\\' "
+            f"{label_clause}{proj_sql} LIMIT ?",
+            [f"%.{_like_literal(query)}", *label_params, *proj_params, fetch_limit],
             2.0,
         )
         await _run(
             f"SELECT {_NODE_COLUMNS} FROM nodes "
-            f"WHERE (qualified_name LIKE ? OR name LIKE ?) {label_clause}{proj_sql} LIMIT ?",
-            [f"%{query}%", f"%{query}%", *label_params, *proj_params, fetch_limit],
+            f"WHERE (qualified_name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\') "
+            f"{label_clause}{proj_sql} LIMIT ?",
+            [f"%{_like_literal(query)}%", f"%{_like_literal(query)}%", *label_params, *proj_params, fetch_limit],
             1.0,
         )
 
@@ -2629,7 +2650,12 @@ class SqliteGraphClient:
         type_placeholders = ",".join("?" * len(edge_types))
         filter_clause = ""
         if resolved_only:
-            filter_clause += " AND json_extract(props_json, '$.confidence') = 'resolved'"
+            # coalesce, matching Memgraph's `coalesce(r.confidence, 'resolved')`. An absent
+            # confidence means STRUCTURAL (ADR-0028) — DEFINES, IMPORTS, INHERITS are facts,
+            # not guesses. Without it json_extract yields NULL for exactly those edges and
+            # the comparison drops every one, so `resolved_only` hid the best evidence in
+            # the graph while keeping the ambiguous CALLS that do carry the property.
+            filter_clause += " AND coalesce(json_extract(props_json, '$.confidence'), 'resolved') = 'resolved'"
         if production_only:
             filter_clause += " AND coalesce(json_extract(props_json, '$.from_test'), 0) = 0"
         reached: dict[str, tuple[int, float]] = {}
@@ -3004,14 +3030,28 @@ class SqliteGraphClient:
             # cannot mean "no CALLS edge" (a class is used by being annotated, subclassed
             # or imported), and a function nested in another function is reached through
             # its enclosing scope rather than by name.
+            # REFERENCES included, matching Memgraph: handed to a registry or a callback
+            # slot counts as used, even though the call that eventually runs it belongs to
+            # a framework rather than to this codebase.
             "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = n.uid AND e.rel_type IN "
-            "('CALLS', 'USES_TYPE', 'IMPORTS', 'INHERITS', 'IMPLEMENTS', 'OVERRIDES')) "
+            "('CALLS', 'USES_TYPE', 'IMPORTS', 'INHERITS', 'IMPLEMENTS', 'OVERRIDES', 'REFERENCES')) "
             "AND NOT EXISTS (SELECT 1 FROM edges d JOIN edges c ON c.to_uid = d.to_uid "
             "WHERE d.from_uid = n.uid AND d.rel_type = 'DEFINES' AND c.rel_type = 'CALLS') "
             "AND NOT EXISTS (SELECT 1 FROM edges d JOIN nodes p ON p.uid = d.from_uid "
             "WHERE d.to_uid = n.uid AND d.rel_type = 'DEFINES' AND p.labels = 'Callable') "
+            # OVERRIDES added here: an override is reached through its base, so liveness is
+            # an OUTBOUND test. Memgraph recorded this hook as 100% false-positive before it
+            # was added there — the graph already held the disproof and the predicate
+            # discarded it.
             "AND NOT EXISTS (SELECT 1 FROM edges i WHERE i.from_uid = n.uid "
-            "AND i.rel_type IN ('IMPLEMENTS', 'REGISTERED_BY')) "
+            "AND i.rel_type IN ('IMPLEMENTS', 'REGISTERED_BY', 'OVERRIDES')) "
+            # A decorator that is CALLED registers the function with whoever owns the
+            # registry, which is the inbound edge no relationship records. Every Typer
+            # command and every @mcp.tool() handler looked dead without this.
+            "AND json_extract(props_json, '$.decorator_name') IS NULL "
+            # A property is READ (`obj.ok`), and an attribute read is not a call — zero
+            # inbound edges is the expected state for one, not evidence about it.
+            "AND kind != 'property' "
             "ORDER BY file_path, json_extract(props_json, '$.line_start')",
             [project, *code_kinds, *extra],
         )
@@ -3503,9 +3543,14 @@ class SqliteGraphClient:
             await cur.close()
             results.extend({"n": _row_to_node(r), "_match_score": score} for r in rows)
 
-        await _branch("qualified_name LIKE ?", [f"%.{name}"], 3)
-        await _branch("qualified_name LIKE ?", [f"{name}.%"], 2)
-        await _branch("(qualified_name LIKE ? OR name LIKE ?)", [f"%{name}%", f"%{name}%"], 1)
+        escaped = _like_literal(name)
+        await _branch("qualified_name LIKE ? ESCAPE '\\'", [f"%.{escaped}"], 3)
+        await _branch("qualified_name LIKE ? ESCAPE '\\'", [f"{escaped}.%"], 2)
+        await _branch(
+            "(qualified_name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')",
+            [f"%{escaped}%", f"%{escaped}%"],
+            1,
+        )
         return results
 
     async def get_label_counts(self) -> dict[str, int]:

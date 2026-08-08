@@ -1337,3 +1337,201 @@ class TestGcOrphanedReferenceNodes:
         assert await client.gc_orphaned_reference_nodes() == 1
         assert await _node_row(client, "env/ORPHANED") is None
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# LIKE wildcard containment (ATL-112)
+# ---------------------------------------------------------------------------
+
+
+class TestLikeMetacharacters:
+    """User text reaches SQL ``LIKE``, where ``_`` and ``%`` are wildcards.
+
+    Both are ordinary characters in the identifiers this backend searches, so an
+    unescaped query silently returns the wrong rows rather than failing.
+    """
+
+    async def test_underscore_does_not_match_an_arbitrary_character(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities(
+            "proj",
+            "mod.py",
+            [_entity("get_node", "mod.get_node"), _entity("getXnode", "mod.getXnode")],
+            [],
+        )
+
+        found = await client.graph_search("get_node", project="proj")
+
+        assert {r["node"]["name"] for r in found} == {"get_node"}, "`_` matched any character"
+        await client.close()
+
+    async def test_a_percent_query_does_not_match_everything(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities(
+            "proj",
+            "mod.py",
+            [_entity("alpha", "mod.alpha"), _entity("beta", "mod.beta")],
+            [],
+        )
+
+        found = await client.graph_search("%", project="proj")
+
+        assert found == [], "a bare `%` matched every node in the project"
+        await client.close()
+
+    async def test_get_node_by_name_escapes_too(self, tmp_path: Path) -> None:
+        """The same trap in the second cascade — fixing one site is not fixing the bug."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities(
+            "proj",
+            "mod.py",
+            [_entity("do_thing", "mod.do_thing"), _entity("doXthing", "mod.doXthing")],
+            [],
+        )
+
+        found = await client.get_node_partial_matches("do_thing", "", 20)
+
+        assert {r["n"]["name"] for r in found} == {"do_thing"}
+        await client.close()
+
+    async def test_an_escaped_query_still_finds_its_literal_match(self, tmp_path: Path) -> None:
+        """Escaping must not break the ordinary case it exists to protect."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await client.upsert_file_entities("proj", "mod.py", [_entity("get_node", "mod.get_node")], [])
+
+        assert len(await client.graph_search("get_node", project="proj")) == 1
+        assert len(await client.graph_search("t_no", project="proj")) == 1, "substring search still works"
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Structural edges under resolved_only (ATL-112, ADR-0028)
+# ---------------------------------------------------------------------------
+
+
+class TestStructuralEdgesAreResolved:
+    """An absent ``confidence`` means structural, which means resolved.
+
+    Memgraph reads ``coalesce(r.confidence, 'resolved')``. SQLite compared
+    ``json_extract`` directly, which yields NULL for an edge that never carried the
+    property — so ``resolved_only`` dropped every DEFINES, IMPORTS and INHERITS edge
+    while keeping the ambiguous CALLS that do carry it. It hid the best evidence in the
+    graph and kept the worst.
+    """
+
+    @staticmethod
+    async def _seed(client: SqliteGraphClient) -> None:
+        await client.upsert_file_entities(
+            "proj",
+            "mod.py",
+            [
+                _entity("target", "mod.target"),
+                _entity("structural_caller", "mod.structural_caller"),
+                _entity("resolved_caller", "mod.resolved_caller"),
+                _entity("guessing_caller", "mod.guessing_caller"),
+            ],
+            [],
+        )
+        # No confidence property at all — a structural edge.
+        await _insert_edge(client, "proj:mod.structural_caller", "proj:mod.target", "USES_TYPE", {})
+        await _insert_edge(client, "proj:mod.resolved_caller", "proj:mod.target", "CALLS", {"confidence": "resolved"})
+        await _insert_edge(client, "proj:mod.guessing_caller", "proj:mod.target", "CALLS", {"confidence": "ambiguous"})
+
+    async def test_a_structural_dependent_is_not_flagged_as_a_guess(self, tmp_path: Path) -> None:
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await self._seed(client)
+
+        entries = await client.compute_blast_radius("proj:mod.target", "in", ("CALLS", "USES_TYPE"), 3)
+        by_uid = {e["uid"]: e for e in entries}
+
+        assert by_uid["proj:mod.structural_caller"]["ambiguous_only"] is False
+        assert by_uid["proj:mod.resolved_caller"]["ambiguous_only"] is False
+        await client.close()
+
+    async def test_an_ambiguous_dependent_is_still_flagged(self, tmp_path: Path) -> None:
+        """The fix must not make everything look resolved."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await self._seed(client)
+
+        entries = await client.compute_blast_radius("proj:mod.target", "in", ("CALLS", "USES_TYPE"), 3)
+        by_uid = {e["uid"]: e for e in entries}
+
+        assert by_uid["proj:mod.guessing_caller"]["ambiguous_only"] is True
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Dead-code exclusions (ATL-112)
+# ---------------------------------------------------------------------------
+
+
+class TestDeadCodeExclusions:
+    """The one finding a user might act on by deleting code.
+
+    Each exclusion below was measured as 100% false-positive on the Memgraph side before
+    it was added there. SQLite carried the same predicate minus four of them, so it
+    reported live code as dead — a miss costs nothing, a false positive costs working
+    code.
+    """
+
+    @staticmethod
+    async def _seed(client: SqliteGraphClient, entities: list[Any]) -> None:
+        await client.upsert_file_entities("proj", "mod.py", entities, [])
+
+    async def _dead(self, client: SqliteGraphClient) -> set[str]:
+        return {r["name"] for r in await client.get_dead_code_candidates("proj", "")}
+
+    async def test_a_referenced_callable_is_alive(self, tmp_path: Path) -> None:
+        """REFERENCES is proof of life: handed to a registry, the framework calls it."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await self._seed(client, [_entity("handler", "mod.handler"), _entity("register", "mod.register")])
+        await _insert_edge(client, "proj:mod.register", "proj:mod.handler", "REFERENCES", {})
+
+        assert "handler" not in await self._dead(client)
+        await client.close()
+
+    async def test_an_override_is_reached_through_its_base(self, tmp_path: Path) -> None:
+        """Liveness is an OUTBOUND test here — the override runs when the base is called."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await self._seed(client, [_entity("_pre_run", "mod._pre_run"), _entity("base_pre_run", "mod.base_pre_run")])
+        await _insert_edge(client, "proj:mod._pre_run", "proj:mod.base_pre_run", "OVERRIDES", {})
+
+        assert "_pre_run" not in await self._dead(client)
+        await client.close()
+
+    async def test_a_decorated_callable_is_registered_not_dead(self, tmp_path: Path) -> None:
+        """`@app.command()` IS the inbound edge, but no relationship records it."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        decorated = _entity("mine_git_history", "mod.mine_git_history")
+        decorated.extra_properties["decorator_name"] = "app.command"
+        await self._seed(client, [decorated])
+
+        assert "mine_git_history" not in await self._dead(client)
+        await client.close()
+
+    async def test_a_property_is_read_not_called(self, tmp_path: Path) -> None:
+        """Zero inbound edges is the expected state for a property, not evidence."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await self._seed(client, [_entity("ok", "mod.ok", kind="property")])
+
+        assert "ok" not in await self._dead(client)
+        await client.close()
+
+    async def test_a_genuinely_unreferenced_function_is_still_reported(self, tmp_path: Path) -> None:
+        """The exclusions must not empty the result — then the tool would be useless."""
+        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+        await client.ensure_schema()
+        await self._seed(client, [_entity("orphan", "mod.orphan")])
+
+        assert "orphan" in await self._dead(client)
+        await client.close()
