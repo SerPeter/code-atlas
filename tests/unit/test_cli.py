@@ -687,3 +687,42 @@ class TestProjectRootOutsideAGitRepo:
 
         monkeypatch.setattr(settings_mod, "find_git_root", lambda *a, **k: tmp_path / "repo")
         assert settings_mod._default_project_root() == tmp_path / "repo"
+
+
+class TestConfigSectionsRejectUnknownKeys:
+    """A typo inside a config section must fail loudly, not vanish (ATL-111).
+
+    The root settings model has always been `extra="forbid"`, but a nested BaseModel
+    defaults to `ignore` — so `[scope] include_paths = [...]` was accepted and dropped,
+    and someone scoping indexing to three services silently indexed the whole monorepo.
+    """
+
+    def test_a_mistyped_scope_key_is_rejected(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from code_atlas.settings import ScopeSettings
+
+        with pytest.raises(ValidationError, match="include_paths"):
+            # Deliberately invalid. `extra="forbid"` also makes ty reject these
+            # statically, which is a bonus of the change, not a problem with the test.
+            ScopeSettings(include_paths=["a"], exclude_patterns=["b"])  # ty: ignore[unknown-argument]
+
+    def test_the_real_keys_still_work(self):
+        from code_atlas.settings import ScopeSettings
+
+        s = ScopeSettings(paths=["svc/a"], extend_exclude=["*.tmp"])
+        assert s.paths == ["svc/a"]
+        assert s.extend_exclude == ["*.tmp"]
+
+    def test_every_section_inherits_strictness(self):
+        """Inherited rather than repeated, so a section added later is strict by default."""
+        from code_atlas import settings as m
+
+        sections = [
+            v
+            for v in vars(m).values()
+            if isinstance(v, type) and issubclass(v, m.StrictSection) and v is not m.StrictSection
+        ]
+        assert len(sections) >= 15, "expected every atlas.toml section to inherit StrictSection"
+        assert all(s.model_config.get("extra") == "forbid" for s in sections)
