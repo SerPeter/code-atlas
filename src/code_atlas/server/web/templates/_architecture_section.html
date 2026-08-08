@@ -78,3 +78,41 @@ metric over partial extraction must say so. #}
   </ul>
 </details>
 {% endfor %} {% endif %}
+
+{% if health.trend and health.trend.has_trend %}
+<h2>Trend</h2>
+<p class="muted">{{ health.trend.note }}</p>
+{% if health.trend.coverage_changed %}
+{# A metric that moved because coverage moved is not a codebase that changed. #}
+<p class="caveat">
+  <b>Direction unclear.</b> The module count changed by more than 10% across this window, which is
+  enough to explain the movement on its own — a language whose extraction improved adds real
+  dependencies that were always there.
+</p>
+{% else %}
+<p>
+  Propagation cost is <b>{{ health.trend.propagation_delta_pct }}</b> over this window
+  ({{ health.trend.direction }}).
+</p>
+{% endif %}
+<table>
+  <tr>
+    <th>Indexed</th>
+    <th>Commit</th>
+    <th>Modules</th>
+    <th>Propagation</th>
+    <th>Core</th>
+    <th>Largest cycle</th>
+  </tr>
+  {% for point in health.trend.points %}
+  <tr>
+    <td class="muted">{{ point.at }}</td>
+    <td class="muted"><code>{{ point.commit or "—" }}</code></td>
+    <td>{{ point.modules }}</td>
+    <td>{{ point.propagation_pct }}</td>
+    <td>{{ point.core_pct }}</td>
+    <td>{{ point.largest_cycle }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}

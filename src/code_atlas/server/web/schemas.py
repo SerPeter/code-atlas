@@ -143,6 +143,53 @@ class EntityDetail(msgspec.Struct, frozen=True):
     caveat: CoverageCaveat
 
 
+class TrendPoint(msgspec.Struct, frozen=True):
+    """One recorded index run, for the trend table."""
+
+    at: str
+    commit: str
+    modules: int
+    propagation_cost: float
+    core_size: float
+    largest_cycle: int
+
+    @property
+    def propagation_pct(self) -> str:
+        return f"{self.propagation_cost * 100:.1f}%"
+
+    @property
+    def core_pct(self) -> str:
+        return f"{self.core_size * 100:.1f}%"
+
+
+class ArchitectureTrend(msgspec.Struct, frozen=True):
+    """How the architecture numbers have moved across recorded index runs.
+
+    ``direction`` is ``"unclear"`` whenever coverage moved enough to explain the change on
+    its own. A propagation cost that rose because a language's extraction improved is not
+    a codebase that decayed, and calling that "worse" would be a confident wrong answer.
+
+    ``note`` carries the retention bound, because a window silently capped at fifty runs
+    reads as the whole history.
+    """
+
+    points: tuple[TrendPoint, ...]
+    direction: str
+    propagation_delta: float
+    core_delta: float
+    coverage_changed: bool
+    note: str
+
+    @property
+    def has_trend(self) -> bool:
+        """One point is not a trend; a line drawn through it invents a direction."""
+        return len(self.points) >= 2
+
+    @property
+    def propagation_delta_pct(self) -> str:
+        return f"{self.propagation_delta * 100:+.1f}%"
+
+
 class CycleDetail(msgspec.Struct, frozen=True):
     """One dependency cycle, with the edges that actually close it.
 
@@ -183,6 +230,7 @@ class ArchitectureHealth(msgspec.Struct, frozen=True):
     dsm_marks: tuple[tuple[int, int], ...]
     dsm_truncated: bool
     caveat: CoverageCaveat
+    trend: ArchitectureTrend | None = None
 
     @property
     def propagation_pct(self) -> str:

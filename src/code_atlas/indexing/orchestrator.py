@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from typing import Protocol
 
+    from code_atlas.graph.protocol import GraphBackend
+
     class _HasProgress(Protocol):
         """Anything teardown can ask "are you still working?".
 
@@ -411,6 +413,42 @@ class IndexResult:
     # Empty on a complete install; non-empty means the index is partial BY INSTALL, which
     # the caller must say out loud rather than reporting a clean run (ATL-110).
     skipped_no_grammar: dict[str, int] = field(default_factory=dict)
+
+
+async def _record_architecture_snapshot(
+    graph: GraphBackend, project_name: str, git_hash: str, skipped_no_grammar: dict[str, int]
+) -> None:
+    """Capture the architecture-health numbers for this index run.
+
+    On the index path, not the view path. Computing these when someone opens a page would
+    make the history a record of who looked at it rather than of how the code changed.
+
+    Every failure is swallowed: this is telemetry about the run, and it must not be able
+    to fail the run. The snapshot carries the module count and any language whose grammar
+    was missing, because a propagation cost that rose when C++ extraction improved is not
+    a codebase that decayed — without the coverage the two are indistinguishable.
+    """
+    try:
+        from code_atlas.server.architecture import analyse  # noqa: PLC0415
+        from code_atlas.server.architecture_history import record, snapshot_from_metrics  # noqa: PLC0415
+
+        records = await graph.get_module_import_edges(project_name, "")
+        edges = [
+            (str(r.get("from_mod") or ""), str(r.get("to_mod") or ""))
+            for r in records.get("direct", [])
+            if r.get("from_mod") and r.get("to_mod")
+        ]
+        if not edges:
+            return
+        nodes = sorted({n for edge in edges for n in edge})
+        snapshot = snapshot_from_metrics(
+            analyse(nodes, edges),
+            commit=git_hash,
+            skipped_languages=tuple(sorted(skipped_no_grammar)),
+        )
+        await record(graph, project_name, snapshot)
+    except Exception as exc:  # telemetry may never break indexing
+        logger.debug("Skipped architecture snapshot for {}: {}", project_name, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1946,6 +1984,9 @@ async def _index_project_inner(  # noqa: PLR0915
         metadata["delta_files_modified"] = len(decision.files_modified)
         metadata["delta_files_deleted"] = len(decision.files_deleted)
     await graph.update_project_metadata(project_name, **metadata)
+
+    # 9. Record the architecture snapshot (ATL-121)
+    await _record_architecture_snapshot(graph, project_name, git_hash or "", skipped_no_grammar)
 
     duration = time.monotonic() - start
     delta_stats = _build_delta_stats(decision, ast_stats) if decision.mode == "delta" else None
