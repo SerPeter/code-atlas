@@ -61,3 +61,46 @@ jobs:
           python-version: "3.14-dev"
       - run: uv sync --group dev --all-extras
       - run: uv run pytest -m "not integration and not bench and not tei"
+
+  # The suite that actually validates the product. CI ran only
+  # `-m "not integration and not bench and not tei"` until ATL-114, which excluded
+  # ~365 tests including tests/integration/graph/test_client.py — the Memgraph
+  # client's ONLY real coverage. Every Cypher query, all seven resolve_* passes,
+  # incremental upsert and schema migration reached main untested, and that is how a
+  # 60s CALLS-write timeout got as far as a user's first real C++ project.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      memgraph:
+        image: memgraph/memgraph-mage:3.12.0
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "echo 'RETURN 1;' | mgconsole || exit 1" --health-interval 10s --health-timeout 5s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14-dev"
+      - run: uv sync --group dev --all-extras
+      # Pointing the tests at the service containers rather than letting
+      # testcontainers start its own: one instance, already health-gated by the job.
+      #
+      # NOT parallelised. `graph_client` is function-scoped and wipes the database
+      # before every test; under xdist the session fixtures run once per worker, so
+      # with these env vars set every worker shares one instance and they wipe each
+      # other mid-test. The failures look like nondeterministic product bugs.
+      - run: uv run pytest -m integration
+        env:
+          ATLAS_TEST_MEMGRAPH_PORT: "7687"
+          ATLAS_TEST_VALKEY_PORT: "6379"

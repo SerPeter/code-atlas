@@ -20,9 +20,45 @@ permissions:
 
 jobs:
   # ------------------------------------------------------------------- #
+  # Job 0: Refuse to release from a commit CI has not passed
+  # ------------------------------------------------------------------- #
+  #
+  # Nothing gated a release before ATL-114. This workflow is dispatch-only with no
+  # `needs:` on CI, so a human clicked Run and it tagged and published to PyPI
+  # regardless of whether main was red -- and main's branch protection is bypassable
+  # by direct push, so much of the history never ran CI at all.
+  #
+  # Checks the CI *conclusion for this exact SHA* rather than trusting the branch:
+  # a green run on an older commit says nothing about the one being released.
+  verify-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require a successful CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "Looking for a successful CI run on $sha"
+          conclusion="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow CI \
+            --commit "$sha" \
+            --limit 1 \
+            --json conclusion \
+            --jq '.[0].conclusion // "none"')"
+          echo "CI conclusion: $conclusion"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::Refusing to release $sha - CI conclusion is '$conclusion', not 'success'."
+            echo "::error::Push the commit, let CI run, and dispatch again."
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------- #
   # Job 1: Version bump, changelog, tag, push, GitHub Release
   # ------------------------------------------------------------------- #
   release:
+    needs: verify-ci
     runs-on: ubuntu-latest
     concurrency:
       group: release
