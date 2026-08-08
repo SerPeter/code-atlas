@@ -28,12 +28,14 @@ from litestar.response import Template
 from code_atlas.server.web.schemas import (  # noqa: TC001
     ArchitectureHealth,
     EntityDetail,
+    ModuleMap,
     ProjectOverview,
     SearchPage,
 )
 from code_atlas.server.web.services import (
     ArchitectureViewService,
     EntityNotFoundError,
+    MapViewService,
     ProjectNotIndexedError,
     ProjectViewService,
     SearchViewService,
@@ -136,3 +138,20 @@ class ArchitectureController(Controller):
         self, architecture_service: NamedDependency[ArchitectureViewService]
     ) -> ArchitectureHealth:
         return await architecture_service.health()
+
+
+class MapController(Controller):
+    """The community map — modules as nodes, subsystems as clusters."""
+
+    path = "/map"
+
+    @get("/", name="map")
+    async def map_page(self, map_service: NamedDependency[MapViewService]) -> Template:
+        return Template("map.html", context={"map": await map_service.map()})
+
+    @get("/api", name="api_map")
+    async def api_map(
+        self, map_service: NamedDependency[MapViewService], external: FromQuery[bool] = True
+    ) -> ModuleMap:
+        """The map as JSON — this is what the canvas fetches and renders."""
+        return await map_service.map(include_external=external)

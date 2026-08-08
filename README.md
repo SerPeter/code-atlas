@@ -209,3 +209,10 @@ If Code Atlas saves you time, tokens, or makes your agents noticeably better —
 ## License
 
 [Apache License 2.0](LICENSE)
+
+**Third-party components.** The web UI ships two vendored browser bundles, both MIT, each with its
+upstream licence text alongside it: [sigma.js](https://github.com/jacomyal/sigma.js) 3.0.3 and
+[graphology](https://github.com/graphology/graphology) 0.26.0, under
+`src/code_atlas/server/web/static/vendor/`. Versions, sources and file hashes are recorded in
+[PROVENANCE.md](src/code_atlas/server/web/static/vendor/PROVENANCE.md). They are committed rather than
+fetched, so `atlas ui` needs no network beyond your local Memgraph.

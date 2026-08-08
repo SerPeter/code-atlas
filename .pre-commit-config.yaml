@@ -7,13 +7,21 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
-      # Vendored corpus is excluded from every whitespace-normalising hook:
-      # the coverage floors measure upstream code as it is actually written,
-      # and a stripped trailing space is a silent edit to the thing under test.
+      # Vendored code is excluded from every whitespace-normalising hook.
+      #
+      # For tests/fixtures/: the coverage floors measure upstream code as it is
+      # actually written, and a stripped trailing space is a silent edit to the
+      # thing under test.
+      #
+      # For the web UI's static/vendor/: those are third-party minified bundles
+      # whose SHA-512 is recorded in PROVENANCE.md so a reader can verify they
+      # match what npm published. A hook that rewrites one byte breaks that
+      # check and leaves us shipping a modified build under someone else's
+      # licence, with a manifest that says otherwise.
       - id: trailing-whitespace
-        exclude: "^tests/fixtures/"
+        exclude: "^tests/fixtures/|^src/code_atlas/server/web/static/vendor/"
       - id: end-of-file-fixer
-        exclude: "^tests/fixtures/"
+        exclude: "^tests/fixtures/|^src/code_atlas/server/web/static/vendor/"
       - id: check-yaml
       - id: check-toml
       - id: check-json
@@ -42,7 +50,7 @@ repos:
     hooks:
       - id: prettier
         types_or: [markdown, yaml]
-        exclude: 'CHANGELOG\.md|^tests/fixtures/'
+        exclude: 'CHANGELOG\.md|^tests/fixtures/|^src/code_atlas/server/web/static/vendor/'
 
   # --------------------------------------------------------------------------
   # Python — ty (type checking, local — no official pre-commit hook yet)
