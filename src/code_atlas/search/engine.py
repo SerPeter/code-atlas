@@ -99,6 +99,12 @@ class SearchResult:
     sources: dict[str, int] = field(default_factory=dict)  # channel → rank
     visibility: str = "public"
     source: str = ""
+    # The value results are actually ordered by: rrf_score after the visibility, label
+    # and secondary-project multipliers. Reported separately because showing the raw
+    # rrf_score next to a boosted ordering produces a list that is not sorted by the
+    # number beside it — `atlas search fetch` printed 0.0078 at rank 5 and 0.0076 at
+    # rank 4, which reads as a broken ranker rather than a deliberate demotion.
+    ranked_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -758,16 +764,18 @@ def _boost_results(
         project_name = result.uid.split(":", 1)[0] if ":" in result.uid else ""
         return _SECONDARY_PROJECT_BOOST if project_name in secondary_projects else 1.0
 
-    return sorted(
-        results,
-        key=lambda r: (
-            r.rrf_score
-            * _VIS_BOOST.get(r.visibility, 1.0)
-            * max((boost_table.get(lbl, 1.0) for lbl in r.labels), default=1.0)
-            * _project_boost(r)
-        ),
-        reverse=True,
-    )
+    def _effective(result: SearchResult) -> float:
+        return (
+            result.rrf_score
+            * _VIS_BOOST.get(result.visibility, 1.0)
+            * max((boost_table.get(lbl, 1.0) for lbl in result.labels), default=1.0)
+            * _project_boost(result)
+        )
+
+    # Recorded on each result rather than discarded with the sort key, so a consumer can
+    # show the number that produced the order it is looking at.
+    scored = [replace(r, ranked_score=_effective(r)) for r in results]
+    return sorted(scored, key=lambda r: r.ranked_score, reverse=True)
 
 
 async def hybrid_search(  # noqa: PLR0912, PLR0915

@@ -1357,8 +1357,10 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             "(mode='blended'); pass mode='knowledge' for why/decision/gotcha-shaped questions to invert that. "
             "Set code_only=true (or mode='code') to exclude DocSection/DocFile/Note entirely. "
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, line_start, "
-            "line_end, signature, docstring, visibility, _labels, rrf_score, sources}], "
+            "line_end, signature, docstring, visibility, _labels, score, rrf_score, sources}], "
             "count, truncated, query_ms}. "
+            "Ordered by `score` — rrf_score after the visibility/label boosts. Re-sorting on "
+            "`rrf_score` yields a different order than the one returned. "
             "Pass detail='full' to include source code, full docstrings, and caller/callee info. "
             "Use offset to page beyond the first `limit` results."
         ),
@@ -1482,6 +1484,10 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 "signature": r.signature,
                 "visibility": r.visibility,
                 "_labels": r.labels,
+                # The value the list is ordered by. `rrf_score` is the raw fusion score
+                # before the visibility/label/project multipliers, so sorting on it gives
+                # a different order than the one returned.
+                "score": round(r.ranked_score, 6),
                 "rrf_score": round(r.rrf_score, 6),
                 "sources": r.sources,
             }

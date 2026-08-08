@@ -846,7 +846,7 @@ async def _run_search(  # noqa: PLR0912, PLR0915
             sources = ", ".join(f"{ch}#{rank}" for ch, rank in r.sources.items())
             loc = f"{r.file_path}:{r.line_start}" if r.file_path and r.line_start else ""
             kind = r.kind or ", ".join(r.labels)
-            _echo(f"{i}. {r.qualified_name or r.name} ({kind}) — rrf={r.rrf_score:.4f} [{sources}] {loc}")
+            _echo(f"{i}. {r.qualified_name or r.name} ({kind}) — score={r.ranked_score:.4f} [{sources}] {loc}")
 
         if info.stale:
             commit_str = info.last_indexed_commit[:8] if info.last_indexed_commit else "never"

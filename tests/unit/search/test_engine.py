@@ -965,3 +965,52 @@ class TestHybridSearchChannelStatus:
         )
         assert results == []
         assert status["vector"].startswith("unavailable")
+
+
+# ---------------------------------------------------------------------------
+# The displayed score must explain the order
+# ---------------------------------------------------------------------------
+
+
+class TestRankedScoreMatchesTheOrder:
+    """A list that is not sorted by the number beside it reads as a broken ranker.
+
+    `atlas search fetch` printed rrf=0.0078 at rank 5 and rrf=0.0076 at rank 4 — correct
+    ordering (a Callable boosts 1.15, a Module 1.10) shown against the *pre-boost* score.
+    Found by running the real CLI; every unit test passed.
+    """
+
+    def test_results_are_monotonic_in_the_score_they_report(self):
+        from code_atlas.search.engine import _boost_results
+
+        results = [
+            _result_with_score(name="callable_lower", labels=["Callable"], rrf_score=0.0076),
+            _result_with_score(name="module_higher", labels=["Module"], rrf_score=0.0078),
+        ]
+
+        ranked = _boost_results(results)
+
+        scores = [r.ranked_score for r in ranked]
+        assert scores == sorted(scores, reverse=True), "the reported score must explain the order"
+
+    def test_the_label_boost_still_demotes_the_module(self):
+        """The ordering itself is deliberate and must not change."""
+        from code_atlas.search.engine import _boost_results
+
+        ranked = _boost_results(
+            [
+                _result_with_score(name="mod", labels=["Module"], rrf_score=0.0078),
+                _result_with_score(name="fn", labels=["Callable"], rrf_score=0.0076),
+            ]
+        )
+
+        assert [r.name for r in ranked] == ["fn", "mod"]
+
+    def test_the_raw_fusion_score_is_still_available(self):
+        """`rrf_score` keeps its meaning — the boosted value is reported alongside it."""
+        from code_atlas.search.engine import _boost_results
+
+        [ranked] = _boost_results([_result_with_score(name="fn", labels=["Callable"], rrf_score=0.02)])
+
+        assert ranked.rrf_score == 0.02
+        assert ranked.ranked_score > ranked.rrf_score, "a Callable boosts above its raw score"
