@@ -43,6 +43,8 @@ All powered by [Memgraph](https://memgraph.com/) as a single backend.
 - **Token-efficient** — budget-aware context assembly that prioritizes what matters most
 - **Pluggable AI** — TEI for embeddings, LiteLLM for LLM calls, or bring your own
 - **MCP server** — works with Claude Code, Cursor, Windsurf, or any MCP-compatible client
+- **Human-readable too** — `atlas ui` serves the same graph as a local web interface, including an
+  architecture-health view (DSM, propagation cost, dependency cycles) for spotting decay
 
 ## How Does This Compare?
 
@@ -52,39 +54,54 @@ For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code
 
 ## MCP Tools
 
-15 tools exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), designed to minimize context window overhead.
+23 tools exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), designed to minimize context window overhead. On the SQLite fallback the server registers **22** — `find_communities` needs Memgraph and is unregistered rather than left to fail when called.
 
-| Tool                   | What it does                                                                                 | Search | Full | Latency (avg / p95) |
-| ---------------------- | -------------------------------------------------------------------------------------------- | -----: | ---: | ------------------: |
-| **Search**             |                                                                                              |        |      |                     |
-| `hybrid_search`        | **Primary tool** — fuses graph + BM25 + vector via RRF. Auto-adjusts weights by query shape. |   ~117 | ~497 |        548 / 677 ms |
-| `text_search`          | BM25 keyword search. Quoted phrases, wildcards, field-specific queries.                      |    ~90 | ~275 |          34 / 36 ms |
-| `vector_search`        | Semantic similarity via embeddings. Finds code by meaning, not name.                         |    ~67 | ~297 |        102 / 125 ms |
-| `get_node`             | Find entities by name. Cascade: exact (uid + name) → partial (suffix > prefix > contains).   |   ~100 | ~254 |            7 / 8 ms |
-| **Navigation**         |                                                                                              |        |      |                     |
-| `get_context`          | Expand a node's neighborhood: parent, siblings, callers, callees, docs.                      |    ~64 | ~273 |          34 / 36 ms |
-| `cypher_query`         | Run read-only Cypher against the graph. Auto-limited, write-protected.                       |    ~59 | ~168 |            3 / 3 ms |
-| **Analysis**           |                                                                                              |        |      |                     |
-| `analyze_repo`         | Structure, centrality, dependencies, pattern, or quality analysis.                           |    ~41 | ~266 |          22 / 23 ms |
-| `generate_diagram`     | Mermaid diagrams: packages, imports, inheritance, module detail.                             |    ~37 | ~254 |            3 / 3 ms |
-| **Guidance**           |                                                                                              |        |      |                     |
-| `get_usage_guide`      | Quick-start or topic-specific guidance for the agent.                                        |    ~35 | ~106 |        < 1 / < 1 ms |
-| `plan_search_strategy` | Recommends which search tool + params for a question.                                        |    ~40 |  ~97 |        < 1 / < 1 ms |
-| `validate_cypher`      | Catches Cypher errors before execution.                                                      |    ~58 | ~116 |            1 / 2 ms |
-| `schema_info`          | Full graph schema: labels, relationships, Cypher examples.                                   |    ~75 |  ~96 |        < 1 / < 1 ms |
-| **Status**             |                                                                                              |        |      |                     |
-| `index_status`         | Projects, entity counts, schema version, index health.                                       |    ~72 |  ~93 |          22 / 23 ms |
-| `list_projects`        | Monorepo project list with dependency relationships.                                         |    ~56 |  ~77 |          12 / 13 ms |
-| `health_check`         | Infrastructure diagnostics: Memgraph, TEI, Valkey, schema.                                   |    ~55 |  ~76 |        218 / 264 ms |
+| Tool                       | What it does                                                                                     | Search | Full | Latency (avg / p95) |
+| -------------------------- | ------------------------------------------------------------------------------------------------ | -----: | ---: | ------------------: |
+| **Search**                 |                                                                                                  |        |      |                     |
+| `hybrid_search`            | **Primary tool** — fuses graph + BM25 + vector via RRF. Auto-adjusts weights by query shape.     |   ~198 | ~672 |        548 / 677 ms |
+| `text_search`              | BM25 keyword search. Quoted phrases, wildcards, field-specific queries.                          |   ~111 | ~320 |          34 / 36 ms |
+| `vector_search`            | Semantic similarity via embeddings. Finds code by meaning, not name.                             |    ~88 | ~329 |        102 / 125 ms |
+| `get_node`                 | Find entities by name. Cascade: exact (uid + name) → partial (suffix > prefix > contains).       |   ~122 | ~369 |            7 / 8 ms |
+| **Navigation**             |                                                                                                  |        |      |                     |
+| `get_context`              | Expand a node's neighborhood: parent, siblings, callers, callees, docs.                          |    ~90 | ~246 |          34 / 36 ms |
+| `summarize_module`         | Dense skeleton of a module or package — signatures, line spans, adjacency, fan-in and fan-out.   |   ~218 | ~407 |                   — |
+| `trace_path`               | Shortest path between two entities. Each hop carries its edge type, confidence and strategy.     |   ~114 | ~252 |                   — |
+| `cypher_query`             | Run read-only Cypher against the graph. Auto-limited, write-protected.                           |    ~48 | ~128 |            3 / 3 ms |
+| **Analysis**               |                                                                                                  |        |      |                     |
+| `analyze_repo`             | Structure, centrality, dependencies, pattern, or quality analysis.                               |    ~50 | ~470 |          22 / 23 ms |
+| `blast_radius`             | Transitive closure of callers/callees — "what breaks if I change this". Every hit reports `via`. |   ~214 | ~473 |                   — |
+| `find_communities`         | Clusters modules into subsystems by deterministic greedy modularity. Memgraph only.              |   ~159 | ~341 |                   — |
+| `find_dead_code`           | Entities with no incoming edge. **A lead, not a verdict** — known false positives are listed.    |   ~171 | ~310 |                   — |
+| `find_complexity_hotspots` | Top callables by LOC-span — a crude proxy, not cyclomatic complexity.                            |    ~72 | ~213 |                   — |
+| `find_hotspots`            | Commit-count hotspots, bus-factor risks and co-change pairs from git history.                    |   ~145 | ~286 |                   — |
+| `generate_diagram`         | Mermaid diagrams: packages, imports, inheritance, module detail.                                 |    ~82 | ~284 |            3 / 3 ms |
+| **Guidance**               |                                                                                                  |        |      |                     |
+| `get_usage_guide`          | Quick-start or topic-specific guidance for the agent.                                            |    ~24 |  ~79 |        < 1 / < 1 ms |
+| `plan_search_strategy`     | Recommends which search tool + params for a question.                                            |    ~29 |  ~70 |        < 1 / < 1 ms |
+| `validate_cypher`          | Catches Cypher errors before execution.                                                          |    ~47 |  ~89 |            1 / 2 ms |
+| `schema_info`              | Full graph schema: labels, relationships, Cypher examples.                                       |    ~64 |  ~79 |        < 1 / < 1 ms |
+| **Status**                 |                                                                                                  |        |      |                     |
+| `index_status`             | Projects, entity counts, schema version, index health.                                           |    ~61 |  ~76 |          22 / 23 ms |
+| `list_projects`            | Monorepo project list with dependency relationships.                                             |    ~45 |  ~60 |          12 / 13 ms |
+| `health_check`             | Infrastructure diagnostics: Memgraph, TEI, Valkey, schema.                                       |    ~73 |  ~88 |        218 / 264 ms |
+| `knowledge_health`         | Knowledge-vault lint: inbox, orphans, dangling links, duplicate ids, promotion candidates.       |   ~135 | ~150 |                   — |
 
-Token counts measured from MCP JSON tool definitions (tiktoken cl100k_base). **Search** = name + description (~966 total); **Full** = name + description + parameter schema with field descriptions, enums, and constraints (~2,945 total). All parameters are self-documented — agents can one-shot any tool without calling `get_usage_guide` first. **Latency** measured with local TEI embeddings on the code-atlas repo (~1,400 entities), 5 iterations, warm embedding cache. See `scripts/profile_query.py`.
+Token counts measured from the registered MCP tool definitions (tiktoken `cl100k_base`) — reproduce with `uv run python scripts/count_tool_tokens.py`. **Search** = name + description (2,360 total); **Full** = name + description + parameter schema with field descriptions, enums and constraints (5,791 total). All parameters are self-documented, so agents can one-shot any tool without calling `get_usage_guide` first.
+
+**Latency** was measured with local TEI embeddings on the code-atlas repo (~1,400 entities), 5 iterations, warm embedding cache — see `scripts/profile_query.py`. A `—` means that tool is not yet in the profiling harness; it is unmeasured, not instant.
 
 ## Quick Start
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-- [uv](https://docs.astral.sh/uv/) (Python package manager)
+- **Python 3.14+** (`requires-python = ">=3.14"`). A hard floor, not a soft one: the codebase uses
+  [PEP 758](https://peps.python.org/pep-0758/) unparenthesized `except` tuples, which are a **syntax
+  error** before 3.14 — it will not even import. `litellm` is also held below 1.92, because newer
+  releases dropped prebuilt Windows/3.14 wheels.
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose — for Memgraph and Valkey.
+- [uv](https://docs.astral.sh/uv/) (Python package manager). `uvx` fetches a matching interpreter for
+  you, so you do not need 3.14 already on your PATH.
 
 ### 1. Start infrastructure
 
@@ -112,7 +129,19 @@ uvx --from code-atlas-mcp atlas index /path/to/your/project
 uvx --from code-atlas-mcp atlas status
 ```
 
-### 3. Connect to your AI agent
+### 3. Explore it yourself (optional)
+
+The graph is not only for agents. `atlas ui` serves a local, project-scoped web interface — search,
+entity detail with the evidence behind every edge, and an architecture-health view that reports whether
+the codebase is trending toward a big ball of mud:
+
+```bash
+uvx --from "code-atlas-mcp[ui]" atlas ui   # http://127.0.0.1:8420
+```
+
+It binds to loopback and talks to nothing but your local Memgraph.
+
+### 4. Connect to your AI agent
 
 **Claude Code:**
 
