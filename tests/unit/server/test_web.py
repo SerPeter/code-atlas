@@ -414,6 +414,39 @@ class TestSearchHonesty:
         # that more exist. Reporting the fetch size as a count is the ATL-111 bug.
         assert not hasattr(page, "total")
 
+    async def test_hits_are_monotonic_in_the_score_they_report(self, monkeypatch):
+        """A list not sorted by the number beside it reads as a broken ranker.
+
+        The CLI and the MCP tools were fixed for this; the web layer was missed and kept
+        showing the pre-boost rrf_score. Caught by reading a real /api/search response.
+        """
+        from code_atlas.search.engine import SearchResult
+
+        results = [
+            SearchResult(
+                uid=f"u:{i}",
+                name=f"e{i}",
+                qualified_name=f"app.e{i}",
+                kind="function",
+                file_path="app.py",
+                line_start=i,
+                line_end=i,
+                signature="",
+                docstring="",
+                labels=["Callable"],
+                rrf_score=0.01 * (i + 1),
+                ranked_score=1.0 - i,  # deliberately disagrees with rrf_score
+            )
+            for i in range(3)
+        ]
+        self._patch_search(monkeypatch, results)
+
+        page = await _search_service(FakeGraph()).search("e", limit=10)
+
+        scores = [h.score for h in page.hits]
+        assert scores == sorted(scores, reverse=True), "hits must be ordered by the score shown"
+        assert scores[0] == 1.0, "the reported score is the ranked one, not the raw fusion score"
+
     async def test_a_complete_page_says_so(self, monkeypatch):
         self._patch_search(monkeypatch, self._hits(3))
 

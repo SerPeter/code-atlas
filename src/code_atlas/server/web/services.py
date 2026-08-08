@@ -338,7 +338,11 @@ def _as_hit(result: SearchResult) -> SearchHit:
         file_path=result.file_path,
         line_start=result.line_start,
         signature=result.signature,
-        score=round(result.rrf_score, 4),
+        # ranked_score, not rrf_score: the raw fusion score is the value *before* the
+        # visibility/label boosts, so showing it against the boosted ordering renders a
+        # list that is not sorted by the number beside it. The CLI and the MCP tools were
+        # fixed for this; this third consumer was missed.
+        score=round(result.ranked_score, 4),
         channels=tuple(sorted(result.sources)),
     )
 
