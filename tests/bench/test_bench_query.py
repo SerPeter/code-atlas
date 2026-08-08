@@ -54,7 +54,7 @@ async def seeded_graph(graph_client: GraphClient, bench_small: tuple[Path, list[
 
     # Parse and upsert a subset (first 50 files for speed)
     for rel_path in py_paths[:50]:
-        abs_path = root / rel_path.replace("/", "\\")
+        abs_path = root / rel_path
         source = abs_path.read_bytes()
         result = parse_file(rel_path, source, project_name=project_name)
         if result is not None:

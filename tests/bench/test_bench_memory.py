@@ -43,7 +43,7 @@ def _run_memory_bench(root: Path, rel_paths: list[str], label: str) -> None:
     all_results: list[ParsedFile] = []
     total_entities = 0
     for rel_path in py_paths:
-        abs_path = root / rel_path.replace("/", "\\")
+        abs_path = root / rel_path
         source = abs_path.read_bytes()
         result = parse_file(rel_path, source, project_name="bench")
         if result is not None:

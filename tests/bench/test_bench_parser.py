@@ -29,7 +29,7 @@ def test_parser_throughput_small(bench_small: tuple[Path, list[str]]):
     start = time.perf_counter()
 
     for rel_path in py_paths:
-        abs_path = root / rel_path.replace("/", "\\")
+        abs_path = root / rel_path
         source = abs_path.read_bytes()
         result = parse_file(rel_path, source, project_name="bench")
         if result is not None:
@@ -62,7 +62,7 @@ def test_parser_throughput_medium(bench_medium: tuple[Path, list[str]]):
     start = time.perf_counter()
 
     for rel_path in py_paths:
-        abs_path = root / rel_path.replace("/", "\\")
+        abs_path = root / rel_path
         source = abs_path.read_bytes()
         result = parse_file(rel_path, source, project_name="bench")
         if result is not None:

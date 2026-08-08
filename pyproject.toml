@@ -27,7 +27,7 @@ keywords = [
     "code-navigation",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
@@ -123,6 +123,26 @@ dev = [
 # --------------------------------------------------------------------------- #
 [tool.hatch.build.targets.wheel]
 packages = ["src/code_atlas"]
+
+# Hatchling's sdist default is include-everything, which put 308 entries in the
+# tarball: the whole test suite, wiki/, .claude/, and — since ATL-096 — 99 files of
+# vendored third-party corpus under tests/fixtures/langcov/. That corpus is MIT,
+# Apache-2.0, BSD-3 and MIT-OR-Unlicense, correctly attributed per directory, but the
+# package declares `License-Expression: Apache-2.0` and nothing at top level discloses
+# the rest. v0.7.0 predates the corpus (`git ls-tree v0.7.0 tests/fixtures/` is empty),
+# so the next release would be the first to ship it. An sdist consumer needs the
+# package and the metadata to build it; none of this (ATL-114).
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/code_atlas",
+    # Anchored with a leading slash: a bare "README.md" matches any README at any
+    # depth, which quietly re-admitted wiki/adr/README.md and the vendored corpus's
+    # own tests/fixtures/langcov/README.md.
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/pyproject.toml",
+]
 
 [tool.hatch.envs.default]
 installer = "uv"
