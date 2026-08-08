@@ -30,12 +30,18 @@ class _Graph:
             projects
             if projects is not None
             else [
-                {"project": "demo", "entities": 42, "indexed_at": "2026-08-08T00:00:00Z", "git_hash": "abc123def4567"}
+                {
+                    "name": "demo",
+                    "entity_count": 42,
+                    "last_indexed_at": "2026-08-08T00:00:00Z",
+                    "git_hash": "abc123def4567",
+                }
             ]
         )
 
     async def get_project_status(self, project_name: str | None = None) -> list[dict[str, Any]]:
-        return self._projects
+        # `[{"n": <node>}]` with the node's own property names — the real backend shape.
+        return [{"n": p} for p in self._projects]
 
     async def get_structure_overview(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
         return {"counts": [{"label": "Module", "kind": "module", "cnt": 3}], "largest_modules": [], "packages": []}
@@ -203,7 +209,7 @@ class TestWriting:
     async def test_an_unindexed_project_refuses_rather_than_writing_zeroes(self, monkeypatch, tmp_path):
         """A file of zeroes is indistinguishable from a project that really is empty."""
         _patch_map(monkeypatch)
-        graph = _Graph(projects=[{"project": "other", "entities": 1}])
+        graph = _Graph(projects=[{"name": "other", "entity_count": 1}])
         target = tmp_path / "snapshot.html"
 
         with pytest.raises(ProjectNotIndexedError):

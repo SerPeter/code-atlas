@@ -20,6 +20,7 @@ buys a shared number at the cost of depending on that analysis's entire output s
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES
@@ -105,8 +106,8 @@ class ProjectViewService:
 
     async def overview(self) -> ProjectOverview:
         """The landing view for the current project."""
-        statuses = await self._graph.get_project_status()
-        current = next((s for s in statuses if s.get("project") == self._project), None)
+        statuses = [_project_props(row) for row in await self._graph.get_project_status()]
+        current = next((s for s in statuses if s.get("name") == self._project), None)
         if current is None:
             raise ProjectNotIndexedError(self._project)
 
@@ -124,19 +125,19 @@ class ProjectViewService:
 
         others = tuple(
             ProjectRef(
-                name=str(s.get("project", "")),
-                entities=int(s.get("entities") or 0),
-                is_current=s.get("project") == self._project,
+                name=str(s.get("name", "")),
+                entities=int(s.get("entity_count") or 0),
+                is_current=s.get("name") == self._project,
             )
             for s in statuses
-            if s.get("project")
+            if s.get("name")
         )
 
         return ProjectOverview(
             project=self._project,
-            entity_count=int(current.get("entities") or 0),
+            entity_count=int(current.get("entity_count") or 0),
             module_count=int(label_counts.get("Module", 0)),
-            indexed_at=_as_str(current.get("indexed_at")),
+            indexed_at=_as_timestamp(current.get("last_indexed_at")),
             git_hash=_as_str(current.get("git_hash")),
             label_counts=label_counts,
             other_projects=others,
@@ -144,10 +145,42 @@ class ProjectViewService:
         )
 
 
+def _project_props(row: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap a ``get_project_status`` row into the Project node's own properties.
+
+    Both backends return ``[{"n": <node>}]`` — Memgraph from ``RETURN n``, SQLite from
+    ``_row_to_node`` — and the properties are ``name``/``entity_count``/
+    ``last_indexed_at``, not ``project``/``entities``/``indexed_at``. Reading the wrapper
+    dict directly finds none of them, so every project compared unequal and the landing
+    page 404'd as "not indexed" against a fully indexed graph.
+
+    The unit tests missed it because the fake returned a flattened shape that no backend
+    produces. `mcp.py`'s ``index_status`` had the unwrapping right all along.
+    """
+    node = row.get("n", row)
+    return dict(node.items()) if hasattr(node, "items") else dict(node)
+
+
 def _as_str(value: object) -> str | None:
     """Normalise a graph value to a display string, preserving "absent"."""
     if value is None or value == "":
         return None
+    return str(value)
+
+
+def _as_timestamp(value: object) -> str | None:
+    """Render an index time for a human.
+
+    `update_project_metadata` writes `last_indexed_at` as `time.time()`, so the stored
+    value is a float. Passing it through `str()` put `1786176798.014237` on the landing
+    page — technically the data, and useless as an answer to "when was this indexed".
+    Anything that is not a number is passed through unchanged, since older rows and the
+    SQLite path may hold an ISO string already.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(float(value), tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
     return str(value)
 
 
