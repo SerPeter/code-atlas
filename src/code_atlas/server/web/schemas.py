@@ -141,3 +141,37 @@ class EntityDetail(msgspec.Struct, frozen=True):
     callees: tuple[RelatedEntity, ...]
     docs: tuple[RelatedEntity, ...]
     caveat: CoverageCaveat
+
+
+class ArchitectureHealth(msgspec.Struct, frozen=True):
+    """The mud report, ready to render.
+
+    ``dsm_order`` and ``dsm_marks`` are the matrix: modules on both axes in dependency
+    order, a mark where the row depends on the column. Marks below the diagonal are
+    layering; marks **above** it are cycles, and they are what the view is for.
+
+    Capped at ``dsm_limit`` modules because an N x N grid is quadratic in the page.
+    ``dsm_truncated`` says so rather than silently showing a corner of the matrix as if
+    it were the whole thing.
+    """
+
+    project: str
+    module_count: int
+    edge_count: int
+    propagation_cost: float
+    core_size: float
+    largest_cycle: int
+    fan_in_gini: float
+    cycles: tuple[tuple[str, ...], ...]
+    dsm_order: tuple[str, ...]
+    dsm_marks: tuple[tuple[int, int], ...]
+    dsm_truncated: bool
+    caveat: CoverageCaveat
+
+    @property
+    def propagation_pct(self) -> str:
+        return f"{self.propagation_cost * 100:.1f}%"
+
+    @property
+    def core_pct(self) -> str:
+        return f"{self.core_size * 100:.1f}%"

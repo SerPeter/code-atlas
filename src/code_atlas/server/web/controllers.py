@@ -15,6 +15,7 @@ from __future__ import annotations
 from litestar import Controller, get
 from litestar.di import NamedDependency  # noqa: TC002 — see the runtime-import note below
 from litestar.exceptions import NotFoundException
+from litestar.params import FromPath, FromQuery  # noqa: TC002 — see the runtime-import note below
 from litestar.response import Template
 
 # Imported at RUNTIME, not under TYPE_CHECKING, and that is load-bearing rather than an
@@ -24,8 +25,14 @@ from litestar.response import Template
 # under TYPE_CHECKING raises `NameError: name 'ProjectViewService' is not defined`
 # before the app finishes constructing. Any type appearing in a handler signature has to
 # be importable for real.
-from code_atlas.server.web.schemas import EntityDetail, ProjectOverview, SearchPage  # noqa: TC001
+from code_atlas.server.web.schemas import (  # noqa: TC001
+    ArchitectureHealth,
+    EntityDetail,
+    ProjectOverview,
+    SearchPage,
+)
 from code_atlas.server.web.services import (
+    ArchitectureViewService,
     EntityNotFoundError,
     ProjectNotIndexedError,
     ProjectViewService,
@@ -82,13 +89,16 @@ class SearchController(Controller):
 
     @get("/search", name="search")
     async def search(
-        self, search_service: NamedDependency[SearchViewService], q: str = "", limit: int = 20
+        self,
+        search_service: NamedDependency[SearchViewService],
+        q: FromQuery[str] = "",
+        limit: FromQuery[int] = 20,
     ) -> Template:
         page = await search_service.search(q, limit=min(max(limit, 1), 100))
         return Template("search.html", context={"page": page})
 
     @get("/entity/{uid:path}", name="entity")
-    async def entity(self, search_service: NamedDependency[SearchViewService], uid: str) -> Template:
+    async def entity(self, search_service: NamedDependency[SearchViewService], uid: FromPath[str]) -> Template:
         try:
             detail = await search_service.detail(uid.lstrip("/"))
         except EntityNotFoundError as exc:
@@ -97,13 +107,32 @@ class SearchController(Controller):
 
     @get("/api/search", name="api_search")
     async def api_search(
-        self, search_service: NamedDependency[SearchViewService], q: str = "", limit: int = 20
+        self,
+        search_service: NamedDependency[SearchViewService],
+        q: FromQuery[str] = "",
+        limit: FromQuery[int] = 20,
     ) -> SearchPage:
         return await search_service.search(q, limit=min(max(limit, 1), 100))
 
     @get("/api/entity/{uid:path}", name="api_entity")
-    async def api_entity(self, search_service: NamedDependency[SearchViewService], uid: str) -> EntityDetail:
+    async def api_entity(self, search_service: NamedDependency[SearchViewService], uid: FromPath[str]) -> EntityDetail:
         try:
             return await search_service.detail(uid.lstrip("/"))
         except EntityNotFoundError as exc:
             raise NotFoundException(detail=f"No entity with uid {exc.uid!r}") from exc
+
+
+class ArchitectureController(Controller):
+    """The mud view — a design structure matrix, not another node-link graph."""
+
+    path = "/architecture"
+
+    @get("/", name="architecture")
+    async def architecture(self, architecture_service: NamedDependency[ArchitectureViewService]) -> Template:
+        return Template("architecture.html", context={"health": await architecture_service.health()})
+
+    @get("/api", name="api_architecture")
+    async def api_architecture(
+        self, architecture_service: NamedDependency[ArchitectureViewService]
+    ) -> ArchitectureHealth:
+        return await architecture_service.health()

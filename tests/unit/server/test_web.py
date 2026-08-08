@@ -14,6 +14,7 @@ from litestar.testing import TestClient
 
 from code_atlas.server.web.app import create_app
 from code_atlas.server.web.services import (
+    ArchitectureViewService,
     EntityNotFoundError,
     ProjectNotIndexedError,
     ProjectViewService,
@@ -31,7 +32,19 @@ class FakeGraph:
     ``_analyze_structure`` reads, not a convenient invention.
     """
 
-    def __init__(self, *, projects: list[dict[str, Any]] | None = None, counts: list[dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        *,
+        projects: list[dict[str, Any]] | None = None,
+        counts: list[dict[str, Any]] | None = None,
+        imports: list[tuple[str, str]] | None = None,
+    ):
+        # `direct` only: the architecture view measures declared dependencies, and
+        # counting the transitive `indirect` rows too would double-count every path the
+        # closure already covers.
+        self._imports = imports if imports is not None else [("app", "service"), ("service", "repo")]
+        # Malformed rows a test wants to inject verbatim, past the (from, to) shorthand.
+        self.extra_import_rows: list[dict[str, Any]] = []
         self._projects = (
             projects
             if projects is not None
@@ -90,6 +103,12 @@ class FakeGraph:
                 {"from_qn": "app.target", "to_qn": "app.helper", "rel_type": "CALLS", "props": {}},
             ],
             "docs": [],
+        }
+
+    async def get_module_import_edges(self, project: str, path: str) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "direct": [{"from_mod": a, "to_mod": b} for a, b in self._imports] + self.extra_import_rows,
+            "indirect": [],
         }
 
     async def close(self) -> None: ...
@@ -348,3 +367,99 @@ class TestSearchHonesty:
 
         assert page.hits == ()
         assert page.more_available is False
+
+
+def _architecture_service(graph: FakeGraph, project: str = "demo") -> ArchitectureViewService:
+    return ArchitectureViewService(cast("GraphBackend", graph), project)
+
+
+class TestArchitectureView:
+    """The mud view (ATL-119).
+
+    The matrix earns its place over a node-link graph only if a healthy architecture and
+    a rotten one produce visibly different pictures — so that is what these assert,
+    rather than that the numbers merely came back.
+    """
+
+    async def test_a_layered_project_puts_every_mark_below_the_diagonal(self):
+        """app -> service -> repo, ordered repo, service, app: rows exceed columns."""
+        health = await _architecture_service(FakeGraph()).health()
+
+        assert health.dsm_order == ("repo", "service", "app")
+        assert all(row > col for row, col in health.dsm_marks), "a DAG must be fully lower-triangular"
+        assert health.largest_cycle == 1
+        assert health.cycles == ()
+
+    async def test_a_cycle_shows_up_above_the_diagonal(self):
+        """The one thing the ordering cannot hide, and the reason to draw it at all."""
+        graph = FakeGraph(imports=[("a", "b"), ("b", "a")])
+
+        health = await _architecture_service(graph).health()
+
+        assert any(row < col for row, col in health.dsm_marks), "a cycle must break the triangle"
+        assert health.cycles == (("a", "b"),)
+        assert health.core_size == 1.0
+
+    async def test_propagation_cost_matches_the_hand_worked_value(self):
+        """app reaches 2, service reaches 1, repo reaches 0 — 3/(3*2) = 0.5."""
+        health = await _architecture_service(FakeGraph()).health()
+
+        assert health.propagation_cost == pytest.approx(0.5)
+        assert health.propagation_pct == "50.0%"
+
+    async def test_a_truncated_matrix_says_so(self):
+        """An N x N grid is quadratic in the page, so it is capped — but never silently."""
+        chain = [(f"m{i}", f"m{i + 1}") for i in range(20)]
+        health = await _architecture_service(FakeGraph(imports=chain)).health(dsm_limit=5)
+
+        assert len(health.dsm_order) == 5
+        assert health.dsm_truncated is True
+        assert health.module_count == 21, "the metrics still cover the whole graph, not just the visible corner"
+
+    async def test_marks_outside_the_visible_window_are_dropped_not_misplaced(self):
+        """Truncation must not fold hidden modules onto visible coordinates."""
+        chain = [(f"m{i}", f"m{i + 1}") for i in range(20)]
+        health = await _architecture_service(FakeGraph(imports=chain)).health(dsm_limit=5)
+
+        assert all(0 <= row < 5 and 0 <= col < 5 for row, col in health.dsm_marks)
+
+    async def test_incomplete_rows_are_ignored(self):
+        """A module with no qualified_name is not an edge to nowhere."""
+        graph = FakeGraph(imports=[("a", "b")])
+        graph.extra_import_rows = [{"from_mod": "c", "to_mod": ""}]
+
+        health = await _architecture_service(graph).health()
+
+        assert health.module_count == 2
+        assert health.edge_count == 1
+
+    async def test_a_project_with_no_imports_says_there_is_nothing_to_measure(self):
+        """A propagation cost of 0.0 over an empty graph would read as excellent."""
+        health = await _architecture_service(FakeGraph(imports=[])).health()
+
+        assert health.module_count == 0
+        assert not health.caveat.is_complete
+
+    async def test_the_caveat_never_claims_completeness(self):
+        """Extraction coverage varies by language (ATL-096), so this is a lower bound."""
+        health = await _architecture_service(FakeGraph()).health()
+
+        assert not health.caveat.is_complete
+
+
+class TestArchitectureEndpoint:
+    def test_the_page_renders_the_matrix(self):
+        with _client(FakeGraph(), "demo") as client:
+            response = client.get("/architecture/")
+
+        assert response.status_code == 200
+        assert "repo" in response.text
+        assert "50.0%" in response.text
+
+    def test_the_api_returns_the_same_numbers(self):
+        with _client(FakeGraph(), "demo") as client:
+            payload = client.get("/architecture/api").json()
+
+        assert payload["propagation_cost"] == pytest.approx(0.5)
+        assert payload["dsm_order"] == ["repo", "service", "app"]
+        assert payload["largest_cycle"] == 1
