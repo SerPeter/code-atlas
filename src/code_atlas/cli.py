@@ -330,9 +330,52 @@ def ui(
     port: int = typer.Option(8420, "--port", "-p", help="Bind port."),
     project: str = typer.Option("", "--project", help="Project to view. Empty = detect from the working directory."),
     reload: bool = typer.Option(False, "--reload", help="Enable debug mode and template auto-reload."),
+    export: Path = typer.Option(
+        None, "--export", help="Write a self-contained HTML snapshot to this path instead of serving."
+    ),
 ) -> None:
     """Start the local web interface for exploring the graph."""
+    if export is not None:
+        asyncio.run(_run_export(path=export, project=project))
+        return
     asyncio.run(_run_ui(host=host, port=port, project=project, debug=reload))
+
+
+async def _run_export(*, path: Path, project: str) -> None:
+    """Write a static snapshot instead of serving one.
+
+    A second renderer over the same view services and template partials, not a second
+    implementation — see `code_atlas.server.web.export`.
+    """
+    try:
+        import jinja2  # noqa: F401  # presence check; the exporter imports what it needs
+    except ImportError:
+        logger.error("The HTML export needs the 'ui' extra. Install it with: pip install 'code-atlas-mcp[ui]'")
+        raise typer.Exit(code=1) from None
+
+    from code_atlas.backends import create_graph_client
+    from code_atlas.settings import derive_project_name
+
+    settings = _load_settings()
+    project_name = project or derive_project_name(settings.project_root)
+    graph = await create_graph_client(settings)
+    try:
+        from code_atlas.server.web.export import ProjectNotIndexedError, export_project
+
+        try:
+            result = await export_project(graph, project_name, path)
+        except ProjectNotIndexedError:
+            # Same distinction the CLI draws everywhere else (ATL-110): "not indexed" is
+            # not "empty", and writing a file of zeroes would erase the difference.
+            logger.error("Project '{}' has no index. Run 'atlas index' first.", project_name)
+            raise typer.Exit(code=1) from None
+
+        _echo(f"Wrote {result.path} — {result.size_mb:.1f} MB, {result.node_count} modules.")
+        if not result.map_available:
+            _echo("  The map is not in this export: community detection needs the Memgraph backend.")
+        _echo("  Self-contained: open it directly, no server and no network.")
+    finally:
+        await graph.close()
 
 
 async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
