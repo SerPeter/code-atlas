@@ -18,12 +18,14 @@ from litestar.template.config import TemplateConfig
 from code_atlas.server.web.controllers import (
     ArchitectureController,
     HealthController,
+    ImpactController,
     MapController,
     ProjectController,
     SearchController,
 )
 from code_atlas.server.web.services import (
     ArchitectureViewService,
+    ImpactViewService,
     MapViewService,
     ProjectViewService,
     SearchViewService,
@@ -74,6 +76,9 @@ def create_app(
     async def provide_map_service() -> MapViewService:
         return MapViewService(graph, project)
 
+    async def provide_impact_service() -> ImpactViewService:
+        return ImpactViewService(graph, project)
+
     template_config: TemplateConfig[Any] = TemplateConfig(directory=TEMPLATES_DIR, engine=JinjaTemplateEngine)
 
     return Litestar(
@@ -82,6 +87,7 @@ def create_app(
             SearchController,
             ArchitectureController,
             MapController,
+            ImpactController,
             HealthController,
             # Vendored, never CDN — `atlas ui` must work offline, and the static export
             # (ATL-120) must not reach the network at all. See ADR-0033.
@@ -92,6 +98,7 @@ def create_app(
             "search_service": Provide(provide_search_service),
             "architecture_service": Provide(provide_architecture_service),
             "map_service": Provide(provide_map_service),
+            "impact_service": Provide(provide_impact_service),
         },
         # Annotated rather than inlined: `TemplateConfig` is generic in its engine and
         # Litestar's own parameter is `TemplateConfig[EngineType] | None`, so the

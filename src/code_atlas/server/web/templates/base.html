@@ -94,6 +94,40 @@
       .dsm .dsm-cycle {
         background: #c0574a;
       }
+      code.via {
+        font-size: 0.8em;
+        padding: 0.05rem 0.3rem;
+        border: 1px solid var(--line);
+        margin-right: 0.2rem;
+      }
+      .impact-form {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem 1.25rem;
+        align-items: flex-end;
+        margin-bottom: 1rem;
+      }
+      .impact-form label {
+        display: flex;
+        flex-direction: column;
+        font-size: 0.85em;
+        gap: 0.2rem;
+      }
+      .impact-form label.inline {
+        flex-direction: row;
+        align-items: center;
+        gap: 0.35rem;
+      }
+      table.impact {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      table.impact th {
+        border-bottom: 1px solid var(--line);
+      }
+      ol.hops li {
+        margin-bottom: 0.35rem;
+      }
       .map-canvas {
         width: 100%;
         height: 60vh;
@@ -150,6 +184,7 @@
       <a href="/">overview</a>
       <a href="/search">search</a>
       <a href="/map">map</a>
+      <a href="/impact">impact</a>
       <a href="/architecture">architecture</a>
       <span class="muted">{% block subtitle %}{% endblock %}</span>
     </header>

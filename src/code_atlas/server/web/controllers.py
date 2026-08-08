@@ -27,14 +27,17 @@ from litestar.response import Template
 # be importable for real.
 from code_atlas.server.web.schemas import (  # noqa: TC001
     ArchitectureHealth,
+    BlastRadiusView,
     EntityDetail,
     ModuleMap,
     ProjectOverview,
     SearchPage,
+    TracePathView,
 )
 from code_atlas.server.web.services import (
     ArchitectureViewService,
     EntityNotFoundError,
+    ImpactViewService,
     MapViewService,
     ProjectNotIndexedError,
     ProjectViewService,
@@ -155,3 +158,68 @@ class MapController(Controller):
     ) -> ModuleMap:
         """The map as JSON — this is what the canvas fetches and renders."""
         return await map_service.map(include_external=external)
+
+
+class ImpactController(Controller):
+    """ "What breaks if I change this", and "how do these two connect"."""
+
+    path = "/impact"
+
+    @get("/", name="impact")
+    async def impact(
+        self,
+        impact_service: NamedDependency[ImpactViewService],
+        uid: FromQuery[str] = "",
+        direction: FromQuery[str] = "callers",
+        depth: FromQuery[int] = 3,
+        resolved_only: FromQuery[bool] = False,
+        to: FromQuery[str] = "",
+    ) -> Template:
+        """One page for both questions — a path is the natural follow-up to an impact list."""
+        if not uid:
+            return Template("impact.html", context={"blast": None, "trace": None})
+
+        safe_direction, safe_depth = _impact_params(direction, depth)
+        blast = await impact_service.blast(
+            uid, direction=safe_direction, max_depth=safe_depth, resolved_only=resolved_only
+        )
+        trace = await impact_service.trace(uid, to) if to else None
+        return Template(
+            "impact.html",
+            context={"blast": blast, "trace": trace, "resolved_only": resolved_only, "to": to},
+        )
+
+    @get("/api/blast", name="api_blast")
+    async def api_blast(
+        self,
+        impact_service: NamedDependency[ImpactViewService],
+        uid: FromQuery[str],
+        direction: FromQuery[str] = "callers",
+        depth: FromQuery[int] = 3,
+        resolved_only: FromQuery[bool] = False,
+    ) -> BlastRadiusView:
+        safe_direction, safe_depth = _impact_params(direction, depth)
+        return await impact_service.blast(
+            uid, direction=safe_direction, max_depth=safe_depth, resolved_only=resolved_only
+        )
+
+    @get("/api/trace", name="api_trace")
+    async def api_trace(
+        self,
+        impact_service: NamedDependency[ImpactViewService],
+        uid: FromQuery[str],
+        to: FromQuery[str],
+        depth: FromQuery[int] = 6,
+    ) -> TracePathView:
+        return await impact_service.trace(uid, to, max_depth=max(1, min(depth, 10)))
+
+
+def _impact_params(direction: str, depth: int) -> tuple[str, int]:
+    """Clamp the query string to what the traversal will accept.
+
+    Bounded at the edge rather than deeper in: an unbounded depth on a dense graph is a
+    denial of service against the reader's own machine, and the service should not have
+    to defend itself from its own HTTP layer.
+    """
+    safe = direction if direction in {"callers", "callees", "both"} else "callers"
+    return safe, max(1, min(depth, 10))

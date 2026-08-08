@@ -1,0 +1,118 @@
+{% extends "base.html" %} {% block title %}Impact — code-atlas{% endblock %} {% block content %}
+<h1>Impact</h1>
+
+<form method="get" action="/impact" class="impact-form">
+  <label>
+    Entity uid
+    <input
+      type="text"
+      name="uid"
+      value="{{ blast.uid if blast else '' }}"
+      placeholder="project:module.name"
+      size="42"
+    />
+  </label>
+  <label>
+    Direction
+    {# Every tag below is written out complete, with the conditional wrapping whole
+       elements rather than sitting inside one. Jinja inside a tag is not parseable as
+       HTML, and a formatter that tries rewrites `direction == option` into
+       `direction="" ="option"` — a silent break. Do not run prettier on this file. #}
+    {% set current = blast.direction if blast else "callers" %}
+    <select name="direction">
+      {% for option in ["callers", "callees", "both"] %}
+        {% if option == current %}
+      <option value="{{ option }}" selected>{{ option }}</option>
+        {% else %}
+      <option value="{{ option }}">{{ option }}</option>
+        {% endif %}
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    Depth
+    <input type="number" name="depth" min="1" max="10" value="{{ blast.max_depth if blast else 3 }}" />
+  </label>
+  <label class="inline">
+    {% if resolved_only %}
+    <input type="checkbox" name="resolved_only" value="true" checked />
+    {% else %}
+    <input type="checkbox" name="resolved_only" value="true" />
+    {% endif %}
+    resolved paths only
+  </label>
+  <label>
+    Path to (optional)
+    <input type="text" name="to" value="{{ to or '' }}" placeholder="second uid" size="32" />
+  </label>
+  <button type="submit">Analyse</button>
+</form>
+
+{% if blast is none %}
+<p class="muted">
+  Enter an entity uid to see what a change to it could reach. Find one via <a href="/search">search</a>.
+</p>
+{% elif not blast.is_found %}
+<p class="caveat"><b>Not found.</b> {{ blast.error }}</p>
+{% else %}
+
+<h2>Blast radius — {{ blast.direction }}</h2>
+
+{# The count is real here: the traversal computes the whole closure and then slices, so unlike a search it genuinely
+knows the total (ATL-111). #}
+<p class="caveat">{{ blast.caveat.note }}</p>
+{% if blast.truncated %}
+<p class="caveat">Showing {{ blast.shown }} of {{ blast.considered }} examined. {{ blast.remedy }}</p>
+{% endif %} {% for group in blast.groups %}
+<h3>{{ group.depth }} hop{{ "s" if group.depth != 1 }} away — {{ group.entities | length }}</h3>
+<table class="impact">
+  <tr>
+    <th>Entity</th>
+    <th>Reached by</th>
+    <th>Evidence</th>
+    <th>File</th>
+  </tr>
+  {% for entity in group.entities %}
+  <tr>
+    <td><a href="/entity/{{ entity.uid }}">{{ entity.qualified_name or entity.name }}</a></td>
+    {# `via` is the whole point: a REFERENCES dependent must never read as a caller (ADR-0029). #}
+    <td>
+      {% for edge in entity.via %}<code class="via">{{ edge }}</code>{% endfor %} {% if not entity.is_call %}
+      <span class="muted">not a call</span>{% endif %}
+    </td>
+    <td>
+      {% if entity.ambiguous_only %}<span class="guess" title="No fully-resolved path reaches this">guessed path</span>
+      {% else %}<span class="muted">resolved</span>{% endif %} {% if entity.test_only %}
+      <span class="muted">test-only</span>{% endif %}
+    </td>
+    <td class="muted">{{ entity.file_path }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">Nothing reaches this entity within depth {{ blast.max_depth }}.</p>
+{% endfor %} {% endif %} {% if trace %}
+<h2>Path</h2>
+{% if trace.error %}
+<p class="caveat">{{ trace.error }}</p>
+{% elif not trace.found %}
+<p class="muted">{{ trace.message }}</p>
+{% else %}
+<p class="muted">
+  {{ trace.hop_count }} hop{{ "s" if trace.hop_count != 1 }}{% if trace.path_weight is not none %}, path weight {{
+  trace.path_weight }}{% endif %}. {% if trace.has_guessed_hop %}
+  <b>One or more hops is a guess</b> — the path is only as trustworthy as its weakest hop. {% endif %}
+</p>
+<ol class="hops">
+  {% for hop in trace.hops %}
+  <li>
+    <code>{{ hop.from_name }}</code> <code class="via">{{ hop.edge_type }}</code> <code>{{ hop.to_name }}</code> {% if
+    hop.at_line %}<span class="muted">line {{ hop.at_line }}</span>{% endif %} {% if hop.is_guess %}<span class="guess"
+      >{{ hop.confidence }}</span
+    >{% elif hop.strategy %}<span class="muted">{{ hop.strategy }}</span>{% elif hop.is_structural %}<span class="muted"
+      >structural</span
+    >{% endif %} {% if hop.from_test %}<span class="muted">from test</span>{% endif %}
+  </li>
+  {% endfor %}
+</ol>
+{% endif %} {% endif %} {% endblock %}
