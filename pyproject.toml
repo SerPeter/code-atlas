@@ -90,6 +90,11 @@ config = [
     "tree-sitter-toml~=0.7",
     "tree-sitter-xml~=0.7",
 ]
+# The `atlas ui` web interface. Optional because the CLI and MCP server do not need
+# a web stack, and litestar pulls ~7 packages including polyfactory -> faker, which a
+# read-only graph viewer will never use. Chosen anyway for first-class HTMX support
+# and msgspec serialisation of large node payloads (ATL-115).
+ui = ["litestar~=2.24", "jinja2~=3.1"]
 all-languages = ["code-atlas-mcp[typescript,go,rust,java,csharp,cpp,ruby,php,terraform,shell,docker,sql,config]"]
 
 [project.scripts]

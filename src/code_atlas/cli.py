@@ -325,6 +325,53 @@ def dream() -> None:
 
 
 @app.command()
+def ui(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address. Non-loopback exposes the whole graph."),
+    port: int = typer.Option(8420, "--port", "-p", help="Bind port."),
+    project: str = typer.Option("", "--project", help="Project to view. Empty = detect from the working directory."),
+    reload: bool = typer.Option(False, "--reload", help="Enable debug mode and template auto-reload."),
+) -> None:
+    """Start the local web interface for exploring the graph."""
+    asyncio.run(_run_ui(host=host, port=port, project=project, debug=reload))
+
+
+async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
+    """Serve the web UI against the configured backend.
+
+    The `ui` extra is optional, so its absence is reported the way a missing grammar is
+    (ATL-110): name the thing and the command that installs it, never fail obscurely on
+    an ImportError traceback.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        logger.error("The web UI needs the 'ui' extra. Install it with: pip install 'code-atlas-mcp[ui]'")
+        raise typer.Exit(code=1) from None
+
+    from code_atlas.backends import create_graph_client
+    from code_atlas.settings import derive_project_name
+
+    settings = _load_settings()
+    project_name = project or derive_project_name(settings.project_root)
+    graph = await create_graph_client(settings)
+    try:
+        from code_atlas.server.web.app import create_app
+
+        app_instance = create_app(graph, project_name, debug=debug)
+
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            # The UI is unauthenticated and reaches the entire graph. Binding it
+            # outward is a deliberate act and is worth saying out loud once.
+            logger.warning("Binding {} — the UI has no authentication and exposes the whole graph.", host)
+
+        _echo(f"code-atlas UI for '{project_name}' — http://{host}:{port}")
+        config = uvicorn.Config(app_instance, host=host, port=port, log_level="warning")
+        await uvicorn.Server(config).serve()
+    finally:
+        await graph.close()
+
+
+@app.command()
 def mcp(
     transport: str = typer.Option(None, "--transport", "-t", help="Transport: stdio, streamable-http."),
     host: str = typer.Option(None, "--host", help="Bind address for HTTP transports (ignored for stdio)."),

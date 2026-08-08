@@ -43,6 +43,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0030](./0030-candidate-hygiene-is-asymmetric.md)                 | Candidate Hygiene Is Asymmetric                                | Accepted               | 2026-08-05 |
 | [0031](./0031-anonymous-callables-attribute-upward.md)            | Anonymous Callables Attribute Their Calls Upward               | Accepted               | 2026-08-05 |
 | [0032](./0032-a-uid-must-identify-exactly-one-definition.md)      | A uid Must Identify Exactly One Definition                     | Accepted               | 2026-08-06 |
+| [0033](./0033-graph-renderer-must-be-permissively-licensed.md)    | The Graph Renderer Must Be Permissively Licensed               | Accepted               | 2026-08-08 |
 
 ## Creating a New ADR
 
