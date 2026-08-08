@@ -258,3 +258,109 @@ class ModuleMap(msgspec.Struct, frozen=True):
     @property
     def external_count(self) -> int:
         return sum(1 for n in self.nodes if n.is_external)
+
+
+class AffectedEntity(msgspec.Struct, frozen=True):
+    """One entity a change to the target could reach.
+
+    ``via`` is load-bearing. It names the edge types that land on the *target*, so a
+    dependent found through REFERENCES or USES_TYPE is never read as a caller — ADR-0029
+    calls moving that from an omission to real output the only place it was useful, and a
+    rendered list is the easiest place to lose it again.
+    """
+
+    uid: str
+    name: str
+    qualified_name: str
+    label: str
+    file_path: str
+    depth: int
+    via: tuple[str, ...]
+    via_lines: tuple[int, ...] = ()
+    ambiguous_only: bool = False
+    test_only: bool = False
+    confidence_score: float = 1.0
+
+    @property
+    def is_call(self) -> bool:
+        """Whether this really is a caller/callee, rather than some other dependency."""
+        return "CALLS" in self.via
+
+
+class DepthGroup(msgspec.Struct, frozen=True):
+    """Everything reachable in exactly *depth* hops."""
+
+    depth: int
+    entities: tuple[AffectedEntity, ...]
+
+
+class BlastRadiusView(msgspec.Struct, frozen=True):
+    """What a change to one entity could reach.
+
+    ``affected_count`` is the true total from the traversal, not the page size — the
+    analysis computes the whole closure and then slices, so unlike a search this one
+    genuinely knows (ATL-111).
+
+    ``considered`` is what the resolved-only filter was applied over. Filtering a page is
+    not the same as paging a filtered set, and saying which happened is the difference
+    between an honest count and a plausible one.
+    """
+
+    uid: str
+    target_name: str
+    direction: str
+    max_depth: int
+    groups: tuple[DepthGroup, ...]
+    affected_count: int
+    shown: int
+    considered: int
+    resolved_only: bool
+    truncated: bool
+    remedy: str
+    caveat: CoverageCaveat
+    error: str = ""
+
+    @property
+    def is_found(self) -> bool:
+        return not self.error
+
+
+class PathHop(msgspec.Struct, frozen=True):
+    """One edge on a traced path, with the claim behind it."""
+
+    from_uid: str
+    from_name: str
+    to_uid: str
+    to_name: str
+    edge_type: str
+    confidence: str = ""
+    strategy: str = ""
+    weight: float | None = None
+    at_line: int | None = None
+    from_test: bool = False
+
+    @property
+    def is_guess(self) -> bool:
+        return self.confidence == "ambiguous"
+
+    @property
+    def is_structural(self) -> bool:
+        return not self.confidence and not self.strategy
+
+
+class TracePathView(msgspec.Struct, frozen=True):
+    """How two entities connect, hop by hop."""
+
+    from_uid: str
+    to_uid: str
+    found: bool
+    hops: tuple[PathHop, ...] = ()
+    hop_count: int | None = None
+    path_weight: float | None = None
+    message: str = ""
+    error: str = ""
+
+    @property
+    def has_guessed_hop(self) -> bool:
+        """A path is only as trustworthy as its weakest hop."""
+        return any(hop.is_guess for hop in self.hops)

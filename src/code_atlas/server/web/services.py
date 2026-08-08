@@ -22,23 +22,29 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any
 
+from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES
 from code_atlas.server.architecture import analyse
 from code_atlas.server.web.layout import layout_communities, node_size
 from code_atlas.server.web.schemas import (
+    AffectedEntity,
     ArchitectureHealth,
+    BlastRadiusView,
     CommunityRef,
     CoverageCaveat,
     CycleDetail,
+    DepthGroup,
     EdgeEvidence,
     EntityDetail,
     MapEdge,
     MapNode,
     ModuleMap,
+    PathHop,
     ProjectOverview,
     ProjectRef,
     RelatedEntity,
     SearchHit,
     SearchPage,
+    TracePathView,
 )
 
 if TYPE_CHECKING:
@@ -60,6 +66,9 @@ _DSM_LIMIT = 60
 _MAP_NODE_LIMIT = 1500
 _COMMUNITY_MEMBER_LIMIT = 200
 _EXTERNAL_RING = 165.0
+# The page a reader sees, and the ceiling the resolved-only filter runs over.
+_IMPACT_PAGE = 50
+_IMPACT_CEILING = 500
 
 
 class ProjectNotIndexedError(LookupError):
@@ -641,3 +650,185 @@ def _map_caveat(module_count: int, truncated: bool, node_limit: int) -> Coverage
             )
         )
     return CoverageCaveat(note=f"Clustered over {module_count} modules.")
+
+
+class ImpactViewService:
+    """ "What breaks if I change this", and "how do these two connect".
+
+    Both views delegate to :mod:`code_atlas.server.analysis` — the same functions the
+    ``blast_radius`` and ``trace_path`` MCP tools call. Re-implementing either traversal
+    in Cypher here would let the UI and the tool drift apart on the same question, and the
+    UI would be the one nobody notices was wrong.
+    """
+
+    def __init__(self, graph: GraphBackend, project: str, *, test_patterns: tuple[str, ...] = ()) -> None:
+        self._graph = graph
+        self._project = project
+        self._test_patterns = test_patterns
+
+    async def blast(
+        self,
+        uid: str,
+        *,
+        direction: str = "callers",
+        max_depth: int = 3,
+        limit: int = _IMPACT_PAGE,
+        resolved_only: bool = False,
+    ) -> BlastRadiusView:
+        """The dependency closure around *uid*, grouped by distance.
+
+        Per ADR-0029 this traverses dependency edges only — DEFINES and CONTAINS are
+        excluded, because counting containment makes "what does changing this method
+        affect" mean nothing.
+        """
+        from code_atlas.server.analysis import blast_radius  # noqa: PLC0415
+
+        # Fetched at the view's own ceiling rather than at `limit`, so the resolved-only
+        # filter runs over the whole considered set instead of over one page. Filtering a
+        # page and paging a filtered set give different answers, and the second is the one
+        # a reader assumes they are looking at.
+        result = await blast_radius(
+            self._graph,
+            uid,
+            direction=direction,
+            max_depth=max_depth,
+            edge_types=_DEFAULT_BLAST_EDGE_TYPES,
+            limit=_IMPACT_CEILING,
+            test_patterns=self._test_patterns,
+        )
+        if result.get("error"):
+            return _blast_error(uid, direction, max_depth, str(result["error"]))
+
+        considered = [_as_affected(row) for row in result.get("affected", [])]
+        kept = [e for e in considered if not e.ambiguous_only] if resolved_only else considered
+        page = kept[:limit]
+
+        return BlastRadiusView(
+            uid=uid,
+            target_name=_target_name(uid),
+            direction=direction,
+            max_depth=max_depth,
+            groups=_group_by_depth(page),
+            affected_count=int(result.get("affected_count") or 0),
+            shown=len(page),
+            considered=len(considered),
+            resolved_only=resolved_only,
+            truncated=len(page) < len(kept),
+            remedy="Raise the limit, lower the depth, or narrow the direction.",
+            caveat=_impact_caveat(result, considered, resolved_only),
+        )
+
+    async def trace(self, from_uid: str, to_uid: str, *, max_depth: int = 6) -> TracePathView:
+        """The shortest path between two entities, hop by hop."""
+        from code_atlas.server.analysis import trace_path  # noqa: PLC0415
+
+        result = await trace_path(self._graph, from_uid, to_uid, max_depth=max_depth)
+        if result.get("error"):
+            return TracePathView(from_uid=from_uid, to_uid=to_uid, found=False, error=str(result["error"]))
+        if not result.get("found"):
+            return TracePathView(
+                from_uid=from_uid,
+                to_uid=to_uid,
+                found=False,
+                message=str(result.get("message") or f"No path within {max_depth} hops."),
+            )
+
+        return TracePathView(
+            from_uid=from_uid,
+            to_uid=to_uid,
+            found=True,
+            hops=tuple(_as_hop(hop) for hop in result.get("hops", [])),
+            hop_count=result.get("hop_count"),
+            path_weight=result.get("path_weight"),
+        )
+
+
+def _as_affected(row: dict[str, Any]) -> AffectedEntity:
+    return AffectedEntity(
+        uid=str(row.get("uid") or ""),
+        name=str(row.get("name") or ""),
+        qualified_name=str(row.get("qualified_name") or ""),
+        label=str(row.get("label") or ""),
+        file_path=str(row.get("file_path") or ""),
+        depth=int(row.get("min_depth") or 0),
+        via=tuple(str(v) for v in (row.get("via") or []) if v),
+        via_lines=tuple(int(v) for v in (row.get("via_lines") or []) if isinstance(v, int)),
+        ambiguous_only=bool(row.get("ambiguous_only", False)),
+        test_only=bool(row.get("test_only", False)),
+        confidence_score=float(row.get("confidence_score", 1.0) or 0.0),
+    )
+
+
+def _as_hop(hop: dict[str, Any]) -> PathHop:
+    source = hop.get("from") or {}
+    target = hop.get("to") or {}
+    return PathHop(
+        from_uid=str(source.get("uid") or ""),
+        from_name=str(source.get("name") or ""),
+        to_uid=str(target.get("uid") or ""),
+        to_name=str(target.get("name") or ""),
+        edge_type=str(hop.get("edge_type") or ""),
+        confidence=str(hop.get("confidence") or ""),
+        strategy=str(hop.get("strategy") or ""),
+        weight=_as_float(hop.get("weight")),
+        at_line=_as_int(hop.get("at_line")),
+        from_test=bool(hop.get("from_test", False)),
+    )
+
+
+def _group_by_depth(entities: list[AffectedEntity]) -> tuple[DepthGroup, ...]:
+    """Nearest first. Distance is the strongest signal of how likely a break is."""
+    by_depth: dict[int, list[AffectedEntity]] = {}
+    for entity in entities:
+        by_depth.setdefault(entity.depth, []).append(entity)
+    return tuple(DepthGroup(depth=d, entities=tuple(by_depth[d])) for d in sorted(by_depth))
+
+
+def _target_name(uid: str) -> str:
+    """A readable name for the analysed entity.
+
+    The traversal never returns the target itself, so there is nothing to read a real
+    name from — the uid's own tail is the honest fallback rather than a second lookup.
+    """
+    return uid.rsplit(":", 1)[-1] or uid
+
+
+def _blast_error(uid: str, direction: str, max_depth: int, error: str) -> BlastRadiusView:
+    return BlastRadiusView(
+        uid=uid,
+        target_name=uid.rsplit(":", 1)[-1] or uid,
+        direction=direction,
+        max_depth=max_depth,
+        groups=(),
+        affected_count=0,
+        shown=0,
+        considered=0,
+        resolved_only=False,
+        truncated=False,
+        remedy="",
+        caveat=CoverageCaveat(note=error),
+        error=error,
+    )
+
+
+def _impact_caveat(result: dict[str, Any], considered: list[AffectedEntity], resolved_only: bool) -> CoverageCaveat:
+    """Say what the closure did and did not cover.
+
+    ``ambiguous_only`` is a heuristic, not a guarantee — an edge type carrying no
+    confidence property always counts as not-resolved — so a filtered list must not read
+    as a verified one.
+    """
+    total = int(result.get("affected_count") or 0)
+    if not total:
+        return CoverageCaveat(note="Nothing depends on this entity within the traversed depth.")
+
+    parts = [f"{total} affected within depth {result.get('max_depth')}."]
+    if len(considered) < total:
+        parts.append(f"The nearest {len(considered)} were examined.")
+    if resolved_only:
+        dropped = sum(1 for e in considered if e.ambiguous_only)
+        parts.append(
+            f"{dropped} reached only by a guessed path are hidden — that flag is a heuristic, "
+            "so treat what remains as better-evidenced, not verified."
+        )
+    return CoverageCaveat(note=" ".join(parts))
