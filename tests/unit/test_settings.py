@@ -284,3 +284,82 @@ class TestExtraVaultsUniqueness:
         )
 
         assert len(settings.extra_vaults) == 2
+
+
+# ---------------------------------------------------------------------------
+# Section strictness (ATL-111)
+# ---------------------------------------------------------------------------
+
+
+class TestEverySectionRejectsUnknownKeys:
+    """A typo inside a section used to vanish without a word.
+
+    The root model has always been ``extra="forbid"``, but a nested ``BaseModel``
+    defaults to ``ignore``. Measured before the fix::
+
+        ScopeSettings(include_paths=[...], exclude_patterns=[...])
+        -> {'paths': [], 'include': None, 'exclude': None}
+
+    Someone scoping indexing to three services would have indexed the whole monorepo and
+    been told nothing.
+    """
+
+    @staticmethod
+    def _sections() -> dict[str, type]:
+        """Every nested section model reachable from AtlasSettings.
+
+        Discovered from the model rather than listed by hand: a hand-written list is
+        exactly what a newly-added section would not appear in, and the whole point is
+        that the *next* section is strict too.
+        """
+        from pydantic import BaseModel
+
+        from code_atlas.settings import AtlasSettings
+
+        found: dict[str, type] = {}
+        for name, field in AtlasSettings.model_fields.items():
+            annotation = field.annotation
+            if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                found[name] = annotation
+        return found
+
+    def test_the_discovery_actually_finds_the_sections(self):
+        """Guard the guard: an empty mapping would make every assertion below vacuous."""
+        sections = self._sections()
+
+        assert len(sections) >= 15, f"only found {sorted(sections)}"
+        assert "scope" in sections
+        assert "search" in sections
+
+    def test_no_section_silently_accepts_an_unknown_key(self):
+        from pydantic import ValidationError
+
+        accepting = []
+        for name, model in self._sections().items():
+            try:
+                model(definitely_not_a_real_setting_xyz=1)
+            except ValidationError:
+                continue
+            except Exception:
+                # A section whose constructor fails for another reason is still strict
+                # about extras; only silent acceptance is the defect.
+                continue
+            accepting.append(name)
+
+        assert not accepting, f"these sections ignore unknown keys: {accepting}"
+
+    def test_the_original_scope_typo_is_now_an_error(self):
+        """The exact call that silently produced an empty scope."""
+        import pytest
+        from pydantic import ValidationError
+
+        from code_atlas.settings import ScopeSettings
+
+        with pytest.raises(ValidationError):
+            ScopeSettings(include_paths=["a"], exclude_patterns=["b"])  # ty: ignore[unknown-argument]
+
+    def test_a_correct_key_still_works(self):
+        """Strictness must not break the fields that do exist."""
+        from code_atlas.settings import ScopeSettings
+
+        assert ScopeSettings(paths=["services/a"]).paths == ["services/a"]
