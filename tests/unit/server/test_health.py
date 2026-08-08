@@ -150,18 +150,40 @@ async def test_check_memgraph_none():
     assert "No client" in result.message
 
 
-async def test_check_memgraph_names_sqlite_backend_when_active(tmp_path):
-    """Health-check honesty: a SqliteGraphClient must be reported as SQLite, never Memgraph."""
+async def test_check_memgraph_warns_when_the_sqlite_fallback_is_active(tmp_path):
+    """A fully-degraded install must not report an unqualified OK (ATL-112).
+
+    This assertion was inverted until ATL-112: it required `status == OK`, which pinned
+    the defect as the contract. `backend.graph = "auto"` falls back to SQLite whenever
+    Memgraph is unreachable, so on a machine without Docker running this is the *default*
+    outcome — and ADR-0015 calls SQLite explicitly not a parity replacement. WARN keeps
+    `report.ok` True (the tool still works) while flipping `report.degraded`, which is
+    exactly what the distinction is for.
+    """
     from code_atlas.backends.sqlite_graph import SqliteGraphClient
 
     graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
     mg_settings = MemgraphSettings()
 
     result = await check_memgraph(graph, mg_settings)
-    assert result.status == CheckStatus.OK
+    assert result.status == CheckStatus.WARN
     assert "SQLite" in result.message
-    assert "Memgraph" not in result.message
+    assert "NOT Memgraph" in result.message, "it must say which engine it is *not*"
+    assert result.suggestion, "a warning without a remedy is just noise"
     await graph.close()
+
+
+async def test_a_healthy_memgraph_check_stays_a_plain_ok(tmp_path):
+    """The warning must not fire for the supported configuration."""
+
+    class _Memgraph:
+        async def ping(self) -> bool:
+            return True
+
+    result = await check_memgraph(_Memgraph(), MemgraphSettings())  # ty: ignore[invalid-argument-type]
+
+    assert result.status == CheckStatus.OK
+    assert "Memgraph" in result.message
 
 
 # ---------------------------------------------------------------------------
@@ -255,17 +277,24 @@ async def test_check_valkey_none():
     assert "No client" in result.message
 
 
-async def test_check_valkey_names_sqlite_backend_when_active(tmp_path):
-    """Health-check honesty: a SqliteEventBus must be reported as SQLite, never Valkey."""
+async def test_check_valkey_warns_when_the_sqlite_fallback_is_active(tmp_path):
+    """The embedded queue must not report an unqualified OK either (ATL-112).
+
+    Inverted for the same reason as the memgraph check: ADR-0015 calls the embedded path
+    "not a parity replacement for the Memgraph+Valkey path", and names a concrete gap —
+    blocking reads are emulated by short polling, because SQLite has no server-side
+    blocking. `atlas health` printed a green tick for a fallback nobody chose.
+    """
     from code_atlas.backends.sqlite_queue import SqliteEventBus
 
     bus = SqliteEventBus(tmp_path / "queue.sqlite3")
     redis_settings = RedisSettings()
 
     result = await check_valkey(bus, redis_settings)
-    assert result.status == CheckStatus.OK
+    assert result.status == CheckStatus.WARN
     assert "SQLite" in result.message
-    assert "Valkey" not in result.message
+    assert "NOT Valkey" in result.message
+    assert result.suggestion
     await bus.close()
 
 

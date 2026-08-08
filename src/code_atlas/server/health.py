@@ -93,10 +93,27 @@ async def check_memgraph(
             name, CheckStatus.FAIL, f"No client ({addr})", suggestion="Check Memgraph connection settings."
         )
 
-    backend = "SQLite (embedded)" if isinstance(graph, SqliteGraphClient) else f"Memgraph ({addr})"
+    embedded = isinstance(graph, SqliteGraphClient)
+    backend = "SQLite (embedded)" if embedded else f"Memgraph ({addr})"
 
     try:
         ok = await asyncio.wait_for(graph.ping(), timeout=_CHECK_TIMEOUT)
+        if ok and embedded:
+            # WARN, not OK. `backend.graph = "auto"` falls back here whenever Memgraph is
+            # unreachable, so this is the *default* outcome on a machine without Docker
+            # running — and ADR-0015 calls SQLite explicitly not a parity replacement.
+            # Reporting an unqualified OK meant a fully-degraded install looked healthy,
+            # which is the one thing a health check must never do.
+            return CheckResult(
+                name,
+                CheckStatus.WARN,
+                f"Connected — {backend}, NOT Memgraph",
+                detail=(
+                    "The embedded fallback is active. Community detection is unavailable and "
+                    "some analyses differ from Memgraph; see the README."
+                ),
+                suggestion=f"Start Memgraph ({addr}) with: docker compose up -d memgraph",
+            )
         if ok:
             return CheckResult(name, CheckStatus.OK, f"Connected — {backend}")
         return CheckResult(
@@ -208,6 +225,20 @@ async def check_valkey(
     )
     try:
         ok = await asyncio.wait_for(bus.ping(), timeout=_CHECK_TIMEOUT)
+        if ok and is_sqlite:
+            # Same reasoning as check_memgraph: ADR-0015 calls the embedded path "not a
+            # parity replacement for the Memgraph+Valkey path", and names a concrete gap
+            # — blocking reads are emulated by short polling, since SQLite has no
+            # server-side blocking. The queue works, so this stays WARN rather than FAIL,
+            # but a plain OK would let a fallback nobody chose read as the supported
+            # configuration.
+            return CheckResult(
+                name,
+                CheckStatus.WARN,
+                f"Connected — {backend}, NOT Valkey",
+                detail="Blocking reads are emulated by polling; throughput is lower than the Valkey path.",
+                suggestion=f"Start Valkey ({addr}) with: docker compose up -d valkey",
+            )
         if ok:
             return CheckResult(name, CheckStatus.OK, f"Connected — {backend}")
         return CheckResult(

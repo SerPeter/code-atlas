@@ -31,6 +31,14 @@ Three search types, one system:
 
 All powered by [Memgraph](https://memgraph.com/) as a single backend.
 
+> **Which backend am I actually on?** `backend.graph` defaults to `"auto"`, which uses Memgraph when it
+> is reachable and silently falls back to an embedded SQLite engine when it is not — so **on a machine
+> without Docker running, SQLite is what you get**. It is a fallback, not a parity replacement
+> ([ADR-0015](wiki/adr/0015-embedded-backend-option.md)): community detection (`find_communities`,
+> and the map in `atlas ui`) is unavailable there, and some analyses differ. `health_check` reports a
+> **warning** rather than an OK while it is active, and `index_status` carries a `backend` field. Set
+> `backend.graph = "memgraph"` in `atlas.toml` to fail loudly instead of falling back.
+
 ## Key Features
 
 - **Monorepo-native** — auto-detects sub-projects, tracks cross-project dependencies, scoped queries
