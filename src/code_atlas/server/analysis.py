@@ -1283,6 +1283,94 @@ async def _fetch_community_inputs(
     return modules, call_edges
 
 
+async def fetch_first_hop_external(graph: GraphBackend, project: str) -> list[dict[str, Any]]:
+    """Modules in *other* indexed projects that this project's modules import.
+
+    First hop only. The map's default scope is one project plus its immediate
+    neighbours; following the dependency chain outward turns a readable picture into the
+    whole graph, which is the "show everything" toggle rather than the default.
+
+    Mirrors ``get_module_import_edges``'s direct and indirect shapes — an IMPORTS edge
+    lands on a Module or on the individual symbol a Module DEFINES — so a cross-project
+    dependency is not missed just because it named a function rather than a package.
+    """
+    params: dict[str, Any] = {"project": project}
+    direct = await graph.execute(
+        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(m2:Module) "
+        "WHERE m2.project_name <> $project AND m2.project_name IS NOT NULL "
+        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod, "
+        "m2.project_name AS to_project",
+        params,
+    )
+    indirect = await graph.execute(
+        "MATCH (m1:Module {project_name: $project})-[:IMPORTS]->(e)<-[:DEFINES]-(m2:Module) "
+        "WHERE NOT e:Module AND m2.project_name <> $project AND m2.project_name IS NOT NULL "
+        "RETURN m1.qualified_name AS from_mod, m2.qualified_name AS to_mod, "
+        "m2.project_name AS to_project",
+        params,
+    )
+    return [*direct, *indirect]
+
+
+@dataclass(frozen=True)
+class ModuleGraph:
+    """The weighted, undirected module graph and its community partition.
+
+    Shared rather than private because two callers need the *same* clustering:
+    ``find_communities`` reports it, and the web map view draws it. Rebuilding the graph
+    in the view would let the picture drift from the tool's answer for the same project,
+    which is the one divergence the UI must not have.
+
+    ``edges`` is keyed by :func:`_undirected_key`, so a pair appears once with its
+    summed weight (CALLS weight per ADR-0017, plus import counts).
+    """
+
+    modules: dict[str, dict[str, Any]]
+    edges: dict[tuple[str, str], float]
+    partition: list[list[str]]
+
+
+async def build_module_graph(
+    graph: GraphBackend, project: str, path: str, *, test_patterns: tuple[str, ...] = ()
+) -> ModuleGraph:
+    """Aggregate the callable-level graph up to modules and cluster it.
+
+    Module granularity is the point, not a simplification: at callable granularity the
+    CALLS+IMPORTS subgraph puts ~95% of production code in one community at every usable
+    resolution — see :func:`_analyze_communities` for why no resolution parameter fixes
+    that.
+    """
+    module_rows, call_rows = await _fetch_community_inputs(graph, project, path)
+
+    if test_patterns:
+        patterns = list(test_patterns)
+        module_rows = [r for r in module_rows if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
+
+    modules_by_qn = {r["qn"]: r for r in module_rows if r["qn"]}
+    qn_by_path = {r["file_path"]: r["qn"] for r in module_rows if r["file_path"] and r["qn"]}
+
+    edges: dict[tuple[str, str], float] = {}
+    for row in call_rows:
+        from_qn = qn_by_path.get(row["from_path"])
+        to_qn = qn_by_path.get(row["to_path"])
+        if from_qn is None or to_qn is None or from_qn == to_qn:
+            continue
+        key = _undirected_key(from_qn, to_qn)
+        edges[key] = edges.get(key, 0.0) + float(row["weight"])
+
+    import_records = await graph.get_module_import_edges(project, path)
+    import_pairs = _module_imports_from_records(import_records["direct"], import_records["indirect"])
+    for (from_mod, to_mod), count in import_pairs.items():
+        if from_mod == to_mod or from_mod not in modules_by_qn or to_mod not in modules_by_qn:
+            continue
+        key = _undirected_key(from_mod, to_mod)
+        edges[key] = edges.get(key, 0.0) + float(count)
+
+    partition = _detect_module_communities(set(modules_by_qn), edges)
+    partition.sort(key=lambda group: (-len(group), group[0] if group else ""))
+    return ModuleGraph(modules=modules_by_qn, edges=edges, partition=partition)
+
+
 async def _analyze_communities(
     graph: GraphBackend, project: str, path: str, limit: int, test_patterns: tuple[str, ...] = ()
 ) -> dict[str, Any]:
@@ -1367,34 +1455,8 @@ async def _analyze_communities(
         }
 
     t0 = time.monotonic()
-    module_rows, call_rows = await _fetch_community_inputs(graph, project, path)
-
-    if test_patterns:
-        patterns = list(test_patterns)
-        module_rows = [r for r in module_rows if not matches_test_pattern(r["file_path"] or "", r["name"], patterns)]
-
-    modules_by_qn = {r["qn"]: r for r in module_rows if r["qn"]}
-    qn_by_path = {r["file_path"]: r["qn"] for r in module_rows if r["file_path"] and r["qn"]}
-
-    edges: dict[tuple[str, str], float] = {}
-    for row in call_rows:
-        from_qn = qn_by_path.get(row["from_path"])
-        to_qn = qn_by_path.get(row["to_path"])
-        if from_qn is None or to_qn is None or from_qn == to_qn:
-            continue
-        key = _undirected_key(from_qn, to_qn)
-        edges[key] = edges.get(key, 0.0) + float(row["weight"])
-
-    import_records = await graph.get_module_import_edges(project, path)
-    import_pairs = _module_imports_from_records(import_records["direct"], import_records["indirect"])
-    for (from_mod, to_mod), count in import_pairs.items():
-        if from_mod == to_mod or from_mod not in modules_by_qn or to_mod not in modules_by_qn:
-            continue
-        key = _undirected_key(from_mod, to_mod)
-        edges[key] = edges.get(key, 0.0) + float(count)
-
-    partition = _detect_module_communities(set(modules_by_qn), edges)
-    partition.sort(key=lambda group: (-len(group), group[0] if group else ""))
+    module_graph = await build_module_graph(graph, project, path, test_patterns=test_patterns)
+    modules_by_qn, edges, partition = module_graph.modules, module_graph.edges, module_graph.partition
 
     sized: list[dict[str, Any]] = [
         {

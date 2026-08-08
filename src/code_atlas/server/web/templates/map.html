@@ -1,0 +1,38 @@
+{% extends "base.html" %} {% block title %}Map — code-atlas{% endblock %} {% block subtitle %}{{ map.project }}{%
+endblock %} {% block content %}
+<h1>Community map</h1>
+
+{% if not map.is_available %} {# Not an error page: the backend cannot cluster, and a partial map would still look
+complete. #}
+<p class="caveat"><b>Map unavailable.</b> {{ map.unavailable }}</p>
+{% elif not map.nodes %}
+<p class="caveat">{{ map.caveat.note }}</p>
+{% else %}
+<p class="caveat">{{ map.caveat.note }}</p>
+
+<p class="muted">
+  {{ map.nodes | length }} modules in {{ map.communities | length }} subsystems, modularity
+  <b>{{ map.modularity }}</b>. Edge thickness is the stored dependency weight, so a thick edge is well-evidenced rather
+  than merely frequent. {% if map.external_count %} {{ map.external_count }} first-hop modules from other projects sit
+  on the outer ring, greyed and prefixed with ↗. {% endif %}
+</p>
+
+<div id="map-canvas" class="map-canvas" role="img" aria-label="Module dependency map grouped by subsystem"></div>
+<p class="muted" id="map-status">Loading the graph…</p>
+
+<h2>Subsystems</h2>
+<ul class="communities">
+  {% for community in map.communities %}
+  <li>
+    <button type="button" class="community-focus" data-community="{{ community.id }}">
+      <b>{{ community.label }}</b> — {{ community.size }} modules
+    </button>
+    <div class="community-members muted">{{ community.members | join(", ") }}</div>
+  </li>
+  {% endfor %}
+</ul>
+
+<script src="/static/vendor/graphology-0.26.0.umd.min.js"></script>
+<script src="/static/vendor/sigma-3.0.3.min.js"></script>
+<script src="/static/map.js"></script>
+{% endif %} {% endblock %}

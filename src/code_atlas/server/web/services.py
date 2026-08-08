@@ -19,15 +19,21 @@ buys a shared number at the cost of depending on that analysis's entire output s
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import math
+from typing import TYPE_CHECKING, Any
 
 from code_atlas.server.architecture import analyse
+from code_atlas.server.web.layout import layout_communities, node_size
 from code_atlas.server.web.schemas import (
     ArchitectureHealth,
+    CommunityRef,
     CoverageCaveat,
     CycleDetail,
     EdgeEvidence,
     EntityDetail,
+    MapEdge,
+    MapNode,
+    ModuleMap,
     ProjectOverview,
     ProjectRef,
     RelatedEntity,
@@ -40,6 +46,7 @@ if TYPE_CHECKING:
 
     from code_atlas.graph.protocol import GraphBackend
     from code_atlas.search.engine import CompactNode, EmbedOne, SearchResult
+    from code_atlas.server.analysis import ModuleGraph
     from code_atlas.server.architecture import Cycle
     from code_atlas.settings import SearchSettings
 
@@ -49,6 +56,10 @@ _STRUCTURE_LIMIT = 20
 _ENTITY_LIMIT = 200
 _EDGE_LIMIT = 500
 _DSM_LIMIT = 60
+# Sigma renders far more than this comfortably; the bound is readability, not WebGL.
+_MAP_NODE_LIMIT = 1500
+_COMMUNITY_MEMBER_LIMIT = 200
+_EXTERNAL_RING = 165.0
 
 
 class ProjectNotIndexedError(LookupError):
@@ -393,3 +404,240 @@ def _architecture_caveat(module_count: int) -> CoverageCaveat:
             "incomplete makes this a lower bound, not a ceiling."
         )
     )
+
+
+class MapViewService:
+    """The "how is this codebase organised" view.
+
+    Clusters modules into subsystems and draws them. Module granularity is not a
+    simplification for the sake of the picture — at callable granularity the
+    CALLS+IMPORTS subgraph puts ~95% of production code in one community at every usable
+    resolution (see ``_analyze_communities``), so an entity-level map would be a hairball
+    that also happened to be wrong.
+
+    The clustering comes from :func:`build_module_graph`, the same code path
+    ``find_communities`` uses, so the map and the MCP tool cannot disagree about the same
+    project.
+    """
+
+    def __init__(self, graph: GraphBackend, project: str, *, test_patterns: tuple[str, ...] = ()) -> None:
+        self._graph = graph
+        self._project = project
+        self._test_patterns = test_patterns
+
+    async def map(self, *, node_limit: int = _MAP_NODE_LIMIT, include_external: bool = True) -> ModuleMap:
+        """Modules, their dependencies, and the subsystems they fall into."""
+        from code_atlas.server.analysis import (  # noqa: PLC0415
+            build_module_graph,
+            fetch_first_hop_external,
+        )
+
+        unavailable = self._unsupported_reason()
+        if unavailable:
+            return _empty_map(self._project, unavailable)
+
+        module_graph = await build_module_graph(self._graph, self._project, "", test_patterns=self._test_patterns)
+        if not module_graph.modules:
+            return _empty_map(self._project, "", caveat=CoverageCaveat(note="No modules indexed for this project."))
+
+        community_of = {qn: idx for idx, group in enumerate(module_graph.partition) for qn in group}
+        kept = _largest_first(module_graph.partition, node_limit)
+        truncated = len(kept) < len(module_graph.modules)
+
+        external_rows = await fetch_first_hop_external(self._graph, self._project) if include_external else []
+        external = _external_nodes(external_rows, kept)
+
+        positions = layout_communities([[qn for qn in group if qn in kept] for group in module_graph.partition])
+        positions.update(_external_positions(external))
+
+        degree = _degree_by_module(module_graph.edges, kept)
+        nodes = tuple(
+            MapNode(
+                id=qn,
+                label=str(module_graph.modules[qn].get("name") or qn.rsplit(".", 1)[-1]),
+                community=community_of.get(qn, -1),
+                size=node_size(degree.get(qn, 0)),
+                x=positions.get(qn, (0.0, 0.0))[0],
+                y=positions.get(qn, (0.0, 0.0))[1],
+                project=self._project,
+            )
+            for qn in sorted(kept)
+        ) + tuple(
+            MapNode(
+                id=qn,
+                label=qn.rsplit(".", 1)[-1],
+                community=-1,
+                size=node_size(1),
+                x=positions.get(qn, (0.0, 0.0))[0],
+                y=positions.get(qn, (0.0, 0.0))[1],
+                project=owner,
+                is_external=True,
+            )
+            for qn, owner in sorted(external.items())
+        )
+
+        edges = _map_edges(module_graph.edges, kept, community_of) + _external_edges(external_rows, kept, external)
+
+        communities = tuple(
+            CommunityRef(
+                id=idx,
+                size=len(group),
+                label=_community_label(group),
+                members=tuple(sorted(group)[:_COMMUNITY_MEMBER_LIMIT]),
+            )
+            for idx, group in enumerate(module_graph.partition)
+            if len(group) >= 2
+        )
+
+        return ModuleMap(
+            project=self._project,
+            nodes=nodes,
+            edges=edges,
+            communities=communities,
+            modularity=_modularity_of(module_graph),
+            truncated=truncated,
+            caveat=_map_caveat(len(module_graph.modules), truncated, node_limit),
+        )
+
+    def _unsupported_reason(self) -> str:
+        """Why this backend cannot produce the map, or empty if it can.
+
+        Checked before any query rather than caught after one: the failure on SQLite is a
+        missing capability, not a runtime error, and a half-drawn map is worse than none
+        because a map with modules silently missing still looks complete.
+        """
+        from code_atlas.backends.sqlite_graph import SqliteGraphClient  # noqa: PLC0415
+
+        if isinstance(self._graph, SqliteGraphClient):
+            return (
+                "Community detection is not available on the SQLite backend — the module inventory "
+                "and module-pair CALLS aggregation it clusters are still raw Cypher reads. "
+                "Run against Memgraph to see the map."
+            )
+        return ""
+
+
+def _modularity_of(module_graph: ModuleGraph) -> float:
+    """Partition quality, from the same function ``find_communities`` reports."""
+    from code_atlas.server.analysis import _modularity  # noqa: PLC0415
+
+    return round(_modularity(module_graph.partition, module_graph.edges), 4)
+
+
+def _empty_map(project: str, unavailable: str, *, caveat: CoverageCaveat | None = None) -> ModuleMap:
+    return ModuleMap(
+        project=project,
+        nodes=(),
+        edges=(),
+        communities=(),
+        modularity=0.0,
+        truncated=False,
+        caveat=caveat or CoverageCaveat(note=unavailable),
+        unavailable=unavailable,
+    )
+
+
+def _largest_first(partition: list[list[str]], node_limit: int) -> set[str]:
+    """The modules that fit, taking whole communities largest-first.
+
+    Truncating by community rather than by module keeps every drawn subsystem complete.
+    Slicing a flat list would cut communities in half and show a subsystem missing the
+    modules that explain it — a picture that is not merely partial but actively
+    misleading, because the gap is invisible.
+    """
+    kept: set[str] = set()
+    for group in partition:
+        if len(kept) + len(group) > node_limit:
+            continue
+        kept.update(group)
+    return kept
+
+
+def _degree_by_module(edges: dict[tuple[str, str], float], kept: set[str]) -> dict[str, int]:
+    degree: dict[str, int] = {}
+    for a, b in edges:
+        if a in kept and b in kept:
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+    return degree
+
+
+def _map_edges(
+    edges: dict[tuple[str, str], float], kept: set[str], community_of: dict[str, int]
+) -> tuple[MapEdge, ...]:
+    return tuple(
+        MapEdge(
+            source=a,
+            target=b,
+            weight=round(weight, 4),
+            crosses_community=community_of.get(a, -1) != community_of.get(b, -2),
+        )
+        for (a, b), weight in sorted(edges.items())
+        if a in kept and b in kept
+    )
+
+
+def _external_nodes(rows: list[dict[str, Any]], kept: set[str]) -> dict[str, str]:
+    """``module_qn -> owning project`` for first-hop modules outside this project."""
+    found: dict[str, str] = {}
+    for row in rows:
+        source = str(row.get("from_mod") or "")
+        target = str(row.get("to_mod") or "")
+        owner = str(row.get("to_project") or "")
+        if source in kept and target and owner:
+            found[target] = owner
+    return found
+
+
+def _external_edges(rows: list[dict[str, Any]], kept: set[str], external: dict[str, str]) -> tuple[MapEdge, ...]:
+    """Edges reaching out of the project, deduplicated per pair.
+
+    Weight is fixed at 1.0 rather than summed: these come from IMPORTS, which carries no
+    ADR-0017 weight, and inventing one would make a cross-project edge look better
+    evidenced than a call edge that actually was measured.
+    """
+    pairs = {
+        (str(row.get("from_mod") or ""), str(row.get("to_mod") or ""))
+        for row in rows
+        if str(row.get("from_mod") or "") in kept and str(row.get("to_mod") or "") in external
+    }
+    return tuple(MapEdge(source=a, target=b, weight=1.0, crosses_community=True) for a, b in sorted(pairs))
+
+
+def _external_positions(external: dict[str, str]) -> dict[str, tuple[float, float]]:
+    """Park external modules on an outer ring, clear of the project's own clusters."""
+    if not external:
+        return {}
+    step = 2 * math.pi / len(external)
+    return {
+        qn: (_EXTERNAL_RING * math.cos(i * step), _EXTERNAL_RING * math.sin(i * step))
+        for i, qn in enumerate(sorted(external))
+    }
+
+
+def _community_label(group: list[str]) -> str:
+    """Name a subsystem by the longest package prefix its modules share.
+
+    A generated name beats an integer id — "community 3" tells a reader nothing they can
+    act on. Falls back to the first member when the modules share no prefix at all.
+    """
+    if not group:
+        return "empty"
+    parts = [qn.split(".") for qn in sorted(group)]
+    shared: list[str] = []
+    for segments in zip(*parts, strict=False):
+        if len(set(segments)) != 1:
+            break
+        shared.append(segments[0])
+    return ".".join(shared) if shared else sorted(group)[0]
+
+
+def _map_caveat(module_count: int, truncated: bool, node_limit: int) -> CoverageCaveat:
+    if truncated:
+        return CoverageCaveat(
+            note=(
+                f"{module_count} modules indexed; showing the largest communities that fit within "
+                f"{node_limit} nodes. Communities are kept whole, so the cut falls between subsystems."
+            )
+        )
+    return CoverageCaveat(note=f"Clustered over {module_count} modules.")

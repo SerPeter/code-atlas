@@ -94,6 +94,33 @@
       .dsm .dsm-cycle {
         background: #c0574a;
       }
+      .map-canvas {
+        width: 100%;
+        height: 60vh;
+        min-height: 420px;
+        border: 1px solid var(--line);
+        margin: 0.75rem 0;
+      }
+      ul.communities {
+        list-style: none;
+        padding: 0;
+      }
+      ul.communities li {
+        margin-bottom: 0.6rem;
+      }
+      .community-focus {
+        background: none;
+        border: 0;
+        padding: 0;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+        text-decoration: underline dotted;
+      }
+      .community-members {
+        font-size: 0.85em;
+        word-break: break-word;
+      }
       details.cycle {
         border-left: 3px solid #c0574a;
         padding: 0.35rem 0 0.35rem 0.75rem;
@@ -122,6 +149,7 @@
       <b>code-atlas</b>
       <a href="/">overview</a>
       <a href="/search">search</a>
+      <a href="/map">map</a>
       <a href="/architecture">architecture</a>
       <span class="muted">{% block subtitle %}{% endblock %}</span>
     </header>

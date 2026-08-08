@@ -191,3 +191,70 @@ class ArchitectureHealth(msgspec.Struct, frozen=True):
     @property
     def core_pct(self) -> str:
         return f"{self.core_size * 100:.1f}%"
+
+
+class MapNode(msgspec.Struct, frozen=True):
+    """One module on the map.
+
+    ``x``/``y`` are computed server-side. The client runs no force simulation on first
+    paint — a layout that settles in the browser makes the same graph look different on
+    every reload, which destroys the one thing a map is for: recognising it again.
+    """
+
+    id: str
+    label: str
+    community: int
+    size: float
+    x: float
+    y: float
+    project: str
+    is_external: bool = False
+
+
+class MapEdge(msgspec.Struct, frozen=True):
+    """A weighted module-to-module dependency.
+
+    ``weight`` is the stored edge weight (ADR-0017: ``1 / candidate_count``, halved when
+    unverified, quartered when test-origin), summed over the pair. Thickness therefore
+    tracks how well-evidenced a dependency is, not merely how often it appears.
+    """
+
+    source: str
+    target: str
+    weight: float
+    crosses_community: bool = False
+
+
+class CommunityRef(msgspec.Struct, frozen=True):
+    """A detected subsystem — id, size, and the modules in it."""
+
+    id: int
+    size: int
+    label: str
+    members: tuple[str, ...]
+
+
+class ModuleMap(msgspec.Struct, frozen=True):
+    """The map view model.
+
+    ``unavailable`` is not an error string: community detection needs MAGE, which the
+    SQLite backend does not have. Rendering a partial map there would be worse than
+    rendering none, because a map with modules silently missing still looks complete.
+    """
+
+    project: str
+    nodes: tuple[MapNode, ...]
+    edges: tuple[MapEdge, ...]
+    communities: tuple[CommunityRef, ...]
+    modularity: float
+    truncated: bool
+    caveat: CoverageCaveat
+    unavailable: str = ""
+
+    @property
+    def is_available(self) -> bool:
+        return not self.unavailable
+
+    @property
+    def external_count(self) -> int:
+        return sum(1 for n in self.nodes if n.is_external)
