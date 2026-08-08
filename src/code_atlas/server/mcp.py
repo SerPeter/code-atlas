@@ -513,6 +513,26 @@ def _parse_rel_types(rel_types: str, default: tuple[str, ...]) -> tuple[tuple[st
     return parsed, None
 
 
+def _unverified_staleness(result: dict[str, Any], stale_mode: str) -> dict[str, Any]:
+    """What to answer when freshness could not be established within the timeout.
+
+    ``lock`` fails CLOSED. That mode exists precisely to refuse answers from a stale
+    index, so serving one because the check timed out defeats the setting the user
+    chose — the one place where carrying on is the wrong default (ATL-111).
+
+    ``warn`` still answers, but says the check did not run. Returning the envelope
+    untouched was the bug: an absent ``stale`` key is indistinguishable from a verified
+    fresh one to anything looking for it.
+    """
+    if stale_mode == "lock":
+        return _error(
+            "Could not verify index freshness within 5s, and stale_mode is 'lock'. "
+            "Re-run, or set [index] stale_mode = 'warn' to accept unverified results.",
+            code="STALE_UNKNOWN",
+        )
+    return {**result, "stale": None, "stale_check": "timed_out"}
+
+
 async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str = "") -> dict[str, Any]:
     """Annotate a query result envelope with staleness info.
 
@@ -545,8 +565,8 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
             timeout=5.0,
         )
     except TimeoutError, QueryTimeoutError:
-        logger.warning("Staleness check timed out — skipping annotation")
-        return result
+        logger.warning("Staleness check timed out")
+        return _unverified_staleness(result, stale_mode)
 
     if stale_mode == "lock" and info.stale:
         msg = "Index is stale"
