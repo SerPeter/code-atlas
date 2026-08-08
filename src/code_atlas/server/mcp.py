@@ -68,6 +68,7 @@ from code_atlas.server.analysis import (
     _DEFAULT_BLAST_EDGE_TYPES,
     _DEFAULT_TRACE_EDGE_TYPES,
     _padded_limit,
+    more_available_notice,
     truncation_notice,
 )
 from code_atlas.server.analysis import analyze_repo as _analyze_repo
@@ -438,20 +439,34 @@ def _result(
     limit: int,
     query_ms: float,
     total: int | None = None,
+    has_more: bool = False,
     remedy: str = "raise `limit` (max 100), or narrow the query",
 ) -> dict[str, Any]:
     """Consistent result envelope.
 
-    ``truncated`` is ``False`` when nothing was cut and a
-    ``{shown, total, cut, remedy}`` payload when something was — see
-    ``analysis.truncation_notice``. Callers that cannot know *total* leave it
-    ``None`` and get ``False``, which is the pre-existing behaviour: claiming
-    completeness we have not established is the one thing this must not do.
+    Three states, and the third exists because conflating it with the first is how
+    the truncation contract came to lie (ATL-111):
+
+    * *total* known, nothing cut — ``truncated: False``.
+    * *total* known, rows cut — ``{shown, total, cut, remedy}``.
+    * *total* unknown but rows were cut — pass ``has_more=True`` and get
+      ``{shown, total: None, cut: None, has_more: True, remedy}``. A caller reading
+      ``cut`` sees "unknown" rather than a number that cannot be right.
+
+    Leaving both ``total`` and ``has_more`` unset still yields ``False``, which is
+    correct only where the caller genuinely knows nothing was withheld — a user-written
+    Cypher LIMIT, or a list built from a bounded set. It is not a default to reach for.
     """
+    if total is not None:
+        truncated: Any = truncation_notice(min(limit, total), total, remedy)
+    elif has_more:
+        truncated = more_available_notice(len(records), remedy)
+    else:
+        truncated = False
     return {
         "results": records,
         "count": len(records),
-        "truncated": False if total is None else truncation_notice(min(limit, total), total, remedy),
+        "truncated": truncated,
         "query_ms": round(query_ms, 1),
     }
 
@@ -814,7 +829,9 @@ def create_mcp_server(  # noqa: PLR0915
             "Use schema_info for Cypher examples, validate_cypher to check queries before running them. "
             "Call get_usage_guide('guidelines') for tips on structuring code for better search results. "
             "A result's `truncated` is false when nothing was withheld, otherwise an object carrying "
-            "{shown, total, cut, remedy} — read `cut` before concluding a short list is a complete one."
+            "{shown, total, cut, remedy} — read `cut` before concluding a short list is a complete one. "
+            "The search tools cannot count matches they did not fetch, so there `total` and `cut` are "
+            "null with `has_more: true`: more exist, quantity unknown. Treat null as unknown, not zero."
         ),
         host=host,
         port=port,
@@ -1129,12 +1146,14 @@ def _register_search_tools(mcp: FastMCP) -> None:
         all_results = filter_raw_records(all_results, app.settings.search)
         elapsed = (time.monotonic() - t0) * 1000
 
-        total = len(all_results)
+        # Fetched `page_end * 3 + 1` to survive post-filtering, so a full page means
+        # "at least one more", never a total (ATL-111).
+        has_more = len(all_results) > page_end
         all_results = all_results[offset:page_end]
         compacted = [_compact_node(r, detail=detail) for r in all_results]
         await _enrich_with_calls(app.graph, compacted, detail=detail)
         return await _with_staleness(
-            app, _result(compacted, limit=page_end, query_ms=elapsed, total=total), scope=resolved_scope
+            app, _result(compacted, limit=page_end, query_ms=elapsed, has_more=has_more), scope=resolved_scope
         )
 
     @mcp.tool(
@@ -1209,12 +1228,14 @@ def _register_search_tools(mcp: FastMCP) -> None:
         all_results = filter_raw_records(all_results, app.settings.search)
         elapsed = (time.monotonic() - t0) * 1000
 
-        total = len(all_results)
+        # Fetched `page_end * 3 + 1` to survive post-filtering, so a full page means
+        # "at least one more", never a total (ATL-111).
+        has_more = len(all_results) > page_end
         all_results = all_results[offset:page_end]
         compacted = [_compact_node(r, detail=detail) for r in all_results]
         await _enrich_with_calls(app.graph, compacted, detail=detail)
         return await _with_staleness(
-            app, _result(compacted, limit=page_end, query_ms=elapsed, total=total), scope=resolved_scope
+            app, _result(compacted, limit=page_end, query_ms=elapsed, has_more=has_more), scope=resolved_scope
         )
 
 
@@ -1397,7 +1418,10 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
             return _error(str(exc), code="QUERY_TIMEOUT")
         elapsed = (time.monotonic() - t0) * 1000
 
-        total = len(results)
+        # `limit=page_end + 1` above buys exactly one fact: whether a further row
+        # exists. It is not a count, and reporting it as one made `cut` incapable of
+        # exceeding 1 on a repo with thousands of matches (ATL-111).
+        has_more = len(results) > page_end
         results = results[offset:page_end]
 
         serialized = []
@@ -1430,7 +1454,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
 
         await _enrich_with_calls(app.graph, serialized, detail=detail)
         return await _with_staleness(
-            app, _result(serialized, limit=page_end, query_ms=elapsed, total=total), scope=scope
+            app, _result(serialized, limit=page_end, query_ms=elapsed, has_more=has_more), scope=scope
         )
 
 
