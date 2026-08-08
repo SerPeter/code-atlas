@@ -50,12 +50,12 @@ class FakeGraph:
             if projects is not None
             else [
                 {
-                    "project": "demo",
-                    "entities": 42,
-                    "indexed_at": "2026-08-08T00:00:00Z",
+                    "name": "demo",
+                    "entity_count": 42,
+                    "last_indexed_at": "2026-08-08T00:00:00Z",
                     "git_hash": "abc123def456789",
                 },
-                {"project": "other", "entities": 7},
+                {"name": "other", "entity_count": 7},
             ]
         )
         # `kind` is required, not optional: _analyze_structure reads r["kind"] directly.
@@ -70,9 +70,12 @@ class FakeGraph:
         )
 
     async def get_project_status(self, project_name: str | None = None) -> list[dict[str, Any]]:
-        # Both shapes at once: the overview reads the row directly, the snapshot loader
-        # reads it under "n" the way the real backends return it.
-        return [{**p, "n": p} for p in self._projects]
+        # `[{"n": <node>}]` with the node's OWN property names — what both backends really
+        # return. An earlier version of this fake flattened the row and renamed the keys
+        # to `project`/`entities`/`indexed_at`, none of which exist on a Project node. The
+        # service read those names, matched nothing, and 404'd every real install as "not
+        # indexed" — while every test here passed.
+        return [{"n": p} for p in self._projects]
 
     async def get_structure_overview(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
         return {"counts": self._counts, "largest_modules": [], "packages": []}
@@ -188,15 +191,49 @@ class TestProjectViewService:
             await _service(FakeGraph(), "never-indexed").overview()
 
     async def test_an_indexed_but_empty_project_carries_a_caveat(self):
-        graph = FakeGraph(projects=[{"project": "demo", "entities": 0}], counts=[])
+        graph = FakeGraph(projects=[{"name": "demo", "entity_count": 0}], counts=[])
         overview = await _service(graph, "demo").overview()
 
         assert overview.entity_count == 0
         assert not overview.caveat.is_complete, "an empty index must say so, not render as a clean zero"
 
+    async def test_the_index_time_is_rendered_for_a_human(self):
+        """`last_indexed_at` is written as time.time(), so it arrives as a float.
+
+        str() put `1786176798.014237` on the landing page — technically the data, and no
+        answer at all to "when was this indexed". Only running the real server showed it.
+        """
+        graph = FakeGraph(projects=[{"name": "demo", "entity_count": 1, "last_indexed_at": 1786176798.014237}])
+
+        overview = await _service(graph, "demo").overview()
+
+        assert overview.indexed_at is not None
+        assert overview.indexed_at.startswith("2026-")
+        assert "1786176798" not in overview.indexed_at
+
+    async def test_an_iso_string_index_time_passes_through(self):
+        """Older rows and the SQLite path may already hold a string."""
+        graph = FakeGraph(projects=[{"name": "demo", "entity_count": 1, "last_indexed_at": "2026-08-08T00:00:00Z"}])
+
+        overview = await _service(graph, "demo").overview()
+
+        assert overview.indexed_at == "2026-08-08T00:00:00Z"
+
+    async def test_the_real_backend_row_shape_is_understood(self):
+        """Both backends return `[{"n": <node>}]` with the node's own property names.
+
+        The service read `project`/`entities`/`indexed_at`, which no Project node carries,
+        so it matched nothing and 404'd every real install as "not indexed" — while every
+        test here passed against a fake that invented the flattened shape.
+        """
+        overview = await _service(FakeGraph(), "demo").overview()
+
+        assert overview.project == "demo"
+        assert overview.entity_count == 42
+
     async def test_absent_metadata_stays_absent(self):
         """Empty string and None both mean "not recorded" and must not render as data."""
-        graph = FakeGraph(projects=[{"project": "demo", "entities": 1, "indexed_at": "", "git_hash": None}])
+        graph = FakeGraph(projects=[{"name": "demo", "entity_count": 1, "last_indexed_at": "", "git_hash": None}])
         overview = await _service(graph, "demo").overview()
 
         assert overview.indexed_at is None
