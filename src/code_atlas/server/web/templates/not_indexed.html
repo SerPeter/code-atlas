@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Not indexed — code-atlas{% endblock %}
+{% block content %}
+  <h1>No index for “{{ project }}”</h1>
+  <p>
+    This project has no graph data. That is different from an empty project — run
+    <code>atlas index</code> and reload.
+  </p>
+{% endblock %}
