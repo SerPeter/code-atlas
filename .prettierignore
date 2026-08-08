@@ -3,3 +3,12 @@ target/
 dist/
 *.min.js
 .venv/
+
+# Jinja templates. Prettier parses the inside of an HTML tag as attributes, so a
+# comparison like `{% if a == b %}` placed there is rewritten to `a="" ="b"` — valid
+# Jinja, wrong semantics, and silent. It mangled impact.html exactly this way once.
+src/code_atlas/server/web/templates/
+
+# Vendored third-party bundles: their SHA-512 is recorded in PROVENANCE.md, so any
+# reformat invalidates the provenance claim.
+src/code_atlas/server/web/static/vendor/
