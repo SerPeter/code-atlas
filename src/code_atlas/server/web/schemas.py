@@ -143,6 +143,22 @@ class EntityDetail(msgspec.Struct, frozen=True):
     caveat: CoverageCaveat
 
 
+class CycleDetail(msgspec.Struct, frozen=True):
+    """One dependency cycle, with the edges that actually close it.
+
+    Members alone are not actionable — "these six modules are tangled" does not say
+    which import to cut. The edges do, so they travel with the cycle rather than being
+    a second lookup the view might skip.
+    """
+
+    members: tuple[str, ...]
+    edges: tuple[tuple[str, str], ...]
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
+
+
 class ArchitectureHealth(msgspec.Struct, frozen=True):
     """The mud report, ready to render.
 
@@ -162,7 +178,7 @@ class ArchitectureHealth(msgspec.Struct, frozen=True):
     core_size: float
     largest_cycle: int
     fan_in_gini: float
-    cycles: tuple[tuple[str, ...], ...]
+    cycles: tuple[CycleDetail, ...]
     dsm_order: tuple[str, ...]
     dsm_marks: tuple[tuple[int, int], ...]
     dsm_truncated: bool

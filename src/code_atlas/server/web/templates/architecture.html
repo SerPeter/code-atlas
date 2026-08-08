@@ -66,9 +66,14 @@ metric over partial extraction must say so. #}
 <p class="muted">No module dependencies to plot.</p>
 {% endif %} {% if health.cycles %}
 <h2>Cycles</h2>
-<ul>
-  {% for cycle in health.cycles %}
-  <li>{{ cycle | length }} modules — <span class="muted">{{ cycle | join(" → ") }}</span></li>
-  {% endfor %}
-</ul>
-{% endif %} {% endblock %}
+<p class="muted">Every edge listed is part of a loop, so every one is a candidate for the cut that breaks it.</p>
+{% for cycle in health.cycles %}
+<details class="cycle">
+  <summary><b>{{ cycle.size }} modules</b> — {{ cycle.members | join(", ") }}</summary>
+  <ul class="cycle-edges">
+    {% for src, dst in cycle.edges %}
+    <li><code>{{ src }}</code> → <code>{{ dst }}</code></li>
+    {% endfor %}
+  </ul>
+</details>
+{% endfor %} {% endif %} {% endblock %}

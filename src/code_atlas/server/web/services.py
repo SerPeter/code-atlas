@@ -25,6 +25,7 @@ from code_atlas.server.architecture import analyse
 from code_atlas.server.web.schemas import (
     ArchitectureHealth,
     CoverageCaveat,
+    CycleDetail,
     EdgeEvidence,
     EntityDetail,
     ProjectOverview,
@@ -35,8 +36,11 @@ from code_atlas.server.web.schemas import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from code_atlas.graph.protocol import GraphBackend
     from code_atlas.search.engine import CompactNode, EmbedOne, SearchResult
+    from code_atlas.server.architecture import Cycle
     from code_atlas.settings import SearchSettings
 
 # Label tallies are whole-project aggregates; the limit only bounds the ranked lists
@@ -334,7 +338,11 @@ class ArchitectureViewService:
 
         shown = metrics.order[:dsm_limit]
         position = {name: i for i, name in enumerate(shown)}
-        marks = tuple((position[src], position[dst]) for src, dst in edges if src in position and dst in position)
+        # Deduplicated: a repeated import between the same module pair is one mark, and
+        # counting it twice would make the matrix look denser than the graph is.
+        marks = tuple(
+            sorted({(position[src], position[dst]) for src, dst in edges if src in position and dst in position})
+        )
 
         return ArchitectureHealth(
             project=self._project,
@@ -344,12 +352,28 @@ class ArchitectureViewService:
             core_size=metrics.core_size,
             largest_cycle=metrics.largest_cycle,
             fan_in_gini=metrics.fan_in_gini,
-            cycles=tuple(c.members for c in metrics.cycles[:10]),
+            cycles=_cycle_details(metrics.cycles[:10], edges),
             dsm_order=shown,
             dsm_marks=marks,
             dsm_truncated=len(metrics.order) > len(shown),
             caveat=_architecture_caveat(metrics.module_count),
         )
+
+
+def _cycle_details(cycles: Sequence[Cycle], edges: Sequence[tuple[str, str]]) -> tuple[CycleDetail, ...]:
+    """Attach to each cycle the edges that close it.
+
+    A cycle's edges are exactly those with both endpoints inside it — every one is part
+    of some loop, so every one is a candidate for the cut that breaks it. Listing the
+    members alone would say a subsystem is tangled without saying which import to remove,
+    which is the only thing a reader can act on.
+    """
+    details: list[CycleDetail] = []
+    for cycle in cycles:
+        members = set(cycle.members)
+        internal = sorted({(src, dst) for src, dst in edges if src in members and dst in members})
+        details.append(CycleDetail(members=cycle.members, edges=tuple(internal)))
+    return tuple(details)
 
 
 def _architecture_caveat(module_count: int) -> CoverageCaveat:
