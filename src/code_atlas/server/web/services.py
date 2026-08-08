@@ -21,7 +21,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from code_atlas.server.architecture import analyse
 from code_atlas.server.web.schemas import (
+    ArchitectureHealth,
     CoverageCaveat,
     EdgeEvidence,
     EntityDetail,
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
 _STRUCTURE_LIMIT = 20
 _ENTITY_LIMIT = 200
 _EDGE_LIMIT = 500
+_DSM_LIMIT = 60
 
 
 class ProjectNotIndexedError(LookupError):
@@ -299,3 +302,70 @@ def _as_float(value: object) -> float | None:
 
 def _as_int(value: object) -> int | None:
     return int(value) if isinstance(value, int) else None
+
+
+class ArchitectureViewService:
+    """The "is this becoming a big ball of mud" view.
+
+    Deliberately not a node-link graph: a force-directed blob looks like a hairball at
+    every level of health, so it cannot answer whether things are getting worse. A design
+    structure matrix can, because a clean architecture and a rotten one produce
+    categorically different pictures.
+
+    All arithmetic lives in :mod:`code_atlas.server.architecture` as pure functions over
+    an edge list, so the numbers are checkable against hand-worked graphs rather than
+    only against a live database.
+    """
+
+    def __init__(self, graph: GraphBackend, project: str) -> None:
+        self._graph = graph
+        self._project = project
+
+    async def health(self, *, dsm_limit: int = _DSM_LIMIT) -> ArchitectureHealth:
+        raw = await self._graph.get_module_import_edges(self._project, "")
+        edges = [
+            (str(r.get("from_mod", "")), str(r.get("to_mod", "")))
+            for r in raw.get("direct", [])
+            if r.get("from_mod") and r.get("to_mod")
+        ]
+        nodes = sorted({n for edge in edges for n in edge})
+
+        metrics = analyse(nodes, edges)
+
+        shown = metrics.order[:dsm_limit]
+        position = {name: i for i, name in enumerate(shown)}
+        marks = tuple((position[src], position[dst]) for src, dst in edges if src in position and dst in position)
+
+        return ArchitectureHealth(
+            project=self._project,
+            module_count=metrics.module_count,
+            edge_count=metrics.edge_count,
+            propagation_cost=metrics.propagation_cost,
+            core_size=metrics.core_size,
+            largest_cycle=metrics.largest_cycle,
+            fan_in_gini=metrics.fan_in_gini,
+            cycles=tuple(c.members for c in metrics.cycles[:10]),
+            dsm_order=shown,
+            dsm_marks=marks,
+            dsm_truncated=len(metrics.order) > len(shown),
+            caveat=_architecture_caveat(metrics.module_count),
+        )
+
+
+def _architecture_caveat(module_count: int) -> CoverageCaveat:
+    """What these numbers do not cover.
+
+    Propagation cost over a graph whose C++ named-function capture sits at 0.690
+    (ATL-096) is a LOWER BOUND, and "8% - you are fine" over partial extraction is
+    exactly the confident wrong answer this project keeps removing. The per-language
+    coverage data is recorded per index run but not yet persisted to the graph, so this
+    states the honest general case until it is.
+    """
+    if module_count == 0:
+        return CoverageCaveat(note="No module dependencies indexed - nothing to measure.")
+    return CoverageCaveat(
+        note=(
+            f"Computed over {module_count} modules. Any language whose extraction is "
+            "incomplete makes this a lower bound, not a ceiling."
+        )
+    )

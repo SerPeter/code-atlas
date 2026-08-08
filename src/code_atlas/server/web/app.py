@@ -15,8 +15,13 @@ from litestar.di import Provide
 from litestar.static_files import create_static_files_router
 from litestar.template.config import TemplateConfig
 
-from code_atlas.server.web.controllers import HealthController, ProjectController, SearchController
-from code_atlas.server.web.services import ProjectViewService, SearchViewService
+from code_atlas.server.web.controllers import (
+    ArchitectureController,
+    HealthController,
+    ProjectController,
+    SearchController,
+)
+from code_atlas.server.web.services import ArchitectureViewService, ProjectViewService, SearchViewService
 
 if TYPE_CHECKING:
     from code_atlas.graph.protocol import GraphBackend
@@ -43,7 +48,7 @@ def create_app(
     against a fake backend, which is why the service layer depends on the
     ``GraphBackend`` protocol and not on ``GraphClient``.
     """
-    from litestar.contrib.jinja import JinjaTemplateEngine  # noqa: PLC0415
+    from litestar.plugins.jinja import JinjaTemplateEngine  # noqa: PLC0415
 
     from code_atlas.settings import SearchSettings as _SearchSettings  # noqa: PLC0415
 
@@ -57,12 +62,16 @@ def create_app(
     async def provide_search_service() -> SearchViewService:
         return SearchViewService(graph, project, search_settings=search_settings, embed=embed)
 
+    async def provide_architecture_service() -> ArchitectureViewService:
+        return ArchitectureViewService(graph, project)
+
     template_config: TemplateConfig[Any] = TemplateConfig(directory=TEMPLATES_DIR, engine=JinjaTemplateEngine)
 
     return Litestar(
         route_handlers=[
             ProjectController,
             SearchController,
+            ArchitectureController,
             HealthController,
             # Vendored, never CDN — `atlas ui` must work offline, and the static export
             # (ATL-120) must not reach the network at all. See ADR-0033.
@@ -71,6 +80,7 @@ def create_app(
         dependencies={
             "view_service": Provide(provide_view_service),
             "search_service": Provide(provide_search_service),
+            "architecture_service": Provide(provide_architecture_service),
         },
         # Annotated rather than inlined: `TemplateConfig` is generic in its engine and
         # Litestar's own parameter is `TemplateConfig[EngineType] | None`, so the
