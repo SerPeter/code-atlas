@@ -1,6 +1,18 @@
 {% extends "base.html" %}
 {% block title %}{{ overview.project }} — code-atlas snapshot{% endblock %}
 {% block subtitle %}snapshot{% endblock %}
+{% block stylesheet %}
+{# Inlined, not linked. A linked stylesheet would make the file non-portable — the
+   whole point of the export is that it opens from a filesystem with no server. #}
+<style>{{ design_css }}</style>
+{% endblock %}
+{% block projectswitch %}
+{# Inert in an export: there is no server to switch projects against. #}
+<span class="project-switch">
+  <span class="project-name">{{ overview.project }}</span>
+  <span class="project-meta">snapshot</span>
+</span>
+{% endblock %}
 {% block nav %}
       <a href="#overview">overview</a>
       <a href="#map">map</a>

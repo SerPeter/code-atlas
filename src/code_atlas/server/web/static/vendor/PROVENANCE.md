@@ -49,3 +49,26 @@ of them legibly would not answer the question the map exists for.
 
 `sigma.min.js` is a UMD bundle exposing `Sigma`; graphology is a **peer** dependency, not bundled, so
 `graphology.umd.min.js` must load first and expose `graphology`.
+
+## Archivo (typeface)
+
+Added 2026-08-09 with the Claude Design output for the v1 interface. **SIL Open Font License 1.1** --
+permissive, and the licence text ships beside the files as `archivo.LICENSE.txt`, which OFL requires.
+
+| File | Subset | Source |
+| --- | --- | --- |
+| `archivo-latin.woff2` | latin | https://github.com/Omnibus-Type/Archivo |
+| `archivo-latin-ext.woff2` | latin-ext | (via `@fontsource/archivo@5.3.0`, licence `OFL-1.1`) |
+| `archivo-vietnamese.woff2` | vietnamese | |
+
+80,776 bytes across the three subsets. They are the woff2 builds embedded in the design bundle, extracted
+verbatim -- each begins with the `wOF2` magic number and is byte-identical to what the bundle carried.
+
+Kept as three subsets rather than merged: each `@font-face` declares its own `unicode-range`, so a browser
+downloads only the ranges a page actually uses. Latin-only pages fetch 34KB, not 80KB.
+
+```
+archivo-latin-ext.woff2        sha512-J32KRMxeSVnEjxg+dMPwNYaKqKmPFmbwKbrHesGWWBvQKfu2PgHC1GMC32DUfrfKVqj31Najr3kwSeBads3x8Q==
+archivo-latin.woff2            sha512-1A47GJcwSdmzi16cgyIRY+EDxXzJk5LXYpopNJvfpDii6Rl3qR2C8aS9GXEKNjcOGBD+mPqzPP1ScWLjQftT4g==
+archivo-vietnamese.woff2       sha512-CMh56tILNZFI24qfi4Ulxw72wL1gfL9qv+pS/xTI2W7QKXx8tGfK62I/qST2JLFDmfB/zqDlGLQzZSSoB6eNXw==
+```

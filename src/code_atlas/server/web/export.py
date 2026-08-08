@@ -18,6 +18,7 @@ nowhere, and the map data is embedded rather than fetched.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -95,6 +96,7 @@ class StaticExporter:
                 map_data_json=Markup(_embed_json(module_map)),
                 vendor_js=Markup(_read_assets(_VENDOR_BUNDLES)),
                 map_js=Markup(_read_assets(("map.js",))),
+                design_css=Markup(_inlined_css()),
                 generated_at=stamp.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 indexed_at=overview.indexed_at,
             )
@@ -136,6 +138,25 @@ class StaticExporter:
 def _read_assets(relative: tuple[str, ...]) -> str:
     """Concatenate vendored assets, each isolated in its own IIFE-safe boundary."""
     return "\n;\n".join((STATIC_DIR / name).read_text(encoding="utf-8") for name in relative)
+
+
+def _inlined_css() -> str:
+    """The stylesheet with its font files folded in as data URIs.
+
+    `design.css` points at `/static/vendor/archivo-*.woff2`, which resolves through the
+    server and nowhere else. An export opened from a filesystem would silently fall back
+    to the system font — the page would still render, so nothing would look broken, and
+    the design would simply be gone. Embedding costs ~33% over the raw bytes and removes
+    the failure entirely.
+    """
+    css = (STATIC_DIR / "design.css").read_text(encoding="utf-8")
+    for font in sorted((STATIC_DIR / "vendor").glob("archivo-*.woff2")):
+        encoded = base64.b64encode(font.read_bytes()).decode("ascii")
+        css = css.replace(
+            f'url("/static/vendor/{font.name}")',
+            f'url("data:font/woff2;base64,{encoded}")',
+        )
+    return css
 
 
 def _embed_json(payload: Any) -> str:

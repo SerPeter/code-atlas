@@ -101,8 +101,13 @@ class TestWheelContents:
         vendored = [n for n in names if "server/web/static/vendor/" in n]
         assert any(n.endswith("sigma-3.0.3.min.js") for n in vendored), "the renderer is missing"
         assert any(n.endswith("graphology-0.26.0.umd.min.js") for n in vendored)
-        # MIT requires the notice to travel with the code.
-        assert sum(1 for n in vendored if n.endswith("LICENSE.txt")) == 2
+        assert any(n.endswith(".woff2") for n in vendored), "the typeface is missing"
+
+        # Each licence by name rather than a count: MIT and OFL both require the notice
+        # to travel with the code, and a bare total silently passes if one is swapped
+        # for another. It also broke the moment a third vendored asset arrived.
+        for licence in ("sigma-3.0.3.LICENSE.txt", "graphology-0.26.0.LICENSE.txt", "archivo.LICENSE.txt"):
+            assert any(n.endswith(licence) for n in vendored), f"{licence} does not ship"
 
     def test_the_templates_ship(self, tmp_path: Path) -> None:
         archive = _build("--wheel", tmp_path)
