@@ -16,24 +16,15 @@
   var S = 1000;
   var EW = { structural: 1, resolved: 0.72, guessed: 0.45, unknown: 0.22 };
 
-  // Twelve node kinds, distinguished by silhouette rather than by twelve more
-  // colours — colour is already carrying community. Filled circle = callable,
-  // square = class, diamond = value, tab = documentation, ring = container,
-  // dashed = outside the index.
-  var KIND_COLOR = {
-    module: "var(--atlas-c8)", package: "var(--atlas-c8)",
-    class: "var(--atlas-c5)", function: "var(--atlas-c4)", method: "var(--atlas-c3)",
-    constant: "var(--atlas-c1)", env_var: "var(--atlas-c0)",
-    doc_file: "var(--atlas-c7)", doc_section: "var(--atlas-c7)", knowledge_note: "var(--atlas-c6)",
-    external_package: "var(--atlas-c2)", external_symbol: "var(--atlas-c2)",
-  };
-
+  // Twelve node kinds, distinguished by silhouette; colour carries community at
+  // every level, so shape answers "what is it" and colour answers "where does it
+  // belong" — externals get their own community, which is the boundary itself.
   var KIND_SHAPE = {
     module: "ring", package: "ring", class: "square",
     function: "circle", method: "circle",
     constant: "diamond", env_var: "diamond",
     doc_file: "tab", doc_section: "tab", knowledge_note: "tab",
-    external_package: "outside", external_symbol: "outside",
+    external_package: "outside", external_symbol: "outside", external: "outside",
     test: "dashed", noncode: "solid",
   };
 
@@ -97,6 +88,7 @@
     expandMethods: qs.get("expand") === "1",
     showTests: qs.has("show_tests") ? qs.get("show_tests") === "1" : localStorage.getItem("atlas.showTests") === "1",
     showNoncode: qs.has("show_noncode") ? qs.get("show_noncode") === "1" : localStorage.getItem("atlas.showNoncode") === "1",
+    showExternal: qs.has("show_external") ? qs.get("show_external") === "1" : localStorage.getItem("atlas.showExternal") === "1",
     focus: qs.has("focus") ? parseInt(qs.get("focus"), 10) : -1,
     selected: qs.get("selected") || null,
     // URL wins (a shared link shows what its sender saw); the stored default fills
@@ -105,6 +97,12 @@
     hops: parseInt(pick(qs.get("hops"), localStorage.getItem("atlas.hops"), ["1", "2", "3"], "1"), 10),
     direction: pick(qs.get("direction"), localStorage.getItem("atlas.direction"), ["arrows", "taper", "fade", "flow"], "arrows"),
     hover: null,
+    // Transient rail-hover highlights: a kind id, or a community id.
+    kindHover: null,
+    commHover: -1,
+    // Directories the scope tree shows open. Null until first render, which opens
+    // the path to the current scope.
+    scopeOpen: null,
     legend: false,
     // Display settings start collapsed: what is on the map matters more than how it is drawn.
     open: [],
@@ -140,6 +138,7 @@
     }
     if (state.showTests) p.set("show_tests", "1");
     if (state.showNoncode) p.set("show_noncode", "1");
+    if (state.showExternal && state.level !== "entity") p.set("show_external", "1");
     return "/map/api?" + p.toString();
   }
 
@@ -158,6 +157,7 @@
     }
     if (state.showTests) p.set("show_tests", "1");
     if (state.showNoncode) p.set("show_noncode", "1");
+    if (state.showExternal && state.level !== "entity") p.set("show_external", "1");
     if (state.direction !== "arrows") p.set("direction", state.direction);
     if (state.hops !== 1) p.set("hops", String(state.hops));
     if (state.labels !== "some") p.set("labels", state.labels);
@@ -243,7 +243,6 @@
   }
 
   function nodeColor(n, comms) {
-    if (state.level === "entity") return KIND_COLOR[n.kind] || "var(--atlas-c8)";
     var c = comms[n.community];
     return c ? c.color : "var(--atlas-c8)";
   }
@@ -301,6 +300,71 @@
     renderSidebar();
     renderMain();
     renderContext();
+  }
+
+  // The scope tree: every indexed module arranged by directory, any level
+  // selectable — a directory scopes to everything beneath it, since the server's
+  // module summary is prefix-based.
+  function buildScopeTree() {
+    var root = { dirs: {}, files: [], count: 0 };
+    (D.scope_options || []).forEach(function (o) {
+      var parts = String(o.id).replace(/\\/g, "/").split("/");
+      var node = root;
+      root.count += o.entities || 0;
+      for (var i = 0; i < parts.length - 1; i++) {
+        var dir = parts[i];
+        if (!node.dirs[dir]) node.dirs[dir] = { dirs: {}, files: [], count: 0 };
+        node = node.dirs[dir];
+        node.count += o.entities || 0;
+      }
+      node.files.push({ id: o.id, name: parts[parts.length - 1], count: o.entities || 0 });
+    });
+    return root;
+  }
+
+  function scopeRow(id, name, count, depth, expandable, open) {
+    var on = state.scope === id;
+    return (
+      '<div style="display:flex;align-items:center">' +
+      (expandable
+        ? '<button data-scope-exp="' + esc(id) + '" style="flex:none;width:18px;background:transparent;border:0;cursor:pointer;color:color-mix(in srgb, var(--color-text) 45%, transparent);font:inherit;font-size:10px;padding:0 0 0 ' + (4 + depth * 12) + 'px">' + (open ? "▾" : "▸") + "</button>"
+        : '<span style="flex:none;width:18px;padding-left:' + (4 + depth * 12) + 'px"></span>') +
+      '<button data-scope="' + esc(id) + '" class="hv6" style="display:flex;flex:1;min-width:0;align-items:center;gap:7px;background:' +
+      (on ? "color-mix(in srgb, var(--color-accent) 10%, transparent)" : "transparent") +
+      ';border:0;border-radius:6px;padding:3px 7px;cursor:pointer;color:' + (on ? "var(--color-accent-700)" : "inherit") +
+      ';font:inherit;font-size:12px;text-align:left">' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(name) + "</span>" +
+      '<span style="flex:none;font-size:10.5px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 45%, transparent)">' + fmt(count) + "</span>" +
+      "</button></div>"
+    );
+  }
+
+  function scopeTreeHtml() {
+    if (state.scopeOpen === null) {
+      // First render: open the ancestors of the current scope so it is visible.
+      state.scopeOpen = new Set();
+      var parts = state.scope.replace(/\\/g, "/").split("/");
+      var at = "";
+      for (var i = 0; i < parts.length - 1; i++) {
+        at = at ? at + "/" + parts[i] : parts[i];
+        state.scopeOpen.add(at);
+      }
+    }
+    var tree = buildScopeTree();
+    var out = [scopeRow("", "Whole project", tree.count, 0, false, false)];
+    var walk = function (node, base, depth) {
+      Object.keys(node.dirs).sort().forEach(function (dir) {
+        var path = base ? base + "/" + dir : dir;
+        var open = state.scopeOpen.has(path);
+        out.push(scopeRow(path, dir + "/", node.dirs[dir].count, depth, true, open));
+        if (open) walk(node.dirs[dir], path, depth + 1);
+      });
+      node.files.sort(function (a, b) { return a.name < b.name ? -1 : 1; }).forEach(function (f) {
+        out.push(scopeRow(f.id, f.name, f.count, depth, false, false));
+      });
+    };
+    walk(tree, "", 0);
+    return out.join("");
   }
 
   function toggleHtml(on, extra) {
@@ -388,12 +452,9 @@
       html +=
         '<div style="margin-top:10px">' +
         '<div style="' + LABEL10 + ';margin-bottom:5px">Scope</div>' +
-        '<select class="input" id="scope-select" style="height:30px;min-height:30px;font-size:12px;padding:0 8px">' +
-        '<option value=""' + (state.scope ? "" : " selected") + ">Whole project</option>" +
-        (D.scope_options || []).map(function (o) {
-          return '<option value="' + esc(o.id) + '"' + (o.id === state.scope ? " selected" : "") + ">" + esc(o.label) + "</option>";
-        }).join("") +
-        "</select></div>";
+        '<div style="max-height:230px;overflow-y:auto;border:1px solid var(--color-divider);border-radius:8px;background:var(--color-surface);padding:3px">' +
+        scopeTreeHtml() +
+        "</div></div>";
     }
     html += "</div>";
 
@@ -406,14 +467,23 @@
       // "the most connected" only when something was actually cut — with nothing
       // truncated, what is drawn is everything the filters admit.
       var connectedNote = D.truncated ? " — the most connected." : ".";
+      var extCount = entity
+        ? (D.tally || []).reduce(function (a, t) {
+            return a + (t.id === "external_package" || t.id === "external_symbol" ? t.in_module : 0);
+          }, 0)
+        : D.external_count || 0;
+      var extShown = entity
+        ? !(state.hidden && (state.hidden.has("external_package") || state.hidden.has("external_symbol")))
+        : state.showExternal;
       var unitWord = entity ? "entities" : "modules";
       var unitTotal = entity ? D.in_module + testCount + ncCount : moduleTotal;
-      var hiddenNote = (state.showTests && state.showNoncode)
-        ? "Drawing " + fmt(drawnNodes) + " of " + fmt(unitTotal) + " indexed " + (entity ? "entities" : "files") + connectedNote
-        : "Drawing " + fmt(drawnNodes) + " of " + fmt(unitTotal) + " " + unitWord + connectedNote + " " +
-          (state.showTests ? "" : fmt(testCount) + " test " + unitWord + " ") + (!state.showTests && !state.showNoncode ? "and " : "") +
-          (state.showNoncode ? "" : fmt(ncCount) + " non-code " + unitWord + " ") + "are hidden by the filters above." +
-          (entity && D.collapsed ? " Folded methods and filtered kinds are counted below." : "");
+      var hiddenParts = [];
+      if (!state.showTests && testCount) hiddenParts.push(fmt(testCount) + " test " + unitWord);
+      if (!state.showNoncode && ncCount) hiddenParts.push(fmt(ncCount) + " non-code " + unitWord);
+      if (!extShown && extCount) hiddenParts.push(fmt(extCount) + " external packages");
+      var hiddenNote = "Drawing " + fmt(drawnNodes) + " of " + fmt(unitTotal) + " " + unitWord + connectedNote +
+        (hiddenParts.length ? " " + hiddenParts.join(" and ") + " are hidden by the filters above." : "") +
+        (entity && D.collapsed ? " Folded methods and filtered kinds are counted below." : "");
       html +=
         '<section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">' +
         '<div style="' + LABEL10 + ';margin-bottom:8px">Filters</div>' +
@@ -426,6 +496,11 @@
         toggleHtml(state.showNoncode) +
         '<span style="flex:1">Non-code files</span>' +
         '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + ncCount + (state.showNoncode ? " shown" : " hidden") + "</span>" +
+        "</button>" +
+        '<button data-toggle="external" class="hv6" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:6px 4px;cursor:pointer;color:inherit;font:inherit;font-size:13px;text-align:left">' +
+        toggleHtml(extShown) +
+        '<span style="flex:1">External packages</span>' +
+        '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + fmt(extCount) + (extShown ? " shown" : " hidden") + "</span>" +
         "</button>" +
         '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--color-surface);font-size:11px;line-height:1.45;color:color-mix(in srgb, var(--color-text) 65%, transparent)">' + esc(hiddenNote) + "</div>" +
         "</section>";
@@ -442,23 +517,20 @@
         '<div style="' + LABEL10 + '">Node kinds</div>' +
         '<div style="margin-left:auto;padding-left:10px;white-space:nowrap;flex:none;font-size:11px;color:color-mix(in srgb, var(--color-text) 45%, transparent)">' + tally.length + " of 12 kinds present</div>" +
         "</div>" +
-        '<button data-toggle="expand" class="hv6" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:6px 0;margin-bottom:6px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-align:left">' +
-        toggleHtml(state.expandMethods, "none") +
-        '<span style="flex:1">Expand methods</span>' +
-        '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + methodCount + (state.expandMethods ? " shown" : " folded") + "</span>" +
-        "</button>" +
         tally.map(function (t) {
           var kind = (D.kinds || []).filter(function (k) { return k.id === t.id; })[0] || { label: t.id, shape: "circle" };
           var sw = SHAPE_SWATCH[kind.shape] || SHAPE_SWATCH.circle;
-          var fill = sw.fill === "transparent" ? "transparent" : KIND_COLOR[t.id];
-          var border = sw.border === "0" ? "0" : sw.border.replace("var(--color-text)", KIND_COLOR[t.id]);
-          // The skeleton kinds are not toggleable: containers anchor everything,
-          // classes are the fold target, and methods have their own toggle above.
-          var toggleable = ["module", "package", "class", "method"].indexOf(t.id) < 0;
-          var isHidden = state.hidden && state.hidden.has(t.id);
-          var drawnNote = isHidden ? "hidden"
+          var fill = sw.fill;
+          var border = sw.border;
+          // The skeleton kinds are not toggleable: containers anchor everything
+          // and classes are the fold target. The Method row toggles the fold
+          // itself — one control, not a switch plus a row describing it.
+          var isMethod = t.id === "method";
+          var toggleable = isMethod || ["module", "package", "class"].indexOf(t.id) < 0;
+          var isHidden = !isMethod && state.hidden && state.hidden.has(t.id);
+          var drawnNote = isMethod ? (D.collapsed ? "folded — click to expand" : "expanded")
+            : isHidden ? "hidden"
             : t.drawn === t.in_module ? ""
-            : t.id === "method" && D.collapsed ? "collapsed"
             : t.drawn ? t.drawn + " drawn" : "not drawn";
           var swatch =
             '<span style="width:14px;display:flex;justify-content:center;flex:none">' +
@@ -468,19 +540,22 @@
             '<span style="font-size:10.5px;color:color-mix(in srgb, var(--color-text) 45%, transparent)">' + drawnNote + "</span>" +
             '<span style="font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + fmt(t.in_module) + "</span>";
           if (!toggleable) {
-            return '<div style="display:flex;align-items:center;gap:10px;padding:4px 0;font-size:12px;opacity:' + (t.drawn ? 1 : 0.5) + '">' + swatch + "</div>";
+            return '<div data-kind-row="' + t.id + '" style="display:flex;align-items:center;gap:10px;padding:4px 0;font-size:12px;opacity:' + (t.drawn ? 1 : 0.5) + '">' + swatch + "</div>";
           }
+          var title = isMethod
+            ? (D.collapsed ? "Expand methods out of their classes" : "Fold methods into their classes")
+            : (isHidden ? "Show " : "Hide ") + esc(kind.label.toLowerCase()) + "s";
           return (
-            '<button data-kind-toggle="' + t.id + '" class="hv6" title="' + (isHidden ? "Show" : "Hide") + " " + esc(kind.label.toLowerCase()) + 's" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:4px 0;cursor:pointer;color:inherit;font:inherit;font-size:12px;text-align:left;opacity:' + (isHidden ? 0.5 : 1) + '">' +
+            '<button data-kind-toggle="' + t.id + '" data-kind-row="' + t.id + '" class="hv6" title="' + title + '" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:4px 0;cursor:pointer;color:inherit;font:inherit;font-size:12px;text-align:left;opacity:' + (isHidden ? 0.5 : 1) + '">' +
             swatch + "</button>"
           );
         }).join("") +
-        '<div style="margin-top:8px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Silhouette and colour both carry kind — every entity in one module shares its community, so colour is free here. Dashed means the entity sits outside the index.</div>' +
+        '<div style="margin-top:8px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Silhouette carries kind; colour carries the community of the module that holds the entity. Dashed means it sits outside the index.</div>' +
         "</section>";
     }
 
-    // ── Communities (module level only) ──
-    if (!entity) {
+    // ── Communities — wherever the payload names them ──
+    if ((D.communities || []).length) {
       var CAP = 10, rowH = 28.6;
       var commRows = (D.communities || []).map(function (c) {
         var drawn = drawnCount[c.id] || 0;
@@ -501,7 +576,7 @@
         '<section style="padding:13px 10px 14px;border-bottom:1px solid var(--color-divider)">' +
         '<div style="display:flex;align-items:baseline;padding:0 4px;margin-bottom:7px">' +
         '<div style="' + LABEL10 + '">Communities</div>' +
-        '<div style="margin-left:auto;padding-left:10px;white-space:nowrap;flex:none;font-size:11px;color:color-mix(in srgb, var(--color-text) 45%, transparent)">' + comms.length + " · " + moduleTotal + " modules</div>" +
+        '<div style="margin-left:auto;padding-left:10px;white-space:nowrap;flex:none;font-size:11px;color:color-mix(in srgb, var(--color-text) 45%, transparent)">' + comms.length + " · " + fmt(moduleTotal) + (entity ? " entities" : " modules") + "</div>" +
         "</div>" +
         '<div style="max-height:' + ((D.communities || []).length > CAP ? CAP * rowH + "px" : "none") + ';overflow-y:auto">' +
         commRows.join("") +
@@ -659,6 +734,8 @@
     return { x: r.width / 2, y: r.height / 2 };
   }
 
+  var mainWired = false;
+
   function wireCanvas() {
     var el = canvasEl();
     if (!el) return;
@@ -697,6 +774,11 @@
     el.addEventListener("pointerup", end);
     el.addEventListener("pointercancel", end);
     el.style.cursor = "grab";
+
+    // The remaining listeners live on the container, which is never rebuilt —
+    // registering them per canvas stacked duplicates that cancelled each other.
+    if (mainWired) return;
+    mainWired = true;
 
     els.main.addEventListener("click", function (e) {
       hideMenu();
@@ -877,9 +959,7 @@
     var rCap = Math.max(5, Math.min(14, pitch * 0.28));
     var radius = function (n) { return 2.6 + (rCap - 2.6) * Math.sqrt(n.deg / maxDeg); };
     var edgeColor = function (id) {
-      return state.level === "entity"
-        ? (KIND_COLOR[ids[id] && ids[id].kind] || "var(--atlas-c8)")
-        : nodeColor(ids[id], comms);
+      return nodeColor(ids[id], comms);
     };
     var SX = CW > 0 ? CW / S : 1, SY = CH > 0 ? CH / S : 1;
 
@@ -887,7 +967,7 @@
       var a = pos[e.s], b = pos[e.t];
       if (!a || !b) return null;
       var ev = e.ev || "unknown";
-      var cross = state.level !== "entity" && ids[e.s] && ids[e.t] && ids[e.s].community !== ids[e.t].community;
+      var cross = ids[e.s] && ids[e.t] && ids[e.s].community !== ids[e.t].community;
       return {
         i: i, s: e.s, t: e.t, ev: ev, defines: e.rel === "defines",
         weight: EW[ev] * (0.7 + e.w * 0.1),
@@ -934,7 +1014,7 @@
       // strength — the isolation is the answer, the field is the context.
       density: Math.min(1, Math.sqrt(1200 / Math.max(1, E.length))),
       tight: CW < 420, mode: state.direction, E: E,
-      sel: state.selected, focus: state.level === "entity" ? -1 : state.focus,
+      sel: state.selected, focus: state.focus,
       edgeEls: null, gradEls: null, arrowEls: null, nodeEls: null, ringEls: null,
       labelsHost: null, leadersHost: null,
     };
@@ -1012,18 +1092,26 @@
       ? ((st.ids[e.s].community === st.focus && st.ids[e.t].community === st.focus) ? 1
         : (st.ids[e.s].community === st.focus || st.ids[e.t].community === st.focus) ? 0.45 : 0.05)
       : 1;
+    // A rail hover (kind or community row) lights matching nodes; edges keep
+    // only the links inside the lit set so the membership reads as one shape.
+    var rail = 1;
+    if (state.kindHover) {
+      rail = (st.ids[e.s].kind === state.kindHover && st.ids[e.t].kind === state.kindHover) ? 1 : 0.25;
+    } else if (state.commHover >= 0) {
+      rail = (st.ids[e.s].community === state.commHover && st.ids[e.t].community === state.commHover) ? 1 : 0.25;
+    }
     return {
       onPath: onPath,
       w: e.defines ? 0.5 : ctx.pathing && onPath ? 2.6 : 0.5 + e.weight * 2.4,
       color: ctx.pathing && onPath ? "var(--color-accent)" : e.baseColor,
       dash: e.defines ? "none" : st.mode === "flow" ? "7 5" : e.baseDash,
       o: e.defines
-        ? (ctx.pathing ? 0.04 : 0.1 * rel * fo * st.density)
+        ? (ctx.pathing ? 0.04 : 0.1 * rel * fo * st.density * rail)
         : ctx.pathing
           ? (onPath ? 1 : 0.07)
           : ctx.dimming && ctx.nbr.has(e.s) && ctx.nbr.has(e.t)
-            ? ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo
-            : ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo * st.density,
+            ? ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo * rail
+            : ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo * st.density * rail,
     };
   }
 
@@ -1032,6 +1120,8 @@
     var isHot = isSel || n.id === state.hover;
     var o = 1;
     if (ctx.pathing) o = ctx.path.nodes.has(n.id) ? 1 : 0.1;
+    else if (state.kindHover) o = n.kind === state.kindHover ? 1 : 0.1;
+    else if (state.commHover >= 0) o = n.community === state.commHover ? 1 : 0.1;
     else if (st.focus >= 0 && n.community !== st.focus) o = 0.12;
     else if (ctx.dimming) o = ctx.nbr.has(n.id) ? ctx.hopOpacity(n.id) : 0.13;
     return {
@@ -1360,7 +1450,7 @@
         "</div>";
     }
 
-    if (state.level !== "entity" && state.focus >= 0) {
+    if (state.focus >= 0) {
       var c = comms[state.focus];
       var drawn = (D.nodes || []).some(function (n) { return n.community === state.focus; });
       var focusName = c ? c.name.split(".").slice(-1)[0] : String(state.focus);
@@ -1370,9 +1460,9 @@
         html +=
           '<div style="position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);z-index:21;width:min(420px,80%);background:var(--color-bg);border:1px solid var(--color-divider);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow-md);pointer-events:auto">' +
           '<div style="' + LABEL10 + '">Nothing to show for this community</div>' +
-          '<div style="margin-top:6px;font-size:13px;line-height:1.55">None of ' + esc(c.name) + "'s " + c.count + " modules are among the " +
-          (D.nodes || []).length + " drawn here. The map shows the most connected modules of the " + D.module_total +
-          " indexed; these sit outside that subset — they are indexed, not missing.</div>" +
+          '<div style="margin-top:6px;font-size:13px;line-height:1.55">None of ' + esc(c.name) + "'s " + c.count +
+          " members are among the " + (D.nodes || []).length +
+          " drawn here — hidden by the filters or the fold, not missing from the index.</div>" +
           '<button data-clear-focus class="btn btn-secondary" style="margin-top:11px;height:28px;font-size:12px">Clear focus</button>' +
           "</div>";
       }
@@ -1583,14 +1673,46 @@
       } else if (which === "noncode") {
         localStorage.setItem("atlas.showNoncode", state.showNoncode ? "0" : "1");
         setAndLoad({ showNoncode: !state.showNoncode, selected: null });
+      } else if (which === "external") {
+        if (state.level === "entity") {
+          var hidden2 = new Set(state.hidden || []);
+          if (hidden2.has("external_package") || hidden2.has("external_symbol")) {
+            hidden2.delete("external_package");
+            hidden2.delete("external_symbol");
+          } else {
+            hidden2.add("external_package");
+            hidden2.add("external_symbol");
+          }
+          setAndLoad({ hidden: hidden2, selected: null });
+        } else {
+          localStorage.setItem("atlas.showExternal", state.showExternal ? "0" : "1");
+          setAndLoad({ showExternal: !state.showExternal, selected: null });
+        }
       } else if (which === "expand") {
         setAndLoad({ expandMethods: !state.expandMethods, selected: null });
       }
       return;
     }
+    var scopeExp = e.target.closest("[data-scope-exp]");
+    if (scopeExp) {
+      var dirPath = scopeExp.getAttribute("data-scope-exp");
+      if (state.scopeOpen.has(dirPath)) state.scopeOpen.delete(dirPath);
+      else state.scopeOpen.add(dirPath);
+      renderSidebar();
+      return;
+    }
+    var scopePick = e.target.closest("[data-scope]");
+    if (scopePick) {
+      setAndLoad({ scope: scopePick.getAttribute("data-scope"), selected: null, focus: -1 });
+      return;
+    }
     var kindToggle = e.target.closest("[data-kind-toggle]");
     if (kindToggle) {
       var kindId = kindToggle.getAttribute("data-kind-toggle");
+      if (kindId === "method") {
+        setAndLoad({ expandMethods: !state.expandMethods, selected: null });
+        return;
+      }
       var hidden = new Set(state.hidden || []);
       if (hidden.has(kindId)) hidden.delete(kindId);
       else hidden.add(kindId);
@@ -1622,12 +1744,29 @@
     } else if (t.dataset.labels) {
       localStorage.setItem("atlas.labels", t.dataset.labels);
       setAndRender({ labels: t.dataset.labels });
-    } else if (t.id === "scope-select") {
-      setAndLoad({ scope: t.value, selected: null });
     }
   });
   els.aside.addEventListener("focusin", function (e) {
     if (e.target.id === "rail-search") window.location.href = "/search";
+  });
+  // Hovering a rail row lights its members on the canvas — a preview, not a state.
+  els.aside.addEventListener("mouseover", function (e) {
+    var kindRow = e.target.closest("[data-kind-row]");
+    var commRow = e.target.closest("[data-comm]");
+    var kind = kindRow ? kindRow.getAttribute("data-kind-row") : null;
+    var comm = commRow ? parseInt(commRow.getAttribute("data-comm"), 10) : -1;
+    if (state.kindHover !== kind || state.commHover !== comm) {
+      state.kindHover = kind;
+      state.commHover = comm;
+      restyleHover();
+    }
+  });
+  els.aside.addEventListener("mouseleave", function () {
+    if (state.kindHover !== null || state.commHover >= 0) {
+      state.kindHover = null;
+      state.commHover = -1;
+      restyleHover();
+    }
   });
   els.main.addEventListener("click", function (e) {
     if (e.target.closest("[data-clear-path]")) {

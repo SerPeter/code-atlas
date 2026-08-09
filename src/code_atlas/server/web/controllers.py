@@ -233,6 +233,7 @@ class MapController(Controller):
         expand: FromQuery[bool] = False,
         show_tests: FromQuery[bool] = False,
         show_noncode: FromQuery[bool] = False,
+        show_external: FromQuery[bool] = False,
         hide: FromQuery[str] | None = None,
     ) -> MapPayload:
         """Whichever level was asked for, in the shape map.js renders.
@@ -246,7 +247,12 @@ class MapController(Controller):
             return await map_service.entity_map(
                 module, expand_methods=expand, hidden=hidden, show_tests=show_tests, show_noncode=show_noncode
             )
-        return await map_service.map(show_tests=show_tests, show_noncode=show_noncode, projects=selected_projects)
+        return await map_service.map(
+            show_tests=show_tests,
+            show_noncode=show_noncode,
+            show_external=show_external,
+            projects=selected_projects,
+        )
 
 
 class ImpactController(Controller):
