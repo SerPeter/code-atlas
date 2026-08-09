@@ -51,6 +51,37 @@
         <span data-toggle-slot="showNoncode"></span>
         <span style="flex:1">Show non-code files on the map</span>
       </button>
+
+      <div style="margin-top:12px;font-size:12.5px;font-weight:600">Direction</div>
+      <div id="default-direction" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:7px">
+        {% for id, label, clip in [
+          ("arrows", "Arrows", "polygon(0 42%, 62% 42%, 62% 20%, 100% 50%, 62% 80%, 62% 58%, 0 58%)"),
+          ("taper", "Taper", "polygon(0 12%, 100% 44%, 100% 56%, 0 88%)"),
+          ("fade", "Fade", "polygon(0 40%, 100% 40%, 100% 60%, 0 60%)"),
+          ("flow", "Flow", "polygon(0 40%, 22% 40%, 22% 60%, 0 60%, 34% 40%, 56% 40%, 56% 60%, 34% 60%, 68% 40%, 90% 40%, 90% 60%, 68% 60%)"),
+        ] %}
+        <button data-display-pick="direction" data-value="{{ id }}" class="hv7" style="display:flex;align-items:center;gap:7px;background:transparent;color:var(--color-text);border:1px solid var(--color-divider);border-radius:999px;padding:4px 11px 4px 8px;cursor:pointer;font:inherit;font-size:11.5px">
+          <span style="width:26px;height:10px;display:block;background:color-mix(in srgb, var(--color-text) 60%, transparent);clip-path:{{ clip }};opacity:0.7"></span>
+          <span>{{ label }}</span>
+        </button>
+        {% endfor %}
+      </div>
+
+      <div style="margin-top:12px;font-size:12.5px;font-weight:600">Neighbourhood</div>
+      <div class="seg" id="default-hops" style="width:100%;overflow:hidden;margin-top:7px">
+        {% for h in ["1", "2", "3"] %}
+        <button data-display-pick="hops" data-value="{{ h }}" class="seg-opt" style="flex:1;justify-content:center;background:transparent;border:0;font:inherit;cursor:pointer;color:inherit">{{ h }} hop{{ "s" if h != "1" }}</button>
+        {% endfor %}
+      </div>
+
+      <div style="margin-top:12px;font-size:12.5px;font-weight:600">Labels</div>
+      <div class="seg" id="default-labels" style="width:100%;overflow:hidden;margin-top:7px">
+        {% for id, label in [("few", "Hubs"), ("some", "Most"), ("all", "All")] %}
+        <button data-display-pick="labels" data-value="{{ id }}" class="seg-opt" style="flex:1;justify-content:center;background:transparent;border:0;font:inherit;cursor:pointer;color:inherit">{{ label }}</button>
+        {% endfor %}
+      </div>
+
+      <div style="margin-top:10px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 60%, transparent)">How the map is drawn by default. The map's own display settings edit the same stored values, so a change made there holds here too.</div>
     </div>
 
     <div style="background:var(--color-surface);border-radius:12px;padding:16px">
@@ -104,10 +135,39 @@
         var slot = document.querySelector('[data-toggle-slot="' + key + '"]');
         if (slot) slot.outerHTML = '<span data-toggle-slot="' + key + '">' + toggleHtml(localStorage.getItem("atlas." + key) === "1") + "</span>";
       });
+      // Display defaults — the same stored values the map rail edits.
+      var display = {
+        direction: localStorage.getItem("atlas.direction") || "arrows",
+        hops: localStorage.getItem("atlas.hops") || "1",
+        labels: localStorage.getItem("atlas.labels") || "some",
+      };
+      document.querySelectorAll("[data-display-pick]").forEach(function (el) {
+        var on = el.dataset.value === display[el.dataset.displayPick];
+        if (el.classList.contains("seg-opt")) {
+          // Inline, because the button carries inline resets that outrank a class.
+          el.style.background = on ? "var(--color-accent)" : "transparent";
+          el.style.color = on ? "var(--color-bg)" : "inherit";
+        } else {
+          el.style.background = on ? "color-mix(in srgb, var(--color-accent) 12%, transparent)" : "transparent";
+          el.style.color = on ? "var(--color-accent-700)" : "var(--color-text)";
+          el.style.border = on ? "1px solid var(--color-accent)" : "1px solid var(--color-divider)";
+          var swatch = el.querySelector("span");
+          if (swatch) {
+            swatch.style.background = on ? "var(--color-accent)" : "color-mix(in srgb, var(--color-text) 60%, transparent)";
+            swatch.style.opacity = on ? "1" : "0.7";
+          }
+        }
+      });
     }
     document.addEventListener("click", function (e) {
       var p = e.target.closest("[data-palette-pick]");
       if (p) { AtlasTheme.set("palette", p.dataset.palettePick); paint(); return; }
+      var pick = e.target.closest("[data-display-pick]");
+      if (pick) {
+        localStorage.setItem("atlas." + pick.dataset.displayPick, pick.dataset.value);
+        paint();
+        return;
+      }
       var d = e.target.closest("[data-default-pick]");
       if (d) {
         var key = d.dataset.defaultPick;

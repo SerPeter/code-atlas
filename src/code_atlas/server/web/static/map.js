@@ -80,6 +80,12 @@
   var MUTED10 = "color-mix(in srgb, var(--color-text) 50%, transparent)";
   var LABEL10 = 'font-size:10px;letter-spacing:0.12em;text-transform:uppercase;color:' + MUTED10;
 
+  function pick(fromUrl, stored, allowed, fallback) {
+    if (allowed.indexOf(fromUrl) >= 0) return fromUrl;
+    if (allowed.indexOf(stored) >= 0) return stored;
+    return fallback;
+  }
+
   // ── State ────────────────────────────────────────────────────────────────
   var qs = new URLSearchParams(window.location.search);
   var state = {
@@ -90,9 +96,11 @@
     showNoncode: qs.has("show_noncode") ? qs.get("show_noncode") === "1" : localStorage.getItem("atlas.showNoncode") === "1",
     focus: qs.has("focus") ? parseInt(qs.get("focus"), 10) : -1,
     selected: qs.get("selected") || null,
-    labels: ["few", "some", "all"].indexOf(qs.get("labels")) >= 0 ? qs.get("labels") : "some",
-    hops: [1, 2, 3].indexOf(parseInt(qs.get("hops"), 10)) >= 0 ? parseInt(qs.get("hops"), 10) : 1,
-    direction: ["arrows", "taper", "fade", "flow"].indexOf(qs.get("direction")) >= 0 ? qs.get("direction") : "arrows",
+    // URL wins (a shared link shows what its sender saw); the stored default fills
+    // in otherwise. The rail and the Settings page both edit the same stored value.
+    labels: pick(qs.get("labels"), localStorage.getItem("atlas.labels"), ["few", "some", "all"], "some"),
+    hops: parseInt(pick(qs.get("hops"), localStorage.getItem("atlas.hops"), ["1", "2", "3"], "1"), 10),
+    direction: pick(qs.get("direction"), localStorage.getItem("atlas.direction"), ["arrows", "taper", "fade", "flow"], "arrows"),
     hover: null,
     legend: false,
     // Display settings start collapsed: what is on the map matters more than how it is drawn.
@@ -232,6 +240,9 @@
     if (!a || !b || a === b) return null;
     var adj = new Map();
     (D.edges || []).forEach(function (e) {
+      // Containment edges would make every pair two hops apart via the module —
+      // a "path" that answers nothing. Only dependency edges are walkable.
+      if (e.rel === "defines") return;
       if (!adj.has(e.s)) adj.set(e.s, []);
       if (!adj.has(e.t)) adj.set(e.t, []);
       adj.get(e.s).push({ to: e.t, ev: e.ev, dir: "out" });
@@ -641,6 +652,7 @@
       applyTransform();
     });
     var end = function (e) {
+      if (drag && drag.captured) suppressClick = true;
       drag = null;
       el.style.cursor = "grab";
       try { el.releasePointerCapture(e.pointerId); } catch (err) { /* no-op */ }
@@ -650,6 +662,12 @@
     el.style.cursor = "grab";
 
     els.main.addEventListener("click", function (e) {
+      hideMenu();
+      if (suppressClick) {
+        // The click that ends a pan is not a selection gesture.
+        suppressClick = false;
+        return;
+      }
       var z = e.target.closest("[data-zoom]");
       if (z) {
         var mode = z.getAttribute("data-zoom");
@@ -661,24 +679,110 @@
       var node = e.target.closest("[data-node]");
       if (node) {
         onSelect(node.getAttribute("data-node"));
+        return;
+      }
+      // Clicking empty canvas clears: first an armed path pick, then the selection.
+      if (e.target.closest("[data-atlas-canvas]")) {
+        if (state.arming) {
+          set({ arming: false, pathFrom: null, pathTo: null });
+        } else if (state.selected || state.pathTo) {
+          set({ selected: null, pathFrom: null, pathTo: null });
+        } else {
+          return;
+        }
+        renderCanvasContents();
+        renderOverlays();
+        renderContext();
       }
     });
-    els.main.addEventListener("mouseover", function (e) {
+
+    // Right-click on a node opens its actions where the cursor is.
+    els.main.addEventListener("contextmenu", function (e) {
       var node = e.target.closest("[data-node]");
-      if (node && state.hover !== node.getAttribute("data-node")) {
-        state.hover = node.getAttribute("data-node");
+      if (!node) {
+        hideMenu();
+        return;
+      }
+      e.preventDefault();
+      showMenu(node.getAttribute("data-node"), e);
+    });
+    // Hover is whatever the pointer is over RIGHT NOW: entering a node sets it,
+    // moving over empty canvas clears it. Tracking enter/leave pairs instead
+    // loses the leave event whenever the hover re-render replaces the element
+    // under the cursor, and the isolation sticks until the next click.
+    els.main.addEventListener("mouseover", function (e) {
+      if (e.target.closest("[data-ctx-menu]")) return;
+      var node = e.target.closest("[data-node]");
+      var id = node ? node.getAttribute("data-node") : null;
+      if (state.hover !== id) {
+        state.hover = id;
         renderCanvasContents();
       }
     });
-    els.main.addEventListener("mouseout", function (e) {
-      var node = e.target.closest("[data-node]");
-      if (node && !(e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest('[data-node="' + CSS.escape(node.getAttribute("data-node")) + '"]'))) {
-        if (state.hover === node.getAttribute("data-node")) {
-          state.hover = null;
-          renderCanvasContents();
-        }
+    // Leaving the frame entirely — including out of the window — always clears.
+    els.main.addEventListener("mouseleave", function () {
+      if (state.hover !== null) {
+        state.hover = null;
+        renderCanvasContents();
       }
     });
+  }
+
+  var suppressClick = false;
+
+  // ── Node context menu ────────────────────────────────────────────────────
+  function hideMenu() {
+    var menu = els.main.querySelector("[data-ctx-menu]");
+    if (menu) menu.remove();
+  }
+
+  function showMenu(id, event) {
+    hideMenu();
+    var n = byId()[id];
+    if (!n) return;
+    var rect = els.main.getBoundingClientRect();
+    var row = function (action, label) {
+      return (
+        '<button data-menu-action="' + action + '" class="hv6" style="display:block;width:100%;background:transparent;border:0;border-radius:7px;padding:6px 11px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-align:left;white-space:nowrap">' +
+        label + "</button>"
+      );
+    };
+    var items = "";
+    if (n.uid) items += row("detail", "Open detail");
+    items += row("path", "Path to…");
+    if (state.level !== "entity" && n.path) items += row("entities", "Entities");
+    if (state.level !== "entity" && n.community >= 0) items += row("focus", "Focus community");
+    if (state.selected === id) items += row("deselect", "Deselect");
+    var menu = document.createElement("div");
+    menu.setAttribute("data-ctx-menu", id);
+    menu.style.cssText =
+      "position:absolute;z-index:30;min-width:150px;background:var(--color-bg);border:1px solid var(--color-divider);border-radius:10px;box-shadow:var(--shadow-md);padding:4px;left:" +
+      Math.min(event.clientX - rect.left, rect.width - 170) + "px;top:" +
+      Math.min(event.clientY - rect.top, rect.height - 160) + "px";
+    menu.innerHTML =
+      '<div style="padding:5px 11px 3px;font-size:10px;letter-spacing:0.12em;text-transform:uppercase;color:' + MUTED10 +
+      ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;direction:rtl;text-align:left">' + esc(n.label) + "</div>" + items;
+    menu.addEventListener("click", function (e) {
+      var action = e.target.closest("[data-menu-action]");
+      if (!action) return;
+      e.stopPropagation();
+      hideMenu();
+      var kind = action.getAttribute("data-menu-action");
+      if (kind === "detail" && n.uid) {
+        window.location.href = "/entity/" + encodeURIComponent(n.uid);
+      } else if (kind === "path") {
+        set({ selected: id, arming: true, pathFrom: id, pathTo: null });
+        render();
+      } else if (kind === "entities" && n.path) {
+        setAndLoad({ level: "entity", scope: n.path, selected: null });
+      } else if (kind === "focus") {
+        setAndRender({ focus: state.focus === n.community ? -1 : n.community });
+      } else if (kind === "deselect") {
+        set({ selected: null, pathFrom: null, pathTo: null, arming: false });
+        render();
+      }
+    });
+    els.main.appendChild(menu);
   }
 
   function onSelect(id) {
@@ -734,16 +838,19 @@
     var depth = Math.max(1, Math.min(4, state.hops));
     if (active) {
       nbr.add(active); dist.set(active, 0);
+      // Containment edges are excluded: the module defines everything, so walking
+      // them would light the whole scope and the isolation would show nothing.
+      var deps = es.filter(function (e) { return e.rel !== "defines"; });
       var frontier = [active];
       for (var d = 0; d < depth; d++) {
         var next = [];
-        es.forEach(function (e) {
+        deps.forEach(function (e) {
           if (frontier.indexOf(e.s) >= 0 && !nbr.has(e.t)) { nbr.add(e.t); dist.set(e.t, d + 1); next.push(e.t); }
         });
         frontier = next;
         if (!frontier.length) break;
       }
-      es.forEach(function (e) {
+      deps.forEach(function (e) {
         if (e.t === active && !nbr.has(e.s)) { nbr.add(e.s); dist.set(e.s, 1); }
       });
     }
@@ -754,10 +861,22 @@
       var dd = dist.has(id) ? dist.get(id) : 99;
       return HOP_FADE[Math.min(4, dd)] != null && dd <= 4 ? HOP_FADE[Math.min(4, dd)] : 0.13;
     };
-    // Only a hover dims the rest of the map; a selection is persistent, so it is
-    // marked with the accent ring and its label instead of fading everything else.
-    var dimming = !!state.hover;
+    // A selection keeps its neighbourhood isolated — the highlight should not
+    // vanish the moment the pointer moves on. A hover retargets the isolation.
+    var dimming = !!active;
     var path = pathSets();
+    // With a selection (or an armed "Path to…"), hovering another node previews
+    // the route between them before any click commits it.
+    var previewFrom = state.pathFrom || sel;
+    if (!path.hops && previewFrom && state.hover && state.hover !== previewFrom) {
+      var previewHops = shortestPath(previewFrom, state.hover);
+      if (previewHops) {
+        var pn = new Set([previewFrom]);
+        var pe = new Set();
+        previewHops.forEach(function (h) { pn.add(h.to); pe.add(h.from + "|" + h.to); });
+        path = { nodes: pn, edges: pe, hops: previewHops };
+      }
+    }
     var pathing = path.nodes.size > 0;
 
     // Ranked, not thresholded: degrees are quantized, so a degree cut-off can
@@ -796,12 +915,17 @@
         ? ((ids[e.s].community === focus && ids[e.t].community === focus) ? 1
           : (ids[e.s].community === focus || ids[e.t].community === focus) ? 0.45 : 0.05)
         : 1;
+      // Containment is scaffolding, not signal: a fixed hairline at low opacity,
+      // whatever the direction mode, so a dense scope's call graph stays readable.
+      var defines = e.rel === "defines";
       return {
-        id: "e" + i, ev: ev, weight: weight, onPath: onPath,
-        dash: ev === "guessed" ? "5 4" : ev === "unknown" ? "1.5 5" : "none",
-        w: pathing && onPath ? 2.6 : 0.5 + weight * 2.4,
+        id: "e" + i, ev: ev, weight: weight, onPath: onPath, defines: defines,
+        dash: defines ? "none" : ev === "guessed" ? "5 4" : ev === "unknown" ? "1.5 5" : "none",
+        w: defines ? 0.5 : pathing && onPath ? 2.6 : 0.5 + weight * 2.4,
         color: pathing && onPath ? "var(--color-accent)" : cross ? "var(--color-text)" : edgeColor(e.s),
-        o: pathing ? (onPath ? 1 : 0.07) : ((cross ? 0.24 : 0.14) + weight * 0.5) * rel * fo,
+        o: defines
+          ? (pathing ? 0.04 : 0.1 * rel * fo)
+          : pathing ? (onPath ? 1 : 0.07) : ((cross ? 0.24 : 0.14) + weight * 0.5) * rel * fo,
         x1: a.x * SX, y1: a.y * SY, x2: b.x * SX, y2: b.y * SY,
         rt: ids[e.t] ? radius(ids[e.t]) : 4, rs: ids[e.s] ? radius(ids[e.s]) : 4,
       };
@@ -814,7 +938,7 @@
     if (mode === "fade" && CW > 0) {
       svgParts.push("<defs>");
       E.forEach(function (e) {
-        if (e.onPath) return;
+        if (e.onPath || e.defines) return;
         svgParts.push(
           '<linearGradient id="g' + e.id + '" gradientUnits="userSpaceOnUse" x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) + '">' +
           '<stop offset="0%" stop-color="' + e.color + '" stop-opacity="' + (e.o * 0.15).toFixed(3) + '"></stop>' +
@@ -826,10 +950,10 @@
     }
     if (lineMode) {
       E.forEach(function (e) {
-        var stroke = mode === "fade" && !e.onPath ? "url(#g" + e.id + ")" : e.color;
-        var o = mode === "fade" && !e.onPath ? 1 : e.o.toFixed(3);
-        var dash = mode === "flow" ? "7 5" : e.dash;
-        var anim = mode === "flow" && e.o > 0.12 ? "atlas-flow " + (1.6 + (1 - e.weight) * 1.6).toFixed(2) + "s linear infinite" : "none";
+        var stroke = mode === "fade" && !e.onPath && !e.defines ? "url(#g" + e.id + ")" : e.color;
+        var o = mode === "fade" && !e.onPath && !e.defines ? 1 : e.o.toFixed(3);
+        var dash = e.defines ? "none" : mode === "flow" ? "7 5" : e.dash;
+        var anim = mode === "flow" && !e.defines && e.o > 0.12 ? "atlas-flow " + (1.6 + (1 - e.weight) * 1.6).toFixed(2) + "s linear infinite" : "none";
         svgParts.push(
           '<line x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) +
           '" vector-effect="non-scaling-stroke" style="stroke:' + stroke + ";stroke-width:" + e.w + "px;stroke-dasharray:" + dash + ";opacity:" + o + ";stroke-linecap:round;animation:" + anim + '"></line>'
@@ -837,6 +961,14 @@
       });
     } else if (CW > 0) {
       E.forEach(function (e) {
+        // Taper mode draws wedges for dependencies; scaffolding stays a hairline.
+        if (e.defines) {
+          svgParts.push(
+            '<line x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) +
+            '" vector-effect="non-scaling-stroke" style="stroke:' + e.color + ";stroke-width:0.5px;opacity:" + e.o.toFixed(3) + '"></line>'
+          );
+          return;
+        }
         var dx = e.x2 - e.x1, dy = e.y2 - e.y1;
         var len = Math.hypot(dx, dy) || 1;
         var nx = -dy / len, ny = dx / len;
@@ -857,7 +989,7 @@
     var arrowParts = [];
     if ((mode === "arrows" || (pathing && mode !== "taper")) && CW > 0) {
       E.forEach(function (e) {
-        if (e.o < 0.09) return;
+        if (e.defines || e.o < 0.09) return;
         if (mode !== "arrows" && !e.onPath) return;
         var dx = e.x2 - e.x1, dy = e.y2 - e.y1;
         var len = Math.hypot(dx, dy) || 1;
@@ -1137,6 +1269,9 @@
     if (n) {
       var inbound = [], outbound = [];
       (D.edges || []).forEach(function (e) {
+        // Containment scaffolding stays on the canvas; listing a module's every
+        // member as "depends on this" would say nothing about dependencies.
+        if (e.rel === "defines") return;
         if (e.t === n.id && ids[e.s]) inbound.push({ node: ids[e.s], ev: e.ev });
         if (e.s === n.id && ids[e.t]) outbound.push({ node: ids[e.t], ev: e.ev });
       });
@@ -1243,6 +1378,7 @@
     }
     var dir = e.target.closest("[data-dir]");
     if (dir) {
+      localStorage.setItem("atlas.direction", dir.getAttribute("data-dir"));
       setAndRender({ direction: dir.getAttribute("data-dir") });
       return;
     }
@@ -1254,8 +1390,10 @@
       if (level === "entity") setAndLoad({ level: "entity", scope: state.scope || (D && D.default_scope) || "", selected: null, focus: -1 });
       else setAndLoad({ level: "module", selected: null, focus: -1 });
     } else if (t.dataset.hops) {
+      localStorage.setItem("atlas.hops", t.dataset.hops);
       setAndRender({ hops: parseInt(t.dataset.hops, 10) });
     } else if (t.dataset.labels) {
+      localStorage.setItem("atlas.labels", t.dataset.labels);
       setAndRender({ labels: t.dataset.labels });
     } else if (t.id === "scope-select") {
       setAndLoad({ scope: t.value, selected: null });
@@ -1309,6 +1447,14 @@
   });
   window.addEventListener("resize", function () {
     renderCanvasContents();
+  });
+  window.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") return;
+    hideMenu();
+    if (state.arming) {
+      set({ arming: false, pathFrom: null, pathTo: null });
+      render();
+    }
   });
 
   load();

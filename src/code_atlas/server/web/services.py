@@ -98,6 +98,10 @@ _ENTITY_SCOPE_LIMIT = 1500
 _IMPACT_PAGE = 50
 _IMPACT_CEILING = 500
 
+# Containment anchors weigh far less than any real call in the layout's attraction
+# term — the call graph, not the containment tree, should decide where things sit.
+_DEFINES_WEIGHT = 0.25
+
 # ADR-0028's four states, strongest first. Shared by every view that draws a chip.
 _EV_RANK = {"structural": 3, "resolved": 2, "guessed": 1, "unknown": 0}
 
@@ -1250,7 +1254,10 @@ class MapViewService:
         # Containment is structural fact: the module DEFINES its members, a class its
         # own. Drawn as edges they anchor every entity — without them, anything with
         # no resolved call floats detached at the map's edge, which reads as "isolated"
-        # when the truth is "contained".
+        # when the truth is "contained". They are scaffolding, not signal, so they get
+        # a "defines" rel (the canvas draws them as faint hairlines) and a low weight
+        # (the layout must let the call graph, not the containment tree, drive shape).
+        edge_rel: dict[tuple[str, str], str] = {}
         if module_qn in drawn:
             for qn in drawn:
                 if qn == module_qn:
@@ -1260,8 +1267,9 @@ class MapViewService:
                     definer = definer.rsplit(".", 1)[0] if "." in definer else ""
                 anchor = definer or module_qn
                 if anchor != qn and (anchor, qn) not in edges:
-                    edges[anchor, qn] = 1.0
+                    edges[anchor, qn] = _DEFINES_WEIGHT
                     edge_ev[anchor, qn] = "structural"
+                    edge_rel[anchor, qn] = "defines"
 
         kept = set(sorted(drawn, key=lambda qn: qn)[:node_limit])
         truncated = len(kept) < len(drawn)
@@ -1302,7 +1310,7 @@ class MapViewService:
             level="entity",
             nodes=nodes,
             edges=tuple(
-                MapEdge(s=a, t=b, w=round(w, 2), ev=edge_ev.get((a, b), "unknown"))
+                MapEdge(s=a, t=b, w=round(w, 2), ev=edge_ev.get((a, b), "unknown"), rel=edge_rel.get((a, b), "calls"))
                 for (a, b), w in sorted(scaled.items())
             ),
             communities=(),
