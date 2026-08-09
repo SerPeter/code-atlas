@@ -1,37 +1,40 @@
-{# The map view's markup, shared verbatim by the live server and the static
-   export (ATL-120). Two renderers over one component: the alternative is a second
+{# The map view's markup, shared verbatim by the live server and the static export
+   (ATL-120). Two renderers over one component: the alternative is a second
    implementation that drifts, and the export becomes the stale one nobody notices. #}
-<h1>Community map</h1>
-
-{% if not map.is_available %} {# Not an error page: the backend cannot cluster, and a partial map would still look
-complete. #}
-<p class="caveat"><b>Map unavailable.</b> {{ map.unavailable }}</p>
+{% if not map.is_available %}
+{# Not an error: the backend cannot cluster, and a partial map would still look
+   complete. Naming the capability is the difference between "broken" and "needs X". #}
+<div class="view-empty">
+  <h1>Map unavailable</h1>
+  <p class="caveat">{{ map.unavailable }}</p>
+</div>
 {% elif not map.nodes %}
-<p class="caveat">{{ map.caveat.note }}</p>
+<div class="view-empty">
+  <h1>Nothing to map</h1>
+  <p class="caveat">{{ map.caveat.note }}</p>
+  {% if map.hidden_tests or map.hidden_noncode %}
+  <p class="muted">
+    {{ map.hidden_tests + map.hidden_noncode }} modules are hidden by the current filters.
+  </p>
+  {% endif %}
+</div>
 {% else %}
-<p class="caveat">{{ map.caveat.note }}</p>
+<div class="map-wrap">
+  <div id="map-canvas" class="map-canvas" role="img"
+       aria-label="Module dependency map, {{ map.nodes | length }} modules grouped by subsystem"></div>
 
-<p class="muted">
-  {{ map.nodes | length }} modules in {{ map.communities | length }} subsystems, modularity
-  <b>{{ map.modularity }}</b>. Edge thickness is the stored dependency weight, so a thick edge is well-evidenced rather
-  than merely frequent. {% if map.external_count %} {{ map.external_count }} first-hop modules from other projects sit
-  on the outer ring, greyed and prefixed with ↗. {% endif %}
-</p>
+  <div class="map-status" id="map-status">Laying out {{ map.nodes | length }} modules…</div>
 
-<div id="map-canvas" class="map-canvas" role="img" aria-label="Module dependency map grouped by subsystem"></div>
-<p class="muted" id="map-status">Loading the graph…</p>
-
-<h2>Subsystems</h2>
-<ul class="communities">
-  {% for community in map.communities %}
-  <li>
-    <button type="button" class="community-focus" data-community="{{ community.id }}">
-      <b>{{ community.label }}</b> — {{ community.size }} modules
-    </button>
-    <div class="community-members muted">{{ community.members | join(", ") }}</div>
-  </li>
-  {% endfor %}
-</ul>
+  <div class="map-footnote">
+    <span>{{ map.caveat.note }}</span>
+    {% if map.truncated %}
+    <span class="caveat-inline">Truncated — whole subsystems are kept, so the cut falls between them.</span>
+    {% endif %}
+    {% if map.external_count %}
+    <span>{{ map.external_count }} first-hop modules from other projects, on the outer ring.</span>
+    {% endif %}
+  </div>
+</div>
 
 {# Data, not a driver concern: the static export embeds the payload here and map.js
    prefers it over a fetch. The live server omits it and the fetch runs. #}

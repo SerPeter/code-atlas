@@ -521,3 +521,198 @@ html, body { height: 100%; }
 .app-main > .prose {
   max-width: 60rem;
 }
+
+/* ========================================================================
+   4. VIEW COMPONENTS
+   The sidebar rail, the map frame, and the project picker. Built from the
+   design's own tokens — nothing here introduces a colour or a size the
+   system does not already define.
+   ======================================================================== */
+
+.rail-section {
+  padding: 13px 14px 14px;
+  border-bottom: 1px solid var(--color-divider);
+}
+.rail-grow {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.rail-label {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+}
+
+.rail-project {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+}
+.rail-project-name {
+  display: block;
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 15px;
+}
+.rail-project-meta,
+.rail-count {
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+
+.rail-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 13px;
+  text-decoration: none;
+  color: inherit;
+}
+.rail-toggle-box {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-divider);
+  font-size: 10px;
+  line-height: 1;
+}
+.rail-toggle.is-on .rail-toggle-box {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: #fff;
+}
+.rail-toggle .rail-count {
+  margin-left: 6px;
+}
+
+.rail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.rail-community {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 0;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.rail-community:hover {
+  color: var(--color-accent);
+}
+.swatch {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 2px;
+}
+.rail-community-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Truncate from the left: these are dotted paths, and the distinguishing
+     part is the tail. */
+  direction: rtl;
+  text-align: left;
+}
+.rail-actions {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+.rail-selection-name {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 13px;
+  word-break: break-word;
+}
+.rail-selection-meta {
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+
+.map-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.map-canvas {
+  flex: 1;
+  min-height: 0;
+}
+.map-status,
+.map-footnote {
+  flex: none;
+  padding: 6px 14px;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  border-top: 1px solid var(--color-divider);
+}
+.map-footnote {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.caveat-inline {
+  color: var(--color-accent-700);
+}
+
+.view-empty {
+  padding: 40px;
+  max-width: 44rem;
+}
+
+.picker-list,
+.picker-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.picker-children {
+  margin-left: 22px;
+  border-left: 1px solid var(--color-divider);
+  padding-left: 10px;
+}
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 4px;
+  cursor: pointer;
+}
+.picker-row:hover {
+  background: color-mix(in srgb, var(--color-text) 5%, transparent);
+}
+.picker-name {
+  font-weight: 600;
+  min-width: 11rem;
+}
+.picker-facts {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  flex: 1;
+}
+.picker-cost {
+  flex: 1;
+  font-size: 12px;
+}

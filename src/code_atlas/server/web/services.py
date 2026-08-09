@@ -23,6 +23,9 @@ import math
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import msgspec
+from loguru import logger
+
 from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES
 from code_atlas.server.architecture import analyse
 from code_atlas.server.web.layout import force_layout, node_size
@@ -42,7 +45,9 @@ from code_atlas.server.web.schemas import (
     MapNode,
     ModuleMap,
     PathHop,
+    ProjectChoice,
     ProjectOverview,
+    ProjectPicker,
     ProjectRef,
     RelatedEntity,
     SearchHit,
@@ -536,7 +541,18 @@ class MapViewService:
         if unavailable:
             return _empty_map(self._project, unavailable)
 
-        module_graph = await build_module_graph(self._graph, self._project, "", test_patterns=self._test_patterns)
+        try:
+            module_graph = await build_module_graph(self._graph, self._project, "", test_patterns=self._test_patterns)
+        except Exception as exc:  # the map is the landing page; it may not take it down
+            # Clustering reads raw Cypher, so a backend that cannot serve it, a timeout,
+            # or a shape change all land here. Before the map became `/`, this surfaced
+            # as a 500 on a secondary page; now it would be the front door.
+            logger.debug("Map unavailable for {}: {}", self._project, exc)
+            return _empty_map(
+                self._project,
+                "The module map could not be built for this project. "
+                "Run health_check for the backend's own account of why.",
+            )
         if not module_graph.modules:
             return _empty_map(self._project, "", caveat=CoverageCaveat(note="No modules indexed for this project."))
 
@@ -990,3 +1006,75 @@ def _impact_caveat(result: dict[str, Any], considered: list[AffectedEntity], res
             "so treat what remains as better-evidenced, not verified."
         )
     return CoverageCaveat(note=" ".join(parts))
+
+
+class ProjectPickerService:
+    """Every indexed project, arranged the way a monorepo actually is.
+
+    Separate from ProjectViewService because it is a different question: that one
+    assembles *a* project, this one chooses between them, and it is the only view that
+    reads across the whole graph rather than staying inside one scope.
+    """
+
+    def __init__(self, graph: GraphBackend, project: str) -> None:
+        self._graph = graph
+        self._project = project
+
+    async def picker(self, selected: tuple[str, ...] = ()) -> ProjectPicker:
+        rows = [_project_props(row) for row in await self._graph.get_project_status()]
+        chosen = tuple(selected) or (self._project,)
+
+        flat: dict[str, ProjectChoice] = {}
+        for row in rows:
+            name = str(row.get("name") or "")
+            if not name:
+                continue
+            indexed = _as_timestamp(row.get("last_indexed_at"))
+            flat[name] = ProjectChoice(
+                name=name,
+                label=name.rsplit("/", 1)[-1],
+                entities=int(row.get("entity_count") or 0),
+                modules=0,
+                indexed_at=indexed,
+                git_hash=_as_str(row.get("git_hash")),
+                is_current=name in chosen,
+                days_since_indexed=_days_since(row.get("last_indexed_at")),
+            )
+
+        # `a/b` is a sub-project of `a` when `a` is itself indexed. Without that check a
+        # path-shaped name would invent a parent that does not exist in the graph.
+        roots: list[ProjectChoice] = []
+        for name in sorted(flat):
+            parent = name.rsplit("/", 1)[0] if "/" in name else ""
+            if parent and parent in flat:
+                continue
+            kids = tuple(flat[child] for child in sorted(flat) if "/" in child and child.rsplit("/", 1)[0] == name)
+            roots.append(msgspec.structs.replace(flat[name], children=kids))
+
+        selected_entities = sum(c.entities for c in flat.values() if c.name in chosen)
+        return ProjectPicker(
+            projects=tuple(roots),
+            selected=chosen,
+            selected_modules=selected_entities,
+            cost_note=_picker_cost(len(chosen), selected_entities),
+        )
+
+
+def _days_since(value: object) -> int | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    delta = datetime.now(tz=UTC) - datetime.fromtimestamp(float(value), tz=UTC)
+    return max(delta.days, 0)
+
+
+def _picker_cost(count: int, entities: int) -> str:
+    """What the current selection implies, before it is applied.
+
+    Layout is O(n^2) per iteration, so combining large projects is the one choice here
+    that a reader would want warned about rather than discovered.
+    """
+    if count <= 1:
+        return ""
+    if entities > 20_000:
+        return f"{count} projects, ~{entities:,} entities — a large combined graph, slower to lay out."
+    return f"{count} projects, ~{entities:,} entities combined."

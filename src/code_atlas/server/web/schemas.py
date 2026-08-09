@@ -416,3 +416,52 @@ class TracePathView(msgspec.Struct, frozen=True):
     def has_guessed_hop(self) -> bool:
         """A path is only as trustworthy as its weakest hop."""
         return any(hop.is_guess for hop in self.hops)
+
+
+class ProjectChoice(msgspec.Struct, frozen=True):
+    """One selectable project in the picker.
+
+    ``children`` carries the monorepo shape: `trading-bot` really does have four
+    sub-projects, and they are separate graph projects rather than folders — selecting
+    the parent does not pull them in.
+    """
+
+    name: str
+    label: str
+    entities: int
+    modules: int
+    indexed_at: str | None
+    git_hash: str | None
+    is_current: bool
+    days_since_indexed: int | None = None
+    children: tuple[ProjectChoice, ...] = ()
+
+    @property
+    def is_stale(self) -> bool:
+        """Old enough that the code has probably moved on.
+
+        A fortnight is arbitrary but has to be *something*: a view of two-week-old data
+        that looks live is the failure the coverage rules exist to prevent.
+        """
+        return self.days_since_indexed is not None and self.days_since_indexed > 14
+
+    @property
+    def short_hash(self) -> str:
+        return (self.git_hash or "")[:7]
+
+
+class ProjectPicker(msgspec.Struct, frozen=True):
+    """Every indexed project, and what selecting them would cost.
+
+    ``cost_note`` exists because combining projects is the one action here with a real
+    performance cliff — the picker should say so before the map has to.
+    """
+
+    projects: tuple[ProjectChoice, ...]
+    selected: tuple[str, ...]
+    selected_modules: int
+    cost_note: str
+
+    @property
+    def total_projects(self) -> int:
+        return sum(1 + len(p.children) for p in self.projects)
