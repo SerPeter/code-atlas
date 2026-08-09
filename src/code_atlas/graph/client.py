@@ -2584,15 +2584,21 @@ class GraphClient:
         """
         if not changed_uids:
             return 0
-        records = await self.execute(
-            f"UNWIND $uids AS uid "
-            f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(e {{uid: uid}}) "
-            "WHERE r.anchor_hash <> e.content_hash "
-            "SET r.stale = true "
-            "RETURN count(r) AS cnt",
-            {"uids": list(changed_uids)},
-        )
-        count = records[0]["cnt"] if records else 0
+        # Chunked: a full re-index hands over every uid at once, and the one-shot
+        # UNWIND over ~8k of them blew the 10s query timeout — which then took the
+        # whole close-out down with it. Each chunk stays well under the limit.
+        count = 0
+        uids = sorted(changed_uids)
+        for start in range(0, len(uids), 500):
+            records = await self.execute(
+                f"UNWIND $uids AS uid "
+                f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(e {{uid: uid}}) "
+                "WHERE r.anchor_hash <> e.content_hash "
+                "SET r.stale = true "
+                "RETURN count(r) AS cnt",
+                {"uids": uids[start : start + 500]},
+            )
+            count += records[0]["cnt"] if records else 0
         if count:
             logger.debug("Marked {} anchor edge(s) stale", count)
         return count
