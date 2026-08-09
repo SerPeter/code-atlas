@@ -97,6 +97,7 @@ class StaticExporter:
                 vendor_js=Markup(_read_assets(_VENDOR_BUNDLES)),
                 map_js=Markup(_read_assets(("map.js",))),
                 design_css=Markup(_inlined_css()),
+                theme_js=Markup(_read_assets(("theme.js",))),
                 generated_at=stamp.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 indexed_at=overview.indexed_at,
             )

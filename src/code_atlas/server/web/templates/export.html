@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block title %}{{ overview.project }} — code-atlas snapshot{% endblock %}
 {% block subtitle %}snapshot{% endblock %}
+{# No server to reach, so the control that needs one is simply absent. #}
+{% block settingslink %}{% endblock %}
+{% block headscripts %}<script>{{ theme_js }}</script>{% endblock %}
 {% block stylesheet %}
 {# Inlined, not linked. A linked stylesheet would make the file non-portable — the
    whole point of the export is that it opens from a filesystem with no server. #}

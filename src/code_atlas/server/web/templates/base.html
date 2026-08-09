@@ -14,11 +14,16 @@
      scripts   per-view asset delivery — the server links, the export inlines
 #}
 <!doctype html>
-<html lang="en" data-theme="{{ theme | default('auto') }}">
+{# Two independent axes: palette picks the look, theme picks the ground. Cyber adds
+   a ruled grid, glow and a scan sweep, all gated on dark and on reduced-motion. #}
+<html lang="en" data-theme="{{ theme | default('light') }}" data-palette="{{ palette | default('modernist') }}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}Code Atlas{% endblock %}</title>
+    {# Before the stylesheet so the stored palette is on the root when it lands, and
+       the page does not flash the default first. #}
+    {% block headscripts %}<script src="/static/theme.js"></script>{% endblock %}
     {% block stylesheet %}
     <link rel="stylesheet" href="/static/design.css" />
     {% endblock %}
@@ -54,6 +59,10 @@
           {% endfor %}
           {% endblock %}
         </nav>
+
+        {% block settingslink %}
+        <a class="app-settings" href="/settings" title="Settings" aria-label="Settings">⚙</a>
+        {% endblock %}
       </header>
 
       <div class="app-body">

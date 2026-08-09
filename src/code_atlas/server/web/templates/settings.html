@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Settings — Code Atlas{% endblock %}
+{% block subtitle %}appearance{% endblock %}
+
+{# Two axes rather than one list of four: the palette is a look, the theme is a ground,
+   and every combination is valid. Collapsing them would hide half the options. #}
+{% block content %}
+<div class="prose settings-view">
+  <h1>Appearance</h1>
+
+  <section class="settings-group">
+    <h2>Theme</h2>
+    <p class="text-muted">The visual language. Cyber adds a ruled grid under the graph,
+      glow on nodes and headings, and a slow scan sweep that stops for reduced-motion.</p>
+    <div class="swatch-row">
+      {% for value, label in [('modernist', 'Modernist'), ('cyber', 'Cyber')] %}
+      <a class="swatch-card{% if palette == value %} is-on{% endif %}"
+         href="/settings?palette={{ value }}&theme={{ theme }}"
+         data-palette="{{ value }}" data-theme="{{ theme }}">
+        <span class="swatch-preview">
+          <span class="swatch-chip" style="background: var(--color-accent)"></span>
+          <span class="swatch-chip" style="background: var(--atlas-c3)"></span>
+          <span class="swatch-chip" style="background: var(--atlas-c5)"></span>
+        </span>
+        <span class="swatch-name">{{ label }}</span>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="settings-group">
+    <h2>Ground</h2>
+    <div class="seg">
+      {% for value, label in [('light', 'Light'), ('dark', 'Dark'), ('auto', 'Follow OS')] %}
+      <a class="seg-opt{% if theme == value %} is-on{% endif %}"
+         href="/settings?palette={{ palette }}&theme={{ value }}">{{ label }}</a>
+      {% endfor %}
+    </div>
+    <p class="text-muted">
+      {% if theme == 'auto' %}Following the OS setting via prefers-color-scheme.
+      {% else %}Overriding the OS setting for this machine.{% endif %}
+    </p>
+  </section>
+
+  <p class="text-muted">
+    Stored in this browser only — the server keeps no preferences, and there is no account to keep them on.
+  </p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/theme.js"></script>
+{% endblock %}

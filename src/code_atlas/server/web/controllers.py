@@ -108,6 +108,22 @@ class ProjectController(Controller):
             context={"overview": overview, "project": overview.project, "active": "overview"},
         )
 
+    @get("/settings", name="settings")
+    async def settings(
+        self,
+        palette: FromQuery[str] = "modernist",
+        theme: FromQuery[str] = "light",
+    ) -> Template:
+        """Appearance. Two axes, both applied on the root element."""
+        return Template(
+            "settings.html",
+            context={
+                "palette": palette if palette in {"modernist", "cyber"} else "modernist",
+                "theme": theme if theme in {"light", "dark", "auto"} else "light",
+                "active": "settings",
+            },
+        )
+
     @get("/projects", name="projects")
     async def projects(
         self,
@@ -289,10 +305,19 @@ class MapController(Controller):
 
     @get("/api", name="api_map")
     async def api_map(
-        self, map_service: NamedDependency[MapViewService], external: FromQuery[bool] = True
+        self,
+        map_service: NamedDependency[MapViewService],
+        external: FromQuery[bool] = True,
+        level: FromQuery[str] = "module",
+        module: FromQuery[str] = "",
+        expand: FromQuery[bool] = False,
+        show_tests: FromQuery[bool] = False,
+        show_noncode: FromQuery[bool] = False,
     ) -> ModuleMap:
         """The map as JSON — this is what the canvas fetches and renders."""
-        return await map_service.map(include_external=external)
+        if level == "entity":
+            return await map_service.entity_map(module, expand_methods=expand)
+        return await map_service.map(include_external=external, show_tests=show_tests, show_noncode=show_noncode)
 
 
 class ImpactController(Controller):

@@ -128,9 +128,8 @@ class TestSameComponents:
         html = await _exporter().render()
 
         # Markers that only exist inside the shared partials.
-        assert "Community map" in html
-        assert "Architecture health" in html
         assert "map-canvas" in html
+        assert "Architecture health" in html
         assert "Propagation cost" in html
 
     async def test_a_missing_template_variable_fails_loudly(self, monkeypatch):

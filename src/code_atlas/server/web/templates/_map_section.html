@@ -13,25 +13,43 @@
   <h1>Nothing to map</h1>
   <p class="caveat">{{ map.caveat.note }}</p>
   {% if map.hidden_tests or map.hidden_noncode %}
-  <p class="muted">
-    {{ map.hidden_tests + map.hidden_noncode }} modules are hidden by the current filters.
-  </p>
+  <p class="muted">{{ map.hidden_tests + map.hidden_noncode }} modules are hidden by the current filters.</p>
   {% endif %}
 </div>
 {% else %}
 <div class="map-wrap">
-  <div id="map-canvas" class="map-canvas" role="img"
-       aria-label="Module dependency map, {{ map.nodes | length }} modules grouped by subsystem"></div>
+  <div class="map-chrome">
+    <input class="input map-find" id="map-find" type="search"
+           placeholder="Find on map…" aria-label="Find a node on the map" />
+    <div class="map-zoom" role="group" aria-label="Zoom">
+      <button class="btn btn-ghost btn-icon" id="map-zoom-out" type="button" title="Zoom out">−</button>
+      <button class="btn btn-ghost btn-icon" id="map-zoom-in" type="button" title="Zoom in">+</button>
+      <button class="btn btn-ghost" id="map-zoom-reset" type="button" title="Back to the computed view">
+        Reset
+      </button>
+    </div>
+  </div>
 
-  <div class="map-status" id="map-status">Laying out {{ map.nodes | length }} modules…</div>
+  {# Display settings ride in data attributes rather than a second request: the page
+     already knows them from the query string, and the renderer should not have to ask. #}
+  <div id="map-canvas" class="map-canvas" data-atlas-canvas role="img"
+       data-level="{{ map.level }}"
+       data-direction="{{ direction | default('arrows') }}"
+       data-hops="{{ hops | default(1) }}"
+       data-labels="{{ labels | default('some') }}"
+       data-focus="{{ focus | default(-1) }}"
+       data-api="{{ '/map/api?level=entity&module=' ~ map.scope if map.level == 'entity' else '/map/api' }}"
+       aria-label="{{ map.nodes | length }} nodes grouped by {{ 'kind' if map.level == 'entity' else 'community' }}"></div>
+
+  <div class="map-status" id="map-status">Laying out {{ map.nodes | length }} nodes…</div>
 
   <div class="map-footnote">
     <span>{{ map.caveat.note }}</span>
     {% if map.truncated %}
-    <span class="caveat-inline">Truncated — whole subsystems are kept, so the cut falls between them.</span>
+    <span class="caveat-inline">Truncated — whole communities are kept, so the cut falls between them.</span>
     {% endif %}
     {% if map.external_count %}
-    <span>{{ map.external_count }} first-hop modules from other projects, on the outer ring.</span>
+    <span>{{ map.external_count }} first-hop modules from other projects.</span>
     {% endif %}
   </div>
 </div>
