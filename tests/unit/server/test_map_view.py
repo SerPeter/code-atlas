@@ -104,6 +104,35 @@ class TestModuleLevel:
 
         assert sum(c.count for c in result.communities) == result.module_total == 3
 
+    async def test_a_community_is_named_for_its_visible_members(self, monkeypatch):
+        """A partition group carries its filtered test modules too. Naming from the
+        full membership christened the languages community "languages.apex" (the
+        alphabetically first member, once the hidden tests broke the shared
+        prefix) — the name must come from what the reader can actually see."""
+        _patch(
+            monkeypatch,
+            ModuleGraph(
+                modules=_modules(
+                    "code_atlas.parsing.languages.apex",
+                    "code_atlas.parsing.languages.python",
+                    "tests.unit.parsing.test_apex",
+                ),
+                edges={("code_atlas.parsing.languages.apex", "code_atlas.parsing.languages.python"): 1.0},
+                directed={("code_atlas.parsing.languages.apex", "code_atlas.parsing.languages.python"): 1.0},
+                partition=[
+                    [
+                        "code_atlas.parsing.languages.apex",
+                        "code_atlas.parsing.languages.python",
+                        "tests.unit.parsing.test_apex",
+                    ]
+                ],
+            ),
+        )
+
+        result = await _service().map()
+
+        assert result.communities[0].name == "code_atlas.parsing.languages"
+
     async def test_edge_direction_is_the_dependency_not_the_alphabet(self, monkeypatch):
         """`s` depends on `t`, whichever way the names happen to sort."""
         _patch(
@@ -377,7 +406,7 @@ class TestEntityLevel:
     async def test_methods_fold_into_their_class_and_calls_are_rewired(self, monkeypatch):
         """Folding hides nodes without hiding dependencies."""
         self._patch_entities(monkeypatch)
-        result = await _service().entity_map("src/app/mod.py")
+        result = await _service().entity_map("src/app/mod.py", expand_methods=False)
 
         ids = {n.id for n in result.nodes}
         assert "app.mod.Klass.run" not in ids
@@ -387,7 +416,7 @@ class TestEntityLevel:
     async def test_the_tally_counts_the_whole_inventory_not_the_drawn_subset(self, monkeypatch):
         """A folded method still appears in its row — kind tallies never shrink."""
         self._patch_entities(monkeypatch)
-        result = await _service().entity_map("src/app/mod.py")
+        result = await _service().entity_map("src/app/mod.py", expand_methods=False)
 
         tally = {t.id: t for t in result.tally}
         assert tally["method"].in_module == 1
@@ -406,7 +435,7 @@ class TestEntityLevel:
         the anchor is marked "defines" so the canvas can draw it as a faint hairline
         instead of letting a starburst of anchors drown the call graph."""
         self._patch_entities(monkeypatch)
-        result = await _service().entity_map("src/app/mod.py")
+        result = await _service().entity_map("src/app/mod.py", expand_methods=False)
 
         by_rel = {e.rel: [] for e in result.edges}
         for e in result.edges:
@@ -504,7 +533,7 @@ class TestFullScope:
     async def test_folding_and_anchoring_work_across_modules(self, monkeypatch):
         self._patch_graph(monkeypatch)
 
-        result = await _service().entity_map("")
+        result = await _service().entity_map("", expand_methods=False)
 
         drawn = {n.id for n in result.nodes}
         assert "app.alpha.Klass.run" not in drawn, "methods fold project-wide"
@@ -512,6 +541,59 @@ class TestFullScope:
         assert ("app.beta.helper", "app.alpha.Klass") in pairs, "the call rewires to the class"
         assert pairs[("app.alpha", "app.alpha.Klass")].rel == "defines", "modules anchor their members"
         assert ("app.beta", "app.alpha") in pairs, "module imports stay dependency edges"
+
+    async def test_a_stranded_external_follows_its_hidden_importers_out(self, monkeypatch):
+        """pytest is on the map because the tests import it; with the tests filtered
+        the package must not stay behind floating edge-less at the border."""
+        entities = [
+            {
+                "uid": "u:app.alpha",
+                "qn": "app.alpha",
+                "name": "alpha",
+                "label": "Module",
+                "kind": "module",
+                "file_path": "src/app/alpha.py",
+            },
+            {
+                "uid": "u:tests.test_alpha",
+                "qn": "tests.test_alpha",
+                "name": "test_alpha",
+                "label": "Module",
+                "kind": "module",
+                "file_path": "tests/test_alpha.py",
+            },
+            {
+                "uid": "u:ext/pytest",
+                "qn": "ext/pytest",
+                "name": "pytest",
+                "label": "ExternalPackage",
+                "kind": "",
+                "file_path": "",
+            },
+        ]
+        edges = [
+            {
+                "from_qn": "tests.test_alpha",
+                "to_qn": "ext/pytest",
+                "rel_type": "IMPORTS",
+                "weight": 1.0,
+                "confidence": "",
+                "strategy": "",
+            },
+        ]
+
+        async def _fake(graph, project):
+            return entities, edges
+
+        monkeypatch.setattr("code_atlas.server.analysis.fetch_entity_graph", _fake)
+
+        filtered = await _service().entity_map("", hidden=())
+        assert "ext/pytest" not in {n.id for n in filtered.nodes}
+
+        shown = await _service().entity_map("", hidden=(), show_tests=True)
+        ids = {n.id for n in shown.nodes}
+        assert "ext/pytest" in ids
+        assert "tests.test_alpha" in ids
 
     async def test_the_skeleton_kinds_cannot_be_hidden(self, monkeypatch):
         """Hiding classes would vanish their folded methods silently."""
