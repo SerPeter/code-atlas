@@ -28,6 +28,7 @@ from loguru import logger
 
 from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES
 from code_atlas.server.architecture import analyse
+from code_atlas.server.web.kinds import KINDS, classify
 from code_atlas.server.web.layout import force_layout, node_size
 from code_atlas.server.web.naming import breadcrumb
 from code_atlas.server.web.schemas import (
@@ -41,6 +42,7 @@ from code_atlas.server.web.schemas import (
     DepthGroup,
     EdgeEvidence,
     EntityDetail,
+    KindRow,
     MapEdge,
     MapNode,
     ModuleMap,
@@ -50,6 +52,7 @@ from code_atlas.server.web.schemas import (
     ProjectPicker,
     ProjectRef,
     RelatedEntity,
+    ScopeOption,
     SearchHit,
     SearchPage,
     TracePathView,
@@ -637,6 +640,127 @@ class MapViewService:
             caveat=_map_caveat(len(module_graph.modules), truncated, node_limit),
         )
 
+    async def entity_map(
+        self,
+        scope: str,
+        *,
+        expand_methods: bool = False,
+        node_limit: int = _MAP_NODE_LIMIT,
+    ) -> ModuleMap:
+        """The graph's own nodes, scoped to one module (v1.1).
+
+        The module map is an aggregation; this is the thing itself. It is scoped because
+        the full entity graph is 6,879 nodes against a 1,500 cap — drawing all of it
+        would truncate 78% of the project and call the remainder a picture.
+
+        Methods fold into the class that holds them by default, with their calls rewired
+        to the class. That keeps a 280-entity module readable without hiding anything
+        silently: the kind tallies are counted over the **full** inventory, so a folded
+        method still appears in its row.
+        """
+        summary = await self._graph.get_module_summary(self._project, scope, _ENTITY_SCOPE_LIMIT, _EDGE_LIMIT)
+        rows = list(summary.get("entities") or [])
+        if not rows:
+            return _empty_map(
+                self._project,
+                "",
+                caveat=CoverageCaveat(note=f"No entities indexed under {scope or 'this scope'}."),
+            )
+
+        entities = {
+            str(r.get("qn") or r.get("uid") or ""): {
+                "uid": str(r.get("uid") or ""),
+                "name": str(r.get("name") or ""),
+                "kind": classify(str(r.get("label") or ""), str(r.get("kind") or "")),
+                "file_path": str(r.get("file_path") or ""),
+            }
+            for r in rows
+            if r.get("qn") or r.get("uid")
+        }
+
+        # Counted before folding: the tally answers "what is in this module", not "what
+        # survived the display setting".
+        tally: dict[str, int] = {}
+        for info in entities.values():
+            tally[info["kind"]] = tally.get(info["kind"], 0) + 1
+
+        owner = {} if expand_methods else _method_owners(entities)
+        drawn = {qn: info for qn, info in entities.items() if qn not in owner}
+
+        edges: dict[tuple[str, str], float] = {}
+        for row in summary.get("internal_edges") or []:
+            a = owner.get(str(row.get("from_qn") or ""), str(row.get("from_qn") or ""))
+            b = owner.get(str(row.get("to_qn") or ""), str(row.get("to_qn") or ""))
+            if a == b or a not in drawn or b not in drawn:
+                continue
+            weight = float((row.get("props") or {}).get("weight") or 1.0)
+            edges[(a, b)] = edges.get((a, b), 0.0) + weight
+
+        kept = set(list(drawn)[:node_limit])
+        undirected = {_undirected(a, b): w for (a, b), w in edges.items()}
+        positions = force_layout(sorted(kept), {e: w for e, w in undirected.items() if set(e) <= kept})
+        degree = _degree_by_module(undirected, kept)
+
+        folded = len(entities) - len(drawn)
+        return ModuleMap(
+            project=self._project,
+            nodes=tuple(
+                MapNode(
+                    id=qn,
+                    label=drawn[qn]["name"] or qn.rsplit(".", 1)[-1],
+                    community=_KIND_ORDER.get(drawn[qn]["kind"], 0),
+                    size=node_size(degree.get(qn, 0)),
+                    x=positions.get(qn, (0.0, 0.0))[0],
+                    y=positions.get(qn, (0.0, 0.0))[1],
+                    project=self._project,
+                    kind=drawn[qn]["kind"],
+                )
+                for qn in sorted(kept)
+            ),
+            edges=tuple(
+                MapEdge(source=a, target=b, weight=round(w, 4), crosses_community=False)
+                for (a, b), w in sorted(edges.items())
+                if a in kept and b in kept
+            ),
+            communities=(),
+            modularity=0.0,
+            truncated=len(kept) < len(drawn),
+            caveat=CoverageCaveat(note=f"{len(entities)} entities indexed under {scope}."),
+            level="entity",
+            scope=scope,
+            scope_options=await self._scope_options(),
+            kinds=_kind_rows(tally, drawn),
+            expand_methods=expand_methods,
+            expand_count=f"{folded} folded into their class" if folded else "nothing to fold",
+            kind_header_note="in this module",
+            level_note=(
+                "Each node is an entity as the graph stores it — silhouette and colour both "
+                f"carry kind. This module holds {len(entities)} entities; the module map "
+                "above is an aggregation of these."
+            ),
+            legend_note=(
+                "Size = dependency degree. Shape and colour = kind. Position is computed "
+                "from the edges. Scroll to zoom, drag to pan."
+            ),
+            entity_total=len(entities),
+        )
+
+    async def _scope_options(self) -> tuple[ScopeOption, ...]:
+        """Modules the entity level can be pointed at, largest first."""
+        try:
+            overview = await self._graph.get_structure_overview(self._project, "", 60)
+        except Exception:  # the picker is a convenience; its failure is not the view's
+            return ()
+        return tuple(
+            ScopeOption(
+                id=str(row.get("file_path") or row.get("name") or ""),
+                label=str(row.get("name") or row.get("file_path") or ""),
+                entities=int(row.get("cnt") or row.get("entities") or 0),
+            )
+            for row in (overview.get("largest_modules") or [])
+            if row.get("file_path") or row.get("name")
+        )
+
     def _unsupported_reason(self) -> str:
         """Why this backend cannot produce the map, or empty if it can.
 
@@ -698,6 +822,63 @@ def _is_test_module(file_path: str, name: str, patterns: tuple[str, ...]) -> boo
 
     effective = list(patterns) if patterns else list(SearchSettings().test_patterns)
     return matches_test_pattern(file_path, name, effective)
+
+
+# The rail lists kinds in a fixed order; the entity level reuses the community slot on
+# MapNode to carry it, so the client can colour by kind without a second field.
+_KIND_ORDER = {k.id: i for i, k in enumerate(KINDS)}
+_ENTITY_SCOPE_LIMIT = 1500
+
+
+def _undirected(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a < b else (b, a)
+
+
+def _method_owners(entities: dict[str, dict[str, str]]) -> dict[str, str]:
+    """``method_qn -> owning class_qn`` for every method whose class is present.
+
+    A method's qualified name is its class's plus one segment, which is how the fold
+    finds its owner without a second query. A method whose class is not in this scope
+    stays drawn — folding it into nothing would remove it from the picture.
+    """
+    classes = {qn for qn, info in entities.items() if info["kind"] == "class"}
+    owners: dict[str, str] = {}
+    for qn, info in entities.items():
+        if info["kind"] != "method" or "." not in qn:
+            continue
+        parent = qn.rsplit(".", 1)[0]
+        if parent in classes:
+            owners[qn] = parent
+    return owners
+
+
+def _kind_rows(tally: dict[str, int], drawn: dict[str, dict[str, str]]) -> tuple[KindRow, ...]:
+    """The rail's kind list — counted over the whole inventory, not the drawn subset.
+
+    Folding methods into their class must not make the methods look like they vanished,
+    so ``n`` is the full count and ``drawn_note`` says when fewer are on the canvas.
+    """
+    on_canvas: dict[str, int] = {}
+    for info in drawn.values():
+        on_canvas[info["kind"]] = on_canvas.get(info["kind"], 0) + 1
+
+    rows = []
+    for kind in KINDS:
+        total = tally.get(kind.id, 0)
+        if not total:
+            continue
+        shown = on_canvas.get(kind.id, 0)
+        rows.append(
+            KindRow(
+                id=kind.id,
+                label=kind.label,
+                shape=kind.shape,
+                color=kind.color,
+                n=total,
+                drawn_note="" if shown == total else f"{shown} drawn",
+            )
+        )
+    return tuple(rows)
 
 
 def _empty_map(project: str, unavailable: str, *, caveat: CoverageCaveat | None = None) -> ModuleMap:

@@ -38,6 +38,36 @@ if TYPE_CHECKING:
     from code_atlas.settings import SearchSettings
 
 
+_MAP_DEFAULTS: dict[str, Any] = {
+    "level": "module",
+    "module": "",
+    "expand": False,
+    "show_tests": False,
+    "show_noncode": False,
+    "direction": "arrows",
+    "hops": 1,
+    "labels": "some",
+    "focus": -1,
+}
+
+
+def _map_url(**overrides: Any) -> str:
+    """A map link with *overrides* applied and everything else left at its default.
+
+    Only non-default values are emitted, so the common URL stays `/` rather than a
+    paragraph of query string.
+    """
+    from urllib.parse import urlencode  # noqa: PLC0415
+
+    values = {**_MAP_DEFAULTS, **{k: v for k, v in overrides.items() if v is not None}}
+    query = {
+        key: ("1" if value is True else "0" if value is False else str(value))
+        for key, value in values.items()
+        if value != _MAP_DEFAULTS[key]
+    }
+    return "/?" + urlencode(query) if query else "/"
+
+
 def create_app(
     graph: GraphBackend,
     project: str,
@@ -80,6 +110,10 @@ def create_app(
         return ProjectPickerService(graph, project)
 
     template_config: TemplateConfig[Any] = TemplateConfig(directory=TEMPLATES_DIR, engine=JinjaTemplateEngine)
+    # `map_url` lets a rail control change one setting and carry the rest. Without it
+    # every link would have to restate all nine, and one omission silently resets a
+    # setting the reader chose.
+    template_config.engine_instance.engine.globals["map_url"] = _map_url
 
     return Litestar(
         route_handlers=[

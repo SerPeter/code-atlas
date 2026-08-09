@@ -1,70 +1,136 @@
-{# The map's left rail: project, filters, subsystems, selection.
+{# The map rail, following the v1.1 design's own order and vocabulary:
+   Level · Scope · Filters · Node kinds · Communities · Display settings · Legend.
 
-   Every filter states how many modules it is hiding. A filtered view that looks
-   complete is the one failure this product refuses to have — and on the real graph
-   these two hide 64% of the nodes. #}
+   Display settings and the legend start collapsed — what is on the map matters more
+   than how it is drawn. Every filter states what it hides; a filtered view that looks
+   complete is the failure this product refuses to have. #}
 <aside class="app-sidebar">
   <section class="rail-section">
-    <div class="rail-label">Project</div>
-    <a class="rail-project" href="/projects">
-      <span class="rail-project-name">{{ map.project }}</span>
-      <span class="rail-project-meta">
-        {{ map.nodes | length }} modules · {{ map.edges | length }} dependencies
-      </span>
-    </a>
+    <div class="rail-label">Level</div>
+    <div class="seg" role="group" aria-label="Map level">
+      <a class="seg-opt{% if level == 'module' %} is-on{% endif %}" href="{{ map_url() }}">Modules</a>
+      <a class="seg-opt{% if level == 'entity' %} is-on{% endif %}"
+         href="{{ map_url(level='entity') }}">Entities</a>
+    </div>
+    <p class="rail-note">{{ map.level_note }}</p>
+  </section>
+
+  {% if level == 'entity' %}
+  <section class="rail-section">
+    <div class="rail-label">Scope</div>
+    <select class="input" name="scope" onchange="location = this.value">
+      {% for option in map.scope_options %}
+      <option value="{{ map_url(level='entity', module=option.id) }}"
+              {% if option.id == map.scope %}selected{% endif %}>{{ option.label }}</option>
+      {% endfor %}
+    </select>
   </section>
 
   <section class="rail-section">
-    <div class="rail-label">Filters</div>
-
-    {# Links rather than checkboxes: the map is server-rendered, so a filter is a
-       different URL. That also makes any view shareable by pasting the address. #}
-    <a class="rail-toggle{% if not show_tests %} is-on{% endif %}"
-       href="?{{ 'show_tests=0' if show_tests else 'show_tests=1' }}{% if show_noncode %}&show_noncode=1{% endif %}">
-      <span class="rail-toggle-box" aria-hidden="true">{% if not show_tests %}✓{% endif %}</span>
-      <span>
-        Hide tests
-        {% if map.hidden_tests %}<span class="rail-count">{{ map.hidden_tests }} hidden</span>{% endif %}
-      </span>
-    </a>
-
-    <a class="rail-toggle{% if not show_noncode %} is-on{% endif %}"
-       href="?{{ 'show_noncode=0' if show_noncode else 'show_noncode=1' }}{% if show_tests %}&show_tests=1{% endif %}">
-      <span class="rail-toggle-box" aria-hidden="true">{% if not show_noncode %}✓{% endif %}</span>
-      <span>
-        Hide non-code
-        {% if map.hidden_noncode %}<span class="rail-count">{{ map.hidden_noncode }} hidden</span>{% endif %}
-      </span>
-    </a>
-  </section>
-
-  <section class="rail-section rail-grow">
     <div class="rail-label">
-      Subsystems <span class="rail-count">{{ map.communities | length }}</span>
+      Node kinds <span class="rail-count">{{ map.kind_header_note }}</span>
     </div>
-    {# Doubles as the colour legend. Only the first eight hues are distinct — 22
-       distinguishable colours do not exist — so the rest share the neutral and are
-       told apart by name here rather than on the canvas. #}
-    <ul class="rail-list">
-      {% for community in map.communities %}
-      <li>
-        <button type="button" class="rail-community" data-community="{{ community.id }}">
-          <span class="swatch" style="background: var(--atlas-c{{ community.id if community.id < 8 else 8 }})"></span>
-          <span class="rail-community-name">{{ community.label }}</span>
-          <span class="rail-count">{{ community.size }}</span>
-        </button>
+
+    <a class="rail-toggle{% if map.expand_methods %} is-on{% endif %}"
+       href="{{ map_url(level='entity', module=map.scope, expand=not map.expand_methods) }}">
+      <span class="rail-toggle-box" aria-hidden="true">{% if map.expand_methods %}✓{% endif %}</span>
+      <span>Expand methods <span class="rail-count">{{ map.expand_count }}</span></span>
+    </a>
+
+    <ul class="rail-list rail-kinds">
+      {% for kind in map.kinds %}
+      <li class="rail-kind">
+        <span class="shape shape-{{ kind.shape }}" style="--kind-color: {{ kind.color }}"></span>
+        <span class="rail-kind-name">{{ kind.label }}</span>
+        {% if kind.drawn_note %}<span class="rail-count">{{ kind.drawn_note }}</span>{% endif %}
+        <span class="rail-count">{{ kind.n }}</span>
       </li>
       {% endfor %}
     </ul>
+    <p class="rail-note">
+      Silhouette and colour both carry kind — every entity in one module shares its
+      community, so colour is free here. Dashed means the entity sits outside the index.
+    </p>
+  </section>
+  {% else %}
+  <section class="rail-section">
+    <div class="rail-label">Filters</div>
+    <a class="rail-toggle{% if not show_tests %} is-on{% endif %}"
+       href="{{ map_url(show_tests=not show_tests, show_noncode=show_noncode) }}">
+      <span class="rail-toggle-box" aria-hidden="true">{% if not show_tests %}✓{% endif %}</span>
+      <span>Test modules <span class="rail-count">{{ map.hidden_tests }}</span></span>
+    </a>
+    <a class="rail-toggle{% if not show_noncode %} is-on{% endif %}"
+       href="{{ map_url(show_tests=show_tests, show_noncode=not show_noncode) }}">
+      <span class="rail-toggle-box" aria-hidden="true">{% if not show_noncode %}✓{% endif %}</span>
+      <span>Non-code files <span class="rail-count">{{ map.hidden_noncode }}</span></span>
+    </a>
+    {% if map.hidden_note %}<p class="rail-note">{{ map.hidden_note }}</p>{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="rail-section rail-grow">
+    <div class="rail-label">
+      Communities <span class="rail-count">{{ map.community_summary }}</span>
+    </div>
+    <ul class="rail-list">
+      {% for community in map.communities %}
+      <li>
+        <a class="rail-community{% if focus == community.id %} is-on{% endif %}"
+           href="{{ map_url(focus=None if focus == community.id else community.id) }}">
+          <span class="swatch" style="background: {{ community.color }}"></span>
+          <span class="rail-community-name">{{ community.label }}</span>
+          <span class="rail-count">{{ community.size }}</span>
+        </a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% if map.community_overflow_note %}
+    <p class="rail-note">{{ map.community_overflow_note }}</p>
+    {% endif %}
   </section>
 
-  <section class="rail-section rail-selection" id="rail-selection" hidden>
-    <div class="rail-label">Selected</div>
-    <div class="rail-selection-name" id="sel-name"></div>
-    <div class="rail-selection-meta" id="sel-meta"></div>
-    <div class="rail-actions">
-      <a class="btn btn-secondary btn-block" id="sel-detail" href="#">Open detail</a>
-      <a class="btn btn-ghost btn-block" id="sel-impact" href="#">What breaks if I change this</a>
-    </div>
+  <section class="rail-section">
+    <details class="rail-fold">
+      <summary class="rail-label">Display settings</summary>
+      <p class="rail-note">How the map is drawn. These change nothing about what is in it.</p>
+
+      <div class="rail-field">
+        <div class="rail-field-label">Direction</div>
+        <div class="seg">
+          {% for value, label in [('arrows', 'Arrows'), ('plain', 'Plain'), ('curved', 'Curved')] %}
+          <a class="seg-opt{% if direction == value %} is-on{% endif %}"
+             href="{{ map_url(direction=value) }}">{{ label }}</a>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="rail-field">
+        <div class="rail-field-label">Neighbourhood</div>
+        <div class="seg">
+          {% for value in [1, 2, 3] %}
+          <a class="seg-opt{% if hops == value %} is-on{% endif %}"
+             href="{{ map_url(hops=value) }}">{{ value }} hop{{ 's' if value != 1 }}</a>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="rail-field">
+        <div class="rail-field-label">Labels</div>
+        <div class="seg">
+          {% for value, label in [('few', 'Hubs'), ('some', 'Most'), ('all', 'All')] %}
+          <a class="seg-opt{% if labels == value %} is-on{% endif %}"
+             href="{{ map_url(labels=value) }}">{{ label }}</a>
+          {% endfor %}
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <section class="rail-section">
+    <details class="rail-fold">
+      <summary class="rail-label">Legend</summary>
+      <p class="rail-note">{{ map.legend_note }}</p>
+    </details>
   </section>
 </aside>

@@ -53,12 +53,21 @@ class ProjectController(Controller):
     path = "/"
 
     @get("/", name="index")
-    async def index(
+    async def index(  # every argument is one control in the rail
         self,
         view_service: NamedDependency[ProjectViewService],
         map_service: NamedDependency[MapViewService],
         show_tests: FromQuery[bool] = False,
         show_noncode: FromQuery[bool] = False,
+        level: FromQuery[str] = "module",
+        # NOT `scope`: Litestar reserves that name and injects its ASGI ScopeState,
+        # which then travelled into a Cypher parameter and failed inside the driver.
+        module: FromQuery[str] = "",
+        expand: FromQuery[bool] = False,
+        direction: FromQuery[str] = "arrows",
+        hops: FromQuery[int] = 1,
+        labels: FromQuery[str] = "some",
+        focus: FromQuery[int] = -1,
     ) -> Template:
         """Landing page — the map, already open.
 
@@ -72,16 +81,17 @@ class ProjectController(Controller):
         except ProjectNotIndexedError as exc:
             return Template("not_indexed.html", context={"project": exc.project}, status_code=404)
 
-        module_map = await map_service.map(show_tests=show_tests, show_noncode=show_noncode)
-        return Template(
-            "map.html",
-            context={
-                "map": module_map,
-                "project": module_map.project,
-                "active": "map",
-                "show_tests": show_tests,
-                "show_noncode": show_noncode,
-            },
+        return await _render_map(
+            map_service,
+            level=level,
+            scope=module,
+            expand=expand,
+            show_tests=show_tests,
+            show_noncode=show_noncode,
+            direction=direction,
+            hops=hops,
+            labels=labels,
+            focus=focus,
         )
 
     @get("/overview", name="overview")
@@ -123,6 +133,64 @@ class ProjectController(Controller):
             return await view_service.overview()
         except ProjectNotIndexedError as exc:
             raise NotFoundException(detail=f"Project {exc.project!r} has no index. Run 'atlas index'.") from exc
+
+
+async def _render_map(  # each argument is one control in the rail
+    map_service: MapViewService,
+    *,
+    level: str,
+    scope: str,
+    expand: bool,
+    show_tests: bool,
+    show_noncode: bool,
+    direction: str,
+    hops: int,
+    labels: str,
+    focus: int,
+) -> Template:
+    """Render whichever level was asked for, with the display settings echoed back.
+
+    Display settings ride in the query string rather than in a session: the page is
+    server-rendered, so a setting is a different URL — which also makes any view
+    shareable by pasting the address.
+    """
+    if level == "entity":
+        target = scope or await _default_scope(map_service)
+        module_map = await map_service.entity_map(target, expand_methods=expand)
+    else:
+        module_map = await map_service.map(show_tests=show_tests, show_noncode=show_noncode)
+
+    return Template(
+        "map.html",
+        context={
+            "map": module_map,
+            "project": module_map.project,
+            "active": "map",
+            "level": module_map.level,
+            "show_tests": show_tests,
+            "show_noncode": show_noncode,
+            "direction": direction if direction in {"arrows", "plain", "curved"} else "arrows",
+            "hops": hops if hops in {1, 2, 3} else 1,
+            "labels": labels if labels in {"few", "some", "all"} else "some",
+            "focus": focus,
+        },
+    )
+
+
+async def _default_scope(map_service: MapViewService) -> str:
+    """The first module to show when the entity level is opened without one."""
+    options = await map_service._scope_options()  # noqa: SLF001  # same package, one caller
+    if not options:
+        return ""
+    # Largest *production* module. The largest overall is a test file, which is a poor
+    # first thing to show someone opening the entity level.
+    production = [o for o in options if not _looks_like_test(o.id)]
+    return (production or options)[0].id
+
+
+def _looks_like_test(path: str) -> bool:
+    lowered = path.replace("\\", "/").lower()
+    return "/tests/" in f"/{lowered}" or lowered.rsplit("/", 1)[-1].startswith("test_")
 
 
 class HealthController(Controller):
