@@ -971,6 +971,19 @@ def _module_label(qn: str) -> str:
     return breadcrumb(qualified_name=qn, label="Module").short or qn
 
 
+def _doc_label(file_path: str) -> str:
+    """A documentation file's breadcrumb: its directory and its name.
+
+    Doc paths are not dotted qualified names, so the module breadcrumb logic would
+    say things like "CHANGELOG, CHANGELOG.md" — one thing twice. A root-level file
+    is just its own name, which for a README identifies plenty.
+    """
+    parts = file_path.replace("\\", "/").strip("/").split("/")
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[-2]}{SEPARATOR}{parts[-1]}"
+
+
 def _module_map_label(qn: str, file_path: str) -> str:
     """``package``, separator, ``file.py`` — the design's module-level breadcrumb.
 
@@ -1036,7 +1049,11 @@ class MapViewService:
         graph they are 64% of the picture, mirroring the production structure or
         participating in no import graph at all.
         """
-        from code_atlas.server.analysis import build_module_graph, fetch_first_hop_external  # noqa: PLC0415
+        from code_atlas.server.analysis import (  # noqa: PLC0415
+            build_module_graph,
+            fetch_doc_modules,
+            fetch_first_hop_external,
+        )
 
         unavailable = self._unsupported_reason()
         if unavailable:
@@ -1052,6 +1069,7 @@ class MapViewService:
         communities: list[CommunityRef] = []
         community_of: dict[str, int] = {}
         partition_groups: list[list[str]] = []
+        doc_group_names: dict[int, str] = {}
 
         for project in selected:
             try:
@@ -1079,6 +1097,55 @@ class MapViewService:
                 for member in members:
                     community_of[member] = base + idx
 
+            # Documentation files are DocFile/Note nodes, not Modules, so the module
+            # inventory never sees them — merged here as non-code files behind the
+            # same toggle as the CI YAML, in their own files community. A DOCUMENTS
+            # link is a structural fact; it aggregates onto the module that owns the
+            # documented entity.
+            try:
+                doc_rows, doc_links = await fetch_doc_modules(self._graph, project)
+            except Exception as exc:  # docs are additive; their failure is not the map's
+                logger.debug("Doc modules unavailable for {}: {}", project, exc)
+                doc_rows, doc_links = [], []
+            path_key = {str(info.get("file_path") or ""): prefix + qn for qn, info in module_graph.modules.items()}
+            doc_members: list[str] = []
+            for row in doc_rows:
+                path = str(row.get("file_path") or "")
+                qn = str(row.get("qn") or "") or path.replace("\\", "/").replace("/", ".")
+                key = prefix + qn
+                if not path or key in nodes_all:
+                    continue
+                nodes_all[key] = {
+                    "uid": str(row.get("uid") or ""),
+                    "name": str(row.get("name") or "") or path.rsplit("/", 1)[-1],
+                    "qn": qn,
+                    "file_path": path,
+                    "project": project,
+                    "is_doc": True,
+                }
+                path_key.setdefault(path, key)
+                doc_members.append(key)
+            for row in doc_links:
+                a = path_key.get(str(row.get("from_path") or ""))
+                b = path_key.get(str(row.get("to_path") or ""))
+                if not a or not b or a == b:
+                    continue
+                weight = float(row.get("links") or 1.0)
+                directed[a, b] = directed.get((a, b), 0.0) + weight
+                if _EV_RANK["structural"] > _EV_RANK.get(evidence.get((a, b), ""), -1):
+                    evidence[a, b] = "structural"
+                key2 = (min(a, b), max(a, b))
+                undirected[key2] = undirected.get(key2, 0.0) + weight
+            if doc_members:
+                doc_idx = len(partition_groups)
+                partition_groups.append(doc_members)
+                for member in doc_members:
+                    community_of[member] = doc_idx
+                tops = {
+                    str(nodes_all[m]["file_path"]).replace("\\", "/").strip("/").split("/", 1)[0] for m in doc_members
+                }
+                doc_group_names[doc_idx] = (prefix + tops.pop()) if len(tops) == 1 else (prefix + "documentation")
+
         # Cross-project imports appear when more than one project is loaded — the
         # modal's own promise. They are IMPORTS, so their evidence is structural.
         if multi:
@@ -1103,7 +1170,10 @@ class MapViewService:
         test_count = noncode_count = 0
         for qn, info in nodes_all.items():
             path = str(info.get("file_path") or "")
-            if _is_test_module(path, str(info.get("name") or ""), self._test_patterns):
+            if info.get("is_doc"):
+                kind_of[qn] = "noncode"
+                noncode_count += 1
+            elif _is_test_module(path, str(info.get("name") or ""), self._test_patterns):
                 kind_of[qn] = "test"
                 test_count += 1
             elif _is_noncode_module(path):
@@ -1131,7 +1201,7 @@ class MapViewService:
             communities.append(
                 CommunityRef(
                     id=idx,
-                    name=_community_label([m.split(":", 1)[-1] for m in group]),
+                    name=doc_group_names.get(idx) or _community_label([m.split(":", 1)[-1] for m in group]),
                     count=len(group),
                     color=f"var(--atlas-c{min(8, idx)})",
                     files=members_kind == {"noncode"},
@@ -1147,7 +1217,11 @@ class MapViewService:
         nodes = tuple(
             MapNode(
                 id=qn,
-                label=_module_map_label(qn.split(":", 1)[-1], str(nodes_all[qn].get("file_path") or "")),
+                label=(
+                    _doc_label(str(nodes_all[qn].get("file_path") or ""))
+                    if nodes_all[qn].get("is_doc")
+                    else _module_map_label(qn.split(":", 1)[-1], str(nodes_all[qn].get("file_path") or ""))
+                ),
                 community=community_of.get(qn, -1),
                 deg=degree.get(qn, 0),
                 kind=kind_of[qn],

@@ -251,6 +251,62 @@ class TestModuleLevel:
             assert 0.0 <= node.y <= 1000.0
 
 
+class TestDocFiles:
+    """Markdown docs are DocFile/Note nodes, not Modules — the map merges them."""
+
+    @staticmethod
+    def _patch_docs(monkeypatch) -> None:
+        async def _fake_docs(graph, project):
+            docs = [
+                {"uid": "u:doc", "qn": "wiki.HOME_md", "name": "HOME.md", "file_path": "wiki/HOME.md"},
+                {"uid": "u:adr", "qn": "wiki.adr.0001_md", "name": "0001.md", "file_path": "wiki/adr/0001.md"},
+            ]
+            links = [{"from_path": "wiki/HOME.md", "to_path": "src/app/core.py", "links": 3}]
+            return docs, links
+
+        monkeypatch.setattr("code_atlas.server.analysis.fetch_doc_modules", _fake_docs)
+
+    async def test_docs_hide_behind_the_noncode_toggle_and_are_counted(self, monkeypatch):
+        modules = _modules("app.core")
+        modules["app.core"]["file_path"] = "src/app/core.py"
+        _patch(monkeypatch, ModuleGraph(modules=modules, edges={}, directed={}, partition=[["app.core"]]))
+        self._patch_docs(monkeypatch)
+
+        hidden = await _service().map()
+        shown = await _service().map(show_noncode=True)
+
+        assert hidden.noncode_count == 2
+        assert {n.id for n in hidden.nodes} == {"app.core"}
+        drawn = {n.id: n for n in shown.nodes}
+        assert "wiki.HOME_md" in drawn
+        assert drawn["wiki.HOME_md"].kind == "noncode"
+
+    async def test_a_documents_link_is_a_structural_edge_onto_the_owning_module(self, monkeypatch):
+        modules = _modules("app.core")
+        modules["app.core"]["file_path"] = "src/app/core.py"
+        _patch(monkeypatch, ModuleGraph(modules=modules, edges={}, directed={}, partition=[["app.core"]]))
+        self._patch_docs(monkeypatch)
+
+        result = await _service().map(show_noncode=True)
+
+        pairs = {(e.s, e.t): e for e in result.edges}
+        assert ("wiki.HOME_md", "app.core") in pairs
+        assert pairs[("wiki.HOME_md", "app.core")].ev == "structural"
+
+    async def test_docs_form_their_own_files_community_and_the_sums_still_close(self, monkeypatch):
+        modules = _modules("app.core")
+        modules["app.core"]["file_path"] = "src/app/core.py"
+        _patch(monkeypatch, ModuleGraph(modules=modules, edges={}, directed={}, partition=[["app.core"]]))
+        self._patch_docs(monkeypatch)
+
+        result = await _service().map(show_noncode=True)
+
+        files = [c for c in result.communities if c.files]
+        assert len(files) == 1
+        assert files[0].count == 2
+        assert sum(c.count for c in result.communities) == result.module_total == 3
+
+
 class TestMultiProject:
     async def test_cross_project_imports_appear_when_both_are_loaded(self, monkeypatch):
         """The dialog's own promise: cross-project dependencies appear when more than
