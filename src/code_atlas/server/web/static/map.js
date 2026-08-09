@@ -91,6 +91,9 @@
   var state = {
     level: qs.get("level") === "entity" ? "entity" : "module",
     scope: qs.get("module") || "",
+    // null until the payload names the applied set — the defaults live server-side,
+    // and duplicating them here would let the two drift.
+    hidden: qs.has("hide") ? new Set(qs.get("hide").split(",").filter(Boolean)) : null,
     expandMethods: qs.get("expand") === "1",
     showTests: qs.has("show_tests") ? qs.get("show_tests") === "1" : localStorage.getItem("atlas.showTests") === "1",
     showNoncode: qs.has("show_noncode") ? qs.get("show_noncode") === "1" : localStorage.getItem("atlas.showNoncode") === "1",
@@ -131,12 +134,12 @@
     var p = new URLSearchParams();
     if (state.level === "entity") {
       p.set("level", "entity");
-      p.set("module", state.scope);
+      if (state.scope) p.set("module", state.scope);
       if (state.expandMethods) p.set("expand", "1");
-    } else {
-      if (state.showTests) p.set("show_tests", "1");
-      if (state.showNoncode) p.set("show_noncode", "1");
+      if (state.hidden !== null) p.set("hide", Array.from(state.hidden).sort().join(","));
     }
+    if (state.showTests) p.set("show_tests", "1");
+    if (state.showNoncode) p.set("show_noncode", "1");
     return "/map/api?" + p.toString();
   }
 
@@ -151,6 +154,7 @@
       p.set("level", "entity");
       if (state.scope) p.set("module", state.scope);
       if (state.expandMethods) p.set("expand", "1");
+      if (state.hidden !== null) p.set("hide", Array.from(state.hidden).sort().join(","));
     }
     if (state.showTests) p.set("show_tests", "1");
     if (state.showNoncode) p.set("show_noncode", "1");
@@ -177,16 +181,25 @@
       render();
       return;
     }
+    // The full-project layout takes tens of seconds the first time (cached after);
+    // an empty canvas for that long reads as broken, so say what is happening.
+    if (state.level === "entity" && !state.scope) {
+      canvasReady = false;
+      els.main.innerHTML =
+        '<div style="position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);width:min(420px,80%);background:var(--color-bg);border:1px solid var(--color-divider);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow-md)">' +
+        '<div style="' + LABEL10 + '">Computing the layout</div>' +
+        '<div style="margin-top:6px;font-size:13px;line-height:1.55">The whole project at once — position is computed from every edge, which takes tens of seconds on the first load and is cached afterwards.</div>' +
+        "</div>";
+    }
     fetch(url)
       .then(function (r) { return r.json(); })
       .then(function (data) {
         cache[url] = data;
         D = data;
-        // Opening the entity level without a scope lets the server pick one; the
-        // rail's selector must then show the scope actually drawn.
-        if (data.level === "entity" && data.scope && state.scope !== data.scope) {
-          state.scope = data.scope;
-          syncUrl();
+        // The server names the hidden set it actually applied (its defaults, when
+        // the request stayed silent); the rail's toggles render from that truth.
+        if (data.level === "entity" && state.hidden === null) {
+          state.hidden = new Set(data.hidden_kinds || []);
         }
         render();
       })
@@ -341,18 +354,26 @@
     var mapSummary, levelNote;
     if (entity) {
       var drawnN = (D.nodes || []).length;
+      var fullScope = !state.scope;
+      var holder = fullScope ? "the project's" : "this module's";
       mapSummary = drawnN === D.in_module
         ? D.in_module + " entities · " + (D.edges || []).length + " edges"
-        : "Drawing " + drawnN + " of this module's " + D.in_module + " entities · " + (D.edges || []).length + " edges";
+        : "Drawing " + drawnN + " of " + holder + " " + fmt(D.in_module) + " entities · " + fmt((D.edges || []).length) + " edges";
       var methodTally = (D.tally || []).filter(function (t) { return t.id === "method"; })[0];
       var methods = methodTally ? methodTally.in_module : 0;
+      var hiddenTotal = (D.tally || []).reduce(function (a, t) {
+        return a + ((state.hidden && state.hidden.has(t.id)) ? t.in_module : 0);
+      }, 0);
       levelNote =
-        "Each node is an entity as the graph stores it — silhouette and colour both carry kind. This module holds " +
-        D.in_module + " of the " + fmt(D.entity_total) + " entities indexed across " + D.module_total + " modules." +
-        (D.truncated ? " Above the 1,500-node cap the map truncates; it is drawing its " + drawnN + " most connected." : "") +
+        "Each node is an entity as the graph stores it — silhouette and colour both carry kind. " +
+        (fullScope
+          ? "The whole index at once: " + fmt(D.in_module) + " entities across " + D.module_total + " modules."
+          : "This module holds " + D.in_module + " of the " + fmt(D.entity_total) + " entities indexed across " + D.module_total + " modules.") +
         (D.collapsed && methods
-          ? " Its " + methods + " methods are folded into the classes that hold them — a class's size is how many it holds, and calls into a method are drawn to its class."
-          : "");
+          ? " " + fmt(methods) + " methods are folded into the classes that hold them — a class's size is how many it holds, and calls into a method are drawn to its class."
+          : "") +
+        (hiddenTotal ? " " + fmt(hiddenTotal) + " entities are hidden by the kind filters below, counted on their rows." : "") +
+        (D.truncated ? " Above the " + fmt(4000) + "-node cap the map truncates; it is drawing the " + fmt(drawnN) + " most connected." : "");
     } else {
       mapSummary = moduleTotal + " modules · " + D.edge_total + " edges · " + comms.length + " communities";
       levelNote =
@@ -368,6 +389,7 @@
         '<div style="margin-top:10px">' +
         '<div style="' + LABEL10 + ';margin-bottom:5px">Scope</div>' +
         '<select class="input" id="scope-select" style="height:30px;min-height:30px;font-size:12px;padding:0 8px">' +
+        '<option value=""' + (state.scope ? "" : " selected") + ">Whole project</option>" +
         (D.scope_options || []).map(function (o) {
           return '<option value="' + esc(o.id) + '"' + (o.id === state.scope ? " selected" : "") + ">" + esc(o.label) + "</option>";
         }).join("") +
@@ -375,19 +397,23 @@
     }
     html += "</div>";
 
-    // ── Filters (module level only) ──
-    if (!entity) {
+    // ── Filters — the module level, and the full-scope entity level, which
+    // honours the same defaults ──
+    if (!entity || !state.scope) {
       var testCount = D.test_count || 0;
       var ncCount = D.noncode_count || 0;
-      var drawnNodes = (D.nodes || []).length;
+      var drawnNodes = entity ? D.in_module : (D.nodes || []).length;
       // "the most connected" only when something was actually cut — with nothing
       // truncated, what is drawn is everything the filters admit.
       var connectedNote = D.truncated ? " — the most connected." : ".";
+      var unitWord = entity ? "entities" : "modules";
+      var unitTotal = entity ? D.in_module + testCount + ncCount : moduleTotal;
       var hiddenNote = (state.showTests && state.showNoncode)
-        ? "Drawing " + drawnNodes + " of " + moduleTotal + " indexed files" + connectedNote
-        : "Drawing " + drawnNodes + " of " + moduleTotal + " modules" + connectedNote + " " +
-          (state.showTests ? "" : testCount + " tests ") + (!state.showTests && !state.showNoncode ? "and " : "") +
-          (state.showNoncode ? "" : ncCount + " non-code files ") + "are hidden by the filters above.";
+        ? "Drawing " + fmt(drawnNodes) + " of " + fmt(unitTotal) + " indexed " + (entity ? "entities" : "files") + connectedNote
+        : "Drawing " + fmt(drawnNodes) + " of " + fmt(unitTotal) + " " + unitWord + connectedNote + " " +
+          (state.showTests ? "" : fmt(testCount) + " test " + unitWord + " ") + (!state.showTests && !state.showNoncode ? "and " : "") +
+          (state.showNoncode ? "" : fmt(ncCount) + " non-code " + unitWord + " ") + "are hidden by the filters above." +
+          (entity && D.collapsed ? " Folded methods and filtered kinds are counted below." : "");
       html +=
         '<section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">' +
         '<div style="' + LABEL10 + ';margin-bottom:8px">Filters</div>' +
@@ -426,16 +452,27 @@
           var sw = SHAPE_SWATCH[kind.shape] || SHAPE_SWATCH.circle;
           var fill = sw.fill === "transparent" ? "transparent" : KIND_COLOR[t.id];
           var border = sw.border === "0" ? "0" : sw.border.replace("var(--color-text)", KIND_COLOR[t.id]);
-          var drawnNote = t.drawn === t.in_module ? "" : (t.drawn ? t.drawn + " drawn" : "collapsed");
-          return (
-            '<div style="display:flex;align-items:center;gap:10px;padding:4px 0;font-size:12px;opacity:' + (t.drawn ? 1 : 0.5) + '">' +
+          // The skeleton kinds are not toggleable: containers anchor everything,
+          // classes are the fold target, and methods have their own toggle above.
+          var toggleable = ["module", "package", "class", "method"].indexOf(t.id) < 0;
+          var isHidden = state.hidden && state.hidden.has(t.id);
+          var drawnNote = isHidden ? "hidden"
+            : t.drawn === t.in_module ? ""
+            : t.id === "method" && D.collapsed ? "collapsed"
+            : t.drawn ? t.drawn + " drawn" : "not drawn";
+          var swatch =
             '<span style="width:14px;display:flex;justify-content:center;flex:none">' +
             '<span style="width:' + sw.w + "px;height:" + sw.h + "px;border-radius:" + sw.radius + ";rotate:" + sw.rot + ";background:" + fill + ";border:" + border + ';display:block"></span>' +
             "</span>" +
             '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(kind.label) + "</span>" +
             '<span style="font-size:10.5px;color:color-mix(in srgb, var(--color-text) 45%, transparent)">' + drawnNote + "</span>" +
-            '<span style="font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + t.in_module + "</span>" +
-            "</div>"
+            '<span style="font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + fmt(t.in_module) + "</span>";
+          if (!toggleable) {
+            return '<div style="display:flex;align-items:center;gap:10px;padding:4px 0;font-size:12px;opacity:' + (t.drawn ? 1 : 0.5) + '">' + swatch + "</div>";
+          }
+          return (
+            '<button data-kind-toggle="' + t.id + '" class="hv6" title="' + (isHidden ? "Show" : "Hide") + " " + esc(kind.label.toLowerCase()) + 's" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:4px 0;cursor:pointer;color:inherit;font:inherit;font-size:12px;text-align:left;opacity:' + (isHidden ? 0.5 : 1) + '">' +
+            swatch + "</button>"
           );
         }).join("") +
         '<div style="margin-top:8px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Silhouette and colour both carry kind — every entity in one module shares its community, so colour is free here. Dashed means the entity sits outside the index.</div>' +
@@ -716,14 +753,14 @@
       var id = node ? node.getAttribute("data-node") : null;
       if (state.hover !== id) {
         state.hover = id;
-        renderCanvasContents();
+        restyleHover();
       }
     });
     // Leaving the frame entirely — including out of the window — always clears.
     els.main.addEventListener("mouseleave", function () {
       if (state.hover !== null) {
         state.hover = null;
-        renderCanvasContents();
+        restyleHover();
       }
     });
   }
@@ -813,11 +850,16 @@
     applyTransform();
   }
 
-  function renderCanvasContents() {
-    if (!D || D.unavailable) return;
+  // The scene: everything a hover cannot change, plus references to the drawn
+  // elements. Hover restyles the scene in place — at full scope a DOM rebuild per
+  // pointer movement would cost hundreds of milliseconds; a style pass costs a few.
+  var scene = null;
+  var CHIP_BUDGET = 140;
+
+  function buildStatics() {
     var layer = layerEl();
     var inner = innerEl();
-    if (!layer || !inner) return;
+    if (!layer || !inner) return null;
 
     var ns = D.nodes || [];
     var es = D.edges || [];
@@ -826,21 +868,95 @@
     var pos = {};
     ns.forEach(function (n) { pos[n.id] = { x: n.x, y: n.y }; });
 
-    var sel = state.selected;
+    var box = inner.getBoundingClientRect();
+    var CW = box.width, CH = box.height;
+    // Node size is relative to the space each node actually gets, so a dense
+    // graph draws smaller marks instead of overlapping ones.
+    var pitch = (CW > 0 && ns.length) ? Math.sqrt((CW * CH) / ns.length) : 40;
+    var maxDeg = ns.reduce(function (m, n) { return Math.max(m, n.deg); }, 1);
+    var rCap = Math.max(5, Math.min(14, pitch * 0.28));
+    var radius = function (n) { return 2.6 + (rCap - 2.6) * Math.sqrt(n.deg / maxDeg); };
+    var edgeColor = function (id) {
+      return state.level === "entity"
+        ? (KIND_COLOR[ids[id] && ids[id].kind] || "var(--atlas-c8)")
+        : nodeColor(ids[id], comms);
+    };
+    var SX = CW > 0 ? CW / S : 1, SY = CH > 0 ? CH / S : 1;
+
+    var E = es.map(function (e, i) {
+      var a = pos[e.s], b = pos[e.t];
+      if (!a || !b) return null;
+      var ev = e.ev || "unknown";
+      var cross = state.level !== "entity" && ids[e.s] && ids[e.t] && ids[e.s].community !== ids[e.t].community;
+      return {
+        i: i, s: e.s, t: e.t, ev: ev, defines: e.rel === "defines",
+        weight: EW[ev] * (0.7 + e.w * 0.1),
+        cross: cross,
+        baseColor: cross ? "var(--color-text)" : edgeColor(e.s),
+        baseDash: ev === "guessed" ? "5 4" : ev === "unknown" ? "1.5 5" : "none",
+        x1: a.x * SX, y1: a.y * SY, x2: b.x * SX, y2: b.y * SY,
+        rt: ids[e.t] ? radius(ids[e.t]) : 4, rs: ids[e.s] ? radius(ids[e.s]) : 4,
+      };
+    }).filter(Boolean);
+
+    // Ranked, not thresholded: degrees are quantized, so a degree cut-off can
+    // admit everything at one level and nothing at another.
+    var ranked = ns.slice().sort(function (a, b) { return b.deg - a.deg || a.id.localeCompare(b.id); });
+    var share = state.labels === "all" ? 1 : state.labels === "some" ? 0.6 : 0.25;
+    var eligible = new Set(ranked.slice(0, Math.max(3, Math.round(ranked.length * share))).map(function (n) { return n.id; }));
+
+    // Node discs in a coarse grid, so a label seat checks a handful of nearby
+    // discs instead of every node on the map.
+    var discs = CW > 0 ? ns.map(function (n) {
+      var r = radius(n);
+      var cx = pos[n.id].x / S * CW, cy = pos[n.id].y / S * CH;
+      return { id: n.id, l: cx - r, t: cy - r, r: cx + r, b: cy + r };
+    }) : [];
+    var CELL = 64;
+    var discGrid = new Map();
+    discs.forEach(function (d, idx) {
+      for (var gx = Math.floor(d.l / CELL); gx <= Math.floor(d.r / CELL); gx++) {
+        for (var gy = Math.floor(d.t / CELL); gy <= Math.floor(d.b / CELL); gy++) {
+          var key = gx + "," + gy;
+          var bucket = discGrid.get(key);
+          if (!bucket) discGrid.set(key, (bucket = []));
+          bucket.push(idx);
+        }
+      }
+    });
+
+    return {
+      layer: layer, ns: ns, es: es, ids: ids, comms: comms, pos: pos,
+      CW: CW, CH: CH, radius: radius, eligible: eligible,
+      discs: discs, discGrid: discGrid, CELL: CELL,
+      // Past ~1,200 edges the resting field attenuates so structure reads as
+      // texture; anything highlighted (hover, selection, path) stays at full
+      // strength — the isolation is the answer, the field is the context.
+      density: Math.min(1, Math.sqrt(1200 / Math.max(1, E.length))),
+      tight: CW < 420, mode: state.direction, E: E,
+      sel: state.selected, focus: state.level === "entity" ? -1 : state.focus,
+      edgeEls: null, gradEls: null, arrowEls: null, nodeEls: null, ringEls: null,
+      labelsHost: null, leadersHost: null,
+    };
+  }
+
+  // Everything the hover CAN change: the isolation sets and the (possibly
+  // previewed) path. Recomputed per pointer move, applied by restyleHover.
+  function hoverCtx(st) {
+    var sel = st.sel;
     var active = state.hover || sel;
-    var focus = state.level === "entity" ? -1 : state.focus;
 
     // Downstream travels: what this node depends on, and what those depend on in
     // turn, expands to the full hop setting. What depends on the node is shown one
-    // hop only — following it further answers a different question.
+    // hop only — following it further answers a different question. Containment
+    // edges are excluded: the module defines everything, so walking them would
+    // light the whole scope and the isolation would show nothing.
     var nbr = new Set();
     var dist = new Map();
     var depth = Math.max(1, Math.min(4, state.hops));
     if (active) {
       nbr.add(active); dist.set(active, 0);
-      // Containment edges are excluded: the module defines everything, so walking
-      // them would light the whole scope and the isolation would show nothing.
-      var deps = es.filter(function (e) { return e.rel !== "defines"; });
+      var deps = st.es.filter(function (e) { return e.rel !== "defines"; });
       var frontier = [active];
       for (var d = 0; d < depth; d++) {
         var next = [];
@@ -861,9 +977,7 @@
       var dd = dist.has(id) ? dist.get(id) : 99;
       return HOP_FADE[Math.min(4, dd)] != null && dd <= 4 ? HOP_FADE[Math.min(4, dd)] : 0.13;
     };
-    // A selection keeps its neighbourhood isolated — the highlight should not
-    // vanish the moment the pointer moves on. A hover retargets the isolation.
-    var dimming = !!active;
+
     var path = pathSets();
     // With a selection (or an armed "Path to…"), hovering another node previews
     // the route between them before any click commits it.
@@ -877,252 +991,356 @@
         path = { nodes: pn, edges: pe, hops: previewHops };
       }
     }
-    var pathing = path.nodes.size > 0;
 
-    // Ranked, not thresholded: degrees are quantized, so a degree cut-off can
-    // admit everything at one level and nothing at another.
-    var ranked = ns.slice().sort(function (a, b) { return b.deg - a.deg || a.id.localeCompare(b.id); });
-    var share = state.labels === "all" ? 1 : state.labels === "some" ? 0.6 : 0.25;
-    var eligible = new Set(ranked.slice(0, Math.max(3, Math.round(ranked.length * share))).map(function (n) { return n.id; }));
-
-    var box = inner.getBoundingClientRect();
-    var CW = box.width, CH = box.height;
-    // Node size is relative to the space each node actually gets, so a dense
-    // graph draws smaller marks instead of overlapping ones.
-    var pitch = (CW > 0 && ns.length) ? Math.sqrt((CW * CH) / ns.length) : 40;
-    var maxDeg = ns.reduce(function (m, n) { return Math.max(m, n.deg); }, 1);
-    var rCap = Math.max(5, Math.min(14, pitch * 0.28));
-    var radius = function (n) { return 2.6 + (rCap - 2.6) * Math.sqrt(n.deg / maxDeg); };
-    var edgeColor = function (id) {
-      return state.level === "entity"
-        ? (KIND_COLOR[ids[id] && ids[id].kind] || "var(--atlas-c8)")
-        : nodeColor(ids[id], comms);
+    return {
+      sel: sel, active: active, nbr: nbr, hopOpacity: hopOpacity,
+      // A selection keeps its neighbourhood isolated — the highlight should not
+      // vanish the moment the pointer moves on. A hover retargets the isolation.
+      dimming: !!active,
+      path: path, pathing: path.nodes.size > 0,
     };
-    var mode = state.direction;
-    var SX = CW > 0 ? CW / S : 1, SY = CH > 0 ? CH / S : 1;
+  }
 
-    var E = es.map(function (e, i) {
-      var a = pos[e.s], b = pos[e.t];
-      if (!a || !b) return null;
-      var ev = e.ev || "unknown";
-      var cross = state.level !== "entity" && ids[e.s] && ids[e.t] && ids[e.s].community !== ids[e.t].community;
-      var weight = EW[ev] * (0.7 + e.w * 0.1);
-      var onPath = path.edges.has(e.s + "|" + e.t) || path.edges.has(e.t + "|" + e.s);
-      var rel = dimming
-        ? (nbr.has(e.s) && nbr.has(e.t) ? Math.min(hopOpacity(e.s), hopOpacity(e.t)) : 0.05)
-        : 1;
-      var fo = focus >= 0
-        ? ((ids[e.s].community === focus && ids[e.t].community === focus) ? 1
-          : (ids[e.s].community === focus || ids[e.t].community === focus) ? 0.45 : 0.05)
-        : 1;
-      // Containment is scaffolding, not signal: a fixed hairline at low opacity,
-      // whatever the direction mode, so a dense scope's call graph stays readable.
-      var defines = e.rel === "defines";
-      return {
-        id: "e" + i, ev: ev, weight: weight, onPath: onPath, defines: defines,
-        dash: defines ? "none" : ev === "guessed" ? "5 4" : ev === "unknown" ? "1.5 5" : "none",
-        w: defines ? 0.5 : pathing && onPath ? 2.6 : 0.5 + weight * 2.4,
-        color: pathing && onPath ? "var(--color-accent)" : cross ? "var(--color-text)" : edgeColor(e.s),
-        o: defines
-          ? (pathing ? 0.04 : 0.1 * rel * fo)
-          : pathing ? (onPath ? 1 : 0.07) : ((cross ? 0.24 : 0.14) + weight * 0.5) * rel * fo,
-        x1: a.x * SX, y1: a.y * SY, x2: b.x * SX, y2: b.y * SY,
-        rt: ids[e.t] ? radius(ids[e.t]) : 4, rs: ids[e.s] ? radius(ids[e.s]) : 4,
-      };
-    }).filter(Boolean);
+  // Containment is scaffolding, not signal: a fixed hairline at low opacity,
+  // whatever the direction mode, so a dense scope's call graph stays readable.
+  function edgeDyn(st, ctx, e) {
+    var onPath = ctx.path.edges.has(e.s + "|" + e.t) || ctx.path.edges.has(e.t + "|" + e.s);
+    var rel = ctx.dimming
+      ? (ctx.nbr.has(e.s) && ctx.nbr.has(e.t) ? Math.min(ctx.hopOpacity(e.s), ctx.hopOpacity(e.t)) : 0.05)
+      : 1;
+    var fo = st.focus >= 0
+      ? ((st.ids[e.s].community === st.focus && st.ids[e.t].community === st.focus) ? 1
+        : (st.ids[e.s].community === st.focus || st.ids[e.t].community === st.focus) ? 0.45 : 0.05)
+      : 1;
+    return {
+      onPath: onPath,
+      w: e.defines ? 0.5 : ctx.pathing && onPath ? 2.6 : 0.5 + e.weight * 2.4,
+      color: ctx.pathing && onPath ? "var(--color-accent)" : e.baseColor,
+      dash: e.defines ? "none" : st.mode === "flow" ? "7 5" : e.baseDash,
+      o: e.defines
+        ? (ctx.pathing ? 0.04 : 0.1 * rel * fo * st.density)
+        : ctx.pathing
+          ? (onPath ? 1 : 0.07)
+          : ctx.dimming && ctx.nbr.has(e.s) && ctx.nbr.has(e.t)
+            ? ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo
+            : ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo * st.density,
+    };
+  }
 
-    var edgeViewBox = CW > 0 ? "0 0 " + CW.toFixed(0) + " " + CH.toFixed(0) : "0 0 " + S + " " + S;
-    var lineMode = mode !== "taper";
+  function nodeDyn(st, ctx, n) {
+    var isSel = n.id === ctx.sel;
+    var isHot = isSel || n.id === state.hover;
+    var o = 1;
+    if (ctx.pathing) o = ctx.path.nodes.has(n.id) ? 1 : 0.1;
+    else if (st.focus >= 0 && n.community !== st.focus) o = 0.12;
+    else if (ctx.dimming) o = ctx.nbr.has(n.id) ? ctx.hopOpacity(n.id) : 0.13;
+    return {
+      o: o, z: isHot ? 3 : 1, hot: isHot,
+      ring: (isSel || (ctx.pathing && ctx.path.nodes.has(n.id))) ? "0 0 0 3px var(--color-accent)" : "none",
+    };
+  }
 
-    var svgParts = ['<svg viewBox="' + edgeViewBox + '" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%;display:block;overflow:visible">'];
-    if (mode === "fade" && CW > 0) {
-      svgParts.push("<defs>");
-      E.forEach(function (e) {
-        if (e.onPath || e.defines) return;
-        svgParts.push(
-          '<linearGradient id="g' + e.id + '" gradientUnits="userSpaceOnUse" x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) + '">' +
-          '<stop offset="0%" stop-color="' + e.color + '" stop-opacity="' + (e.o * 0.15).toFixed(3) + '"></stop>' +
-          '<stop offset="100%" stop-color="' + e.color + '" stop-opacity="' + Math.min(1, e.o * 1.5).toFixed(3) + '"></stop>' +
-          "</linearGradient>"
-        );
-      });
-      svgParts.push("</defs>");
-    }
-    if (lineMode) {
-      E.forEach(function (e) {
-        var stroke = mode === "fade" && !e.onPath && !e.defines ? "url(#g" + e.id + ")" : e.color;
-        var o = mode === "fade" && !e.onPath && !e.defines ? 1 : e.o.toFixed(3);
-        var dash = e.defines ? "none" : mode === "flow" ? "7 5" : e.dash;
-        var anim = mode === "flow" && !e.defines && e.o > 0.12 ? "atlas-flow " + (1.6 + (1 - e.weight) * 1.6).toFixed(2) + "s linear infinite" : "none";
-        svgParts.push(
-          '<line x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) +
-          '" vector-effect="non-scaling-stroke" style="stroke:' + stroke + ";stroke-width:" + e.w + "px;stroke-dasharray:" + dash + ";opacity:" + o + ";stroke-linecap:round;animation:" + anim + '"></line>'
-        );
-      });
-    } else if (CW > 0) {
-      E.forEach(function (e) {
-        // Taper mode draws wedges for dependencies; scaffolding stays a hairline.
-        if (e.defines) {
-          svgParts.push(
-            '<line x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) +
-            '" vector-effect="non-scaling-stroke" style="stroke:' + e.color + ";stroke-width:0.5px;opacity:" + e.o.toFixed(3) + '"></line>'
-          );
-          return;
-        }
-        var dx = e.x2 - e.x1, dy = e.y2 - e.y1;
-        var len = Math.hypot(dx, dy) || 1;
-        var nx = -dy / len, ny = dx / len;
-        var hs = (e.w * 1.9) / 2, ht = 0.35;
-        var tx2 = e.x2 - (dx / len) * (e.rt + 1), ty2 = e.y2 - (dy / len) * (e.rt + 1);
-        var p = function (x, y) { return x.toFixed(1) + "," + y.toFixed(1); };
-        svgParts.push(
-          '<polygon points="' +
-          [p(e.x1 + nx * hs, e.y1 + ny * hs), p(tx2 + nx * ht, ty2 + ny * ht), p(tx2 - nx * ht, ty2 - ny * ht), p(e.x1 - nx * hs, e.y1 - ny * hs)].join(" ") +
-          '" style="fill:' + e.color + ";opacity:" + Math.min(1, e.o * 1.25).toFixed(3) + '"></polygon>'
-        );
-      });
-    }
-    svgParts.push("</svg>");
-
-    // Direction: a small arrowhead just short of the target node. Drawn in the
-    // measured pixel space (not the stretched SVG) so it never skews.
-    var arrowParts = [];
-    if ((mode === "arrows" || (pathing && mode !== "taper")) && CW > 0) {
-      E.forEach(function (e) {
-        if (e.defines || e.o < 0.09) return;
-        if (mode !== "arrows" && !e.onPath) return;
-        var dx = e.x2 - e.x1, dy = e.y2 - e.y1;
-        var len = Math.hypot(dx, dy) || 1;
-        arrowParts.push(
-          '<div style="position:absolute;left:' + (e.x2 - (dx / len) * (e.rt + 5)).toFixed(1) + "px;top:" + (e.y2 - (dy / len) * (e.rt + 5)).toFixed(1) +
-          "px;width:9px;height:7px;background:" + e.color + ";opacity:" + Math.min(1, e.o + 0.15).toFixed(2) +
-          ";transform:translate(-50%,-50%) rotate(" + (Math.atan2(dy, dx) * 180 / Math.PI).toFixed(1) + "deg);clip-path:polygon(100% 50%, 0 0, 0 100%);pointer-events:none\"></div>"
-        );
-      });
-    }
-
-    // ── Labels: rank order, four adjacent seats, then the outward search ──
-    var discs = CW > 0 ? ns.map(function (n) {
-      var r = radius(n);
-      var cx = pos[n.id].x / S * CW, cy = pos[n.id].y / S * CH;
-      return { id: n.id, l: cx - r, t: cy - r, r: cx + r, b: cy + r };
-    }) : [];
+  // ── Labels: rank order, four adjacent seats, then the outward search — with
+  // a hard chip budget so a thousand-node scope pays for the labels it can
+  // actually fit, not for a seat search over every candidate.
+  function labelChips(st, ctx) {
+    var chips = [];
+    if (st.CW < 200 || st.CH < 160) return chips;
     var hit = function (a, b) { return a.l < b.r && a.r > b.l && a.t < b.b && a.b > b.t; };
     var area = function (b) { return Math.max(1, (b.r - b.l) * (b.b - b.t)); };
     var overlapArea = function (a, b) {
       return Math.max(0, Math.min(a.r, b.r) - Math.max(a.l, b.l)) * Math.max(0, Math.min(a.b, b.b) - Math.max(a.t, b.t));
     };
+    var discHit = function (rect, selfId) {
+      for (var gx = Math.floor(rect.l / st.CELL); gx <= Math.floor(rect.r / st.CELL); gx++) {
+        for (var gy = Math.floor(rect.t / st.CELL); gy <= Math.floor(rect.b / st.CELL); gy++) {
+          var bucket = st.discGrid.get(gx + "," + gy);
+          if (!bucket) continue;
+          for (var bi = 0; bi < bucket.length; bi++) {
+            var d2 = st.discs[bucket[bi]];
+            if (d2.id !== selfId && overlapArea(rect, d2) > 0.22 * area(d2)) return true;
+          }
+        }
+      }
+      return false;
+    };
 
-    var order = ns.slice().sort(function (a, b) {
-      var av = (a.id === active ? 2 : nbr.has(a.id) ? 1 : 0), bv = (b.id === active ? 2 : nbr.has(b.id) ? 1 : 0);
+    var order = st.ns.slice().sort(function (a, b) {
+      var av = (a.id === ctx.active ? 2 : ctx.nbr.has(a.id) ? 1 : 0);
+      var bv = (b.id === ctx.active ? 2 : ctx.nbr.has(b.id) ? 1 : 0);
       return bv - av || b.deg - a.deg;
     });
-    var chips = [];
-    // Below ~420px of canvas the graph is too dense for breadcrumbs; only the
-    // node under the cursor (or selected) is labelled there.
-    var tight = CW < 420;
-    if (CW >= 200 && CH >= 160) {
-      order.forEach(function (n) {
-        var r = radius(n);
-        var interesting = pathing ? path.nodes.has(n.id)
-          : tight ? n.id === active
-          : ((active && nbr.has(n.id)) || n.id === sel || eligible.has(n.id));
-        if (!interesting) return;
-        var w = Math.min(160, Math.max(96, n.label.length * 6.2 + 12));
-        if (w > CW - 8) return;
-        var cx = pos[n.id].x / S * CW, cy = pos[n.id].y / S * CH;
-        var H = 17;
-        // Seats are tried adjacent first, then pushed outward along the vector
-        // away from the graph's centre. Without the outward ring the densest
-        // nodes — which are exactly the hubs — find every adjacent seat taken
-        // and get dropped, handing the label quota to the periphery.
-        var ax = cx - CW / 2, ay = cy - CH / 2;
-        var alen = Math.hypot(ax, ay) || 1;
-        ax /= alen; ay /= alen;
-        var seats = [
-          { l: cx - w / 2, t: cy + r + 5 },
-          { l: cx - w / 2, t: cy - r - 5 - H },
-          { l: cx + r + 6, t: cy - H / 2 },
-          { l: cx - r - 6 - w, t: cy - H / 2 },
-        ];
-        for (var step = 1; step <= 7; step++) {
-          var dd = r + 10 + step * 16;
-          [0, 0.5, -0.5, 1, -1, 1.6, -1.6].forEach(function (a) {
-            var ux = ax * Math.cos(a) - ay * Math.sin(a);
-            var uy = ax * Math.sin(a) + ay * Math.cos(a);
-            seats.push({ l: cx + ux * dd - w / 2, t: cy + uy * dd - H / 2, far: true });
-          });
-        }
-        for (var si = 0; si < seats.length; si++) {
-          var seat = seats[si];
-          var l = Math.max(2, Math.min(CW - w - 2, seat.l));
-          var t = Math.max(2, Math.min(CH - H, seat.t));
-          var rect = { l: l, t: t, r: l + w, b: t + H };
-          var pad = { l: l - 3, t: t - 3, r: l + w + 3, b: t + H + 3 };
-          if (chips.some(function (c) { return hit(pad, c.rect); })) continue;
-          // The chip is opaque and painted above the discs, so a graze is
-          // legible; only a real collision with a node's core disqualifies it.
-          if (!tight && discs.some(function (d2) { return d2.id !== n.id && overlapArea(rect, d2) > 0.22 * area(d2); })) continue;
-          // A chip that had to move away from its node gets a leader line, so
-          // the association stays unambiguous.
-          var mx = l + w / 2, my = t + H / 2;
-          var far = seat.far && Math.hypot(mx - cx, my - cy) > r + 14;
-          chips.push({ n: n, rect: rect, w: w, leader: far ? { cx: cx, cy: cy, mx: mx, my: my, r: r } : null });
-          return;
-        }
-      });
+
+    for (var oi = 0; oi < order.length; oi++) {
+      if (chips.length >= CHIP_BUDGET) break;
+      var n = order[oi];
+      var r = st.radius(n);
+      // Below ~420px of canvas the graph is too dense for breadcrumbs; only the
+      // node under the cursor (or selected) is labelled there.
+      var interesting = ctx.pathing ? ctx.path.nodes.has(n.id)
+        : st.tight ? n.id === ctx.active
+        : ((ctx.active && ctx.nbr.has(n.id)) || n.id === ctx.sel || st.eligible.has(n.id));
+      if (!interesting) continue;
+      var w = Math.min(160, Math.max(96, n.label.length * 6.2 + 12));
+      if (w > st.CW - 8) continue;
+      var cx = st.pos[n.id].x / S * st.CW, cy = st.pos[n.id].y / S * st.CH;
+      var H = 17;
+      // Seats are tried adjacent first, then pushed outward along the vector
+      // away from the graph's centre. Without the outward ring the densest
+      // nodes — which are exactly the hubs — find every adjacent seat taken
+      // and get dropped, handing the label quota to the periphery.
+      var ax = cx - st.CW / 2, ay = cy - st.CH / 2;
+      var alen = Math.hypot(ax, ay) || 1;
+      ax /= alen; ay /= alen;
+      var seats = [
+        { l: cx - w / 2, t: cy + r + 5 },
+        { l: cx - w / 2, t: cy - r - 5 - H },
+        { l: cx + r + 6, t: cy - H / 2 },
+        { l: cx - r - 6 - w, t: cy - H / 2 },
+      ];
+      for (var step = 1; step <= 7; step++) {
+        var dd = r + 10 + step * 16;
+        [0, 0.5, -0.5, 1, -1, 1.6, -1.6].forEach(function (a) {
+          var ux = ax * Math.cos(a) - ay * Math.sin(a);
+          var uy = ax * Math.sin(a) + ay * Math.cos(a);
+          seats.push({ l: cx + ux * dd - w / 2, t: cy + uy * dd - H / 2, far: true });
+        });
+      }
+      for (var si = 0; si < seats.length; si++) {
+        var seat = seats[si];
+        var l = Math.max(2, Math.min(st.CW - w - 2, seat.l));
+        var t = Math.max(2, Math.min(st.CH - H, seat.t));
+        var rect = { l: l, t: t, r: l + w, b: t + H };
+        var pad = { l: l - 3, t: t - 3, r: l + w + 3, b: t + H + 3 };
+        if (chips.some(function (c) { return hit(pad, c.rect); })) continue;
+        // The chip is opaque and painted above the discs, so a graze is
+        // legible; only a real collision with a node's core disqualifies it.
+        if (!st.tight && discHit(rect, n.id)) continue;
+        // A chip that had to move away from its node gets a leader line, so
+        // the association stays unambiguous.
+        var mx = l + w / 2, my = t + H / 2;
+        var far = seat.far && Math.hypot(mx - cx, my - cy) > r + 14;
+        chips.push({ n: n, rect: rect, w: w, leader: far ? { cx: cx, cy: cy, mx: mx, my: my, r: r } : null });
+        break;
+      }
     }
+    return chips;
+  }
 
-    var nodeParts = ns.map(function (n) {
-      var r = radius(n);
-      var c = nodeColor(n, comms);
-      var isSel = n.id === sel;
-      var isHot = isSel || n.id === state.hover;
-      var o = 1;
-      if (pathing) o = path.nodes.has(n.id) ? 1 : 0.1;
-      else if (focus >= 0 && n.community !== focus) o = 0.12;
-      else if (dimming) o = nbr.has(n.id) ? hopOpacity(n.id) : 0.13;
-      var onPath = pathing && path.nodes.has(n.id);
-      var sh = SHAPES(n, c, r);
-      return (
-        '<div data-node="' + esc(n.id) + '" style="position:absolute;left:' + (pos[n.id].x / S * 100).toFixed(2) + "%;top:" + (pos[n.id].y / S * 100).toFixed(2) +
-        "%;display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;opacity:" + o.toFixed(2) + ";z-index:" + (isHot ? 3 : 1) +
-        ';transform:translate(-50%,-50%)">' +
-        '<span style="width:' + sh.w + "px;height:" + sh.h + "px;flex:none;border-radius:" + sh.radius + ";rotate:" + sh.rot +
-        ";display:block;background:" + sh.fill + ";border:" + sh.border + ";box-shadow:" + ((isSel || onPath) ? "0 0 0 3px var(--color-accent)" : "none") + '"></span>' +
-        "</div>"
-      );
-    });
-
-    var leaderParts = ['<svg style="position:absolute;inset:0;width:100%;height:100%;display:block;overflow:visible;pointer-events:none;z-index:2">'];
+  function leadersHtml(st, ctx, chips) {
+    var parts = ['<svg style="position:absolute;inset:0;width:100%;height:100%;display:block;overflow:visible;pointer-events:none;z-index:2">'];
     chips.forEach(function (c) {
       if (!c.leader) return;
       var dx = c.leader.mx - c.leader.cx, dy = c.leader.my - c.leader.cy;
       var len = Math.hypot(dx, dy) || 1;
-      leaderParts.push(
+      parts.push(
         '<line x1="' + (c.leader.cx + (dx / len) * c.leader.r).toFixed(1) + '" y1="' + (c.leader.cy + (dy / len) * c.leader.r).toFixed(1) +
         '" x2="' + (c.leader.mx - (dx / len) * 3).toFixed(1) + '" y2="' + (c.leader.my - (dy / len) * 3).toFixed(1) +
         '" vector-effect="non-scaling-stroke" style="stroke:var(--color-text);stroke-width:1px;opacity:' +
-        ((c.n.id === sel || c.n.id === state.hover) ? 0.75 : 0.32) + '"></line>'
+        ((c.n.id === ctx.sel || c.n.id === state.hover) ? 0.75 : 0.32) + '"></line>'
       );
     });
-    leaderParts.push("</svg>");
+    parts.push("</svg>");
+    return parts.join("");
+  }
 
-    var labelParts = chips.map(function (c) {
-      var isHot = c.n.id === sel || c.n.id === state.hover || (pathing && path.nodes.has(c.n.id));
+  function labelsHtml(st, ctx, chips) {
+    return chips.map(function (c) {
+      var isHot = c.n.id === ctx.sel || c.n.id === state.hover || (ctx.pathing && ctx.path.nodes.has(c.n.id));
       var o = 1;
-      if (pathing) o = path.nodes.has(c.n.id) ? 1 : 0.1;
-      else if (focus >= 0 && c.n.community !== focus) o = 0.12;
-      else if (dimming) o = nbr.has(c.n.id) ? Math.max(0.45, hopOpacity(c.n.id)) : 0.13;
+      if (ctx.pathing) o = ctx.path.nodes.has(c.n.id) ? 1 : 0.1;
+      else if (st.focus >= 0 && c.n.community !== st.focus) o = 0.12;
+      else if (ctx.dimming) o = ctx.nbr.has(c.n.id) ? Math.max(0.45, ctx.hopOpacity(c.n.id)) : 0.13;
       return (
         '<div data-atlas-label="' + (isHot ? "active" : "idle") + '" style="position:absolute;left:' + c.rect.l.toFixed(1) + "px;top:" + c.rect.t.toFixed(1) +
         "px;width:" + c.w.toFixed(0) + "px;display:flex;justify-content:center;opacity:" + o.toFixed(2) + ";z-index:" + (isHot ? 4 : 2) + ';pointer-events:none">' +
         '<span style="max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left;padding:0 3px;border-radius:4px;background:color-mix(in srgb, var(--color-bg) 86%, transparent);font-size:11.5px;line-height:1.35;font-weight:' +
         (isHot ? 700 : 400) + ';color:var(--color-text);letter-spacing:-0.01em">' + esc(c.n.label) + "</span></div>"
       );
+    }).join("");
+  }
+
+  function renderCanvasContents() {
+    if (!D || D.unavailable) return;
+    var st = buildStatics();
+    if (!st) return;
+    var ctx = hoverCtx(st);
+    var mode = st.mode;
+    var CW = st.CW, CH = st.CH;
+    var E = st.E;
+
+    var edgeViewBox = CW > 0 ? "0 0 " + CW.toFixed(0) + " " + CH.toFixed(0) : "0 0 " + S + " " + S;
+    var lineMode = mode !== "taper";
+    var dyn = E.map(function (e) { return edgeDyn(st, ctx, e); });
+
+    var svgParts = ['<svg viewBox="' + edgeViewBox + '" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%;display:block;overflow:visible">'];
+    if (mode === "fade" && CW > 0) {
+      svgParts.push("<defs>");
+      E.forEach(function (e, i) {
+        if (e.defines) return;
+        svgParts.push(
+          '<linearGradient data-gi="' + i + '" id="ge' + e.i + '" gradientUnits="userSpaceOnUse" x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) + '">' +
+          '<stop offset="0%" stop-color="' + e.baseColor + '" stop-opacity="' + (dyn[i].o * 0.15).toFixed(3) + '"></stop>' +
+          '<stop offset="100%" stop-color="' + e.baseColor + '" stop-opacity="' + Math.min(1, dyn[i].o * 1.5).toFixed(3) + '"></stop>' +
+          "</linearGradient>"
+        );
+      });
+      svgParts.push("</defs>");
+    }
+    if (lineMode) {
+      E.forEach(function (e, i) {
+        var d = dyn[i];
+        var fade = mode === "fade" && !d.onPath && !e.defines;
+        var stroke = fade ? "url(#ge" + e.i + ")" : d.color;
+        var o = fade ? 1 : d.o.toFixed(3);
+        var anim = mode === "flow" && !e.defines && d.o > 0.12 ? "atlas-flow " + (1.6 + (1 - e.weight) * 1.6).toFixed(2) + "s linear infinite" : "none";
+        svgParts.push(
+          '<line data-ei="' + i + '" x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) +
+          '" vector-effect="non-scaling-stroke" style="stroke:' + stroke + ";stroke-width:" + d.w + "px;stroke-dasharray:" + d.dash + ";opacity:" + o + ";stroke-linecap:round;animation:" + anim + '"></line>'
+        );
+      });
+    } else if (CW > 0) {
+      E.forEach(function (e, i) {
+        var d = dyn[i];
+        // Taper mode draws wedges for dependencies; scaffolding stays a hairline.
+        if (e.defines) {
+          svgParts.push(
+            '<line data-ei="' + i + '" x1="' + e.x1.toFixed(1) + '" y1="' + e.y1.toFixed(1) + '" x2="' + e.x2.toFixed(1) + '" y2="' + e.y2.toFixed(1) +
+            '" vector-effect="non-scaling-stroke" style="stroke:' + d.color + ";stroke-width:0.5px;opacity:" + d.o.toFixed(3) + '"></line>'
+          );
+          return;
+        }
+        var dx = e.x2 - e.x1, dy = e.y2 - e.y1;
+        var len = Math.hypot(dx, dy) || 1;
+        var nx = -dy / len, ny = dx / len;
+        var hs = (d.w * 1.9) / 2, ht = 0.35;
+        var tx2 = e.x2 - (dx / len) * (e.rt + 1), ty2 = e.y2 - (dy / len) * (e.rt + 1);
+        var pt = function (x, y) { return x.toFixed(1) + "," + y.toFixed(1); };
+        svgParts.push(
+          '<polygon data-ei="' + i + '" points="' +
+          [pt(e.x1 + nx * hs, e.y1 + ny * hs), pt(tx2 + nx * ht, ty2 + ny * ht), pt(tx2 - nx * ht, ty2 - ny * ht), pt(e.x1 - nx * hs, e.y1 - ny * hs)].join(" ") +
+          '" style="fill:' + d.color + ";opacity:" + Math.min(1, d.o * 1.25).toFixed(3) + '"></polygon>'
+        );
+      });
+    }
+    svgParts.push("</svg>");
+
+    // Direction: a small arrowhead just short of the target node. Drawn in the
+    // measured pixel space (not the stretched SVG) so it never skews. Past two
+    // thousand edges only the well-evidenced get heads — at that density a head
+    // per edge is texture, not direction.
+    var arrowParts = [];
+    var arrowMin = E.length > 2000 ? 0.25 : 0.09;
+    if ((mode === "arrows" || (ctx.pathing && mode !== "taper")) && CW > 0) {
+      E.forEach(function (e, i) {
+        var d = dyn[i];
+        if (e.defines || d.o < arrowMin) return;
+        if (mode !== "arrows" && !d.onPath) return;
+        var dx = e.x2 - e.x1, dy = e.y2 - e.y1;
+        var len = Math.hypot(dx, dy) || 1;
+        arrowParts.push(
+          '<div data-ai="' + i + '" style="position:absolute;left:' + (e.x2 - (dx / len) * (e.rt + 5)).toFixed(1) + "px;top:" + (e.y2 - (dy / len) * (e.rt + 5)).toFixed(1) +
+          "px;width:9px;height:7px;background:" + d.color + ";opacity:" + Math.min(1, d.o + 0.15).toFixed(2) +
+          ";transform:translate(-50%,-50%) rotate(" + (Math.atan2(dy, dx) * 180 / Math.PI).toFixed(1) + "deg);clip-path:polygon(100% 50%, 0 0, 0 100%);pointer-events:none\"></div>"
+        );
+      });
+    }
+
+    var chips = labelChips(st, ctx);
+    var nodeParts = st.ns.map(function (n) {
+      var r = st.radius(n);
+      var c = nodeColor(n, st.comms);
+      var d = nodeDyn(st, ctx, n);
+      var sh = SHAPES(n, c, r);
+      return (
+        '<div data-node="' + esc(n.id) + '" style="position:absolute;left:' + (st.pos[n.id].x / S * 100).toFixed(2) + "%;top:" + (st.pos[n.id].y / S * 100).toFixed(2) +
+        "%;display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;opacity:" + d.o.toFixed(2) + ";z-index:" + d.z +
+        ';transform:translate(-50%,-50%)">' +
+        '<span style="width:' + sh.w + "px;height:" + sh.h + "px;flex:none;border-radius:" + sh.radius + ";rotate:" + sh.rot +
+        ";display:block;background:" + sh.fill + ";border:" + sh.border + ";box-shadow:" + d.ring + '"></span>' +
+        "</div>"
+      );
     });
 
-    layer.innerHTML = svgParts.join("") + arrowParts.join("") + nodeParts.join("") + leaderParts.join("") + labelParts.join("");
+    st.layer.innerHTML =
+      svgParts.join("") + arrowParts.join("") + nodeParts.join("") +
+      '<div data-leaders-host style="position:absolute;inset:0;pointer-events:none">' + leadersHtml(st, ctx, chips) + "</div>" +
+      '<div data-labels-host style="position:absolute;inset:0;pointer-events:none">' + labelsHtml(st, ctx, chips) + "</div>";
+
+    // Collect references so a hover can restyle without rebuilding.
+    st.edgeEls = {};
+    st.layer.querySelectorAll("[data-ei]").forEach(function (el) { st.edgeEls[el.getAttribute("data-ei")] = el; });
+    st.gradEls = {};
+    st.layer.querySelectorAll("[data-gi]").forEach(function (el) { st.gradEls[el.getAttribute("data-gi")] = el.querySelectorAll("stop"); });
+    st.arrowEls = {};
+    st.layer.querySelectorAll("[data-ai]").forEach(function (el) { st.arrowEls[el.getAttribute("data-ai")] = el; });
+    st.nodeEls = {};
+    st.ringEls = {};
+    st.layer.querySelectorAll("[data-node]").forEach(function (el) {
+      var id = el.getAttribute("data-node");
+      st.nodeEls[id] = el;
+      st.ringEls[id] = el.firstElementChild;
+    });
+    st.leadersHost = st.layer.querySelector("[data-leaders-host]");
+    st.labelsHost = st.layer.querySelector("[data-labels-host]");
+    scene = st;
+  }
+
+  // The hover path: restyle the scene in place. Structure never changes here —
+  // only opacity, stroke, width and the label layers, which are budget-bounded.
+  function restyleHover() {
+    if (!scene) {
+      renderCanvasContents();
+      return;
+    }
+    var st = scene;
+    var ctx = hoverCtx(st);
+    var mode = st.mode;
+
+    st.E.forEach(function (e, i) {
+      var d = edgeDyn(st, ctx, e);
+      var el = st.edgeEls[i];
+      if (el) {
+        if (el.tagName === "polygon") {
+          el.style.fill = d.color;
+          el.style.opacity = Math.min(1, d.o * 1.25).toFixed(3);
+        } else {
+          var fade = mode === "fade" && !d.onPath && !e.defines;
+          el.style.stroke = fade ? "url(#ge" + e.i + ")" : d.color;
+          el.style.opacity = fade ? 1 : d.o.toFixed(3);
+          el.style.strokeWidth = d.w + "px";
+          if (!e.defines) el.style.strokeDasharray = d.dash;
+          if (mode === "flow" && !e.defines) {
+            el.style.animation = d.o > 0.12 ? "atlas-flow " + (1.6 + (1 - e.weight) * 1.6).toFixed(2) + "s linear infinite" : "none";
+          }
+        }
+      }
+      var stops = st.gradEls[i];
+      if (stops && stops.length === 2) {
+        stops[0].setAttribute("stop-opacity", (d.o * 0.15).toFixed(3));
+        stops[1].setAttribute("stop-opacity", Math.min(1, d.o * 1.5).toFixed(3));
+      }
+      var arrow = st.arrowEls[i];
+      if (arrow) {
+        arrow.style.background = d.color;
+        arrow.style.opacity = d.o < 0.09 ? 0 : Math.min(1, d.o + 0.15).toFixed(2);
+      }
+    });
+
+    st.ns.forEach(function (n) {
+      var d = nodeDyn(st, ctx, n);
+      var el = st.nodeEls[n.id];
+      if (el) {
+        el.style.opacity = d.o.toFixed(2);
+        el.style.zIndex = d.z;
+      }
+      var ring = st.ringEls[n.id];
+      if (ring) ring.style.boxShadow = d.ring;
+    });
+
+    var chips = labelChips(st, ctx);
+    st.leadersHost.innerHTML = leadersHtml(st, ctx, chips);
+    st.labelsHost.innerHTML = labelsHtml(st, ctx, chips);
   }
 
   // ── Overlays: arming banner, focus chip, focus-empty card, legend ────────
@@ -1282,7 +1500,7 @@
       if (entity) {
         selFile = outside
           ? "outside the index — no file recorded"
-          : "in " + (D.scope_name || state.scope) + (n.lines ? " · lines " + n.lines : "");
+          : "in " + (state.scope ? (D.scope_name || state.scope) : (n.path || "the index")) + (n.lines ? " · lines " + n.lines : "");
       } else {
         selFile = (n.path || "") + " · degree " + n.deg + " in full index";
       }
@@ -1370,6 +1588,15 @@
       }
       return;
     }
+    var kindToggle = e.target.closest("[data-kind-toggle]");
+    if (kindToggle) {
+      var kindId = kindToggle.getAttribute("data-kind-toggle");
+      var hidden = new Set(state.hidden || []);
+      if (hidden.has(kindId)) hidden.delete(kindId);
+      else hidden.add(kindId);
+      setAndLoad({ hidden: hidden, selected: null });
+      return;
+    }
     var comm = e.target.closest("[data-comm]");
     if (comm) {
       var cid = parseInt(comm.getAttribute("data-comm"), 10);
@@ -1387,7 +1614,7 @@
     var t = e.target;
     if (t.dataset.level) {
       var level = t.dataset.level;
-      if (level === "entity") setAndLoad({ level: "entity", scope: state.scope || (D && D.default_scope) || "", selected: null, focus: -1 });
+      if (level === "entity") setAndLoad({ level: "entity", scope: "", selected: null, focus: -1 });
       else setAndLoad({ level: "module", selected: null, focus: -1 });
     } else if (t.dataset.hops) {
       localStorage.setItem("atlas.hops", t.dataset.hops);

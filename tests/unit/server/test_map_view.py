@@ -357,6 +357,107 @@ class TestEntityLevel:
         assert "empty.py" in result.caveat.note
 
 
+class TestFullScope:
+    """An empty scope draws the whole project — folded, filtered and counted."""
+
+    @staticmethod
+    def _patch_graph(monkeypatch) -> None:
+        def row(qn: str, label: str, kind: str = "") -> dict[str, Any]:
+            return {
+                "uid": f"u:{qn}",
+                "qn": qn,
+                "name": qn.rsplit(".", 1)[-1],
+                "label": label,
+                "kind": kind,
+                "file_path": f"src/{qn.split('.', maxsplit=1)[0]}.py",
+            }
+
+        entities = [
+            row("app.alpha", "Module", "module"),
+            row("app.beta", "Module", "module"),
+            row("app.alpha.Klass", "TypeDef", "class"),
+            row("app.alpha.Klass.run", "Callable", "method"),
+            row("app.beta.helper", "Callable", "function"),
+            row("app.alpha.LIMIT", "Value", "constant"),
+        ]
+        edges = [
+            {
+                "from_qn": "app.beta.helper",
+                "to_qn": "app.alpha.Klass.run",
+                "rel_type": "CALLS",
+                "weight": 1.0,
+                "confidence": "resolved",
+                "strategy": "import",
+            },
+            {
+                "from_qn": "app.beta",
+                "to_qn": "app.alpha",
+                "rel_type": "IMPORTS",
+                "weight": 1.0,
+                "confidence": "",
+                "strategy": "",
+            },
+        ]
+
+        async def _fake(graph, project):
+            return entities, edges
+
+        monkeypatch.setattr("code_atlas.server.analysis.fetch_entity_graph", _fake)
+
+    async def test_the_defaults_hide_values_and_docs_but_count_them(self, monkeypatch):
+        self._patch_graph(monkeypatch)
+
+        result = await _service().entity_map("")
+
+        assert result.scope == ""
+        assert result.scope_name == "Whole project"
+        assert "constant" in result.hidden_kinds
+        drawn = {n.id for n in result.nodes}
+        assert "app.alpha.LIMIT" not in drawn
+        tally = {t.id: t for t in result.tally}
+        assert tally["constant"].in_module == 1, "hidden is counted, never dropped from the inventory"
+        assert tally["constant"].drawn == 0
+
+    async def test_an_explicit_empty_hide_shows_everything(self, monkeypatch):
+        self._patch_graph(monkeypatch)
+
+        result = await _service().entity_map("", hidden=())
+
+        assert result.hidden_kinds == ()
+        assert "app.alpha.LIMIT" in {n.id for n in result.nodes}
+
+    async def test_folding_and_anchoring_work_across_modules(self, monkeypatch):
+        self._patch_graph(monkeypatch)
+
+        result = await _service().entity_map("")
+
+        drawn = {n.id for n in result.nodes}
+        assert "app.alpha.Klass.run" not in drawn, "methods fold project-wide"
+        pairs = {(e.s, e.t): e for e in result.edges}
+        assert ("app.beta.helper", "app.alpha.Klass") in pairs, "the call rewires to the class"
+        assert pairs[("app.alpha", "app.alpha.Klass")].rel == "defines", "modules anchor their members"
+        assert ("app.beta", "app.alpha") in pairs, "module imports stay dependency edges"
+
+    async def test_the_skeleton_kinds_cannot_be_hidden(self, monkeypatch):
+        """Hiding classes would vanish their folded methods silently."""
+        self._patch_graph(monkeypatch)
+
+        result = await _service().entity_map("", hidden=("class", "module", "constant"))
+
+        assert result.hidden_kinds == ("constant",)
+        assert "app.alpha.Klass" in {n.id for n in result.nodes}
+
+    async def test_truncation_keeps_the_most_connected(self, monkeypatch):
+        self._patch_graph(monkeypatch)
+
+        result = await _service().entity_map("", hidden=(), node_limit=3)
+
+        assert result.truncated is True
+        drawn = {n.id for n in result.nodes}
+        assert "app.alpha" in drawn, "the anchor hub survives a cut"
+        assert "app.alpha.LIMIT" not in drawn or len(drawn) == 3
+
+
 class TestDegradedBackend:
     """Community detection needs raw Cypher, which SQLite does not serve."""
 

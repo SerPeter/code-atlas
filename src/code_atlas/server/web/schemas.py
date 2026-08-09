@@ -362,6 +362,9 @@ class MapPayload(msgspec.Struct, frozen=True):
     scope_name: str = ""
     in_module: int = 0
     collapsed: bool = False
+    # The kinds the drawing hides right now — the rail's toggles render from this,
+    # and every hidden kind stays counted in ``tally``.
+    hidden_kinds: tuple[str, ...] = ()
     tally: tuple[KindTally, ...] = ()
 
     @property

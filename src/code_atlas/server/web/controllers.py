@@ -233,13 +233,19 @@ class MapController(Controller):
         expand: FromQuery[bool] = False,
         show_tests: FromQuery[bool] = False,
         show_noncode: FromQuery[bool] = False,
+        hide: FromQuery[str] | None = None,
     ) -> MapPayload:
-        """Whichever level was asked for, in the shape map.js renders."""
+        """Whichever level was asked for, in the shape map.js renders.
+
+        An empty ``module`` at the entity level means the whole project. ``hide``
+        absent means the level's own defaults; present (even empty) it is the exact
+        set of kinds to hide, so "show me everything" is expressible.
+        """
         if level == "entity":
-            payload = await map_service.entity_map(module or "", expand_methods=expand)
-            if module or not payload.default_scope:
-                return payload
-            return await map_service.entity_map(payload.default_scope, expand_methods=expand)
+            hidden = None if hide is None else tuple(k for k in hide.split(",") if k)
+            return await map_service.entity_map(
+                module, expand_methods=expand, hidden=hidden, show_tests=show_tests, show_noncode=show_noncode
+            )
         return await map_service.map(show_tests=show_tests, show_noncode=show_noncode, projects=selected_projects)
 
 

@@ -47,6 +47,16 @@ class TestBounds:
         assert force_layout(["only"], {}) == {"only": (SPACE / 2, SPACE / 2)}
 
 
+class TestChunkedRepulsion:
+    def test_row_blocks_match_the_one_shot_matrix(self):
+        """Chunking exists for memory, not for a different picture: each row still
+        sums over every column in order, so the result is bit-identical."""
+        nodes = _grid(9)
+        edges = {("m0", "m1"): 2.0, ("m2", "m7"): 1.0, ("m4", "m5"): 3.0}
+
+        assert force_layout(nodes, edges) == force_layout(nodes, edges, _block=2)
+
+
 class TestEdgesDrivePosition:
     def test_connected_nodes_sit_closer_than_strangers(self):
         """Position is a function of the edges — the whole point of replacing the ring."""
