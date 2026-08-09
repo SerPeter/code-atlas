@@ -1308,7 +1308,10 @@ async def fetch_entity_graph(graph: GraphBackend, project: str) -> tuple[list[di
         "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start, n.line_end AS line_end",
         params,
     )
-    rel_types = ", ".join(f"'{t}'" for t in _DEFAULT_BLAST_EDGE_TYPES)
+    # CONTAINS rides along for the externals: a library's package CONTAINS its
+    # symbols, which is the structure that keeps a stub library recognisable as one
+    # shape instead of a scatter of loose names. The map draws it as scaffolding.
+    rel_types = ", ".join(f"'{t}'" for t in (*_DEFAULT_BLAST_EDGE_TYPES, "CONTAINS"))
     edges = await graph.execute(
         "MATCH (a {project_name: $project})-[r]->(b {project_name: $project}) "
         f"WHERE type(r) IN [{rel_types}] "
@@ -1318,6 +1321,31 @@ async def fetch_entity_graph(graph: GraphBackend, project: str) -> tuple[list[di
         params,
     )
     return entities, edges
+
+
+async def fetch_external_imports(
+    graph: GraphBackend, project: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """External packages and every edge reaching out to them, for the module map.
+
+    The first-party/third-party boundary: 690 module-level IMPORTS land on
+    ExternalPackage/ExternalSymbol nodes in this repo's graph, and the module map
+    never showed one. Links come back keyed by the *source file*, so a Callable's
+    import or a TypeDef's INHERITS is attributed to the module that owns it.
+    """
+    params: dict[str, Any] = {"project": project}
+    packages = await graph.execute(
+        "MATCH (x:ExternalPackage {project_name: $project}) "
+        "RETURN x.uid AS uid, x.qualified_name AS qn, x.name AS name",
+        params,
+    )
+    links = await graph.execute(
+        "MATCH (s {project_name: $project})-[r:IMPORTS|INHERITS|USES_TYPE|REFERENCES]->(x) "
+        "WHERE (x:ExternalPackage OR x:ExternalSymbol) AND s.file_path IS NOT NULL "
+        "RETURN s.file_path AS from_path, x.qualified_name AS to_qn, count(r) AS links",
+        params,
+    )
+    return packages, links
 
 
 async def fetch_doc_modules(graph: GraphBackend, project: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

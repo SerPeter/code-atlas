@@ -971,6 +971,21 @@ def _module_label(qn: str) -> str:
     return breadcrumb(qualified_name=qn, label="Module").short or qn
 
 
+def _external_root(qn: str, known: dict[str, str]) -> str | None:
+    """The drawn node an external link lands on: the symbol's root package.
+
+    "ext/opentelemetry.sdk.trace.export.SpanExporter" belongs to
+    "ext/opentelemetry"; a slash-shaped ref ("ext/actions/checkout") is its own
+    package. Links to anything the inventory does not name are dropped rather than
+    drawn against an invented node.
+    """
+    if qn in known:
+        return known[qn]
+    rest = qn.removeprefix("ext/")
+    root = "ext/" + rest.split(".", 1)[0]
+    return known.get(root)
+
+
 def _doc_label(file_path: str) -> str:
     """A documentation file's breadcrumb: its directory and its name.
 
@@ -1041,6 +1056,7 @@ class MapViewService:
         node_limit: int = _MAP_NODE_LIMIT,
         show_tests: bool = False,
         show_noncode: bool = False,
+        show_external: bool = False,
         projects: tuple[str, ...] = (),
     ) -> MapPayload:
         """The module level: one node per module, edges rolled up, evidence carried.
@@ -1052,6 +1068,7 @@ class MapViewService:
         from code_atlas.server.analysis import (  # noqa: PLC0415
             build_module_graph,
             fetch_doc_modules,
+            fetch_external_imports,
             fetch_first_hop_external,
         )
 
@@ -1146,6 +1163,52 @@ class MapViewService:
                 }
                 doc_group_names[doc_idx] = (prefix + tops.pop()) if len(tops) == 1 else (prefix + "documentation")
 
+            # External packages are the third-party boundary — 690 import edges on
+            # this repo that the module level never showed. A symbol import
+            # aggregates onto its root package, so the map draws one dashed node
+            # per library rather than a scatter of loose names.
+            try:
+                ext_rows, ext_links = await fetch_external_imports(self._graph, project)
+            except Exception as exc:  # externals are additive; their failure is not the map's
+                logger.debug("External imports unavailable for {}: {}", project, exc)
+                ext_rows, ext_links = [], []
+            ext_members: list[str] = []
+            ext_known: dict[str, str] = {}
+            for row in ext_rows:
+                ext_qn = str(row.get("qn") or "")
+                if not ext_qn:
+                    continue
+                key = prefix + ext_qn
+                ext_known[ext_qn] = key
+                if key in nodes_all:
+                    continue
+                nodes_all[key] = {
+                    "uid": str(row.get("uid") or ""),
+                    "name": str(row.get("name") or "") or ext_qn.removeprefix("ext/"),
+                    "qn": ext_qn,
+                    "file_path": "",
+                    "project": project,
+                    "is_external": True,
+                }
+                ext_members.append(key)
+            for row in ext_links:
+                target = _external_root(str(row.get("to_qn") or ""), ext_known)
+                source = path_key.get(str(row.get("from_path") or ""))
+                if not source or not target or source == target:
+                    continue
+                weight = float(row.get("links") or 1.0)
+                directed[source, target] = directed.get((source, target), 0.0) + weight
+                if _EV_RANK["structural"] > _EV_RANK.get(evidence.get((source, target), ""), -1):
+                    evidence[source, target] = "structural"
+                key2 = (min(source, target), max(source, target))
+                undirected[key2] = undirected.get(key2, 0.0) + weight
+            if ext_members:
+                ext_idx = len(partition_groups)
+                partition_groups.append(ext_members)
+                for member in ext_members:
+                    community_of[member] = ext_idx
+                doc_group_names[ext_idx] = prefix + "external packages"
+
         # Cross-project imports appear when more than one project is loaded — the
         # modal's own promise. They are IMPORTS, so their evidence is structural.
         if multi:
@@ -1168,9 +1231,13 @@ class MapViewService:
         # Classify every module once; the counts below all derive from this one table.
         kind_of: dict[str, str] = {}
         test_count = noncode_count = 0
+        external_count = 0
         for qn, info in nodes_all.items():
             path = str(info.get("file_path") or "")
-            if info.get("is_doc"):
+            if info.get("is_external"):
+                kind_of[qn] = "external"
+                external_count += 1
+            elif info.get("is_doc"):
                 kind_of[qn] = "noncode"
                 noncode_count += 1
             elif _is_test_module(path, str(info.get("name") or ""), self._test_patterns):
@@ -1185,7 +1252,9 @@ class MapViewService:
         excluded = {
             qn
             for qn, kind in kind_of.items()
-            if (kind == "test" and not show_tests) or (kind == "noncode" and not show_noncode)
+            if (kind == "test" and not show_tests)
+            or (kind == "noncode" and not show_noncode)
+            or (kind == "external" and not show_external)
         }
         visible_partition = [[qn for qn in group if qn not in excluded] for group in partition_groups]
         kept = _largest_first(visible_partition, node_limit)
@@ -1220,6 +1289,8 @@ class MapViewService:
                 label=(
                     _doc_label(str(nodes_all[qn].get("file_path") or ""))
                     if nodes_all[qn].get("is_doc")
+                    else _external_label(str(nodes_all[qn].get("qn") or qn))
+                    if nodes_all[qn].get("is_external")
                     else _module_map_label(qn.split(":", 1)[-1], str(nodes_all[qn].get("file_path") or ""))
                 ),
                 community=community_of.get(qn, -1),
@@ -1250,6 +1321,7 @@ class MapViewService:
             edge_total=len(directed),
             test_count=test_count,
             noncode_count=noncode_count,
+            external_count=external_count,
             entity_total=await self._entity_total(selected),
             truncated=truncated,
             scope_options=scope_options,
@@ -1401,16 +1473,27 @@ class MapViewService:
         hidden_set = set(hidden_kinds)
         drawn = {qn: info for qn, info in entities.items() if qn not in owner and info["kind"] not in hidden_set}
 
-        # Aggregate dependency edges onto the drawn set, carrying the strongest evidence.
+        # Aggregate dependency edges onto the drawn set, carrying the strongest
+        # evidence. CONTAINS is containment, not dependency — it becomes the same
+        # "defines" scaffolding the qualified-name walk synthesises, which is what
+        # holds a stub library together as one shape.
         edges: dict[tuple[str, str], float] = {}
         edge_ev: dict[tuple[str, str], str] = {}
+        edge_rel: dict[tuple[str, str], str] = {}
         for from_qn, to_qn, rel_type, weight, confidence, strategy in edge_rows:
             a = owner.get(from_qn, from_qn)
             b = owner.get(to_qn, to_qn)
             if a == b or a not in drawn or b not in drawn:
                 continue
+            if rel_type == "CONTAINS":
+                if (a, b) not in edges:
+                    edges[a, b] = _DEFINES_WEIGHT
+                    edge_ev[a, b] = "structural"
+                    edge_rel[a, b] = "defines"
+                continue
             state = _evidence_state(EdgeEvidence(rel_type=rel_type, strategy=strategy, confidence=confidence))
             edges[a, b] = edges.get((a, b), 0.0) + weight
+            edge_rel[a, b] = "calls"
             if _EV_RANK[state] > _EV_RANK.get(edge_ev.get((a, b), ""), -1):
                 edge_ev[a, b] = state
 
@@ -1422,7 +1505,6 @@ class MapViewService:
         # low weight. At full scope an entity with no drawn ancestor simply has no
         # anchor — there is no single host to fall back to, and modules connect
         # through their own import edges.
-        edge_rel: dict[tuple[str, str], str] = {}
         for qn in drawn:
             if qn == module_qn:
                 continue
@@ -1481,11 +1563,13 @@ class MapViewService:
         for qn in kept:
             drawn_count[drawn[qn]["kind"]] = drawn_count.get(drawn[qn]["kind"], 0) + 1
 
+        entity_comm, entity_communities = await self._entity_communities(entities)
+
         nodes = tuple(
             MapNode(
                 id=qn,
                 label=_entity_label(qn, drawn[qn]),
-                community=0,
+                community=entity_comm.get(qn, -1),
                 deg=degree.get(qn, 0) + held.get(qn, 0),
                 kind=drawn[qn]["kind"],
                 x=round(positions.get(qn, (500.0, 500.0))[0], 1),
@@ -1505,7 +1589,7 @@ class MapViewService:
                 MapEdge(s=a, t=b, w=round(w, 2), ev=edge_ev.get((a, b), "unknown"), rel=edge_rel.get((a, b), "calls"))
                 for (a, b), w in sorted(scaled.items())
             ),
-            communities=(),
+            communities=entity_communities,
             kinds=_kind_defs(),
             caveat=CoverageCaveat(note=f"{len(entities)} entities indexed under {scope or 'this project'}."),
             module_total=await self._module_total(),
@@ -1536,10 +1620,62 @@ class MapViewService:
         current = next((st for st in statuses if st.get("name") == self._project), {})
         return str(current.get("last_indexed_at") or "")
 
-    async def _scope_options(self) -> tuple[ScopeOption, ...]:
-        """Modules the entity level can be pointed at, largest first."""
+    async def _entity_communities(
+        self, entities: dict[str, dict[str, Any]]
+    ) -> tuple[dict[str, int], tuple[CommunityRef, ...]]:
+        """Each entity's community — its module's, from the same partition the module
+        map draws — plus the community table whose counts sum to the inventory.
+
+        Externals form their own community: the first-party/third-party boundary is
+        exactly what colour should show. Files outside the partition (docs, notes)
+        get a named bucket rather than silently colouring as something else.
+        """
+        from code_atlas.server.analysis import build_module_graph  # noqa: PLC0415
+
+        community_of_path: dict[str, int] = {}
+        names: dict[int, str] = {}
         try:
-            overview = await self._graph.get_structure_overview(self._project, "", 60)
+            module_graph = await build_module_graph(self._graph, self._project, "", test_patterns=self._test_patterns)
+            for idx, group in enumerate(module_graph.partition):
+                names[idx] = _community_label(group)
+                for qn in group:
+                    path = str(module_graph.modules.get(qn, {}).get("file_path") or "")
+                    if path:
+                        community_of_path[path] = idx
+        except Exception as exc:  # colour degrades to neutral, the map survives
+            logger.debug("Entity communities unavailable for {}: {}", self._project, exc)
+
+        ext_id = len(names)
+        misc_id = ext_id + 1
+        entity_comm: dict[str, int] = {}
+        counts: dict[int, int] = {}
+        for qn, info in entities.items():
+            if info["kind"] in {"external_package", "external_symbol"}:
+                cid = ext_id
+            else:
+                cid = community_of_path.get(info["file_path"], misc_id)
+            entity_comm[qn] = cid
+            counts[cid] = counts.get(cid, 0) + 1
+
+        names[ext_id] = "external packages"
+        names[misc_id] = "docs & other files"
+        communities = tuple(
+            CommunityRef(
+                id=cid,
+                name=names.get(cid, f"community {cid}"),
+                count=counts[cid],
+                color=f"var(--atlas-c{min(8, cid)})",
+                files=cid == misc_id,
+            )
+            for cid in sorted(counts)
+        )
+        return entity_comm, communities
+
+    async def _scope_options(self) -> tuple[ScopeOption, ...]:
+        """Every module the entity level can be pointed at — the rail arranges them
+        into a file tree, so the list must be complete, not merely the largest."""
+        try:
+            overview = await self._graph.get_structure_overview(self._project, "", 500)
         except Exception:  # the picker is a convenience; its failure is not the view's
             return ()
         return tuple(
@@ -1601,8 +1737,23 @@ def _lines_of(row: dict[str, Any]) -> str:
     return ""
 
 
+def _external_label(qn: str) -> str:
+    """The library path with its symbol — a bare "batched" answers nothing.
+
+    Slash-shaped refs (GitHub Actions) stay whole: splitting "actions/checkout"
+    would invent structure it does not have.
+    """
+    rest = qn.removeprefix("ext/")
+    if "." in rest:
+        package, symbol = rest.rsplit(".", 1)
+        return f"{package}{SEPARATOR}{symbol}"
+    return rest
+
+
 def _entity_label(qn: str, info: dict[str, Any]) -> str:
     """``file.py › Class › symbol`` — the design's entity-level breadcrumb."""  # noqa: RUF002
+    if info["kind"] in {"external_package", "external_symbol"}:
+        return _external_label(qn)
     crumb = breadcrumb(qualified_name=qn, file_path=info["file_path"], kind=info["kind"])
     leaf = crumb.path.rsplit("/", 1)[-1]
     parts = [p for p in (leaf, crumb.owner, crumb.symbol) if p]

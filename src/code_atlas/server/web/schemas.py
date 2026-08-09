@@ -353,6 +353,7 @@ class MapPayload(msgspec.Struct, frozen=True):
     edge_total: int = 0
     test_count: int = 0
     noncode_count: int = 0
+    external_count: int = 0
     entity_total: int = 0
     truncated: bool = False
     scope_options: tuple[ScopeOption, ...] = ()
