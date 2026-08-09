@@ -50,7 +50,7 @@ services:
         limits:
           memory: 384m
     command: >
-      valkey-server --appendonly yes --appendfsync everysec --save "" --maxmemory 256mb --maxmemory-policy noeviction
+      valkey-server --appendonly yes --appendfsync everysec --save "" --maxmemory 320mb --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
