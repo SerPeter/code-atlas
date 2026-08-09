@@ -74,18 +74,24 @@ jobs:
       memgraph:
         image: memgraph/memgraph-mage:3.12.0
         ports:
-          - 7687:7687
+          # Host 7688, NOT 7687: the conftest isolation guard refuses the
+          # production ports by design, and it was right to refuse them here.
+          - 7688:7687
         options: >-
           --health-cmd "echo 'RETURN 1;' | mgconsole || exit 1" --health-interval 10s --health-timeout 5s
           --health-retries 10
       valkey:
         image: valkey/valkey:8-alpine
         ports:
-          - 6379:6379
+          - 6380:6379
         options: >-
           --health-cmd "valkey-cli ping" --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The git-signals tests mine this checkout's own history; a shallow
+          # clone leaves parent commits as missing objects ("fatal: bad object").
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -102,5 +108,5 @@ jobs:
       # other mid-test. The failures look like nondeterministic product bugs.
       - run: uv run pytest -m integration
         env:
-          ATLAS_TEST_MEMGRAPH_PORT: "7687"
-          ATLAS_TEST_VALKEY_PORT: "6379"
+          ATLAS_TEST_MEMGRAPH_PORT: "7688"
+          ATLAS_TEST_VALKEY_PORT: "6380"
