@@ -346,6 +346,7 @@ class ModuleMap(msgspec.Struct, frozen=True):
     expand_count: str = ""
     kind_header_note: str = ""
     level_note: str = ""
+    map_summary: str = ""
     hidden_note: str = ""
     community_summary: str = ""
     community_overflow_note: str = ""
