@@ -14,6 +14,7 @@ import pytest
 from code_atlas.server.web.layout import (
     cluster_positions,
     cluster_radius,
+    force_layout,
     layout_communities,
     node_size,
 )
@@ -92,3 +93,67 @@ class TestNodeSize:
     def test_a_hub_cannot_dwarf_everything_else(self):
         """Linear sizing would render the long tail invisible next to one hub."""
         assert node_size(5000) <= 14.0
+
+
+class TestForceLayout:
+    """Position must be a function of the edges (ATL-123).
+
+    The layout this replaces put communities on a fixed ring, so on the real graph every
+    node landed between radius 73 and 128 and none inside 60. Distance meant nothing.
+    """
+
+    @staticmethod
+    def _two_clusters():
+        a = [f"a{i}" for i in range(5)]
+        b = [f"b{i}" for i in range(5)]
+        edges = {}
+        for grp in (a, b):
+            for i in range(len(grp)):
+                for j in range(i + 1, len(grp)):
+                    edges[(grp[i], grp[j])] = 5.0
+        edges[("a0", "b0")] = 1.0  # one thin bridge
+        return a, b, edges
+
+    def test_coupled_modules_land_closer_than_unrelated_ones(self):
+        a, b, edges = self._two_clusters()
+        pos = force_layout(a + b, edges)
+
+        within = sum(math.dist(pos[x], pos[y]) for x in a for y in a if x != y) / 20
+        across = sum(math.dist(pos[x], pos[y]) for x in a for y in b) / 25
+
+        assert across > within * 2, f"clusters not separated: within={within:.1f} across={across:.1f}"
+
+    def test_the_same_graph_lays_out_identically_every_time(self):
+        """Determinism is why the ring existed; it survives the change."""
+        a, b, edges = self._two_clusters()
+
+        assert force_layout(a + b, edges) == force_layout(a + b, edges)
+
+    def test_input_order_does_not_change_the_result(self):
+        """A dict iteration order must not become a visual difference."""
+        a, b, edges = self._two_clusters()
+        nodes = a + b
+
+        first = force_layout(nodes, edges)
+        second = force_layout(nodes, dict(reversed(list(edges.items()))))
+
+        assert first == second
+
+    def test_an_empty_graph_is_empty_not_an_error(self):
+        assert force_layout([], {}) == {}
+
+    def test_a_single_node_sits_at_the_origin(self):
+        assert force_layout(["only"], {}) == {"only": (0.0, 0.0)}
+
+    def test_output_is_bounded(self):
+        """The client should never have to guess a viewport."""
+        a, b, edges = self._two_clusters()
+        pos = force_layout(a + b, edges)
+
+        assert all(abs(x) <= 201 and abs(y) <= 201 for x, y in pos.values())
+
+    def test_an_edge_to_an_unknown_node_is_ignored(self):
+        """Truncation leaves dangling pairs; they must not crash or move anything."""
+        pos = force_layout(["a", "b"], {("a", "b"): 1.0, ("a", "gone"): 5.0})
+
+        assert set(pos) == {"a", "b"}
