@@ -2,6 +2,252 @@
 
 <!-- version list -->
 
+## v0.8.0 (2026-08-09)
+
+### Bug Fixes
+
+- **backends**: Close three SQLite defects that produce wrong answers (ATL-112)
+  ([`3dd231b`](https://github.com/SerPeter/code-atlas/commit/3dd231bb29ca294dc98772c9fd1b094ecdcaf232))
+
+- **cli**: Make a partial index say so instead of reporting success (ATL-110)
+  ([`f01fa61`](https://github.com/SerPeter/code-atlas/commit/f01fa6179085dedb0398930b101932471c171a57))
+
+- **graph**: Resolve calls only within a call-namespace group (ATL-113)
+  ([`abaa4f9`](https://github.com/SerPeter/code-atlas/commit/abaa4f984f34245c35eb7a70db345a4625b6a308))
+
+- **index**: Verify the embedding dimension and fail closed on unknown staleness (ATL-111)
+  ([`06aa2bb`](https://github.com/SerPeter/code-atlas/commit/06aa2bbc2bb3ffb5a7f532f45d2e1504310f7e70))
+
+- **indexing**: Anchor staleness survives full re-indexes
+  ([`eecf7f6`](https://github.com/SerPeter/code-atlas/commit/eecf7f67acdceece00d76f23ff597eb0adbe2aa7))
+
+- **infra**: Size Valkey for the embedding cache it actually holds
+  ([`9f9c1cc`](https://github.com/SerPeter/code-atlas/commit/9f9c1ccf65dd7479094d1f68f12c8b1e91bb470c))
+
+- **layout**: Scale the simulation constants with node count
+  ([`bfe43f3`](https://github.com/SerPeter/code-atlas/commit/bfe43f394d8c8bfe28e9d67f794e584dbfc4cb7d))
+
+- **map**: Directory scopes get the whole graph, filters reach every view
+  ([`d011d90`](https://github.com/SerPeter/code-atlas/commit/d011d90155f0de71457b9d69ea755dd3752f1505))
+
+- **map**: Methods on by default, stranded externals out, honest names
+  ([`95c6ef5`](https://github.com/SerPeter/code-atlas/commit/95c6ef57028f04447ff9685899995d3919ec6cdf))
+
+- **map**: One node cap for every entity view
+  ([`f97b3fa`](https://github.com/SerPeter/code-atlas/commit/f97b3facee446a4044cf4dbecd9ea085c063bb36))
+
+- **parsing**: Attribute Go closure calls to the enclosing named scope (ATL-096)
+  ([`43419d1`](https://github.com/SerPeter/code-atlas/commit/43419d175a64b9291939abf7c07c3debbeb6de6b))
+
+- **parsing**: Decline an entity for a PHP closure bound to a local (ATL-096)
+  ([`50c60c4`](https://github.com/SerPeter/code-atlas/commit/50c60c4bfdb0b7fbf6b804f78b10835755d8e02b))
+
+- **parsing**: Decline TypeScript bindings local to an anonymous callback (ATL-107)
+  ([`95b0d05`](https://github.com/SerPeter/code-atlas/commit/95b0d05ead5d0af35e738515e854199c69f2f5ff))
+
+- **parsing**: Give C++ overloads distinct uids (ATL-107)
+  ([`e6736a7`](https://github.com/SerPeter/code-atlas/commit/e6736a747405fe97491bf553e1c24760ac6c9c54))
+
+- **parsing**: Name gtest cases from their macro arguments (ATL-096)
+  ([`771ffa3`](https://github.com/SerPeter/code-atlas/commit/771ffa3cd9056c921ac63a47ed7436ca0ea689e2))
+
+- **parsing**: Reach the Java and C# callables the walkers never visited (ATL-096)
+  ([`74708e5`](https://github.com/SerPeter/code-atlas/commit/74708e58415faf06ca0ef100a9039b9e7de9b819))
+
+- **parsing**: Route .h to C or C++ by sniffing its content (ATL-096)
+  ([`e17d91e`](https://github.com/SerPeter/code-atlas/commit/e17d91e60e9820b54bdf2462e5772cef462f65d2))
+
+- **parsing**: Separate Ruby singleton methods and decline block-nested defs (ATL-107)
+  ([`020e34d`](https://github.com/SerPeter/code-atlas/commit/020e34d460c8375f4d69740480c6c6cafa5b7df3))
+
+- **parsing**: Walk C++ preprocessor branches, class bodies and linkage blocks (ATL-096)
+  ([`02d9e6b`](https://github.com/SerPeter/code-atlas/commit/02d9e6b15fef07c12db3d3c2c006172cdfc3b1fa))
+
+- **parsing**: Walk PHP blocks and emit an edge for `new` (ATL-096)
+  ([`c7c9714`](https://github.com/SerPeter/code-atlas/commit/c7c97149f5cda49bcb5b80693452184f7cb40221))
+
+- **parsing**: Walk Ruby blocks and class<<self instead of stepping over them (ATL-096)
+  ([`001965e`](https://github.com/SerPeter/code-atlas/commit/001965ecf9a650e9d9cc60a6c73abd11d3da6454))
+
+- **parsing**: Walk Rust closures, nested fns and module scope (ATL-096)
+  ([`adddc33`](https://github.com/SerPeter/code-atlas/commit/adddc33682c454634c6c6c9c9c09ce3e7de2cecb))
+
+- **parsing**: Walk TypeScript scopes so every call reaches a named owner (ATL-096)
+  ([`6f53a88`](https://github.com/SerPeter/code-atlas/commit/6f53a88440defb8facddde576538d1552afa35b1))
+
+- **search**: Report the score that actually determined the order
+  ([`ea1672d`](https://github.com/SerPeter/code-atlas/commit/ea1672da8ec407782b4115c8f4f7a85ac01911f6))
+
+- **server**: Make the SQLite fallback announce itself (ATL-112)
+  ([`751ff20`](https://github.com/SerPeter/code-atlas/commit/751ff20cd429aa85a9d3e5e1768f4b370cca7a18))
+
+- **server**: Stop reporting a truncation count the search never computed (ATL-111)
+  ([`7fdc537`](https://github.com/SerPeter/code-atlas/commit/7fdc537e8c19e0279bab794922090b4d265d6368))
+
+- **settings**: Reject unknown keys inside a config section (ATL-111)
+  ([`aba1b00`](https://github.com/SerPeter/code-atlas/commit/aba1b00f4993ea45ebc4e331d2e46baad190837f))
+
+- **ui**: Port the design's own markup instead of rebuilding it from memory
+  ([`20f7aec`](https://github.com/SerPeter/code-atlas/commit/20f7aecf41a6901a539adbfac12887e71b808725))
+
+- **ui**: Read the real get_project_status shape, not the one the fake invented
+  ([`28a1246`](https://github.com/SerPeter/code-atlas/commit/28a1246c9e480e5f69b66d86733bcfbf832d27fa))
+
+- **ui**: The web search page showed the pre-boost score too
+  ([`6e7ad82`](https://github.com/SerPeter/code-atlas/commit/6e7ad826e070a0f2c943b2c45c41f3ea6bf4c969))
+
+### Build System
+
+- Keep prettier off the Jinja templates and vendored bundles
+  ([`6bbbd7e`](https://github.com/SerPeter/code-atlas/commit/6bbbd7ec6a1f0f8d93e0a44dab290e6e8464d942))
+
+### Chores
+
+- Catch uv.lock up to the released version
+  ([`73dd4a6`](https://github.com/SerPeter/code-atlas/commit/73dd4a62c2b570bbe900d15116f549c8808e1ae7))
+
+### Continuous Integration
+
+- Gate releases on a CI run that actually tests the product (ATL-114)
+  ([`8e4cd98`](https://github.com/SerPeter/code-atlas/commit/8e4cd986d78d39cd26cd1a71e273b8a8e4775d49))
+
+- Isolate integration services from production ports, unshallow history
+  ([`2da949c`](https://github.com/SerPeter/code-atlas/commit/2da949c12d1118ea5337f83961a882970fb3a0c6))
+
+### Documentation
+
+- **adr**: A uid must identify exactly one definition (ADR-0032)
+  ([`b73d5bc`](https://github.com/SerPeter/code-atlas/commit/b73d5bc1e4944e2e9e20bea0eb4ff008a5e1edaf))
+
+- **adr**: Correct what the ADR-0031 loss table actually measures
+  ([`9282116`](https://github.com/SerPeter/code-atlas/commit/928211640ef905b5f208dd29fc963203ae38fcbf))
+
+- **adr**: Record why architecture snapshots live on the Project node
+  ([`02cb0cf`](https://github.com/SerPeter/code-atlas/commit/02cb0cf0860efcacd36e5e1fa99167b0637b4244))
+
+- **adr**: Record why candidate hygiene is asymmetric (ADR-0030)
+  ([`011b818`](https://github.com/SerPeter/code-atlas/commit/011b818eff023ac3aa38024099ed9056805e478c))
+
+- **readme**: Document all 23 MCP tools and make the token figures reproducible
+  ([`452c6ea`](https://github.com/SerPeter/code-atlas/commit/452c6eadad18f09821e9937d567c6a9fa710173e))
+
+- **test**: Record what named_funcs cannot see
+  ([`c2b7ce4`](https://github.com/SerPeter/code-atlas/commit/c2b7ce430b51ec687bf9fed9057948e28fc60372))
+
+### Features
+
+- **analysis**: Carry per-pair evidence up to the module graph
+  ([`986f5d8`](https://github.com/SerPeter/code-atlas/commit/986f5d85a5405a194cf4d6088bccf1ce8ddd3824))
+
+- **graph**: Schema v12 — re-index for uid discriminators (ATL-107)
+  ([`7fe929b`](https://github.com/SerPeter/code-atlas/commit/7fe929b00d1375872387595d825ab2b0467ad2c9))
+
+- **layout**: Community blobs, per-edge affinity, and measured spacing
+  ([`dc2c4fa`](https://github.com/SerPeter/code-atlas/commit/dc2c4fabfff570d1af4b3eadca80ca393adc9305))
+
+- **map**: Documentation files join the module level
+  ([`e5e6182`](https://github.com/SerPeter/code-atlas/commit/e5e61828a52271d6238075a590d769b2e3479d16))
+
+- **map**: The third-party boundary, entity communities, and a scope tree
+  ([`c015b99`](https://github.com/SerPeter/code-atlas/commit/c015b9923ac52adb632e5e9ecd0589ed9af8084e))
+
+- **parsing**: Constants get the REFERENCES edges they always deserved
+  ([`79bf8f1`](https://github.com/SerPeter/code-atlas/commit/79bf8f1c7ad719914f2f7f03f9da1167b1232fce))
+
+- **ui**: Add architecture-health view with DSM and propagation cost
+  ([`c9f7542`](https://github.com/SerPeter/code-atlas/commit/c9f7542cab7a813bf33b57279f8b0d5132ac484d))
+
+- **ui**: Add atlas ui --export for a self-contained HTML snapshot
+  ([`66d0e3d`](https://github.com/SerPeter/code-atlas/commit/66d0e3d76fd5c5cec8add7772de3ab31e88cbcd2))
+
+- **ui**: Add the blast radius and trace path explorer
+  ([`31e9b54`](https://github.com/SerPeter/code-atlas/commit/31e9b54d3ffd0e9c37b78c28f171dbb0f065cff8))
+
+- **ui**: Add the community map with a vendored sigma.js renderer
+  ([`28c6796`](https://github.com/SerPeter/code-atlas/commit/28c679689ae657e87acfb27d0e44ae996d206537))
+
+- **ui**: Adopt Claude Design v1.1 — two map levels and the real rail
+  ([`4c6e2d1`](https://github.com/SerPeter/code-atlas/commit/4c6e2d1469f1426ccb0d3c970bfb069a4247f650))
+
+- **ui**: Adopt the Claude Design visual system and app shell
+  ([`60212d5`](https://github.com/SerPeter/code-atlas/commit/60212d581abf9d47d3d78b3a357ad654dfce4310))
+
+- **ui**: Make the map show real structure — direction, position, names, scope
+  ([`18f1491`](https://github.com/SerPeter/code-atlas/commit/18f14911ab3333c661bc31c09765f8065df26ece))
+
+- **ui**: Map interaction polish and dense-scope readability
+  ([`d2b84c4`](https://github.com/SerPeter/code-atlas/commit/d2b84c4521923d0f0fd69abd97d21ca64ba77d08))
+
+- **ui**: Name the edges that close each dependency cycle
+  ([`7aa00bd`](https://github.com/SerPeter/code-atlas/commit/7aa00bd8ce872348fd7b9b02a0b6646423e1f4e2))
+
+- **ui**: Rebuild the web UI as a verbatim port of the v1.1 design
+  ([`e783ca3`](https://github.com/SerPeter/code-atlas/commit/e783ca366419a4d6e9be90486d1b55a64a342b68))
+
+- **ui**: Record architecture snapshots per index run and show the trend
+  ([`c282892`](https://github.com/SerPeter/code-atlas/commit/c282892d8820496babcf81b6fa84846fec4e1e30))
+
+- **ui**: Search entry and entity detail with edge evidence (ATL-116)
+  ([`e948b17`](https://github.com/SerPeter/code-atlas/commit/e948b1749a113738aa3e07ac2fe84dd16f3dce06))
+
+- **ui**: The entity level draws the whole project
+  ([`6df3e80`](https://github.com/SerPeter/code-atlas/commit/6df3e8010404fa4822fff606d1d988539c01931e))
+
+- **ui**: The map is the homepage, and projects are picked from a real page
+  ([`a258ce7`](https://github.com/SerPeter/code-atlas/commit/a258ce73e95d8be13c0120ead866a86a47ed803e))
+
+- **ui**: Three-layer web skeleton for atlas ui (ATL-115)
+  ([`2bd07dd`](https://github.com/SerPeter/code-atlas/commit/2bd07dd5a1a4369be541438589b8e5e37acb91db))
+
+- **ui**: Wire the renderer, theme axes, and map chrome to v1.1
+  ([`ba33e32`](https://github.com/SerPeter/code-atlas/commit/ba33e32b8872ac207af67bf068ca5128d9d01264))
+
+- **web**: Tests and guessed calls become stated, togglable populations
+  ([`6b475f0`](https://github.com/SerPeter/code-atlas/commit/6b475f073b5d96db50880805e1513437aac645ea))
+
+### Performance Improvements
+
+- **graph**: Match CALLS sources on their own label index
+  ([`0dd3f6c`](https://github.com/SerPeter/code-atlas/commit/0dd3f6c71e34d5fdd12f1c24fb77abd37afe4c4b))
+
+- **graph**: Match citation DOCUMENTS endpoints on their own label index
+  ([`b473727`](https://github.com/SerPeter/code-atlas/commit/b4737278b0b01c3f060ca7cdaf8df9bace82bff5))
+
+- **graph**: Match IMPORTS endpoints on their own label index
+  ([`eff5948`](https://github.com/SerPeter/code-atlas/commit/eff59483a214f7906dfa48cba39ae719635550fd))
+
+### Refactoring
+
+- **ui**: Extract the view sections into partials two renderers can share
+  ([`8e60e47`](https://github.com/SerPeter/code-atlas/commit/8e60e474b1e14cfc4281915f147d502aef5a6da5))
+
+### Testing
+
+- **bench**: Give the synthetic corpus calls that actually resolve
+  ([`6af9ff8`](https://github.com/SerPeter/code-atlas/commit/6af9ff8435848f177e42f4a6bfd264b00f3c19d3))
+
+- **build**: Verify the distributions by building and reading them (ATL-114)
+  ([`09db0f4`](https://github.com/SerPeter/code-atlas/commit/09db0f4066b97f757835314d9a1827c6020582a2))
+
+- **graph**: Pin the call-candidate narrowing rules (ATL-113)
+  ([`9b6bfef`](https://github.com/SerPeter/code-atlas/commit/9b6bfef0c9723e6135ae75b7ce27f2cd61dba817))
+
+- **parsing**: Assert a per-language ceiling on colliding uids (ATL-096)
+  ([`6d90358`](https://github.com/SerPeter/code-atlas/commit/6d9035800cfa1158a0f6ea3f025d3a6f970fb0b3))
+
+- **parsing**: Count only forms that must be entities, and calls in statement position
+  ([`dddd1a6`](https://github.com/SerPeter/code-atlas/commit/dddd1a69c315daea811358d9939ce250428ef83d))
+
+- **parsing**: Measure extraction coverage against real code (ATL-096)
+  ([`a896c14`](https://github.com/SerPeter/code-atlas/commit/a896c14a3fdeec1aa9911421c73c2c28a5c6ab1c))
+
+- **parsing**: Stop asserting capture of definitions ADR-0032 declines
+  ([`6acd308`](https://github.com/SerPeter/code-atlas/commit/6acd308b71e32c0959ba1cb3515b97eb7b889498))
+
+- **settings**: Prove every section rejects unknown keys (ATL-111)
+  ([`2674625`](https://github.com/SerPeter/code-atlas/commit/2674625b8a2c1deceae74824989594550b1965fc))
+
+
 ## v0.7.0 (2026-08-05)
 
 ### Bug Fixes
