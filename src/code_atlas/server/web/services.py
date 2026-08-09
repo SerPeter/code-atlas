@@ -1256,6 +1256,27 @@ class MapViewService:
             or (kind == "noncode" and not show_noncode)
             or (kind == "external" and not show_external)
         }
+
+        # An external is on the map because something drawn imports it; once the test
+        # and non-code filters hide every importer, the package would float
+        # context-free at the border, so it follows its importers out. Reachability,
+        # not degree: a package anchored only through another stranded package drops
+        # with it. The tally still counts it — hidden, not absent.
+        if show_external:
+            neighbours: dict[str, set[str]] = {}
+            for a, b in undirected:
+                neighbours.setdefault(a, set()).add(b)
+                neighbours.setdefault(b, set()).add(a)
+            pending = {qn for qn, kind in kind_of.items() if kind == "external" and qn not in excluded}
+            frontier = [qn for qn, kind in kind_of.items() if kind != "external" and qn not in excluded]
+            reachable: set[str] = set()
+            while frontier:
+                for m in neighbours.get(frontier.pop(), ()):
+                    if m in pending and m not in reachable:
+                        reachable.add(m)
+                        frontier.append(m)
+            excluded |= pending - reachable
+
         visible_partition = [[qn for qn in group if qn not in excluded] for group in partition_groups]
         kept = _largest_first(visible_partition, node_limit)
         truncated = len(kept) < len(nodes_all) - len(excluded)
@@ -1267,10 +1288,14 @@ class MapViewService:
             if not group:
                 continue
             members_kind = {kind_of[m] for m in group}
+            # Named for what the reader can see: a community holding the language
+            # modules plus their (hidden) tests is the languages subsystem, not
+            # "unit.parsing". Only a fully hidden group is named by all its members.
+            name_src = [m for m in group if m not in excluded] or group
             communities.append(
                 CommunityRef(
                     id=idx,
-                    name=doc_group_names.get(idx) or _community_label([m.split(":", 1)[-1] for m in group]),
+                    name=doc_group_names.get(idx) or _community_label([m.split(":", 1)[-1] for m in name_src]),
                     count=len(group),
                     color=f"var(--atlas-c{min(8, idx)})",
                     files=members_kind == {"noncode"},
@@ -1332,7 +1357,7 @@ class MapViewService:
         self,
         scope: str,
         *,
-        expand_methods: bool = False,
+        expand_methods: bool = True,
         hidden: tuple[str, ...] | None = None,
         node_limit: int | None = None,
         show_tests: bool = False,
@@ -1340,8 +1365,8 @@ class MapViewService:
     ) -> MapPayload:
         """The entity level: the graph's own nodes — one module, or the whole project.
 
-        An empty *scope* draws every entity the project indexes. Methods fold into the
-        class that holds them by default, with their calls rewired to the class; kind
+        An empty *scope* draws every entity the project indexes. Methods draw by
+        default and can fold into the class that holds them, calls rewired; kind
         filters hide what they name and count what they hid; and the tallies always
         cover the **full** inventory, so nothing removed from the drawing reads as
         absent from the module.
@@ -1513,6 +1538,29 @@ class MapViewService:
                 edge_ev[anchor, qn] = "structural"
                 edge_rel[anchor, qn] = "defines"
 
+        # An external earns its place through the code that imports it. When the
+        # test and non-code filters hide every importer, the package — and any
+        # symbol chain hanging off it — would float context-free at the border, so
+        # it follows its importers out of the drawing. The inventory still counts
+        # it: hidden, not absent.
+        ext_kinds = {"external_package", "external_symbol"}
+        ext_neighbours: dict[str, set[str]] = {}
+        for a, b in edges:
+            ext_neighbours.setdefault(a, set()).add(b)
+            ext_neighbours.setdefault(b, set()).add(a)
+        pending = {qn for qn, info in drawn.items() if info["kind"] in ext_kinds}
+        frontier = [qn for qn, info in drawn.items() if info["kind"] not in ext_kinds]
+        reachable: set[str] = set()
+        while frontier:
+            for m in ext_neighbours.get(frontier.pop(), ()):
+                if m in pending and m not in reachable:
+                    reachable.add(m)
+                    frontier.append(m)
+        stranded = pending - reachable
+        if stranded:
+            drawn = {qn: info for qn, info in drawn.items() if qn not in stranded}
+            edges = {p: w for p, w in edges.items() if p[0] not in stranded and p[1] not in stranded}
+
         # Degree over everything drawable, so a truncation keeps the most connected
         # rather than the alphabetically first.
         degree: dict[str, int] = {}
@@ -1633,19 +1681,21 @@ class MapViewService:
         from code_atlas.server.analysis import build_module_graph  # noqa: PLC0415
 
         community_of_path: dict[str, int] = {}
-        names: dict[int, str] = {}
+        partition: list[list[str]] = []
+        module_paths: dict[str, str] = {}
         try:
             module_graph = await build_module_graph(self._graph, self._project, "", test_patterns=self._test_patterns)
-            for idx, group in enumerate(module_graph.partition):
-                names[idx] = _community_label(group)
+            partition = [list(group) for group in module_graph.partition]
+            for idx, group in enumerate(partition):
                 for qn in group:
                     path = str(module_graph.modules.get(qn, {}).get("file_path") or "")
                     if path:
+                        module_paths[qn] = path
                         community_of_path[path] = idx
         except Exception as exc:  # colour degrades to neutral, the map survives
             logger.debug("Entity communities unavailable for {}: {}", self._project, exc)
 
-        ext_id = len(names)
+        ext_id = len(partition)
         misc_id = ext_id + 1
         entity_comm: dict[str, int] = {}
         counts: dict[int, int] = {}
@@ -1657,6 +1707,15 @@ class MapViewService:
             entity_comm[qn] = cid
             counts[cid] = counts.get(cid, 0) + 1
 
+        # Named for what the view holds: a partition group carries its (filtered)
+        # test modules too, and naming from those christened the languages
+        # community "unit.parsing". Only a group with no entity on screen keeps
+        # its full-membership name.
+        visible_paths = {info["file_path"] for info in entities.values()}
+        names: dict[int, str] = {}
+        for idx, group in enumerate(partition):
+            src = [qn for qn in group if module_paths.get(qn) in visible_paths] or group
+            names[idx] = _community_label(src)
         names[ext_id] = "external packages"
         names[misc_id] = "docs & other files"
         communities = tuple(
@@ -1916,7 +1975,13 @@ def _degree_of(edges: dict[tuple[str, str], float], kept: set[str]) -> dict[str,
 
 
 def _community_label(group: list[str]) -> str:
-    """Name a subsystem by the longest package prefix its modules share."""
+    """Name a subsystem by the longest package prefix its modules share.
+
+    When nothing is shared — production code clustered with its tests, say — the
+    dominant package names the group with the outliers counted, instead of the old
+    fallback that crowned the alphabetically first member: a community holding
+    every language module used to read "languages.apex".
+    """
     if not group:
         return "empty"
     parts = [qn.split(".") for qn in sorted(group)]
@@ -1925,7 +1990,17 @@ def _community_label(group: list[str]) -> str:
         if len(set(segments)) != 1:
             break
         shared.append(segments[0])
-    return ".".join(shared) if shared else sorted(group)[0]
+    if shared:
+        return ".".join(shared)
+    packages: dict[str, int] = {}
+    for qn in group:
+        package = qn.rsplit(".", 1)[0] if "." in qn else qn
+        packages[package] = packages.get(package, 0) + 1
+    dominant = max(packages.items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+    outliers = sum(1 for qn in group if (qn.rsplit(".", 1)[0] if "." in qn else qn) != dominant)
+    # The root segment adds depth without meaning once the group spans packages.
+    display = dominant.split(".", 1)[1] if "." in dominant else dominant
+    return f"{display} +{outliers}" if outliers else display
 
 
 def _map_caveat(module_count: int, truncated: bool, node_limit: int) -> CoverageCaveat:

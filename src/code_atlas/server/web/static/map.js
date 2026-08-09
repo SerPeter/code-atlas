@@ -85,7 +85,7 @@
     // null until the payload names the applied set — the defaults live server-side,
     // and duplicating them here would let the two drift.
     hidden: qs.has("hide") ? new Set(qs.get("hide").split(",").filter(Boolean)) : null,
-    expandMethods: qs.get("expand") === "1",
+    expandMethods: qs.has("expand") ? qs.get("expand") === "1" : true,
     showTests: qs.has("show_tests") ? qs.get("show_tests") === "1" : localStorage.getItem("atlas.showTests") === "1",
     showNoncode: qs.has("show_noncode") ? qs.get("show_noncode") === "1" : localStorage.getItem("atlas.showNoncode") === "1",
     showExternal: qs.has("show_external") ? qs.get("show_external") === "1" : localStorage.getItem("atlas.showExternal") === "1",
@@ -133,7 +133,7 @@
     if (state.level === "entity") {
       p.set("level", "entity");
       if (state.scope) p.set("module", state.scope);
-      if (state.expandMethods) p.set("expand", "1");
+      if (!state.expandMethods) p.set("expand", "0");
       if (state.hidden !== null) p.set("hide", Array.from(state.hidden).sort().join(","));
     }
     if (state.showTests) p.set("show_tests", "1");
@@ -152,7 +152,7 @@
     if (state.level === "entity") {
       p.set("level", "entity");
       if (state.scope) p.set("module", state.scope);
-      if (state.expandMethods) p.set("expand", "1");
+      if (!state.expandMethods) p.set("expand", "0");
       if (state.hidden !== null) p.set("hide", Array.from(state.hidden).sort().join(","));
     }
     if (state.showTests) p.set("show_tests", "1");

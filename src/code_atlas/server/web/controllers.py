@@ -230,7 +230,7 @@ class MapController(Controller):
         selected_projects: NamedDependency[tuple[str, ...]],
         level: FromQuery[str] = "module",
         module: FromQuery[str] = "",
-        expand: FromQuery[bool] = False,
+        expand: FromQuery[bool] = True,
         show_tests: FromQuery[bool] = False,
         show_noncode: FromQuery[bool] = False,
         show_external: FromQuery[bool] = False,
