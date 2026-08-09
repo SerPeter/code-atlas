@@ -273,12 +273,18 @@ class MapEdge(msgspec.Struct, frozen=True):
     canvas's thickness formula expects that range). ``ev`` is the strongest ADR-0028
     claim among the entity edges the pair aggregates — and "unknown" means the edge was
     never looked up, which the canvas draws as the thinnest dotted line, not as absence.
+
+    ``rel`` distinguishes containment from dependency: a "defines" edge is the module or
+    class holding its member — structural scaffolding the canvas draws as a faint
+    hairline, so a dense scope's call graph stays readable instead of drowning under a
+    starburst of anchors.
     """
 
     s: str
     t: str
     w: float
     ev: str
+    rel: str = ""
 
 
 class CommunityRef(msgspec.Struct, frozen=True):

@@ -331,12 +331,19 @@ class TestEntityLevel:
         assert "app.mod.Klass.run" in {n.id for n in result.nodes}
         assert result.collapsed is False
 
-    async def test_containment_anchors_every_entity(self):
-        """An entity with no resolved call must read as contained, not isolated."""
+    async def test_containment_anchors_every_entity_as_scaffolding(self):
+        """An entity with no resolved call must read as contained, not isolated — and
+        the anchor is marked "defines" so the canvas can draw it as a faint hairline
+        instead of letting a starburst of anchors drown the call graph."""
         result = await _service(_Graph(summary=self._summary())).entity_map("src/app/mod.py")
 
-        anchored = {e.t for e in result.edges if e.ev == "structural"}
+        by_rel = {e.rel: [] for e in result.edges}
+        for e in result.edges:
+            by_rel[e.rel].append(e)
+        anchored = {e.t for e in by_rel.get("defines", [])}
         assert "app.mod.LIMIT" in anchored, "the constant has no call edge, only its definer"
+        assert all(e.ev == "structural" for e in by_rel.get("defines", []))
+        assert ("app.mod.helper", "app.mod.Klass") in {(e.s, e.t) for e in by_rel.get("calls", [])}
         # Every non-module node is reachable from something.
         targets = {e.t for e in result.edges} | {e.s for e in result.edges}
         for node in result.nodes:
