@@ -1,13 +1,16 @@
 /**
- * Community map renderer.
+ * Map renderer.
  *
- * The one client-side island in this UI. Everything else is server-rendered HTML, but a
- * pannable, zoomable graph is the part HTMX cannot express.
+ * The one client-side island: everything else is server-rendered, but a pannable,
+ * zoomable graph is what HTMX cannot express.
  *
- * Node positions arrive precomputed from the server. No force simulation runs here, and
- * that is deliberate: a layout that settles in the browser draws the same graph
- * differently on every reload, which destroys the map's only real job — letting someone
- * recognise their codebase and notice when a module has moved between subsystems.
+ * Node positions arrive precomputed and seeded from the server. No force simulation runs
+ * here — a layout that settles in the browser draws the same graph differently on every
+ * reload, which destroys the map's only real job: letting someone recognise their
+ * codebase and notice when something moved.
+ *
+ * Display settings arrive as data attributes on the canvas, set from the query string,
+ * so a view is reproducible by pasting its address.
  */
 (function () {
   "use strict";
@@ -20,43 +23,37 @@
     return;
   }
 
-  /* Sequential, not random: a community keeps its colour across reloads. A map that
-     recolours itself cannot be compared with the one you looked at last week. */
-  var PALETTE = [
-    "#4e79a7",
-    "#f28e2b",
-    "#59a14f",
-    "#e15759",
-    "#b07aa1",
-    "#76b7b2",
-    "#edc948",
-    "#ff9da7",
-    "#9c755f",
-    "#bab0ac",
-  ];
-  var EXTERNAL_COLOR = "#9aa0a6";
-  var DIMMED = "#d8d8d8";
+  var opts = {
+    direction: container.dataset.direction || "arrows",
+    hops: parseInt(container.dataset.hops || "1", 10),
+    labels: container.dataset.labels || "some",
+    level: container.dataset.level || "module",
+    focus: parseInt(container.dataset.focus || "-1", 10),
+  };
 
-  function colorFor(node) {
-    if (node.is_external || node.community < 0) return EXTERNAL_COLOR;
-    return PALETTE[node.community % PALETTE.length];
+  var NEUTRAL = "var(--atlas-c8)";
+  function communityColor(i) {
+    return "var(--atlas-c" + (i >= 0 && i < 8 ? i : 8) + ")";
   }
 
-  /* The static export embeds its payload in the document; the live server serves it.
-     One code path either way — a second renderer that fetched differently would be a
-     second implementation, and the export would be the one that quietly drifts.
+  /* Sigma paints to WebGL and cannot read a CSS custom property, so each token is
+     resolved once against the live stylesheet. That keeps one palette definition for
+     both the rail's swatches and the canvas. */
+  var css = getComputedStyle(document.documentElement);
+  function resolve(token) {
+    var m = /^var\((--[\w-]+)\)$/.exec(token);
+    return m ? (css.getPropertyValue(m[1]) || "").trim() || "#888" : token;
+  }
+  function alpha(color, a) {
+    return "color-mix(in srgb, " + color + " " + Math.round(a * 100) + "%, transparent)";
+  }
 
-     This is also what makes `file://` safe: with the blob present, no request is ever
-     issued. A static export has an empty hostname, so "skip localhost" style guards do
-     not protect it (ADR-0033). */
   function loadMap() {
     var embedded = document.getElementById("map-data");
-    if (embedded) {
-      return Promise.resolve(JSON.parse(embedded.textContent));
-    }
-    return fetch("/map/api").then(function (response) {
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      return response.json();
+    if (embedded) return Promise.resolve(JSON.parse(embedded.textContent));
+    return fetch(container.dataset.api || "/map/api").then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
     });
   }
 
@@ -64,93 +61,203 @@
     .then(function (data) {
       var graph = new graphology.Graph({ type: "directed", multi: false });
 
-      data.nodes.forEach(function (node) {
-        graph.addNode(node.id, {
-          /* External modules are prefixed rather than given their own shape: sigma's
-             default build ships one node program, and adding another to say "outside"
-             is more machinery than the distinction needs. */
-          label: node.is_external ? "↗ " + node.label : node.label,
-          x: node.x,
-          y: node.y,
-          size: node.size,
-          color: colorFor(node),
-          community: node.community,
-          external: node.is_external,
-          project: node.project,
+      /* Node size is the degree the server computed, already log-compressed: linear
+         sizing lets one 59-degree hub render every other module as a dot. */
+      data.nodes.forEach(function (n) {
+        var base = n.is_external ? NEUTRAL : communityColor(n.community);
+        graph.addNode(n.id, {
+          label: n.label,
+          x: n.x,
+          y: n.y,
+          size: n.size,
+          color: resolve(base),
+          baseColor: resolve(base),
+          community: n.community,
+          kind: n.kind || "",
+          external: !!n.is_external,
+          project: n.project,
         });
       });
 
-      data.edges.forEach(function (edge) {
-        if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) return;
-        if (graph.hasEdge(edge.source, edge.target)) return;
-        graph.addEdge(edge.source, edge.target, {
-          /* Thickness tracks the stored weight (ADR-0017), log-compressed so one heavy
-             edge does not render every other dependency as a hairline. */
-          size: Math.min(6, 0.4 + Math.log1p(edge.weight) * 1.4),
-          color: edge.crosses_community ? "rgba(192,87,74,0.35)" : "rgba(127,127,127,0.25)",
+      /* Edge thickness tracks the stored ADR-0017 weight. Raw weights span 0.0027 to
+         126.79 on the real graph — a 47,000x range — so it is log-compressed or one
+         edge would be wider than the viewport.
+
+         An edge inside a community takes that community's colour; one that crosses
+         stays neutral. Doing it the other way round would accent 81% of the edges,
+         which accents nothing. */
+      var weights = data.edges.map(function (e) {
+        return e.weight;
+      });
+      var maxW = Math.max.apply(null, weights.concat([1]));
+      data.edges.forEach(function (e) {
+        if (!graph.hasNode(e.source) || !graph.hasNode(e.target)) return;
+        if (graph.hasEdge(e.source, e.target)) return;
+        var within = !e.crosses_community;
+        var tint = within ? communityColor(graph.getNodeAttribute(e.source, "community")) : NEUTRAL;
+        graph.addEdge(e.source, e.target, {
+          size: 0.4 + (Math.log1p(e.weight) / Math.log1p(maxW)) * 5.6,
+          color: resolve(alpha(tint, within ? 0.55 : 0.28)),
+          baseSize: 0.4 + (Math.log1p(e.weight) / Math.log1p(maxW)) * 5.6,
+          type: opts.direction === "arrows" ? "arrow" : opts.direction === "curved" ? "curve" : "line",
+          weight: e.weight,
         });
       });
+
+      /* Labels are ranked, not thresholded: "Hubs" must label the actual hubs rather
+         than whatever happened to have empty space beside it. */
+      var ranked = graph
+        .nodes()
+        .slice()
+        .sort(function (a, b) {
+          return graph.degree(b) - graph.degree(a);
+        });
+      var labelCount =
+        opts.labels === "all" ? ranked.length : opts.labels === "few" ? Math.ceil(ranked.length * 0.12) : Math.ceil(ranked.length * 0.45);
+      var labelled = new Set(ranked.slice(0, labelCount));
 
       var hovered = null;
+      var neighbourhood = null;
+
+      function withinHops(root, hops) {
+        var seen = new Set([root]);
+        var frontier = [root];
+        for (var i = 0; i < hops; i++) {
+          var next = [];
+          frontier.forEach(function (id) {
+            graph.neighbors(id).forEach(function (n) {
+              if (!seen.has(n)) {
+                seen.add(n);
+                next.push(n);
+              }
+            });
+          });
+          frontier = next;
+        }
+        return seen;
+      }
+
+      var DIM = resolve("color-mix(in srgb, var(--color-text) 12%, transparent)");
 
       var renderer = new Sigma(graph, container, {
         renderEdgeLabels: false,
-        labelDensity: 0.6,
-        labelGridCellSize: 70,
-        labelRenderedSizeThreshold: 5,
+        defaultEdgeType: opts.direction === "arrows" ? "arrow" : "line",
+        labelDensity: 1,
+        labelGridCellSize: 0,
+        labelRenderedSizeThreshold: 0,
         nodeReducer: function (key, attrs) {
-          if (!hovered || key === hovered || graph.areNeighbors(key, hovered)) return attrs;
-          return Object.assign({}, attrs, { color: DIMMED, label: "" });
+          var out = attrs;
+          if (!labelled.has(key)) out = Object.assign({}, out, { label: "" });
+          if (opts.focus >= 0 && attrs.community !== opts.focus) {
+            out = Object.assign({}, out, { color: DIM, label: "" });
+          }
+          if (neighbourhood && !neighbourhood.has(key)) {
+            out = Object.assign({}, out, { color: DIM, label: "" });
+          }
+          if (hovered === key) out = Object.assign({}, out, { label: attrs.label, highlighted: true });
+          return out;
         },
         edgeReducer: function (key, attrs) {
-          if (!hovered || graph.hasExtremity(key, hovered)) return attrs;
-          return Object.assign({}, attrs, { hidden: true });
+          if (neighbourhood) {
+            var ends = graph.extremities(key);
+            if (!neighbourhood.has(ends[0]) || !neighbourhood.has(ends[1])) {
+              return Object.assign({}, attrs, { hidden: true });
+            }
+          }
+          if (opts.focus >= 0) {
+            var e = graph.extremities(key);
+            if (
+              graph.getNodeAttribute(e[0], "community") !== opts.focus &&
+              graph.getNodeAttribute(e[1], "community") !== opts.focus
+            ) {
+              return Object.assign({}, attrs, { hidden: true });
+            }
+          }
+          return attrs;
         },
       });
 
-      status.textContent = graph.order + " modules, " + graph.size + " dependencies. Scroll to zoom, drag to pan.";
+      function describe(n) {
+        var a = graph.getNodeAttributes(n);
+        return a.external
+          ? n + " — external, owned by '" + a.project + "'"
+          : n + " — " + graph.degree(n) + " dependencies" + (a.kind ? " · " + a.kind : "");
+      }
 
-      /* Hovering dims everything the node does not touch — the only way to read one
-         module's reach out of a picture this dense. */
-      renderer.on("enterNode", function (event) {
-        hovered = event.node;
+      renderer.on("enterNode", function (e) {
+        hovered = e.node;
+        neighbourhood = withinHops(e.node, opts.hops);
         renderer.refresh();
+        status.textContent = describe(e.node);
       });
       renderer.on("leaveNode", function () {
         hovered = null;
+        neighbourhood = null;
         renderer.refresh();
+        status.textContent = summary;
       });
-      renderer.on("clickNode", function (event) {
-        var attrs = graph.getNodeAttributes(event.node);
-        status.textContent = attrs.external
-          ? event.node + " — external, owned by project '" + attrs.project + "'"
-          : event.node + " — " + graph.degree(event.node) + " dependencies";
+      renderer.on("clickNode", function (e) {
+        selectNode(e.node);
       });
 
-      /* Focus a subsystem without reloading the page. The camera works in framed-graph
-         coordinates, not the graph's own, so the centroid has to be read back from
-         sigma's display data rather than computed from the x/y we supplied. */
-      document.querySelectorAll(".community-focus").forEach(function (button) {
-        button.addEventListener("click", function () {
-          var id = parseInt(button.dataset.community, 10);
-          var members = graph.filterNodes(function (_key, attrs) {
-            return attrs.community === id;
+      var summary =
+        graph.order + (opts.level === "entity" ? " entities, " : " modules, ") + graph.size + " dependencies.";
+      status.textContent = summary;
+
+      /* Selection panel in the rail. */
+      var panel = document.getElementById("rail-selection");
+      function selectNode(id) {
+        if (!panel) return;
+        var a = graph.getNodeAttributes(id);
+        panel.hidden = false;
+        document.getElementById("sel-name").textContent = a.label || id;
+        document.getElementById("sel-meta").textContent =
+          graph.degree(id) + " dependencies" + (a.kind ? " · " + a.kind : "") + (a.external ? " · external" : "");
+        /* Both need a server. In a static export there is none, so the links are left
+           inert rather than pointing at an address that cannot answer. */
+        var live = !document.getElementById("map-data");
+        var detail = document.getElementById("sel-detail");
+        var impact = document.getElementById("sel-impact");
+        if (detail) detail.href = live ? "/entity/" + encodeURIComponent(id) : "#";
+        if (impact) impact.href = live ? "/impact?uid=" + encodeURIComponent(id) : "#";
+      }
+
+      /* Camera controls. Reset returns to the layout the server computed, which is the
+         view a reader compares against next week. */
+      var camera = renderer.getCamera();
+      function bind(id, fn) {
+        var el = document.getElementById(id);
+        if (el) el.addEventListener("click", fn);
+      }
+      bind("map-zoom-in", function () {
+        camera.animatedZoom({ duration: 200 });
+      });
+      bind("map-zoom-out", function () {
+        camera.animatedUnzoom({ duration: 200 });
+      });
+      bind("map-zoom-reset", function () {
+        camera.animatedReset({ duration: 250 });
+      });
+
+      /* Find-on-map: filters to matching nodes rather than navigating away. */
+      var find = document.getElementById("map-find");
+      if (find) {
+        find.addEventListener("input", function () {
+          var q = find.value.trim().toLowerCase();
+          if (!q) {
+            neighbourhood = null;
+            renderer.refresh();
+            status.textContent = summary;
+            return;
+          }
+          var hits = graph.filterNodes(function (id, a) {
+            return id.toLowerCase().indexOf(q) >= 0 || (a.label || "").toLowerCase().indexOf(q) >= 0;
           });
-          if (!members.length) return;
-
-          var sum = members.reduce(
-            function (acc, key) {
-              var display = renderer.getNodeDisplayData(key);
-              return display ? { x: acc.x + display.x, y: acc.y + display.y, n: acc.n + 1 } : acc;
-            },
-            { x: 0, y: 0, n: 0 },
-          );
-          if (!sum.n) return;
-
-          renderer.getCamera().animate({ x: sum.x / sum.n, y: sum.y / sum.n, ratio: 0.35 }, { duration: 400 });
-          status.textContent = members.length + " modules in this subsystem.";
+          neighbourhood = new Set(hits);
+          renderer.refresh();
+          status.textContent = hits.length + " matching — " + summary;
         });
-      });
+      }
     })
     .catch(function (error) {
       status.textContent = "Could not load the map: " + error.message;

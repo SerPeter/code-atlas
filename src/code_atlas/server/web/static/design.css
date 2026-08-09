@@ -550,7 +550,6 @@ html, body { height: 100%; }
   display: flex;
   align-items: stretch;
   gap: 2px;
-  margin-left: auto;
 }
 .app-nav-item {
   display: flex;
@@ -568,8 +567,17 @@ html, body { height: 100%; }
    colour alone fails for the ~8% of readers with a red-green deficiency. */
 .app-nav-item.is-active {
   color: var(--color-text);
-  border-bottom-color: var(--color-accent);
   font-weight: 600;
+  position: relative;
+}
+.app-nav-item.is-active::after {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 0;
+  height: 2px;
+  background: var(--color-accent);
 }
 
 .app-body {
@@ -882,4 +890,104 @@ html, body { height: 100%; }
   border-radius: 50%;
   background: transparent;
   border: 1.5px dashed var(--kind-color, var(--color-text));
+}
+
+/* ----- map chrome, settings, and the roundness the system sets to 0 ----- */
+
+/* The design system zeroes --radius-*; the application layer puts it back on the
+   interactive elements. These are the ones this app adds. */
+.rail-toggle-box,
+.swatch,
+.map-find,
+.btn-icon {
+  border-radius: 6px;
+}
+.swatch {
+  border-radius: 50%;
+}
+.rail-project,
+.rail-community,
+.picker-row,
+.swatch-card {
+  border-radius: 8px;
+}
+.rail-community,
+.rail-toggle {
+  padding-inline: 6px;
+}
+.rail-community.is-on {
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+
+/* Push the settings control to the edge; the tabs stay beside the project name. */
+.app-settings {
+  margin-left: auto;
+  align-self: center;
+  text-decoration: none;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  font-size: 16px;
+  padding: 0 4px;
+}
+.app-settings:hover {
+  color: var(--color-text);
+}
+
+.map-chrome {
+  flex: none;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--color-divider);
+}
+.map-find {
+  flex: 1;
+  max-width: 22rem;
+}
+.map-zoom {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+.btn-icon {
+  min-width: 30px;
+  padding: 4px 8px;
+}
+
+.settings-view {
+  padding: 28px;
+}
+.settings-group {
+  margin-bottom: 28px;
+}
+.swatch-row {
+  display: flex;
+  gap: 12px;
+  margin-top: 10px;
+}
+.swatch-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--color-divider);
+  text-decoration: none;
+  color: inherit;
+  min-width: 9rem;
+}
+.swatch-card.is-on {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 1px var(--color-accent) inset;
+}
+.swatch-preview {
+  display: flex;
+  gap: 5px;
+}
+.swatch-chip {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+}
+.swatch-name {
+  font-weight: 600;
+  font-size: 13px;
 }
