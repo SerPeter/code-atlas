@@ -429,15 +429,17 @@ async def _record_architecture_snapshot(
     a codebase that decayed — without the coverage the two are indistinguishable.
     """
     try:
+        from code_atlas.server.analysis import fetch_architecture_pairs  # noqa: PLC0415
         from code_atlas.server.architecture import analyse  # noqa: PLC0415
         from code_atlas.server.architecture_history import record, snapshot_from_metrics  # noqa: PLC0415
 
-        records = await graph.get_module_import_edges(project_name, "")
-        edges = [
-            (str(r.get("from_mod") or ""), str(r.get("to_mod") or ""))
-            for r in records.get("direct", [])
-            if r.get("from_mod") and r.get("to_mod")
-        ]
+        # Same edge source and defaults as the architecture page (production
+        # modules, structural+resolved evidence) — the history used to record the
+        # near-empty direct Module->Module import edges, so its numbers were not
+        # comparable to anything the page showed. The trend view's own guard
+        # marks the definition switch "unclear" once, since the module count jumps.
+        source = await fetch_architecture_pairs(graph, project_name)
+        edges = sorted(source.pairs)
         if not edges:
             return
         nodes = sorted({n for edge in edges for n in edge})

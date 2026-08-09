@@ -687,15 +687,17 @@ class ArchitectureViewService:
         self._project = project
 
     async def health(self, *, dsm_limit: int = _DSM_LIMIT) -> ArchitectureHealth:
-        """The JSON contract — unchanged, still computed over the import graph."""
+        """The JSON contract, on the same edge source and defaults as the page.
+
+        It used to read the direct Module->Module import edges — near-empty,
+        since a from-import links a module to a *symbol* — and disagreed with
+        the page about the same metric by an order of magnitude.
+        """
+        from code_atlas.server.analysis import fetch_architecture_pairs  # noqa: PLC0415
         from code_atlas.server.architecture import analyse  # noqa: PLC0415
 
-        raw = await self._graph.get_module_import_edges(self._project, "")
-        edges = [
-            (str(r.get("from_mod", "")), str(r.get("to_mod", "")))
-            for r in raw.get("direct", [])
-            if r.get("from_mod") and r.get("to_mod")
-        ]
+        source = await fetch_architecture_pairs(self._graph, self._project)
+        edges = sorted(source.pairs)
         nodes = sorted({n for edge in edges for n in edge})
 
         metrics = analyse(nodes, edges)
@@ -722,17 +724,29 @@ class ArchitectureViewService:
             trend=await self._trend(),
         )
 
-    async def view(self, *, dsm_limit: int = _DSM_LIMIT) -> ArchitectureView:
+    async def view(
+        self, *, dsm_limit: int = _DSM_LIMIT, include_tests: bool = False, include_guessed: bool = False
+    ) -> ArchitectureView:
         """The architecture page, in the design's shape.
 
         Built on the same module graph as the map (CALLS + IMPORTS, per-pair evidence)
         so the matrix and the picture cannot disagree. On SQLite that graph is not
         available and the page says so rather than drawing a partial one.
-        """
-        from code_atlas.server.architecture import analyse  # noqa: PLC0415
 
-        source = await self._edge_source()
-        if isinstance(source, str):
+        Tests and guessed pairs are excluded by default and the page says what it
+        excluded — the old all-in number was an artifact of two population choices
+        pulling opposite ways (tests dilute, guesses inflate) and moved when either
+        population changed for reasons that are not architecture.
+        """
+        from code_atlas.server.analysis import fetch_architecture_pairs  # noqa: PLC0415
+        from code_atlas.server.architecture import analyse, propagation_cost  # noqa: PLC0415
+
+        try:
+            source = await fetch_architecture_pairs(
+                self._graph, self._project, include_tests=include_tests, include_guessed=include_guessed
+            )
+        except Exception as exc:
+            logger.debug("Architecture view unavailable for {}: {}", self._project, exc)
             return ArchitectureView(
                 cards=(),
                 dsm_rows=(),
@@ -740,9 +754,13 @@ class ArchitectureViewService:
                 cycles=(),
                 trend_rows=(),
                 references=self._REFERENCES,
-                unavailable=source,
+                unavailable=(
+                    "The module graph could not be built. Run health_check for the backend's own account of why."
+                ),
+                include_tests=include_tests,
+                include_guessed=include_guessed,
             )
-        pair_ev, module_paths = source
+        pair_ev, module_paths = source.pairs, source.module_paths
 
         edges = sorted(pair_ev)
         nodes = sorted({n for e in edges for n in e})
@@ -755,6 +773,8 @@ class ArchitectureViewService:
                 trend_rows=(),
                 references=self._REFERENCES,
                 unavailable="No module dependencies indexed — nothing to measure.",
+                include_tests=include_tests,
+                include_guessed=include_guessed,
             )
         metrics = analyse(nodes, edges)
 
@@ -805,14 +825,29 @@ class ArchitectureViewService:
         top5 = sum(sorted(fan_in.values(), reverse=True)[:5])
         core_modules = round(metrics.core_size * metrics.module_count)
 
+        # The excluded guesses get a number, not silence: the closure is maximally
+        # sensitive to a false edge, so the honest statement is a range.
+        population_bits = []
+        if not include_tests:
+            population_bits.append(f"{source.excluded_test_modules} test modules excluded")
+        if not include_guessed and source.excluded_guessed_pairs:
+            all_edges = sorted(source.all_pairs)
+            all_nodes = sorted({n for e in all_edges for n in e})
+            with_guessed = propagation_cost(all_nodes, all_edges)
+            population_bits.append(
+                f"{source.excluded_guessed_pairs} guessed pairs excluded — including them: {with_guessed * 100:.1f}%"
+            )
+        population = "; ".join(population_bits)
+
         cards = (
             MetricCard(
                 label="Propagation cost",
                 value=f"{metrics.propagation_cost * 100:.1f}%",
                 note=(
                     f"Share of module pairs where one can reach the other. Computed over "
-                    f"{metrics.module_count} modules; any language whose extraction is incomplete "
-                    "makes this a lower bound."
+                    f"{metrics.module_count} modules"
+                    + (f" ({population})" if population else "")
+                    + ". Any language whose extraction is incomplete makes this a lower bound."
                 ),
             ),
             MetricCard(
@@ -855,34 +890,9 @@ class ArchitectureViewService:
             ),
             trend_rows=await self._trend_rows(),
             references=self._REFERENCES,
+            include_tests=include_tests,
+            include_guessed=include_guessed,
         )
-
-    async def _edge_source(self) -> tuple[dict[tuple[str, str], str], dict[str, str]] | str:
-        """Directed module pairs with evidence plus module file paths, or a reason
-        string when unavailable.
-
-        Memgraph gets the full CALLS+IMPORTS graph the map draws. SQLite cannot serve
-        the CALLS aggregation, but its IMPORT edges are real structural facts — so the
-        page still works there, computed over imports alone.
-        """
-        from code_atlas.backends.sqlite_graph import SqliteGraphClient  # noqa: PLC0415
-        from code_atlas.server.analysis import build_module_graph  # noqa: PLC0415
-
-        if isinstance(self._graph, SqliteGraphClient):
-            raw = await self._graph.get_module_import_edges(self._project, "")
-            pairs = {
-                (str(r.get("from_mod")), str(r.get("to_mod"))): "structural"
-                for r in raw.get("direct", [])
-                if r.get("from_mod") and r.get("to_mod") and r.get("from_mod") != r.get("to_mod")
-            }
-            return pairs, {}
-        try:
-            module_graph = await build_module_graph(self._graph, self._project, "")
-        except Exception as exc:
-            logger.debug("Architecture view unavailable for {}: {}", self._project, exc)
-            return "The module graph could not be built. Run health_check for the backend's own account of why."
-        paths = {qn: str(info.get("file_path") or "") for qn, info in module_graph.modules.items()}
-        return {pair: module_graph.evidence.get(pair, "unknown") for pair in module_graph.directed}, paths
 
     async def _trend_rows(self) -> tuple[TrendRow, ...]:
         """Across index runs, with the coverage rule the design states verbatim:
@@ -1057,6 +1067,7 @@ class MapViewService:
         show_tests: bool = False,
         show_noncode: bool = False,
         show_external: bool = False,
+        show_guessed: bool = True,
         projects: tuple[str, ...] = (),
     ) -> MapPayload:
         """The module level: one node per module, edges rolled up, evidence carried.
@@ -1228,6 +1239,17 @@ class MapViewService:
         if not nodes_all:
             return _empty_map(self._project, "", caveat=CoverageCaveat(note="No modules indexed for this project."))
 
+        # Guessed call pairs are togglable, because the closure of guesses bloats
+        # the picture the same way it bloats the propagation cost: one wrong guess
+        # ties two subsystems together. The count states the population either way.
+        # Structural links (imports, docs, externals) always stay.
+        guessed_pairs = {p for p in directed if evidence.get(p, "unknown") in ("guessed", "unknown")}
+        guessed_count = len(guessed_pairs)
+        if not show_guessed and guessed_pairs:
+            directed = {p: w for p, w in directed.items() if p not in guessed_pairs}
+            surviving = {(min(a, b), max(a, b)) for a, b in directed}
+            undirected = {k: w for k, w in undirected.items() if k in surviving}
+
         # Classify every module once; the counts below all derive from this one table.
         kind_of: dict[str, str] = {}
         test_count = noncode_count = 0
@@ -1347,6 +1369,7 @@ class MapViewService:
             test_count=test_count,
             noncode_count=noncode_count,
             external_count=external_count,
+            guessed_count=guessed_count,
             entity_total=await self._entity_total(selected),
             truncated=truncated,
             scope_options=scope_options,
@@ -1362,6 +1385,7 @@ class MapViewService:
         node_limit: int | None = None,
         show_tests: bool = False,
         show_noncode: bool = False,
+        show_guessed: bool = True,
     ) -> MapPayload:
         """The entity level: the graph's own nodes — one module, or the whole project.
 
@@ -1518,6 +1542,19 @@ class MapViewService:
             if _EV_RANK[state] > _EV_RANK.get(edge_ev.get((a, b), ""), -1):
                 edge_ev[a, b] = state
 
+        # Guessed call pairs are togglable here too — dropped after aggregation,
+        # so a pair that also carries structural or resolved evidence keeps its
+        # strongest claim and stays. The endpoints keep their containment anchors,
+        # so hiding guesses never orphans a node.
+        guessed_count = sum(
+            1 for pair, rel in edge_rel.items() if rel == "calls" and edge_ev.get(pair) in ("guessed", "unknown")
+        )
+        if not show_guessed and guessed_count:
+            drop = {
+                pair for pair, rel in edge_rel.items() if rel == "calls" and edge_ev.get(pair) in ("guessed", "unknown")
+            }
+            edges = {pair: w for pair, w in edges.items() if pair not in drop}
+
         # Containment is structural fact: the module DEFINES its members, a class its
         # own. Drawn as edges they anchor every entity — without them, anything with
         # no resolved call floats detached at the map's edge, which reads as
@@ -1596,6 +1633,7 @@ class MapViewService:
                 hidden_kinds,
                 show_tests,
                 show_noncode,
+                show_guessed,
                 await self._index_stamp(),
                 len(kept),
                 len(scaled),
@@ -1646,6 +1684,7 @@ class MapViewService:
             external_count=sum(
                 1 for info in entities.values() if info["kind"] in {"external_package", "external_symbol"}
             ),
+            guessed_count=guessed_count,
             entity_total=await self._entity_total((self._project,)),
             truncated=truncated,
             scope_options=scope_options,

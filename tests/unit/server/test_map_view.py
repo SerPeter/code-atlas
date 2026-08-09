@@ -542,6 +542,64 @@ class TestFullScope:
         assert pairs[("app.alpha", "app.alpha.Klass")].rel == "defines", "modules anchor their members"
         assert ("app.beta", "app.alpha") in pairs, "module imports stay dependency edges"
 
+    async def test_guessed_calls_are_togglable_and_counted(self, monkeypatch):
+        """A guessed pair drops with show_guessed off; its endpoints keep their
+        containment anchors, so nothing orphans — and the count states the
+        population whichever way the toggle points."""
+        entities = [
+            {
+                "uid": "u:app",
+                "qn": "app",
+                "name": "app",
+                "label": "Module",
+                "kind": "module",
+                "file_path": "src/app.py",
+            },
+            {
+                "uid": "u:app.f",
+                "qn": "app.f",
+                "name": "f",
+                "label": "Callable",
+                "kind": "function",
+                "file_path": "src/app.py",
+            },
+            {
+                "uid": "u:app.g",
+                "qn": "app.g",
+                "name": "g",
+                "label": "Callable",
+                "kind": "function",
+                "file_path": "src/app.py",
+            },
+        ]
+        edges = [
+            {
+                "from_qn": "app.f",
+                "to_qn": "app.g",
+                "rel_type": "CALLS",
+                "weight": 0.5,
+                "confidence": "ambiguous",
+                "strategy": "project_unique",
+            },
+        ]
+
+        async def _fake(graph, project):
+            return entities, edges
+
+        monkeypatch.setattr("code_atlas.server.analysis.fetch_entity_graph", _fake)
+
+        shown = await _service().entity_map("", hidden=())
+        assert shown.guessed_count == 1
+        assert ("app.f", "app.g") in {(e.s, e.t) for e in shown.edges if e.rel == "calls"}
+
+        hidden_view = await _service().entity_map("", hidden=(), show_guessed=False)
+        assert hidden_view.guessed_count == 1, "hidden is counted, never dropped from the population"
+        assert ("app.f", "app.g") not in {(e.s, e.t) for e in hidden_view.edges if e.rel == "calls"}
+        drawn = {n.id for n in hidden_view.nodes}
+        assert {"app.f", "app.g"} <= drawn, "hiding guesses must not remove the entities"
+        anchored = {e.t for e in hidden_view.edges if e.rel == "defines"}
+        assert {"app.f", "app.g"} <= anchored, "the endpoints keep their containment anchors"
+
     async def test_a_stranded_external_follows_its_hidden_importers_out(self, monkeypatch):
         """pytest is on the map because the tests import it; with the tests filtered
         the package must not stay behind floating edge-less at the border."""

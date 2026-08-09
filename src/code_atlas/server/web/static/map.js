@@ -89,6 +89,7 @@
     showTests: qs.has("show_tests") ? qs.get("show_tests") === "1" : localStorage.getItem("atlas.showTests") === "1",
     showNoncode: qs.has("show_noncode") ? qs.get("show_noncode") === "1" : localStorage.getItem("atlas.showNoncode") === "1",
     showExternal: qs.has("show_external") ? qs.get("show_external") === "1" : localStorage.getItem("atlas.showExternal") === "1",
+    showGuessed: qs.has("show_guessed") ? qs.get("show_guessed") === "1" : localStorage.getItem("atlas.showGuessed") !== "0",
     focus: qs.has("focus") ? parseInt(qs.get("focus"), 10) : -1,
     selected: qs.get("selected") || null,
     // URL wins (a shared link shows what its sender saw); the stored default fills
@@ -139,6 +140,7 @@
     if (state.showTests) p.set("show_tests", "1");
     if (state.showNoncode) p.set("show_noncode", "1");
     if (state.showExternal && state.level !== "entity") p.set("show_external", "1");
+    if (!state.showGuessed) p.set("show_guessed", "0");
     return "/map/api?" + p.toString();
   }
 
@@ -158,6 +160,7 @@
     if (state.showTests) p.set("show_tests", "1");
     if (state.showNoncode) p.set("show_noncode", "1");
     if (state.showExternal && state.level !== "entity") p.set("show_external", "1");
+    if (!state.showGuessed) p.set("show_guessed", "0");
     if (state.direction !== "arrows") p.set("direction", state.direction);
     if (state.hops !== 1) p.set("hops", String(state.hops));
     if (state.labels !== "some") p.set("labels", state.labels);
@@ -500,6 +503,11 @@
         toggleHtml(extShown) +
         '<span style="flex:1">External packages</span>' +
         '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + fmt(extCount) + (extShown ? " shown" : " hidden") + "</span>" +
+        "</button>" +
+        '<button data-toggle="guessed" class="hv6" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:6px 4px;cursor:pointer;color:inherit;font:inherit;font-size:13px;text-align:left">' +
+        toggleHtml(state.showGuessed) +
+        '<span style="flex:1">Guessed calls</span>' +
+        '<span style="font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">' + fmt(D.guessed_count || 0) + (state.showGuessed ? " shown" : " hidden") + "</span>" +
         "</button>" +
         '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--color-surface);font-size:11px;line-height:1.45;color:color-mix(in srgb, var(--color-text) 65%, transparent)">' + esc(hiddenNote) + "</div>" +
         "</section>";
@@ -1702,6 +1710,9 @@
           localStorage.setItem("atlas.showExternal", state.showExternal ? "0" : "1");
           setAndLoad({ showExternal: !state.showExternal, selected: null });
         }
+      } else if (which === "guessed") {
+        localStorage.setItem("atlas.showGuessed", state.showGuessed ? "0" : "1");
+        setAndLoad({ showGuessed: !state.showGuessed, selected: null });
       } else if (which === "expand") {
         setAndLoad({ expandMethods: !state.expandMethods, selected: null });
       }
