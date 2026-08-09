@@ -638,6 +638,23 @@ class MapViewService:
             hidden_tests=hidden_tests,
             hidden_noncode=hidden_noncode,
             caveat=_map_caveat(len(module_graph.modules), truncated, node_limit),
+            map_summary=(
+                f"{len(kept)} modules · {len(edges)} dependencies · {len(module_graph.partition)} communities"
+            ),
+            level_note=(
+                "Each node is a module — one file. The graph stores individual entities; "
+                "this level aggregates them so communities mean something."
+            ),
+            community_summary=f"{len([g for g in module_graph.partition if len(g) >= 2])}",
+            legend_note=(
+                "Size = dependency degree. Colour = community. Position is computed from "
+                "the edges — coupled modules sit near each other. Scroll to zoom, drag to pan."
+            ),
+            hidden_note=(
+                f"{hidden_tests + hidden_noncode} modules hidden by the filters above."
+                if (hidden_tests + hidden_noncode)
+                else ""
+            ),
         )
 
     async def entity_map(
@@ -743,6 +760,7 @@ class MapViewService:
                 "from the edges. Scroll to zoom, drag to pan."
             ),
             entity_total=len(entities),
+            map_summary=f"{len(kept)} entities · {len(edges)} calls · {len(tally)} kinds",
         )
 
     async def _scope_options(self) -> tuple[ScopeOption, ...]:

@@ -483,378 +483,33 @@ html, body { height: 100%; }
   }
 
 /* ========================================================================
-   3. APPLICATION SHELL
-   The design expressed the frame as inline styles on <header>/<aside>. Those
-   measurements are reproduced here as classes so the markup stays readable and
-   the static export does not carry them on every element.
+   3. WHAT THE PORTED MARKUP NEEDS
+   The design carries its layout in inline styles, so almost nothing belongs
+   here. These are the few hooks its markup references by class.
    ======================================================================== */
 
-.app {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
+/* `style-hover` in the design output; a real pseudo-class here. */
+.hover-tint:hover {
+  background: color-mix(in srgb, var(--color-text) 6%, transparent) !important;
 }
-
-.app-header {
-  flex: none;
-  display: flex;
-  align-items: stretch;
-  gap: 18px;
-  padding: 0 14px;
-  height: 52px;
-  border-bottom: 1px solid var(--color-divider);
-}
-
-.brand {
-  display: flex;
-  flex: none;
-  align-items: center;
-  white-space: nowrap;
-  font-family: var(--font-heading);
-  font-weight: 800;
-  font-size: 12px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-}
-
-.project-switch {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  align-self: center;
-  background: var(--color-surface);
-  border: 1px solid var(--color-divider);
-  border-radius: 10px;
-  padding: 5px 10px;
-  cursor: pointer;
-  color: inherit;
-  text-decoration: none;
-}
-.project-switch:hover {
-  background: color-mix(in srgb, var(--color-text) 8%, transparent);
-  color: inherit;
-}
-.project-name {
-  font-family: var(--font-heading);
-  font-weight: 800;
-  font-size: 14px;
-  white-space: nowrap;
-}
-.project-meta {
-  font-size: 11px;
-  white-space: nowrap;
-  color: color-mix(in srgb, var(--color-text) 55%, transparent);
-}
-
-.app-nav {
-  display: flex;
-  align-items: stretch;
-  gap: 2px;
-}
-.app-nav-item {
-  display: flex;
-  align-items: center;
-  padding: 0 12px;
-  font-size: 13px;
-  text-decoration: none;
-  color: color-mix(in srgb, var(--color-text) 65%, transparent);
-  border-bottom: 2px solid transparent;
-}
-.app-nav-item:hover {
-  color: var(--color-text);
-}
-/* The active view is marked by the accent underline, not by colour alone —
-   colour alone fails for the ~8% of readers with a red-green deficiency. */
-.app-nav-item.is-active {
-  color: var(--color-text);
-  font-weight: 600;
-  position: relative;
-}
-.app-nav-item.is-active::after {
-  content: "";
-  position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: 0;
-  height: 2px;
-  background: var(--color-accent);
-}
-
-.app-body {
-  flex: 1;
-  display: flex;
-  min-height: 0;
-}
-
-.app-sidebar {
-  width: 272px;
-  flex: none;
-  border-right: 1px solid var(--color-divider);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-}
-
-/* No max-width. The old shell capped every view at 60rem, which is right for
-   prose and wrong for a graph canvas and a square matrix — it left half the
-   window empty. Views that want a reading measure set it themselves. */
-.app-main {
-  flex: 1;
-  min-width: 0;
-  overflow: auto;
-}
-.app-main > .prose {
-  max-width: 60rem;
-}
-
-/* ========================================================================
-   4. VIEW COMPONENTS
-   The sidebar rail, the map frame, and the project picker. Built from the
-   design's own tokens — nothing here introduces a colour or a size the
-   system does not already define.
-   ======================================================================== */
-
-.rail-section {
-  padding: 13px 14px 14px;
-  border-bottom: 1px solid var(--color-divider);
-}
-.rail-grow {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-}
-.rail-label {
-  font-family: var(--font-heading);
-  font-weight: 800;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: color-mix(in srgb, var(--color-text) 55%, transparent);
-  margin-bottom: 8px;
-  display: flex;
-  justify-content: space-between;
-}
-
-.rail-project {
-  display: block;
-  text-decoration: none;
-  color: inherit;
-}
-.rail-project-name {
-  display: block;
-  font-family: var(--font-heading);
-  font-weight: 800;
-  font-size: 15px;
-}
-.rail-project-meta,
-.rail-count {
-  font-size: 11px;
-  color: color-mix(in srgb, var(--color-text) 55%, transparent);
-}
-
-.rail-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 0;
-  font-size: 13px;
-  text-decoration: none;
-  color: inherit;
-}
-.rail-toggle-box {
-  width: 15px;
-  height: 15px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--color-divider);
-  font-size: 10px;
-  line-height: 1;
-}
-.rail-toggle.is-on .rail-toggle-box {
-  background: var(--color-accent);
-  border-color: var(--color-accent);
-  color: #fff;
-}
-.rail-toggle .rail-count {
-  margin-left: 6px;
-}
-
-.rail-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-.rail-community {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 4px 0;
-  background: none;
-  border: 0;
-  color: inherit;
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  text-align: left;
-}
-.rail-community:hover {
-  color: var(--color-accent);
-}
-.swatch {
-  width: 9px;
-  height: 9px;
-  flex: none;
-  border-radius: 2px;
-}
-.rail-community-name {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  /* Truncate from the left: these are dotted paths, and the distinguishing
-     part is the tail. */
-  direction: rtl;
-  text-align: left;
-}
-.rail-actions {
-  display: grid;
-  gap: 6px;
-  margin-top: 10px;
-}
-.rail-selection-name {
-  font-family: var(--font-heading);
-  font-weight: 800;
-  font-size: 13px;
-  word-break: break-word;
-}
-.rail-selection-meta {
-  font-size: 11px;
-  color: color-mix(in srgb, var(--color-text) 55%, transparent);
-}
-
-.map-wrap {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-.map-canvas {
-  flex: 1;
-  min-height: 0;
-}
-.map-status,
-.map-footnote {
-  flex: none;
-  padding: 6px 14px;
-  font-size: 11px;
-  color: color-mix(in srgb, var(--color-text) 55%, transparent);
-  border-top: 1px solid var(--color-divider);
-}
-.map-footnote {
-  display: flex;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-.caveat-inline {
-  color: var(--color-accent-700);
-}
-
-.view-empty {
-  padding: 40px;
-  max-width: 44rem;
-}
-
-.picker-list,
-.picker-children {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-.picker-children {
-  margin-left: 22px;
-  border-left: 1px solid var(--color-divider);
-  padding-left: 10px;
-}
-.picker-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 4px;
-  cursor: pointer;
-}
-.picker-row:hover {
-  background: color-mix(in srgb, var(--color-text) 5%, transparent);
-}
-.picker-name {
-  font-weight: 600;
-  min-width: 11rem;
-}
-.picker-facts {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  flex: 1;
-}
-.picker-cost {
-  flex: 1;
-  font-size: 12px;
-}
-
-/* ----- v1.1 rail additions: level, kinds, folds ----- */
 
 .seg-opt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
   text-decoration: none;
   color: inherit;
+  cursor: pointer;
 }
 .seg-opt.is-on {
   background: var(--color-text);
   color: var(--color-bg);
 }
 
-.rail-note {
-  font-size: 11px;
-  line-height: 1.45;
-  color: color-mix(in srgb, var(--color-text) 55%, transparent);
-  margin: 8px 0 0;
-}
-.rail-fold summary {
-  cursor: pointer;
-  list-style: none;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.rail-fold summary::after {
-  content: "▸";
-  font-size: 9px;
-}
-.rail-fold[open] summary::after {
-  content: "▾";
-}
-.rail-field {
-  margin-top: 10px;
-}
-.rail-field-label {
-  font-size: 11px;
-  margin-bottom: 4px;
-  color: color-mix(in srgb, var(--color-text) 70%, transparent);
-}
-
-.rail-kind {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 0;
-  font-size: 12px;
-}
-.rail-kind-name {
-  flex: 1;
-}
-
-/* Silhouette carries kind alongside colour. Every entity in one module shares a
-   community, so the community hue is free here to mean something else. */
+/* Silhouette carries kind alongside colour on the entity level. Every entity in
+   one module shares a community, so the community hue is free there. */
 .shape {
   width: 11px;
   height: 11px;
@@ -892,70 +547,47 @@ html, body { height: 100%; }
   border: 1.5px dashed var(--kind-color, var(--color-text));
 }
 
-/* ----- map chrome, settings, and the roundness the system sets to 0 ----- */
-
-/* The design system zeroes --radius-*; the application layer puts it back on the
-   interactive elements. These are the ones this app adds. */
-.rail-toggle-box,
-.swatch,
-.map-find,
-.btn-icon {
-  border-radius: 6px;
+/* The picker and settings pages, which have no design counterpart to copy. */
+.picker-list,
+.picker-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
-.swatch {
-  border-radius: 50%;
+.picker-children {
+  margin-left: 22px;
+  border-left: 1px solid var(--color-divider);
+  padding-left: 10px;
 }
-.rail-project,
-.rail-community,
-.picker-row,
-.swatch-card {
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 4px;
+  cursor: pointer;
   border-radius: 8px;
 }
-.rail-community,
-.rail-toggle {
-  padding-inline: 6px;
+.picker-row:hover {
+  background: color-mix(in srgb, var(--color-text) 5%, transparent);
 }
-.rail-community.is-on {
-  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+.picker-name {
+  font-weight: 600;
+  min-width: 11rem;
 }
-
-/* Push the settings control to the edge; the tabs stay beside the project name. */
-.app-settings {
-  margin-left: auto;
-  align-self: center;
-  text-decoration: none;
-  color: color-mix(in srgb, var(--color-text) 60%, transparent);
-  font-size: 16px;
-  padding: 0 4px;
-}
-.app-settings:hover {
-  color: var(--color-text);
-}
-
-.map-chrome {
-  flex: none;
+.picker-facts {
   display: flex;
   gap: 10px;
-  align-items: center;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--color-divider);
-}
-.map-find {
+  flex-wrap: wrap;
+  font-size: 12px;
   flex: 1;
-  max-width: 22rem;
 }
-.map-zoom {
-  display: flex;
-  gap: 4px;
-  margin-left: auto;
+.picker-cost {
+  flex: 1;
+  font-size: 12px;
 }
-.btn-icon {
-  min-width: 30px;
-  padding: 4px 8px;
-}
-
 .settings-view {
   padding: 28px;
+  max-width: 46rem;
 }
 .settings-group {
   margin-bottom: 28px;
@@ -970,6 +602,7 @@ html, body { height: 100%; }
   gap: 8px;
   padding: 12px;
   border: 1px solid var(--color-divider);
+  border-radius: 8px;
   text-decoration: none;
   color: inherit;
   min-width: 9rem;
@@ -990,4 +623,11 @@ html, body { height: 100%; }
 .swatch-name {
   font-weight: 600;
   font-size: 13px;
+}
+.caveat-inline {
+  color: var(--color-accent-700);
+}
+.view-empty {
+  padding: 40px;
+  max-width: 44rem;
 }

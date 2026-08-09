@@ -36,16 +36,36 @@
     return "var(--atlas-c" + (i >= 0 && i < 8 ? i : 8) + ")";
   }
 
-  /* Sigma paints to WebGL and cannot read a CSS custom property, so each token is
-     resolved once against the live stylesheet. That keeps one palette definition for
-     both the rail's swatches and the canvas. */
-  var css = getComputedStyle(document.documentElement);
+  /* Sigma paints through its own colour parser, which understands hex and rgb()/rgba()
+     and nothing else. The palette is authored in oklch() and the dimmed variants in
+     color-mix() — neither parses, so every node and edge came out pure black.
+
+     The browser does the conversion: assign the value to a detached element and read it
+     back, which yields rgb()/rgba() whatever notation went in. One palette definition
+     still serves both the rail's swatches and the canvas. */
+  var probe = document.createElement("span");
+  probe.style.display = "none";
+  document.body.appendChild(probe);
+  var colorCache = {};
+
   function resolve(token) {
-    var m = /^var\((--[\w-]+)\)$/.exec(token);
-    return m ? (css.getPropertyValue(m[1]) || "").trim() || "#888" : token;
+    if (token in colorCache) return colorCache[token];
+    probe.style.color = "";
+    probe.style.color = token;
+    var out = getComputedStyle(probe).color;
+    // An unparseable value leaves the property unset; fall back rather than paint black.
+    if (!out || out === "rgba(0, 0, 0, 0)") out = "#888888";
+    colorCache[token] = out;
+    return out;
   }
-  function alpha(color, a) {
-    return "color-mix(in srgb, " + color + " " + Math.round(a * 100) + "%, transparent)";
+
+  function alpha(token, a) {
+    // Resolve first, then apply opacity numerically. Handing color-mix() to sigma would
+    // only fail again; rgb() is trivial to reopen.
+    var m = /rgba?\(([^)]+)\)/.exec(resolve(token));
+    if (!m) return resolve(token);
+    var p = m[1].split(",");
+    return "rgba(" + parseFloat(p[0]) + "," + parseFloat(p[1]) + "," + parseFloat(p[2]) + "," + a + ")";
   }
 
   function loadMap() {
@@ -97,7 +117,7 @@
         var tint = within ? communityColor(graph.getNodeAttribute(e.source, "community")) : NEUTRAL;
         graph.addEdge(e.source, e.target, {
           size: 0.4 + (Math.log1p(e.weight) / Math.log1p(maxW)) * 5.6,
-          color: resolve(alpha(tint, within ? 0.55 : 0.28)),
+          color: alpha(tint, within ? 0.55 : 0.28),
           baseSize: 0.4 + (Math.log1p(e.weight) / Math.log1p(maxW)) * 5.6,
           type: opts.direction === "arrows" ? "arrow" : opts.direction === "curved" ? "curve" : "line",
           weight: e.weight,
@@ -137,7 +157,7 @@
         return seen;
       }
 
-      var DIM = resolve("color-mix(in srgb, var(--color-text) 12%, transparent)");
+      var DIM = alpha("var(--color-text)", 0.12);
 
       var renderer = new Sigma(graph, container, {
         renderEdgeLabels: false,
@@ -222,42 +242,6 @@
         if (impact) impact.href = live ? "/impact?uid=" + encodeURIComponent(id) : "#";
       }
 
-      /* Camera controls. Reset returns to the layout the server computed, which is the
-         view a reader compares against next week. */
-      var camera = renderer.getCamera();
-      function bind(id, fn) {
-        var el = document.getElementById(id);
-        if (el) el.addEventListener("click", fn);
-      }
-      bind("map-zoom-in", function () {
-        camera.animatedZoom({ duration: 200 });
-      });
-      bind("map-zoom-out", function () {
-        camera.animatedUnzoom({ duration: 200 });
-      });
-      bind("map-zoom-reset", function () {
-        camera.animatedReset({ duration: 250 });
-      });
-
-      /* Find-on-map: filters to matching nodes rather than navigating away. */
-      var find = document.getElementById("map-find");
-      if (find) {
-        find.addEventListener("input", function () {
-          var q = find.value.trim().toLowerCase();
-          if (!q) {
-            neighbourhood = null;
-            renderer.refresh();
-            status.textContent = summary;
-            return;
-          }
-          var hits = graph.filterNodes(function (id, a) {
-            return id.toLowerCase().indexOf(q) >= 0 || (a.label || "").toLowerCase().indexOf(q) >= 0;
-          });
-          neighbourhood = new Set(hits);
-          renderer.refresh();
-          status.textContent = hits.length + " matching — " + summary;
-        });
-      }
     })
     .catch(function (error) {
       status.textContent = "Could not load the map: " + error.message;

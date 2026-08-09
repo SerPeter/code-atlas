@@ -1,48 +1,42 @@
-{# The application shell: 52px header, optional 272px sidebar, and the view.
+{# The application shell, ported verbatim from the Claude Design v1.1 output.
 
-   The visual system lives in static/design.css, extracted verbatim from the Claude
-   Design output (.specs/research/, 2026-08-09). Nothing here re-declares a colour or a
-   size the stylesheet owns — if a screen looks wrong, fix the token, not a local
-   override.
+   Inline styles are kept exactly as the design emits them. They are not placeholders —
+   they *are* the design, and rewriting them as hand-authored classes is what made the
+   first attempt look like something else. Only the design's own directives change:
+   `sc-camel-on-click` becomes an href, `<sc-for>` becomes a Jinja loop, and `{{ }}`
+   expressions bind to the view models.
 
-   Blocks a view fills:
-     title     browser title
-     subtitle  the muted line beside the project name in the header
-     nav       the top-level view links (override only to suppress them)
-     sidebar   the left rail; omit it and the view takes the full width
-     content   the view itself
-     scripts   per-view asset delivery — the server links, the export inlines
+   static/design.css supplies the tokens and component classes these styles reference.
+
+   Blocks a view fills: title · subtitle · nav · sidebar · content · scripts
 #}
 <!doctype html>
-{# Two independent axes: palette picks the look, theme picks the ground. Cyber adds
-   a ruled grid, glow and a scan sweep, all gated on dark and on reduced-motion. #}
 <html lang="en" data-theme="{{ theme | default('light') }}" data-palette="{{ palette | default('modernist') }}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}Code Atlas{% endblock %}</title>
-    {# Before the stylesheet so the stored palette is on the root when it lands, and
-       the page does not flash the default first. #}
     {% block headscripts %}<script src="/static/theme.js"></script>{% endblock %}
     {% block stylesheet %}
     <link rel="stylesheet" href="/static/design.css" />
     {% endblock %}
   </head>
   <body>
-    <div class="app">
-      <header class="app-header">
-        <div class="brand">Code Atlas</div>
+    <div style="display:flex;flex-direction:column;height:100vh">
+      <header style="flex:none;display:flex;align-items:stretch;gap:18px;padding:0 14px;height:52px;border-bottom:1px solid var(--color-divider)">
+        <div style="display:flex;flex:none;align-items:center;white-space:nowrap;font-family:var(--font-heading);font-weight:800;font-size:12px;letter-spacing:0.16em;text-transform:uppercase">Code Atlas</div>
 
-        {# A link, not a button: the static export has no server to open a dialog
-           against, and a link still resolves there. #}
-        {% block projectswitch %}
-        <a class="project-switch" href="/projects">
-          <span class="project-name">{{ project | default('—') }}</span>
-          <span class="project-meta">{% block subtitle %}{% endblock %}</span>
-        </a>
-        {% endblock %}
+        <div style="display:flex;flex:none;align-items:center">
+          {% block projectswitch %}
+          <a href="/projects" class="hover-tint" style="display:flex;align-items:center;gap:9px;background:var(--color-surface);border:1px solid var(--color-divider);border-radius:10px;padding:5px 10px;cursor:pointer;color:inherit;text-align:left;text-decoration:none">
+            <span style="font-family:var(--font-heading);font-weight:800;font-size:14px;white-space:nowrap">{{ project | default('—') }}</span>
+            <span style="font-size:11px;white-space:nowrap;color:color-mix(in srgb, var(--color-text) 58%, transparent)">{% block subtitle %}{% endblock %}</span>
+            <span style="font-size:11px;color:color-mix(in srgb, var(--color-text) 45%, transparent)">▾</span>
+          </a>
+          {% endblock %}
+        </div>
 
-        <nav class="app-nav">
+        <nav style="display:flex;flex:none;align-items:stretch;gap:2px;margin-left:8px;white-space:nowrap">
           {% block nav %}
           {% set current = active | default('') %}
           {% for href, key, label in [
@@ -51,23 +45,28 @@
             ('/impact', 'impact', 'Impact'),
             ('/architecture/', 'architecture', 'Architecture')
           ] %}
-            {% if key == current %}
-          <a class="app-nav-item is-active" href="{{ href }}" aria-current="page">{{ label }}</a>
-            {% else %}
-          <a class="app-nav-item" href="{{ href }}">{{ label }}</a>
-            {% endif %}
+          {# margin-bottom:-1px pulls the marker onto the header's own rule, so an active
+             tab reads as one line rather than two stacked. #}
+          <a href="{{ href }}" class="hover-tint" style="display:flex;align-items:center;gap:6px;padding:0 14px;background:transparent;border:0;border-bottom:2px solid {{ 'var(--color-accent)' if key == current else 'transparent' }};margin-bottom:-1px;cursor:pointer;color:{{ 'var(--color-text)' if key == current else 'color-mix(in srgb, var(--color-text) 62%, transparent)' }};font:inherit;font-size:13.5px;font-weight:{{ 700 if key == current else 500 }};text-decoration:none">
+            <span>{{ label }}</span>
+          </a>
           {% endfor %}
           {% endblock %}
         </nav>
 
-        {% block settingslink %}
-        <a class="app-settings" href="/settings" title="Settings" aria-label="Settings">⚙</a>
-        {% endblock %}
+        <div style="display:flex;align-items:center;gap:10px;margin-left:auto;min-width:0;flex:0 1 auto;overflow:hidden">
+          <span style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{% block indexednote %}{% endblock %}</span>
+          {% block settingslink %}
+          <a href="/settings" class="hover-tint" style="display:flex;flex:none;align-items:center;gap:7px;background:transparent;border:1px solid var(--color-divider);border-radius:10px;padding:5px 10px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-decoration:none">Settings</a>
+          {% endblock %}
+        </div>
       </header>
 
-      <div class="app-body">
+      <div style="flex:1;display:flex;min-height:0">
         {% block sidebar %}{% endblock %}
-        <main class="app-main">{% block content %}{% endblock %}</main>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden">
+          {% block content %}{% endblock %}
+        </div>
       </div>
     </div>
     {% block scripts %}{% endblock %}
