@@ -1355,51 +1355,42 @@ class MapViewService:
         limit = node_limit if node_limit is not None else (_ENTITY_FULL_LIMIT if full else _ENTITY_SCOPE_LIMIT)
         scope_options = await self._scope_options()
 
-        # One row shape for both sources: (from_qn, to_qn, rel_type, weight, confidence, strategy).
-        if full:
-            unavailable = self._unsupported_reason()
-            if unavailable:
-                return _empty_map(self._project, unavailable, level="entity", scope_options=scope_options)
-            from code_atlas.server.analysis import fetch_entity_graph  # noqa: PLC0415
+        # One fetch for every entity view: the whole graph, filtered by path prefix
+        # when a scope is set. The module-summary read this replaced capped a scope
+        # at 1,500 entities and 500 edges — a directory like src/code_atlas blew
+        # through both, and the containment anchors then papered over the missing
+        # call edges as if nothing had been cut.
+        unavailable = self._unsupported_reason()
+        if unavailable:
+            return _empty_map(self._project, unavailable, level="entity", scope=scope, scope_options=scope_options)
+        from code_atlas.server.analysis import fetch_entity_graph  # noqa: PLC0415
 
-            try:
-                rows, raw_edges = await fetch_entity_graph(self._graph, self._project)
-            except Exception as exc:  # the map may not take the page down
-                logger.debug("Entity graph unavailable for {}: {}", self._project, exc)
-                return _empty_map(
-                    self._project,
-                    "The entity graph could not be fetched for this project. "
-                    "Run health_check for the backend's own account of why.",
-                    level="entity",
-                    scope_options=scope_options,
-                )
-            edge_rows = [
-                (
-                    str(r.get("from_qn") or ""),
-                    str(r.get("to_qn") or ""),
-                    str(r.get("rel_type") or ""),
-                    _as_float(r.get("weight")) or 1.0,
-                    str(r.get("confidence") or ""),
-                    str(r.get("strategy") or ""),
-                )
-                for r in raw_edges
-            ]
-        else:
-            summary = await self._graph.get_module_summary(self._project, scope, _ENTITY_SCOPE_LIMIT, _EDGE_LIMIT)
-            rows = list(summary.get("entities") or [])
-            edge_rows = []
-            for row in summary.get("internal_edges") or []:
-                props = row.get("props") or {}
-                edge_rows.append(
-                    (
-                        str(row.get("from_qn") or ""),
-                        str(row.get("to_qn") or ""),
-                        str(row.get("rel_type") or ""),
-                        _as_float(props.get("weight")) or 1.0,
-                        str(props.get("confidence") or ""),
-                        str(props.get("strategy") or ""),
-                    )
-                )
+        try:
+            rows, raw_edges = await fetch_entity_graph(self._graph, self._project)
+        except Exception as exc:  # the map may not take the page down
+            logger.debug("Entity graph unavailable for {}: {}", self._project, exc)
+            return _empty_map(
+                self._project,
+                "The entity graph could not be fetched for this project. "
+                "Run health_check for the backend's own account of why.",
+                level="entity",
+                scope=scope,
+                scope_options=scope_options,
+            )
+        if scope:
+            prefix = scope.replace("\\", "/").rstrip("/")
+            rows = [r for r in rows if str(r.get("file_path") or "").replace("\\", "/").startswith(prefix)]
+        edge_rows = [
+            (
+                str(r.get("from_qn") or ""),
+                str(r.get("to_qn") or ""),
+                str(r.get("rel_type") or ""),
+                _as_float(r.get("weight")) or 1.0,
+                str(r.get("confidence") or ""),
+                str(r.get("strategy") or ""),
+            )
+            for r in raw_edges
+        ]
 
         if not rows:
             return _empty_map(
@@ -1424,31 +1415,34 @@ class MapViewService:
                 "lines": _lines_of(r),
             }
 
-        # Full scope honours the same test and non-code filters the module level
-        # does — without them half the picture is test scaffolding mirroring the
-        # production structure. Hidden is counted, never silently dropped. A view
-        # deliberately scoped INTO a test module keeps showing it.
+        # The same test and non-code filters as the module level, at every scope —
+        # without them half the picture is test scaffolding mirroring the production
+        # structure. Hidden is counted, never silently dropped; a scope that holds
+        # only filtered entities says so and offers the toggles.
         test_count = noncode_count = 0
-        if full:
-            production: dict[str, dict[str, Any]] = {}
-            for qn, info in entities.items():
-                path = info["file_path"]
-                if not show_tests and _is_test_module(path, info["name"], self._test_patterns):
-                    test_count += 1
-                elif not show_noncode and _is_noncode_module(path):
-                    noncode_count += 1
-                else:
-                    production[qn] = info
-            entities = production
-            if not entities:
-                return _empty_map(
-                    self._project,
-                    "",
-                    caveat=CoverageCaveat(note="Every indexed entity is test or non-code, and both are filtered."),
-                    level="entity",
-                    scope=scope,
-                    scope_options=scope_options,
-                )
+        production: dict[str, dict[str, Any]] = {}
+        for qn, info in entities.items():
+            path = info["file_path"]
+            if info["kind"] in {"external_package", "external_symbol"}:
+                production[qn] = info
+            elif not show_tests and _is_test_module(path, info["name"], self._test_patterns):
+                test_count += 1
+            elif not show_noncode and _is_noncode_module(path):
+                noncode_count += 1
+            else:
+                production[qn] = info
+        entities = production
+        if not entities:
+            return _empty_map(
+                self._project,
+                "",
+                caveat=CoverageCaveat(note="Everything in this scope is test or non-code, and the filters hide both."),
+                level="entity",
+                scope=scope,
+                scope_options=scope_options,
+                test_count=test_count,
+                noncode_count=noncode_count,
+            )
 
         # A scoped view synthesises its host module when the summary omits it — the
         # design draws the module as the graph's anchor. At full scope the modules are
@@ -1539,9 +1533,10 @@ class MapViewService:
 
         # A full-scope layout is the one expensive computation here — deterministic
         # per graph, so it is cached against the index stamp.
-        if full and len(kept) > 800:
+        if len(kept) > 800:
             key = (
                 self._project,
+                scope,
                 expand_methods,
                 hidden_kinds,
                 show_tests,
@@ -1595,6 +1590,9 @@ class MapViewService:
             module_total=await self._module_total(),
             test_count=test_count,
             noncode_count=noncode_count,
+            external_count=sum(
+                1 for info in entities.values() if info["kind"] in {"external_package", "external_symbol"}
+            ),
             entity_total=await self._entity_total((self._project,)),
             truncated=truncated,
             scope_options=scope_options,
@@ -1867,7 +1865,9 @@ def _empty_map(
     level: str = "module",
     scope: str = "",
     scope_options: tuple[ScopeOption, ...] = (),
-) -> MapPayload:  # an empty map still names its level and scope
+    test_count: int = 0,
+    noncode_count: int = 0,
+) -> MapPayload:  # an empty map still names its level, scope and filter counts
     return MapPayload(
         project=project,
         level=level,
@@ -1880,6 +1880,8 @@ def _empty_map(
         scope=scope,
         scope_options=scope_options,
         default_scope=_default_scope(scope_options),
+        test_count=test_count,
+        noncode_count=noncode_count,
     )
 
 

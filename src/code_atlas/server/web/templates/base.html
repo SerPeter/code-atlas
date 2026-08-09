@@ -24,7 +24,7 @@
         document.documentElement.dataset.palette = p;
       })();
     </script>
-    <link rel="stylesheet" href="/static/design.css" />
+    <link rel="stylesheet" href="/static/design.css?v={{ static_v }}" />
   </head>
   <body>
     <div style="display:flex;flex-direction:column;height:100vh;overflow:hidden;font-family:var(--font-body);background:var(--color-bg);color:var(--color-text)">
@@ -71,7 +71,7 @@
          so the row template lives in exactly one place. #}
       <div id="projects-modal" hidden></div>
     </div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v={{ static_v }}"></script>
     {% block scripts %}{% endblock %}
   </body>
 </html>
