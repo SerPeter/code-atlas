@@ -1730,11 +1730,14 @@ class SqliteGraphClient:
             return
         conn = await self._get_conn()
         for r in ref_rels:
+            # A table lookup or a constant read names a Value; everything else here
+            # names a Callable — same split the Memgraph resolver makes.
+            label = "Value" if r.properties.get("via") in {"table", "const"} else "Callable"
             cur = await conn.execute(
                 "SELECT b.uid FROM nodes b JOIN nodes a ON a.uid = ? "
-                "WHERE b.labels = 'Callable' AND b.project_name = ? AND b.name = ? "
+                "WHERE b.labels = ? AND b.project_name = ? AND b.name = ? "
                 "AND b.file_path = a.file_path AND b.uid <> a.uid LIMIT 1",
-                (r.from_qualified_name, project_name, r.to_name),
+                (r.from_qualified_name, label, project_name, r.to_name),
             )
             row = await cur.fetchone()
             await cur.close()

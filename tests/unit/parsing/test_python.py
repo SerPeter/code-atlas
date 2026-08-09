@@ -2234,3 +2234,95 @@ def test_only_ellipsis_and_abstractmethod_count_as_stubs():
     assert not stub("Base.real")
     assert not stub("Base.hook")
     assert not stub("Base.doc_only")
+
+
+# ---------------------------------------------------------------------------
+# Constant reads — REFERENCES via="const" onto module-level Values
+# ---------------------------------------------------------------------------
+
+
+def _const_refs(parsed: ParsedFile) -> set[tuple[str, str]]:
+    return {
+        (r.from_qualified_name, r.to_name)
+        for r in parsed.relationships
+        if r.rel_type == RelType.REFERENCES and r.properties.get("via") == "const"
+    }
+
+
+def test_a_function_reading_a_module_constant_gets_a_references_edge():
+    """`_match_brace` reading `_OPEN_BRACE` was invisible: one REFERENCES edge landed
+    on a Value in the whole graph, so every constant looked unused."""
+    parsed = _parse(
+        """
+_OPEN_BRACE = "{"
+
+def _match_brace(text):
+    return text.startswith(_OPEN_BRACE)
+"""
+    )
+
+    assert (f"{PROJECT}:example._match_brace", "_OPEN_BRACE") in _const_refs(parsed)
+
+
+def test_a_local_binding_shadows_the_module_constant():
+    """A bare name bound in the function is a local — Python's own scoping rule, and
+    the exact false edge ADR-0022 exists to refuse."""
+    parsed = _parse(
+        """
+LIMIT = 10
+
+def shadowed():
+    LIMIT = 3
+    return LIMIT
+
+def parameter(LIMIT):
+    return LIMIT
+"""
+    )
+
+    assert _const_refs(parsed) == set()
+
+
+def test_a_global_declaration_unshadows():
+    """`global NAME` declares the name module-scoped, so touching it really does
+    touch the Value."""
+    parsed = _parse(
+        """
+COUNTER = 0
+
+def bump():
+    global COUNTER
+    COUNTER = COUNTER + 1
+"""
+    )
+
+    assert (f"{PROJECT}:example.bump", "COUNTER") in _const_refs(parsed)
+
+
+def test_module_level_reads_attribute_to_the_module():
+    parsed = _parse(
+        """
+BASE = ("a",)
+DERIVED = tuple(BASE)
+"""
+    )
+
+    assert (f"{PROJECT}:example", "BASE") in _const_refs(parsed)
+
+
+def test_one_edge_per_reader_not_per_mention():
+    parsed = _parse(
+        """
+SEP = ","
+
+def join(parts):
+    return SEP + SEP.join(parts) + SEP
+"""
+    )
+
+    refs = [
+        r
+        for r in parsed.relationships
+        if r.rel_type == RelType.REFERENCES and r.properties.get("via") == "const" and r.to_name == "SEP"
+    ]
+    assert len(refs) == 1
