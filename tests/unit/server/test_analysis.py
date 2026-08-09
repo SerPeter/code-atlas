@@ -995,8 +995,9 @@ async def test_communities_query_sums_the_numeric_calls_weight():
     ``1.0`` (``_CALL_WEIGHT_BASE``) for edges written before the ADR-0014
     weighting amendment. Summing — not averaging, not counting rows — is what
     makes a module pair joined by many confident calls outrank one joined by a
-    single ambiguous or test-provenance call. ``confidence`` is a *string* and
-    must never appear as the aggregated property.
+    single ambiguous or test-provenance call. ``confidence`` is a *string*: it may
+    be COUNTED by state (the CASE sums that carry the map's evidence) but must
+    never appear as the aggregated weight itself.
     """
     graph = _community_graph([_mod_row("pkg.a")])
 
@@ -1004,7 +1005,8 @@ async def test_communities_query_sums_the_numeric_calls_weight():
 
     calls_query = graph.execute.call_args_list[1][0][0]
     assert "sum(coalesce(r.weight, 1.0))" in calls_query
-    assert "confidence" not in calls_query
+    assert "sum(r.confidence" not in calls_query, "a summed string is a silent type error"
+    assert "coalesce(r.confidence" not in calls_query
 
 
 async def test_greedy_modularity_is_weight_sensitive():
