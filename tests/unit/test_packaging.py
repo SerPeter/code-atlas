@@ -99,15 +99,14 @@ class TestWheelContents:
             names = wheel.namelist()
 
         vendored = [n for n in names if "server/web/static/vendor/" in n]
-        assert any(n.endswith("sigma-3.0.3.min.js") for n in vendored), "the renderer is missing"
-        assert any(n.endswith("graphology-0.26.0.umd.min.js") for n in vendored)
-        assert any(n.endswith(".woff2") for n in vendored), "the typeface is missing"
+        # The canvas is DOM + SVG, exactly as the reference design draws it — there is
+        # no renderer library to vendor. The typeface is the only binary asset.
+        for subset in ("archivo-latin.woff2", "archivo-latin-ext.woff2", "archivo-vietnamese.woff2"):
+            assert any(n.endswith(subset) for n in vendored), f"{subset} is missing"
 
-        # Each licence by name rather than a count: MIT and OFL both require the notice
-        # to travel with the code, and a bare total silently passes if one is swapped
-        # for another. It also broke the moment a third vendored asset arrived.
-        for licence in ("sigma-3.0.3.LICENSE.txt", "graphology-0.26.0.LICENSE.txt", "archivo.LICENSE.txt"):
-            assert any(n.endswith(licence) for n in vendored), f"{licence} does not ship"
+        # The licence by name rather than a count: OFL requires the notice to travel
+        # with the font, and a bare total silently passes if it is swapped for another.
+        assert any(n.endswith("archivo.LICENSE.txt") for n in vendored), "the font licence does not ship"
 
     def test_the_templates_ship(self, tmp_path: Path) -> None:
         archive = _build("--wheel", tmp_path)

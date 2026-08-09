@@ -1,57 +1,47 @@
-{% extends "base.html" %}
-{% block title %}{{ overview.project }} — code-atlas snapshot{% endblock %}
-{% block subtitle %}snapshot{% endblock %}
-{# No server to reach, so the control that needs one is simply absent. #}
-{% block settingslink %}{% endblock %}
-{% block headscripts %}<script>{{ theme_js }}</script>{% endblock %}
-{% block stylesheet %}
-{# Inlined, not linked. A linked stylesheet would make the file non-portable — the
-   whole point of the export is that it opens from a filesystem with no server. #}
-<style>{{ design_css }}</style>
-{% endblock %}
-{% block projectswitch %}
-{# Inert in an export: there is no server to switch projects against. #}
-<span class="project-switch">
-  <span class="project-name">{{ overview.project }}</span>
-  <span class="project-meta">snapshot</span>
-</span>
-{% endblock %}
-{% block nav %}
-      <a href="#overview">overview</a>
-      <a href="#map">map</a>
-      <a href="#architecture">architecture</a>
-{% endblock %}
-{% block content %}
-  {# A snapshot that does not say when it was taken is a trap: it looks like the
-     current state forever. Provenance goes first, not in a footer. #}
-  <p class="caveat">
-    <b>Static snapshot.</b>
-    Project <b>{{ overview.project }}</b>,
-    commit <code>{{ (overview.git_hash or "unknown")[:12] }}</code>,
-    generated <b>{{ generated_at }}</b>{% if indexed_at %}, indexed {{ indexed_at }}{% endif %}.
-    This file reflects the graph at that moment and will not update.
-  </p>
+<!doctype html>
+{# The static export — one self-contained file: the shell and the map island with the
+   payload embedded, no server, no network. Deliberately the same markup and the same
+   map.js as the live server (inlined rather than linked), so the two cannot drift. #}
+<html lang="en" data-theme="light" data-palette="modernist">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ chrome.project_name }} — Code Atlas export</title>
+    <style>{{ design_css }}</style>
+  </head>
+  <body>
+    <div style="display:flex;flex-direction:column;height:100vh;overflow:hidden;font-family:var(--font-body);background:var(--color-bg);color:var(--color-text)">
 
-  {# Named rather than silently absent. A missing view reads as "nothing to show";
-     a disabled one reads as "this needs the server", which is the truth. #}
-  <p class="muted">
-    Search, entity detail and the impact explorer are <b>not included</b>: each runs a query
-    against the graph for whatever you ask it, so there is nothing to precompute.
-    Run <code>atlas ui</code> for those.
-  </p>
+      <header style="flex:none;display:flex;align-items:stretch;gap:18px;padding:0 14px;height:52px;border-bottom:1px solid var(--color-divider)">
+        <div style="display:flex;flex:none;align-items:center;white-space:nowrap;font-family:var(--font-heading);font-weight:800;font-size:12px;letter-spacing:0.16em;text-transform:uppercase">Code Atlas</div>
+        <div style="display:flex;flex:none;align-items:center">
+          <span style="display:flex;align-items:center;gap:9px;background:var(--color-surface);border:1px solid var(--color-divider);border-radius:10px;padding:5px 10px;color:inherit">
+            <span style="font-family:var(--font-heading);font-weight:800;font-size:14px;white-space:nowrap">{{ chrome.project_name }}</span>
+            <span style="font-size:11px;white-space:nowrap;color:color-mix(in srgb, var(--color-text) 58%, transparent)">{{ chrome.project_meta }}</span>
+          </span>
+        </div>
+        <nav style="display:flex;flex:none;align-items:stretch;gap:2px;margin-left:8px;white-space:nowrap">
+          <span style="display:flex;align-items:center;gap:6px;padding:0 14px;border-bottom:2px solid var(--color-accent);margin-bottom:-1px;color:var(--color-accent-700);font-size:13.5px;font-weight:600">Map</span>
+        </nav>
+        <div style="display:flex;align-items:center;gap:10px;margin-left:auto;min-width:0;flex:0 1 auto;overflow:hidden">
+          <span style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">static export · {{ generated_at }}</span>
+        </div>
+      </header>
 
-  <h2 id="overview">Overview</h2>
-  {% include "_overview_section.html" %}
+      <div style="flex:1;display:flex;min-height:0">
+        <aside id="map-aside" style="width:272px;flex:none;border-right:1px solid var(--color-divider);overflow-y:auto;display:flex;flex-direction:column"></aside>
+        <main id="map-main" style="flex:1;min-width:0;position:relative"></main>
+        <aside id="map-context" style="width:326px;flex:none;border-left:1px solid var(--color-divider);overflow-y:auto"></aside>
+      </div>
 
-  <h2 id="map">Map</h2>
-  {% include "_map_section.html" %}
-
-  <h2 id="architecture">Architecture</h2>
-  {% include "_architecture_section.html" %}
-{% endblock %}
-{% block scripts %}
-{# Inlined, not linked. A linked asset would make the file non-portable, and a CDN
-   would make it phone home from a file:// origin. #}
-<script>{{ vendor_js }}</script>
-<script>{{ map_js }}</script>
-{% endblock %}
+      <footer style="flex:none;display:flex;align-items:center;gap:16px;height:34px;padding:0 16px;border-top:1px solid var(--color-divider);font-size:11px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
+        <span style="display:flex;align-items:center;gap:7px"><span style="width:7px;height:7px;border-radius:999px;background:var(--color-accent);display:block"></span>{{ chrome.footer_indexed }}</span>
+        <span style="opacity:0.35">|</span>
+        <span>{{ chrome.coverage_note }}</span>
+        <span style="margin-left:auto">Exported {{ generated_at }}</span>
+      </footer>
+    </div>
+    <script>window.ATLAS_EMBED = {{ map_data_json }};</script>
+    <script>{{ map_js }}</script>
+  </body>
+</html>

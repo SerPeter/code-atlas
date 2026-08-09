@@ -1,21 +1,9 @@
-/* Code Atlas interface stylesheet.
- *
- * Extracted verbatim from the Claude Design v1.1 output (.specs/research/) and rewired
- * only where it referenced bundler asset ids.
- *
- * Three layers, in override order:
- *   1. DESIGN SYSTEM  - tokens and component classes
- *   2. APPLICATION    - palettes (modernist/cyber) x themes (light/dark), community hues
- *   3. SHELL + VIEWS  - the frame and per-view components
- *
- * Themes are two independent axes on the root element: data-palette and data-theme.
- * Cyber adds a ruled grid, node/edge glow and a scan sweep, all gated on dark and on
- * prefers-reduced-motion.
- */
+/* Code Atlas UI stylesheet — a verbatim port of the v1.1 design's two style layers.
+   Layer 1 is the Modernist design system (tokens + component classes), layer 2 is the
+   page layer (radii, community palette, Cyber palette, dark ground, canvas effects).
+   Layer 3 at the bottom is the only addition: hover/selected classes standing in for
+   the design runtime's `style-hover` attribute, byte-for-byte the same declarations. */
 
-/* ===== 1. DESIGN SYSTEM ===== */
-
-/* Modernist — design-system tokens and component classes. This file is the source of truth for the system's look; retune it here and see readme.md. */
 /* vietnamese */
 @font-face {
   font-family: 'Archivo';
@@ -181,8 +169,7 @@ h1, h2, h3, h4 { font-family: var(--font-heading); font-weight: var(--font-headi
 
 /* ══════════════════════════════════════════════════════════════════════════
    Components — built with the tokens above. Plain CSS
-   on plain HTML: no JavaScript, no build step. Each class is documented in
-   readme.md and demonstrated in foundations/ and components/.
+   on plain HTML: no JavaScript, no build step.
    ══════════════════════════════════════════════════════════════════════ */
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -222,8 +209,7 @@ figcaption {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   cursor: pointer; text-decoration: none;
   font-family: var(--font-heading); font-weight: var(--font-heading-weight);
-  font-size: 14px; line-height: 1.2; color: var(--color-text); /* matches the .input's 14px —
-     the pair sits side by side in sign-up rows */
+  font-size: 14px; line-height: 1.2; color: var(--color-text);
   background: transparent; border: 1px solid transparent;
   padding: var(--space-2) calc(var(--space-3) * 1.2);
   border-radius: var(--radius-md);
@@ -357,277 +343,146 @@ textarea.input { min-height: 90px; resize: vertical; }
 .dialog-body { font-size: 14px; opacity: 0.85; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-2); }
 
-/* ===== 2. APPLICATION: palettes, themes, community hues ===== */
+/* ── Page layer — radii, community palette, Cyber palette, dark ground ──── */
 
 html, body { height: 100%; }
-  body { margin: 0; background: var(--color-bg); color: var(--color-text); }
-  a { color: var(--color-accent); }
-  a:hover { color: var(--color-accent-600); }
-  .input { border-radius: 8px; }
-  .btn { border-radius: 8px; }
-  .seg { border-radius: 8px; }
-  .tag { border-radius: 999px; }
-  /* Community palette: one hue sweep at a fixed lightness and chroma, so no
-     subsystem shouts louder than another and red stays the interface accent. */
-  :root {
-    --atlas-c0: oklch(0.55 0.14 30);
-    --atlas-c1: oklch(0.57 0.11 62);
-    --atlas-c2: oklch(0.55 0.10 105);
-    --atlas-c3: oklch(0.54 0.09 152);
-    --atlas-c4: oklch(0.54 0.08 205);
-    --atlas-c5: oklch(0.52 0.10 252);
-    --atlas-c6: oklch(0.52 0.11 295);
-    --atlas-c7: oklch(0.54 0.11 340);
-    --atlas-c8: oklch(0.62 0.012 60);
-  }
-  /* ── Cyber palette ──────────────────────────────────────────────────────
-     A second theme, selectable in Settings. Cold near-black ground, cyan ink,
-     magenta accent; the community hues become a narrow cyan→magenta sweep so
-     the map reads as one signal rather than a rainbow. Both grounds are
-     first-class, as the light/dark rule requires. */
-  :root[data-palette="cyber"], [data-palette="cyber"] {
-    --color-bg: #eef1f4; --color-surface: #e2e7ec; --color-text: #12181f;
-    --color-divider: color-mix(in srgb, #12181f 22%, transparent);
-    --color-accent: #b0006e; --color-accent-600: #8e0058; --color-accent-700: #75004a;
-    --color-accent-100: color-mix(in srgb, #b0006e 12%, #eef1f4);
-    --color-accent-800: #5c003a;
-    --color-neutral-100: #e6eaee; --color-neutral-200: #d7dde3; --color-neutral-300: #c3ccd4;
-    --color-neutral-800: #2a333d; --color-neutral-900: #12181f;
-    --atlas-c0: oklch(0.55 0.13 200); --atlas-c1: oklch(0.53 0.14 225);
-    --atlas-c2: oklch(0.52 0.15 255); --atlas-c3: oklch(0.52 0.16 285);
-    --atlas-c4: oklch(0.53 0.17 315); --atlas-c5: oklch(0.54 0.16 340);
-    --atlas-c6: oklch(0.55 0.12 185); --atlas-c7: oklch(0.51 0.13 265);
-    --atlas-c8: oklch(0.60 0.02 235);
-  }
-  :root[data-palette="cyber"][data-theme="dark"], [data-palette="cyber"][data-theme="dark"] {
-    --color-bg: #07090d; --color-surface: #0e1319; --color-text: #d6f2f6;
-    --color-divider: color-mix(in srgb, #4de3f0 26%, transparent);
-    --color-accent: #ff2fbf; --color-accent-600: #ff5fcd; --color-accent-700: #ff8bd9;
-    --color-accent-100: color-mix(in srgb, #ff2fbf 16%, #07090d);
-    --color-accent-800: #ffb3e6;
-    --color-neutral-100: #0d1218; --color-neutral-200: #141b23; --color-neutral-300: #1e2832;
-    --color-neutral-400: #2a3843; --color-neutral-500: #3d5260; --color-neutral-600: #587485;
-    --color-neutral-700: #7fa3b3; --color-neutral-800: #a8cdd8; --color-neutral-900: #d6f2f6;
-    --shadow-md: 0 0 22px rgba(77,227,240,0.14); --shadow-lg: 0 0 44px rgba(77,227,240,0.2);
-    --atlas-c0: oklch(0.82 0.14 195); --atlas-c1: oklch(0.79 0.15 218);
-    --atlas-c2: oklch(0.75 0.17 250); --atlas-c3: oklch(0.72 0.19 285);
-    --atlas-c4: oklch(0.74 0.20 318); --atlas-c5: oklch(0.77 0.19 342);
-    --atlas-c6: oklch(0.85 0.13 180); --atlas-c7: oklch(0.70 0.16 262);
-    --atlas-c8: oklch(0.58 0.03 230);
-  }
-  /* Cyber effects layer — scoped to the palette, so Modernist stays flat.
-     Everything here is decoration over an unchanged layout: a ruled ground
-     under the graph, glow on the emissive parts, and one slow scan sweep. */
-  /* `top` is percentage-of-parent, so the sweep crosses the whole canvas at any
-     window height; translateY would resolve against the 14px band itself. */
-  @keyframes atlas-scan { from { top: -14px; } to { top: 100%; } }
-  /* the canvas carries an inline `background`, which resets background-image —
-     the theme layer has to win past it */
-  [data-palette="cyber"] [data-atlas-canvas] {
-    background-image:
-      linear-gradient(color-mix(in srgb, var(--color-text) 7%, transparent) 1px, transparent 1px),
-      linear-gradient(90deg, color-mix(in srgb, var(--color-text) 7%, transparent) 1px, transparent 1px) !important;
-    background-size: 44px 44px, 44px 44px !important;
-  }
-  [data-palette="cyber"][data-theme="dark"] [data-atlas-canvas]::after {
-    content: ""; position: absolute; left: 0; right: 0; top: 0; height: 14px; pointer-events: none;
-    background: linear-gradient(180deg, transparent, color-mix(in srgb, #4de3f0 12%, transparent), transparent);
-    animation-name: atlas-scan; animation-duration: 9s;
-    animation-timing-function: linear; animation-iteration-count: infinite;
-  }
-  [data-palette="cyber"][data-theme="dark"] [data-atlas-inner] span[style*="border-radius: 50%"] {
-    filter: drop-shadow(0 0 5px currentColor);
-  }
-  [data-palette="cyber"][data-theme="dark"] [data-atlas-inner] svg {
-    filter: drop-shadow(0 0 3px color-mix(in srgb, #4de3f0 55%, transparent));
-  }
-  [data-palette="cyber"][data-theme="dark"] h3,
-  [data-palette="cyber"][data-theme="dark"] h4,
-  [data-palette="cyber"][data-theme="dark"] header > div:first-child {
-    text-shadow: 0 0 14px color-mix(in srgb, #4de3f0 40%, transparent);
-  }
-  [data-palette="cyber"][data-theme="dark"] .btn-primary {
-    box-shadow: 0 0 16px color-mix(in srgb, var(--color-accent) 45%, transparent);
-  }
-  [data-palette="cyber"][data-theme="dark"] .input:focus,
-  [data-palette="cyber"][data-theme="dark"] .btn:focus-visible {
-    box-shadow: 0 0 0 1px var(--color-accent), 0 0 18px color-mix(in srgb, var(--color-accent) 40%, transparent);
-  }
-  [data-palette="cyber"][data-theme="dark"] footer,
-  [data-palette="cyber"][data-theme="dark"] header {
-    background: linear-gradient(180deg, color-mix(in srgb, #4de3f0 4%, transparent), transparent);
-  }
-  [data-palette="cyber"] .table thead th { letter-spacing: 0.08em; text-transform: uppercase; }
-  @media (prefers-reduced-motion: reduce) {
-    [data-palette="cyber"][data-theme="dark"] [data-atlas-canvas]::after { animation: none; opacity: 0; }
-  }
-  :root[data-theme="dark"], [data-theme="dark"] {
-    --color-bg: #171615; --color-surface: #221f1e; --color-text: #ece8e5;
-    --color-divider: color-mix(in srgb, #ece8e5 26%, transparent);
-    --color-accent: #ff644b;
-    /* On the dark ground the same hues are lifted and slightly softened, so
-       they read as one family rather than as saturated pinpricks. */
-    --atlas-c0: oklch(0.70 0.13 30);
-    --atlas-c1: oklch(0.75 0.10 62);
-    --atlas-c2: oklch(0.76 0.09 105);
-    --atlas-c3: oklch(0.75 0.09 152);
-    --atlas-c4: oklch(0.75 0.08 205);
-    --atlas-c5: oklch(0.72 0.09 252);
-    --atlas-c6: oklch(0.71 0.10 295);
-    --atlas-c7: oklch(0.73 0.10 340);
-    --atlas-c8: oklch(0.60 0.012 60);
-    --color-neutral-100: #211f1e; --color-neutral-200: #2b2928; --color-neutral-300: #3a3736;
-    --color-neutral-400: #4f4b4a; --color-neutral-500: #6d6968; --color-neutral-600: #8e8a88;
-    --color-neutral-700: #b0acaa; --color-neutral-800: #d3d0ce; --color-neutral-900: #f0eeec;
-    --shadow-md: 0 4px 18px rgba(0,0,0,0.5); --shadow-lg: 0 12px 40px rgba(0,0,0,0.55);
-  }
-
-/* ========================================================================
-   3. WHAT THE PORTED MARKUP NEEDS
-   The design carries its layout in inline styles, so almost nothing belongs
-   here. These are the few hooks its markup references by class.
-   ======================================================================== */
-
-/* `style-hover` in the design output; a real pseudo-class here. */
-.hover-tint:hover {
-  background: color-mix(in srgb, var(--color-text) 6%, transparent) !important;
+body { margin: 0; background: var(--color-bg); color: var(--color-text); }
+a { color: var(--color-accent); }
+a:hover { color: var(--color-accent-600); }
+.input { border-radius: 8px; }
+.btn { border-radius: 8px; }
+.seg { border-radius: 8px; }
+.tag { border-radius: 999px; }
+/* Community palette: one hue sweep at a fixed lightness and chroma, so no
+   subsystem shouts louder than another and red stays the interface accent. */
+:root {
+  --atlas-c0: oklch(0.55 0.14 30);
+  --atlas-c1: oklch(0.57 0.11 62);
+  --atlas-c2: oklch(0.55 0.10 105);
+  --atlas-c3: oklch(0.54 0.09 152);
+  --atlas-c4: oklch(0.54 0.08 205);
+  --atlas-c5: oklch(0.52 0.10 252);
+  --atlas-c6: oklch(0.52 0.11 295);
+  --atlas-c7: oklch(0.54 0.11 340);
+  --atlas-c8: oklch(0.62 0.012 60);
+}
+/* ── Cyber palette ──────────────────────────────────────────────────────
+   A second theme, selectable in Settings. Cold near-black ground, cyan ink,
+   magenta accent; the community hues become a narrow cyan→magenta sweep so
+   the map reads as one signal rather than a rainbow. Both grounds are
+   first-class, as the light/dark rule requires. */
+:root[data-palette="cyber"], [data-palette="cyber"] {
+  --color-bg: #eef1f4; --color-surface: #e2e7ec; --color-text: #12181f;
+  --color-divider: color-mix(in srgb, #12181f 22%, transparent);
+  --color-accent: #b0006e; --color-accent-600: #8e0058; --color-accent-700: #75004a;
+  --color-accent-100: color-mix(in srgb, #b0006e 12%, #eef1f4);
+  --color-accent-800: #5c003a;
+  --color-neutral-100: #e6eaee; --color-neutral-200: #d7dde3; --color-neutral-300: #c3ccd4;
+  --color-neutral-800: #2a333d; --color-neutral-900: #12181f;
+  --atlas-c0: oklch(0.55 0.13 200); --atlas-c1: oklch(0.53 0.14 225);
+  --atlas-c2: oklch(0.52 0.15 255); --atlas-c3: oklch(0.52 0.16 285);
+  --atlas-c4: oklch(0.53 0.17 315); --atlas-c5: oklch(0.54 0.16 340);
+  --atlas-c6: oklch(0.55 0.12 185); --atlas-c7: oklch(0.51 0.13 265);
+  --atlas-c8: oklch(0.60 0.02 235);
+}
+:root[data-palette="cyber"][data-theme="dark"], [data-palette="cyber"][data-theme="dark"] {
+  --color-bg: #07090d; --color-surface: #0e1319; --color-text: #d6f2f6;
+  --color-divider: color-mix(in srgb, #4de3f0 26%, transparent);
+  --color-accent: #ff2fbf; --color-accent-600: #ff5fcd; --color-accent-700: #ff8bd9;
+  --color-accent-100: color-mix(in srgb, #ff2fbf 16%, #07090d);
+  --color-accent-800: #ffb3e6;
+  --color-neutral-100: #0d1218; --color-neutral-200: #141b23; --color-neutral-300: #1e2832;
+  --color-neutral-400: #2a3843; --color-neutral-500: #3d5260; --color-neutral-600: #587485;
+  --color-neutral-700: #7fa3b3; --color-neutral-800: #a8cdd8; --color-neutral-900: #d6f2f6;
+  --shadow-md: 0 0 22px rgba(77,227,240,0.14); --shadow-lg: 0 0 44px rgba(77,227,240,0.2);
+  --atlas-c0: oklch(0.82 0.14 195); --atlas-c1: oklch(0.79 0.15 218);
+  --atlas-c2: oklch(0.75 0.17 250); --atlas-c3: oklch(0.72 0.19 285);
+  --atlas-c4: oklch(0.74 0.20 318); --atlas-c5: oklch(0.77 0.19 342);
+  --atlas-c6: oklch(0.85 0.13 180); --atlas-c7: oklch(0.70 0.16 262);
+  --atlas-c8: oklch(0.58 0.03 230);
+}
+/* Cyber effects layer — scoped to the palette, so Modernist stays flat.
+   Everything here is decoration over an unchanged layout: a ruled ground
+   under the graph, glow on the emissive parts, and one slow scan sweep. */
+/* `top` is percentage-of-parent, so the sweep crosses the whole canvas at any
+   window height; translateY would resolve against the 14px band itself. */
+@keyframes atlas-scan { from { top: -14px; } to { top: 100%; } }
+/* the canvas carries an inline `background`, which resets background-image —
+   the theme layer has to win past it */
+[data-palette="cyber"] [data-atlas-canvas] {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--color-text) 7%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--color-text) 7%, transparent) 1px, transparent 1px) !important;
+  background-size: 44px 44px, 44px 44px !important;
+}
+[data-palette="cyber"][data-theme="dark"] [data-atlas-canvas]::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 14px; pointer-events: none;
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, #4de3f0 12%, transparent), transparent);
+  animation-name: atlas-scan; animation-duration: 9s;
+  animation-timing-function: linear; animation-iteration-count: infinite;
+}
+[data-palette="cyber"][data-theme="dark"] [data-atlas-inner] span[style*="border-radius: 50%"],
+[data-palette="cyber"][data-theme="dark"] [data-atlas-inner] span[style*="border-radius:50%"] {
+  filter: drop-shadow(0 0 5px currentColor);
+}
+[data-palette="cyber"][data-theme="dark"] [data-atlas-inner] svg {
+  filter: drop-shadow(0 0 3px color-mix(in srgb, #4de3f0 55%, transparent));
+}
+[data-palette="cyber"][data-theme="dark"] h3,
+[data-palette="cyber"][data-theme="dark"] h4,
+[data-palette="cyber"][data-theme="dark"] header > div:first-child {
+  text-shadow: 0 0 14px color-mix(in srgb, #4de3f0 40%, transparent);
+}
+[data-palette="cyber"][data-theme="dark"] .btn-primary {
+  box-shadow: 0 0 16px color-mix(in srgb, var(--color-accent) 45%, transparent);
+}
+[data-palette="cyber"][data-theme="dark"] .input:focus,
+[data-palette="cyber"][data-theme="dark"] .btn:focus-visible {
+  box-shadow: 0 0 0 1px var(--color-accent), 0 0 18px color-mix(in srgb, var(--color-accent) 40%, transparent);
+}
+[data-palette="cyber"][data-theme="dark"] footer,
+[data-palette="cyber"][data-theme="dark"] header {
+  background: linear-gradient(180deg, color-mix(in srgb, #4de3f0 4%, transparent), transparent);
+}
+[data-palette="cyber"] .table thead th { letter-spacing: 0.08em; text-transform: uppercase; }
+@media (prefers-reduced-motion: reduce) {
+  [data-palette="cyber"][data-theme="dark"] [data-atlas-canvas]::after { animation: none; opacity: 0; }
+}
+:root[data-theme="dark"], [data-theme="dark"] {
+  --color-bg: #171615; --color-surface: #221f1e; --color-text: #ece8e5;
+  --color-divider: color-mix(in srgb, #ece8e5 26%, transparent);
+  --color-accent: #ff644b;
+  /* On the dark ground the same hues are lifted and slightly softened, so
+     they read as one family rather than as saturated pinpricks. */
+  --atlas-c0: oklch(0.70 0.13 30);
+  --atlas-c1: oklch(0.75 0.10 62);
+  --atlas-c2: oklch(0.76 0.09 105);
+  --atlas-c3: oklch(0.75 0.09 152);
+  --atlas-c4: oklch(0.75 0.08 205);
+  --atlas-c5: oklch(0.72 0.09 252);
+  --atlas-c6: oklch(0.71 0.10 295);
+  --atlas-c7: oklch(0.73 0.10 340);
+  --atlas-c8: oklch(0.60 0.012 60);
+  --color-neutral-100: #211f1e; --color-neutral-200: #2b2928; --color-neutral-300: #3a3736;
+  --color-neutral-400: #4f4b4a; --color-neutral-500: #6d6968; --color-neutral-600: #8e8a88;
+  --color-neutral-700: #b0acaa; --color-neutral-800: #d3d0ce; --color-neutral-900: #f0eeec;
+  --shadow-md: 0 4px 18px rgba(0,0,0,0.5); --shadow-lg: 0 12px 40px rgba(0,0,0,0.55);
 }
 
-.seg-opt {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  font-size: 12px;
-  text-decoration: none;
-  color: inherit;
-  cursor: pointer;
-}
-.seg-opt.is-on {
-  background: var(--color-text);
-  color: var(--color-bg);
-}
-
-/* Silhouette carries kind alongside colour on the entity level. Every entity in
-   one module shares a community, so the community hue is free there. */
-.shape {
-  width: 11px;
-  height: 11px;
-  flex: none;
-  background: var(--kind-color, var(--color-text));
-}
-.shape-circle {
-  border-radius: 50%;
-}
-.shape-square {
-  border-radius: 2px;
-}
-.shape-diamond {
-  width: 9px;
-  height: 9px;
-  border-radius: 1px;
-  transform: rotate(45deg);
-}
-.shape-rect {
-  width: 13px;
-  height: 9px;
-  border-radius: 2px 2px 2px 0;
-}
-.shape-ring {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: transparent;
-  border: 3px solid var(--kind-color, var(--color-text));
-}
-/* Dashed means the entity sits outside the index. */
-.shape-hollow {
-  border-radius: 50%;
-  background: transparent;
-  border: 1.5px dashed var(--kind-color, var(--color-text));
-}
-
-/* The picker and settings pages, which have no design counterpart to copy. */
-.picker-list,
-.picker-children {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-.picker-children {
-  margin-left: 22px;
-  border-left: 1px solid var(--color-divider);
-  padding-left: 10px;
-}
-.picker-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 4px;
-  cursor: pointer;
-  border-radius: 8px;
-}
-.picker-row:hover {
-  background: color-mix(in srgb, var(--color-text) 5%, transparent);
-}
-.picker-name {
-  font-weight: 600;
-  min-width: 11rem;
-}
-.picker-facts {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  flex: 1;
-}
-.picker-cost {
-  flex: 1;
-  font-size: 12px;
-}
-.settings-view {
-  padding: 28px;
-  max-width: 46rem;
-}
-.settings-group {
-  margin-bottom: 28px;
-}
-.swatch-row {
-  display: flex;
-  gap: 12px;
-  margin-top: 10px;
-}
-.swatch-card {
-  display: grid;
-  gap: 8px;
-  padding: 12px;
-  border: 1px solid var(--color-divider);
-  border-radius: 8px;
-  text-decoration: none;
-  color: inherit;
-  min-width: 9rem;
-}
-.swatch-card.is-on {
-  border-color: var(--color-accent);
-  box-shadow: 0 0 0 1px var(--color-accent) inset;
-}
-.swatch-preview {
-  display: flex;
-  gap: 5px;
-}
-.swatch-chip {
-  width: 22px;
-  height: 22px;
-  border-radius: 4px;
-}
-.swatch-name {
-  font-weight: 600;
-  font-size: 13px;
-}
-.caveat-inline {
-  color: var(--color-accent-700);
-}
-.view-empty {
-  padding: 40px;
-  max-width: 44rem;
-}
+/* ── App shims — the only additions over the design's own CSS ───────────────
+   The design runtime applies `style-hover="…"` per element; plain HTML cannot,
+   so each distinct hover declaration becomes one class with the same value. */
+/* Native scrollbars and form widgets follow the ground — a light scrollbar
+   column through a dark page is not part of any theme. */
+:root { color-scheme: light; }
+:root[data-theme="dark"], [data-theme="dark"] { color-scheme: dark; }
+@keyframes atlas-flow { to { stroke-dashoffset: -24; } }
+.hv5:hover { background: color-mix(in srgb, var(--color-text) 5%, transparent); }
+.hv6:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+.hv7:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.hv8:hover { background: color-mix(in srgb, var(--color-text) 8%, transparent); }
+/* Server-rendered segmented controls are links, not radios, so the checked
+   state is a class carrying the same declarations as `:has(input:checked)`. */
+.seg-opt.is-on { background: var(--color-accent); color: var(--color-bg); }
+.seg-opt:not(.is-on):hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+a.seg-opt { color: inherit; text-decoration: none; }

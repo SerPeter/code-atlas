@@ -19,7 +19,6 @@ buys a shared number at the cost of depending on that analysis's entire output s
 
 from __future__ import annotations
 
-import math
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -27,36 +26,55 @@ import msgspec
 from loguru import logger
 
 from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES
-from code_atlas.server.architecture import analyse
 from code_atlas.server.web.kinds import KINDS, classify
-from code_atlas.server.web.layout import force_layout, node_size
-from code_atlas.server.web.naming import breadcrumb
+from code_atlas.server.web.layout import force_layout
+from code_atlas.server.web.naming import SEPARATOR, breadcrumb
 from code_atlas.server.web.schemas import (
     AffectedEntity,
     ArchitectureHealth,
     ArchitectureTrend,
+    ArchitectureView,
     BlastRadiusView,
+    ChannelFilter,
     CommunityRef,
     CoverageCaveat,
     CycleDetail,
+    CycleRow,
     DepthGroup,
+    DetailEvidenceMix,
+    DetailRelated,
+    DetailView,
+    DsmCell,
+    DsmRow,
     EdgeEvidence,
     EntityDetail,
-    KindRow,
+    ImpactHopGroup,
+    ImpactRoot,
+    ImpactRow,
+    ImpactView,
+    KindDef,
+    KindFilter,
+    KindTally,
     MapEdge,
     MapNode,
-    ModuleMap,
+    MapPayload,
+    MetricCard,
+    PageChrome,
     PathHop,
     ProjectChoice,
     ProjectOverview,
     ProjectPicker,
     ProjectRef,
+    ReferenceRow,
     RelatedEntity,
     ScopeOption,
     SearchHit,
     SearchPage,
+    SearchRow,
+    SearchView,
     TracePathView,
     TrendPoint,
+    TrendRow,
 )
 
 if TYPE_CHECKING:
@@ -64,7 +82,6 @@ if TYPE_CHECKING:
 
     from code_atlas.graph.protocol import GraphBackend
     from code_atlas.search.engine import CompactNode, EmbedOne, SearchResult
-    from code_atlas.server.analysis import ModuleGraph
     from code_atlas.server.architecture import Cycle
     from code_atlas.settings import SearchSettings
 
@@ -74,13 +91,17 @@ _STRUCTURE_LIMIT = 20
 _ENTITY_LIMIT = 200
 _EDGE_LIMIT = 500
 _DSM_LIMIT = 60
-# Sigma renders far more than this comfortably; the bound is readability, not WebGL.
+# The design's 1,500-node cap: past it the map truncates and says so.
 _MAP_NODE_LIMIT = 1500
-_COMMUNITY_MEMBER_LIMIT = 200
-_EXTERNAL_RING = 165.0
+_ENTITY_SCOPE_LIMIT = 1500
 # The page a reader sees, and the ceiling the resolved-only filter runs over.
 _IMPACT_PAGE = 50
 _IMPACT_CEILING = 500
+
+# ADR-0028's four states, strongest first. Shared by every view that draws a chip.
+_EV_RANK = {"structural": 3, "resolved": 2, "guessed": 1, "unknown": 0}
+
+_CHANNELS = ("graph", "keyword", "semantic")
 
 
 class ProjectNotIndexedError(LookupError):
@@ -100,9 +121,7 @@ class ProjectViewService:
     """Assembles the project-scoped views.
 
     Scope is deliberate and is what keeps every query bounded: a view covers **one
-    project**, with other projects reachable but not loaded. The alternative — render
-    everything — is an unbounded query against a graph that is already ~30k nodes for
-    eight projects, and it is offered as an explicit opt-in rather than a default.
+    project**, with other projects reachable but not loaded.
     """
 
     def __init__(self, graph: GraphBackend, project: str) -> None:
@@ -114,17 +133,12 @@ class ProjectViewService:
         return self._project
 
     async def overview(self) -> ProjectOverview:
-        """The landing view for the current project."""
+        """The project's headline numbers — the chrome and the export read these."""
         statuses = [_project_props(row) for row in await self._graph.get_project_status()]
         current = next((s for s in statuses if s.get("name") == self._project), None)
         if current is None:
             raise ProjectNotIndexedError(self._project)
 
-        # Straight to the data layer rather than through `analyze_repo`. Routing the
-        # overview through the MCP-facing dispatcher coupled this service to that
-        # analysis's whole contract — largest_modules, packages, external_deps — for a
-        # label tally that is four lines. Both read `get_structure_overview`, so the
-        # numbers still share one source; only the needless coupling is gone.
         structure = await self._graph.get_structure_overview(self._project, "", _STRUCTURE_LIMIT)
         label_counts: dict[str, int] = {}
         for row in structure.get("counts", []):
@@ -154,6 +168,83 @@ class ProjectViewService:
         )
 
 
+class ChromeService:
+    """Header chip, indexed note and footer — the values every page shows.
+
+    Never raises: an unindexed project still gets a shell, because the shell is where
+    the "run atlas index" explanation lives.
+    """
+
+    def __init__(self, graph: GraphBackend, projects: tuple[str, ...]) -> None:
+        self._graph = graph
+        self._projects = projects or ("",)
+
+    async def chrome(self) -> PageChrome:
+        try:
+            rows = await self._graph.get_project_status()
+            statuses = {str(s.get("name") or ""): s for s in map(_project_props, rows)}
+        except Exception:  # the shell must render even when the backend is down
+            statuses = {}
+        chosen = [statuses[name] for name in self._projects if name in statuses]
+
+        if len(chosen) == 1:
+            current = chosen[0]
+            name = str(current.get("name") or self._projects[0])
+            entities = int(current.get("entity_count") or 0)
+            # Relative when the stored stamp is numeric; the absolute string otherwise —
+            # older rows and the SQLite path hold ISO strings, and "Not indexed" over a
+            # real index would be the confident wrong answer.
+            ago = _ago(current.get("last_indexed_at")) or _as_timestamp(current.get("last_indexed_at"))
+            indexed_note = f"indexed {ago}" if ago else "not indexed yet"
+            commit = str(current.get("git_hash") or "")[:7]
+            footer = f"Indexed {ago}" if ago else "Not indexed"
+            if commit:
+                footer += f" · commit {commit}"
+            meta = f"{entities:,} entities"
+        elif chosen:
+            name = f"{len(chosen)} projects"
+            entities = sum(int(c.get("entity_count") or 0) for c in chosen)
+            indexed_note = "mixed index times"
+            footer = f"Indexed at mixed times · {len(chosen)} projects"
+            meta = f"{entities:,} entities combined"
+        else:
+            name = self._projects[0] or "no project"
+            indexed_note = "not indexed yet"
+            footer = "Not indexed"
+            meta = "no entities"
+
+        module_count = await self._module_count()
+        coverage = (
+            f"Computed over {module_count} modules. Languages with incomplete extraction make this a lower bound."
+            if module_count
+            else "Nothing indexed yet — run `atlas index` to build the graph."
+        )
+
+        return PageChrome(
+            project_name=name,
+            project_meta=meta,
+            indexed_note=indexed_note,
+            footer_indexed=footer,
+            coverage_note=coverage,
+            backend_note=_backend_note(self._graph),
+        )
+
+    async def _module_count(self) -> int:
+        try:
+            structure = await self._graph.get_structure_overview(self._projects[0], "", _STRUCTURE_LIMIT)
+        except Exception:
+            return 0
+        return sum(int(row.get("cnt") or 0) for row in structure.get("counts", []) if str(row.get("label")) == "Module")
+
+
+def _backend_note(graph: GraphBackend) -> str:
+    from code_atlas.backends.sqlite_graph import SqliteGraphClient  # noqa: PLC0415
+
+    if isinstance(graph, SqliteGraphClient):
+        return "Backend sqlite · map and impact need Memgraph"
+    return "Backend memgraph · all views available"
+
+
 def _project_props(row: dict[str, Any]) -> dict[str, Any]:
     """Unwrap a ``get_project_status`` row into the Project node's own properties.
 
@@ -162,9 +253,6 @@ def _project_props(row: dict[str, Any]) -> dict[str, Any]:
     ``last_indexed_at``, not ``project``/``entities``/``indexed_at``. Reading the wrapper
     dict directly finds none of them, so every project compared unequal and the landing
     page 404'd as "not indexed" against a fully indexed graph.
-
-    The unit tests missed it because the fake returned a flattened shape that no backend
-    produces. `mcp.py`'s ``index_status`` had the unwrapping right all along.
     """
     node = row.get("n", row)
     return dict(node.items()) if hasattr(node, "items") else dict(node)
@@ -181,10 +269,8 @@ def _as_timestamp(value: object) -> str | None:
     """Render an index time for a human.
 
     `update_project_metadata` writes `last_indexed_at` as `time.time()`, so the stored
-    value is a float. Passing it through `str()` put `1786176798.014237` on the landing
-    page — technically the data, and useless as an answer to "when was this indexed".
-    Anything that is not a number is passed through unchanged, since older rows and the
-    SQLite path may hold an ISO string already.
+    value is a float. Anything that is not a number is passed through unchanged, since
+    older rows and the SQLite path may hold an ISO string already.
     """
     if value is None or value == "":
         return None
@@ -193,15 +279,28 @@ def _as_timestamp(value: object) -> str | None:
     return str(value)
 
 
-def _coverage_caveat(label_counts: dict[str, int]) -> CoverageCaveat:
-    """State what these numbers do not cover.
+def _ago(value: object) -> str:
+    """ "2 hours ago" — the design's header and footer speak in relative time."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return ""
+    seconds = max(0.0, (datetime.now(tz=UTC) - datetime.fromtimestamp(float(value), tz=UTC)).total_seconds())
+    if seconds < 90:
+        return "just now"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{round(minutes)} minutes ago"
+    hours = minutes / 60
+    if hours < 36:
+        return f"{round(hours)} hour{'s' if round(hours) != 1 else ''} ago"
+    days = hours / 24
+    if days < 14:
+        return f"{round(days)} day{'s' if round(days) != 1 else ''} ago"
+    weeks = days / 7
+    return f"{round(weeks)} weeks ago"
 
-    Placeholder shape for now: the real signal is which languages in this project had no
-    grammar installed, which ATL-110 already records per index run but does not yet
-    persist to the graph. Wiring that through is ATL-119's dependency, not this story's —
-    what matters here is that every view carries the field from the start, so adding the
-    data later cannot be forgotten.
-    """
+
+def _coverage_caveat(label_counts: dict[str, int]) -> CoverageCaveat:
+    """State what these numbers do not cover."""
     return CoverageCaveat(note="" if label_counts else "No entities indexed for this project.")
 
 
@@ -213,13 +312,27 @@ class EntityNotFoundError(LookupError):
         self.uid = uid
 
 
-class SearchViewService:
-    """Search, and the entity detail a result leads to.
+def _evidence_state(evidence: EdgeEvidence | None) -> str:
+    """An edge's ADR-0028 state, for the chip that renders it.
 
-    Separate from :class:`ProjectViewService` because it is a different use case with
-    different collaborators, not because the file was getting long: this one needs the
-    search engine and an embedding client, the overview needs neither.
+    ``None`` — the edge was not found among the module's annotated edges — is
+    **unknown**: evidence was never looked up, which must never render like "there is
+    nothing". A structural relationship (IMPORTS, DEFINES, INHERITS…) is a fact. A
+    CALLS edge with no recorded strategy or confidence was likewise never looked up.
     """
+    if evidence is None:
+        return "unknown"
+    if evidence.rel_type and evidence.rel_type != "CALLS":
+        return "structural"
+    if evidence.confidence == "ambiguous":
+        return "guessed"
+    if evidence.strategy or evidence.confidence:
+        return "resolved"
+    return "unknown"
+
+
+class SearchViewService:
+    """Search, and the entity detail a result leads to."""
 
     def __init__(
         self,
@@ -235,12 +348,11 @@ class SearchViewService:
         self._embed = embed
 
     async def search(self, query: str, *, limit: int = 20) -> SearchPage:
-        """Ranked results for *query*, scoped to this project.
+        """Ranked results for *query*, scoped to this project — the JSON contract.
 
         Ranking is whatever :func:`hybrid_search` produces — the same call the MCP tool
         makes. A UI that re-ranked would give a human a different answer from the agent
-        looking at the same graph, which is the divergence the service layer exists to
-        prevent.
+        looking at the same graph.
         """
         from code_atlas.search.engine import hybrid_search  # noqa: PLC0415
 
@@ -262,6 +374,91 @@ class SearchViewService:
             query=query,
             hits=tuple(_as_hit(r) for r in results[:limit]),
             more_available=more,
+        )
+
+    async def search_view(
+        self,
+        query: str,
+        *,
+        channels: tuple[str, ...] = _CHANNELS,
+        kinds: tuple[str, ...] = (),
+        limit: int = 20,
+        entities: int = 0,
+    ) -> SearchView:
+        """The search page, in the design's shape.
+
+        Filters narrow what was **fetched**; they cannot reveal matches the search did
+        not retrieve, so every count here names the fetched set and never a total.
+        """
+        page = await self.search(query, limit=limit)
+        hits = list(page.hits)
+        active_channels = tuple(c for c in _CHANNELS if c in channels) or _CHANNELS
+        shown = [h for h in hits if any(c in active_channels for c in h.channels) and (not kinds or h.kind in kinds)]
+
+        rows = tuple(
+            SearchRow(
+                uid=h.uid,
+                label=breadcrumb(qualified_name=h.qualified_name, file_path=h.file_path, kind=h.kind).full or h.name,
+                kind=h.kind or h.label.lower(),
+                loc=_loc(h.file_path, h.line_start),
+                sig=h.signature or h.qualified_name,
+                channels=h.channels,
+                strength={3: "found three ways", 2: "found two ways"}.get(len(h.channels), "found one way"),
+                score=f"{h.score:.2f}",
+            )
+            for h in shown
+        )
+
+        if not query.strip():
+            note = "Type a query to search this project."
+        elif len(shown) == len(hits):
+            note = (
+                f"{len(hits)} results fetched · more exist, quantity unknown"
+                if page.more_available
+                else f"{len(hits)} results fetched"
+            )
+        else:
+            note = f"{len(shown)} of {len(hits)} fetched results shown · more exist, quantity unknown"
+
+        def _channel_url(channel: str) -> str:
+            if channel in active_channels:
+                active = [c for c in active_channels if c != channel]
+            else:
+                active = [*active_channels, channel]
+            return _search_url(query, tuple(c for c in _CHANNELS if c in active), kinds)
+
+        seen_kinds = sorted({h.kind for h in hits if h.kind})
+
+        def _kind_url(kind: str) -> str:
+            active = tuple(k for k in kinds if k != kind) if kind in kinds else (*kinds, kind)
+            return _search_url(query, active_channels, active)
+
+        return SearchView(
+            query=query,
+            rows=rows,
+            channels=tuple(
+                ChannelFilter(
+                    id=c,
+                    label=c.capitalize(),
+                    count=f"{sum(1 for h in hits if c in h.channels)} hits",
+                    on=c in active_channels,
+                    url=_channel_url(c),
+                )
+                for c in _CHANNELS
+            ),
+            kind_filters=tuple(
+                KindFilter(
+                    id=k,
+                    label_count=f"{k} · {sum(1 for h in hits if h.kind == k)}",
+                    on=k in kinds,
+                    url=_kind_url(k),
+                )
+                for k in seen_kinds
+            ),
+            result_note=note,
+            searching_note=(
+                f"Searching {self._project} · {entities:,} entities" if entities else f"Searching {self._project}"
+            ),
         )
 
     async def detail(self, uid: str) -> EntityDetail:
@@ -297,19 +494,73 @@ class SearchViewService:
             caveat=CoverageCaveat(),
         )
 
+    async def detail_view(self, uid: str) -> DetailView:
+        """The entity page, in the design's shape."""
+        detail = await self.detail(uid)
+        crumb = breadcrumb(
+            qualified_name=detail.qualified_name, file_path=detail.file_path, kind=detail.kind, label=detail.label
+        )
+        lines = (
+            f"{detail.line_start}–{detail.line_end}"  # noqa: RUF001  # en dash: a range, not a hyphen
+            if detail.line_start and detail.line_end
+            else str(detail.line_start or "")
+        )
+
+        def related(row: RelatedEntity) -> DetailRelated:
+            return DetailRelated(
+                uid=row.uid,
+                label=breadcrumb(qualified_name=row.qualified_name, file_path=row.file_path, kind=row.kind).full
+                or row.name,
+                rel=(row.evidence.rel_type.lower() if row.evidence and row.evidence.rel_type else "calls"),
+                ev=_evidence_state(row.evidence),
+            )
+
+        callers = tuple(related(r) for r in detail.callers)
+        callees = tuple(related(r) for r in detail.callees)
+        unknown_callers = sum(1 for c in callers if c.ev == "unknown")
+        parent_crumb = (
+            breadcrumb(
+                qualified_name=detail.parent.qualified_name,
+                file_path=detail.parent.file_path,
+                kind=detail.parent.kind,
+            ).full
+            if detail.parent
+            else ""
+        )
+
+        return DetailView(
+            uid=detail.uid,
+            name=crumb.full or detail.qualified_name,
+            short_name=detail.name or crumb.symbol,
+            kind=detail.kind or detail.label.lower(),
+            file=detail.file_path,
+            lines=f"lines {lines}" if lines else "",
+            file_lines=f"{detail.file_path} · lines {lines}" if lines else detail.file_path,
+            parent_line=f"Defined in {parent_crumb}" if parent_crumb else "",
+            signature=detail.signature,
+            paragraphs=tuple(p.strip() for p in detail.docstring.split("\n\n") if p.strip()),
+            callers=callers,
+            callees=callees,
+            docs=tuple(
+                DetailRelated(uid=d.uid, label=d.qualified_name or d.name, rel="documents", ev="structural")
+                for d in detail.docs
+            ),
+            evidence_mix=tuple(
+                DetailEvidenceMix(ev=state, n=sum(1 for c in callers if c.ev == state))
+                for state in ("structural", "resolved", "guessed", "unknown")
+            ),
+            caller_note=(
+                f"{unknown_callers} of {len(callers)} callers carry no evidence — "
+                "they were not looked up, not disproved."
+                if callers
+                else "No callers indexed. Callers reached only through dynamic dispatch are not counted."
+            ),
+            callers_count_note=f"{len(callers)} indexed",
+            callees_count_note=f"{len(callees)} indexed",
+        )
+
     async def _edge_evidence(self, file_path: str) -> dict[tuple[str, str], EdgeEvidence]:
-        """``(from_qn, to_qn) -> evidence`` for edges around *file_path*'s module.
-
-        Sourced from ``get_module_summary``, which already returns a decoded ``props``
-        dict per edge — "all relationship properties, whatever they are ... so new CALLS
-        edge properties surface without a backend change", per its own contract. Using
-        it costs a module's worth of edges to annotate one entity's, and buys not adding
-        an entity-scoped read to both backends for data that is already reachable.
-
-        ``expand_context`` cannot supply this: ``CompactNode`` is a node, and evidence
-        belongs to the edge that reached it — the same node reached two ways has two
-        different claims behind it.
-        """
+        """``(from_qn, to_qn) -> evidence`` for edges around *file_path*'s module."""
         if not file_path:
             return {}
         try:
@@ -336,6 +587,21 @@ class SearchViewService:
         return found
 
 
+def _loc(file_path: str, line: int | None) -> str:
+    leaf = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return f"{leaf}:{line}" if line else leaf
+
+
+def _search_url(query: str, channels: tuple[str, ...], kinds: tuple[str, ...]) -> str:
+    from urllib.parse import urlencode  # noqa: PLC0415
+
+    params: list[tuple[str, str]] = [("q", query)]
+    if tuple(channels) != _CHANNELS:
+        params.extend(("channel", c) for c in channels)
+    params.extend(("kind", k) for k in kinds)
+    return "/search?" + urlencode(params)
+
+
 def _as_hit(result: SearchResult) -> SearchHit:
     """Project a ``SearchResult`` onto the view model."""
     return SearchHit(
@@ -349,11 +615,16 @@ def _as_hit(result: SearchResult) -> SearchHit:
         signature=result.signature,
         # ranked_score, not rrf_score: the raw fusion score is the value *before* the
         # visibility/label boosts, so showing it against the boosted ordering renders a
-        # list that is not sorted by the number beside it. The CLI and the MCP tools were
-        # fixed for this; this third consumer was missed.
+        # list that is not sorted by the number beside it.
         score=round(result.ranked_score, 4),
-        channels=tuple(sorted(result.sources)),
+        channels=tuple(sorted(_CHANNEL_NAMES.get(s, s) for s in result.sources)),
     )
+
+
+# The engine's channel ids, translated to the names a reader sees. "bm25" describes
+# the algorithm; "keyword" describes what it does — and the rail's toggles, the row
+# dots and the hit counts must all speak the same three words.
+_CHANNEL_NAMES = {"bm25": "keyword", "vector": "semantic"}
 
 
 def _as_related(node: CompactNode, evidence: EdgeEvidence | None) -> RelatedEntity:
@@ -383,17 +654,24 @@ class ArchitectureViewService:
     every level of health, so it cannot answer whether things are getting worse. A design
     structure matrix can, because a clean architecture and a rotten one produce
     categorically different pictures.
-
-    All arithmetic lives in :mod:`code_atlas.server.architecture` as pure functions over
-    an edge list, so the numbers are checkable against hand-worked graphs rather than
-    only against a live database.
     """
+
+    # Published propagation-cost measurements, for scale only. They were computed on
+    # other languages and other tools; the rail says to treat them as order-of-magnitude.
+    _REFERENCES = (
+        ReferenceRow(label="A large browser codebase, before refactoring", value="~17%"),
+        ReferenceRow(label="The same codebase, after", value="~2%"),
+        ReferenceRow(label="Linux kernel", value="~0.3%"),
+    )
 
     def __init__(self, graph: GraphBackend, project: str) -> None:
         self._graph = graph
         self._project = project
 
     async def health(self, *, dsm_limit: int = _DSM_LIMIT) -> ArchitectureHealth:
+        """The JSON contract — unchanged, still computed over the import graph."""
+        from code_atlas.server.architecture import analyse  # noqa: PLC0415
+
         raw = await self._graph.get_module_import_edges(self._project, "")
         edges = [
             (str(r.get("from_mod", "")), str(r.get("to_mod", "")))
@@ -406,8 +684,6 @@ class ArchitectureViewService:
 
         shown = metrics.order[:dsm_limit]
         position = {name: i for i, name in enumerate(shown)}
-        # Deduplicated: a repeated import between the same module pair is one mark, and
-        # counting it twice would make the matrix look denser than the graph is.
         marks = tuple(
             sorted({(position[src], position[dst]) for src, dst in edges if src in position and dst in position})
         )
@@ -428,13 +704,210 @@ class ArchitectureViewService:
             trend=await self._trend(),
         )
 
-    async def _trend(self) -> ArchitectureTrend | None:
-        """How these numbers have moved across recorded index runs.
+    async def view(self, *, dsm_limit: int = _DSM_LIMIT) -> ArchitectureView:
+        """The architecture page, in the design's shape.
 
-        Read-only here. Snapshots are written on the index path (ATL-121), because a
-        history written when someone opens a page would record who looked at it rather
-        than how the code changed.
+        Built on the same module graph as the map (CALLS + IMPORTS, per-pair evidence)
+        so the matrix and the picture cannot disagree. On SQLite that graph is not
+        available and the page says so rather than drawing a partial one.
         """
+        from code_atlas.server.architecture import analyse  # noqa: PLC0415
+
+        source = await self._edge_source()
+        if isinstance(source, str):
+            return ArchitectureView(
+                cards=(),
+                dsm_rows=(),
+                dsm_caption="",
+                cycles=(),
+                trend_rows=(),
+                references=self._REFERENCES,
+                unavailable=source,
+            )
+        pair_ev, module_paths = source
+
+        edges = sorted(pair_ev)
+        nodes = sorted({n for e in edges for n in e})
+        if not nodes:
+            return ArchitectureView(
+                cards=(),
+                dsm_rows=(),
+                dsm_caption="",
+                cycles=(),
+                trend_rows=(),
+                references=self._REFERENCES,
+                unavailable="No module dependencies indexed — nothing to measure.",
+            )
+        metrics = analyse(nodes, edges)
+
+        # The matrix shows the most connected modules; ordering within the shown set
+        # still comes from the dependency sort, so cycles stay above the diagonal.
+        degree: dict[str, int] = dict.fromkeys(nodes, 0)
+        for a, b in edges:
+            degree[a] += 1
+            degree[b] += 1
+        top = set(sorted(nodes, key=lambda n: -degree[n])[:dsm_limit])
+        shown = [n for n in metrics.order if n in top]
+        position = {name: i for i, name in enumerate(shown)}
+
+        label_of = {n: _module_map_label(n, module_paths.get(n, "")) for n in nodes}
+        mark_ev: dict[tuple[int, int], str] = {}
+        for a, b in edges:
+            if a in position and b in position:
+                mark_ev[position[a], position[b]] = pair_ev[a, b]
+
+        dsm_rows = tuple(
+            DsmRow(
+                label=label_of[row],
+                cells=tuple(
+                    _dsm_cell(r, c, mark_ev.get((r, c)), label_of[row], label_of[col]) for c, col in enumerate(shown)
+                ),
+            )
+            for r, row in enumerate(shown)
+        )
+
+        back_edges = [
+            (a, b, pair_ev[a, b]) for a, b in edges if a in position and b in position and position[b] > position[a]
+        ]
+        cycles = tuple(
+            CycleRow(
+                members=f"{label_of[a]}  ⇄  {label_of[b]}",
+                closing=f"{label_of[a]} → {label_of[b]}  ·  {ev}",
+                closing2=f"{label_of[b]} → {label_of[a]}  ·  {pair_ev.get((b, a), 'unknown')}",
+                note="Both directions are indexed; cutting either breaks the cycle.",
+                ev=ev,
+            )
+            for a, b, ev in back_edges[:10]
+        )
+
+        fan_in: dict[str, int] = dict.fromkeys(nodes, 0)
+        for _a, b in edges:
+            fan_in[b] += 1
+        total_fan = sum(fan_in.values())
+        top5 = sum(sorted(fan_in.values(), reverse=True)[:5])
+        core_modules = round(metrics.core_size * metrics.module_count)
+
+        cards = (
+            MetricCard(
+                label="Propagation cost",
+                value=f"{metrics.propagation_cost * 100:.1f}%",
+                note=(
+                    f"Share of module pairs where one can reach the other. Computed over "
+                    f"{metrics.module_count} modules; any language whose extraction is incomplete "
+                    "makes this a lower bound."
+                ),
+            ),
+            MetricCard(
+                label="Cycles",
+                value=f"{len(back_edges)} cycle{'s' if len(back_edges) != 1 else ''}",
+                note=(
+                    (
+                        f"Ten of the {len(back_edges)} are listed below with both of their edges."
+                        if len(back_edges) > 10
+                        else "Each is listed below with both of its edges."
+                    )
+                    if back_edges
+                    else "No dependency cycles among the modules shown."
+                ),
+            ),
+            MetricCard(
+                label="Core size",
+                value=f"{core_modules} module{'s' if core_modules != 1 else ''}",
+                note="Modules that both depend on and are depended on by the bulk of the system.",
+            ),
+            MetricCard(
+                label="Fan-in concentration",
+                value=f"{round(top5 / max(1, total_fan) * 100)}%",
+                note="Share of all incoming dependencies landing on the five most depended-upon modules.",
+            ),
+        )
+
+        return ArchitectureView(
+            cards=cards,
+            dsm_rows=dsm_rows,
+            dsm_caption=(
+                f"Showing {len(shown)} of {metrics.module_count} modules, the most connected. "
+                "Rows depend on columns; a mark above the diagonal closes a cycle."
+            ),
+            cycles=cycles,
+            cycles_caption=(
+                f"read off the matrix — {len(back_edges)} above the diagonal, ten listed, both edges named"
+                if len(back_edges) > 10
+                else "read off the matrix — both edges named, cut either"
+            ),
+            trend_rows=await self._trend_rows(),
+            references=self._REFERENCES,
+        )
+
+    async def _edge_source(self) -> tuple[dict[tuple[str, str], str], dict[str, str]] | str:
+        """Directed module pairs with evidence plus module file paths, or a reason
+        string when unavailable.
+
+        Memgraph gets the full CALLS+IMPORTS graph the map draws. SQLite cannot serve
+        the CALLS aggregation, but its IMPORT edges are real structural facts — so the
+        page still works there, computed over imports alone.
+        """
+        from code_atlas.backends.sqlite_graph import SqliteGraphClient  # noqa: PLC0415
+        from code_atlas.server.analysis import build_module_graph  # noqa: PLC0415
+
+        if isinstance(self._graph, SqliteGraphClient):
+            raw = await self._graph.get_module_import_edges(self._project, "")
+            pairs = {
+                (str(r.get("from_mod")), str(r.get("to_mod"))): "structural"
+                for r in raw.get("direct", [])
+                if r.get("from_mod") and r.get("to_mod") and r.get("from_mod") != r.get("to_mod")
+            }
+            return pairs, {}
+        try:
+            module_graph = await build_module_graph(self._graph, self._project, "")
+        except Exception as exc:
+            logger.debug("Architecture view unavailable for {}: {}", self._project, exc)
+            return "The module graph could not be built. Run health_check for the backend's own account of why."
+        paths = {qn: str(info.get("file_path") or "") for qn, info in module_graph.modules.items()}
+        return {pair: module_graph.evidence.get(pair, "unknown") for pair in module_graph.directed}, paths
+
+    async def _trend_rows(self) -> tuple[TrendRow, ...]:
+        """Across index runs, with the coverage rule the design states verbatim:
+        direction is unclear whenever the index itself changed size by more than a
+        tenth — a metric that moved because extraction improved is not decay."""
+        from code_atlas.server.architecture_history import load  # noqa: PLC0415
+
+        try:
+            snapshots = list(await load(self._graph, self._project))
+        except Exception:  # a missing history costs the trend, never the view
+            return ()
+        snapshots.reverse()  # newest first, as the design's table reads
+
+        rows = []
+        for i, snap in enumerate(snapshots):
+            prev = snapshots[i + 1] if i + 1 < len(snapshots) else None
+            direction, accented = "—", False
+            if prev is not None and prev.modules:
+                grew = abs(snap.modules - prev.modules) / prev.modules
+                delta = (snap.propagation_cost - prev.propagation_cost) * 100
+                if grew > 0.1:
+                    direction, accented = f"unclear — index grew {round(grew * 100)}%", True
+                elif delta > 0.05:
+                    direction, accented = f"worse +{delta:.1f} pts", True
+                elif delta < -0.05:
+                    direction = f"better −{abs(delta):.1f} pts"  # noqa: RUF001  # a real minus sign
+                else:
+                    direction = "unchanged"
+            rows.append(
+                TrendRow(
+                    date=snap.at[:10],
+                    commit=snap.commit[:7],
+                    modules=f"{snap.modules} modules",
+                    propagation=f"{snap.propagation_cost * 100:.1f}%",
+                    largest_cycle=str(snap.largest_cycle),
+                    direction=direction,
+                    accented=accented,
+                )
+            )
+        return tuple(rows)
+
+    async def _trend(self) -> ArchitectureTrend | None:
+        """How these numbers have moved across recorded index runs (JSON contract)."""
         from code_atlas.server.architecture_history import MAX_SNAPSHOTS, load, trend  # noqa: PLC0415
 
         try:
@@ -466,14 +939,39 @@ class ArchitectureViewService:
         )
 
 
-def _cycle_details(cycles: Sequence[Cycle], edges: Sequence[tuple[str, str]]) -> tuple[CycleDetail, ...]:
-    """Attach to each cycle the edges that close it.
+def _dsm_cell(r: int, c: int, ev: str | None, row_label: str, col_label: str) -> DsmCell:
+    if ev is None:
+        return DsmCell(mark="diag" if r == c else "")
+    above = c > r
+    return DsmCell(
+        mark="cycle" if above else "dep",
+        title=f"{row_label} → {col_label} ({ev}{', closes a cycle' if above else ''})",
+    )
 
-    A cycle's edges are exactly those with both endpoints inside it — every one is part
-    of some loop, so every one is a candidate for the cut that breaks it. Listing the
-    members alone would say a subsystem is tangled without saying which import to remove,
-    which is the only thing a reader can act on.
+
+def _module_label(qn: str) -> str:
+    return breadcrumb(qualified_name=qn, label="Module").short or qn
+
+
+def _module_map_label(qn: str, file_path: str) -> str:
+    """``package``, separator, ``file.py`` — the design's module-level breadcrumb.
+
+    Never a bare filename: ``conftest`` four times on one map identifies nothing. The
+    package path keeps its root only when the module sits directly under it;
+    deeper modules drop it ("parsing.ast, builder.py"), exactly as the reference
+    labels its own nodes.
     """
+    leaf = file_path.replace("\\", "/").rsplit("/", 1)[-1] or qn.rsplit(".", 1)[-1]
+    package = qn.split(".")[:-1]
+    if len(package) > 1:
+        package = package[1:]
+    if not package:
+        return leaf
+    return f"{'.'.join(package)}{SEPARATOR}{leaf}"
+
+
+def _cycle_details(cycles: Sequence[Cycle], edges: Sequence[tuple[str, str]]) -> tuple[CycleDetail, ...]:
+    """Attach to each cycle the edges that close it."""
     details: list[CycleDetail] = []
     for cycle in cycles:
         members = set(cycle.members)
@@ -483,14 +981,6 @@ def _cycle_details(cycles: Sequence[Cycle], edges: Sequence[tuple[str, str]]) ->
 
 
 def _architecture_caveat(module_count: int) -> CoverageCaveat:
-    """What these numbers do not cover.
-
-    Propagation cost over a graph whose C++ named-function capture sits at 0.690
-    (ATL-096) is a LOWER BOUND, and "8% - you are fine" over partial extraction is
-    exactly the confident wrong answer this project keeps removing. The per-language
-    coverage data is recorded per index run but not yet persisted to the graph, so this
-    states the honest general case until it is.
-    """
     if module_count == 0:
         return CoverageCaveat(note="No module dependencies indexed - nothing to measure.")
     return CoverageCaveat(
@@ -502,17 +992,11 @@ def _architecture_caveat(module_count: int) -> CoverageCaveat:
 
 
 class MapViewService:
-    """The "how is this codebase organised" view.
+    """The map — the design's two levels over the real graph.
 
-    Clusters modules into subsystems and draws them. Module granularity is not a
-    simplification for the sake of the picture — at callable granularity the
-    CALLS+IMPORTS subgraph puts ~95% of production code in one community at every usable
-    resolution (see ``_analyze_communities``), so an entity-level map would be a hairball
-    that also happened to be wrong.
-
-    The clustering comes from :func:`build_module_graph`, the same code path
-    ``find_communities`` uses, so the map and the MCP tool cannot disagree about the same
-    project.
+    Module level aggregates the entity graph one node per module (the same clustering
+    ``find_communities`` reports, so the map and the MCP tool cannot disagree). Entity
+    level draws the graph database's own nodes, scoped to one module.
     """
 
     def __init__(self, graph: GraphBackend, project: str, *, test_patterns: tuple[str, ...] = ()) -> None:
@@ -520,247 +1004,324 @@ class MapViewService:
         self._project = project
         self._test_patterns = test_patterns
 
-    async def map(
+    async def map(  # noqa: PLR0912, PLR0915  # one pass over one table, so every count closes
         self,
         *,
         node_limit: int = _MAP_NODE_LIMIT,
-        include_external: bool = True,
         show_tests: bool = False,
         show_noncode: bool = False,
-    ) -> ModuleMap:
-        """Modules, their dependencies, and the subsystems they fall into.
+        projects: tuple[str, ...] = (),
+    ) -> MapPayload:
+        """The module level: one node per module, edges rolled up, evidence carried.
 
-        Tests and non-code files are excluded by default. On the real graph 69 of 126
-        modules are tests and another twelve are CI YAML, a Dockerfile and TOML — 64% of
-        the picture, mirroring the production structure or participating in no import
-        graph at all. Both are counted and reported rather than silently dropped.
+        Tests and non-code files are hidden by default and **counted** — on the real
+        graph they are 64% of the picture, mirroring the production structure or
+        participating in no import graph at all.
         """
-        from code_atlas.server.analysis import (  # noqa: PLC0415
-            build_module_graph,
-            fetch_first_hop_external,
-        )
+        from code_atlas.server.analysis import build_module_graph, fetch_first_hop_external  # noqa: PLC0415
 
         unavailable = self._unsupported_reason()
         if unavailable:
             return _empty_map(self._project, unavailable)
 
-        try:
-            module_graph = await build_module_graph(self._graph, self._project, "", test_patterns=self._test_patterns)
-        except Exception as exc:  # the map is the landing page; it may not take it down
-            # Clustering reads raw Cypher, so a backend that cannot serve it, a timeout,
-            # or a shape change all land here. Before the map became `/`, this surfaced
-            # as a 500 on a secondary page; now it would be the front door.
-            logger.debug("Map unavailable for {}: {}", self._project, exc)
-            return _empty_map(
-                self._project,
-                "The module map could not be built for this project. "
-                "Run health_check for the backend's own account of why.",
-            )
-        if not module_graph.modules:
+        selected = tuple(projects) or (self._project,)
+        multi = len(selected) > 1
+
+        nodes_all: dict[str, dict[str, Any]] = {}
+        directed: dict[tuple[str, str], float] = {}
+        evidence: dict[tuple[str, str], str] = {}
+        undirected: dict[tuple[str, str], float] = {}
+        communities: list[CommunityRef] = []
+        community_of: dict[str, int] = {}
+        partition_groups: list[list[str]] = []
+
+        for project in selected:
+            try:
+                module_graph = await build_module_graph(self._graph, project, "", test_patterns=self._test_patterns)
+            except Exception as exc:  # the map is the landing page; it may not take it down
+                logger.debug("Map unavailable for {}: {}", project, exc)
+                return _empty_map(
+                    self._project,
+                    "The module map could not be built for this project. "
+                    "Run health_check for the backend's own account of why.",
+                )
+            prefix = f"{project}:" if multi else ""
+            base = len(partition_groups)
+            for qn, info in module_graph.modules.items():
+                nodes_all[prefix + qn] = {**info, "project": project}
+            for (a, b), w in module_graph.directed.items():
+                directed[prefix + a, prefix + b] = w
+            for pair, state in module_graph.evidence.items():
+                evidence[prefix + pair[0], prefix + pair[1]] = state
+            for (a, b), w in module_graph.edges.items():
+                undirected[prefix + a, prefix + b] = w
+            for idx, group in enumerate(module_graph.partition):
+                members = [prefix + qn for qn in group]
+                partition_groups.append(members)
+                for member in members:
+                    community_of[member] = base + idx
+
+        # Cross-project imports appear when more than one project is loaded — the
+        # modal's own promise. They are IMPORTS, so their evidence is structural.
+        if multi:
+            selected_set = set(selected)
+            for project in selected:
+                for row in await fetch_first_hop_external(self._graph, project):
+                    to_project = str(row.get("to_project") or "")
+                    if to_project not in selected_set:
+                        continue
+                    a = f"{project}:{row.get('from_mod')}"
+                    b = f"{to_project}:{row.get('to_mod')}"
+                    if a in nodes_all and b in nodes_all and (a, b) not in directed:
+                        directed[a, b] = 1.0
+                        evidence[a, b] = "structural"
+                        undirected[min(a, b), max(a, b)] = undirected.get((min(a, b), max(a, b)), 0.0) + 1.0
+
+        if not nodes_all:
             return _empty_map(self._project, "", caveat=CoverageCaveat(note="No modules indexed for this project."))
 
-        hidden_tests, hidden_noncode = 0, 0
-        excluded: set[str] = set()
-        for qn, info in module_graph.modules.items():
+        # Classify every module once; the counts below all derive from this one table.
+        kind_of: dict[str, str] = {}
+        test_count = noncode_count = 0
+        for qn, info in nodes_all.items():
             path = str(info.get("file_path") or "")
-            if not show_tests and _is_test_module(path, str(info.get("name") or ""), self._test_patterns):
-                excluded.add(qn)
-                hidden_tests += 1
-            elif not show_noncode and _is_noncode_module(path):
-                excluded.add(qn)
-                hidden_noncode += 1
+            if _is_test_module(path, str(info.get("name") or ""), self._test_patterns):
+                kind_of[qn] = "test"
+                test_count += 1
+            elif _is_noncode_module(path):
+                kind_of[qn] = "noncode"
+                noncode_count += 1
+            else:
+                kind_of[qn] = "code"
 
-        community_of = {qn: idx for idx, group in enumerate(module_graph.partition) for qn in group}
-        visible_partition = [[qn for qn in group if qn not in excluded] for group in module_graph.partition]
+        excluded = {
+            qn
+            for qn, kind in kind_of.items()
+            if (kind == "test" and not show_tests) or (kind == "noncode" and not show_noncode)
+        }
+        visible_partition = [[qn for qn in group if qn not in excluded] for group in partition_groups]
         kept = _largest_first(visible_partition, node_limit)
-        truncated = len(kept) < len(module_graph.modules) - len(excluded)
+        truncated = len(kept) < len(nodes_all) - len(excluded)
 
-        external_rows = await fetch_first_hop_external(self._graph, self._project) if include_external else []
-        external = _external_nodes(external_rows, kept)
+        # Every community rides along, singletons included: the sidebar's totals are
+        # summed from this list, so a group left out would make the arithmetic on
+        # screen fail to close (acceptance check 1).
+        for idx, group in enumerate(partition_groups):
+            if not group:
+                continue
+            members_kind = {kind_of[m] for m in group}
+            communities.append(
+                CommunityRef(
+                    id=idx,
+                    name=_community_label([m.split(":", 1)[-1] for m in group]),
+                    count=len(group),
+                    color=f"var(--atlas-c{min(8, idx)})",
+                    files=members_kind == {"noncode"},
+                )
+            )
 
-        # Position is a function of the edges now (ATL-123). The clustered ring it
-        # replaces put every node in a band and encoded nothing.
-        positions = force_layout(sorted(kept), {e: w for e, w in module_graph.edges.items() if set(e) <= kept})
-        positions.update(_external_positions(external))
+        max_w = max(directed.values(), default=1.0) or 1.0
+        scaled = {pair: _scale_weight(w, max_w) for pair, w in directed.items()}
+        kept_edges = {pair: w for pair, w in scaled.items() if pair[0] in kept and pair[1] in kept}
+        positions = force_layout(sorted(kept), kept_edges)
 
-        # Undirected for size: a module coupled to ten others is equally central
-        # whichever way the arrows point, and counting in+out would double a mutual pair.
-        degree = _degree_by_module(module_graph.edges, kept)
+        degree = _degree_of(undirected, kept)
         nodes = tuple(
             MapNode(
                 id=qn,
-                label=breadcrumb(
-                    qualified_name=qn,
-                    file_path=str(module_graph.modules[qn].get("file_path") or ""),
-                    label="Module",
-                ).short,
+                label=_module_map_label(qn.split(":", 1)[-1], str(nodes_all[qn].get("file_path") or "")),
                 community=community_of.get(qn, -1),
-                size=node_size(degree.get(qn, 0)),
-                x=positions.get(qn, (0.0, 0.0))[0],
-                y=positions.get(qn, (0.0, 0.0))[1],
-                project=self._project,
+                deg=degree.get(qn, 0),
+                kind=kind_of[qn],
+                x=round(positions.get(qn, (500.0, 500.0))[0], 1),
+                y=round(positions.get(qn, (500.0, 500.0))[1], 1),
+                uid=str(nodes_all[qn].get("uid") or ""),
+                path=str(nodes_all[qn].get("file_path") or ""),
             )
             for qn in sorted(kept)
-        ) + tuple(
-            MapNode(
-                id=qn,
-                label=qn.rsplit(".", 1)[-1],
-                community=-1,
-                size=node_size(1),
-                x=positions.get(qn, (0.0, 0.0))[0],
-                y=positions.get(qn, (0.0, 0.0))[1],
-                project=owner,
-                is_external=True,
-            )
-            for qn, owner in sorted(external.items())
+        )
+        edges = tuple(
+            MapEdge(s=a, t=b, w=round(w, 2), ev=evidence.get((a, b), "unknown"))
+            for (a, b), w in sorted(kept_edges.items())
         )
 
-        edges = _map_edges(module_graph.directed, kept, community_of) + _external_edges(external_rows, kept, external)
-
-        communities = tuple(
-            CommunityRef(
-                id=idx,
-                size=len(group),
-                label=_community_label(group),
-                members=tuple(sorted(group)[:_COMMUNITY_MEMBER_LIMIT]),
-            )
-            for idx, group in enumerate(module_graph.partition)
-            if len(group) >= 2
-        )
-
-        return ModuleMap(
+        scope_options = await self._scope_options()
+        return MapPayload(
             project=self._project,
+            level="module",
             nodes=nodes,
             edges=edges,
-            communities=communities,
-            modularity=_modularity_of(module_graph),
+            communities=tuple(communities),
+            kinds=_kind_defs(),
+            caveat=_map_caveat(len(nodes_all), truncated, node_limit),
+            module_total=len(nodes_all),
+            edge_total=len(directed),
+            test_count=test_count,
+            noncode_count=noncode_count,
+            entity_total=await self._entity_total(selected),
             truncated=truncated,
-            hidden_tests=hidden_tests,
-            hidden_noncode=hidden_noncode,
-            caveat=_map_caveat(len(module_graph.modules), truncated, node_limit),
-            map_summary=(
-                f"{len(kept)} modules · {len(edges)} dependencies · {len(module_graph.partition)} communities"
-            ),
-            level_note=(
-                "Each node is a module — one file. The graph stores individual entities; "
-                "this level aggregates them so communities mean something."
-            ),
-            community_summary=f"{len([g for g in module_graph.partition if len(g) >= 2])}",
-            legend_note=(
-                "Size = dependency degree. Colour = community. Position is computed from "
-                "the edges — coupled modules sit near each other. Scroll to zoom, drag to pan."
-            ),
-            hidden_note=(
-                f"{hidden_tests + hidden_noncode} modules hidden by the filters above."
-                if (hidden_tests + hidden_noncode)
-                else ""
-            ),
+            scope_options=scope_options,
+            default_scope=_default_scope(scope_options),
         )
 
-    async def entity_map(
+    async def entity_map(  # noqa: PLR0912, PLR0915  # inventory, fold, anchor and tally share one table
         self,
         scope: str,
         *,
         expand_methods: bool = False,
-        node_limit: int = _MAP_NODE_LIMIT,
-    ) -> ModuleMap:
-        """The graph's own nodes, scoped to one module (v1.1).
+        node_limit: int = _ENTITY_SCOPE_LIMIT,
+    ) -> MapPayload:
+        """The entity level: the graph's own nodes, scoped to one module.
 
-        The module map is an aggregation; this is the thing itself. It is scoped because
-        the full entity graph is 6,879 nodes against a 1,500 cap — drawing all of it
-        would truncate 78% of the project and call the remainder a picture.
-
-        Methods fold into the class that holds them by default, with their calls rewired
-        to the class. That keeps a 280-entity module readable without hiding anything
-        silently: the kind tallies are counted over the **full** inventory, so a folded
-        method still appears in its row.
+        Methods fold into the class that holds them by default, with their calls
+        rewired to the class — folding hides nodes without hiding dependencies. The
+        kind tallies are counted over the **full** inventory, so a folded method still
+        appears in its row.
         """
         summary = await self._graph.get_module_summary(self._project, scope, _ENTITY_SCOPE_LIMIT, _EDGE_LIMIT)
         rows = list(summary.get("entities") or [])
+        scope_options = await self._scope_options()
         if not rows:
             return _empty_map(
                 self._project,
                 "",
                 caveat=CoverageCaveat(note=f"No entities indexed under {scope or 'this scope'}."),
+                level="entity",
+                scope=scope,
+                scope_options=scope_options,
             )
 
-        entities = {
-            str(r.get("qn") or r.get("uid") or ""): {
+        entities: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            qn = str(r.get("qn") or r.get("uid") or "")
+            if not qn:
+                continue
+            entities[qn] = {
                 "uid": str(r.get("uid") or ""),
                 "name": str(r.get("name") or ""),
                 "kind": classify(str(r.get("label") or ""), str(r.get("kind") or "")),
                 "file_path": str(r.get("file_path") or ""),
+                "lines": _lines_of(r),
             }
-            for r in rows
-            if r.get("qn") or r.get("uid")
-        }
 
-        # Counted before folding: the tally answers "what is in this module", not "what
-        # survived the display setting".
-        tally: dict[str, int] = {}
+        # The module is one of the entities. When the summary does not list it, it is
+        # synthesised — the design draws the host module as the graph's anchor, and
+        # DEFINES is a structural fact the qualified names already prove.
+        module_qn = _host_module_qn(entities)
+        if module_qn and module_qn not in entities:
+            entities[module_qn] = {
+                "uid": "",
+                "name": module_qn.rsplit(".", 1)[-1],
+                "kind": "module",
+                "file_path": scope,
+                "lines": "",
+            }
+
+        # Counted before folding: the tally answers "what is in this module", not
+        # "what survived the display setting".
+        inventory: dict[str, int] = {}
         for info in entities.values():
-            tally[info["kind"]] = tally.get(info["kind"], 0) + 1
+            inventory[info["kind"]] = inventory.get(info["kind"], 0) + 1
 
         owner = {} if expand_methods else _method_owners(entities)
         drawn = {qn: info for qn, info in entities.items() if qn not in owner}
 
+        # Aggregate edges onto the drawn set, carrying the strongest evidence.
         edges: dict[tuple[str, str], float] = {}
+        edge_ev: dict[tuple[str, str], str] = {}
         for row in summary.get("internal_edges") or []:
             a = owner.get(str(row.get("from_qn") or ""), str(row.get("from_qn") or ""))
             b = owner.get(str(row.get("to_qn") or ""), str(row.get("to_qn") or ""))
             if a == b or a not in drawn or b not in drawn:
                 continue
-            weight = float((row.get("props") or {}).get("weight") or 1.0)
-            edges[(a, b)] = edges.get((a, b), 0.0) + weight
-
-        kept = set(list(drawn)[:node_limit])
-        undirected = {_undirected(a, b): w for (a, b), w in edges.items()}
-        positions = force_layout(sorted(kept), {e: w for e, w in undirected.items() if set(e) <= kept})
-        degree = _degree_by_module(undirected, kept)
-
-        folded = len(entities) - len(drawn)
-        return ModuleMap(
-            project=self._project,
-            nodes=tuple(
-                MapNode(
-                    id=qn,
-                    label=drawn[qn]["name"] or qn.rsplit(".", 1)[-1],
-                    community=_KIND_ORDER.get(drawn[qn]["kind"], 0),
-                    size=node_size(degree.get(qn, 0)),
-                    x=positions.get(qn, (0.0, 0.0))[0],
-                    y=positions.get(qn, (0.0, 0.0))[1],
-                    project=self._project,
-                    kind=drawn[qn]["kind"],
+            props = row.get("props") or {}
+            state = _evidence_state(
+                EdgeEvidence(
+                    rel_type=str(row.get("rel_type") or ""),
+                    strategy=str(props.get("strategy") or ""),
+                    confidence=str(props.get("confidence") or ""),
                 )
-                for qn in sorted(kept)
-            ),
+            )
+            weight = float(props.get("weight") or 1.0)
+            edges[a, b] = edges.get((a, b), 0.0) + weight
+            if _EV_RANK[state] > _EV_RANK.get(edge_ev.get((a, b), ""), -1):
+                edge_ev[a, b] = state
+
+        # Containment is structural fact: the module DEFINES its members, a class its
+        # own. Drawn as edges they anchor every entity — without them, anything with
+        # no resolved call floats detached at the map's edge, which reads as "isolated"
+        # when the truth is "contained".
+        if module_qn in drawn:
+            for qn in drawn:
+                if qn == module_qn:
+                    continue
+                definer = qn.rsplit(".", 1)[0] if "." in qn else ""
+                while definer and definer not in drawn:
+                    definer = definer.rsplit(".", 1)[0] if "." in definer else ""
+                anchor = definer or module_qn
+                if anchor != qn and (anchor, qn) not in edges:
+                    edges[anchor, qn] = 1.0
+                    edge_ev[anchor, qn] = "structural"
+
+        kept = set(sorted(drawn, key=lambda qn: qn)[:node_limit])
+        truncated = len(kept) < len(drawn)
+        max_w = max(edges.values(), default=1.0) or 1.0
+        scaled = {pair: _scale_weight(w, max_w) for pair, w in edges.items() if pair[0] in kept and pair[1] in kept}
+        positions = force_layout(sorted(kept), scaled)
+
+        degree: dict[str, int] = {}
+        held: dict[str, int] = {}
+        for class_qn in owner.values():
+            held[class_qn] = held.get(class_qn, 0) + 1
+        for a, b in scaled:
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+
+        drawn_count: dict[str, int] = {}
+        for qn in kept:
+            drawn_count[drawn[qn]["kind"]] = drawn_count.get(drawn[qn]["kind"], 0) + 1
+
+        nodes = tuple(
+            MapNode(
+                id=qn,
+                label=_entity_label(qn, drawn[qn]),
+                community=0,
+                deg=degree.get(qn, 0) + held.get(qn, 0),
+                kind=drawn[qn]["kind"],
+                x=round(positions.get(qn, (500.0, 500.0))[0], 1),
+                y=round(positions.get(qn, (500.0, 500.0))[1], 1),
+                uid=drawn[qn]["uid"],
+                path=drawn[qn]["file_path"],
+                lines=drawn[qn]["lines"],
+            )
+            for qn in sorted(kept)
+        )
+
+        return MapPayload(
+            project=self._project,
+            level="entity",
+            nodes=nodes,
             edges=tuple(
-                MapEdge(source=a, target=b, weight=round(w, 4), crosses_community=False)
-                for (a, b), w in sorted(edges.items())
-                if a in kept and b in kept
+                MapEdge(s=a, t=b, w=round(w, 2), ev=edge_ev.get((a, b), "unknown"))
+                for (a, b), w in sorted(scaled.items())
             ),
             communities=(),
-            modularity=0.0,
-            truncated=len(kept) < len(drawn),
+            kinds=_kind_defs(),
             caveat=CoverageCaveat(note=f"{len(entities)} entities indexed under {scope}."),
-            level="entity",
+            module_total=await self._module_total(),
+            entity_total=await self._entity_total((self._project,)),
+            truncated=truncated,
+            scope_options=scope_options,
+            default_scope=_default_scope(scope_options),
             scope=scope,
-            scope_options=await self._scope_options(),
-            kinds=_kind_rows(tally, drawn),
-            expand_methods=expand_methods,
-            expand_count=f"{folded} folded into their class" if folded else "nothing to fold",
-            kind_header_note="in this module",
-            level_note=(
-                "Each node is an entity as the graph stores it — silhouette and colour both "
-                f"carry kind. This module holds {len(entities)} entities; the module map "
-                "above is an aggregation of these."
+            scope_name=_scope_name(scope, scope_options),
+            in_module=len(entities),
+            collapsed=not expand_methods,
+            tally=tuple(
+                KindTally(id=kind.id, in_module=inventory[kind.id], drawn=drawn_count.get(kind.id, 0))
+                for kind in KINDS
+                if inventory.get(kind.id)
             ),
-            legend_note=(
-                "Size = dependency degree. Shape and colour = kind. Position is computed "
-                "from the edges. Scroll to zoom, drag to pan."
-            ),
-            entity_total=len(entities),
-            map_summary=f"{len(kept)} entities · {len(edges)} calls · {len(tally)} kinds",
         )
 
     async def _scope_options(self) -> tuple[ScopeOption, ...]:
@@ -779,13 +1340,22 @@ class MapViewService:
             if row.get("file_path") or row.get("name")
         )
 
-    def _unsupported_reason(self) -> str:
-        """Why this backend cannot produce the map, or empty if it can.
+    async def _entity_total(self, selected: tuple[str, ...]) -> int:
+        try:
+            statuses = [_project_props(row) for row in await self._graph.get_project_status()]
+        except Exception:
+            return 0
+        return sum(int(s.get("entity_count") or 0) for s in statuses if s.get("name") in selected)
 
-        Checked before any query rather than caught after one: the failure on SQLite is a
-        missing capability, not a runtime error, and a half-drawn map is worse than none
-        because a map with modules silently missing still looks complete.
-        """
+    async def _module_total(self) -> int:
+        try:
+            overview = await self._graph.get_structure_overview(self._project, "", _STRUCTURE_LIMIT)
+        except Exception:
+            return 0
+        return sum(int(r.get("cnt") or 0) for r in overview.get("counts", []) if str(r.get("label")) == "Module")
+
+    def _unsupported_reason(self) -> str:
+        """Why this backend cannot produce the map, or empty if it can."""
         from code_atlas.backends.sqlite_graph import SqliteGraphClient  # noqa: PLC0415
 
         if isinstance(self._graph, SqliteGraphClient):
@@ -797,16 +1367,64 @@ class MapViewService:
         return ""
 
 
-def _modularity_of(module_graph: ModuleGraph) -> float:
-    """Partition quality, from the same function ``find_communities`` reports."""
-    from code_atlas.server.analysis import _modularity  # noqa: PLC0415
+def _scale_weight(weight: float, max_weight: float) -> float:
+    """ADR-0017 aggregates into the design's 1-3 band.
 
-    return round(_modularity(module_graph.partition, module_graph.edges), 4)
+    The canvas thickness formula (``EW[ev] * (0.7 + w * 0.1)``) and the layout's
+    attraction term both expect the mock's discrete 1..3; real aggregates span four
+    orders of magnitude, so the square root spreads the low end instead of letting one
+    heavy pair flatten everything else to 1.
+    """
+    return 1.0 + 2.0 * (max(weight, 0.0) / max_weight) ** 0.5
+
+
+def _kind_defs() -> tuple[KindDef, ...]:
+    return tuple(KindDef(id=k.id, label=k.label, shape=k.shape, note=k.note) for k in KINDS)
+
+
+def _lines_of(row: dict[str, Any]) -> str:
+    start, end = row.get("line_start"), row.get("line_end")
+    if isinstance(start, int) and isinstance(end, int):
+        return f"{start}–{end}"  # noqa: RUF001  # en dash: a range, not a hyphen
+    return ""
+
+
+def _entity_label(qn: str, info: dict[str, Any]) -> str:
+    """``file.py › Class › symbol`` — the design's entity-level breadcrumb."""  # noqa: RUF002
+    crumb = breadcrumb(qualified_name=qn, file_path=info["file_path"], kind=info["kind"])
+    leaf = crumb.path.rsplit("/", 1)[-1]
+    parts = [p for p in (leaf, crumb.owner, crumb.symbol) if p]
+    # A module names itself; "client.py › client" would say one thing twice.  # noqa: RUF003
+    if info["kind"] in {"module", "package"} and len(parts) == 2 and parts[0].rsplit(".", 1)[0] == parts[1]:
+        parts = [parts[0]]
+    return SEPARATOR.join(parts) or info["name"] or qn
+
+
+def _scope_name(scope: str, options: tuple[ScopeOption, ...]) -> str:
+    for option in options:
+        if option.id == scope:
+            return option.label
+    return scope
+
+
+def _default_scope(options: tuple[ScopeOption, ...]) -> str:
+    """The first module to show when the entity level is opened without one.
+
+    Largest *production* module: the largest overall is a test file, which is a poor
+    first thing to show someone opening the entity level.
+    """
+    production = [o for o in options if not _looks_like_test(o.id)]
+    chosen = production or list(options)
+    return chosen[0].id if chosen else ""
+
+
+def _looks_like_test(path: str) -> bool:
+    lowered = path.replace("\\", "/").lower()
+    return "/tests/" in f"/{lowered}" or lowered.rsplit("/", 1)[-1].startswith("test_")
 
 
 # Extensions that carry no import graph: they are indexed on purpose and belong in
-# search, but a dependency map draws them as isolated dots. On the real project the CI
-# workflows even formed their own "community", which is noise in a picture about coupling.
+# search, but a dependency map draws them as isolated dots.
 _NONCODE_SUFFIXES = (
     ".yml",
     ".yaml",
@@ -842,22 +1460,30 @@ def _is_test_module(file_path: str, name: str, patterns: tuple[str, ...]) -> boo
     return matches_test_pattern(file_path, name, effective)
 
 
-# The rail lists kinds in a fixed order; the entity level reuses the community slot on
-# MapNode to carry it, so the client can colour by kind without a second field.
-_KIND_ORDER = {k.id: i for i, k in enumerate(KINDS)}
-_ENTITY_SCOPE_LIMIT = 1500
+def _host_module_qn(entities: dict[str, dict[str, Any]]) -> str:
+    """The scope's own module, read off the entity names.
+
+    The module's qualified name is the shortest parent shared by its members — a
+    top-level function is one segment deeper, a method two. An explicit Module row
+    wins when the summary carries one.
+    """
+    for qn, info in entities.items():
+        if info["kind"] in {"module", "package"}:
+            return qn
+    parents = [qn.rsplit(".", 1)[0] for qn in entities if "." in qn]
+    if not parents:
+        return ""
+    # Sorted in place rather than `min(..., key=len)` — the key-callable widens the
+    # element type to Sized under ty, losing str.
+    parents.sort(key=lambda parent: (len(parent), parent))
+    return parents[0]
 
 
-def _undirected(a: str, b: str) -> tuple[str, str]:
-    return (a, b) if a < b else (b, a)
-
-
-def _method_owners(entities: dict[str, dict[str, str]]) -> dict[str, str]:
+def _method_owners(entities: dict[str, dict[str, Any]]) -> dict[str, str]:
     """``method_qn -> owning class_qn`` for every method whose class is present.
 
-    A method's qualified name is its class's plus one segment, which is how the fold
-    finds its owner without a second query. A method whose class is not in this scope
-    stays drawn — folding it into nothing would remove it from the picture.
+    A method whose class is not in this scope stays drawn — folding it into nothing
+    would remove it from the picture.
     """
     classes = {qn for qn, info in entities.items() if info["kind"] == "class"}
     owners: dict[str, str] = {}
@@ -870,45 +1496,27 @@ def _method_owners(entities: dict[str, dict[str, str]]) -> dict[str, str]:
     return owners
 
 
-def _kind_rows(tally: dict[str, int], drawn: dict[str, dict[str, str]]) -> tuple[KindRow, ...]:
-    """The rail's kind list — counted over the whole inventory, not the drawn subset.
-
-    Folding methods into their class must not make the methods look like they vanished,
-    so ``n`` is the full count and ``drawn_note`` says when fewer are on the canvas.
-    """
-    on_canvas: dict[str, int] = {}
-    for info in drawn.values():
-        on_canvas[info["kind"]] = on_canvas.get(info["kind"], 0) + 1
-
-    rows = []
-    for kind in KINDS:
-        total = tally.get(kind.id, 0)
-        if not total:
-            continue
-        shown = on_canvas.get(kind.id, 0)
-        rows.append(
-            KindRow(
-                id=kind.id,
-                label=kind.label,
-                shape=kind.shape,
-                color=kind.color,
-                n=total,
-                drawn_note="" if shown == total else f"{shown} drawn",
-            )
-        )
-    return tuple(rows)
-
-
-def _empty_map(project: str, unavailable: str, *, caveat: CoverageCaveat | None = None) -> ModuleMap:
-    return ModuleMap(
+def _empty_map(
+    project: str,
+    unavailable: str,
+    *,
+    caveat: CoverageCaveat | None = None,
+    level: str = "module",
+    scope: str = "",
+    scope_options: tuple[ScopeOption, ...] = (),
+) -> MapPayload:
+    return MapPayload(
         project=project,
+        level=level,
         nodes=(),
         edges=(),
         communities=(),
-        modularity=0.0,
-        truncated=False,
+        kinds=_kind_defs(),
         caveat=caveat or CoverageCaveat(note=unavailable),
         unavailable=unavailable,
+        scope=scope,
+        scope_options=scope_options,
+        default_scope=_default_scope(scope_options),
     )
 
 
@@ -917,18 +1525,21 @@ def _largest_first(partition: list[list[str]], node_limit: int) -> set[str]:
 
     Truncating by community rather than by module keeps every drawn subsystem complete.
     Slicing a flat list would cut communities in half and show a subsystem missing the
-    modules that explain it — a picture that is not merely partial but actively
-    misleading, because the gap is invisible.
+    modules that explain it.
     """
     kept: set[str] = set()
-    for group in partition:
+    # Copied then sorted in place: `sorted(..., key=len)` resolves the element type
+    # from `len` and widens it to Sized, losing list[str].
+    ordered = list(partition)
+    ordered.sort(key=len, reverse=True)
+    for group in ordered:
         if len(kept) + len(group) > node_limit:
             continue
         kept.update(group)
     return kept
 
 
-def _degree_by_module(edges: dict[tuple[str, str], float], kept: set[str]) -> dict[str, int]:
+def _degree_of(edges: dict[tuple[str, str], float], kept: set[str]) -> dict[str, int]:
     degree: dict[str, int] = {}
     for a, b in edges:
         if a in kept and b in kept:
@@ -937,72 +1548,8 @@ def _degree_by_module(edges: dict[tuple[str, str], float], kept: set[str]) -> di
     return degree
 
 
-def _map_edges(
-    directed: dict[tuple[str, str], float], kept: set[str], community_of: dict[str, int]
-) -> tuple[MapEdge, ...]:
-    """``source`` depends on ``target`` — a real orientation, not a sort order.
-
-    This reads the directed view. It previously read the undirected one, whose key is
-    ``(a, b) if a < b else (b, a)``, so every rendered edge pointed alphabetically: on the
-    real graph all 615 had ``source < target``. Any arrowhead drawn from that was
-    dictionary order wearing the costume of a dependency.
-    """
-    return tuple(
-        MapEdge(
-            source=depender,
-            target=dependency,
-            weight=round(weight, 4),
-            crosses_community=community_of.get(depender, -1) != community_of.get(dependency, -2),
-        )
-        for (depender, dependency), weight in sorted(directed.items())
-        if depender in kept and dependency in kept
-    )
-
-
-def _external_nodes(rows: list[dict[str, Any]], kept: set[str]) -> dict[str, str]:
-    """``module_qn -> owning project`` for first-hop modules outside this project."""
-    found: dict[str, str] = {}
-    for row in rows:
-        source = str(row.get("from_mod") or "")
-        target = str(row.get("to_mod") or "")
-        owner = str(row.get("to_project") or "")
-        if source in kept and target and owner:
-            found[target] = owner
-    return found
-
-
-def _external_edges(rows: list[dict[str, Any]], kept: set[str], external: dict[str, str]) -> tuple[MapEdge, ...]:
-    """Edges reaching out of the project, deduplicated per pair.
-
-    Weight is fixed at 1.0 rather than summed: these come from IMPORTS, which carries no
-    ADR-0017 weight, and inventing one would make a cross-project edge look better
-    evidenced than a call edge that actually was measured.
-    """
-    pairs = {
-        (str(row.get("from_mod") or ""), str(row.get("to_mod") or ""))
-        for row in rows
-        if str(row.get("from_mod") or "") in kept and str(row.get("to_mod") or "") in external
-    }
-    return tuple(MapEdge(source=a, target=b, weight=1.0, crosses_community=True) for a, b in sorted(pairs))
-
-
-def _external_positions(external: dict[str, str]) -> dict[str, tuple[float, float]]:
-    """Park external modules on an outer ring, clear of the project's own clusters."""
-    if not external:
-        return {}
-    step = 2 * math.pi / len(external)
-    return {
-        qn: (_EXTERNAL_RING * math.cos(i * step), _EXTERNAL_RING * math.sin(i * step))
-        for i, qn in enumerate(sorted(external))
-    }
-
-
 def _community_label(group: list[str]) -> str:
-    """Name a subsystem by the longest package prefix its modules share.
-
-    A generated name beats an integer id — "community 3" tells a reader nothing they can
-    act on. Falls back to the first member when the modules share no prefix at all.
-    """
+    """Name a subsystem by the longest package prefix its modules share."""
     if not group:
         return "empty"
     parts = [qn.split(".") for qn in sorted(group)]
@@ -1028,16 +1575,133 @@ def _map_caveat(module_count: int, truncated: bool, node_limit: int) -> Coverage
 class ImpactViewService:
     """ "What breaks if I change this", and "how do these two connect".
 
-    Both views delegate to :mod:`code_atlas.server.analysis` — the same functions the
-    ``blast_radius`` and ``trace_path`` MCP tools call. Re-implementing either traversal
-    in Cypher here would let the UI and the tool drift apart on the same question, and the
-    UI would be the one nobody notices was wrong.
+    The page works at module level over the same graph the map draws; the JSON routes
+    keep the entity-level traversals the ``blast_radius`` and ``trace_path`` MCP tools
+    use, so neither view can drift from the tools.
     """
 
     def __init__(self, graph: GraphBackend, project: str, *, test_patterns: tuple[str, ...] = ()) -> None:
         self._graph = graph
         self._project = project
         self._test_patterns = test_patterns
+
+    async def module_impact(  # noqa: PLR0912  # the BFS and its grouping belong together
+        self, subject: str = "", *, confident_only: bool = False, max_hops: int = 3
+    ) -> ImpactView:
+        """Everything that transitively depends on one module, grouped by distance.
+
+        A row's evidence is the **weakest** claim anywhere along the path that reached
+        it — a dependent three structural hops away plus one guess is a guess.
+        """
+        from code_atlas.backends.sqlite_graph import SqliteGraphClient  # noqa: PLC0415
+        from code_atlas.server.analysis import build_module_graph  # noqa: PLC0415
+
+        if isinstance(self._graph, SqliteGraphClient):
+            return _impact_unavailable(
+                "Module impact runs over the CALLS+IMPORTS module graph, which the SQLite "
+                "backend cannot aggregate. Run against Memgraph."
+            )
+        try:
+            module_graph = await build_module_graph(self._graph, self._project, "", test_patterns=self._test_patterns)
+        except Exception as exc:
+            logger.debug("Impact unavailable for {}: {}", self._project, exc)
+            return _impact_unavailable("The module graph could not be built for this project.")
+        if not module_graph.modules:
+            return _impact_unavailable("No modules indexed for this project.")
+
+        degree: dict[str, int] = dict.fromkeys(module_graph.modules, 0)
+        for a, b in module_graph.edges:
+            if a in degree:
+                degree[a] += 1
+            if b in degree:
+                degree[b] += 1
+        ranked = sorted(module_graph.modules, key=lambda qn: (-degree[qn], qn))
+        root = subject if subject in module_graph.modules else (ranked[0] if ranked else "")
+        if not root:
+            return _impact_unavailable("No modules indexed for this project.")
+
+        def label_of(qn: str) -> str:
+            return _module_map_label(qn, str(module_graph.modules[qn].get("file_path") or ""))
+
+        # BFS against the arrows: who depends on the root, then who depends on them.
+        seen: dict[str, tuple[int, str, str]] = {root: (0, "structural", "")}
+        frontier = [root]
+        for hop in range(1, max_hops + 1):
+            nxt: list[str] = []
+            for depender, dependency in module_graph.directed:
+                if dependency not in frontier or depender in seen:
+                    continue
+                ev = module_graph.evidence.get((depender, dependency), "unknown")
+                carried = seen[dependency][1]
+                worst = ev if _EV_RANK[ev] < _EV_RANK[carried] else carried
+                rel = "imports" if ev == "structural" else "calls"
+                seen[depender] = (hop, worst, rel)
+                nxt.append(depender)
+            frontier = nxt
+            if not frontier:
+                break
+
+        kept_count = dropped = 0
+        groups: list[ImpactHopGroup] = []
+        for hop in range(1, max_hops + 1):
+            rows: list[ImpactRow] = []
+            for qn, (at, worst, rel) in sorted(seen.items(), key=lambda kv: kv[0]):
+                if at != hop:
+                    continue
+                ok = worst in {"structural", "resolved"}
+                if confident_only and not ok:
+                    dropped += 1
+                    continue
+                kept_count += 1
+                rows.append(
+                    ImpactRow(
+                        id=qn,
+                        label=label_of(qn),
+                        rel=rel,
+                        path_note=(
+                            "path fully resolved"
+                            if ok
+                            else "path passes a guess"
+                            if worst == "guessed"
+                            else "path passes an unlooked-up edge"
+                        ),
+                        ev=worst,
+                        url=_impact_url(qn, confident_only),
+                    )
+                )
+            if rows:
+                groups.append(
+                    ImpactHopGroup(
+                        hop_label=f"{hop} hop{'s' if hop != 1 else ''} away",
+                        count_label=f"{len(rows)} module{'s' if len(rows) != 1 else ''}",
+                        rows=tuple(rows),
+                    )
+                )
+
+        total_note = (
+            f"{kept_count} modules on fully resolved paths · {dropped} hidden because their path "
+            "passes a guess or an unlooked-up edge"
+            if confident_only
+            else f"{kept_count} modules depend on this, directly or transitively, within {max_hops} hops"
+        )
+
+        return ImpactView(
+            subject_id=root,
+            subject_label=label_of(root),
+            total_note=total_note,
+            groups=tuple(groups),
+            roots=tuple(
+                ImpactRoot(
+                    id=qn,
+                    label=label_of(qn),
+                    on=qn == root,
+                    url=_impact_url(qn, confident_only),
+                )
+                for qn in ranked[:10]
+            ),
+            confident_only=confident_only,
+            confident_url=_impact_url(root, not confident_only),
+        )
 
     async def blast(
         self,
@@ -1048,7 +1712,7 @@ class ImpactViewService:
         limit: int = _IMPACT_PAGE,
         resolved_only: bool = False,
     ) -> BlastRadiusView:
-        """The dependency closure around *uid*, grouped by distance.
+        """The dependency closure around *uid*, grouped by distance (JSON contract).
 
         Per ADR-0029 this traverses dependency edges only — DEFINES and CONTAINS are
         excluded, because counting containment makes "what does changing this method
@@ -1057,9 +1721,7 @@ class ImpactViewService:
         from code_atlas.server.analysis import blast_radius  # noqa: PLC0415
 
         # Fetched at the view's own ceiling rather than at `limit`, so the resolved-only
-        # filter runs over the whole considered set instead of over one page. Filtering a
-        # page and paging a filtered set give different answers, and the second is the one
-        # a reader assumes they are looking at.
+        # filter runs over the whole considered set instead of over one page.
         result = await blast_radius(
             self._graph,
             uid,
@@ -1092,7 +1754,7 @@ class ImpactViewService:
         )
 
     async def trace(self, from_uid: str, to_uid: str, *, max_depth: int = 6) -> TracePathView:
-        """The shortest path between two entities, hop by hop."""
+        """The shortest path between two entities, hop by hop (JSON contract)."""
         from code_atlas.server.analysis import trace_path  # noqa: PLC0415
 
         result = await trace_path(self._graph, from_uid, to_uid, max_depth=max_depth)
@@ -1114,6 +1776,28 @@ class ImpactViewService:
             hop_count=result.get("hop_count"),
             path_weight=result.get("path_weight"),
         )
+
+
+def _impact_url(subject: str, confident: bool) -> str:
+    from urllib.parse import urlencode  # noqa: PLC0415
+
+    params: list[tuple[str, str]] = [("subject", subject)]
+    if confident:
+        params.append(("confident", "1"))
+    return "/impact?" + urlencode(params)
+
+
+def _impact_unavailable(reason: str) -> ImpactView:
+    return ImpactView(
+        subject_id="",
+        subject_label="",
+        total_note="",
+        groups=(),
+        roots=(),
+        confident_only=False,
+        confident_url="",
+        unavailable=reason,
+    )
 
 
 def _as_affected(row: dict[str, Any]) -> AffectedEntity:
@@ -1158,11 +1842,7 @@ def _group_by_depth(entities: list[AffectedEntity]) -> tuple[DepthGroup, ...]:
 
 
 def _target_name(uid: str) -> str:
-    """A readable name for the analysed entity.
-
-    The traversal never returns the target itself, so there is nothing to read a real
-    name from — the uid's own tail is the honest fallback rather than a second lookup.
-    """
+    """A readable name for the analysed entity."""
     return uid.rsplit(":", 1)[-1] or uid
 
 
@@ -1185,12 +1865,7 @@ def _blast_error(uid: str, direction: str, max_depth: int, error: str) -> BlastR
 
 
 def _impact_caveat(result: dict[str, Any], considered: list[AffectedEntity], resolved_only: bool) -> CoverageCaveat:
-    """Say what the closure did and did not cover.
-
-    ``ambiguous_only`` is a heuristic, not a guarantee — an edge type carrying no
-    confidence property always counts as not-resolved — so a filtered list must not read
-    as a verified one.
-    """
+    """Say what the closure did and did not cover."""
     total = int(result.get("affected_count") or 0)
     if not total:
         return CoverageCaveat(note="Nothing depends on this entity within the traversed depth.")
@@ -1208,12 +1883,7 @@ def _impact_caveat(result: dict[str, Any], considered: list[AffectedEntity], res
 
 
 class ProjectPickerService:
-    """Every indexed project, arranged the way a monorepo actually is.
-
-    Separate from ProjectViewService because it is a different question: that one
-    assembles *a* project, this one chooses between them, and it is the only view that
-    reads across the whole graph rather than staying inside one scope.
-    """
+    """Every indexed project, arranged the way a monorepo actually is."""
 
     def __init__(self, graph: GraphBackend, project: str) -> None:
         self._graph = graph
@@ -1228,16 +1898,20 @@ class ProjectPickerService:
             name = str(row.get("name") or "")
             if not name:
                 continue
-            indexed = _as_timestamp(row.get("last_indexed_at"))
+            days = _days_since(row.get("last_indexed_at"))
+            entities = int(row.get("entity_count") or 0)
+            unindexed = entities == 0 and not row.get("last_indexed_at")
             flat[name] = ProjectChoice(
                 name=name,
                 label=name.rsplit("/", 1)[-1],
-                entities=int(row.get("entity_count") or 0),
+                entities=entities,
                 modules=0,
-                indexed_at=indexed,
+                indexed_at=_as_timestamp(row.get("last_indexed_at")),
                 git_hash=_as_str(row.get("git_hash")),
                 is_current=name in chosen,
-                days_since_indexed=_days_since(row.get("last_indexed_at")),
+                days_since_indexed=days,
+                state="unindexed" if unindexed else "stale" if (days is not None and days > 14) else "fresh",
+                indexed_ago=_ago(row.get("last_indexed_at")),
             )
 
         # `a/b` is a sub-project of `a` when `a` is itself indexed. Without that check a
@@ -1267,11 +1941,7 @@ def _days_since(value: object) -> int | None:
 
 
 def _picker_cost(count: int, entities: int) -> str:
-    """What the current selection implies, before it is applied.
-
-    Layout is O(n^2) per iteration, so combining large projects is the one choice here
-    that a reader would want warned about rather than discovered.
-    """
+    """What the current selection implies, before it is applied."""
     if count <= 1:
         return ""
     if entities > 20_000:

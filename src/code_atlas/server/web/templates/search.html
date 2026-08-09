@@ -1,29 +1,83 @@
 {% extends "base.html" %}
-{% block title %}Search — code-atlas{% endblock %}
-{% block content %}
-  <form method="get" action="/search">
-    <input name="q" value="{{ page.query }}" placeholder="Search entities…" autofocus size="40" />
-    <button type="submit">Search</button>
-  </form>
+{% import "_macros.html" as m %}
+{% block title %}Search — Code Atlas{% endblock %}
+{# The search page — sidebar and results ported verbatim from the design. Channel
+   toggles and kind chips are links carrying the adjusted query, since the page is
+   server-rendered; the markup and counting rules are the design's own. #}
 
-  {% if page.query %}
-    <p class="muted">
-      {{ page.hits | length }} result{{ "" if page.hits | length == 1 else "s" }}
-      {% if page.more_available %}
-        — <b>more exist</b>, count unknown. Narrow the query or raise the limit.
-      {% endif %}
-    </p>
+{% block sidebar %}
+<aside style="width:272px;flex:none;border-right:1px solid var(--color-divider);overflow-y:auto;display:flex;flex-direction:column">
+  <div>
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Query</div>
+      <form method="get" action="/search">
+        <input class="input" name="q" value="{{ page.query }}" placeholder="Search entities, symbols, docs…" style="height:34px;min-height:34px;font-size:13px" autofocus>
+        {% set inactive = page.channels | rejectattr("on") | list %}
+        {% if inactive %}{% for c in page.channels if c.on %}<input type="hidden" name="channel" value="{{ c.id }}">{% endfor %}{% endif %}
+        {% for k in page.kind_filters if k.on %}<input type="hidden" name="kind" value="{{ k.id }}">{% endfor %}
+      </form>
+      <div style="margin-top:8px;font-size:11px;line-height:1.45;color:color-mix(in srgb, var(--color-text) 62%, transparent)">{{ page.searching_note }}</div>
+    </section>
 
-    <table>
-      <tr><th>Name</th><th>Kind</th><th>File</th><th>Channels</th></tr>
-      {% for hit in page.hits %}
-        <tr>
-          <td><a href="/entity/{{ hit.uid }}">{{ hit.name }}</a></td>
-          <td class="muted">{{ hit.kind }}</td>
-          <td class="muted">{{ hit.file_path }}{% if hit.line_start %}:{{ hit.line_start }}{% endif %}</td>
-          <td class="muted">{{ hit.channels | join(", ") }}</td>
-        </tr>
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Channels</div>
+      {% for c in page.channels %}
+      <a href="{{ c.url }}" class="hv6" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:5px 4px;cursor:pointer;color:inherit;font:inherit;font-size:13px;text-align:left;text-decoration:none">
+        {{ m.toggle(c.on) }}
+        <span style="flex:1">{{ c.label }}</span>
+        <span style="font-size:11px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ c.count }}</span>
+      </a>
       {% endfor %}
-    </table>
-  {% endif %}
+    </section>
+
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Kind</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        {% for k in page.kind_filters %}
+        <a href="{{ k.url }}" class="hv7" style="background:{{ 'color-mix(in srgb, var(--color-accent) 12%, transparent)' if k.on else 'transparent' }};color:{{ 'var(--color-accent-700)' if k.on else 'var(--color-text)' }};border:1px solid {{ 'var(--color-accent)' if k.on else 'var(--color-divider)' }};border-radius:999px;padding:3px 10px;cursor:pointer;font:inherit;font-size:11.5px;text-decoration:none">{{ k.label_count }}</a>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section style="padding:13px 14px 18px;font-size:11px;line-height:1.55;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
+      Filters narrow what was fetched. They cannot reveal matches the search did not retrieve — the total remains unknown.
+    </section>
+  </div>
+</aside>
+{% endblock %}
+
+{% block main %}
+<main style="flex:1;min-width:0;overflow-y:auto">
+  <div style="max-width:900px;padding:20px 26px 40px">
+    <div style="display:flex;align-items:baseline;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--color-divider);font-size:11.5px;color:color-mix(in srgb, var(--color-text) 58%, transparent)">
+      <span>{{ page.result_note }}</span>
+      <span style="margin-left:auto">ranked by fused score</span>
+    </div>
+    {% for r in page.rows %}
+    <a href="/entity/{{ r.uid }}" class="hv5" style="display:block;width:100%;text-align:left;background:transparent;border:0;border-bottom:1px solid var(--color-divider);padding:12px 8px;cursor:pointer;color:inherit;font:inherit;text-decoration:none">
+      <div style="display:flex;align-items:baseline;gap:9px">
+        <span style="font-family:var(--font-heading);font-weight:800;font-size:14.5px">{{ r.label }}</span>
+        <span class="tag tag-neutral" style="font-size:10px">{{ r.kind }}</span>
+        <span style="margin-left:auto;font-size:11.5px;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ r.loc }}</span>
+      </div>
+      <div style="margin-top:5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 72%, transparent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.sig }}</div>
+      <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+        <span style="display:flex;gap:9px">
+          {% for c in ["graph", "keyword", "semantic"] %}
+          {% set lit = c in r.channels %}
+          <span style="display:flex;align-items:center;gap:4px;font-size:10px;letter-spacing:0.04em;text-transform:uppercase;color:{{ 'var(--color-accent-700)' if lit else 'color-mix(in srgb, var(--color-text) 38%, transparent)' }}">
+            <span style="width:6px;height:6px;border-radius:999px;background:{{ 'var(--color-accent)' if lit else 'color-mix(in srgb, var(--color-text) 15%, transparent)' }};display:block"></span>{{ c }}
+          </span>
+          {% endfor %}
+        </span>
+        <span style="font-size:11px;color:color-mix(in srgb, var(--color-text) 50%, transparent)">{{ r.strength }}</span>
+        <span style="margin-left:auto;font-size:11.5px;font-variant-numeric:tabular-nums">{{ r.score }}</span>
+      </div>
+    </a>
+    {% endfor %}
+    <div style="margin-top:14px;padding:10px 12px;border-radius:10px;background:var(--color-surface);font-size:11.5px;line-height:1.55;color:color-mix(in srgb, var(--color-text) 66%, transparent)">
+      The search cannot count matches it did not fetch. This list is the top of a ranking, not a complete set — the total is unknown rather than estimated.
+    </div>
+  </div>
+</main>
 {% endblock %}

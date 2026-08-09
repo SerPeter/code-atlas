@@ -88,8 +88,9 @@ class TestSelfContained:
 
         html = await _exporter().render()
 
-        # `src=`/`href=` to anything other than an in-page anchor would break offline.
-        external = re.findall(r'(?:src|href)\s*=\s*"([^"]*)"', html)
+        # `src=`/`href=` attributes pointing anywhere would break offline. The inlined
+        # map.js contains `location.href` assignments, which are not document loads.
+        external = re.findall(r'<[a-z][^>]*\s(?:src|href)\s*=\s*"([^"]*)"', html)
         assert all(ref.startswith("#") for ref in external), f"non-anchor references: {external}"
 
     async def test_nothing_points_at_the_network(self, monkeypatch):
@@ -106,31 +107,33 @@ class TestSelfContained:
 
         html = await _exporter().render()
 
-        assert "/static/vendor/" not in html
-        assert "sigma" in html.lower(), "the renderer itself must be in the file"
+        assert "/static/" not in html
+        assert "data-atlas-canvas" in html, "the canvas renderer itself must be in the file"
+        assert "data:font/woff2;base64," in html, "the fonts ride along as data URIs"
 
     async def test_the_map_payload_is_embedded_so_no_fetch_runs(self, monkeypatch):
         _patch_map(monkeypatch)
 
         html = await _exporter().render()
 
-        assert 'id="map-data"' in html
+        assert "window.ATLAS_EMBED = " in html
         assert "app.service" in html, "the module data must be in the document"
 
 
 class TestSameComponents:
     """A parallel implementation is the failure mode this story exists to avoid."""
 
-    async def test_the_export_includes_the_same_partials_the_server_does(self, monkeypatch):
-        """Sections are rendered from the shared files, not re-authored markup."""
+    async def test_the_export_renders_through_the_same_island_the_server_serves(self, monkeypatch):
+        """The inlined map.js is byte-identical to the served file — one renderer."""
         _patch_map(monkeypatch)
+
+        from code_atlas.server.web import STATIC_DIR
 
         html = await _exporter().render()
 
-        # Markers that only exist inside the shared partials.
-        assert "map-canvas" in html
-        assert "Architecture health" in html
-        assert "Propagation cost" in html
+        assert 'id="map-aside"' in html
+        assert 'id="map-main"' in html
+        assert (STATIC_DIR / "map.js").read_text(encoding="utf-8") in html
 
     async def test_a_missing_template_variable_fails_loudly(self, monkeypatch):
         """StrictUndefined on purpose: an export is written once and mailed to someone.
@@ -157,18 +160,18 @@ class TestProvenance:
         html = await _exporter().render(generated_at=datetime(2026, 8, 8, 12, 30, tzinfo=UTC))
 
         assert "demo" in html
-        assert "abc123def456" in html, "the commit must be on the page"
+        assert "abc123d" in html, "the commit must be on the page"
         assert "2026-08-08 12:30:00 UTC" in html
-        assert "will not update" in html
+        assert "static export" in html
 
-    async def test_disabled_views_explain_themselves(self, monkeypatch):
-        """A missing view reads as 'nothing to show'; a disabled one tells the truth."""
+    async def test_what_the_export_cannot_do_explains_itself(self, monkeypatch):
+        """Filters and the entity level need the server; the fallback says so rather
+        than rendering an empty canvas."""
         _patch_map(monkeypatch)
 
         html = await _exporter().render()
 
-        assert "not included" in html
-        assert "atlas ui" in html, "it must name the command that provides them"
+        assert "need the live server" in html
 
 
 class TestScriptEmbedding:
@@ -178,7 +181,7 @@ class TestScriptEmbedding:
 
         html = await _exporter().render()
 
-        blob = html.split('id="map-data">')[1].split("</script>")[0]
+        blob = html.split("window.ATLAS_EMBED = ")[1].split("</script>")[0]
         assert "</script" not in blob
         assert "\\u003c" in blob
 
@@ -188,7 +191,7 @@ class TestScriptEmbedding:
         _patch_map(monkeypatch)
 
         html = await _exporter().render()
-        blob = html.split('id="map-data">')[1].split("</script>")[0]
+        blob = html.split("window.ATLAS_EMBED = ")[1].split("</script>")[0].rstrip().rstrip(";")
 
         data = json.loads(blob)
         assert {n["id"] for n in data["nodes"]} == {"app.api", "app.service", "app.repo"}

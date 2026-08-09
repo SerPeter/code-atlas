@@ -279,35 +279,96 @@ class TestTracePath:
         assert "not found" in view.error.lower()
 
 
+class TestModuleImpact:
+    """The impact page itself: module-level dependents with worst-evidence carry."""
+
+    @staticmethod
+    def _patch_graph(monkeypatch) -> None:
+        from code_atlas.server.analysis import ModuleGraph
+
+        # Dependents: mid reaches root on a resolved edge, far reaches mid on a
+        # structural one, and shaky reaches root through a guess.
+        module_graph = ModuleGraph(
+            modules={
+                qn: {"uid": f"u:{qn}", "name": qn, "qn": qn, "file_path": f"src/{qn}.py"}
+                for qn in ("root", "mid", "far", "shaky")
+            },
+            edges={("mid", "root"): 1.0, ("far", "mid"): 1.0, ("shaky", "root"): 1.0},
+            directed={("mid", "root"): 3.0, ("far", "mid"): 1.0, ("shaky", "root"): 1.0},
+            partition=[["root", "mid", "far", "shaky"]],
+            evidence={("mid", "root"): "resolved", ("far", "mid"): "structural", ("shaky", "root"): "guessed"},
+        )
+
+        async def _fake(graph, project, path, *, test_patterns=()):
+            return module_graph
+
+        monkeypatch.setattr("code_atlas.server.analysis.build_module_graph", _fake)
+
+    async def test_dependents_group_by_distance(self, monkeypatch):
+        self._patch_graph(monkeypatch)
+
+        view = await _service().module_impact("root")
+
+        assert [g.hop_label for g in view.groups] == ["1 hop away", "2 hops away"]
+        assert {r.id for r in view.groups[0].rows} == {"mid", "shaky"}
+        assert {r.id for r in view.groups[1].rows} == {"far"}
+
+    async def test_a_row_carries_the_weakest_evidence_on_its_path(self, monkeypatch):
+        """A dependent reached through structural-then-resolved is resolved, not
+        structural — the chain is only as strong as its weakest claim."""
+        self._patch_graph(monkeypatch)
+
+        view = await _service().module_impact("root")
+
+        by_id = {r.id: r for g in view.groups for r in g.rows}
+        assert by_id["far"].ev == "resolved", "far reaches root through mid's resolved edge"
+        assert by_id["shaky"].ev == "guessed"
+
+    async def test_the_confident_filter_counts_what_it_hid(self, monkeypatch):
+        self._patch_graph(monkeypatch)
+
+        view = await _service().module_impact("root", confident_only=True)
+
+        ids = {r.id for g in view.groups for r in g.rows}
+        assert "shaky" not in ids
+        assert "1 hidden" in view.total_note, "what is hidden is counted, never dropped silently"
+
+    async def test_the_default_subject_is_the_highest_degree_module(self, monkeypatch):
+        self._patch_graph(monkeypatch)
+
+        view = await _service().module_impact("")
+
+        # root and mid tie on degree 2; the alphabetical tie-break picks mid.
+        assert view.subject_id == "mid"
+
+    async def test_sqlite_says_why_instead_of_an_empty_page(self):
+        from code_atlas.backends.sqlite_graph import SqliteGraphClient
+
+        fake = cast("GraphBackend", object.__new__(SqliteGraphClient))
+
+        view = await ImpactViewService(fake, "demo").module_impact("root")
+
+        assert view.unavailable
+        assert view.groups == ()
+
+
 class TestImpactEndpoint:
-    def test_the_bare_page_asks_for_an_entity(self):
+    def test_the_page_renders_the_module_view(self, monkeypatch):
         pytest.importorskip("litestar")
         from litestar.testing import TestClient
 
         from code_atlas.server.web.app import create_app
 
-        with TestClient(app=create_app(cast("GraphBackend", _Graph()), "demo")) as client:
-            response = client.get("/impact")
+        TestModuleImpact._patch_graph(monkeypatch)
 
-        assert response.status_code == 200
-        assert "uid" in response.text
+        with TestClient(app=create_app(cast("GraphBackend", _PageGraph()), "demo")) as client:
+            body = client.get("/impact?subject=root").text
 
-    def test_the_page_labels_each_hit_with_the_edge_that_reached_it(self, monkeypatch):
-        pytest.importorskip("litestar")
-        from litestar.testing import TestClient
+        assert "What breaks if I change" in body
+        assert "hop away" in body
+        assert "GUESSED" in body, "evidence chips must be on the page, not just in the model"
 
-        from code_atlas.server.web.app import create_app
-
-        _patch_blast(monkeypatch, [_entry("u:ref", qn="app.referrer", via=["REFERENCES"])])
-
-        with TestClient(app=create_app(cast("GraphBackend", _Graph()), "demo")) as client:
-            body = client.get("/impact?uid=u:target").text
-
-        assert "REFERENCES" in body, "the edge type must be on the page, not just in the model"
-        assert "not a call" in body
-        assert "app.referrer" in body
-
-    def test_depth_is_clamped_at_the_edge(self, monkeypatch):
+    def test_depth_is_clamped_at_the_api_edge(self, monkeypatch):
         pytest.importorskip("litestar")
         from litestar.testing import TestClient
 
@@ -315,8 +376,8 @@ class TestImpactEndpoint:
 
         seen = _patch_blast(monkeypatch, [])
 
-        with TestClient(app=create_app(cast("GraphBackend", _Graph()), "demo")) as client:
-            client.get("/impact?uid=u:x&depth=99&direction=sideways")
+        with TestClient(app=create_app(cast("GraphBackend", _PageGraph()), "demo")) as client:
+            client.get("/impact/api/blast?uid=u:x&depth=99&direction=sideways")
 
         assert seen["max_depth"] == 10, "an unbounded depth is a DoS against the reader's own machine"
         assert seen["direction"] == "callers", "an unknown direction falls back rather than erroring"
@@ -329,8 +390,18 @@ class TestImpactEndpoint:
 
         _patch_blast(monkeypatch, [_entry("u:a", via=["USES_TYPE"])], total=9)
 
-        with TestClient(app=create_app(cast("GraphBackend", _Graph()), "demo")) as client:
+        with TestClient(app=create_app(cast("GraphBackend", _PageGraph()), "demo")) as client:
             payload = client.get("/impact/api/blast?uid=u:target").json()
 
         assert payload["affected_count"] == 9
         assert payload["groups"][0]["entities"][0]["via"] == ["USES_TYPE"]
+
+
+class _PageGraph(_Graph):
+    """The page also renders the shell, whose chrome reads these."""
+
+    async def get_project_status(self, project_name=None):
+        return [{"n": {"name": "demo", "entity_count": 10}}]
+
+    async def get_structure_overview(self, project, path, limit):
+        return {"counts": [{"label": "Module", "kind": "module", "cnt": 4}], "largest_modules": [], "packages": []}

@@ -1,14 +1,21 @@
 {% extends "base.html" %}
-{% block title %}{{ map.project }} — Code Atlas{% endblock %}
-{% block subtitle %}{{ map.nodes | length }} modules{% endblock %}
-{% set active = 'map' %}
+{# The map view. The design implements this screen as one client-side component —
+   rail, canvas and context panel all react to the same state (level, filters,
+   hover, selection, path) — so the port does the same: the server provides the
+   shell and /map/api provides the data; map.js renders the design's markup. #}
 
-{% block sidebar %}{% if map.is_available and map.nodes %}{% include "_map_sidebar.html" %}{% endif %}{% endblock %}
+{% block sidebar %}
+<aside id="map-aside" style="width:272px;flex:none;border-right:1px solid var(--color-divider);overflow-y:auto;display:flex;flex-direction:column"></aside>
+{% endblock %}
 
-{% block content %}{% include "_map_section.html" %}{% endblock %}
+{% block main %}
+<main id="map-main" style="flex:1;min-width:0;position:relative"></main>
+{% endblock %}
+
+{% block context %}
+<aside id="map-context" style="width:326px;flex:none;border-left:1px solid var(--color-divider);overflow-y:auto"></aside>
+{% endblock %}
 
 {% block scripts %}
-<script src="/static/vendor/graphology-0.26.0.umd.min.js"></script>
-<script src="/static/vendor/sigma-3.0.3.min.js"></script>
 <script src="/static/map.js"></script>
 {% endblock %}

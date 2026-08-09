@@ -8,9 +8,10 @@ below this module reaches out to construct its own dependencies.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote
 
-from litestar import Litestar
-from litestar.di import Provide
+from litestar import Litestar, Request
+from litestar.di import NamedDependency, Provide
 from litestar.static_files import create_static_files_router
 from litestar.template.config import TemplateConfig
 
@@ -25,6 +26,7 @@ from code_atlas.server.web.controllers import (
 )
 from code_atlas.server.web.services import (
     ArchitectureViewService,
+    ChromeService,
     ImpactViewService,
     MapViewService,
     ProjectPickerService,
@@ -36,36 +38,6 @@ if TYPE_CHECKING:
     from code_atlas.graph.protocol import GraphBackend
     from code_atlas.search.engine import EmbedOne
     from code_atlas.settings import SearchSettings
-
-
-_MAP_DEFAULTS: dict[str, Any] = {
-    "level": "module",
-    "module": "",
-    "expand": False,
-    "show_tests": False,
-    "show_noncode": False,
-    "direction": "arrows",
-    "hops": 1,
-    "labels": "some",
-    "focus": -1,
-}
-
-
-def _map_url(**overrides: Any) -> str:
-    """A map link with *overrides* applied and everything else left at its default.
-
-    Only non-default values are emitted, so the common URL stays `/` rather than a
-    paragraph of query string.
-    """
-    from urllib.parse import urlencode  # noqa: PLC0415
-
-    values = {**_MAP_DEFAULTS, **{k: v for k, v in overrides.items() if v is not None}}
-    query = {
-        key: ("1" if value is True else "0" if value is False else str(value))
-        for key, value in values.items()
-        if value != _MAP_DEFAULTS[key]
-    }
-    return "/?" + urlencode(query) if query else "/"
 
 
 def create_app(
@@ -91,29 +63,42 @@ def create_app(
     # the UI must still work when the caller has no settings to hand (tests do not).
     search_settings = search_settings or _SearchSettings()
 
-    async def provide_view_service() -> ProjectViewService:
-        return ProjectViewService(graph, project)
+    async def provide_selected_projects(request: Request) -> tuple[str, ...]:
+        """The projects the dialog picked, from its cookie; the CLI's project otherwise.
 
-    async def provide_search_service() -> SearchViewService:
-        return SearchViewService(graph, project, search_settings=search_settings, embed=embed)
+        A cookie rather than a query parameter, so every link on every page stays clean
+        and the selection survives navigation. The first name is the primary project —
+        the one search, impact and the entity level are scoped to.
+        """
+        raw = unquote(request.cookies.get("atlas_projects", ""))
+        names = tuple(name for name in raw.split(",") if name.strip())
+        return names or (project,)
 
-    async def provide_architecture_service() -> ArchitectureViewService:
-        return ArchitectureViewService(graph, project)
+    async def provide_primary_project(selected_projects: NamedDependency[tuple[str, ...]]) -> str:
+        return selected_projects[0]
 
-    async def provide_map_service() -> MapViewService:
-        return MapViewService(graph, project)
+    async def provide_view_service(primary_project: NamedDependency[str]) -> ProjectViewService:
+        return ProjectViewService(graph, primary_project)
 
-    async def provide_impact_service() -> ImpactViewService:
-        return ImpactViewService(graph, project)
+    async def provide_chrome_service(selected_projects: NamedDependency[tuple[str, ...]]) -> ChromeService:
+        return ChromeService(graph, selected_projects)
 
-    async def provide_picker_service() -> ProjectPickerService:
-        return ProjectPickerService(graph, project)
+    async def provide_search_service(primary_project: NamedDependency[str]) -> SearchViewService:
+        return SearchViewService(graph, primary_project, search_settings=search_settings, embed=embed)
+
+    async def provide_architecture_service(primary_project: NamedDependency[str]) -> ArchitectureViewService:
+        return ArchitectureViewService(graph, primary_project)
+
+    async def provide_map_service(primary_project: NamedDependency[str]) -> MapViewService:
+        return MapViewService(graph, primary_project)
+
+    async def provide_impact_service(primary_project: NamedDependency[str]) -> ImpactViewService:
+        return ImpactViewService(graph, primary_project)
+
+    async def provide_picker_service(primary_project: NamedDependency[str]) -> ProjectPickerService:
+        return ProjectPickerService(graph, primary_project)
 
     template_config: TemplateConfig[Any] = TemplateConfig(directory=TEMPLATES_DIR, engine=JinjaTemplateEngine)
-    # `map_url` lets a rail control change one setting and carry the rest. Without it
-    # every link would have to restate all nine, and one omission silently resets a
-    # setting the reader chose.
-    template_config.engine_instance.engine.globals["map_url"] = _map_url
 
     return Litestar(
         route_handlers=[
@@ -128,7 +113,10 @@ def create_app(
             create_static_files_router(path="/static", directories=[STATIC_DIR], name="static"),
         ],
         dependencies={
+            "selected_projects": Provide(provide_selected_projects),
+            "primary_project": Provide(provide_primary_project),
             "view_service": Provide(provide_view_service),
+            "chrome_service": Provide(provide_chrome_service),
             "search_service": Provide(provide_search_service),
             "architecture_service": Provide(provide_architecture_service),
             "map_service": Provide(provide_map_service),
