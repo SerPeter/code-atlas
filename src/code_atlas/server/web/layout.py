@@ -94,6 +94,27 @@ def force_layout(  # noqa: PLR0915  # one simulation, kept whole so it stays com
     k = float(np.sqrt((width * height) / n))
     iterations = iteration_count(n)
 
+    # The design's constants are tuned for its ~40-node mock, while the total
+    # repulsion a peripheral node feels is scale-invariant (n pairs x k^2/d^2 with
+    # k^2 = area/n). Left alone, every leaf's equilibrium orbit lands outside the
+    # canvas at a thousand nodes and the normalise-to-fill step pins that shell to
+    # the border. Above the design's own scale, springs stiffen with sqrt(n/40) to
+    # keep pace with repulsion; repulsion and the spring rest length grow with the
+    # fourth root, so clusters breathe instead of knotting; and gravity grows
+    # fastest, holding the halo despite the stronger push.
+    sim_scale = max(1.0, float(np.sqrt(n / 40)))
+    breathe = float(np.sqrt(sim_scale))
+    stiffness = 0.09 * sim_scale
+    repulsion_c = k * k * 1.1 * breathe
+    rest = k * 0.55 * breathe
+    gravity = 0.006 * sim_scale * breathe
+    # A node with no edge has no spring to hold it; only gravity answers repulsion,
+    # so it gets more — otherwise the edge-less settle in a ring past everything.
+    connected = np.zeros(n, dtype=bool)
+    connected[src_i] = True
+    connected[dst_i] = True
+    gravity_of = np.where(connected, gravity, gravity * 4.0)
+
     for it in range(iterations):
         t = 1 - it / iterations
 
@@ -104,7 +125,7 @@ def force_layout(  # noqa: PLR0915  # one simulation, kept whole so it stays com
             delta = rows[:, None, :] - pos[None, :, :]
             d2 = np.einsum("ijk,ijk->ij", delta, delta)
             np.clip(d2, 0.01, None, out=d2)
-            repulsion = (k * k * 1.1) / d2
+            repulsion = repulsion_c / d2
             self_idx = np.arange(rows.shape[0])
             repulsion[self_idx, start + self_idx] = 0.0  # a node does not push itself
             vel[start : start + block] += np.einsum("ijk,ij->ik", delta, repulsion)
@@ -113,13 +134,13 @@ def force_layout(  # noqa: PLR0915  # one simulation, kept whole so it stays com
             edge_delta = pos[dst_i] - pos[src_i]
             dist = np.linalg.norm(edge_delta, axis=-1)
             np.clip(dist, 0.01, None, out=dist)
-            f = ((dist - k * 0.55) / dist) * 0.09 * (0.5 + pull / 6)
+            f = ((dist - rest) / dist) * stiffness * (0.5 + pull / 6)
             force = edge_delta * f[:, None]
             np.add.at(vel, src_i, force)
             np.add.at(vel, dst_i, -force)
 
-        vel[:, 0] += (width / 2 - pos[:, 0]) * 0.006
-        vel[:, 1] += (height / 2 - pos[:, 1]) * 0.006
+        vel[:, 0] += (width / 2 - pos[:, 0]) * gravity_of
+        vel[:, 1] += (height / 2 - pos[:, 1]) * gravity_of
         pos += np.clip(vel * t, -20, 20)
         vel *= 0.82
 
