@@ -496,6 +496,11 @@ def _parse_python(
     # actually came from `os`).
     _extract_config_refs(root, source, entities, relationships)
 
+    # Module-level constants a body reads. Runs late for the same reason as the
+    # config pass: only the finished entity list says which names are module-level
+    # Values, and only then is a bare identifier's match lexically grounded.
+    _extract_constant_reads(root, entities, relationships)
+
     # Most identifier arguments are ordinary values — `path`, `node`, `entities`. Emitting
     # a reference for every one produced 379 from this file alone, so they are filtered
     # here rather than at the call site: only now is the entity list complete enough to
@@ -1253,6 +1258,134 @@ def _local_declared_types(func_node: Node, body: Node) -> dict[str, str]:
     return types
 
 
+def _extract_constant_reads(  # noqa: PLR0915  # one lexical pass: scope walk, shadow set, load test
+    root: Node, entities: list[ParsedEntity], relationships: list[ParsedRelationship]
+) -> None:
+    """REFERENCES from a body to the module-level constants it reads.
+
+    `_match_brace` reading `_OPEN_BRACE` was invisible: CALLS covers callables and
+    the value-reference pass covers callables-as-values, so a Value's only inbound
+    edge was its DEFINES — one REFERENCES edge onto a Value in the whole graph, and
+    every constant looked unused.
+
+    The same lexical ground rules as ADR-0022: only names that are module-level
+    Values of THIS file, only where no local binding shadows them. A bare name not
+    bound locally resolves to module scope — that is Python's own rule, not a guess.
+    """
+    module_qn = entities[0].qualified_name
+    values = {e.name for e in entities if e.label == NodeLabel.VALUE and e.qualified_name == f"{module_qn}.{e.name}"}
+    if not values:
+        return
+    callables = [(e.line_start, e.line_end, e.qualified_name) for e in entities if e.label == NodeLabel.CALLABLE]
+
+    def _qn_for(def_node: Node) -> str:
+        line = def_node.start_point[0] + 1
+        best: tuple[int, int, str] | None = None
+        for start, end, qn in callables:
+            if start <= line <= end and (best is None or start >= best[0]):
+                best = (start, end, qn)
+        return best[2] if best else module_qn
+
+    emitted: set[tuple[str, str]] = set()
+
+    def _is_load(node: Node) -> bool:  # noqa: PLR0911  # each store context is one early exit
+        parent = node.parent
+        if parent is None:
+            return True
+        if parent.type == "assignment" and parent.child_by_field_name("left") == node:
+            return False
+        if parent.type == "augmented_assignment" and parent.child_by_field_name("left") == node:
+            return False
+        if parent.type == "call" and parent.child_by_field_name("function") == node:
+            return False
+        if parent.type == "attribute" and parent.child_by_field_name("attribute") == node:
+            return False
+        if parent.type == "keyword_argument" and parent.child_by_field_name("name") == node:
+            return False
+        return not (
+            parent.type in ("function_definition", "class_definition") and parent.child_by_field_name("name") == node
+        )
+
+    def _bindings(def_node: Node) -> frozenset[str]:
+        """Names the function binds locally — they shadow the module constant.
+
+        `global NAME` un-shadows: it declares the name module-scoped, so reading or
+        writing it really does touch the Value.
+        """
+        bound: set[str] = set()
+        unshadowed: set[str] = set()
+
+        def collect(node: Node) -> None:
+            for child in node.children:
+                t = child.type
+                if t in ("function_definition", "class_definition"):
+                    name = child.child_by_field_name("name")
+                    if name is not None:
+                        bound.add(node_text(name))
+                    continue  # a nested scope's internals are its own pass
+                if t in ("global_statement", "nonlocal_statement"):
+                    for ident in child.children:
+                        if ident.type == "identifier":
+                            unshadowed.add(node_text(ident))
+                    continue
+                if t in ("assignment", "augmented_assignment", "named_expression"):
+                    left = child.child_by_field_name("left") or child.child_by_field_name("name")
+                    if left is not None:
+                        _collect_target_names(left, bound)
+                if t in ("for_statement", "for_in_clause"):
+                    left = child.child_by_field_name("left")
+                    if left is not None:
+                        _collect_target_names(left, bound)
+                if t == "as_pattern_target":
+                    _collect_target_names(child, bound)
+                collect(child)
+
+        params = def_node.child_by_field_name("parameters")
+        if params is not None:
+            for ident in params.children:
+                _collect_target_names(ident, bound)
+        body = def_node.child_by_field_name("body")
+        if body is not None:
+            collect(body)
+        return frozenset(bound - unshadowed)
+
+    def walk(node: Node, owner_qn: str, shadow: frozenset[str]) -> None:
+        for child in node.children:
+            t = child.type
+            if t == "function_definition":
+                walk(child, _qn_for(child), shadow | _bindings(child))
+                continue
+            if t in ("import_statement", "import_from_statement", "parameters", "decorator"):
+                continue
+            if t == "identifier":
+                name = node_text(child)
+                if name in values and name not in shadow and _is_load(child):
+                    key = (owner_qn, name)
+                    if key not in emitted:
+                        emitted.add(key)
+                        relationships.append(
+                            ParsedRelationship(
+                                from_qualified_name=owner_qn,
+                                rel_type=RelType.REFERENCES,
+                                to_name=name,
+                                properties={"via": "const", "line": child.start_point[0] + 1},
+                            )
+                        )
+                continue
+            walk(child, owner_qn, shadow)
+
+    walk(root, module_qn, frozenset())
+
+
+def _collect_target_names(node: Node, into: set[str]) -> None:
+    """Every identifier a binding target introduces, tuples and stars included."""
+    if node.type == "identifier":
+        into.add(node_text(node))
+        return
+    for child in node.children:
+        _collect_target_names(child, into)
+
+
 def _filter_value_references(entities: list[ParsedEntity], relationships: list[ParsedRelationship]) -> None:
     """Drop REFERENCES whose name is not a callable this file can actually see.
 
@@ -1284,6 +1417,10 @@ def _filter_value_references(entities: list[ParsedEntity], relationships: list[P
             return True
         via = r.properties.get("via")
         if via == "table":
+            return r.to_name in known_tables
+        # A constant read was emitted against this file's own module-level Values,
+        # so the membership test here is belt-and-braces, not the decision.
+        if via == "const":
             return r.to_name in known_tables
         if via == "self":
             return r.to_name in local_methods

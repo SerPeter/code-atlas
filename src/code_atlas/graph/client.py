@@ -2846,7 +2846,7 @@ class GraphClient:
         # so `_HANDLERS[name](...)` needs a different target than everything else here.
         by_type: dict[tuple[str, NodeLabel], list[dict[str, str]]] = {}
         for r in ref_rels:
-            if r.properties.get("via") == "table":
+            if r.properties.get("via") in {"table", "const"}:
                 label = NodeLabel.VALUE
             elif r.rel_type == RelType.USES_TYPE:
                 label = NodeLabel.TYPE_DEF
