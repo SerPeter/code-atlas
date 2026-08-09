@@ -1,74 +1,77 @@
-{# The application shell, ported verbatim from the Claude Design v1.1 output.
-
-   Inline styles are kept exactly as the design emits them. They are not placeholders —
-   they *are* the design, and rewriting them as hand-authored classes is what made the
-   first attempt look like something else. Only the design's own directives change:
-   `sc-camel-on-click` becomes an href, `<sc-for>` becomes a Jinja loop, and `{{ }}`
-   expressions bind to the view models.
-
-   static/design.css supplies the tokens and component classes these styles reference.
-
-   Blocks a view fills: title · subtitle · nav · sidebar · content · scripts
-#}
 <!doctype html>
-<html lang="en" data-theme="{{ theme | default('light') }}" data-palette="{{ palette | default('modernist') }}">
+{# The application shell — a verbatim port of the v1.1 design's frame (header 52px,
+   content row, footer 34px, projects dialog). Inline styles are the design's own;
+   the only translations are its runtime directives: `sc-camel-on-click` becomes an
+   href or an id that app.js wires, `sc-for` becomes a Jinja loop, and `style-hover`
+   becomes the matching .hvN class from design.css. #}
+<html lang="en" data-theme="light" data-palette="modernist">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{% block title %}Code Atlas{% endblock %}</title>
-    {% block headscripts %}<script src="/static/theme.js"></script>{% endblock %}
-    {% block stylesheet %}
+    <title>{% block title %}{{ chrome.project_name }} — Code Atlas{% endblock %}</title>
+    <script>
+      // Applied before first paint so a stored theme never flashes the default.
+      // ?theme= / ?palette= override for this view only — a themed link stays
+      // shareable without silently rewriting the reader's own setting.
+      (function () {
+        var q = new URLSearchParams(window.location.search);
+        var t = q.get("theme") || localStorage.getItem("atlas.theme") || "light";
+        var p = q.get("palette") || localStorage.getItem("atlas.palette") || "modernist";
+        if (t === "auto") {
+          t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        }
+        document.documentElement.dataset.theme = t;
+        document.documentElement.dataset.palette = p;
+      })();
+    </script>
     <link rel="stylesheet" href="/static/design.css" />
-    {% endblock %}
   </head>
   <body>
-    <div style="display:flex;flex-direction:column;height:100vh">
+    <div style="display:flex;flex-direction:column;height:100vh;overflow:hidden;font-family:var(--font-body);background:var(--color-bg);color:var(--color-text)">
+
       <header style="flex:none;display:flex;align-items:stretch;gap:18px;padding:0 14px;height:52px;border-bottom:1px solid var(--color-divider)">
         <div style="display:flex;flex:none;align-items:center;white-space:nowrap;font-family:var(--font-heading);font-weight:800;font-size:12px;letter-spacing:0.16em;text-transform:uppercase">Code Atlas</div>
 
         <div style="display:flex;flex:none;align-items:center">
-          {% block projectswitch %}
-          <a href="/projects" class="hover-tint" style="display:flex;align-items:center;gap:9px;background:var(--color-surface);border:1px solid var(--color-divider);border-radius:10px;padding:5px 10px;cursor:pointer;color:inherit;text-align:left;text-decoration:none">
-            <span style="font-family:var(--font-heading);font-weight:800;font-size:14px;white-space:nowrap">{{ project | default('—') }}</span>
-            <span style="font-size:11px;white-space:nowrap;color:color-mix(in srgb, var(--color-text) 58%, transparent)">{% block subtitle %}{% endblock %}</span>
+          <button id="project-chip" class="hv8" style="display:flex;align-items:center;gap:9px;background:var(--color-surface);border:1px solid var(--color-divider);border-radius:10px;padding:5px 10px;cursor:pointer;color:inherit;text-align:left;font:inherit">
+            <span style="font-family:var(--font-heading);font-weight:800;font-size:14px;white-space:nowrap">{{ chrome.project_name }}</span>
+            <span style="font-size:11px;white-space:nowrap;color:color-mix(in srgb, var(--color-text) 58%, transparent)">{{ chrome.project_meta }}</span>
             <span style="font-size:11px;color:color-mix(in srgb, var(--color-text) 45%, transparent)">▾</span>
-          </a>
-          {% endblock %}
+          </button>
         </div>
 
         <nav style="display:flex;flex:none;align-items:stretch;gap:2px;margin-left:8px;white-space:nowrap">
-          {% block nav %}
-          {% set current = active | default('') %}
-          {% for href, key, label in [
-            ('/', 'map', 'Map'),
-            ('/search', 'search', 'Search'),
-            ('/impact', 'impact', 'Impact'),
-            ('/architecture/', 'architecture', 'Architecture')
-          ] %}
-          {# margin-bottom:-1px pulls the marker onto the header's own rule, so an active
-             tab reads as one line rather than two stacked. #}
-          <a href="{{ href }}" class="hover-tint" style="display:flex;align-items:center;gap:6px;padding:0 14px;background:transparent;border:0;border-bottom:2px solid {{ 'var(--color-accent)' if key == current else 'transparent' }};margin-bottom:-1px;cursor:pointer;color:{{ 'var(--color-text)' if key == current else 'color-mix(in srgb, var(--color-text) 62%, transparent)' }};font:inherit;font-size:13.5px;font-weight:{{ 700 if key == current else 500 }};text-decoration:none">
+          {% for key, label, href in [("map", "Map", "/"), ("search", "Search", "/search"), ("impact", "Impact", "/impact"), ("architecture", "Architecture", "/architecture")] %}
+          <a href="{{ href }}" class="hv6" style="display:flex;align-items:center;gap:6px;padding:0 14px;background:transparent;border:0;border-bottom:2px solid {{ 'var(--color-accent)' if active == key else 'transparent' }};margin-bottom:-1px;cursor:pointer;color:{{ 'var(--color-accent-700)' if active == key else 'var(--color-text)' }};font:inherit;font-size:13.5px;font-weight:{{ '600' if active == key else '400' }};text-decoration:none">
             <span>{{ label }}</span>
           </a>
           {% endfor %}
-          {% endblock %}
         </nav>
 
         <div style="display:flex;align-items:center;gap:10px;margin-left:auto;min-width:0;flex:0 1 auto;overflow:hidden">
-          <span style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{% block indexednote %}{% endblock %}</span>
-          {% block settingslink %}
-          <a href="/settings" class="hover-tint" style="display:flex;flex:none;align-items:center;gap:7px;background:transparent;border:1px solid var(--color-divider);border-radius:10px;padding:5px 10px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-decoration:none">Settings</a>
-          {% endblock %}
+          <span style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ chrome.indexed_note }}</span>
+          <a href="/settings" class="hv8" style="display:flex;flex:none;align-items:center;gap:7px;background:{{ 'color-mix(in srgb, var(--color-accent) 10%, transparent)' if active == 'settings' else 'transparent' }};border:1px solid var(--color-divider);border-radius:10px;padding:5px 10px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-decoration:none">Settings</a>
         </div>
       </header>
 
       <div style="flex:1;display:flex;min-height:0">
         {% block sidebar %}{% endblock %}
-        <div style="flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden">
-          {% block content %}{% endblock %}
-        </div>
+        {% block main %}{% endblock %}
+        {% block context %}{% endblock %}
       </div>
+
+      <footer style="flex:none;display:flex;align-items:center;gap:16px;height:34px;padding:0 16px;border-top:1px solid var(--color-divider);font-size:11px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
+        <span style="display:flex;align-items:center;gap:7px"><span style="width:7px;height:7px;border-radius:999px;background:var(--color-accent);display:block"></span>{{ chrome.footer_indexed }}</span>
+        <span style="opacity:0.35">|</span>
+        <span>{{ chrome.coverage_note }}</span>
+        <span style="margin-left:auto">{{ chrome.backend_note }}</span>
+      </footer>
+
+      {# Projects dialog — markup rendered by app.js from /api/projects on first open,
+         so the row template lives in exactly one place. #}
+      <div id="projects-modal" hidden></div>
     </div>
+    <script src="/static/app.js"></script>
     {% block scripts %}{% endblock %}
   </body>
 </html>

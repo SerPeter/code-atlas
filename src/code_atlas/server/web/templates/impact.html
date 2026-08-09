@@ -1,118 +1,68 @@
-{% extends "base.html" %} {% block title %}Impact — code-atlas{% endblock %} {% block content %}
-<h1>Impact</h1>
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Impact — Code Atlas{% endblock %}
+{# The impact page — subject picker in the rail, dependents grouped by distance in the
+   main column, both ported verbatim. Every row's chip carries the WEAKEST evidence
+   anywhere along the path that reached it, computed server-side. #}
 
-<form method="get" action="/impact" class="impact-form">
-  <label>
-    Entity uid
-    <input
-      type="text"
-      name="uid"
-      value="{{ blast.uid if blast else '' }}"
-      placeholder="project:module.name"
-      size="42"
-    />
-  </label>
-  <label>
-    Direction
-    {# Every tag below is written out complete, with the conditional wrapping whole
-       elements rather than sitting inside one. Jinja inside a tag is not parseable as
-       HTML, and a formatter that tries rewrites `direction == option` into
-       `direction="" ="option"` — a silent break. Do not run prettier on this file. #}
-    {% set current = blast.direction if blast else "callers" %}
-    <select name="direction">
-      {% for option in ["callers", "callees", "both"] %}
-        {% if option == current %}
-      <option value="{{ option }}" selected>{{ option }}</option>
-        {% else %}
-      <option value="{{ option }}">{{ option }}</option>
-        {% endif %}
+{% block sidebar %}
+<aside style="width:272px;flex:none;border-right:1px solid var(--color-divider);overflow-y:auto;display:flex;flex-direction:column">
+  <div>
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Subject</div>
+      {% for r in impact.roots %}
+      <a href="{{ r.url }}" class="hv6" style="display:block;width:100%;background:{{ 'color-mix(in srgb, var(--color-accent) 10%, transparent)' if r.on else 'transparent' }};color:{{ 'var(--color-accent-700)' if r.on else 'var(--color-text)' }};border:0;border-radius:8px;padding:5px 8px;cursor:pointer;font:inherit;font-size:12px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-decoration:none">{{ r.label }}</a>
       {% endfor %}
-    </select>
-  </label>
-  <label>
-    Depth
-    <input type="number" name="depth" min="1" max="10" value="{{ blast.max_depth if blast else 3 }}" />
-  </label>
-  <label class="inline">
-    {% if resolved_only %}
-    <input type="checkbox" name="resolved_only" value="true" checked />
+    </section>
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Confidence</div>
+      <a href="{{ impact.confident_url }}" class="hv6" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:6px 4px;cursor:pointer;color:inherit;font:inherit;font-size:13px;text-align:left;text-decoration:none">
+        {{ m.toggle(impact.confident_only) }}
+        <span style="flex:1">Only paths I'm confident about</span>
+      </a>
+      <div style="margin-top:8px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Hides any dependent reached through a guessed or unlooked-up edge. What is hidden is counted, never dropped silently.</div>
+    </section>
+    <section style="padding:13px 14px 18px;font-size:11px;line-height:1.55;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
+      To trace a specific route between two modules, select one on the map and use <strong>Path to…</strong>.
+    </section>
+  </div>
+</aside>
+{% endblock %}
+
+{% block main %}
+<main style="flex:1;min-width:0;overflow-y:auto">
+  <div style="max-width:900px;padding:20px 26px 40px">
+    {% if impact.unavailable %}
+    <div style="max-width:420px;margin-top:40px;background:var(--color-bg);border:1px solid var(--color-divider);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow-md)">
+      <div style="{{ m.label10() }}">Impact unavailable</div>
+      <div style="margin-top:6px;font-size:13px;line-height:1.55">{{ impact.unavailable }}</div>
+    </div>
     {% else %}
-    <input type="checkbox" name="resolved_only" value="true" />
+    <div style="{{ m.label10() }}">What breaks if I change</div>
+    <h3 style="margin:4px 0 6px;word-break:break-word">{{ impact.subject_label }}</h3>
+    <div style="font-size:12.5px;color:color-mix(in srgb, var(--color-text) 62%, transparent);padding-bottom:12px;border-bottom:1px solid var(--color-divider)">{{ impact.total_note }}</div>
+
+    {% for g in impact.groups %}
+    <div style="margin-top:20px">
+      <div style="display:flex;align-items:baseline;gap:10px;padding-bottom:7px;border-bottom:1px solid var(--color-divider)">
+        <div style="font-family:var(--font-heading);font-weight:800;font-size:15px">{{ g.hop_label }}</div>
+        <div style="margin-left:auto;font-size:11.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ g.count_label }}</div>
+      </div>
+      {% for r in g.rows %}
+      <a href="{{ r.url }}" class="hv5" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-bottom:1px solid var(--color-divider);padding:8px 6px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-align:left;text-decoration:none">
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left">{{ r.label }}</span>
+        <span style="flex:none;font-size:10.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ r.rel }}</span>
+        <span style="flex:none;width:180px;text-align:right;font-size:10.5px;color:color-mix(in srgb, var(--color-text) 50%, transparent)">{{ r.path_note }}</span>
+        {{ m.chip(r.ev) }}
+      </a>
+      {% endfor %}
+    </div>
+    {% endfor %}
+
+    <div style="margin-top:20px;padding:10px 12px;border-radius:10px;background:var(--color-surface);font-size:11.5px;line-height:1.55;color:color-mix(in srgb, var(--color-text) 66%, transparent)">
+      The chip on each row carries the weakest evidence anywhere along the path that reached it, not the evidence of its last hop. Dependents reached only through dynamic dispatch do not appear at all — this is a lower bound.
+    </div>
     {% endif %}
-    resolved paths only
-  </label>
-  <label>
-    Path to (optional)
-    <input type="text" name="to" value="{{ to or '' }}" placeholder="second uid" size="32" />
-  </label>
-  <button type="submit">Analyse</button>
-</form>
-
-{% if blast is none %}
-<p class="muted">
-  Enter an entity uid to see what a change to it could reach. Find one via <a href="/search">search</a>.
-</p>
-{% elif not blast.is_found %}
-<p class="caveat"><b>Not found.</b> {{ blast.error }}</p>
-{% else %}
-
-<h2>Blast radius — {{ blast.direction }}</h2>
-
-{# The count is real here: the traversal computes the whole closure and then slices, so unlike a search it genuinely
-knows the total (ATL-111). #}
-<p class="caveat">{{ blast.caveat.note }}</p>
-{% if blast.truncated %}
-<p class="caveat">Showing {{ blast.shown }} of {{ blast.considered }} examined. {{ blast.remedy }}</p>
-{% endif %} {% for group in blast.groups %}
-<h3>{{ group.depth }} hop{{ "s" if group.depth != 1 }} away — {{ group.entities | length }}</h3>
-<table class="impact">
-  <tr>
-    <th>Entity</th>
-    <th>Reached by</th>
-    <th>Evidence</th>
-    <th>File</th>
-  </tr>
-  {% for entity in group.entities %}
-  <tr>
-    <td><a href="/entity/{{ entity.uid }}">{{ entity.qualified_name or entity.name }}</a></td>
-    {# `via` is the whole point: a REFERENCES dependent must never read as a caller (ADR-0029). #}
-    <td>
-      {% for edge in entity.via %}<code class="via">{{ edge }}</code>{% endfor %} {% if not entity.is_call %}
-      <span class="muted">not a call</span>{% endif %}
-    </td>
-    <td>
-      {% if entity.ambiguous_only %}<span class="guess" title="No fully-resolved path reaches this">guessed path</span>
-      {% else %}<span class="muted">resolved</span>{% endif %} {% if entity.test_only %}
-      <span class="muted">test-only</span>{% endif %}
-    </td>
-    <td class="muted">{{ entity.file_path }}</td>
-  </tr>
-  {% endfor %}
-</table>
-{% else %}
-<p class="muted">Nothing reaches this entity within depth {{ blast.max_depth }}.</p>
-{% endfor %} {% endif %} {% if trace %}
-<h2>Path</h2>
-{% if trace.error %}
-<p class="caveat">{{ trace.error }}</p>
-{% elif not trace.found %}
-<p class="muted">{{ trace.message }}</p>
-{% else %}
-<p class="muted">
-  {{ trace.hop_count }} hop{{ "s" if trace.hop_count != 1 }}{% if trace.path_weight is not none %}, path weight {{
-  trace.path_weight }}{% endif %}. {% if trace.has_guessed_hop %}
-  <b>One or more hops is a guess</b> — the path is only as trustworthy as its weakest hop. {% endif %}
-</p>
-<ol class="hops">
-  {% for hop in trace.hops %}
-  <li>
-    <code>{{ hop.from_name }}</code> <code class="via">{{ hop.edge_type }}</code> <code>{{ hop.to_name }}</code> {% if
-    hop.at_line %}<span class="muted">line {{ hop.at_line }}</span>{% endif %} {% if hop.is_guess %}<span class="guess"
-      >{{ hop.confidence }}</span
-    >{% elif hop.strategy %}<span class="muted">{{ hop.strategy }}</span>{% elif hop.is_structural %}<span class="muted"
-      >structural</span
-    >{% endif %} {% if hop.from_test %}<span class="muted">from test</span>{% endif %}
-  </li>
-  {% endfor %}
-</ol>
-{% endif %} {% endif %} {% endblock %}
+  </div>
+</main>
+{% endblock %}

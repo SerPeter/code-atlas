@@ -1,3 +1,129 @@
-{% extends "base.html" %} {% block title %}Architecture — code-atlas{% endblock %} {% block subtitle %}{{ health.project
-}}{% endblock %}
-{% block content %}{% include "_architecture_section.html" %}{% endblock %}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Architecture — Code Atlas{% endblock %}
+{# The architecture page — metric cards, the design structure matrix, the cycle
+   inventory read off the matrix, and the trend table, all ported verbatim. The
+   matrix rows and the label column share one flex pitch (`align-items:stretch` +
+   `min-height:0`), which is what keeps labels and rows aligned at any height. #}
+
+{% block sidebar %}
+<aside style="width:272px;flex:none;border-right:1px solid var(--color-divider);overflow-y:auto;display:flex;flex-direction:column">
+  <div>
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Reference points</div>
+      {% for r in arch.references %}
+      <div style="display:flex;align-items:baseline;gap:9px;padding:5px 0;border-bottom:1px solid var(--color-divider);font-size:11.5px;line-height:1.4">
+        <span style="flex:1">{{ r.label }}</span>
+        <span style="font-variant-numeric:tabular-nums;font-weight:600">{{ r.value }}</span>
+      </div>
+      {% endfor %}
+      <div style="margin-top:9px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Published measurements of propagation cost, for scale. They were computed on other languages and other tools; treat them as order-of-magnitude only.</div>
+    </section>
+    <section style="padding:13px 14px 18px;font-size:11px;line-height:1.55;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
+      This view is deliberately not a node-link graph. A force-directed blob looks the same whether the architecture is healthy or rotten, so it cannot answer whether things are getting worse.
+    </section>
+  </div>
+</aside>
+{% endblock %}
+
+{% block main %}
+<main style="flex:1;min-width:0;overflow-y:auto">
+  <div style="padding:20px 26px 44px">
+    <h3 style="margin:0 0 4px">Architecture health</h3>
+    <div style="font-size:12.5px;color:color-mix(in srgb, var(--color-text) 62%, transparent);margin-bottom:18px">Whether the structure is decaying, measured across index runs.</div>
+
+    {% if arch.unavailable %}
+    <div style="max-width:420px;background:var(--color-bg);border:1px solid var(--color-divider);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow-md)">
+      <div style="{{ m.label10() }}">Architecture unavailable</div>
+      <div style="margin-top:6px;font-size:13px;line-height:1.55">{{ arch.unavailable }}</div>
+    </div>
+    {% else %}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;max-width:1100px">
+      {% for c in arch.cards %}
+      <div style="background:var(--color-surface);border-radius:12px;padding:13px 14px">
+        <div style="{{ m.label10() }}">{{ c.label }}</div>
+        <div style="font-family:var(--font-heading);font-weight:800;font-size:28px;line-height:1.1;margin:6px 0 6px;font-variant-numeric:tabular-nums">{{ c.value }}</div>
+        <div style="font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">{{ c.note }}</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div style="display:flex;align-items:baseline;gap:10px;margin:26px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--color-divider)">
+      <div style="font-family:var(--font-heading);font-weight:800;font-size:16px">Design structure matrix</div>
+      <div style="margin-left:auto;font-size:11.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ arch.dsm_caption }}</div>
+    </div>
+
+    <div style="display:flex;gap:10px;align-items:stretch;max-width:1100px">
+      <div style="flex:none;width:190px;min-height:0;display:flex;flex-direction:column">
+        {% for r in arch.dsm_rows %}
+        <div style="flex:1;min-height:0;display:flex;align-items:center;justify-content:flex-end;font-size:9.5px;line-height:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;color:color-mix(in srgb, var(--color-text) 70%, transparent)">{{ r.label }}</div>
+        {% endfor %}
+      </div>
+      <div style="flex:1;min-width:0;aspect-ratio:1;display:flex;flex-direction:column;border:1px solid var(--color-divider)">
+        {% for r in arch.dsm_rows %}
+        <div style="flex:1;display:flex;min-height:0">
+          {% for c in r.cells %}
+          <div{% if c.title %} title="{{ c.title }}"{% endif %} style="flex:1;background:{{ 'var(--color-accent)' if c.mark == 'cycle' else 'color-mix(in srgb, var(--color-text) 62%, transparent)' if c.mark == 'dep' else 'color-mix(in srgb, var(--color-text) 14%, transparent)' if c.mark == 'diag' else 'transparent' }};border-right:1px solid color-mix(in srgb, var(--color-text) 6%, transparent);border-bottom:1px solid color-mix(in srgb, var(--color-text) 6%, transparent)"></div>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div style="display:flex;gap:16px;margin-top:10px;font-size:11px;color:color-mix(in srgb, var(--color-text) 60%, transparent)">
+      <span style="display:flex;align-items:center;gap:6px"><span style="width:10px;height:10px;background:color-mix(in srgb, var(--color-text) 62%, transparent);display:block"></span>dependency, below the diagonal</span>
+      <span style="display:flex;align-items:center;gap:6px"><span style="width:10px;height:10px;background:var(--color-accent);display:block"></span>above the diagonal — closes a cycle</span>
+    </div>
+
+    <div style="display:flex;align-items:baseline;gap:10px;margin:26px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--color-divider)">
+      <div style="font-family:var(--font-heading);font-weight:800;font-size:16px">Cycle inventory</div>
+      <div style="margin-left:auto;font-size:11.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ arch.cycles_caption }}</div>
+    </div>
+    <div style="max-width:1100px">
+      {% for c in arch.cycles %}
+      <div style="display:flex;align-items:baseline;gap:12px;padding:10px 4px;border-bottom:1px solid var(--color-divider)">
+        <div style="flex:1;min-width:0">
+          <div style="font-family:var(--font-heading);font-weight:800;font-size:13.5px">{{ c.members }}</div>
+          <div style="margin-top:4px;font-size:12px;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Cut either edge: {{ c.closing }}</div>
+          <div style="font-size:12px;color:color-mix(in srgb, var(--color-text) 70%, transparent)">{{ c.closing2 }}</div>
+          <div style="margin-top:3px;font-size:11.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 58%, transparent)">{{ c.note }}</div>
+        </div>
+        {{ m.chip(c.ev) }}
+      </div>
+      {% else %}
+      <div style="padding:10px 4px;font-size:12.5px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">No dependency cycles among the modules shown.</div>
+      {% endfor %}
+    </div>
+
+    <div style="display:flex;align-items:baseline;gap:10px;margin:26px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--color-divider)">
+      <div style="font-family:var(--font-heading);font-weight:800;font-size:16px">Across index runs</div>
+      <div style="margin-left:auto;font-size:11.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">direction is reported as unclear when the index itself changed size</div>
+    </div>
+    {% if arch.trend_rows %}
+    <table class="table" style="max-width:1100px">
+      <thead>
+        <tr><th>Indexed</th><th>Commit</th><th>Coverage</th><th>Propagation</th><th>Largest cycle</th><th>Direction</th></tr>
+      </thead>
+      <tbody>
+        {% for t in arch.trend_rows %}
+        <tr>
+          <td>{{ t.date }}</td>
+          <td style="font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 62%, transparent)">{{ t.commit }}</td>
+          <td style="font-variant-numeric:tabular-nums">{{ t.modules }}</td>
+          <td style="font-variant-numeric:tabular-nums">{{ t.propagation }}</td>
+          <td style="font-variant-numeric:tabular-nums">{{ t.largest_cycle }}</td>
+          <td style="color:{{ 'var(--color-accent-700)' if t.accented else 'color-mix(in srgb, var(--color-text) 45%, transparent)' if t.direction == '—' else 'var(--color-text)' }}">{{ t.direction }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div style="font-size:12.5px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">One recorded run is not a trend. The table appears after the next index run.</div>
+    {% endif %}
+    <div style="margin-top:12px;max-width:760px;padding:10px 12px;border-radius:10px;background:var(--color-surface);font-size:11.5px;line-height:1.55;color:color-mix(in srgb, var(--color-text) 66%, transparent)">
+      A metric that moved because extraction improved is not a codebase that decayed. Where coverage shifted by more than a tenth between runs, the direction is left unclear rather than reported as better or worse.
+    </div>
+    {% endif %}
+  </div>
+</main>
+{% endblock %}

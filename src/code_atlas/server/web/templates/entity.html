@@ -1,21 +1,101 @@
 {% extends "base.html" %}
-{% from "_related.html" import related_table %}
-{% block title %}{{ detail.name }} — code-atlas{% endblock %}
-{% block subtitle %}{{ detail.file_path }}{% endblock %}
-{% block content %}
-  <h1>{{ detail.name }} <span class="muted">{{ detail.kind }}</span></h1>
-  <p class="muted">{{ detail.qualified_name }}</p>
-  {% if detail.signature %}<pre>{{ detail.signature }}</pre>{% endif %}
-  {% if detail.docstring %}<p>{{ detail.docstring }}</p>{% endif %}
+{% import "_macros.html" as m %}
+{% block title %}{{ detail.short_name }} — Code Atlas{% endblock %}
+{# The entity page — identity rail, full signature block, docstring, and the two
+   neighbour columns with relationship + evidence on every row, ported verbatim.
+   A dependent found by inheritance must not read like a caller, which is why the
+   relationship label travels with the chip. #}
 
-  <p class="muted">
-    {{ detail.file_path }}{% if detail.line_start %}:{{ detail.line_start }}{% endif %}
-    {%- if detail.parent %} · in <a href="/entity/{{ detail.parent.uid }}">{{ detail.parent.name }}</a>{% endif %}
-  </p>
+{% block sidebar %}
+<aside style="width:272px;flex:none;border-right:1px solid var(--color-divider);overflow-y:auto;display:flex;flex-direction:column">
+  <div>
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <a href="/" style="background:transparent;border:0;border-radius:8px;padding:2px 0;cursor:pointer;color:var(--color-accent);font:inherit;font-size:12.5px;text-decoration:none">← Back to map</a>
+      <div style="margin-top:10px;{{ m.label10() }}">Entity</div>
+      <div style="margin-top:4px;font-family:var(--font-heading);font-weight:800;font-size:15px;line-height:1.25;word-break:break-word">{{ detail.short_name }}</div>
+      <div style="margin-top:5px;font-size:11.5px;color:color-mix(in srgb, var(--color-text) 60%, transparent)">{{ detail.kind }} · {{ detail.lines }}</div>
+    </section>
 
-  {# An edge that is a guess must look different from one that is a fact — that
-     distinction is the thing this project has that competitors do not. #}
-  {{ related_table("Callers", detail.callers, "Nothing calls this — or nothing the resolver could pin down.") }}
-  {{ related_table("Calls", detail.callees, "No outgoing calls recorded.") }}
-  {{ related_table("Documentation", detail.docs, "No linked notes or docs.") }}
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Evidence of its callers</div>
+      {% for e in detail.evidence_mix %}
+      <div style="display:flex;align-items:center;gap:9px;padding:4px 0;font-size:12px">
+        {{ m.chip(e.ev) }}
+        <span style="margin-left:auto;font-variant-numeric:tabular-nums;color:color-mix(in srgb, var(--color-text) 60%, transparent)">{{ e.n }}</span>
+      </div>
+      {% endfor %}
+    </section>
+
+    <section style="padding:13px 14px 18px">
+      <div style="{{ m.label10() }};margin-bottom:8px">Location</div>
+      <div style="font-size:12px;line-height:1.6;color:color-mix(in srgb, var(--color-text) 70%, transparent);word-break:break-all">{{ detail.file }}</div>
+      <button class="btn btn-secondary" style="margin-top:10px;height:28px;font-size:12px" disabled title="Open this file in your editor — not wired to an editor yet">Open in editor</button>
+    </section>
+  </div>
+</aside>
+{% endblock %}
+
+{% block main %}
+<main style="flex:1;min-width:0;overflow-y:auto">
+  <div style="padding:22px 26px 44px">
+    <div style="max-width:760px">
+      <div style="display:flex;align-items:baseline;gap:9px;margin-bottom:6px">
+        <span class="tag tag-neutral" style="font-size:10px">{{ detail.kind }}</span>
+        <span style="font-size:11.5px;color:color-mix(in srgb, var(--color-text) 58%, transparent)">{{ detail.file_lines }}</span>
+      </div>
+      <h3 style="margin:0 0 6px;line-height:1.15;word-break:break-word">{{ detail.name }}</h3>
+      {% if detail.parent_line %}
+      <div style="font-size:12px;color:color-mix(in srgb, var(--color-text) 60%, transparent);margin-bottom:16px">{{ detail.parent_line }}</div>
+      {% endif %}
+      {% if detail.signature %}
+      <div style="padding:12px 14px;border-radius:10px;background:var(--color-surface);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.65;white-space:pre-wrap;word-break:break-word">{{ detail.signature }}</div>
+      {% endif %}
+      <div style="margin-top:18px;max-width:68ch;font-size:14px;line-height:1.65;text-wrap:pretty">
+        {% for p in detail.paragraphs %}
+        <p style="margin:0 0 12px">{{ p }}</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:22px;margin-top:26px;max-width:1100px">
+      <div>
+        <div style="display:flex;align-items:baseline;padding-bottom:7px;border-bottom:1px solid var(--color-divider)">
+          <div style="{{ m.label10() }}">Reached by</div>
+          <div style="margin-left:auto;font-size:11px;color:color-mix(in srgb, var(--color-text) 50%, transparent)">{{ detail.callers_count_note }}</div>
+        </div>
+        {% for r in detail.callers %}
+        <a href="/entity/{{ r.uid }}" class="hv5" style="display:flex;align-items:center;gap:9px;width:100%;background:transparent;border:0;border-bottom:1px solid var(--color-divider);padding:7px 4px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-align:left;text-decoration:none">
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left">{{ r.label }}</span>
+          <span style="flex:none;font-size:10.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ r.rel }}</span>
+          {{ m.chip(r.ev) }}
+        </a>
+        {% endfor %}
+        <div style="margin-top:9px;font-size:11.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">{{ detail.caller_note }}</div>
+      </div>
+
+      <div>
+        <div style="display:flex;align-items:baseline;padding-bottom:7px;border-bottom:1px solid var(--color-divider)">
+          <div style="{{ m.label10() }}">Reaches</div>
+          <div style="margin-left:auto;font-size:11px;color:color-mix(in srgb, var(--color-text) 50%, transparent)">{{ detail.callees_count_note }}</div>
+        </div>
+        {% for r in detail.callees %}
+        <a href="/entity/{{ r.uid }}" class="hv5" style="display:flex;align-items:center;gap:9px;width:100%;background:transparent;border:0;border-bottom:1px solid var(--color-divider);padding:7px 4px;cursor:pointer;color:inherit;font:inherit;font-size:12.5px;text-align:left;text-decoration:none">
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left">{{ r.label }}</span>
+          <span style="flex:none;font-size:10.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ r.rel }}</span>
+          {{ m.chip(r.ev) }}
+        </a>
+        {% endfor %}
+        {% if detail.docs %}
+        <div style="margin-top:14px;{{ m.label10() }}">Documentation</div>
+        {% for d in detail.docs %}
+        <div style="display:flex;align-items:center;gap:9px;padding:6px 4px;border-bottom:1px solid var(--color-divider);font-size:12.5px">
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ d.label }}</span>
+          <span style="font-size:10.5px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">{{ d.rel }}</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</main>
 {% endblock %}

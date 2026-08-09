@@ -1,0 +1,25 @@
+{# The design's repeated atoms, one definition each.
+   `chip` is the four-state evidence chip used identically everywhere; `toggle` is the
+   32×18 sliding switch; `label10` is the 10px uppercase section label style. #}
+
+{% macro chip(ev) -%}
+{%- if ev == "structural" -%}
+<span style="flex:none;font-size:9.5px;letter-spacing:0.06em;border-radius:999px;padding:2px 7px;background:var(--color-neutral-300);color:var(--color-neutral-900);border:1px solid transparent">STRUCTURAL</span>
+{%- elif ev == "resolved" -%}
+<span style="flex:none;font-size:9.5px;letter-spacing:0.06em;border-radius:999px;padding:2px 7px;background:var(--color-neutral-200);color:var(--color-neutral-800);border:1px solid transparent">RESOLVED</span>
+{%- elif ev == "guessed" -%}
+<span style="flex:none;font-size:9.5px;letter-spacing:0.06em;border-radius:999px;padding:2px 7px;background:var(--color-accent-100);color:var(--color-accent-800);border:1px solid var(--color-accent)">GUESSED</span>
+{%- else -%}
+<span style="flex:none;font-size:9.5px;letter-spacing:0.06em;border-radius:999px;padding:2px 7px;background:transparent;color:color-mix(in srgb, var(--color-text) 50%, transparent);border:1px dashed var(--color-divider)">UNKNOWN</span>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro toggle(on) -%}
+<span style="width:32px;height:18px;flex:none;border-radius:999px;background:{{ 'var(--color-accent)' if on else 'transparent' }};border:1px solid {{ 'var(--color-accent)' if on else 'var(--color-divider)' }};position:relative;display:block;transition:background 120ms">
+  <span style="position:absolute;top:2px;left:{{ '16px' if on else '2px' }};width:12px;height:12px;border-radius:999px;background:{{ 'var(--color-bg)' if on else 'color-mix(in srgb, var(--color-text) 45%, transparent)' }};display:block;transition:left 120ms"></span>
+</span>
+{%- endmacro %}
+
+{% macro label10() -%}
+font-size:10px;letter-spacing:0.12em;text-transform:uppercase;color:color-mix(in srgb, var(--color-text) 50%, transparent)
+{%- endmacro %}

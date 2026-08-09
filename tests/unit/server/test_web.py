@@ -556,13 +556,36 @@ class TestArchitectureView:
 
 
 class TestArchitectureEndpoint:
-    def test_the_page_renders_the_matrix(self):
+    @staticmethod
+    def _patch_graph(monkeypatch, *, imports: list[tuple[str, str]]) -> None:
+        """The page reads the same CALLS+IMPORTS graph as the map; the API keeps the
+        import-only contract, so only the page tests patch this."""
+        from code_atlas.server.analysis import ModuleGraph
+
+        names = sorted({n for e in imports for n in e})
+        module_graph = ModuleGraph(
+            modules={n: {"uid": f"u:{n}", "name": n, "qn": n, "file_path": f"src/{n}.py"} for n in names},
+            edges={(min(e), max(e)): 1.0 for e in imports},
+            directed=dict.fromkeys(imports, 1.0),
+            partition=[names],
+            evidence=dict.fromkeys(imports, "structural"),
+        )
+
+        async def _fake(graph, project, path, *, test_patterns=()):
+            return module_graph
+
+        monkeypatch.setattr("code_atlas.server.analysis.build_module_graph", _fake)
+
+    def test_the_page_renders_the_matrix(self, monkeypatch):
+        self._patch_graph(monkeypatch, imports=[("app", "service"), ("service", "repo")])
+
         with _client(FakeGraph(), "demo") as client:
             response = client.get("/architecture/")
 
         assert response.status_code == 200
-        assert "repo" in response.text
-        assert "50.0%" in response.text
+        assert "repo.py" in response.text
+        assert "Design structure matrix" in response.text
+        assert "Propagation cost" in response.text
 
     def test_the_api_returns_the_same_numbers(self):
         with _client(FakeGraph(), "demo") as client:
@@ -572,16 +595,16 @@ class TestArchitectureEndpoint:
         assert payload["dsm_order"] == ["repo", "service", "app"]
         assert payload["largest_cycle"] == 1
 
-    def test_the_page_names_the_edges_closing_each_cycle(self):
+    def test_the_page_names_the_edges_closing_each_cycle(self, monkeypatch):
         """The drill-down has to reach the page, not just the view model."""
-        graph = FakeGraph(imports=[("billing", "orders"), ("orders", "billing")])
+        self._patch_graph(monkeypatch, imports=[("billing", "orders"), ("orders", "billing")])
 
-        with _client(graph, "demo") as client:
+        with _client(FakeGraph(), "demo") as client:
             body = client.get("/architecture/").text
 
-        assert "billing" in body
-        assert "orders" in body
-        assert "cycle-edges" in body, "the specific edges must render, not only the member list"
+        assert "billing.py" in body
+        assert "orders.py" in body
+        assert "Cut either edge" in body, "the specific edges must render, not only the member list"
 
 
 class TestArchitectureTrend:
@@ -626,14 +649,15 @@ class TestArchitectureTrend:
         assert health.trend is not None
         assert "50" in health.trend.note
 
-    def test_the_trend_renders_on_the_page(self):
+    def test_the_trend_renders_on_the_page(self, monkeypatch):
+        TestArchitectureEndpoint._patch_graph(monkeypatch, imports=[("app", "service")])
         graph = FakeGraph().with_snapshots([0.06, 0.084])
 
         with _client(graph, "demo") as client:
             body = client.get("/architecture/").text
 
-        assert "Trend" in body
-        assert "+2.4%" in body
+        assert "Across index runs" in body
+        assert "worse +2.4 pts" in body
 
 
 class TestHomeIsTheMap:
@@ -643,7 +667,8 @@ class TestHomeIsTheMap:
         with _client(FakeGraph(), "demo") as client:
             body = client.get("/").text
 
-        assert "map-canvas" in body or "Map unavailable" in body, "the front door is the map"
+        assert 'id="map-main"' in body, "the front door is the map island"
+        assert "demo" in body, "the header chip names the project"
 
     def test_a_map_failure_degrades_rather_than_500ing(self):
         """The map became the landing page, so its failure is now the front door.
@@ -652,10 +677,11 @@ class TestHomeIsTheMap:
         the clustering reads looks like. Before this, the homepage returned 500.
         """
         with _client(FakeGraph(), "demo") as client:
-            response = client.get("/")
+            page = client.get("/")
+            payload = client.get("/map/api").json()
 
-        assert response.status_code == 200
-        assert "could not be built" in response.text
+        assert page.status_code == 200
+        assert "could not be built" in payload["unavailable"]
 
     def test_an_unindexed_project_still_says_how_to_fix_it(self):
         """Distinct from a map that failed — the remedy is different."""
@@ -665,12 +691,20 @@ class TestHomeIsTheMap:
         assert response.status_code == 404
         assert "atlas index" in response.text
 
-    def test_the_overview_survives_at_its_own_address(self):
-        with _client(FakeGraph(), "demo") as client:
-            response = client.get("/overview")
+    def test_the_dialog_cookie_switches_the_served_project(self):
+        """The projects dialog writes a cookie; every service scopes to it."""
+        graph = FakeGraph(
+            projects=[
+                {"name": "demo", "entity_count": 42},
+                {"name": "second", "entity_count": 7},
+            ]
+        )
+        with _client(graph, "demo") as client:
+            client.cookies.set("atlas_projects", "second")
+            body = client.get("/").text
 
-        assert response.status_code == 200
-        assert "demo" in response.text
+        assert "second" in body
+        assert "7 entities" in body
 
 
 class TestProjectPicker:
@@ -720,12 +754,15 @@ class TestProjectPicker:
         assert picker.selected == ("mono",)
         assert next(p for p in picker.projects if p.name == "mono").is_current
 
-    def test_the_page_lists_every_project(self):
+    def test_the_api_lists_every_project_with_its_state(self):
+        """The dialog renders from this payload — names, nesting and staleness."""
         with _client(self._multi(), "demo") as client:
-            body = client.get("/projects").text
+            payload = client.get("/api/projects").json()
 
-        for name in ("demo", "core", "pipeline"):
-            assert name in body
+        roots = {p["name"]: p for p in payload["projects"]}
+        assert set(roots) == {"demo", "mono"}
+        assert {c["name"] for c in roots["mono"]["children"]} == {"mono/core", "mono/pipeline"}
+        assert all("state" in p and "indexed_ago" in p for p in payload["projects"])
 
 
 def _picker(graph: FakeGraph, project: str = "demo"):

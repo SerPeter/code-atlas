@@ -5,9 +5,10 @@ here is a thin translation between a request and a service call; if a handler st
 making decisions about *what* to show rather than *how* to return it, that logic
 belongs in :mod:`code_atlas.server.web.services`.
 
-Handlers return view models (``msgspec.Struct``) for JSON routes and
-``Template`` for HTML ones. The JSON routes exist because the graph canvas is a
-client-side island fed by fetch — that is the one part of this UI HTMX cannot express.
+Handlers return view models (``msgspec.Struct``) for JSON routes and ``Template`` for
+HTML ones. The JSON routes exist because the map view is a client-side island fed by
+fetch — the design implements that screen as one component whose rail, canvas and
+context panel all react to the same state, and the port keeps that shape.
 """
 
 from __future__ import annotations
@@ -22,14 +23,12 @@ from litestar.response import Template
 # oversight. Litestar resolves dependency injection and response types by reading a
 # handler's type hints at registration time, so with `from __future__ import
 # annotations` every hint is a string it must evaluate — and a name that only exists
-# under TYPE_CHECKING raises `NameError: name 'ProjectViewService' is not defined`
-# before the app finishes constructing. Any type appearing in a handler signature has to
-# be importable for real.
+# under TYPE_CHECKING raises `NameError` before the app finishes constructing.
 from code_atlas.server.web.schemas import (  # noqa: TC001
     ArchitectureHealth,
     BlastRadiusView,
     EntityDetail,
-    ModuleMap,
+    MapPayload,
     ProjectOverview,
     ProjectPicker,
     SearchPage,
@@ -37,6 +36,7 @@ from code_atlas.server.web.schemas import (  # noqa: TC001
 )
 from code_atlas.server.web.services import (
     ArchitectureViewService,
+    ChromeService,
     EntityNotFoundError,
     ImpactViewService,
     MapViewService,
@@ -53,160 +53,62 @@ class ProjectController(Controller):
     path = "/"
 
     @get("/", name="index")
-    async def index(  # every argument is one control in the rail
+    async def index(
         self,
         view_service: NamedDependency[ProjectViewService],
-        map_service: NamedDependency[MapViewService],
-        show_tests: FromQuery[bool] = False,
-        show_noncode: FromQuery[bool] = False,
-        level: FromQuery[str] = "module",
-        # NOT `scope`: Litestar reserves that name and injects its ASGI ScopeState,
-        # which then travelled into a Cypher parameter and failed inside the driver.
-        module: FromQuery[str] = "",
-        expand: FromQuery[bool] = False,
-        direction: FromQuery[str] = "arrows",
-        hops: FromQuery[int] = 1,
-        labels: FromQuery[str] = "some",
-        focus: FromQuery[int] = -1,
+        chrome_service: NamedDependency[ChromeService],
     ) -> Template:
         """Landing page — the map, already open.
 
-        Not a dashboard: someone opening this wants to see their codebase, and a page of
-        counts is a step in the way of that. The overview still exists at /overview.
+        Someone opening this wants to see their codebase, and a page of counts is a
+        step in the way of that. The map's own state (level, filters, display
+        settings) lives in the query string, read client-side by the island.
         """
+        chrome = await chrome_service.chrome()
         try:
             # Only to prove the project is indexed. A map of nothing and a project that
             # was never indexed look identical, and the fix for the second is different.
             await view_service.overview()
         except ProjectNotIndexedError as exc:
-            return Template("not_indexed.html", context={"project": exc.project}, status_code=404)
-
-        return await _render_map(
-            map_service,
-            level=level,
-            scope=module,
-            expand=expand,
-            show_tests=show_tests,
-            show_noncode=show_noncode,
-            direction=direction,
-            hops=hops,
-            labels=labels,
-            focus=focus,
-        )
-
-    @get("/overview", name="overview")
-    async def overview(self, view_service: NamedDependency[ProjectViewService]) -> Template:
-        """The counts, for when that is the question."""
-        try:
-            overview = await view_service.overview()
-        except ProjectNotIndexedError as exc:
-            # A project with no graph data is not an empty project. Saying "run atlas
-            # index" is the whole difference between the two (ATL-110).
-            return Template("not_indexed.html", context={"project": exc.project}, status_code=404)
-        return Template(
-            "index.html",
-            context={"overview": overview, "project": overview.project, "active": "overview"},
-        )
+            return Template(
+                "not_indexed.html",
+                context={"project": exc.project, "chrome": chrome, "active": "map"},
+                status_code=404,
+            )
+        return Template("map.html", context={"chrome": chrome, "active": "map"})
 
     @get("/settings", name="settings")
     async def settings(
         self,
-        palette: FromQuery[str] = "modernist",
-        theme: FromQuery[str] = "light",
+        view_service: NamedDependency[ProjectViewService],
+        chrome_service: NamedDependency[ChromeService],
     ) -> Template:
-        """Appearance. Two axes, both applied on the root element."""
+        """Appearance, map defaults, and what the index last did."""
+        chrome = await chrome_service.chrome()
+        try:
+            overview = await view_service.overview()
+        except ProjectNotIndexedError:
+            overview = None
         return Template(
             "settings.html",
-            context={
-                "palette": palette if palette in {"modernist", "cyber"} else "modernist",
-                "theme": theme if theme in {"light", "dark", "auto"} else "light",
-                "active": "settings",
-            },
+            context={"chrome": chrome, "active": "settings", "overview": overview},
         )
-
-    @get("/projects", name="projects")
-    async def projects(
-        self,
-        picker_service: NamedDependency[ProjectPickerService],
-        project: FromQuery[list[str]] | None = None,
-    ) -> Template:
-        """The project picker — multi-select, with monorepo children nested."""
-        picker = await picker_service.picker(tuple(project or ()))
-        return Template("projects.html", context={"picker": picker, "project": picker.selected[0]})
 
     @get("/api/projects", name="api_projects")
     async def api_projects(
         self,
         picker_service: NamedDependency[ProjectPickerService],
-        project: FromQuery[list[str]] | None = None,
+        selected_projects: NamedDependency[tuple[str, ...]],
     ) -> ProjectPicker:
-        return await picker_service.picker(tuple(project or ()))
+        """What the projects dialog renders."""
+        return await picker_service.picker(selected_projects)
 
     @get("/api/overview", name="api_overview")
     async def api_overview(self, view_service: NamedDependency[ProjectViewService]) -> ProjectOverview:
-        """The same view model as JSON, for the client-side canvas."""
         try:
             return await view_service.overview()
         except ProjectNotIndexedError as exc:
             raise NotFoundException(detail=f"Project {exc.project!r} has no index. Run 'atlas index'.") from exc
-
-
-async def _render_map(  # each argument is one control in the rail
-    map_service: MapViewService,
-    *,
-    level: str,
-    scope: str,
-    expand: bool,
-    show_tests: bool,
-    show_noncode: bool,
-    direction: str,
-    hops: int,
-    labels: str,
-    focus: int,
-) -> Template:
-    """Render whichever level was asked for, with the display settings echoed back.
-
-    Display settings ride in the query string rather than in a session: the page is
-    server-rendered, so a setting is a different URL — which also makes any view
-    shareable by pasting the address.
-    """
-    if level == "entity":
-        target = scope or await _default_scope(map_service)
-        module_map = await map_service.entity_map(target, expand_methods=expand)
-    else:
-        module_map = await map_service.map(show_tests=show_tests, show_noncode=show_noncode)
-
-    return Template(
-        "map.html",
-        context={
-            "map": module_map,
-            "project": module_map.project,
-            "active": "map",
-            "level": module_map.level,
-            "show_tests": show_tests,
-            "show_noncode": show_noncode,
-            "direction": direction if direction in {"arrows", "plain", "curved"} else "arrows",
-            "hops": hops if hops in {1, 2, 3} else 1,
-            "labels": labels if labels in {"few", "some", "all"} else "some",
-            "focus": focus,
-        },
-    )
-
-
-async def _default_scope(map_service: MapViewService) -> str:
-    """The first module to show when the entity level is opened without one."""
-    options = await map_service._scope_options()  # noqa: SLF001  # same package, one caller
-    if not options:
-        return ""
-    # Largest *production* module. The largest overall is a test file, which is a poor
-    # first thing to show someone opening the entity level.
-    production = [o for o in options if not _looks_like_test(o.id)]
-    return (production or options)[0].id
-
-
-def _looks_like_test(path: str) -> bool:
-    lowered = path.replace("\\", "/").lower()
-    return "/tests/" in f"/{lowered}" or lowered.rsplit("/", 1)[-1].startswith("test_")
 
 
 class HealthController(Controller):
@@ -220,10 +122,7 @@ class HealthController(Controller):
 
 
 class SearchController(Controller):
-    """Search, and the entity a result leads to.
-
-    The way in: without it every other view needs you to already know an entity name.
-    """
+    """Search, and the entity a result leads to."""
 
     path = "/"
 
@@ -231,19 +130,44 @@ class SearchController(Controller):
     async def search(
         self,
         search_service: NamedDependency[SearchViewService],
+        view_service: NamedDependency[ProjectViewService],
+        chrome_service: NamedDependency[ChromeService],
         q: FromQuery[str] = "",
+        channel: FromQuery[list[str]] | None = None,
+        kind: FromQuery[list[str]] | None = None,
         limit: FromQuery[int] = 20,
     ) -> Template:
-        page = await search_service.search(q, limit=min(max(limit, 1), 100))
-        return Template("search.html", context={"page": page})
+        chrome = await chrome_service.chrome()
+        try:
+            entities = (await view_service.overview()).entity_count
+        except ProjectNotIndexedError:
+            entities = 0
+        page = await search_service.search_view(
+            q,
+            channels=tuple(channel or ("graph", "keyword", "semantic")),
+            kinds=tuple(kind or ()),
+            limit=min(max(limit, 1), 100),
+            entities=entities,
+        )
+        return Template("search.html", context={"page": page, "chrome": chrome, "active": "search"})
 
     @get("/entity/{uid:path}", name="entity")
-    async def entity(self, search_service: NamedDependency[SearchViewService], uid: FromPath[str]) -> Template:
+    async def entity(
+        self,
+        search_service: NamedDependency[SearchViewService],
+        chrome_service: NamedDependency[ChromeService],
+        uid: FromPath[str],
+    ) -> Template:
+        chrome = await chrome_service.chrome()
         try:
-            detail = await search_service.detail(uid.lstrip("/"))
+            detail = await search_service.detail_view(uid.lstrip("/"))
         except EntityNotFoundError as exc:
-            return Template("not_found.html", context={"uid": exc.uid}, status_code=404)
-        return Template("entity.html", context={"detail": detail})
+            return Template(
+                "not_found.html",
+                context={"uid": exc.uid, "chrome": chrome, "active": "search"},
+                status_code=404,
+            )
+        return Template("entity.html", context={"detail": detail, "chrome": chrome, "active": "search"})
 
     @get("/api/search", name="api_search")
     async def api_search(
@@ -268,8 +192,19 @@ class ArchitectureController(Controller):
     path = "/architecture"
 
     @get("/", name="architecture")
-    async def architecture(self, architecture_service: NamedDependency[ArchitectureViewService]) -> Template:
-        return Template("architecture.html", context={"health": await architecture_service.health()})
+    async def architecture(
+        self,
+        architecture_service: NamedDependency[ArchitectureViewService],
+        chrome_service: NamedDependency[ChromeService],
+    ) -> Template:
+        return Template(
+            "architecture.html",
+            context={
+                "arch": await architecture_service.view(),
+                "chrome": await chrome_service.chrome(),
+                "active": "architecture",
+            },
+        )
 
     @get("/api", name="api_architecture")
     async def api_architecture(
@@ -279,45 +214,33 @@ class ArchitectureController(Controller):
 
 
 class MapController(Controller):
-    """The community map — modules as nodes, subsystems as clusters."""
+    """The map data — what the client-side island fetches."""
 
     path = "/map"
 
     @get("/", name="map")
-    async def map_page(
-        self,
-        map_service: NamedDependency[MapViewService],
-        show_tests: FromQuery[bool] = False,
-        show_noncode: FromQuery[bool] = False,
-    ) -> Template:
-        """Kept so /map still resolves; the canonical address is now /."""
-        module_map = await map_service.map(show_tests=show_tests, show_noncode=show_noncode)
-        return Template(
-            "map.html",
-            context={
-                "map": module_map,
-                "project": module_map.project,
-                "active": "map",
-                "show_tests": show_tests,
-                "show_noncode": show_noncode,
-            },
-        )
+    async def map_page(self, chrome_service: NamedDependency[ChromeService]) -> Template:
+        """Kept so /map still resolves; the canonical address is /."""
+        return Template("map.html", context={"chrome": await chrome_service.chrome(), "active": "map"})
 
     @get("/api", name="api_map")
     async def api_map(
         self,
         map_service: NamedDependency[MapViewService],
-        external: FromQuery[bool] = True,
+        selected_projects: NamedDependency[tuple[str, ...]],
         level: FromQuery[str] = "module",
         module: FromQuery[str] = "",
         expand: FromQuery[bool] = False,
         show_tests: FromQuery[bool] = False,
         show_noncode: FromQuery[bool] = False,
-    ) -> ModuleMap:
-        """The map as JSON — this is what the canvas fetches and renders."""
+    ) -> MapPayload:
+        """Whichever level was asked for, in the shape map.js renders."""
         if level == "entity":
-            return await map_service.entity_map(module, expand_methods=expand)
-        return await map_service.map(include_external=external, show_tests=show_tests, show_noncode=show_noncode)
+            payload = await map_service.entity_map(module or "", expand_methods=expand)
+            if module or not payload.default_scope:
+                return payload
+            return await map_service.entity_map(payload.default_scope, expand_methods=expand)
+        return await map_service.map(show_tests=show_tests, show_noncode=show_noncode, projects=selected_projects)
 
 
 class ImpactController(Controller):
@@ -329,24 +252,14 @@ class ImpactController(Controller):
     async def impact(
         self,
         impact_service: NamedDependency[ImpactViewService],
-        uid: FromQuery[str] = "",
-        direction: FromQuery[str] = "callers",
-        depth: FromQuery[int] = 3,
-        resolved_only: FromQuery[bool] = False,
-        to: FromQuery[str] = "",
+        chrome_service: NamedDependency[ChromeService],
+        subject: FromQuery[str] = "",
+        confident: FromQuery[bool] = False,
     ) -> Template:
-        """One page for both questions — a path is the natural follow-up to an impact list."""
-        if not uid:
-            return Template("impact.html", context={"blast": None, "trace": None})
-
-        safe_direction, safe_depth = _impact_params(direction, depth)
-        blast = await impact_service.blast(
-            uid, direction=safe_direction, max_depth=safe_depth, resolved_only=resolved_only
-        )
-        trace = await impact_service.trace(uid, to) if to else None
+        view = await impact_service.module_impact(subject, confident_only=confident)
         return Template(
             "impact.html",
-            context={"blast": blast, "trace": trace, "resolved_only": resolved_only, "to": to},
+            context={"impact": view, "chrome": await chrome_service.chrome(), "active": "impact"},
         )
 
     @get("/api/blast", name="api_blast")

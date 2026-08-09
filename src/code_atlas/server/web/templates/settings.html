@@ -1,53 +1,127 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m %}
 {% block title %}Settings — Code Atlas{% endblock %}
-{% block subtitle %}appearance{% endblock %}
+{# The settings page — theme palette cards, ground seg, map defaults, index info,
+   ported verbatim. No sidebar: the design gives settings the full width. Theme and
+   map defaults live in this browser's localStorage; the inline script below applies
+   choices immediately, exactly as the design's own logic does. #}
 
-{# Two axes rather than one list of four: the palette is a look, the theme is a ground,
-   and every combination is valid. Collapsing them would hide half the options. #}
-{% block content %}
-<div class="prose settings-view">
-  <h1>Appearance</h1>
+{% block main %}
+<main style="flex:1;min-width:0;overflow-y:auto">
+  <div style="max-width:640px;padding:24px 28px 40px">
+    <h3 style="margin:0 0 4px">Settings</h3>
+    <div style="font-size:12.5px;color:color-mix(in srgb, var(--color-text) 60%, transparent);margin-bottom:22px">Local to this machine. Nothing here leaves it.</div>
 
-  <section class="settings-group">
-    <h2>Theme</h2>
-    <p class="text-muted">The visual language. Cyber adds a ruled grid under the graph,
-      glow on nodes and headings, and a slow scan sweep that stops for reduced-motion.</p>
-    <div class="swatch-row">
-      {% for value, label in [('modernist', 'Modernist'), ('cyber', 'Cyber')] %}
-      <a class="swatch-card{% if palette == value %} is-on{% endif %}"
-         href="/settings?palette={{ value }}&theme={{ theme }}"
-         data-palette="{{ value }}" data-theme="{{ theme }}">
-        <span class="swatch-preview">
-          <span class="swatch-chip" style="background: var(--color-accent)"></span>
-          <span class="swatch-chip" style="background: var(--atlas-c3)"></span>
-          <span class="swatch-chip" style="background: var(--atlas-c5)"></span>
-        </span>
-        <span class="swatch-name">{{ label }}</span>
-      </a>
-      {% endfor %}
+    <div style="background:var(--color-surface);border-radius:12px;padding:16px 16px 18px;margin-bottom:16px">
+      <div style="{{ m.label10() }};margin-bottom:10px">Theme</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-bottom:16px">
+        {% for id, name, note, chips in [
+          ("modernist", "Modernist", "Ink on ground, one red accent.", ["#f3f2f2", "#201e1d", "#ec3013"]),
+          ("cyber", "Cyber", "Cold ground, cyan ink, magenta accent. Ruled grid and glow on the map.", ["#07090d", "#4de3f0", "#ff2fbf"]),
+        ] %}
+        <button data-palette-pick="{{ id }}" class="hv6" style="display:flex;align-items:center;gap:11px;background:transparent;border:1px solid var(--color-divider);border-radius:10px;padding:9px 11px;cursor:pointer;color:inherit;font:inherit;text-align:left">
+          <span style="display:flex;flex:none">
+            {% for c in chips %}
+            <span style="width:14px;height:22px;background:{{ c }};display:block;border:1px solid color-mix(in srgb, var(--color-text) 15%, transparent);margin-left:-1px"></span>
+            {% endfor %}
+          </span>
+          <span style="flex:1;min-width:0">
+            <span style="display:block;font-family:var(--font-heading);font-weight:800;font-size:13.5px">{{ name }}</span>
+            <span style="display:block;margin-top:2px;font-size:11px;line-height:1.4;color:color-mix(in srgb, var(--color-text) 60%, transparent)">{{ note }}</span>
+          </span>
+        </button>
+        {% endfor %}
+      </div>
+      <div style="{{ m.label10() }};margin-bottom:10px">Ground</div>
+      <div class="seg" style="overflow:hidden">
+        <label class="seg-opt"><input type="radio" name="theme" data-theme-pick="light"><span>Light</span></label>
+        <label class="seg-opt"><input type="radio" name="theme" data-theme-pick="dark"><span>Dark</span></label>
+        <label class="seg-opt"><input type="radio" name="theme" data-theme-pick="auto"><span>Follow OS</span></label>
+      </div>
+      <div id="theme-note" style="margin-top:10px;font-size:11.5px;color:color-mix(in srgb, var(--color-text) 60%, transparent)"></div>
     </div>
-  </section>
 
-  <section class="settings-group">
-    <h2>Ground</h2>
-    <div class="seg">
-      {% for value, label in [('light', 'Light'), ('dark', 'Dark'), ('auto', 'Follow OS')] %}
-      <a class="seg-opt{% if theme == value %} is-on{% endif %}"
-         href="/settings?palette={{ palette }}&theme={{ value }}">{{ label }}</a>
-      {% endfor %}
+    <div style="background:var(--color-surface);border-radius:12px;padding:16px;margin-bottom:16px">
+      <div style="{{ m.label10() }};margin-bottom:10px">Map defaults</div>
+      <button data-default-pick="showTests" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:7px 4px;cursor:pointer;color:inherit;font:inherit;font-size:13px;text-align:left">
+        <span data-toggle-slot="showTests"></span>
+        <span style="flex:1">Show test modules on the map</span>
+      </button>
+      <button data-default-pick="showNoncode" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:7px 4px;cursor:pointer;color:inherit;font:inherit;font-size:13px;text-align:left">
+        <span data-toggle-slot="showNoncode"></span>
+        <span style="flex:1">Show non-code files on the map</span>
+      </button>
     </div>
-    <p class="text-muted">
-      {% if theme == 'auto' %}Following the OS setting via prefers-color-scheme.
-      {% else %}Overriding the OS setting for this machine.{% endif %}
-    </p>
-  </section>
 
-  <p class="text-muted">
-    Stored in this browser only — the server keeps no preferences, and there is no account to keep them on.
-  </p>
-</div>
+    <div style="background:var(--color-surface);border-radius:12px;padding:16px">
+      <div style="{{ m.label10() }};margin-bottom:10px">Index</div>
+      <div style="display:flex;gap:24px;font-size:13px;line-height:1.7">
+        <div>
+          <div style="color:color-mix(in srgb, var(--color-text) 55%, transparent);font-size:11.5px">Storage backend</div>
+          <div>{{ chrome.backend_note | replace("Backend ", "") }}</div>
+        </div>
+        <div>
+          <div style="color:color-mix(in srgb, var(--color-text) 55%, transparent);font-size:11.5px">Last run</div>
+          <div>{{ chrome.footer_indexed | replace("Indexed ", "") }}</div>
+        </div>
+      </div>
+      <button class="btn btn-secondary" style="margin-top:12px;height:30px;font-size:12.5px" disabled title="Run `atlas index` from the CLI — the UI does not write to the graph">Re-index now</button>
+    </div>
+  </div>
+</main>
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/theme.js"></script>
+<script>
+  // Settings wiring — applies through window.AtlasTheme (app.js) so the whole page
+  // restyles the moment a choice is made, and paints the current state on load.
+  (function () {
+    "use strict";
+    function toggleHtml(on) {
+      return '<span style="width:32px;height:18px;flex:none;border-radius:999px;background:' +
+        (on ? "var(--color-accent)" : "transparent") + ";border:1px solid " +
+        (on ? "var(--color-accent)" : "var(--color-divider)") +
+        ';position:relative;display:block"><span style="position:absolute;top:2px;left:' +
+        (on ? "16px" : "2px") + ';width:12px;height:12px;border-radius:999px;background:' +
+        (on ? "var(--color-bg)" : "color-mix(in srgb, var(--color-text) 45%, transparent)") +
+        ';display:block"></span></span>';
+    }
+    function paint() {
+      var palette = AtlasTheme.get("palette", "modernist");
+      document.querySelectorAll("[data-palette-pick]").forEach(function (el) {
+        var on = el.dataset.palettePick === palette;
+        el.style.border = on ? "1px solid var(--color-accent)" : "1px solid var(--color-divider)";
+        el.style.background = on ? "color-mix(in srgb, var(--color-accent) 8%, transparent)" : "transparent";
+      });
+      var theme = AtlasTheme.get("theme", "light");
+      document.querySelectorAll("[data-theme-pick]").forEach(function (el) {
+        el.checked = el.dataset.themePick === theme;
+      });
+      document.getElementById("theme-note").textContent = theme === "auto"
+        ? "Following the OS setting via prefers-color-scheme."
+        : "Overriding the OS setting for this machine.";
+      ["showTests", "showNoncode"].forEach(function (key) {
+        var slot = document.querySelector('[data-toggle-slot="' + key + '"]');
+        if (slot) slot.outerHTML = '<span data-toggle-slot="' + key + '">' + toggleHtml(localStorage.getItem("atlas." + key) === "1") + "</span>";
+      });
+    }
+    document.addEventListener("click", function (e) {
+      var p = e.target.closest("[data-palette-pick]");
+      if (p) { AtlasTheme.set("palette", p.dataset.palettePick); paint(); return; }
+      var d = e.target.closest("[data-default-pick]");
+      if (d) {
+        var key = d.dataset.defaultPick;
+        localStorage.setItem("atlas." + key, localStorage.getItem("atlas." + key) === "1" ? "0" : "1");
+        paint();
+      }
+    });
+    document.addEventListener("change", function (e) {
+      if (e.target.dataset && e.target.dataset.themePick) {
+        AtlasTheme.set("theme", e.target.dataset.themePick);
+        paint();
+      }
+    });
+    paint();
+  })();
+</script>
 {% endblock %}

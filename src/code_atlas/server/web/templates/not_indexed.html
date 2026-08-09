@@ -1,9 +1,17 @@
 {% extends "base.html" %}
-{% block title %}Not indexed — code-atlas{% endblock %}
-{% block content %}
-  <h1>No index for “{{ project }}”</h1>
-  <p>
-    This project has no graph data. That is different from an empty project — run
-    <code>atlas index</code> and reload.
-  </p>
+{% import "_macros.html" as m %}
+{% block title %}Not indexed — Code Atlas{% endblock %}
+{# A project with no graph data is not an empty project — the fix for this state is
+   `atlas index`, and saying so is the whole difference between the two (ATL-110). #}
+
+{% block main %}
+<main style="flex:1;min-width:0;position:relative">
+  <div style="position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);width:min(420px,80%);background:var(--color-bg);border:1px solid var(--color-divider);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow-md)">
+    <div style="{{ m.label10() }}">Not indexed</div>
+    <div style="margin-top:6px;font-size:13px;line-height:1.55">
+      <strong>{{ project }}</strong> has no graph data yet. This is not an empty project — the index has simply never run.
+    </div>
+    <div style="margin-top:8px;padding:10px 12px;border-radius:8px;background:var(--color-surface);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px">atlas index /path/to/{{ project }}</div>
+  </div>
+</main>
 {% endblock %}
