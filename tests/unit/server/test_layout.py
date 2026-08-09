@@ -78,6 +78,27 @@ class TestEdgesDrivePosition:
         assert len({(round(x), round(y)) for x, y in positions.values()}) > 1
 
 
+class TestLargeGraphBalance:
+    def test_edge_less_nodes_do_not_form_the_outer_shell(self):
+        """With absolute spring constants, everything unheld drifts to a ring past
+        the connected mass and the normalise step pins it to the border. Scaled
+        gravity must keep the edge-less INSIDE the connected hull, not beyond it."""
+        hub_and_spokes = {("m0", f"m{i}"): 2.0 for i in range(1, 60)}
+        nodes = _grid(60) + [f"lone{i}" for i in range(20)]
+
+        positions = force_layout(nodes, hub_and_spokes)
+
+        def radius(name: str) -> float:
+            x, y = positions[name]
+            return ((x - SPACE / 2) ** 2 + (y - SPACE / 2) ** 2) ** 0.5
+
+        lone_max = max(radius(f"lone{i}") for i in range(20))
+        connected_max = max(radius(f"m{i}") for i in range(60))
+        assert lone_max <= connected_max, (
+            f"edge-less nodes reach radius {lone_max:.0f}, past the connected {connected_max:.0f}"
+        )
+
+
 class TestIterationBudget:
     def test_bigger_graphs_get_fewer_passes(self):
         """Each iteration is O(n²); the budget keeps the level switch instant."""
