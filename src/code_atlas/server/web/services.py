@@ -27,7 +27,7 @@ from loguru import logger
 
 from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES
 from code_atlas.server.web.kinds import KINDS, classify
-from code_atlas.server.web.layout import force_layout
+from code_atlas.server.web.layout import clustered_layout, force_layout
 from code_atlas.server.web.naming import SEPARATOR, breadcrumb
 from code_atlas.server.web.schemas import (
     AffectedEntity,
@@ -1581,6 +1581,11 @@ class MapViewService:
         max_w = max(edges.values(), default=1.0) or 1.0
         scaled = {pair: _scale_weight(w, max_w) for pair, w in edges.items() if pair[0] in kept and pair[1] in kept}
 
+        # Communities feed the layout, not just the colours: every community is a
+        # blob of its own, so the drawing shows subsystems with whitespace between
+        # them instead of one space-filling cloud.
+        entity_comm, entity_communities = await self._entity_communities(entities)
+
         # A full-scope layout is the one expensive computation here — deterministic
         # per graph, so it is cached against the index stamp.
         if len(kept) > 800:
@@ -1597,18 +1602,16 @@ class MapViewService:
             )
             positions = _LAYOUT_CACHE.get(key)
             if positions is None:
-                positions = force_layout(sorted(kept), scaled)
+                positions = clustered_layout(sorted(kept), scaled, entity_comm)
                 while len(_LAYOUT_CACHE) >= _LAYOUT_CACHE_MAX:
                     _LAYOUT_CACHE.pop(next(iter(_LAYOUT_CACHE)))
                 _LAYOUT_CACHE[key] = positions
         else:
-            positions = force_layout(sorted(kept), scaled)
+            positions = clustered_layout(sorted(kept), scaled, entity_comm)
 
         drawn_count: dict[str, int] = {}
         for qn in kept:
             drawn_count[drawn[qn]["kind"]] = drawn_count.get(drawn[qn]["kind"], 0) + 1
-
-        entity_comm, entity_communities = await self._entity_communities(entities)
 
         nodes = tuple(
             MapNode(
