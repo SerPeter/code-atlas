@@ -1352,7 +1352,9 @@ class MapViewService:
         full = not scope
         requested = tuple(hidden) if hidden is not None else (_FULL_SCOPE_HIDDEN if full else ())
         hidden_kinds = tuple(k for k in requested if k not in _UNHIDEABLE_KINDS)
-        limit = node_limit if node_limit is not None else (_ENTITY_FULL_LIMIT if full else _ENTITY_SCOPE_LIMIT)
+        # One cap for every entity view: a directory scope can hold most of the
+        # project, and truncating it harder than the whole project makes no sense.
+        limit = node_limit if node_limit is not None else _ENTITY_FULL_LIMIT
         scope_options = await self._scope_options()
 
         # One fetch for every entity view: the whole graph, filtered by path prefix
