@@ -1363,8 +1363,14 @@ class ASTConsumer(TierConsumer):
             # Anchor invalidation runs every batch, unlike the deferred-resolution
             # cadence above — a docstring-only edit that never clears the embed
             # significance gate should still flag its anchoring notes stale.
+            # Best-effort by design: staleness is freshness metadata, and a timeout
+            # here once killed a full index at close-out, leaving the project marked
+            # "not indexed" over data that had landed completely.
             if changed_uids:
-                await self.graph.invalidate_stale_anchors(changed_uids)
+                try:
+                    await self.graph.invalidate_stale_anchors(changed_uids)
+                except Exception as exc:
+                    logger.warning("Anchor staleness pass failed (continuing): {}", exc)
 
             span.set_attribute("files_count", total_paths)
             span.set_attribute("entities_changed", total_changed)
