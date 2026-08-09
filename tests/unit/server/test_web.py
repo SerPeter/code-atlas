@@ -145,6 +145,50 @@ class FakeGraph:
     async def close(self) -> None: ...
 
 
+@pytest.fixture(autouse=True)
+def _route_architecture_pairs(monkeypatch):
+    """The architecture pipeline reads ``fetch_architecture_pairs`` now; route it
+    through the fake's import edges (all structural), which is exactly the old
+    edge source these tests were written against — their dependency semantics
+    (layers, cycles, hand-worked propagation) carry over unchanged."""
+    from code_atlas.server import analysis
+
+    real = analysis.fetch_architecture_pairs
+
+    async def fake(graph, project, *, include_tests=False, include_guessed=False, test_patterns=()):
+        if isinstance(graph, FakeGraph):
+            # The real pipeline first — tests that patch build_module_graph get it
+            # honoured. A bare FakeGraph cannot serve the module-graph reads and
+            # falls back to its import edges.
+            try:
+                return await real(
+                    graph,
+                    project,
+                    include_tests=include_tests,
+                    include_guessed=include_guessed,
+                    test_patterns=test_patterns,
+                )
+            except Exception:
+                raw = await graph.get_module_import_edges(project, "")
+                pairs = {
+                    (str(r.get("from_mod")), str(r.get("to_mod"))): "structural"
+                    for r in raw.get("direct", [])
+                    if r.get("from_mod") and r.get("to_mod")
+                }
+                return analysis.ArchitecturePairs(
+                    pairs=pairs,
+                    all_pairs=dict(pairs),
+                    module_paths={},
+                    excluded_test_modules=0,
+                    excluded_guessed_pairs=0,
+                )
+        return await real(
+            graph, project, include_tests=include_tests, include_guessed=include_guessed, test_patterns=test_patterns
+        )
+
+    monkeypatch.setattr(analysis, "fetch_architecture_pairs", fake)
+
+
 def _service(graph: FakeGraph, project: str) -> ProjectViewService:
     """A service over *graph* — see :func:`_client` for why the cast is deliberate."""
     return ProjectViewService(cast("GraphBackend", graph), project)
@@ -469,6 +513,68 @@ class TestSearchHonesty:
 
 def _architecture_service(graph: FakeGraph, project: str = "demo") -> ArchitectureViewService:
     return ArchitectureViewService(cast("GraphBackend", graph), project)
+
+
+class TestArchitecturePopulation:
+    """fetch_architecture_pairs states its exclusions instead of hiding them.
+
+    Tests dilute propagation (nothing imports a test, so every test module adds an
+    unreachable target to every denominator) and one guessed pair can bridge two
+    subsystems in the closure — measured on this repo: 19% hard evidence vs 78%
+    with guesses, shipped as a meaningless 41% blend of both effects.
+    """
+
+    @staticmethod
+    def _patch_graph(monkeypatch) -> None:
+        from code_atlas.server.analysis import ModuleGraph
+
+        mg = ModuleGraph(
+            modules={
+                "app.core": {"file_path": "src/app/core.py"},
+                "app.web": {"file_path": "src/app/web.py"},
+                "app.util": {"file_path": "src/app/util.py"},
+                "tests.test_core": {"file_path": "tests/test_core.py"},
+            },
+            edges={},
+            partition=[],
+            directed={
+                ("app.web", "app.core"): 3.0,
+                ("app.core", "app.util"): 1.0,
+                ("tests.test_core", "app.core"): 5.0,
+            },
+            evidence={
+                ("app.web", "app.core"): "structural",
+                ("app.core", "app.util"): "guessed",
+                ("tests.test_core", "app.core"): "structural",
+            },
+        )
+
+        async def _fake(graph, project, path, *, test_patterns=()):
+            return mg
+
+        monkeypatch.setattr("code_atlas.server.analysis.build_module_graph", _fake)
+
+    async def test_defaults_exclude_tests_and_guesses_and_count_them(self, monkeypatch):
+        from code_atlas.server.analysis import fetch_architecture_pairs
+
+        self._patch_graph(monkeypatch)
+        source = await fetch_architecture_pairs(cast("GraphBackend", object()), "demo")
+
+        assert set(source.pairs) == {("app.web", "app.core")}
+        assert source.excluded_test_modules == 1
+        assert source.excluded_guessed_pairs == 1
+        assert set(source.all_pairs) == {("app.web", "app.core"), ("app.core", "app.util")}
+
+    async def test_the_flags_restore_each_population(self, monkeypatch):
+        from code_atlas.server.analysis import fetch_architecture_pairs
+
+        self._patch_graph(monkeypatch)
+        with_tests = await fetch_architecture_pairs(cast("GraphBackend", object()), "demo", include_tests=True)
+        assert ("tests.test_core", "app.core") in with_tests.pairs
+
+        with_guessed = await fetch_architecture_pairs(cast("GraphBackend", object()), "demo", include_guessed=True)
+        assert ("app.core", "app.util") in with_guessed.pairs
+        assert with_guessed.excluded_guessed_pairs == 0
 
 
 class TestArchitectureView:

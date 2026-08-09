@@ -1439,6 +1439,102 @@ class ModuleGraph:
     evidence: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ArchitecturePairs:
+    """The architecture metrics' edge source, with its exclusions stated.
+
+    One provider for the page, the JSON endpoint and the index-time history
+    snapshot — they measured three different graphs under one metric name until
+    2026-08 (the page read CALLS+IMPORTS, the endpoint and the history read the
+    near-empty direct Module->Module import edges, ~10x apart on this repo).
+
+    ``pairs`` is the filtered population the metrics run on. ``all_pairs`` is
+    the same population before the evidence filter (tests already excluded), so
+    a consumer can state what the guesses would add rather than hiding them.
+    """
+
+    pairs: dict[tuple[str, str], str]
+    all_pairs: dict[tuple[str, str], str]
+    module_paths: dict[str, str]
+    excluded_test_modules: int
+    excluded_guessed_pairs: int
+
+
+async def fetch_architecture_pairs(
+    graph: GraphBackend,
+    project: str,
+    *,
+    include_tests: bool = False,
+    include_guessed: bool = False,
+    test_patterns: tuple[str, ...] = (),
+) -> ArchitecturePairs:
+    """Directed module pairs with evidence, filtered to what architecture means.
+
+    Tests are excluded by default: nothing imports a test module, so every test
+    adds an unreachable target to every module's denominator — the shipped
+    propagation cost *improved* whenever tests were written. Guessed and
+    never-looked-up pairs are excluded by default because the transitive closure
+    is maximally sensitive to a false edge: one wrong guess bridges two whole
+    subsystems (measured here: 19% hard-evidence vs 78% with guesses).
+
+    On SQLite the CALLS aggregation is unavailable and the pairs are the direct
+    import edges, all structural — the same source the page already used there.
+    """
+    from code_atlas.settings import SearchSettings  # noqa: PLC0415
+
+    patterns = list(test_patterns) if test_patterns else list(SearchSettings().test_patterns)
+
+    if isinstance(graph, SqliteGraphClient):
+        raw = await graph.get_module_import_edges(project, "")
+        sqlite_pairs = {
+            (str(r.get("from_mod")), str(r.get("to_mod"))): "structural"
+            for r in raw.get("direct", [])
+            if r.get("from_mod") and r.get("to_mod") and r.get("from_mod") != r.get("to_mod")
+        }
+        paths: dict[str, str] = {}
+        excluded = 0
+        if not include_tests:
+            names = {n for pair in sqlite_pairs for n in pair}
+            test_names = {n for n in names if matches_test_pattern("", n.rsplit(".", 1)[-1], patterns)}
+            excluded = len(test_names)
+            sqlite_pairs = {
+                p: ev for p, ev in sqlite_pairs.items() if p[0] not in test_names and p[1] not in test_names
+            }
+        return ArchitecturePairs(
+            pairs=sqlite_pairs,
+            all_pairs=dict(sqlite_pairs),
+            module_paths=paths,
+            excluded_test_modules=excluded,
+            excluded_guessed_pairs=0,
+        )
+
+    module_graph = await build_module_graph(graph, project, "")
+    paths = {qn: str(info.get("file_path") or "") for qn, info in module_graph.modules.items()}
+    pair_ev = {pair: module_graph.evidence.get(pair, "unknown") for pair in module_graph.directed}
+
+    excluded_tests = 0
+    if not include_tests:
+        modules = {n for pair in pair_ev for n in pair}
+        test_modules = {n for n in modules if matches_test_pattern(paths.get(n, ""), n.rsplit(".", 1)[-1], patterns)}
+        excluded_tests = len(test_modules)
+        pair_ev = {p: ev for p, ev in pair_ev.items() if p[0] not in test_modules and p[1] not in test_modules}
+
+    all_pairs = dict(pair_ev)
+    excluded_guessed = 0
+    if not include_guessed:
+        hard = {p: ev for p, ev in pair_ev.items() if ev in ("structural", "resolved")}
+        excluded_guessed = len(pair_ev) - len(hard)
+        pair_ev = hard
+
+    return ArchitecturePairs(
+        pairs=pair_ev,
+        all_pairs=all_pairs,
+        module_paths=paths,
+        excluded_test_modules=excluded_tests,
+        excluded_guessed_pairs=excluded_guessed,
+    )
+
+
 async def build_module_graph(
     graph: GraphBackend, project: str, path: str, *, test_patterns: tuple[str, ...] = ()
 ) -> ModuleGraph:

@@ -196,11 +196,13 @@ class ArchitectureController(Controller):
         self,
         architecture_service: NamedDependency[ArchitectureViewService],
         chrome_service: NamedDependency[ChromeService],
+        tests: FromQuery[bool] = False,
+        guessed: FromQuery[bool] = False,
     ) -> Template:
         return Template(
             "architecture.html",
             context={
-                "arch": await architecture_service.view(),
+                "arch": await architecture_service.view(include_tests=tests, include_guessed=guessed),
                 "chrome": await chrome_service.chrome(),
                 "active": "architecture",
             },
@@ -234,6 +236,7 @@ class MapController(Controller):
         show_tests: FromQuery[bool] = False,
         show_noncode: FromQuery[bool] = False,
         show_external: FromQuery[bool] = False,
+        show_guessed: FromQuery[bool] = True,
         hide: FromQuery[str] | None = None,
     ) -> MapPayload:
         """Whichever level was asked for, in the shape map.js renders.
@@ -245,12 +248,18 @@ class MapController(Controller):
         if level == "entity":
             hidden = None if hide is None else tuple(k for k in hide.split(",") if k)
             return await map_service.entity_map(
-                module, expand_methods=expand, hidden=hidden, show_tests=show_tests, show_noncode=show_noncode
+                module,
+                expand_methods=expand,
+                hidden=hidden,
+                show_tests=show_tests,
+                show_noncode=show_noncode,
+                show_guessed=show_guessed,
             )
         return await map_service.map(
             show_tests=show_tests,
             show_noncode=show_noncode,
             show_external=show_external,
+            show_guessed=show_guessed,
             projects=selected_projects,
         )
 

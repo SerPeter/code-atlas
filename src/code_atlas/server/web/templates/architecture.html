@@ -17,7 +17,19 @@
         <span style="font-variant-numeric:tabular-nums;font-weight:600">{{ r.value }}</span>
       </div>
       {% endfor %}
-      <div style="margin-top:9px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Published measurements of propagation cost, for scale. They were computed on other languages and other tools; treat them as order-of-magnitude only.</div>
+      <div style="margin-top:9px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Published measurements of propagation cost, for scale. They were computed on other languages, other tools and far larger systems — propagation cost falls mechanically with size. Treat them as order-of-magnitude only.</div>
+    </section>
+    <section style="padding:13px 14px 14px;border-bottom:1px solid var(--color-divider)">
+      <div style="{{ m.label10() }};margin-bottom:8px">Population</div>
+      <a href="?tests={{ '0' if arch.include_tests else '1' }}&guessed={{ '1' if arch.include_guessed else '0' }}" class="hv6" style="display:flex;align-items:center;justify-content:space-between;gap:9px;padding:6px 0;border-bottom:1px solid var(--color-divider);font-size:11.5px;color:inherit;text-decoration:none">
+        <span>Test modules</span>
+        <span style="font-weight:600">{{ 'included' if arch.include_tests else 'excluded' }}</span>
+      </a>
+      <a href="?tests={{ '1' if arch.include_tests else '0' }}&guessed={{ '0' if arch.include_guessed else '1' }}" class="hv6" style="display:flex;align-items:center;justify-content:space-between;gap:9px;padding:6px 0;border-bottom:1px solid var(--color-divider);font-size:11.5px;color:inherit;text-decoration:none">
+        <span>Guessed calls</span>
+        <span style="font-weight:600">{{ 'included' if arch.include_guessed else 'excluded' }}</span>
+      </a>
+      <div style="margin-top:9px;font-size:11px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 62%, transparent)">Excluded by default: tests dilute the number (nothing imports a test), and one wrong guess bridges two whole subsystems in the closure.</div>
     </section>
     <section style="padding:13px 14px 18px;font-size:11px;line-height:1.55;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
       This view is deliberately not a node-link graph. A force-directed blob looks the same whether the architecture is healthy or rotten, so it cannot answer whether things are getting worse.

@@ -354,6 +354,9 @@ class MapPayload(msgspec.Struct, frozen=True):
     test_count: int = 0
     noncode_count: int = 0
     external_count: int = 0
+    # Call pairs whose strongest evidence is a guess (or was never looked up) —
+    # the population the show_guessed toggle governs, counted either way.
+    guessed_count: int = 0
     entity_total: int = 0
     truncated: bool = False
     scope_options: tuple[ScopeOption, ...] = ()
@@ -705,6 +708,9 @@ class ArchitectureView(msgspec.Struct, frozen=True):
     # Restates the cut whenever the inventory lists fewer cycles than the matrix
     # marks — a capped list that looks complete is the failure this page bans.
     cycles_caption: str = "read off the matrix — both edges named, cut either"
+    # The population toggles, so the page can render its own state and flip links.
+    include_tests: bool = False
+    include_guessed: bool = False
 
 
 class DetailRelated(msgspec.Struct, frozen=True):
