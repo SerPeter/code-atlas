@@ -31,14 +31,25 @@ def iteration_count(node_count: int) -> int:
     return max(110, min(420, round(420 * (40 / max(1, node_count)) ** 0.7)))
 
 
-def force_layout(
+# Pairs per repulsion block: bounds the temporaries to ~64MB however many nodes the
+# graph has. The full-scope entity map is the case that matters — an unchunked pair
+# matrix at ~7,000 nodes is ~750MB before the first iteration finishes.
+_BLOCK_PAIRS = 2_000_000
+
+
+def force_layout(  # noqa: PLR0915  # one simulation, kept whole so it stays comparable to the design's
     nodes: list[str],
     edges: dict[tuple[str, str], float],
     *,
     width: float = SPACE,
     height: float = SPACE,
+    _block: int | None = None,
 ) -> dict[str, tuple[float, float]]:
-    """Position every node; a function of the edges and nothing else."""
+    """Position every node; a function of the edges and nothing else.
+
+    ``_block`` overrides the repulsion block size — a test hook proving the chunked
+    accumulation produces the same picture as the one-shot matrix.
+    """
     import numpy as np  # noqa: PLC0415  # heavy import, only needed when a map is drawn
 
     n = len(nodes)
@@ -46,6 +57,7 @@ def force_layout(
         return {}
     if n == 1:
         return {nodes[0]: (width / 2, height / 2)}
+    block = _block or max(1, _BLOCK_PAIRS // n)
 
     index = {name: i for i, name in enumerate(nodes)}
 
@@ -85,12 +97,17 @@ def force_layout(
     for it in range(iterations):
         t = 1 - it / iterations
 
-        delta = pos[:, None, :] - pos[None, :, :]
-        d2 = np.einsum("ijk,ijk->ij", delta, delta)
-        np.clip(d2, 0.01, None, out=d2)
-        repulsion = (k * k * 1.1) / d2
-        np.fill_diagonal(repulsion, 0.0)
-        vel += np.einsum("ijk,ij->ik", delta, repulsion)
+        # Repulsion in row blocks: identical arithmetic to the full pair matrix (each
+        # row still sums over every column in order), bounded temporaries.
+        for start in range(0, n, block):
+            rows = pos[start : start + block]
+            delta = rows[:, None, :] - pos[None, :, :]
+            d2 = np.einsum("ijk,ijk->ij", delta, delta)
+            np.clip(d2, 0.01, None, out=d2)
+            repulsion = (k * k * 1.1) / d2
+            self_idx = np.arange(rows.shape[0])
+            repulsion[self_idx, start + self_idx] = 0.0  # a node does not push itself
+            vel[start : start + block] += np.einsum("ijk,ij->ik", delta, repulsion)
 
         if src_i.size:
             edge_delta = pos[dst_i] - pos[src_i]

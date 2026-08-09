@@ -1289,6 +1289,37 @@ async def _fetch_community_inputs(
     return modules, call_edges
 
 
+async def fetch_entity_graph(graph: GraphBackend, project: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Every entity in *project* and every dependency edge between them.
+
+    The full-scope entity map's data access — the entity-level analogue of
+    ``_fetch_community_inputs``. Dependency edges only (``_DEFAULT_BLAST_EDGE_TYPES``,
+    ADR-0029): DEFINES/CONTAINS are containment, which the map synthesises from the
+    qualified names as faint scaffolding rather than fetching row by row.
+
+    Raw Cypher for the same reason the community inputs are: no portable backend
+    method serves either shape, and the map is already Memgraph-gated.
+    """
+    params: dict[str, Any] = {"project": project}
+    entities = await graph.execute(
+        "MATCH (n {project_name: $project}) "
+        "WHERE n.qualified_name IS NOT NULL AND NOT n:Project "
+        "RETURN n.uid AS uid, n.qualified_name AS qn, n.name AS name, labels(n)[0] AS label, "
+        "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start, n.line_end AS line_end",
+        params,
+    )
+    rel_types = ", ".join(f"'{t}'" for t in _DEFAULT_BLAST_EDGE_TYPES)
+    edges = await graph.execute(
+        "MATCH (a {project_name: $project})-[r]->(b {project_name: $project}) "
+        f"WHERE type(r) IN [{rel_types}] "
+        "AND a.qualified_name IS NOT NULL AND b.qualified_name IS NOT NULL "
+        "RETURN a.qualified_name AS from_qn, b.qualified_name AS to_qn, type(r) AS rel_type, "
+        "r.weight AS weight, r.confidence AS confidence, r.strategy AS strategy",
+        params,
+    )
+    return entities, edges
+
+
 async def fetch_first_hop_external(graph: GraphBackend, project: str) -> list[dict[str, Any]]:
     """Modules in *other* indexed projects that this project's modules import.
 

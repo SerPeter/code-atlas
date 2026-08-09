@@ -102,6 +102,20 @@ _IMPACT_CEILING = 500
 # term — the call graph, not the containment tree, should decide where things sit.
 _DEFINES_WEIGHT = 0.25
 
+# Full-scope entity defaults: value-and-documentation kinds start hidden so the first
+# paint is a picture of the call structure rather than a wall. Hidden is COUNTED — the
+# kind rows in the rail carry the numbers and the toggles that bring them back.
+_FULL_SCOPE_HIDDEN = ("constant", "env_var", "doc_file", "doc_section", "knowledge_note")
+# The skeleton kinds a filter can never remove: containers anchor everything else, and
+# classes are the fold target — hiding them would vanish their folded methods silently.
+_UNHIDEABLE_KINDS = frozenset({"module", "package", "class", "method"})
+_ENTITY_FULL_LIMIT = 4000
+
+# Full-scope layouts are the one expensive computation in this module (minutes of numpy
+# at thousands of nodes); they are deterministic per graph, so the last few are kept.
+_LAYOUT_CACHE: dict[tuple, dict[str, tuple[float, float]]] = {}
+_LAYOUT_CACHE_MAX = 8
+
 # ADR-0028's four states, strongest first. Shared by every view that draws a chip.
 _EV_RANK = {"structural": 3, "resolved": 2, "guessed": 1, "unknown": 0}
 
@@ -1168,28 +1182,84 @@ class MapViewService:
             default_scope=_default_scope(scope_options),
         )
 
-    async def entity_map(  # noqa: PLR0912, PLR0915  # inventory, fold, anchor and tally share one table
+    async def entity_map(  # noqa: PLR0912, PLR0915  # inventory, fold, filter, anchor and tally share one table
         self,
         scope: str,
         *,
         expand_methods: bool = False,
-        node_limit: int = _ENTITY_SCOPE_LIMIT,
+        hidden: tuple[str, ...] | None = None,
+        node_limit: int | None = None,
+        show_tests: bool = False,
+        show_noncode: bool = False,
     ) -> MapPayload:
-        """The entity level: the graph's own nodes, scoped to one module.
+        """The entity level: the graph's own nodes — one module, or the whole project.
 
-        Methods fold into the class that holds them by default, with their calls
-        rewired to the class — folding hides nodes without hiding dependencies. The
-        kind tallies are counted over the **full** inventory, so a folded method still
-        appears in its row.
+        An empty *scope* draws every entity the project indexes. Methods fold into the
+        class that holds them by default, with their calls rewired to the class; kind
+        filters hide what they name and count what they hid; and the tallies always
+        cover the **full** inventory, so nothing removed from the drawing reads as
+        absent from the module.
+
+        *hidden* is the exact set of kinds to hide; ``None`` means the level's own
+        default — value and documentation kinds at full scope, nothing when scoped.
         """
-        summary = await self._graph.get_module_summary(self._project, scope, _ENTITY_SCOPE_LIMIT, _EDGE_LIMIT)
-        rows = list(summary.get("entities") or [])
+        full = not scope
+        requested = tuple(hidden) if hidden is not None else (_FULL_SCOPE_HIDDEN if full else ())
+        hidden_kinds = tuple(k for k in requested if k not in _UNHIDEABLE_KINDS)
+        limit = node_limit if node_limit is not None else (_ENTITY_FULL_LIMIT if full else _ENTITY_SCOPE_LIMIT)
         scope_options = await self._scope_options()
+
+        # One row shape for both sources: (from_qn, to_qn, rel_type, weight, confidence, strategy).
+        if full:
+            unavailable = self._unsupported_reason()
+            if unavailable:
+                return _empty_map(self._project, unavailable, level="entity", scope_options=scope_options)
+            from code_atlas.server.analysis import fetch_entity_graph  # noqa: PLC0415
+
+            try:
+                rows, raw_edges = await fetch_entity_graph(self._graph, self._project)
+            except Exception as exc:  # the map may not take the page down
+                logger.debug("Entity graph unavailable for {}: {}", self._project, exc)
+                return _empty_map(
+                    self._project,
+                    "The entity graph could not be fetched for this project. "
+                    "Run health_check for the backend's own account of why.",
+                    level="entity",
+                    scope_options=scope_options,
+                )
+            edge_rows = [
+                (
+                    str(r.get("from_qn") or ""),
+                    str(r.get("to_qn") or ""),
+                    str(r.get("rel_type") or ""),
+                    _as_float(r.get("weight")) or 1.0,
+                    str(r.get("confidence") or ""),
+                    str(r.get("strategy") or ""),
+                )
+                for r in raw_edges
+            ]
+        else:
+            summary = await self._graph.get_module_summary(self._project, scope, _ENTITY_SCOPE_LIMIT, _EDGE_LIMIT)
+            rows = list(summary.get("entities") or [])
+            edge_rows = []
+            for row in summary.get("internal_edges") or []:
+                props = row.get("props") or {}
+                edge_rows.append(
+                    (
+                        str(row.get("from_qn") or ""),
+                        str(row.get("to_qn") or ""),
+                        str(row.get("rel_type") or ""),
+                        _as_float(props.get("weight")) or 1.0,
+                        str(props.get("confidence") or ""),
+                        str(props.get("strategy") or ""),
+                    )
+                )
+
         if not rows:
             return _empty_map(
                 self._project,
                 "",
-                caveat=CoverageCaveat(note=f"No entities indexed under {scope or 'this scope'}."),
+                caveat=CoverageCaveat(note=f"No entities indexed under {scope or 'this project'}."),
                 level="entity",
                 scope=scope,
                 scope_options=scope_options,
@@ -1208,10 +1278,36 @@ class MapViewService:
                 "lines": _lines_of(r),
             }
 
-        # The module is one of the entities. When the summary does not list it, it is
-        # synthesised — the design draws the host module as the graph's anchor, and
-        # DEFINES is a structural fact the qualified names already prove.
-        module_qn = _host_module_qn(entities)
+        # Full scope honours the same test and non-code filters the module level
+        # does — without them half the picture is test scaffolding mirroring the
+        # production structure. Hidden is counted, never silently dropped. A view
+        # deliberately scoped INTO a test module keeps showing it.
+        test_count = noncode_count = 0
+        if full:
+            production: dict[str, dict[str, Any]] = {}
+            for qn, info in entities.items():
+                path = info["file_path"]
+                if not show_tests and _is_test_module(path, info["name"], self._test_patterns):
+                    test_count += 1
+                elif not show_noncode and _is_noncode_module(path):
+                    noncode_count += 1
+                else:
+                    production[qn] = info
+            entities = production
+            if not entities:
+                return _empty_map(
+                    self._project,
+                    "",
+                    caveat=CoverageCaveat(note="Every indexed entity is test or non-code, and both are filtered."),
+                    level="entity",
+                    scope=scope,
+                    scope_options=scope_options,
+                )
+
+        # A scoped view synthesises its host module when the summary omits it — the
+        # design draws the module as the graph's anchor. At full scope the modules are
+        # entities in their own right, fetched like everything else.
+        module_qn = "" if full else _host_module_qn(entities)
         if module_qn and module_qn not in entities:
             entities[module_qn] = {
                 "uid": "",
@@ -1221,69 +1317,91 @@ class MapViewService:
                 "lines": "",
             }
 
-        # Counted before folding: the tally answers "what is in this module", not
-        # "what survived the display setting".
+        # Counted before folding or filtering: the tally answers "what is indexed
+        # here", not "what survived the display settings".
         inventory: dict[str, int] = {}
         for info in entities.values():
             inventory[info["kind"]] = inventory.get(info["kind"], 0) + 1
 
         owner = {} if expand_methods else _method_owners(entities)
-        drawn = {qn: info for qn, info in entities.items() if qn not in owner}
+        hidden_set = set(hidden_kinds)
+        drawn = {qn: info for qn, info in entities.items() if qn not in owner and info["kind"] not in hidden_set}
 
-        # Aggregate edges onto the drawn set, carrying the strongest evidence.
+        # Aggregate dependency edges onto the drawn set, carrying the strongest evidence.
         edges: dict[tuple[str, str], float] = {}
         edge_ev: dict[tuple[str, str], str] = {}
-        for row in summary.get("internal_edges") or []:
-            a = owner.get(str(row.get("from_qn") or ""), str(row.get("from_qn") or ""))
-            b = owner.get(str(row.get("to_qn") or ""), str(row.get("to_qn") or ""))
+        for from_qn, to_qn, rel_type, weight, confidence, strategy in edge_rows:
+            a = owner.get(from_qn, from_qn)
+            b = owner.get(to_qn, to_qn)
             if a == b or a not in drawn or b not in drawn:
                 continue
-            props = row.get("props") or {}
-            state = _evidence_state(
-                EdgeEvidence(
-                    rel_type=str(row.get("rel_type") or ""),
-                    strategy=str(props.get("strategy") or ""),
-                    confidence=str(props.get("confidence") or ""),
-                )
-            )
-            weight = float(props.get("weight") or 1.0)
+            state = _evidence_state(EdgeEvidence(rel_type=rel_type, strategy=strategy, confidence=confidence))
             edges[a, b] = edges.get((a, b), 0.0) + weight
             if _EV_RANK[state] > _EV_RANK.get(edge_ev.get((a, b), ""), -1):
                 edge_ev[a, b] = state
 
         # Containment is structural fact: the module DEFINES its members, a class its
         # own. Drawn as edges they anchor every entity — without them, anything with
-        # no resolved call floats detached at the map's edge, which reads as "isolated"
-        # when the truth is "contained". They are scaffolding, not signal, so they get
-        # a "defines" rel (the canvas draws them as faint hairlines) and a low weight
-        # (the layout must let the call graph, not the containment tree, drive shape).
+        # no resolved call floats detached at the map's edge, which reads as
+        # "isolated" when the truth is "contained". They are scaffolding, not signal,
+        # so they get a "defines" rel (the canvas draws them as faint hairlines) and a
+        # low weight. At full scope an entity with no drawn ancestor simply has no
+        # anchor — there is no single host to fall back to, and modules connect
+        # through their own import edges.
         edge_rel: dict[tuple[str, str], str] = {}
-        if module_qn in drawn:
-            for qn in drawn:
-                if qn == module_qn:
-                    continue
-                definer = qn.rsplit(".", 1)[0] if "." in qn else ""
-                while definer and definer not in drawn:
-                    definer = definer.rsplit(".", 1)[0] if "." in definer else ""
-                anchor = definer or module_qn
-                if anchor != qn and (anchor, qn) not in edges:
-                    edges[anchor, qn] = _DEFINES_WEIGHT
-                    edge_ev[anchor, qn] = "structural"
-                    edge_rel[anchor, qn] = "defines"
+        for qn in drawn:
+            if qn == module_qn:
+                continue
+            definer = qn.rsplit(".", 1)[0] if "." in qn else ""
+            while definer and definer not in drawn:
+                definer = definer.rsplit(".", 1)[0] if "." in definer else ""
+            anchor = definer or module_qn
+            if anchor and anchor != qn and (anchor, qn) not in edges:
+                edges[anchor, qn] = _DEFINES_WEIGHT
+                edge_ev[anchor, qn] = "structural"
+                edge_rel[anchor, qn] = "defines"
 
-        kept = set(sorted(drawn, key=lambda qn: qn)[:node_limit])
-        truncated = len(kept) < len(drawn)
-        max_w = max(edges.values(), default=1.0) or 1.0
-        scaled = {pair: _scale_weight(w, max_w) for pair, w in edges.items() if pair[0] in kept and pair[1] in kept}
-        positions = force_layout(sorted(kept), scaled)
-
+        # Degree over everything drawable, so a truncation keeps the most connected
+        # rather than the alphabetically first.
         degree: dict[str, int] = {}
         held: dict[str, int] = {}
         for class_qn in owner.values():
             held[class_qn] = held.get(class_qn, 0) + 1
-        for a, b in scaled:
+        for a, b in edges:
             degree[a] = degree.get(a, 0) + 1
             degree[b] = degree.get(b, 0) + 1
+
+        if len(drawn) > limit:
+            ranked = sorted(drawn, key=lambda qn: (-degree.get(qn, 0), qn))
+            kept = set(ranked[:limit])
+            truncated = True
+        else:
+            kept = set(drawn)
+            truncated = False
+        max_w = max(edges.values(), default=1.0) or 1.0
+        scaled = {pair: _scale_weight(w, max_w) for pair, w in edges.items() if pair[0] in kept and pair[1] in kept}
+
+        # A full-scope layout is the one expensive computation here — deterministic
+        # per graph, so it is cached against the index stamp.
+        if full and len(kept) > 800:
+            key = (
+                self._project,
+                expand_methods,
+                hidden_kinds,
+                show_tests,
+                show_noncode,
+                await self._index_stamp(),
+                len(kept),
+                len(scaled),
+            )
+            positions = _LAYOUT_CACHE.get(key)
+            if positions is None:
+                positions = force_layout(sorted(kept), scaled)
+                while len(_LAYOUT_CACHE) >= _LAYOUT_CACHE_MAX:
+                    _LAYOUT_CACHE.pop(next(iter(_LAYOUT_CACHE)))
+                _LAYOUT_CACHE[key] = positions
+        else:
+            positions = force_layout(sorted(kept), scaled)
 
         drawn_count: dict[str, int] = {}
         for qn in kept:
@@ -1315,22 +1433,34 @@ class MapViewService:
             ),
             communities=(),
             kinds=_kind_defs(),
-            caveat=CoverageCaveat(note=f"{len(entities)} entities indexed under {scope}."),
+            caveat=CoverageCaveat(note=f"{len(entities)} entities indexed under {scope or 'this project'}."),
             module_total=await self._module_total(),
+            test_count=test_count,
+            noncode_count=noncode_count,
             entity_total=await self._entity_total((self._project,)),
             truncated=truncated,
             scope_options=scope_options,
             default_scope=_default_scope(scope_options),
             scope=scope,
-            scope_name=_scope_name(scope, scope_options),
+            scope_name="Whole project" if full else _scope_name(scope, scope_options),
             in_module=len(entities),
             collapsed=not expand_methods,
+            hidden_kinds=hidden_kinds,
             tally=tuple(
                 KindTally(id=kind.id, in_module=inventory[kind.id], drawn=drawn_count.get(kind.id, 0))
                 for kind in KINDS
                 if inventory.get(kind.id)
             ),
         )
+
+    async def _index_stamp(self) -> str:
+        """When this project was last indexed — the layout cache's freshness key."""
+        try:
+            statuses = [_project_props(row) for row in await self._graph.get_project_status()]
+        except Exception:
+            return ""
+        current = next((st for st in statuses if st.get("name") == self._project), {})
+        return str(current.get("last_indexed_at") or "")
 
     async def _scope_options(self) -> tuple[ScopeOption, ...]:
         """Modules the entity level can be pointed at, largest first."""
@@ -1512,7 +1642,7 @@ def _empty_map(
     level: str = "module",
     scope: str = "",
     scope_options: tuple[ScopeOption, ...] = (),
-) -> MapPayload:
+) -> MapPayload:  # an empty map still names its level and scope
     return MapPayload(
         project=project,
         level=level,
