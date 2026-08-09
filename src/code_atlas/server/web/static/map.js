@@ -458,9 +458,8 @@
     }
     html += "</div>";
 
-    // ── Filters — the module level, and the full-scope entity level, which
-    // honours the same defaults ──
-    if (!entity || !state.scope) {
+    // ── Filters — every view: the same toggles, every hidden thing counted ──
+    {
       var testCount = D.test_count || 0;
       var ncCount = D.noncode_count || 0;
       var drawnNodes = entity ? D.in_module : (D.nodes || []).length;
@@ -528,7 +527,7 @@
           var isMethod = t.id === "method";
           var toggleable = isMethod || ["module", "package", "class"].indexOf(t.id) < 0;
           var isHidden = !isMethod && state.hidden && state.hidden.has(t.id);
-          var drawnNote = isMethod ? (D.collapsed ? "folded — click to expand" : "expanded")
+          var drawnNote = isMethod ? (D.collapsed ? "folded" : "")
             : isHidden ? "hidden"
             : t.drawn === t.in_module ? ""
             : t.drawn ? t.drawn + " drawn" : "not drawn";
@@ -545,8 +544,9 @@
           var title = isMethod
             ? (D.collapsed ? "Expand methods out of their classes" : "Fold methods into their classes")
             : (isHidden ? "Show " : "Hide ") + esc(kind.label.toLowerCase()) + "s";
+          var faded = isHidden || (isMethod && D.collapsed);
           return (
-            '<button data-kind-toggle="' + t.id + '" data-kind-row="' + t.id + '" class="hv6" title="' + title + '" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:4px 0;cursor:pointer;color:inherit;font:inherit;font-size:12px;text-align:left;opacity:' + (isHidden ? 0.5 : 1) + '">' +
+            '<button data-kind-toggle="' + t.id + '" data-kind-row="' + t.id + '" class="hv6" title="' + title + '" style="display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;border-radius:8px;padding:4px 0;cursor:pointer;color:inherit;font:inherit;font-size:12px;text-align:left;opacity:' + (faded ? 0.5 : 1) + '">' +
             swatch + "</button>"
           );
         }).join("") +

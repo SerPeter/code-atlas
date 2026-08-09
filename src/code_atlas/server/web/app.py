@@ -40,6 +40,18 @@ if TYPE_CHECKING:
     from code_atlas.settings import SearchSettings
 
 
+def _static_version() -> str:
+    """A short fingerprint of the static assets, for cache-busting links."""
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.sha256()
+    for name in sorted(("design.css", "app.js", "map.js")):
+        path = STATIC_DIR / name
+        if path.exists():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:10]
+
+
 def create_app(
     graph: GraphBackend,
     project: str,
@@ -99,6 +111,10 @@ def create_app(
         return ProjectPickerService(graph, primary_project)
 
     template_config: TemplateConfig[Any] = TemplateConfig(directory=TEMPLATES_DIR, engine=JinjaTemplateEngine)
+    # A version stamp on every static link, derived from the assets' own bytes. A
+    # browser holding yesterday's map.js against today's payload renders half-truths
+    # that look like data bugs; a changed URL cannot be served from cache.
+    template_config.engine_instance.engine.globals["static_v"] = _static_version()
 
     return Litestar(
         route_handlers=[

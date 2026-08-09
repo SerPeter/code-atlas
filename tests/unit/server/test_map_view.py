@@ -335,63 +335,78 @@ class TestMultiProject:
 
 
 class TestEntityLevel:
-    def _summary(self) -> dict[str, Any]:
-        def row(qn: str, label: str, kind: str = "") -> dict[str, Any]:
+    """A scoped view is the full fetch filtered by path prefix — the module-summary
+    read it replaced capped a directory at 1,500 entities and 500 edges."""
+
+    @staticmethod
+    def _patch_entities(monkeypatch) -> None:
+        def row(qn: str, label: str, kind: str, path: str) -> dict[str, Any]:
             return {
                 "uid": f"u:{qn}",
                 "qn": qn,
                 "name": qn.rsplit(".", 1)[-1],
                 "label": label,
                 "kind": kind,
-                "file_path": "src/app/mod.py",
+                "file_path": path,
             }
 
-        return {
-            "entities": [
-                row("app.mod", "Module", "module"),
-                row("app.mod.Klass", "TypeDef", "class"),
-                row("app.mod.Klass.run", "Callable", "method"),
-                row("app.mod.helper", "Callable", "function"),
-                row("app.mod.LIMIT", "Value", "constant"),
-            ],
-            "internal_edges": [
-                {
-                    "from_qn": "app.mod.helper",
-                    "to_qn": "app.mod.Klass.run",
-                    "rel_type": "CALLS",
-                    "props": {"strategy": "import", "confidence": "resolved", "weight": 1.0},
-                }
-            ],
-        }
+        entities = [
+            row("app.mod", "Module", "module", "src/app/mod.py"),
+            row("app.mod.Klass", "TypeDef", "class", "src/app/mod.py"),
+            row("app.mod.Klass.run", "Callable", "method", "src/app/mod.py"),
+            row("app.mod.helper", "Callable", "function", "src/app/mod.py"),
+            row("app.mod.LIMIT", "Value", "constant", "src/app/mod.py"),
+            row("other.thing", "Callable", "function", "src/other/thing.py"),
+        ]
+        edges = [
+            {
+                "from_qn": "app.mod.helper",
+                "to_qn": "app.mod.Klass.run",
+                "rel_type": "CALLS",
+                "weight": 1.0,
+                "confidence": "resolved",
+                "strategy": "import",
+            }
+        ]
 
-    async def test_methods_fold_into_their_class_and_calls_are_rewired(self):
+        async def _fake(graph, project):
+            return entities, edges
+
+        monkeypatch.setattr("code_atlas.server.analysis.fetch_entity_graph", _fake)
+
+    async def test_methods_fold_into_their_class_and_calls_are_rewired(self, monkeypatch):
         """Folding hides nodes without hiding dependencies."""
-        result = await _service(_Graph(summary=self._summary())).entity_map("src/app/mod.py")
+        self._patch_entities(monkeypatch)
+        result = await _service().entity_map("src/app/mod.py")
 
         ids = {n.id for n in result.nodes}
         assert "app.mod.Klass.run" not in ids
+        assert "other.thing" not in ids, "the prefix filter keeps other files out of scope"
         assert ("app.mod.helper", "app.mod.Klass") in {(e.s, e.t) for e in result.edges}
 
-    async def test_the_tally_counts_the_whole_inventory_not_the_drawn_subset(self):
+    async def test_the_tally_counts_the_whole_inventory_not_the_drawn_subset(self, monkeypatch):
         """A folded method still appears in its row — kind tallies never shrink."""
-        result = await _service(_Graph(summary=self._summary())).entity_map("src/app/mod.py")
+        self._patch_entities(monkeypatch)
+        result = await _service().entity_map("src/app/mod.py")
 
         tally = {t.id: t for t in result.tally}
         assert tally["method"].in_module == 1
         assert tally["method"].drawn == 0
         assert result.in_module == 5
 
-    async def test_expand_methods_draws_them(self):
-        result = await _service(_Graph(summary=self._summary())).entity_map("src/app/mod.py", expand_methods=True)
+    async def test_expand_methods_draws_them(self, monkeypatch):
+        self._patch_entities(monkeypatch)
+        result = await _service().entity_map("src/app/mod.py", expand_methods=True)
 
         assert "app.mod.Klass.run" in {n.id for n in result.nodes}
         assert result.collapsed is False
 
-    async def test_containment_anchors_every_entity_as_scaffolding(self):
+    async def test_containment_anchors_every_entity_as_scaffolding(self, monkeypatch):
         """An entity with no resolved call must read as contained, not isolated — and
         the anchor is marked "defines" so the canvas can draw it as a faint hairline
         instead of letting a starburst of anchors drown the call graph."""
-        result = await _service(_Graph(summary=self._summary())).entity_map("src/app/mod.py")
+        self._patch_entities(monkeypatch)
+        result = await _service().entity_map("src/app/mod.py")
 
         by_rel = {e.rel: [] for e in result.edges}
         for e in result.edges:
@@ -406,8 +421,12 @@ class TestEntityLevel:
             if node.kind != "module":
                 assert node.id in targets
 
-    async def test_an_empty_scope_names_itself(self):
-        result = await _service(_Graph(summary={"entities": [], "internal_edges": []})).entity_map("src/app/empty.py")
+    async def test_an_empty_scope_names_itself(self, monkeypatch):
+        async def _nothing(graph, project):
+            return [], []
+
+        monkeypatch.setattr("code_atlas.server.analysis.fetch_entity_graph", _nothing)
+        result = await _service().entity_map("src/app/empty.py")
 
         assert result.nodes == ()
         assert "empty.py" in result.caveat.note
