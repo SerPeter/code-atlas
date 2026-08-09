@@ -1320,6 +1320,31 @@ async def fetch_entity_graph(graph: GraphBackend, project: str) -> tuple[list[di
     return entities, edges
 
 
+async def fetch_doc_modules(graph: GraphBackend, project: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Documentation files and where they point, for the module map.
+
+    Markdown docs and knowledge notes are DocFile/Note nodes, not Modules, so the
+    module inventory never sees them — the map draws them as non-code files behind the
+    same toggle as the CI YAML. Links aggregate per file pair: a DOCUMENTS edge lands
+    on an entity, and the entity's ``file_path`` names the module that owns it.
+    """
+    params: dict[str, Any] = {"project": project}
+    docs = await graph.execute(
+        "MATCH (d {project_name: $project}) "
+        "WHERE (d:DocFile OR d:Note) AND d.file_path IS NOT NULL "
+        "RETURN d.uid AS uid, d.qualified_name AS qn, d.name AS name, d.file_path AS file_path",
+        params,
+    )
+    links = await graph.execute(
+        "MATCH (d {project_name: $project})-[r:DOCUMENTS|LINKS_TO]->(e {project_name: $project}) "
+        "WHERE (d:DocFile OR d:DocSection OR d:Note) "
+        "AND d.file_path IS NOT NULL AND e.file_path IS NOT NULL "
+        "RETURN d.file_path AS from_path, e.file_path AS to_path, count(r) AS links",
+        params,
+    )
+    return docs, links
+
+
 async def fetch_first_hop_external(graph: GraphBackend, project: str) -> list[dict[str, Any]]:
     """Modules in *other* indexed projects that this project's modules import.
 
