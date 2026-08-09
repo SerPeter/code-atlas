@@ -56,6 +56,7 @@ class TestMapView:
             ModuleGraph(
                 modules=_modules("app.a", "app.b", "web.c", "web.d"),
                 edges={("app.a", "app.b"): 3.0, ("web.c", "web.d"): 2.0},
+                directed={("app.a", "app.b"): 3.0, ("web.c", "web.d"): 2.0},
                 partition=[["app.a", "app.b"], ["web.c", "web.d"]],
             ),
         )
@@ -69,6 +70,47 @@ class TestMapView:
             "web.c": 1,
             "web.d": 1,
         }
+
+    async def test_edge_direction_is_the_dependency_not_the_alphabet(self, monkeypatch):
+        """`source` depends on `target`, whichever way the names happen to sort.
+
+        The map read the undirected edge map, whose key is `(a, b) if a < b else (b, a)`.
+        On the real graph that made all 615 rendered edges point alphabetically, so an
+        arrowhead would have shown dictionary order. The fixture below is deliberately
+        *anti*-alphabetical — `zeta` depends on `alpha` — so reading the sorted key
+        cannot satisfy it.
+        """
+        _patch(
+            monkeypatch,
+            ModuleGraph(
+                modules=_modules("zeta", "alpha"),
+                edges={("alpha", "zeta"): 4.0},
+                partition=[["alpha", "zeta"]],
+                directed={("zeta", "alpha"): 4.0},
+            ),
+        )
+
+        [edge] = (await _service().map()).edges
+
+        assert (edge.source, edge.target) == ("zeta", "alpha")
+        assert edge.weight == 4.0
+
+    async def test_a_mutual_dependency_renders_as_two_edges(self, monkeypatch):
+        """Undirected collapse hid the difference between "a uses b" and "both"."""
+        _patch(
+            monkeypatch,
+            ModuleGraph(
+                modules=_modules("a", "b"),
+                edges={("a", "b"): 3.0},
+                partition=[["a", "b"]],
+                directed={("a", "b"): 1.0, ("b", "a"): 2.0},
+            ),
+        )
+
+        edges = (await _service().map()).edges
+
+        assert {(e.source, e.target) for e in edges} == {("a", "b"), ("b", "a")}
+        assert {e.weight for e in edges} == {1.0, 2.0}
 
     async def test_a_community_is_named_by_its_shared_prefix(self):
         """ "community 3" tells a reader nothing they can act on."""
@@ -85,6 +127,7 @@ class TestMapView:
             ModuleGraph(
                 modules=_modules("a", "b", "c"),
                 edges={("a", "b"): 12.5, ("b", "c"): 0.25},
+                directed={("a", "b"): 12.5, ("b", "c"): 0.25},
                 partition=[["a", "b", "c"]],
             ),
         )
@@ -102,6 +145,7 @@ class TestMapView:
             ModuleGraph(
                 modules=_modules("a", "b", "x", "y"),
                 edges={("a", "b"): 1.0, ("b", "x"): 1.0},
+                directed={("a", "b"): 1.0, ("b", "x"): 1.0},
                 partition=[["a", "b"], ["x", "y"]],
             ),
         )
@@ -117,6 +161,7 @@ class TestMapView:
             ModuleGraph(
                 modules=_modules("app.a", "app.b"),
                 edges={("app.a", "app.b"): 1.0},
+                directed={("app.a", "app.b"): 1.0},
                 partition=[["app.a", "app.b"]],
             ),
             external=[{"from_mod": "app.a", "to_mod": "shared.util", "to_project": "other"}],
@@ -136,6 +181,7 @@ class TestMapView:
             ModuleGraph(
                 modules=_modules("app.a", "app.b"),
                 edges={("app.a", "app.b"): 1.0},
+                directed={("app.a", "app.b"): 1.0},
                 partition=[["app.a", "app.b"]],
             ),
             external=[{"from_mod": "app.a", "to_mod": "shared.util", "to_project": "other"}],
@@ -152,6 +198,7 @@ class TestMapView:
             ModuleGraph(
                 modules=_modules("a", "b"),
                 edges={},
+                directed={},
                 partition=[["a", "b"]],
             ),
             external=[{"from_mod": "not-on-the-map", "to_mod": "shared.util", "to_project": "other"}],
@@ -171,7 +218,7 @@ class TestMapView:
         small = [f"small{i}" for i in range(3)]
         _patch(
             monkeypatch,
-            ModuleGraph(modules=_modules(*big, *small), edges={}, partition=[big, small]),
+            ModuleGraph(modules=_modules(*big, *small), edges={}, directed={}, partition=[big, small]),
         )
 
         result = await _service().map(node_limit=8)
@@ -182,14 +229,14 @@ class TestMapView:
         assert "8" in result.caveat.note or "11" in result.caveat.note
 
     async def test_a_complete_map_says_it_is_complete(self, monkeypatch):
-        _patch(monkeypatch, ModuleGraph(modules=_modules("a", "b"), edges={}, partition=[["a", "b"]]))
+        _patch(monkeypatch, ModuleGraph(modules=_modules("a", "b"), edges={}, directed={}, partition=[["a", "b"]]))
 
         result = await _service().map()
 
         assert result.truncated is False
 
     async def test_an_unindexed_project_is_not_an_empty_map(self, monkeypatch):
-        _patch(monkeypatch, ModuleGraph(modules={}, edges={}, partition=[]))
+        _patch(monkeypatch, ModuleGraph(modules={}, edges={}, directed={}, partition=[]))
 
         result = await _service().map()
 
@@ -203,6 +250,7 @@ class TestMapView:
             ModuleGraph(
                 modules=_modules("a", "b", "c", "d"),
                 edges={("a", "b"): 1.0},
+                directed={("a", "b"): 1.0},
                 partition=[["a", "b"], ["c", "d"]],
             ),
         )
@@ -246,6 +294,7 @@ class TestMapEndpoint:
             ModuleGraph(
                 modules=_modules("app.api.users", "app.api.orders", "web.ui"),
                 edges={("app.api.users", "app.api.orders"): 4.0},
+                directed={("app.api.users", "app.api.orders"): 4.0},
                 partition=[["app.api.users", "app.api.orders"], ["web.ui"]],
             ),
         )

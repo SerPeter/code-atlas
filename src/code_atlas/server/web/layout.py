@@ -79,3 +79,108 @@ def node_size(degree: int, *, minimum: float = 3.0, maximum: float = 14.0) -> fl
     keeps a 200-edge module visibly bigger than a 20-edge one without erasing the rest.
     """
     return min(maximum, minimum + math.log1p(max(degree, 0)) * 2.2)
+
+
+# ---------------------------------------------------------------------------
+# Force-directed layout (ATL-123)
+# ---------------------------------------------------------------------------
+
+# Fixed, so the same graph lays out identically on every request. The determinism is the
+# requirement; the particular value is arbitrary.
+_SEED = 20260809
+_ITERATIONS = 300
+
+
+def force_layout(
+    nodes: list[str],
+    edges: dict[tuple[str, str], float],
+    *,
+    iterations: int = _ITERATIONS,
+    seed: int = _SEED,
+) -> dict[str, tuple[float, float]]:
+    """Fruchterman-Reingold, vectorised, seeded.
+
+    Position becomes a function of the edges: coupled modules pull together, unrelated
+    ones drift apart. That is the whole point — the previous clustered-circular layout
+    placed communities on a fixed ring, so every node landed in a band (measured on the
+    real graph: 0 of 126 nodes inside radius 60) and distance meant nothing.
+
+    Determinism was the reason that ring existed. It is preserved here by seeding the
+    initial positions and running a fixed iteration count, which is what makes a map
+    comparable to the one you looked at last week. An *unseeded* force layout would not
+    be; a seeded one is, and it also carries information.
+
+    Repulsion is O(n^2) per iteration, done in numpy rather than Python loops — at the
+    1500-node cap that is 2.25M pair distances per step, which is a few milliseconds
+    vectorised and minutes interpreted.
+    """
+    import numpy as np  # noqa: PLC0415  # heavy import, only needed when a map is drawn
+
+    count = len(nodes)
+    if count == 0:
+        return {}
+    if count == 1:
+        return {nodes[0]: (0.0, 0.0)}
+
+    index = {name: i for i, name in enumerate(nodes)}
+    rng = np.random.default_rng(seed)
+    # Seeded ring start rather than pure noise: a deterministic, well-spread opening
+    # converges faster and avoids the coincident-point singularity at step one.
+    angles = np.linspace(0, 2 * np.pi, count, endpoint=False)
+    pos = np.stack([np.cos(angles), np.sin(angles)], axis=1) * 100.0
+    pos += rng.normal(0.0, 2.0, size=(count, 2))
+
+    src, dst, strength = [], [], []
+    # Sorted, because np.add.at accumulates in array order and float addition is not
+    # associative — the same graph with its edges in a different dict order would
+    # otherwise settle a hair differently, and dict order here comes from query results.
+    for (a, b), weight in sorted(edges.items()):
+        if a in index and b in index and a != b:
+            src.append(index[a])
+            dst.append(index[b])
+            # Log-compressed: raw weights span 0.0027 to 126.79 on the real graph, and a
+            # 47,000x pull would collapse the heavy pairs onto one point.
+            strength.append(1.0 + np.log1p(max(weight, 0.0)))
+    src_i = np.asarray(src, dtype=np.intp)
+    dst_i = np.asarray(dst, dtype=np.intp)
+    pull = np.asarray(strength, dtype=float)
+
+    area = 1.0
+    k = np.sqrt(area / count)
+    temperature = 0.1
+    cooling = temperature / (iterations + 1)
+    scale = 200.0
+    pos /= scale  # work in unit space, rescale at the end
+
+    for _ in range(iterations):
+        delta = pos[:, None, :] - pos[None, :, :]
+        distance = np.linalg.norm(delta, axis=-1)
+        np.clip(distance, 0.01, None, out=distance)
+
+        # Everything pushes everything, inversely with distance.
+        repulsion = (k * k) / distance
+        np.fill_diagonal(repulsion, 0.0)
+        displacement = np.einsum("ijk,ij->ik", delta, repulsion / distance)
+
+        if src_i.size:
+            edge_delta = pos[src_i] - pos[dst_i]
+            edge_dist = np.linalg.norm(edge_delta, axis=-1)
+            np.clip(edge_dist, 0.01, None, out=edge_dist)
+            attraction = (edge_dist / k) * pull
+            force = edge_delta * (attraction / edge_dist)[:, None]
+            np.add.at(displacement, src_i, -force)
+            np.add.at(displacement, dst_i, force)
+
+        length = np.linalg.norm(displacement, axis=-1)
+        np.clip(length, 0.01, None, out=length)
+        step = np.minimum(length, temperature) / length
+        pos += displacement * step[:, None]
+        temperature -= cooling
+
+    # Normalise into a stable box so the client never has to guess a viewport.
+    span = pos.max(axis=0) - pos.min(axis=0)
+    span[span == 0] = 1.0
+    pos = (pos - pos.min(axis=0)) / span * 2.0 - 1.0
+    pos *= scale
+
+    return {name: (float(pos[i, 0]), float(pos[i, 1])) for name, i in index.items()}

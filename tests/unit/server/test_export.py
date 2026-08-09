@@ -65,6 +65,7 @@ def _patch_map(monkeypatch, *, modules: tuple[str, ...] = ("app.api", "app.servi
                 m: {"uid": f"u:{m}", "name": m.rsplit(".", 1)[-1], "qn": m, "file_path": f"{m}.py"} for m in modules
             },
             edges={(modules[0], modules[1]): 3.0} if len(modules) > 1 else {},
+            directed={(modules[0], modules[1]): 3.0} if len(modules) > 1 else {},
             partition=[list(modules)],
         )
 

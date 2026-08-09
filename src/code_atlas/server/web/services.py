@@ -25,7 +25,8 @@ from typing import TYPE_CHECKING, Any
 
 from code_atlas.server.analysis import _DEFAULT_BLAST_EDGE_TYPES
 from code_atlas.server.architecture import analyse
-from code_atlas.server.web.layout import layout_communities, node_size
+from code_atlas.server.web.layout import force_layout, node_size
+from code_atlas.server.web.naming import breadcrumb
 from code_atlas.server.web.schemas import (
     AffectedEntity,
     ArchitectureHealth,
@@ -511,8 +512,21 @@ class MapViewService:
         self._project = project
         self._test_patterns = test_patterns
 
-    async def map(self, *, node_limit: int = _MAP_NODE_LIMIT, include_external: bool = True) -> ModuleMap:
-        """Modules, their dependencies, and the subsystems they fall into."""
+    async def map(
+        self,
+        *,
+        node_limit: int = _MAP_NODE_LIMIT,
+        include_external: bool = True,
+        show_tests: bool = False,
+        show_noncode: bool = False,
+    ) -> ModuleMap:
+        """Modules, their dependencies, and the subsystems they fall into.
+
+        Tests and non-code files are excluded by default. On the real graph 69 of 126
+        modules are tests and another twelve are CI YAML, a Dockerfile and TOML — 64% of
+        the picture, mirroring the production structure or participating in no import
+        graph at all. Both are counted and reported rather than silently dropped.
+        """
         from code_atlas.server.analysis import (  # noqa: PLC0415
             build_module_graph,
             fetch_first_hop_external,
@@ -526,21 +540,41 @@ class MapViewService:
         if not module_graph.modules:
             return _empty_map(self._project, "", caveat=CoverageCaveat(note="No modules indexed for this project."))
 
+        hidden_tests, hidden_noncode = 0, 0
+        excluded: set[str] = set()
+        for qn, info in module_graph.modules.items():
+            path = str(info.get("file_path") or "")
+            if not show_tests and _is_test_module(path, str(info.get("name") or ""), self._test_patterns):
+                excluded.add(qn)
+                hidden_tests += 1
+            elif not show_noncode and _is_noncode_module(path):
+                excluded.add(qn)
+                hidden_noncode += 1
+
         community_of = {qn: idx for idx, group in enumerate(module_graph.partition) for qn in group}
-        kept = _largest_first(module_graph.partition, node_limit)
-        truncated = len(kept) < len(module_graph.modules)
+        visible_partition = [[qn for qn in group if qn not in excluded] for group in module_graph.partition]
+        kept = _largest_first(visible_partition, node_limit)
+        truncated = len(kept) < len(module_graph.modules) - len(excluded)
 
         external_rows = await fetch_first_hop_external(self._graph, self._project) if include_external else []
         external = _external_nodes(external_rows, kept)
 
-        positions = layout_communities([[qn for qn in group if qn in kept] for group in module_graph.partition])
+        # Position is a function of the edges now (ATL-123). The clustered ring it
+        # replaces put every node in a band and encoded nothing.
+        positions = force_layout(sorted(kept), {e: w for e, w in module_graph.edges.items() if set(e) <= kept})
         positions.update(_external_positions(external))
 
+        # Undirected for size: a module coupled to ten others is equally central
+        # whichever way the arrows point, and counting in+out would double a mutual pair.
         degree = _degree_by_module(module_graph.edges, kept)
         nodes = tuple(
             MapNode(
                 id=qn,
-                label=str(module_graph.modules[qn].get("name") or qn.rsplit(".", 1)[-1]),
+                label=breadcrumb(
+                    qualified_name=qn,
+                    file_path=str(module_graph.modules[qn].get("file_path") or ""),
+                    label="Module",
+                ).short,
                 community=community_of.get(qn, -1),
                 size=node_size(degree.get(qn, 0)),
                 x=positions.get(qn, (0.0, 0.0))[0],
@@ -562,7 +596,7 @@ class MapViewService:
             for qn, owner in sorted(external.items())
         )
 
-        edges = _map_edges(module_graph.edges, kept, community_of) + _external_edges(external_rows, kept, external)
+        edges = _map_edges(module_graph.directed, kept, community_of) + _external_edges(external_rows, kept, external)
 
         communities = tuple(
             CommunityRef(
@@ -582,6 +616,8 @@ class MapViewService:
             communities=communities,
             modularity=_modularity_of(module_graph),
             truncated=truncated,
+            hidden_tests=hidden_tests,
+            hidden_noncode=hidden_noncode,
             caveat=_map_caveat(len(module_graph.modules), truncated, node_limit),
         )
 
@@ -608,6 +644,44 @@ def _modularity_of(module_graph: ModuleGraph) -> float:
     from code_atlas.server.analysis import _modularity  # noqa: PLC0415
 
     return round(_modularity(module_graph.partition, module_graph.edges), 4)
+
+
+# Extensions that carry no import graph: they are indexed on purpose and belong in
+# search, but a dependency map draws them as isolated dots. On the real project the CI
+# workflows even formed their own "community", which is noise in a picture about coupling.
+_NONCODE_SUFFIXES = (
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".json",
+    ".ini",
+    ".cfg",
+    ".lock",
+    ".md",
+    ".txt",
+    ".dockerfile",
+)
+_NONCODE_NAMES = ("dockerfile", "containerfile", "makefile")
+
+
+def _is_noncode_module(file_path: str) -> bool:
+    path = file_path.replace("\\", "/").lower()
+    leaf = path.rsplit("/", 1)[-1]
+    return leaf in _NONCODE_NAMES or path.endswith(_NONCODE_SUFFIXES)
+
+
+def _is_test_module(file_path: str, name: str, patterns: tuple[str, ...]) -> bool:
+    """Whether a module is test code.
+
+    Delegates to the same matcher `exclude_tests` uses in the MCP tools. A second notion
+    of "is a test" would drift from the first, and then the map and the tools would
+    disagree about the same file.
+    """
+    from code_atlas.search.engine import matches_test_pattern  # noqa: PLC0415
+    from code_atlas.settings import SearchSettings  # noqa: PLC0415
+
+    effective = list(patterns) if patterns else list(SearchSettings().test_patterns)
+    return matches_test_pattern(file_path, name, effective)
 
 
 def _empty_map(project: str, unavailable: str, *, caveat: CoverageCaveat | None = None) -> ModuleMap:
@@ -649,17 +723,24 @@ def _degree_by_module(edges: dict[tuple[str, str], float], kept: set[str]) -> di
 
 
 def _map_edges(
-    edges: dict[tuple[str, str], float], kept: set[str], community_of: dict[str, int]
+    directed: dict[tuple[str, str], float], kept: set[str], community_of: dict[str, int]
 ) -> tuple[MapEdge, ...]:
+    """``source`` depends on ``target`` — a real orientation, not a sort order.
+
+    This reads the directed view. It previously read the undirected one, whose key is
+    ``(a, b) if a < b else (b, a)``, so every rendered edge pointed alphabetically: on the
+    real graph all 615 had ``source < target``. Any arrowhead drawn from that was
+    dictionary order wearing the costume of a dependency.
+    """
     return tuple(
         MapEdge(
-            source=a,
-            target=b,
+            source=depender,
+            target=dependency,
             weight=round(weight, 4),
-            crosses_community=community_of.get(a, -1) != community_of.get(b, -2),
+            crosses_community=community_of.get(depender, -1) != community_of.get(dependency, -2),
         )
-        for (a, b), weight in sorted(edges.items())
-        if a in kept and b in kept
+        for (depender, dependency), weight in sorted(directed.items())
+        if depender in kept and dependency in kept
     )
 
 

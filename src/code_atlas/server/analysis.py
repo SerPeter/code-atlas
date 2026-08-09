@@ -1314,20 +1314,34 @@ async def fetch_first_hop_external(graph: GraphBackend, project: str) -> list[di
 
 @dataclass(frozen=True)
 class ModuleGraph:
-    """The weighted, undirected module graph and its community partition.
+    """The weighted module graph and its community partition, in both orientations.
 
     Shared rather than private because two callers need the *same* clustering:
     ``find_communities`` reports it, and the web map view draws it. Rebuilding the graph
     in the view would let the picture drift from the tool's answer for the same project,
     which is the one divergence the UI must not have.
 
-    ``edges`` is keyed by :func:`_undirected_key`, so a pair appears once with its
-    summed weight (CALLS weight per ADR-0017, plus import counts).
+    Two edge views, because the two consumers genuinely need different things:
+
+    * ``edges`` — keyed by :func:`_undirected_key`, so a pair appears once with its
+      summed weight (CALLS weight per ADR-0017, plus import counts). Modularity is
+      defined on undirected graphs, so this is what the clustering must see.
+    * ``directed`` — keyed ``(depender, dependency)`` as the sources actually record it.
+      A dependency map that cannot say which way a dependency points is missing the thing
+      a reader opens it for. Collapsing both into one dict meant the map's ``source`` and
+      ``target`` were simply the alphabetically-first and -second name: on the real
+      graph, 615 of 615 edges had ``source < target``, so an arrowhead would have pointed
+      in dictionary order.
+
+    A mutual dependency appears once in ``edges`` and twice in ``directed``.
     """
 
     modules: dict[str, dict[str, Any]]
     edges: dict[tuple[str, str], float]
     partition: list[list[str]]
+    # Required, not defaulted: a ModuleGraph built without it would render a map with no
+    # edges at all, and silently. Direction is part of the contract now.
+    directed: dict[tuple[str, str], float]
 
 
 async def build_module_graph(
@@ -1349,26 +1363,35 @@ async def build_module_graph(
     modules_by_qn = {r["qn"]: r for r in module_rows if r["qn"]}
     qn_by_path = {r["file_path"]: r["qn"] for r in module_rows if r["file_path"] and r["qn"]}
 
+    # Accumulated in one pass. Both inputs are directed at source — CALLS runs
+    # caller->callee, IMPORTS runs importer->imported — so the orientation is there to
+    # keep; the undirected key is where it used to be discarded.
     edges: dict[tuple[str, str], float] = {}
+    directed: dict[tuple[str, str], float] = {}
+
+    def _add(depender: str, dependency: str, weight: float) -> None:
+        key = _undirected_key(depender, dependency)
+        edges[key] = edges.get(key, 0.0) + weight
+        pair = (depender, dependency)
+        directed[pair] = directed.get(pair, 0.0) + weight
+
     for row in call_rows:
         from_qn = qn_by_path.get(row["from_path"])
         to_qn = qn_by_path.get(row["to_path"])
         if from_qn is None or to_qn is None or from_qn == to_qn:
             continue
-        key = _undirected_key(from_qn, to_qn)
-        edges[key] = edges.get(key, 0.0) + float(row["weight"])
+        _add(from_qn, to_qn, float(row["weight"]))
 
     import_records = await graph.get_module_import_edges(project, path)
     import_pairs = _module_imports_from_records(import_records["direct"], import_records["indirect"])
     for (from_mod, to_mod), count in import_pairs.items():
         if from_mod == to_mod or from_mod not in modules_by_qn or to_mod not in modules_by_qn:
             continue
-        key = _undirected_key(from_mod, to_mod)
-        edges[key] = edges.get(key, 0.0) + float(count)
+        _add(from_mod, to_mod, float(count))
 
     partition = _detect_module_communities(set(modules_by_qn), edges)
     partition.sort(key=lambda group: (-len(group), group[0] if group else ""))
-    return ModuleGraph(modules=modules_by_qn, edges=edges, partition=partition)
+    return ModuleGraph(modules=modules_by_qn, edges=edges, partition=partition, directed=directed)
 
 
 async def _analyze_communities(

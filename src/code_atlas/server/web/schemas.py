@@ -298,6 +298,10 @@ class ModuleMap(msgspec.Struct, frozen=True):
     truncated: bool
     caveat: CoverageCaveat
     unavailable: str = ""
+    # Counted, never silently dropped: a filtered view that looks complete is the one
+    # failure this project keeps removing.
+    hidden_tests: int = 0
+    hidden_noncode: int = 0
 
     @property
     def is_available(self) -> bool:
