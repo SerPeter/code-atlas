@@ -12,7 +12,7 @@ import re
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
@@ -1272,12 +1272,18 @@ async def _fetch_community_inputs(
         params,
     )
     call_scope = " AND a.file_path STARTS WITH $path AND b.file_path STARTS WITH $path" if path else ""
+    # The three CASE sums split each pair's calls by the ADR-0028 evidence states:
+    # ambiguous (a guess), no-confidence (never looked up), and the resolved rest.
+    # Aggregated here so the map can label a module edge without a second query.
     call_edges = await graph.execute(
         "MATCH (a {project_name: $project})-[r:CALLS]->(b {project_name: $project}) "
         "WHERE a.file_path IS NOT NULL AND b.file_path IS NOT NULL "
         f"AND a.file_path <> b.file_path{call_scope} "
         "RETURN a.file_path AS from_path, b.file_path AS to_path, "
-        "sum(coalesce(r.weight, 1.0)) AS weight",
+        "sum(coalesce(r.weight, 1.0)) AS weight, "
+        "count(r) AS calls, "
+        "sum(CASE WHEN r.confidence = 'ambiguous' THEN 1 ELSE 0 END) AS ambiguous_calls, "
+        "sum(CASE WHEN r.confidence IS NULL AND r.strategy IS NULL THEN 1 ELSE 0 END) AS unlooked_calls",
         params,
     )
     return modules, call_edges
@@ -1342,6 +1348,11 @@ class ModuleGraph:
     # Required, not defaulted: a ModuleGraph built without it would render a map with no
     # edges at all, and silently. Direction is part of the contract now.
     directed: dict[tuple[str, str], float]
+    # Per directed pair, the strongest claim among the entity edges it aggregates:
+    # structural (an import is a fact) > resolved > guessed > unknown (never looked up).
+    # ADR-0028's states, carried up to module level so the map does not have to invent
+    # one — "unknown is not zero" only works if unknown actually reaches the client.
+    evidence: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
 async def build_module_graph(
@@ -1375,12 +1386,31 @@ async def build_module_graph(
         pair = (depender, dependency)
         directed[pair] = directed.get(pair, 0.0) + weight
 
+    # The strongest claim seen per directed pair. Rank order is ADR-0028's:
+    # a structural fact beats a resolved match beats a guess beats "never looked up".
+    evidence_rank = {"structural": 3, "resolved": 2, "guessed": 1, "unknown": 0}
+    evidence: dict[tuple[str, str], str] = {}
+
+    def _claim(depender: str, dependency: str, state: str) -> None:
+        pair = (depender, dependency)
+        if evidence_rank[state] > evidence_rank.get(evidence.get(pair, ""), -1):
+            evidence[pair] = state
+
     for row in call_rows:
         from_qn = qn_by_path.get(row["from_path"])
         to_qn = qn_by_path.get(row["to_path"])
         if from_qn is None or to_qn is None or from_qn == to_qn:
             continue
         _add(from_qn, to_qn, float(row["weight"]))
+        calls = int(row.get("calls") or 0)
+        ambiguous = int(row.get("ambiguous_calls") or 0)
+        unlooked = int(row.get("unlooked_calls") or 0)
+        if calls - ambiguous - unlooked > 0:
+            _claim(from_qn, to_qn, "resolved")
+        elif ambiguous:
+            _claim(from_qn, to_qn, "guessed")
+        elif calls:
+            _claim(from_qn, to_qn, "unknown")
 
     import_records = await graph.get_module_import_edges(project, path)
     import_pairs = _module_imports_from_records(import_records["direct"], import_records["indirect"])
@@ -1388,10 +1418,11 @@ async def build_module_graph(
         if from_mod == to_mod or from_mod not in modules_by_qn or to_mod not in modules_by_qn:
             continue
         _add(from_mod, to_mod, float(count))
+        _claim(from_mod, to_mod, "structural")
 
     partition = _detect_module_communities(set(modules_by_qn), edges)
     partition.sort(key=lambda group: (-len(group), group[0] if group else ""))
-    return ModuleGraph(modules=modules_by_qn, edges=edges, partition=partition, directed=directed)
+    return ModuleGraph(modules=modules_by_qn, edges=edges, partition=partition, directed=directed, evidence=evidence)
 
 
 async def _analyze_communities(
