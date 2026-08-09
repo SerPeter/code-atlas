@@ -257,6 +257,9 @@ class MapNode(msgspec.Struct, frozen=True):
     y: float
     project: str
     is_external: bool = False
+    # Empty on the module level, where community carries the colour. On the entity level
+    # this is the drawn kind and decides both silhouette and hue.
+    kind: str = ""
 
 
 class MapEdge(msgspec.Struct, frozen=True):
@@ -274,12 +277,44 @@ class MapEdge(msgspec.Struct, frozen=True):
 
 
 class CommunityRef(msgspec.Struct, frozen=True):
-    """A detected subsystem — id, size, and the modules in it."""
+    """A detected community — id, size, and the modules in it."""
 
     id: int
     size: int
     label: str
     members: tuple[str, ...]
+
+    @property
+    def color(self) -> str:
+        """The hue sweep runs to eight; everything past it shares the neutral.
+
+        Twenty-two distinguishable hues do not exist, so the rail's names carry the
+        identity beyond the eighth and colour stops pretending to.
+        """
+        return f"var(--atlas-c{min(8, self.id)})"
+
+
+class KindRow(msgspec.Struct, frozen=True):
+    """One of the twelve node kinds, as the rail lists it.
+
+    ``n`` counts the kind across the *whole* module inventory, not the drawn subset —
+    folding methods into their class must not make the methods appear to vanish.
+    """
+
+    id: str
+    label: str
+    shape: str
+    color: str
+    n: int
+    drawn_note: str = ""
+
+
+class ScopeOption(msgspec.Struct, frozen=True):
+    """A module the entity level can be scoped to."""
+
+    id: str
+    label: str
+    entities: int
 
 
 class ModuleMap(msgspec.Struct, frozen=True):
@@ -302,6 +337,20 @@ class ModuleMap(msgspec.Struct, frozen=True):
     # failure this project keeps removing.
     hidden_tests: int = 0
     hidden_noncode: int = 0
+    # v1.1: the map declares which level it is and what that level means.
+    level: str = "module"
+    scope: str = ""
+    scope_options: tuple[ScopeOption, ...] = ()
+    kinds: tuple[KindRow, ...] = ()
+    expand_methods: bool = False
+    expand_count: str = ""
+    kind_header_note: str = ""
+    level_note: str = ""
+    hidden_note: str = ""
+    community_summary: str = ""
+    community_overflow_note: str = ""
+    legend_note: str = ""
+    entity_total: int = 0
 
     @property
     def is_available(self) -> bool:
