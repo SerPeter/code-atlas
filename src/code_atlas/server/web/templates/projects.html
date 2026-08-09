@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Projects — Code Atlas{% endblock %}
+{% block subtitle %}{{ picker.total_projects }} indexed{% endblock %}
+
+{# A real page rather than an overlay. It is reachable by URL, survives a reload, and
+   works in the static export where there is no server to open a dialog against — but it
+   is styled as a dialog so it reads as the modal the design specifies. #}
+{% block content %}
+<div class="dialog-backdrop">
+  <div class="dialog elev-lg" role="dialog" aria-labelledby="picker-title">
+    <div class="dialog-title" id="picker-title">Select projects</div>
+
+    <form class="dialog-body" method="get" action="/projects">
+      <ul class="picker-list">
+        {% for project in picker.projects %}
+        <li>
+          {% include "_picker_row.html" %}
+          {% if project.children %}
+          <ul class="picker-children">
+            {% for child in project.children %}
+            <li>{% with project = child %}{% include "_picker_row.html" %}{% endwith %}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+
+      <div class="dialog-actions">
+        <div class="picker-cost">
+          {% if picker.cost_note %}
+          {# Combining projects is the one choice here with a real performance cliff.
+             Better warned than discovered. #}
+          <span class="caveat-inline">{{ picker.cost_note }}</span>
+          {% else %}
+          <span class="text-muted">{{ picker.selected | join(', ') }}</span>
+          {% endif %}
+        </div>
+        <a class="btn btn-ghost" href="/">Cancel</a>
+        <button class="btn btn-primary" type="submit" name="apply" value="1">Show map</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

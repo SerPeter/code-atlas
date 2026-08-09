@@ -1,0 +1,70 @@
+{# The map's left rail: project, filters, subsystems, selection.
+
+   Every filter states how many modules it is hiding. A filtered view that looks
+   complete is the one failure this product refuses to have — and on the real graph
+   these two hide 64% of the nodes. #}
+<aside class="app-sidebar">
+  <section class="rail-section">
+    <div class="rail-label">Project</div>
+    <a class="rail-project" href="/projects">
+      <span class="rail-project-name">{{ map.project }}</span>
+      <span class="rail-project-meta">
+        {{ map.nodes | length }} modules · {{ map.edges | length }} dependencies
+      </span>
+    </a>
+  </section>
+
+  <section class="rail-section">
+    <div class="rail-label">Filters</div>
+
+    {# Links rather than checkboxes: the map is server-rendered, so a filter is a
+       different URL. That also makes any view shareable by pasting the address. #}
+    <a class="rail-toggle{% if not show_tests %} is-on{% endif %}"
+       href="?{{ 'show_tests=0' if show_tests else 'show_tests=1' }}{% if show_noncode %}&show_noncode=1{% endif %}">
+      <span class="rail-toggle-box" aria-hidden="true">{% if not show_tests %}✓{% endif %}</span>
+      <span>
+        Hide tests
+        {% if map.hidden_tests %}<span class="rail-count">{{ map.hidden_tests }} hidden</span>{% endif %}
+      </span>
+    </a>
+
+    <a class="rail-toggle{% if not show_noncode %} is-on{% endif %}"
+       href="?{{ 'show_noncode=0' if show_noncode else 'show_noncode=1' }}{% if show_tests %}&show_tests=1{% endif %}">
+      <span class="rail-toggle-box" aria-hidden="true">{% if not show_noncode %}✓{% endif %}</span>
+      <span>
+        Hide non-code
+        {% if map.hidden_noncode %}<span class="rail-count">{{ map.hidden_noncode }} hidden</span>{% endif %}
+      </span>
+    </a>
+  </section>
+
+  <section class="rail-section rail-grow">
+    <div class="rail-label">
+      Subsystems <span class="rail-count">{{ map.communities | length }}</span>
+    </div>
+    {# Doubles as the colour legend. Only the first eight hues are distinct — 22
+       distinguishable colours do not exist — so the rest share the neutral and are
+       told apart by name here rather than on the canvas. #}
+    <ul class="rail-list">
+      {% for community in map.communities %}
+      <li>
+        <button type="button" class="rail-community" data-community="{{ community.id }}">
+          <span class="swatch" style="background: var(--atlas-c{{ community.id if community.id < 8 else 8 }})"></span>
+          <span class="rail-community-name">{{ community.label }}</span>
+          <span class="rail-count">{{ community.size }}</span>
+        </button>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <section class="rail-section rail-selection" id="rail-selection" hidden>
+    <div class="rail-label">Selected</div>
+    <div class="rail-selection-name" id="sel-name"></div>
+    <div class="rail-selection-meta" id="sel-meta"></div>
+    <div class="rail-actions">
+      <a class="btn btn-secondary btn-block" id="sel-detail" href="#">Open detail</a>
+      <a class="btn btn-ghost btn-block" id="sel-impact" href="#">What breaks if I change this</a>
+    </div>
+  </section>
+</aside>

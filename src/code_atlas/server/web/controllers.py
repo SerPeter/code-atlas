@@ -31,6 +31,7 @@ from code_atlas.server.web.schemas import (  # noqa: TC001
     EntityDetail,
     ModuleMap,
     ProjectOverview,
+    ProjectPicker,
     SearchPage,
     TracePathView,
 )
@@ -40,6 +41,7 @@ from code_atlas.server.web.services import (
     ImpactViewService,
     MapViewService,
     ProjectNotIndexedError,
+    ProjectPickerService,
     ProjectViewService,
     SearchViewService,
 )
@@ -51,19 +53,68 @@ class ProjectController(Controller):
     path = "/"
 
     @get("/", name="index")
-    async def index(self, view_service: NamedDependency[ProjectViewService]) -> Template:
-        """Landing page — the project this server was started from."""
+    async def index(
+        self,
+        view_service: NamedDependency[ProjectViewService],
+        map_service: NamedDependency[MapViewService],
+        show_tests: FromQuery[bool] = False,
+        show_noncode: FromQuery[bool] = False,
+    ) -> Template:
+        """Landing page — the map, already open.
+
+        Not a dashboard: someone opening this wants to see their codebase, and a page of
+        counts is a step in the way of that. The overview still exists at /overview.
+        """
+        try:
+            # Only to prove the project is indexed. A map of nothing and a project that
+            # was never indexed look identical, and the fix for the second is different.
+            await view_service.overview()
+        except ProjectNotIndexedError as exc:
+            return Template("not_indexed.html", context={"project": exc.project}, status_code=404)
+
+        module_map = await map_service.map(show_tests=show_tests, show_noncode=show_noncode)
+        return Template(
+            "map.html",
+            context={
+                "map": module_map,
+                "project": module_map.project,
+                "active": "map",
+                "show_tests": show_tests,
+                "show_noncode": show_noncode,
+            },
+        )
+
+    @get("/overview", name="overview")
+    async def overview(self, view_service: NamedDependency[ProjectViewService]) -> Template:
+        """The counts, for when that is the question."""
         try:
             overview = await view_service.overview()
         except ProjectNotIndexedError as exc:
             # A project with no graph data is not an empty project. Saying "run atlas
             # index" is the whole difference between the two (ATL-110).
-            return Template(
-                "not_indexed.html",
-                context={"project": exc.project},
-                status_code=404,
-            )
-        return Template("index.html", context={"overview": overview})
+            return Template("not_indexed.html", context={"project": exc.project}, status_code=404)
+        return Template(
+            "index.html",
+            context={"overview": overview, "project": overview.project, "active": "overview"},
+        )
+
+    @get("/projects", name="projects")
+    async def projects(
+        self,
+        picker_service: NamedDependency[ProjectPickerService],
+        project: FromQuery[list[str]] | None = None,
+    ) -> Template:
+        """The project picker — multi-select, with monorepo children nested."""
+        picker = await picker_service.picker(tuple(project or ()))
+        return Template("projects.html", context={"picker": picker, "project": picker.selected[0]})
+
+    @get("/api/projects", name="api_projects")
+    async def api_projects(
+        self,
+        picker_service: NamedDependency[ProjectPickerService],
+        project: FromQuery[list[str]] | None = None,
+    ) -> ProjectPicker:
+        return await picker_service.picker(tuple(project or ()))
 
     @get("/api/overview", name="api_overview")
     async def api_overview(self, view_service: NamedDependency[ProjectViewService]) -> ProjectOverview:
@@ -149,8 +200,24 @@ class MapController(Controller):
     path = "/map"
 
     @get("/", name="map")
-    async def map_page(self, map_service: NamedDependency[MapViewService]) -> Template:
-        return Template("map.html", context={"map": await map_service.map()})
+    async def map_page(
+        self,
+        map_service: NamedDependency[MapViewService],
+        show_tests: FromQuery[bool] = False,
+        show_noncode: FromQuery[bool] = False,
+    ) -> Template:
+        """Kept so /map still resolves; the canonical address is now /."""
+        module_map = await map_service.map(show_tests=show_tests, show_noncode=show_noncode)
+        return Template(
+            "map.html",
+            context={
+                "map": module_map,
+                "project": module_map.project,
+                "active": "map",
+                "show_tests": show_tests,
+                "show_noncode": show_noncode,
+            },
+        )
 
     @get("/api", name="api_map")
     async def api_map(

@@ -27,6 +27,7 @@ from code_atlas.server.web.services import (
     ArchitectureViewService,
     ImpactViewService,
     MapViewService,
+    ProjectPickerService,
     ProjectViewService,
     SearchViewService,
 )
@@ -75,6 +76,9 @@ def create_app(
     async def provide_impact_service() -> ImpactViewService:
         return ImpactViewService(graph, project)
 
+    async def provide_picker_service() -> ProjectPickerService:
+        return ProjectPickerService(graph, project)
+
     template_config: TemplateConfig[Any] = TemplateConfig(directory=TEMPLATES_DIR, engine=JinjaTemplateEngine)
 
     return Litestar(
@@ -95,6 +99,7 @@ def create_app(
             "architecture_service": Provide(provide_architecture_service),
             "map_service": Provide(provide_map_service),
             "impact_service": Provide(provide_impact_service),
+            "picker_service": Provide(provide_picker_service),
         },
         # Annotated rather than inlined: `TemplateConfig` is generic in its engine and
         # Litestar's own parameter is `TemplateConfig[EngineType] | None`, so the

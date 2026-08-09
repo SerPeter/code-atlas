@@ -634,3 +634,101 @@ class TestArchitectureTrend:
 
         assert "Trend" in body
         assert "+2.4%" in body
+
+
+class TestHomeIsTheMap:
+    """`/` is the map, not a dashboard (ATL-122)."""
+
+    def test_the_landing_page_is_the_map(self):
+        with _client(FakeGraph(), "demo") as client:
+            body = client.get("/").text
+
+        assert "map-canvas" in body or "Map unavailable" in body, "the front door is the map"
+
+    def test_a_map_failure_degrades_rather_than_500ing(self):
+        """The map became the landing page, so its failure is now the front door.
+
+        FakeGraph has no `execute`, which is exactly what a backend that cannot serve
+        the clustering reads looks like. Before this, the homepage returned 500.
+        """
+        with _client(FakeGraph(), "demo") as client:
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert "could not be built" in response.text
+
+    def test_an_unindexed_project_still_says_how_to_fix_it(self):
+        """Distinct from a map that failed — the remedy is different."""
+        with _client(FakeGraph(), "nope") as client:
+            response = client.get("/")
+
+        assert response.status_code == 404
+        assert "atlas index" in response.text
+
+    def test_the_overview_survives_at_its_own_address(self):
+        with _client(FakeGraph(), "demo") as client:
+            response = client.get("/overview")
+
+        assert response.status_code == 200
+        assert "demo" in response.text
+
+
+class TestProjectPicker:
+    """Multi-select with monorepo children nested (ATL-122)."""
+
+    @staticmethod
+    def _multi() -> FakeGraph:
+        return FakeGraph(
+            projects=[
+                {"name": "demo", "entity_count": 6879, "last_indexed_at": "2026-08-06T00:00:00Z"},
+                {"name": "mono", "entity_count": 497, "last_indexed_at": "2026-07-17T00:00:00Z"},
+                {"name": "mono/core", "entity_count": 2574, "last_indexed_at": "2026-07-17T00:00:00Z"},
+                {"name": "mono/pipeline", "entity_count": 663, "last_indexed_at": "2026-07-17T00:00:00Z"},
+            ]
+        )
+
+    async def test_monorepo_children_nest_under_their_parent(self):
+        picker = await _picker(self._multi()).picker()
+
+        roots = {p.name: p for p in picker.projects}
+        assert set(roots) == {"demo", "mono"}
+        assert {c.name for c in roots["mono"].children} == {"mono/core", "mono/pipeline"}
+
+    async def test_a_slash_name_without_an_indexed_parent_stays_a_root(self):
+        """Otherwise the picker invents a parent that is not in the graph."""
+        graph = FakeGraph(projects=[{"name": "orphan/child", "entity_count": 10}])
+
+        picker = await _picker(graph).picker()
+
+        assert [p.name for p in picker.projects] == ["orphan/child"]
+
+    async def test_selecting_several_reports_the_combined_cost(self):
+        """Combining projects is the one choice here with a real performance cliff."""
+        picker = await _picker(self._multi()).picker(("demo", "mono/core"))
+
+        assert picker.selected_modules == 6879 + 2574
+        assert picker.cost_note
+
+    async def test_a_single_selection_needs_no_warning(self):
+        picker = await _picker(self._multi()).picker(("demo",))
+
+        assert picker.cost_note == ""
+
+    async def test_the_current_project_is_preselected(self):
+        picker = await _picker(self._multi(), "mono").picker()
+
+        assert picker.selected == ("mono",)
+        assert next(p for p in picker.projects if p.name == "mono").is_current
+
+    def test_the_page_lists_every_project(self):
+        with _client(self._multi(), "demo") as client:
+            body = client.get("/projects").text
+
+        for name in ("demo", "core", "pipeline"):
+            assert name in body
+
+
+def _picker(graph: FakeGraph, project: str = "demo"):
+    from code_atlas.server.web.services import ProjectPickerService
+
+    return ProjectPickerService(cast("GraphBackend", graph), project)

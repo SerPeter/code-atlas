@@ -1,6 +1,12 @@
-{% extends "base.html" %} {% block title %}Map — code-atlas{% endblock %} {% block subtitle %}{{ map.project }}{%
-endblock %}
+{% extends "base.html" %}
+{% block title %}{{ map.project }} — Code Atlas{% endblock %}
+{% block subtitle %}{{ map.nodes | length }} modules{% endblock %}
+{% set active = 'map' %}
+
+{% block sidebar %}{% if map.is_available and map.nodes %}{% include "_map_sidebar.html" %}{% endif %}{% endblock %}
+
 {% block content %}{% include "_map_section.html" %}{% endblock %}
+
 {% block scripts %}
 <script src="/static/vendor/graphology-0.26.0.umd.min.js"></script>
 <script src="/static/vendor/sigma-3.0.3.min.js"></script>
