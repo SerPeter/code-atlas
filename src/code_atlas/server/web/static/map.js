@@ -947,11 +947,22 @@
     var es = D.edges || [];
     var ids = byId();
     var comms = communityById();
-    var pos = {};
-    ns.forEach(function (n) { pos[n.id] = { x: n.x, y: n.y }; });
 
     var box = inner.getBoundingClientRect();
     var CW = box.width, CH = box.height;
+    // One pixel per layout unit on both axes, centred. The straight percent
+    // mapping stretched the square layout space over a wide canvas, so every
+    // shape the simulation settled into came out a rectangle. Coordinates are
+    // re-expressed in S-space here so all downstream percent and viewBox math
+    // stays as it was; a resize rebuilds the scene (listener below).
+    var fit = Math.min(CW, CH);
+    var ux = (CW - fit) / 2, uy = (CH - fit) / 2;
+    var pos = {};
+    ns.forEach(function (n) {
+      pos[n.id] = CW > 0 && CH > 0
+        ? { x: (ux + n.x / S * fit) / CW * S, y: (uy + n.y / S * fit) / CH * S }
+        : { x: n.x, y: n.y };
+    });
     // Node size is relative to the space each node actually gets, so a dense
     // graph draws smaller marks instead of overlapping ones.
     var pitch = (CW > 0 && ns.length) ? Math.sqrt((CW * CH) / ns.length) : 40;
@@ -1111,7 +1122,10 @@
           ? (onPath ? 1 : 0.07)
           : ctx.dimming && ctx.nbr.has(e.s) && ctx.nbr.has(e.t)
             ? ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo * rail
-            : ((e.cross ? 0.24 : 0.14) + e.weight * 0.5) * rel * fo * st.density * rail,
+            // At rest a cross-community edge spans blob to blob — long, and there
+            // are thousands. They are context, not texture: quiet enough that the
+            // blob interiors read, restored to full strength by any isolation.
+            : ((e.cross ? 0.05 : 0.16) + e.weight * (e.cross ? 0.16 : 0.5)) * rel * fo * st.density * rail,
     };
   }
 
