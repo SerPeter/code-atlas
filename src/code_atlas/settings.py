@@ -492,9 +492,12 @@ class RedisSettings(StrictSection):
     password: str = Field(default="", description="Redis/Valkey password.")
     stream_prefix: str = Field(default="atlas", description="Prefix for Redis Stream keys.")
     stream_maxlen: int = Field(
-        default=1_000_000,
+        default=100_000,
         description="Max entries per Redis Stream (XADD maxlen, approximate). "
-        "Must exceed the largest expected publish backlog. 0 disables trimming.",
+        "Must exceed the largest expected publish backlog, but a retained entry costs ~227 bytes: "
+        "the ceiling is a memory budget, not just a backlog guard. At 100k a single stream tops out "
+        "near 23MB, so one flooding project cannot exhaust the shared bus and OOM every other "
+        "project's streams. 0 disables trimming.",
     )
 
 

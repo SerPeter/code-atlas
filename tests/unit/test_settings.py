@@ -86,8 +86,8 @@ class TestEnvVarScoping:
 
 
 class TestStreamMaxlen:
-    def test_default_is_one_million(self, clean_env):
-        assert RedisSettings().stream_maxlen == 1_000_000
+    def test_default_is_one_hundred_thousand(self, clean_env):
+        assert RedisSettings().stream_maxlen == 100_000
 
     def test_zero_disables_trimming(self, clean_env):
         assert RedisSettings(stream_maxlen=0).stream_maxlen == 0

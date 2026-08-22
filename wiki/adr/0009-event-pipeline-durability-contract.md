@@ -116,10 +116,13 @@ re-enter the pipeline.
 - The poison cap (`_MAX_BATCH_FAILURES = 5`) is a judgment call balancing tolerance for transient infrastructure blips
   against how long a genuinely poisoned file stalls its batch neighbors before being parked. Needs observability if it
   proves miscalibrated in practice.
-- Stream `maxlen` trimming (now configurable via `redis.stream_maxlen`, default 1,000,000) still exists as a safety
+- Stream `maxlen` trimming (now configurable via `redis.stream_maxlen`, default 100,000) still exists as a safety
   ceiling — an index large enough to exceed it in one run can still lose undelivered events; `NULL` lag now correctly
   reports "unknown, not drained" rather than coercing to `0`, so this failure mode is now visible instead of silent, but
-  not eliminated.
+  not eliminated. The default was lowered from 1,000,000 after a retained entry was measured at ~227 bytes: one
+  project's stream reached 217MB and exhausted the shared 256MB Valkey instance under `noeviction`, rejecting writes for
+  every other project. The ceiling is therefore a memory budget as much as a backlog guard — trading a larger single-run
+  loss window for isolation between projects sharing the bus.
 
 ## Alternatives Considered
 
