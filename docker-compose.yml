@@ -48,9 +48,17 @@ services:
     deploy:
       resources:
         limits:
-          memory: 384m
+          # 2g/1536mb, raised from 384m/320mb. `noeviction` makes the ceiling a hard
+          # outage, not a soft degradation: when the bus fills, every project's writes
+          # are rejected, not just those of the project that filled it. One stream was
+          # measured at 217MB, so the old 320mb left no room for a backlog plus the
+          # embedding cache. The ~500MB gap between the two numbers is deliberate —
+          # `appendonly yes` forks to rewrite the AOF and the copy-on-write spike is
+          # charged to the same cgroup, so maxmemory must stay well under the limit or
+          # the kernel OOM-kills the container instead of Valkey rejecting a write.
+          memory: 2g
     command: >
-      valkey-server --appendonly yes --appendfsync everysec --save "" --maxmemory 320mb --maxmemory-policy noeviction
+      valkey-server --appendonly yes --appendfsync everysec --save "" --maxmemory 1536mb --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
