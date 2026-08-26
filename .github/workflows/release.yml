@@ -78,26 +78,57 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      # Both python-semantic-release actions are `using: docker` with
+      # `image: src/**/Dockerfile` -- GitHub *builds the image from source on every run*,
+      # and that Dockerfile installs `python-semantic-release == <tag>` with pip. PSR's own
+      # constraint is `gitpython ~= 3.0`, so each build re-resolves GitPython freely.
+      #
+      # GitPython 3.1.60 (2026-08-25) removed `Actor.name_email_regex` as part of a
+      # security fix (GHSA-v6xg-m7rh-r365 / GHSA-g5vv-9gxw-82hx). PSR's config loader calls
+      # it directly, so every release since then died on
+      # `type object 'Actor' has no attribute 'name_email_regex'`.
+      # Upstream: python-semantic-release#1475 / #1476 (open, no fix released).
+      #
+      # Pinning the *action tag* cannot fix this -- it pins PSR, not PSR's dependencies.
+      # So we invoke the CLI ourselves and constrain GitPython here, where we control it.
+      # Drop the `--with` pin once PSR stops reaching into GitPython internals.
       - name: Semantic Release
         id: release
-        # Pinned to an exact tag, not floating @v10 -- v10's docker image picked up a
-        # newer GitPython that dropped Actor.name_email_regex, breaking every release
-        # (`type object 'Actor' has no attribute 'name_email_regex'` in `semantic-release
-        # version`). v10.6.1 is the last release confirmed working.
-        uses: python-semantic-release/python-semantic-release@v10.6.1
-        with:
-          github_token: ${{ steps.app-token.outputs.token }}
-          git_committer_name: "github-actions[bot]"
-          git_committer_email: "github-actions[bot]@users.noreply.github.com"
-          force: ${{ inputs.force || '' }}
-          prerelease: ${{ inputs.prerelease || false }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # PSR reads this to override the commit author; it also writes `released`,
+          # `version`, `tag` and `is_prerelease` to $GITHUB_OUTPUT on its own, which is
+          # what the docker action relied on too -- the step outputs are unchanged.
+          GIT_COMMIT_AUTHOR: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+          # Passed as env, not interpolated into the script, so the shell never sees
+          # workflow-input text directly.
+          FORCE: ${{ inputs.force }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          args=()
+          if [ -n "$FORCE" ]; then
+            args+=("--$FORCE")
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=("--as-prerelease")
+          fi
+
+          uvx --with "gitpython<3.1.60" --from "python-semantic-release==10.6.1" semantic-release -v version "${args[@]}"
 
       - name: Publish GitHub Release
         if: steps.release.outputs.released == 'true'
-        uses: python-semantic-release/publish-action@v10
-        with:
-          github_token: ${{ steps.app-token.outputs.token }}
-          tag: ${{ steps.release.outputs.tag }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          uvx --with "gitpython<3.1.60" --from "python-semantic-release==10.6.1" semantic-release -v publish --tag "$TAG"
 
     outputs:
       released: ${{ steps.release.outputs.released }}
