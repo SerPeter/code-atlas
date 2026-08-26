@@ -2,6 +2,28 @@
 
 <!-- version list -->
 
+## v0.8.1 (2026-08-26)
+
+### Bug Fixes
+
+- **events**: Size stream_maxlen as a memory budget, not just a backlog guard
+  ([`3054404`](https://github.com/SerPeter/code-atlas/commit/3054404e0bda8432b1ff3b6ba819a77476ba528b))
+
+- **infra**: Raise Valkey ceiling to 2g/1536mb for the bus it actually carries
+  ([`db6b351`](https://github.com/SerPeter/code-atlas/commit/db6b351d5a39eb13dd14ae3267ef8b264a32bbea))
+
+- **search**: Forward configured dimension to litellm embedding calls
+  ([`eb855f3`](https://github.com/SerPeter/code-atlas/commit/eb855f352a5ae6534802a278336491ac2c5a5533))
+
+### Continuous Integration
+
+- **release**: Pin semantic-release action to v10.6.1, not floating v10
+  ([`294d54e`](https://github.com/SerPeter/code-atlas/commit/294d54e412b284673d02f14d9d3749b4e44c172e))
+
+- **release**: Run semantic-release via uvx with a GitPython pin
+  ([`ee53a6e`](https://github.com/SerPeter/code-atlas/commit/ee53a6efdbc38c0e8739a878366d2e59e329f1df))
+
+
 ## v0.8.0 (2026-08-09)
 
 ### Bug Fixes
