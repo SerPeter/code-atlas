@@ -209,6 +209,18 @@ class TestEmbedClient:
         assert client._api_base == "http://localhost:11434"
         assert client._api_key is None
 
+    def test_dimensions_forwarded_for_litellm_provider(self):
+        client = EmbedClient(_make_settings(provider="litellm", base_url="", dimension=1536))
+        assert client._build_kwargs(["hello"])["dimensions"] == 1536
+
+    def test_dimensions_omitted_when_unset(self):
+        client = EmbedClient(_make_settings(provider="litellm", base_url="", dimension=None))
+        assert "dimensions" not in client._build_kwargs(["hello"])
+
+    def test_dimensions_not_forwarded_for_tei_provider(self):
+        client = EmbedClient(_make_settings(provider="tei", dimension=768))
+        assert "dimensions" not in client._build_kwargs(["hello"])
+
     async def test_embed_one(self):
         client = EmbedClient(_make_settings())
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1, 0.2, 0.3])])

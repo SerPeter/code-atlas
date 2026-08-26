@@ -172,6 +172,12 @@ class EmbedClient:
             kwargs["encoding_format"] = "float"
         if self._api_key:
             kwargs["api_key"] = self._api_key
+        # Request provider-side dimension reduction (e.g. OpenAI/Gemini MRL
+        # truncation) so the returned vector matches the configured Memgraph
+        # index size. Only meaningful for litellm-routed cloud providers —
+        # TEI/Ollama models have a fixed dimension set by the hosted model.
+        if self._settings.provider == "litellm" and self._settings.dimension is not None:
+            kwargs["dimensions"] = self._settings.dimension
         return kwargs
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
