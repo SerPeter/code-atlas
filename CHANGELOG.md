@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.8.3 (2026-08-27)
+
+### Bug Fixes
+
+- **indexing**: Translate scope.paths into each monorepo sub-project's own root
+  ([`d6e46e4`](https://github.com/SerPeter/code-atlas/commit/d6e46e40179b11691b3988c0405dd945d7a90f8a))
+
+
 ## v0.8.2 (2026-08-27)
 
 ### Bug Fixes
