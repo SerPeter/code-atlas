@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.8.4 (2026-08-27)
+
+### Bug Fixes
+
+- **indexing**: Make the drain timeout configurable, was hardcoded at 600s
+  ([`29d0340`](https://github.com/SerPeter/code-atlas/commit/29d03403d413b28d4818d1d49af89fff5543c8f4))
+
+
 ## v0.8.3 (2026-08-27)
 
 ### Bug Fixes
