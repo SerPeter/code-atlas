@@ -138,6 +138,24 @@ class TestScanFiles:
 
         assert result == ["src/app.py"]
 
+    def test_explicit_empty_scope_paths_is_unrestricted_not_a_fallback(self, tmp_path):
+        """scope_paths=[] must mean "no restriction", not "fall back to settings.scope.paths".
+
+        The monorepo indexer relies on this: it passes [] for a sub-project an
+        ancestor global scope path already covers in full (see
+        _sub_project_scope_paths). Falling back to the un-translated,
+        repo-root-relative global list here is what made every scoped sub-project
+        scan zero files -- the paths never matched relative to the sub's own root.
+        """
+        _write(tmp_path, "src/app.py", "x = 1")
+        _write(tmp_path, "tests/test_app.py", "y = 2")
+
+        # settings.scope.paths restricts to "src", but the explicit [] passed
+        # directly to scan_files must win and see everything.
+        result = scan_files(tmp_path, _make_settings(tmp_path, paths=["src"]), scope_paths=[])
+
+        assert result == ["src/app.py", "tests/test_app.py"]
+
     def test_exclude_before_include(self, tmp_path):
         """Excluded files are NOT rescued by scope paths."""
         _write(tmp_path, ".atlasignore", "src/generated/\n")
@@ -531,6 +549,39 @@ class TestScanFiles:
         expected_dirs = [".git/", "node_modules/", "__pycache__/", ".venv/", "target/", "build/", "dist/"]
         for pattern in expected_dirs:
             assert pattern in _DEFAULT_EXCLUDE, f"{pattern} missing from _DEFAULT_EXCLUDE"
+
+
+# ---------------------------------------------------------------------------
+# _sub_project_in_scope / _sub_project_scope_paths — unit tests
+#
+# scope.paths is repo-root-relative; a monorepo sub-project's own FileScope is
+# rooted at the sub-project's directory. These two functions translate between
+# the two coordinate systems for _index_monorepo_inner's per-sub-project scan.
+# ---------------------------------------------------------------------------
+
+
+class TestSubProjectScopeTranslation:
+    def test_ancestor_path_covers_whole_sub_project(self):
+        # global "training" covers sub-project "training/core" entirely
+        assert orchestrator_module._sub_project_in_scope(["training"], "training/core") is True
+        assert orchestrator_module._sub_project_scope_paths(["training"], "training/core") == []
+
+    def test_exact_match_covers_whole_sub_project(self):
+        assert orchestrator_module._sub_project_in_scope(["training/core"], "training/core") is True
+        assert orchestrator_module._sub_project_scope_paths(["training/core"], "training/core") == []
+
+    def test_nested_path_translated_relative_to_sub_root(self):
+        global_paths = ["training/core/src", "training/core/tests", "training/pipeline/src"]
+        assert orchestrator_module._sub_project_in_scope(global_paths, "training/core") is True
+        assert orchestrator_module._sub_project_scope_paths(global_paths, "training/core") == ["src", "tests"]
+
+    def test_unrelated_sub_project_has_no_overlap(self):
+        global_paths = ["training/core/src", "wiki"]
+        assert orchestrator_module._sub_project_in_scope(global_paths, "training/pipeline") is False
+
+    def test_trailing_slash_normalised(self):
+        assert orchestrator_module._sub_project_in_scope(["training/core/"], "training/core") is True
+        assert orchestrator_module._sub_project_scope_paths(["training/core/"], "training/core") == []
 
 
 # ---------------------------------------------------------------------------

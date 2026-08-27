@@ -607,8 +607,17 @@ class FileScope:
         return pathspec.PathSpec.from_lines("gitignore", base) if base else None
 
     def _build_include_prefixes(self, scope_paths: list[str] | None, settings: AtlasSettings) -> list[str]:
-        """Normalise scope paths to POSIX form."""
-        paths = scope_paths or settings.scope.paths or []
+        """Normalise scope paths to POSIX form.
+
+        ``scope_paths is None`` means "not overridden by the caller" -- fall back to
+        ``settings.scope.paths``. An explicit ``[]`` must survive as-is (unrestricted),
+        not fall back too: the monorepo indexer passes exactly that for a sub-project
+        an ancestor scope path already covers in full (see ``_sub_project_scope_paths``)
+        -- an ``or`` chain here would silently replace it with the un-translated,
+        repo-root-relative global list, which matches nothing under a sub-project's
+        own root and is how every scoped monorepo sub-project indexed zero files.
+        """
+        paths = settings.scope.paths if scope_paths is None else scope_paths
         return [p.replace("\\", "/").rstrip("/") for p in paths]
 
     def _is_dir_excluded(self, rel_dir: str) -> bool:
@@ -700,6 +709,44 @@ def _read_ignore_file(path: Path) -> list[str]:
 def _matches_any_prefix(rel_path: str, prefixes: list[str]) -> bool:
     """Check if a relative path starts with any of the given prefixes."""
     return any(rel_path == prefix or rel_path.startswith(prefix + "/") for prefix in prefixes)
+
+
+def _sub_project_in_scope(global_paths: list[str], sub_path: str) -> bool:
+    """Whether a monorepo sub-project overlaps ``settings.scope.paths`` at all.
+
+    Both directions count as overlap: an ancestor global path covering the whole
+    sub-project, or a global path nested inside it. A sub-project with neither is
+    entirely outside the configured scope and must not be indexed at all -- not
+    indexed-with-zero-files, which is indistinguishable from "nothing changed".
+    """
+    for raw in global_paths:
+        p = raw.rstrip("/")
+        if p == sub_path or sub_path == p or sub_path.startswith(p + "/") or p.startswith(sub_path + "/"):
+            return True
+    return False
+
+
+def _sub_project_scope_paths(global_paths: list[str], sub_path: str) -> list[str]:
+    """Translate repo-root-relative ``scope.paths`` into *sub_path*-relative include
+    prefixes for one monorepo sub-project's own :class:`FileScope`.
+
+    Only called for a sub-project ``_sub_project_in_scope`` already confirmed
+    overlaps -- a sub-project with zero overlap is dropped before reaching here, so
+    this never needs to represent "nothing in scope" (which an empty list cannot:
+    ``FileScope`` treats ``[]`` as unrestricted, not as "match nothing").
+
+    Returns ``[]`` (unrestricted) when an ancestor or exact-match global path covers
+    the whole sub-project; otherwise the non-empty list of paths nested under it,
+    each relative to the sub-project's own root rather than the repo root.
+    """
+    translated: list[str] = []
+    for raw in global_paths:
+        p = raw.rstrip("/")
+        if p == sub_path or sub_path == p or sub_path.startswith(p + "/"):
+            return []  # an ancestor (or exact match) covers the whole sub-project
+        if p.startswith(sub_path + "/"):
+            translated.append(p[len(sub_path) + 1 :])
+    return translated
 
 
 # ---------------------------------------------------------------------------
@@ -2164,6 +2211,17 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         sub_projects = filtered
         logger.info("Scoped to {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
 
+    # Filter by settings.scope.paths (repo-root-relative) if configured -- a
+    # sub-project with zero overlap is outside the configured scope and must not
+    # be indexed at all. One that does overlap is scanned with a translated,
+    # sub-relative prefix list (see _sub_project_scope_paths at its call site below).
+    if settings.scope.paths:
+        in_scope = [sp for sp in sub_projects if _sub_project_in_scope(settings.scope.paths, sp.path)]
+        if len(in_scope) != len(sub_projects):
+            dropped = sorted({sp.name for sp in sub_projects} - {sp.name for sp in in_scope})
+            logger.info("Outside scope.paths, skipping sub-project(s): {}", ", ".join(dropped))
+        sub_projects = in_scope
+
     # Topological sort: process dependency packages before dependents
     dep_graph = _build_project_dep_graph(sub_projects)
     sub_projects = _topo_sort_projects(sub_projects, dep_graph)
@@ -2228,7 +2286,8 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             if on_progress is not None:
                 on_progress(prefixed_name, i - 1, total)
 
-            sub_files = scan_files(sub.root, settings)
+            sub_scope_paths = _sub_project_scope_paths(settings.scope.paths, sub.path) if settings.scope.paths else None
+            sub_files = scan_files(sub.root, settings, sub_scope_paths)
             pr = await publish_project_changes(
                 settings,
                 graph,
