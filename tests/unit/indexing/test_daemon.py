@@ -259,12 +259,14 @@ class TestStartupCatchup:
                 state["order"].append("consumer-run")
                 await super().run()
 
-        async def fake_index_project(settings: object, graph: object, bus: object) -> None:
+        async def fake_index_project(settings: object, graph: object, bus: object, **kwargs: Any) -> None:
+            state["drain_timeout_s"] = kwargs.get("drain_timeout_s")
             if state["fail_catchup"]:
                 raise RuntimeError("catch-up exploded")
             state["order"].append("catchup-project")
 
-        async def fake_index_monorepo(settings: object, graph: object, bus: object) -> None:
+        async def fake_index_monorepo(settings: object, graph: object, bus: object, **kwargs: Any) -> None:
+            state["drain_timeout_s"] = kwargs.get("drain_timeout_s")
             state["order"].append("catchup-monorepo")
 
         monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
@@ -287,6 +289,24 @@ class TestStartupCatchup:
         order = patched_daemon["order"]
         assert order[0] == "catchup-project"
         assert "consumer-run" in order
+
+        await manager.stop()
+
+    async def test_catchup_threads_configured_drain_timeout(
+        self, tmp_path: Path, patched_daemon: dict[str, Any]
+    ) -> None:
+        """settings.index.drain_timeout_s must reach index_project/index_monorepo, not the
+        hardcoded 600s default -- a workload too large to drain in the default window can
+        never advance its git_hash checkpoint, so every retry republishes everything."""
+        settings = _make_settings(tmp_path)
+        settings.index.drain_timeout_s = 3600.0
+
+        manager = DaemonManager()
+        started = await manager.start(settings, object(), include_watcher=False)  # type: ignore[arg-type]
+        assert started is True
+        await asyncio.sleep(0.05)
+
+        assert patched_daemon["drain_timeout_s"] == 3600.0
 
         await manager.stop()
 

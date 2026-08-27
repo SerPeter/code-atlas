@@ -691,6 +691,7 @@ async def _index_monorepo_with_progress(
             bus,
             scope_projects=projects,
             full_reindex=full_reindex,
+            drain_timeout_s=settings.index.drain_timeout_s,
             on_progress=on_progress,
             on_drain_progress=on_drain,
         )
@@ -735,6 +736,7 @@ async def _index_single_with_spinner(
             bus,
             scope_paths=scope or None,
             full_reindex=full_reindex,
+            drain_timeout_s=settings.index.drain_timeout_s,
             on_drain_progress=on_drain,
         )
 

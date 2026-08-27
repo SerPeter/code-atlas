@@ -258,9 +258,9 @@ class DaemonManager:
         try:
             async with hold_indexer_lease(bus):
                 if detect_sub_projects(settings.project_root, settings.monorepo):
-                    await index_monorepo(settings, graph, bus)
+                    await index_monorepo(settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s)
                 else:
-                    await index_project(settings, graph, bus)
+                    await index_project(settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s)
         except IndexerBusyError as exc:
             logger.info(
                 "Skipping startup catch-up — another indexer already holds the lease "

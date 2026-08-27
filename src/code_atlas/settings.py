@@ -454,6 +454,14 @@ class IndexSettings(StrictSection):
     strip_whitespace: bool = Field(
         default=True, description="Normalize whitespace before hashing (ignores formatting-only changes)."
     )
+    drain_timeout_s: float = Field(
+        default=600.0,
+        description="Max seconds to wait for the AST/embed pipeline to drain after publishing. "
+        "git_hash (the delta checkpoint) only advances on a full drain, so a run that times out "
+        "here republishes the ENTIRE file set on the next invocation -- on top of whatever the "
+        "timed-out run left undrained. A workload that structurally cannot drain within this "
+        "window can never converge; raise it rather than retrying the default indefinitely.",
+    )
 
 
 class ObservabilitySettings(StrictSection):
