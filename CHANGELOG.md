@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.8.2 (2026-08-27)
+
+### Bug Fixes
+
+- **indexing**: Gate daemon startup catch-up behind the indexer lease
+  ([`29618f8`](https://github.com/SerPeter/code-atlas/commit/29618f841023a1b9ba9068b1f9fcd80a13d1afd7))
+
+
 ## v0.8.1 (2026-08-26)
 
 ### Bug Fixes
