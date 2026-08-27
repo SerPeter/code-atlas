@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from code_atlas.backends import create_event_bus
-from code_atlas.events import EventBus, Topic
+from code_atlas.events import EventBus, IndexerBusyError, Topic, hold_indexer_lease
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
     FileScope,
@@ -241,15 +241,32 @@ class DaemonManager:
     ) -> None:
         """One delta index pass so changes made while the daemon was down get indexed.
 
+        Takes the indexer lease for the duration of the pass, same as the CLI's own
+        ``atlas index`` — without it, every MCP server session's auto-started catchup
+        races every other session's (and any concurrent CLI run's) directly against
+        Memgraph. ``defer_to_lease`` on the persistent consumers only protects the
+        live-event path; this inline pass calls the same orchestrator functions the
+        CLI does and was never gated the same way. Multiple sessions racing here is
+        exactly the "two processes writing the same nodes" scenario the lease exists
+        to prevent (see ``hold_indexer_lease``'s docstring) — it surfaced as Memgraph
+        MVCC conflicts and a 60s write timeout that killed an indexing run outright.
+
         *first_index_ready* (if given) is set in the ``finally`` block regardless of
-        outcome — both success and the swallowed-failure path below must unblock a
-        caller waiting on it (MCP's first-index readiness gate), never hang forever.
+        outcome — both success and the swallowed-failure/busy path below must unblock
+        a caller waiting on it (MCP's first-index readiness gate), never hang forever.
         """
         try:
-            if detect_sub_projects(settings.project_root, settings.monorepo):
-                await index_monorepo(settings, graph, bus)
-            else:
-                await index_project(settings, graph, bus)
+            async with hold_indexer_lease(bus):
+                if detect_sub_projects(settings.project_root, settings.monorepo):
+                    await index_monorepo(settings, graph, bus)
+                else:
+                    await index_project(settings, graph, bus)
+        except IndexerBusyError as exc:
+            logger.info(
+                "Skipping startup catch-up — another indexer already holds the lease "
+                "({}); live events will still be consumed once it finishes",
+                exc.holder,
+            )
         except Exception:
             logger.exception("Startup catch-up index failed — continuing with live events only")
         finally:

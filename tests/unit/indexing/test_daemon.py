@@ -76,11 +76,12 @@ class FakeWatcher:
 
 
 class FakeBus:
-    """EventBus stand-in that always pings OK."""
+    """EventBus stand-in that always pings OK, with an in-memory indexer lease."""
 
     def __init__(self, settings: object, *, project_name: str = "") -> None:
         self.project_name = project_name
         self.group_info: dict[str, dict[str, int | None]] = {}
+        self._lease_holder: str | None = None
 
     async def ping(self) -> bool:
         return True
@@ -90,6 +91,24 @@ class FakeBus:
 
     async def stream_group_info_multi(self, queries: list[tuple[Any, str]]) -> list[dict[str, int | None]]:
         return [self.group_info.get(group, {"pending": 0, "lag": 0}) for _topic, group in queries]
+
+    async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        if self._lease_holder is not None:
+            return False
+        self._lease_holder = owner
+        return True
+
+    async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        return self._lease_holder == owner
+
+    async def release_indexer_lease(self, owner: str) -> bool:
+        if self._lease_holder != owner:
+            return False
+        self._lease_holder = None
+        return True
+
+    async def read_indexer_lease(self) -> str | None:
+        return self._lease_holder
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +319,46 @@ class TestStartupCatchup:
 
         # Consumers still started despite the catch-up failure
         assert "consumer-run" in patched_daemon["order"]
+
+        await manager.stop()
+
+    async def test_catchup_holds_and_releases_lease(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
+        """A successful catch-up must not leave the lease held afterwards."""
+        manager = DaemonManager()
+        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False)  # type: ignore[arg-type]
+        assert started is True
+        await asyncio.sleep(0.05)
+
+        assert "catchup-project" in patched_daemon["order"]
+        assert manager.bus._lease_holder is None  # type: ignore[union-attr]
+
+        await manager.stop()
+
+    async def test_catchup_skips_when_lease_held_by_another_process(
+        self, tmp_path: Path, patched_daemon: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A foreign indexer lease (peer daemon or a running CLI index) must stop this
+        catch-up rather than race it straight into Memgraph -- the exact multi-session
+        collision the lease exists to prevent (see hold_indexer_lease's docstring)."""
+
+        class BusyFakeBus(FakeBus):
+            def __init__(self, settings: object, *, project_name: str = "") -> None:
+                super().__init__(settings, project_name=project_name)
+                self._lease_holder = "peer-host:999:deadbeef"
+
+        monkeypatch.setattr("code_atlas.backends.EventBus", BusyFakeBus)
+
+        manager = DaemonManager()
+        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False)  # type: ignore[arg-type]
+        assert started is True
+        await asyncio.sleep(0.05)
+
+        order = patched_daemon["order"]
+        assert "catchup-project" not in order
+        assert "catchup-monorepo" not in order
+        # Live-event consumption still starts -- it'll pick up work once the peer
+        # holding the lease finishes, via the stream rather than this inline pass.
+        assert "consumer-run" in order
 
         await manager.stop()
 
