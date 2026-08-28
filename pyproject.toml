@@ -230,6 +230,16 @@ allow_zero_version = true       # project is 0.x
 major_on_zero = false            # breaking changes bump minor while 0.x
 tag_format = "v{version}"       # matches existing v0.1.0, v0.1.1, v0.1.2
 
+# semantic-release owns `project.version` but has no idea uv.lock records that same
+# version for the editable root package, so the lock drifted 0.4.1 -> 0.7.0 -> 0.8.4 and
+# was caught by hand twice (b3fca33, 73dd4a6). `build_command` runs after the bump and
+# before the release commit; `assets` puts the result in that commit (`git add CHANGELOG.md
+# pyproject.toml uv.lock`) and, as a side effect, attaches it to the GitHub Release --
+# which is the exact resolved dependency set for that version, so it is worth having.
+# Not `--upgrade`: the only thing that must change is the version the lock already pins.
+build_command = "uv lock"
+assets = ["uv.lock"]
+
 [tool.semantic_release.branches.main]
 match = "^(main|master)$"
 prerelease = false
