@@ -1540,11 +1540,15 @@ class GraphClient:
         elif stored == SCHEMA_VERSION:
             logger.debug("Schema v{} already current — no migration needed", SCHEMA_VERSION)
             await self._reconcile_search_indices()
+            # Not covered by the migration chain: a stale writer can strip the invariant
+            # back off *after* the migration ran. See _reconcile_marker_labels.
+            await self._reconcile_marker_labels()
 
         elif stored < SCHEMA_VERSION:
             logger.info("Migrating schema v{} → v{}", stored, SCHEMA_VERSION)
             await self._migrate_indices()
             await self._run_data_migrations(stored)
+            await self._reconcile_marker_labels()
             await self._set_schema_version(SCHEMA_VERSION)
             logger.info("Schema migrated to v{}", SCHEMA_VERSION)
 
@@ -5654,6 +5658,42 @@ class GraphClient:
             "C++ functions and Ruby singleton methods stop sharing one node"
         )
 
+    async def _reconcile_marker_labels(self) -> int:
+        """Stamp :Entity onto any entity node missing it. Returns the number healed.
+
+        This is a *reconcile*, not a migration, because the invariant it restores can be
+        broken after the migration has already run. A writer executing code older than
+        the marker -- a daemon or ``atlas mcp`` process started before the deploy, which
+        keeps its modules in memory and keeps indexing -- creates nodes with no marker
+        against a database already at the current version. Nothing raises: the node is
+        written, and only the queries that match on :Entity quietly stop seeing it.
+
+        That is not hypothetical. It was found in this project's own production graph:
+        157 unmarked Callable/TypeDef/Value/Module/DocSection nodes at schema v14, whose
+        names were symbols added minutes earlier, written by an ``atlas mcp`` process
+        started the previous day. A one-shot migration cannot fix that, because by the
+        time the stale writer produces the node the migration has long since run.
+
+        One MATCH per label rather than a single ``WHERE any(...)`` pass: each label has
+        its own index, so the sweep is per-label rather than a scan of the whole graph.
+        Idempotent and cheap when there is no drift, which is the normal case.
+        """
+        healed = 0
+        for label in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value):
+            rows = await self.execute(
+                f"MATCH (n:{label}) WHERE NOT n:{NodeLabel.ENTITY} SET n:{NodeLabel.ENTITY} RETURN count(n) AS c"
+            )
+            healed += rows[0]["c"] if rows else 0
+        if healed:
+            logger.warning(
+                "Healed {} node(s) missing the :{} marker. This means something wrote to this graph "
+                "with code older than schema v13 -- check for a daemon or 'atlas mcp' process started "
+                "before the last deploy, and restart it; until then it keeps producing them.",
+                healed,
+                NodeLabel.ENTITY,
+            )
+        return healed
+
     async def _migrate_v13_add_entity_label(self) -> None:
         """v13: stamp :Entity onto every existing node in _ENTITY_LABELS.
 
@@ -5672,11 +5712,11 @@ class GraphClient:
         instead of being the second full scan this migration would otherwise
         need to fix the first one.
         """
-        for label in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value):
-            await self._execute_write_patient(f"MATCH (n:{label}) SET n:{NodeLabel.ENTITY}")
+        healed = await self._reconcile_marker_labels()
         logger.info(
-            "Schema v13: stamped :Entity on every existing entity node so uid-only "
-            "lookups can use an index instead of a full graph scan"
+            "Schema v13: stamped :Entity on {} existing entity node(s) so uid-only "
+            "lookups can use an index instead of a full graph scan",
+            healed,
         )
 
     async def _migrate_v14_trim_marker_indices(self) -> None:
