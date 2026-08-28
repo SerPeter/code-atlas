@@ -796,11 +796,20 @@ class SqliteGraphClient:
         self,
         project_name: str,
         file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+        *,
+        rels_only: bool = False,
     ) -> dict[str, UpsertResult]:
         if not file_data:
             return {}
         conn = await self._get_conn()
         async with self._write_lock:
+            if rels_only:
+                # See GraphClient.upsert_batch_entities for why this pass classifies to
+                # nothing and why new_file_paths is empty.
+                file_rels = {fp: rels for fp, (_entities, rels) in file_data.items()}
+                await self._recreate_batch_relationships(conn, project_name, file_rels, set())
+                await conn.commit()
+                return {}
             file_paths = list(file_data)
             old_data = await self._get_batch_file_content_hashes(conn, project_name, file_paths)
             classification = _classify_batch(old_data, file_data)

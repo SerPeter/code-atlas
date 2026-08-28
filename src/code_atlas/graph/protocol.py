@@ -73,6 +73,8 @@ if TYPE_CHECKING:
             self,
             project_name: str,
             file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+            *,
+            rels_only: bool = False,
         ) -> dict[str, UpsertResult]: ...
 
         async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]: ...

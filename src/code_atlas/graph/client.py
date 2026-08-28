@@ -1774,13 +1774,26 @@ class GraphClient:
         self,
         project_name: str,
         file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+        *,
+        rels_only: bool = False,
     ) -> dict[str, UpsertResult]:
         """Batched multi-file upsert using two sequential managed transactions.
 
         TX1 (Entity CRUD): batch hash read → classify → delete/create/update/positions.
         TX2 (Relationships): delete old rels → create new rels → INHERITS → DOCUMENTS.
 
-        Returns ``{file_path: UpsertResult}`` for each file in *file_data*.
+        Returns ``{file_path: UpsertResult}`` for each file in *file_data* -- empty when
+        *rels_only*, since no classification is performed.
+
+        *rels_only* skips the entity transaction entirely. The AST consumer calls this a
+        second time per batch, purely to re-write relationships for files whose detectors
+        emitted some -- passing the same ParsedEntity objects it just wrote. That pass
+        provably classifies to nothing: content_hash was advanced by the first call and
+        the entities are the identical objects, so added/modified/deleted and shifted are
+        all empty, and the transaction is one read plus a begin/commit that write nothing.
+        new_file_paths is empty by construction on that pass (every file now has prior
+        data), which is exactly what the relationship rewrite needs: delete first, for
+        every file, then recreate the merged set.
         """
         if not file_data:
             return {}
@@ -1807,25 +1820,29 @@ class GraphClient:
             finally:
                 _active_tx_var.reset(token)
 
-        async with self._driver.session() as session:
-            classification = await session.execute_write(_entity_tx)
+        if rels_only:
+            classification = None
+        else:
+            async with self._driver.session() as session:
+                classification = await session.execute_write(_entity_tx)
 
         # --- TX2: Relationships ---
         file_rels = {fp: rels for fp, (_, rels) in file_data.items()}
+        new_file_paths = set() if classification is None else classification.new_file_paths
 
         async def _rel_tx(tx: Any) -> None:
             token = _active_tx_var.set(tx)
             try:
-                await self._recreate_batch_relationships(
-                    project_name,
-                    file_rels,
-                    classification.new_file_paths,
-                )
+                await self._recreate_batch_relationships(project_name, file_rels, new_file_paths)
             finally:
                 _active_tx_var.reset(token)
 
         async with self._driver.session() as session:
             await session.execute_write(_rel_tx)
+
+        if classification is None:
+            logger.debug("Batch relationship rewrite for {} file(s)", len(file_data))
+            return {}
 
         total_added = sum(len(r.added) for r in classification.per_file_results.values())
         total_modified = sum(len(r.modified) for r in classification.per_file_results.values())

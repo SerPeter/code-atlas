@@ -1246,7 +1246,13 @@ class ASTConsumer(TierConsumer):
                             fp: (parsed_files[fp].entities, parsed_files[fp].non_import_rels + rels)
                             for fp, rels in det_rel_files.items()
                         }
-                        await self.graph.upsert_batch_entities(project_name, second_file_data)
+                        # rels_only: the entities are byte-identical to the ones step 3
+                        # just wrote, so the entity transaction would classify to nothing
+                        # and issue a read plus an empty begin/commit. The merge below is
+                        # load-bearing and unchanged -- TX2 deletes each file's whole rel
+                        # set before recreating it, so dropping non_import_rels here would
+                        # discard the parser rels written in step 3.
+                        await self.graph.upsert_batch_entities(project_name, second_file_data, rels_only=True)
 
                     # 5. Accumulate stats + entity refs from per-file results
                     for fp, pfd in parsed_files.items():
