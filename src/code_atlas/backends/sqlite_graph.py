@@ -3873,18 +3873,15 @@ class SqliteGraphClient:
         await cur.close()
         return [r[0] for r in rows]
 
-    async def get_note_embeddings(self) -> list[dict[str, Any]]:
+    async def get_notes_for_dedup(self) -> list[dict[str, Any]]:
         conn = await self._get_conn()
-        cur = await conn.execute(
-            "SELECT uid, project_name, embedding FROM nodes WHERE labels = 'Note' AND embedding IS NOT NULL"
-        )
+        cur = await conn.execute("SELECT uid, project_name, name, embedding FROM nodes WHERE labels = 'Note'")
         rows = await cur.fetchall()
         await cur.close()
         result: list[dict[str, Any]] = []
-        for uid, project_name, blob in rows:
-            count = len(blob) // 4
-            vector = list(struct.unpack(f"<{count}f", blob))
-            result.append({"uid": uid, "project_name": project_name, "embedding": vector})
+        for uid, project_name, name, blob in rows:
+            vector = list(struct.unpack(f"<{len(blob) // 4}f", blob)) if blob else None
+            result.append({"uid": uid, "project_name": project_name, "name": name, "embedding": vector})
         return result
 
     # -- Git signals write path (indexing/git_signals.py) -------------------------

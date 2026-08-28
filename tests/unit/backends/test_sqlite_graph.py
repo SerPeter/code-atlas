@@ -1146,8 +1146,14 @@ class TestGetInboxNotePaths:
         await client.close()
 
 
-class TestGetNoteEmbeddings:
-    async def test_returns_notes_with_embeddings_only(self, tmp_path: Path) -> None:
+class TestGetNotesForDedup:
+    async def test_returns_every_note_with_a_nullable_vector(self, tmp_path: Path) -> None:
+        """Unembedded notes must come back too.
+
+        They were filtered out when this only served the cosine scan, which meant a note
+        without a vector was invisible to duplicate detection entirely — and dropped
+        embeds make that common. Title blocking needs them (ATL-130).
+        """
         dim = 3
         client = SqliteGraphClient(tmp_path / "graph.sqlite3", dimension=dim)
         await client.ensure_schema()
@@ -1157,12 +1163,12 @@ class TestGetNoteEmbeddings:
         await client.upsert_file_entities("proj", "b.md", [without_emb], [])
         await client.write_embeddings([("proj:note:a", [1.0, 2.0, 3.0])])
 
-        rows = await client.get_note_embeddings()
+        rows = {r["uid"]: r for r in await client.get_notes_for_dedup()}
 
-        assert len(rows) == 1
-        assert rows[0]["uid"] == "proj:note:a"
-        assert rows[0]["project_name"] == "proj"
-        assert rows[0]["embedding"] == [1.0, 2.0, 3.0]
+        assert set(rows) == {"proj:note:a", "proj:note:b"}
+        assert rows["proj:note:a"]["embedding"] == [1.0, 2.0, 3.0]
+        assert rows["proj:note:b"]["embedding"] is None
+        assert rows["proj:note:a"]["name"] == "a"
         await client.close()
 
 

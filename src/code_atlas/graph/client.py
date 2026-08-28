@@ -5168,11 +5168,20 @@ class GraphClient:
         )
         return [r["file_path"] for r in records]
 
-    async def get_note_embeddings(self) -> list[dict[str, Any]]:
-        """uid/project_name/embedding for every Note with a stored vector — dream-mode similarity scan."""
+    async def get_notes_for_dedup(self) -> list[dict[str, Any]]:
+        """Every Note, with its name and its vector if it has one — dream-mode dedup scan.
+
+        Deliberately **not** filtered to notes that have an embedding. A note without a
+        vector was invisible to the old similarity scan entirely, and the embed pipeline
+        drops embeds often enough that this is common rather than exotic — so the exact
+        case where two notes share a title and one was never embedded, which is the
+        parallel-worktree duplicate, could not be detected at all. Title blocking needs
+        every note; the similarity pass skips the ones whose ``embedding`` is null.
+        """
         return await self.execute(
-            f"MATCH (n:{NodeLabel.NOTE}) WHERE n.embedding IS NOT NULL "
-            "RETURN n.uid AS uid, n.project_name AS project_name, n.embedding AS embedding"
+            f"MATCH (n:{NodeLabel.NOTE}) "
+            "RETURN n.uid AS uid, n.project_name AS project_name, n.name AS name, "
+            "n.embedding AS embedding"
         )
 
     async def write_git_file_signals(self, project_name: str, label: str, items: list[dict[str, Any]]) -> int:

@@ -18,6 +18,7 @@ from code_atlas.dream import (
     _cosine_similarity,
     _find_broken_anchors,
     _find_similar_pairs,
+    _fragmentation,
     _scan_vault_for_notes,
     render_home_md,
     report_to_dict,
@@ -127,32 +128,95 @@ class _FakeGraph:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    async def get_note_embeddings(self) -> list[dict[str, Any]]:
+    async def get_notes_for_dedup(self) -> list[dict[str, Any]]:
         return self._rows
 
     async def get_broken_anchor_notes(self) -> list[dict[str, Any]]:
         return self._rows
 
 
-async def test_find_similar_pairs_respects_threshold() -> None:
-    graph = _FakeGraph(
-        [
-            {"uid": "p:note:a", "project_name": "p", "embedding": [1.0, 0.0]},
-            {"uid": "p:note:b", "project_name": "p", "embedding": [1.0, 0.0]},
-            {"uid": "p:note:c", "project_name": "p", "embedding": [0.0, 1.0]},
-        ]
-    )
+def _row(slug: str, vec: list[float] | None, *, name: str | None = None, project: str = "p") -> dict[str, Any]:
+    return {
+        "uid": f"{project}:note:{slug}",
+        "project_name": project,
+        "name": name if name is not None else slug,
+        "embedding": vec,
+    }
 
-    pairs = await _find_similar_pairs(graph, threshold=0.9)  # type: ignore[arg-type]
+
+async def test_find_similar_pairs_respects_threshold() -> None:
+    graph = _FakeGraph([_row("a", [1.0, 0.0]), _row("b", [1.0, 0.0]), _row("c", [0.0, 1.0])])
+
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
 
     assert len(pairs) == 1
     assert {pairs[0].uid_a, pairs[0].uid_b} == {"p:note:a", "p:note:b"}
     assert pairs[0].similarity == pytest.approx(1.0)
 
 
+async def test_a_gray_zone_pair_lands_in_the_review_band_only() -> None:
+    """0.92 avoids false merge candidates, which is exactly why it hid the pairs worth
+    reviewing: same topic, different wording, 0.80-0.92."""
+    # cos ~= 0.8944 — between the two thresholds.
+    graph = _FakeGraph([_row("a", [1.0, 0.0]), _row("b", [2.0, 1.0])])
+
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+
+    assert len(pairs) == 1
+    assert pairs[0].band == "review"
+    assert pairs[0].match == "embedding"
+
+
+async def test_a_title_collision_surfaces_without_any_embedding() -> None:
+    """The parallel-worktree duplicate: the same note discovered twice, one copy never
+    embedded. Invisible to the cosine scan by construction."""
+    graph = _FakeGraph(
+        [
+            _row("flush-bug", None, name="Flush Bug", project="alpha"),
+            _row("flush-bug", None, name="flush_bug", project="beta"),
+        ]
+    )
+
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+
+    assert len(pairs) == 1
+    assert pairs[0].band == "merge"
+    assert pairs[0].match == "title"
+
+
+async def test_merge_band_sorts_ahead_of_review_band() -> None:
+    graph = _FakeGraph([_row("a", [1.0, 0.0]), _row("b", [1.0, 0.0]), _row("c", [2.0, 1.0])])
+
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+
+    assert [p.band for p in pairs] == ["merge", "review", "review"]
+
+
+async def test_fragmentation_collapses_a_cluster_into_one_concept() -> None:
+    """Three mutually-similar notes are one concept, not three — the headline number."""
+    merge_pairs = [
+        SimilarPair("u:a", "u:b", "p", "p", 0.99),
+        SimilarPair("u:b", "u:c", "p", "p", 0.98),
+    ]
+
+    frag = _fragmentation(10, merge_pairs)
+
+    assert frag.notes == 10
+    assert frag.concepts == 8  # 7 singletons + 1 cluster of 3
+    assert frag.clustered_notes == 3
+    assert frag.multi_note_clusters == 1
+
+
+async def test_fragmentation_of_a_clean_vault_is_one_concept_per_note() -> None:
+    frag = _fragmentation(5, [])
+
+    assert frag.concepts == 5
+    assert frag.ratio == 1.0
+
+
 async def test_find_similar_pairs_empty_when_no_rows() -> None:
     graph = _FakeGraph([])
-    pairs = await _find_similar_pairs(graph, threshold=0.9)  # type: ignore[arg-type]
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
     assert pairs == []
 
 

@@ -381,6 +381,11 @@ class TestKnowledgeHealth:
             "duplicate_ids",
             "dangling_links",
             "similar_pairs",
+            # Split out of similar_pairs so a consumer can tell a high-confidence
+            # merge from a gray-zone question without re-deriving the bands (ATL-130).
+            "merge_band",
+            "review_band",
+            "fragmentation",
             "promotion_candidates",
             "memory_index_issues",
             "broken_anchors",

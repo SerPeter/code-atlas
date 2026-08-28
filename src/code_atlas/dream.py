@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -31,7 +32,14 @@ if TYPE_CHECKING:
 # so an unresolved one is an expected heuristic-miss, not a lint finding.
 _LINK_REL_TYPES = frozenset({RelType.LINKS_TO, RelType.DERIVED_FROM, RelType.SUPERSEDES, RelType.CONTRADICTS})
 
-_DEFAULT_SIMILARITY_THRESHOLD = 0.92
+# Two thresholds, because one cannot serve two decisions. 0.92 is tuned to avoid
+# false merge candidates -- which means genuinely fragmented concepts sitting at
+# 0.80-0.92 (same topic, different wording) never surfaced at all. Lowering the
+# single threshold instead would flood the disposition table with noise and spend
+# LLM adjudication on obvious non-pairs. So: a high-confidence merge band, and a
+# gray zone that is the only thing needing judgement.
+_DEFAULT_SIMILARITY_MERGE = 0.92
+_DEFAULT_SIMILARITY_REVIEW = 0.80
 
 
 @dataclass(frozen=True)
@@ -83,13 +91,38 @@ class BrokenAnchor:
 
 @dataclass(frozen=True)
 class SimilarPair:
-    """Two notes whose embeddings are highly similar — merge/dup candidates."""
+    """Two notes that may be the same concept — merge/dup candidates."""
 
     uid_a: str
     uid_b: str
     project_a: str
     project_b: str
     similarity: float
+    # "merge" -- high confidence, defaults to MERGE with a human confirming.
+    # "review" -- the gray zone, and the only band worth spending judgement on.
+    band: str = "merge"
+    # "embedding" or "title". A title collision is not a similarity score, and
+    # reporting 1.0 for one would claim a measurement that was never made.
+    match: str = "embedding"
+
+
+@dataclass(frozen=True)
+class Fragmentation:
+    """How splintered the vault is: N notes forming M distinct concepts.
+
+    The leading indicator. If resolution is poor everything downstream inherits it,
+    and a pair list alone never says whether the vault is getting better or worse.
+    """
+
+    notes: int
+    concepts: int
+    clustered_notes: int
+    multi_note_clusters: int
+
+    @property
+    def ratio(self) -> float:
+        """Concepts per note. 1.0 is perfectly resolved; lower means more splintering."""
+        return round(self.concepts / self.notes, 4) if self.notes else 1.0
 
 
 @dataclass(frozen=True)
@@ -103,6 +136,7 @@ class DreamReport:
     dangling_links: list[DanglingLink]
     similar_pairs: list[SimilarPair]
     promotion_candidates: list[SimilarPair]
+    fragmentation: Fragmentation = field(default_factory=lambda: Fragmentation(0, 0, 0, 0))
     broken_anchors: list[BrokenAnchor] = field(default_factory=list)
     memory_index_issues: list[str] = field(default_factory=list)
 
@@ -228,31 +262,132 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-async def _find_similar_pairs(graph: GraphBackend, threshold: float) -> list[SimilarPair]:
-    """All-pairs cosine similarity over Note embeddings.
+_TITLE_NOISE = re.compile(r"[^a-z0-9]+")
 
-    O(N^2) in note count — acceptable for a periodic lint report over a
-    knowledge vault (not a hot query path); Memgraph's vector_search is a
-    KNN-for-one-query-vector primitive, not an all-pairs one, so pulling
-    every embedding once and comparing in Python is the simpler v1 approach.
+
+def _normalize_title(name: str) -> str:
+    """Case- and punctuation-folded title, for exact-collision blocking."""
+    return _TITLE_NOISE.sub("-", name.strip().lower()).strip("-")
+
+
+def _title_collisions(rows: list[dict[str, Any]]) -> list[SimilarPair]:
+    """Notes sharing a normalized title, grouped by hash rather than compared pairwise.
+
+    Cheap on purpose: this must not add a second O(N^2) pass. It also runs on notes
+    that have **no vector**, which is the whole point — an unembedded note is invisible
+    to the cosine scan, so the parallel-worktree duplicate (same note discovered twice,
+    one copy never embedded) could not be found at all before.
     """
-    rows = await graph.get_note_embeddings()
+    by_title: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        title = _normalize_title(str(row.get("name") or ""))
+        if title:
+            by_title[title].append(row)
+
     pairs: list[SimilarPair] = []
-    for i in range(len(rows)):
-        for j in range(i + 1, len(rows)):
-            a, b = rows[i], rows[j]
-            similarity = _cosine_similarity(a["embedding"], b["embedding"])
-            if similarity >= threshold:
+    for group in by_title.values():
+        if len(group) < 2:
+            continue
+        ordered = sorted(group, key=lambda r: r["uid"])
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                a, b = ordered[i], ordered[j]
                 pairs.append(
                     SimilarPair(
                         uid_a=a["uid"],
                         uid_b=b["uid"],
                         project_a=a["project_name"],
                         project_b=b["project_name"],
-                        similarity=round(similarity, 4),
+                        # Not a similarity score. An exact title collision is a
+                        # different kind of evidence, and reporting 1.0 would claim a
+                        # measurement nobody made.
+                        similarity=1.0,
+                        band="merge",
+                        match="title",
                     )
                 )
-    pairs.sort(key=lambda p: p.similarity, reverse=True)
+    return pairs
+
+
+def _fragmentation(note_count: int, merge_pairs: list[SimilarPair]) -> Fragmentation:
+    """Union-find over the merge band: N notes collapse into M concepts."""
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for pair in merge_pairs:
+        union(pair.uid_a, pair.uid_b)
+
+    clusters: dict[str, set[str]] = defaultdict(set)
+    for uid in parent:
+        clusters[find(uid)].add(uid)
+    multi = [c for c in clusters.values() if len(c) > 1]
+    clustered = sum(len(c) for c in multi)
+    # Every note outside a multi-note cluster is its own concept.
+    concepts = (note_count - clustered) + len(multi)
+    return Fragmentation(
+        notes=note_count,
+        concepts=concepts,
+        clustered_notes=clustered,
+        multi_note_clusters=len(multi),
+    )
+
+
+async def _find_similar_pairs(
+    graph: GraphBackend, merge_threshold: float, review_threshold: float
+) -> list[SimilarPair]:
+    """Candidate duplicate pairs, split into a merge band and a review band.
+
+    Two sources of evidence. Cosine similarity over stored vectors, banded by the two
+    thresholds; and exact normalized-title collisions, which land in the merge band and
+    work without vectors at all.
+
+    O(N^2) over the embedded notes — acceptable for a periodic lint report, not a hot
+    query path; Memgraph's vector_search is a KNN-for-one-vector primitive, not an
+    all-pairs one, so pulling every vector once and comparing in Python stays simpler.
+    The title pass is hash-grouped and adds no second quadratic sweep.
+    """
+    rows = await graph.get_notes_for_dedup()
+    embedded = [r for r in rows if r.get("embedding")]
+
+    seen: set[tuple[str, str]] = set()
+    pairs: list[SimilarPair] = []
+    for pair in _title_collisions(rows):
+        seen.add((pair.uid_a, pair.uid_b))
+        pairs.append(pair)
+
+    for i in range(len(embedded)):
+        for j in range(i + 1, len(embedded)):
+            a, b = embedded[i], embedded[j]
+            key = (a["uid"], b["uid"]) if a["uid"] < b["uid"] else (b["uid"], a["uid"])
+            if key in seen:
+                continue  # already a title collision; that evidence is stronger
+            similarity = _cosine_similarity(a["embedding"], b["embedding"])
+            if similarity < review_threshold:
+                continue
+            seen.add(key)
+            pairs.append(
+                SimilarPair(
+                    uid_a=a["uid"],
+                    uid_b=b["uid"],
+                    project_a=a["project_name"],
+                    project_b=b["project_name"],
+                    similarity=round(similarity, 4),
+                    band="merge" if similarity >= merge_threshold else "review",
+                    match="embedding",
+                )
+            )
+    pairs.sort(key=lambda p: (p.band != "merge", -p.similarity))
     return pairs
 
 
@@ -265,7 +400,8 @@ async def build_dream_report(
     graph: GraphBackend,
     vault_roots: list[VaultRoot],
     *,
-    similarity_threshold: float = _DEFAULT_SIMILARITY_THRESHOLD,
+    similarity_merge: float = _DEFAULT_SIMILARITY_MERGE,
+    similarity_review: float = _DEFAULT_SIMILARITY_REVIEW,
 ) -> DreamReport:
     """Compute the deterministic dream-mode lint report.
 
@@ -291,8 +427,12 @@ async def build_dream_report(
     orphan_notes = await _find_orphan_notes(graph)
     broken_anchors = await _find_broken_anchors(graph)
     inbox_count, inbox_paths = await _find_inbox_notes(graph)
-    similar_pairs = await _find_similar_pairs(graph, similarity_threshold)
+    similar_pairs = await _find_similar_pairs(graph, similarity_merge, similarity_review)
     promotion_candidates = [p for p in similar_pairs if p.project_a != p.project_b]
+    # Fragmentation counts only the merge band: a gray-zone pair is a question, and
+    # collapsing questions into concepts would report a resolution nobody made.
+    all_notes = await graph.get_notes_for_dedup()
+    fragmentation = _fragmentation(len(all_notes), [p for p in similar_pairs if p.band == "merge"])
 
     return DreamReport(
         inbox_count=inbox_count,
@@ -302,6 +442,7 @@ async def build_dream_report(
         dangling_links=dangling_links,
         similar_pairs=similar_pairs,
         promotion_candidates=promotion_candidates,
+        fragmentation=fragmentation,
         broken_anchors=broken_anchors,
         memory_index_issues=memory_index_issues,
     )
@@ -318,6 +459,33 @@ def _render_list(items: list[str], *, empty: str = "_(none)_") -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def _band(report: DreamReport, band: str) -> list[SimilarPair]:
+    return [p for p in report.similar_pairs if p.band == band]
+
+
+def _render_pair(pair: SimilarPair) -> str:
+    """A pair line that says what kind of evidence put it there."""
+    if pair.match == "title":
+        return f"{pair.uid_a} ~ {pair.uid_b} (identical title)"
+    return f"{pair.uid_a} ~ {pair.uid_b} ({pair.similarity})"
+
+
+def render_fragmentation(frag: Fragmentation) -> str:
+    """The headline number: how splintered the vault is, in one line.
+
+    The trend across cycles is the point, not the absolute value — a pair list never
+    says whether things are getting better or worse.
+    """
+    if not frag.notes:
+        return "Fragmentation: no notes indexed"
+    detail = (
+        f" ({frag.clustered_notes} notes in {frag.multi_note_clusters} multi-note clusters)"
+        if frag.multi_note_clusters
+        else " (no duplicate clusters)"
+    )
+    return f"Fragmentation: {frag.notes} notes, {frag.concepts} concepts{detail}"
+
+
 def render_home_md(report: DreamReport) -> str:
     """Render the vault landing page — inbox digest, lint findings, hubs.
 
@@ -328,6 +496,11 @@ def render_home_md(report: DreamReport) -> str:
         "# Knowledge Vault — Home",
         "",
         "_Generated by `atlas dream` — do not edit directly._",
+        "",
+        # Leads the report on purpose: resolution is the leading indicator. If the
+        # vault is splintering, everything downstream of retrieval inherits it, and a
+        # list of pairs never says whether that is getting better or worse.
+        f"**{render_fragmentation(report.fragmentation)}**",
         "",
         f"## Inbox ({report.inbox_count})",
         "",
@@ -353,7 +526,16 @@ def render_home_md(report: DreamReport) -> str:
         "",
         f"## Similar note pairs ({len(report.similar_pairs)})",
         "",
-        _render_list([f"{p.uid_a} ~ {p.uid_b} ({p.similarity})" for p in report.similar_pairs]),
+        # Merge band first: it is the actionable half. The review band is where
+        # judgement is actually needed, and separating them is what keeps the
+        # adjudication cost proportional to the ambiguity rather than the volume.
+        f"### Merge band ({len(_band(report, 'merge'))}) — high confidence",
+        "",
+        _render_list([_render_pair(p) for p in _band(report, "merge")]),
+        "",
+        f"### Review band ({len(_band(report, 'review'))}) — needs judgement",
+        "",
+        _render_list([_render_pair(p) for p in _band(report, "review")]),
         "",
         f"## Promotion candidates ({len(report.promotion_candidates)})",
         "",
@@ -376,7 +558,12 @@ def report_to_dict(report: DreamReport) -> dict[str, Any]:
         "duplicate_ids": [vars(d) for d in report.duplicate_ids],
         "dangling_links": [vars(d) for d in report.dangling_links],
         "broken_anchors": [vars(b) for b in report.broken_anchors],
+        # `vars` already carries `band` and `match`, so a consumer can tell a
+        # high-confidence merge from a gray-zone question without re-deriving it.
         "similar_pairs": [vars(p) for p in report.similar_pairs],
+        "merge_band": [vars(p) for p in report.similar_pairs if p.band == "merge"],
+        "review_band": [vars(p) for p in report.similar_pairs if p.band == "review"],
         "promotion_candidates": [vars(p) for p in report.promotion_candidates],
+        "fragmentation": {**vars(report.fragmentation), "ratio": report.fragmentation.ratio},
         "memory_index_issues": report.memory_index_issues,
     }
