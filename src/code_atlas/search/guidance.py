@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any
 
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import NodeLabel, RelType, primary_label_expr
 from code_atlas.search.engine import analyze_query
 
 if TYPE_CHECKING:
@@ -95,7 +95,7 @@ CYPHER_EXAMPLES: list[dict[str, str]] = [
         "description": "Module imports (internal and external)",
         "query": (
             "MATCH (m:Module {name: $name})-[:IMPORTS]->(dep) "
-            "RETURN dep.name, dep.qualified_name, labels(dep)[0] AS type"
+            f"RETURN dep.name, dep.qualified_name, {primary_label_expr('dep')} AS type"
         ),
     },
     {
@@ -106,7 +106,7 @@ CYPHER_EXAMPLES: list[dict[str, str]] = [
         "description": "All entities in a file",
         "query": (
             "MATCH (n) WHERE n.file_path = $path "
-            "RETURN n.name, n.qualified_name, labels(n)[0] AS label, n.kind ORDER BY n.line_start"
+            f"RETURN n.name, n.qualified_name, {primary_label_expr('n')} AS label, n.kind ORDER BY n.line_start"
         ),
     },
     {
@@ -114,13 +114,14 @@ CYPHER_EXAMPLES: list[dict[str, str]] = [
         "query": (
             "MATCH (m:Module {name: $name})-[r:IMPORTS]->(dep) "
             "WHERE r.type_only = true "
-            "RETURN dep.name, dep.qualified_name, labels(dep)[0] AS type"
+            f"RETURN dep.name, dep.qualified_name, {primary_label_expr('dep')} AS type"
         ),
     },
     {
         "description": "Find types used by a function (annotation references)",
         "query": (
-            "MATCH (f:Callable {name: $name})-[:USES_TYPE]->(t) RETURN t.name, t.qualified_name, labels(t)[0] AS label"
+            f"MATCH (f:Callable {{name: $name}})-[:USES_TYPE]->(t) "
+            f"RETURN t.name, t.qualified_name, {primary_label_expr('t')} AS label"
         ),
     },
     {

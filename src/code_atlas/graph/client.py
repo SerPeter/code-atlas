@@ -38,6 +38,7 @@ from code_atlas.schema import (
     TypeDefKind,
     env_var_uid,
     generate_composite_index_ddl,
+    generate_drop_redundant_marker_ddl,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
@@ -45,6 +46,7 @@ from code_atlas.schema import (
     generate_text_index_ddl,
     generate_unique_constraint_ddl,
     generate_vector_index_ddl,
+    primary_label_expr,
     resource_file_uid,
 )
 from code_atlas.search.engine import matches_test_pattern
@@ -1559,7 +1561,7 @@ class GraphClient:
             f"MATCH (n {{project_name: $p, file_path: $f}}) "
             f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
             "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le, "
-            "n.signature AS sig, n.docstring AS doc, labels(n)[0] AS lbl",
+            f"n.signature AS sig, n.docstring AS doc, {primary_label_expr('n')} AS lbl",
             {"p": project_name, "f": file_path},
         )
         return {
@@ -1581,7 +1583,7 @@ class GraphClient:
             f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
             "RETURN n.file_path AS fp, n.uid AS uid, n.content_hash AS hash, "
             "n.line_start AS ls, n.line_end AS le, "
-            "n.signature AS sig, n.docstring AS doc, labels(n)[0] AS lbl",
+            f"n.signature AS sig, n.docstring AS doc, {primary_label_expr('n')} AS lbl",
             {"p": project_name, "fps": file_paths},
         )
         result: dict[str, dict[str, EntityHashData]] = defaultdict(dict)
@@ -2028,7 +2030,7 @@ class GraphClient:
             f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
             f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
             f"AND NOT n:{NodeLabel.SCHEMA_VERSION} AND NOT n:{NodeLabel.PROJECT} "
-            "RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp, labels(n)[0] AS lbl",
+            f"RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp, {primary_label_expr('n')} AS lbl",
             {"p": project_name},
         )
         internal_map: dict[str, str] = {}
@@ -2040,12 +2042,13 @@ class GraphClient:
         # A uid missing here is safe — `_write_labelled_edges` falls back to the
         # unlabelled form for its group.
         #
-        # `labels(n)[0]` is exact only because a node carries exactly one label.
-        # That invariant is already load-bearing across the read surface (every
-        # `labels(n)[0] AS label` in this file returns a node's type), and it is
-        # why a shared marker label cannot be added to make these lookups
-        # uniformly indexable: a second label would make the choice arbitrary
-        # here, and would silently drop the edge rather than merely slow it down.
+        # The label must be the node's own, not the :Entity marker every node also
+        # carries, so this reads `primary_label_expr` rather than `labels(n)[0]`.
+        # Memgraph returns labels in write order, so `[0]` happens to be right for
+        # nodes written primary-label-first and silently wrong for any that are
+        # not -- and here "wrong" means a group matched on `:Entity` instead of the
+        # real label. That still writes the edge (the marker is on the node too),
+        # but it gives back the whole-graph scan this grouping exists to avoid.
         uid_label: dict[str, str] = {}
         for r in records:
             internal_map[r["qn"]] = r["uid"]
@@ -2610,7 +2613,7 @@ class GraphClient:
         records = await self.execute(
             f"MATCH (n {{project_name: $p}}) "
             f"WHERE n:{NodeLabel.DOC_FILE} OR n:{NodeLabel.DOC_SECTION} OR n:{NodeLabel.NOTE} "
-            "RETURN labels(n)[0] AS label, n.uid AS uid, n.name AS name, n.file_path AS fp, "
+            f"RETURN {primary_label_expr('n')} AS label, n.uid AS uid, n.name AS name, n.file_path AS fp, "
             "n.header_level AS lvl",
             {"p": project_name},
         )
@@ -2714,7 +2717,7 @@ class GraphClient:
             records = await self.execute(
                 "MATCH (n {project_name: $p}) "
                 "WHERE n.unresolved_citations IS NOT NULL AND size(n.unresolved_citations) > 0 "
-                "RETURN n.uid AS uid, n.citations AS citations, labels(n)[0] AS lbl",
+                f"RETURN n.uid AS uid, n.citations AS citations, {primary_label_expr('n')} AS lbl",
                 {"p": project_name},
             )
             for r in records:
@@ -3584,7 +3587,7 @@ class GraphClient:
             "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
             "n.source AS source, n.tags AS tags, "
-            "n.kind AS kind, labels(n)[0] AS _label, "
+            f"n.kind AS kind, {primary_label_expr('n')} AS _label, "
             "n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding"
         )
 
@@ -3670,7 +3673,7 @@ class GraphClient:
         labels = "|".join(sorted(lbl.value for lbl in _EMBEDDABLE_LABELS))
         rows = await self.execute(
             f"MATCH (n:{labels}) WHERE n.project_name = $project AND n.embedding IS NULL AND n.uid IS NOT NULL "
-            "RETURN n.uid AS uid, labels(n)[0] AS label, n.file_path AS file_path LIMIT $limit",
+            f"RETURN n.uid AS uid, {primary_label_expr('n')} AS label, n.file_path AS file_path LIMIT $limit",
             {"project": project_name, "limit": limit},
         )
         return [(r["uid"], r["label"], r["file_path"] or "") for r in rows]
@@ -4167,7 +4170,7 @@ class GraphClient:
             f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
             "WHERE affected.uid <> $uid "
             "RETURN affected.uid AS uid, affected.name AS name, affected.qualified_name AS qn, "
-            "labels(affected)[0] AS label, affected.file_path AS file_path, "
+            f"{primary_label_expr('affected')} AS label, affected.file_path AS file_path, "
             "min(length(p)) AS min_depth, "
             f"max(reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}))) "
             "AS confidence_score, "
@@ -4228,7 +4231,7 @@ class GraphClient:
         counts_raw = await self.execute(
             f"MATCH (n {{project_name: $project}}) "
             f"WHERE NOT n:Project AND NOT n:SchemaVersion{pa} "
-            "RETURN labels(n)[0] AS label, n.kind AS kind, count(n) AS cnt "
+            f"RETURN {primary_label_expr('n')} AS label, n.kind AS kind, count(n) AS cnt "
             "ORDER BY cnt DESC",
             params,
         )
@@ -4266,7 +4269,7 @@ class GraphClient:
         hubs_raw = await self.execute(
             "MATCH (n {project_name: $project})<-[r:IMPORTS|INHERITS|CALLS]-(src) "
             f"WHERE NOT n:ExternalPackage AND NOT n:ExternalSymbol{pa} "
-            "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
+            f"RETURN n.name AS name, n.qualified_name AS qn, {primary_label_expr('n')} AS label, "
             "n.kind AS kind, n.file_path AS file_path, "
             "count(r) AS in_degree, "
             "sum(CASE WHEN type(r) = 'IMPORTS' THEN 1 ELSE 0 END) AS imported_by, "
@@ -4292,7 +4295,7 @@ class GraphClient:
             # a label-only filter would report every one of them as a leaf.
             "AND NOT n:EnvVar AND NOT n:ResourceFile "
             "AND NOT ()-[:IMPORTS|INHERITS|CALLS]->(n) "
-            "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
+            f"RETURN n.name AS name, n.qualified_name AS qn, {primary_label_expr('n')} AS label, "
             f"n.kind AS kind, n.file_path AS file_path LIMIT {limit}",
             params,
         )
@@ -4500,7 +4503,7 @@ class GraphClient:
             # the concrete method TO the stub. Sampling the output found the top 10 hits
             # were all this one class — 16 of 77 — reachable and reported dead.
             f"AND NOT (n)-[:{RelType.IMPLEMENTS}]->() "
-            "RETURN n.name AS name, n.qualified_name AS qn, labels(n)[0] AS label, "
+            f"RETURN n.name AS name, n.qualified_name AS qn, {primary_label_expr('n')} AS label, "
             "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start "
             "ORDER BY n.file_path, n.line_start",
             params,
@@ -4563,7 +4566,7 @@ class GraphClient:
             "MATCH (pkg:Package {project_name: $project})-[:CONTAINS]->(child) "
             f"WHERE (child:Package OR child:Module){pa} "
             "RETURN pkg.qualified_name AS parent_qn, pkg.name AS parent_name, "
-            "labels(child)[0] AS child_label, child.qualified_name AS child_qn, child.name AS child_name "
+            f"{primary_label_expr('child')} AS child_label, child.qualified_name AS child_qn, child.name AS child_name "
             "ORDER BY parent_qn, child_qn LIMIT $limit",
             params,
         )
@@ -4600,7 +4603,7 @@ class GraphClient:
         mod = modules[0]
         entities = await self.execute(
             "MATCH (m {uid: $uid})-[:DEFINES]->(e) "
-            "RETURN e.name AS name, e.qualified_name AS qn, labels(e)[0] AS label, "
+            f"RETURN e.name AS name, e.qualified_name AS qn, {primary_label_expr('e')} AS label, "
             f"e.kind AS kind, e.visibility AS vis, e.signature AS sig ORDER BY e.line_start LIMIT {max_nodes}",
             {"uid": mod["uid"]},
         )
@@ -4650,7 +4653,7 @@ class GraphClient:
             f"WHERE (e:{NodeLabel.TYPE_DEF} OR e:{NodeLabel.CALLABLE} OR e:{NodeLabel.VALUE}) "
             "AND e.file_path STARTS WITH $path "
             f"OPTIONAL MATCH (p)-[:{RelType.DEFINES}]->(e) "
-            "RETURN e.uid AS uid, e.name AS name, e.qualified_name AS qn, labels(e)[0] AS label, "
+            f"RETURN e.uid AS uid, e.name AS name, e.qualified_name AS qn, {primary_label_expr('e')} AS label, "
             "e.kind AS kind, e.visibility AS vis, e.signature AS sig, e.docstring AS docstring, "
             "e.line_start AS line_start, e.line_end AS line_end, e.file_path AS file_path, "
             "p.qualified_name AS parent_qn ORDER BY e.file_path, e.line_start LIMIT $limit",
@@ -4670,7 +4673,7 @@ class GraphClient:
             "WHERE b.file_path STARTS WITH $path "
             "AND (a.file_path IS NULL OR NOT a.file_path STARTS WITH $path) "
             "RETURN a.qualified_name AS from_qn, a.name AS from_name, a.file_path AS from_path, "
-            "labels(a)[0] AS from_label, b.qualified_name AS to_qn, type(r) AS rel_type, "
+            f"{primary_label_expr('a')} AS from_label, b.qualified_name AS to_qn, type(r) AS rel_type, "
             "properties(r) AS props ORDER BY rel_type, to_qn, from_qn LIMIT $edge_limit",
             params,
         )
@@ -4679,14 +4682,14 @@ class GraphClient:
             "WHERE a.file_path STARTS WITH $path "
             "AND (b.file_path IS NULL OR NOT b.file_path STARTS WITH $path) "
             "RETURN a.qualified_name AS from_qn, b.qualified_name AS to_qn, b.name AS to_name, "
-            "b.file_path AS to_path, labels(b)[0] AS to_label, type(r) AS rel_type, "
+            f"b.file_path AS to_path, {primary_label_expr('b')} AS to_label, type(r) AS rel_type, "
             "properties(r) AS props ORDER BY rel_type, from_qn, to_qn LIMIT $edge_limit",
             params,
         )
         docs = await self.execute(
             f"MATCH (d)-[r:{RelType.DOCUMENTS}]->(e {{project_name: $project}}) "
             "WHERE e.file_path STARTS WITH $path "
-            "RETURN d.qualified_name AS doc_qn, d.name AS doc_name, labels(d)[0] AS doc_label, "
+            f"RETURN d.qualified_name AS doc_qn, d.name AS doc_name, {primary_label_expr('d')} AS doc_label, "
             "e.qualified_name AS to_qn, r.link_type AS link_type ORDER BY to_qn, doc_qn LIMIT $limit",
             params,
         )
@@ -4811,7 +4814,9 @@ class GraphClient:
 
     async def get_label_counts(self) -> dict[str, int]:
         """Per-label node counts across the whole graph — ``index_status``."""
-        records = await self.execute("MATCH (n) RETURN labels(n)[0] AS label, count(n) AS count ORDER BY count DESC")
+        records = await self.execute(
+            f"MATCH (n) RETURN {primary_label_expr('n')} AS label, count(n) AS count ORDER BY count DESC"
+        )
         return {r["label"]: r["count"] for r in records}
 
     async def get_project_dependency_edges(self) -> list[dict[str, Any]]:
@@ -5586,6 +5591,7 @@ class GraphClient:
             (11, self._migrate_v11_clear_for_call_site_lines),
             (12, self._migrate_v12_clear_for_uid_discriminators),
             (13, self._migrate_v13_add_entity_label),
+            (14, self._migrate_v14_trim_marker_indices),
         )
         for threshold, migrate in migrations:
             if stored < threshold:
@@ -5666,11 +5672,28 @@ class GraphClient:
         instead of being the second full scan this migration would otherwise
         need to fix the first one.
         """
-        for label in sorted(_ENTITY_LABELS - {NodeLabel.ENTITY}, key=lambda lbl: lbl.value):
+        for label in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value):
             await self._execute_write_patient(f"MATCH (n:{label}) SET n:{NodeLabel.ENTITY}")
         logger.info(
             "Schema v13: stamped :Entity on every existing entity node so uid-only "
             "lookups can use an index instead of a full graph scan"
+        )
+
+    async def _migrate_v14_trim_marker_indices(self) -> None:
+        """v14: drop the :Entity indices and constraints v13 created that nothing queries.
+
+        v13 made the marker a member of _ENTITY_LABELS, so it inherited the full
+        entity index and constraint set -- nine index structures and three
+        constraint checks on a label carried by every node in the graph, which is
+        write cost on every write for a label that exists to reduce write cost.
+        Only :Entity(uid) and :Entity(project_name, name) are ever queried; see
+        generate_drop_redundant_marker_ddl for what goes and why.
+        """
+        for stmt in generate_drop_redundant_marker_ddl():
+            await self._exec_ddl(stmt)
+        logger.info(
+            "Schema v14: dropped the :Entity indices and constraints nothing queries, "
+            "leaving the two the marker exists for"
         )
 
     async def _set_schema_version(self, version: int) -> None:

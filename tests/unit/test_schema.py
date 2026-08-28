@@ -21,6 +21,7 @@ from code_atlas.schema import (
     UNIQUE_CONSTRAINTS,
     NodeLabel,
     generate_composite_index_ddl,
+    generate_drop_redundant_marker_ddl,
     generate_drop_text_index_ddl,
     generate_drop_vector_index_ddl,
     generate_existence_constraint_ddl,
@@ -28,6 +29,7 @@ from code_atlas.schema import (
     generate_text_index_ddl,
     generate_unique_constraint_ddl,
     generate_vector_index_ddl,
+    primary_label_expr,
 )
 
 
@@ -35,12 +37,15 @@ class TestLabelCompleteness:
     """Every NodeLabel must be accounted for in registries and groupings."""
 
     def test_unique_constraints_cover_all_labels(self):
+        # Markers are exempt: a marker is stamped onto a node that already carries
+        # a primary label enforcing uid uniqueness, so constraining it again would
+        # re-check every write for nothing.
         unique_labels = {spec.label for spec in UNIQUE_CONSTRAINTS}
-        assert unique_labels == set(NodeLabel)
+        assert unique_labels == set(NodeLabel) - _MARKER_LABELS
 
     def test_existence_constraints_cover_all_labels(self):
         existence_labels = {spec.label for spec in EXISTENCE_CONSTRAINTS}
-        assert existence_labels == set(NodeLabel)
+        assert existence_labels == set(NodeLabel) - _MARKER_LABELS
 
     def test_label_sets_cover_all(self):
         grouped = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | _MARKER_LABELS | {NodeLabel.SCHEMA_VERSION}
@@ -49,16 +54,71 @@ class TestLabelCompleteness:
     def test_entity_labels_exclude_meta(self):
         assert NodeLabel.SCHEMA_VERSION not in _ENTITY_LABELS
 
-    def test_entity_label_is_marker_on_every_entity(self):
-        """NodeLabel.ENTITY is a shared marker every _ENTITY_LABELS member carries
-        alongside its primary label, so a uid-only lookup can use one index
-        instead of an unindexed ScanAll (see GraphClient._migrate_v13_add_entity_label)."""
-        assert NodeLabel.ENTITY in _ENTITY_LABELS
-        assert {NodeLabel.ENTITY} == _MARKER_LABELS
+    def test_entity_label_is_marker_not_entity_label(self):
+        """NodeLabel.ENTITY is a marker stamped alongside a primary label, not a
+        label in its own right.
 
-    def test_index_registry_covers_entity_labels(self):
+        It must stay out of _ENTITY_LABELS: that set drives the constraint and index
+        registries, and a marker sits on every node in the graph, so each registry it
+        joins costs every write (see GraphClient._migrate_v14_trim_marker_indices).
+        """
+        assert {NodeLabel.ENTITY} == _MARKER_LABELS
+        assert NodeLabel.ENTITY not in _ENTITY_LABELS
+
+    def test_index_registry_covers_entity_and_marker_labels(self):
         index_labels = {spec.label for spec in LABEL_PROPERTY_INDICES}
-        assert index_labels == _ENTITY_LABELS
+        assert index_labels == _ENTITY_LABELS | _MARKER_LABELS
+
+    def test_marker_label_indexed_only_on_what_is_queried(self):
+        """The marker carries exactly the two indices its own lookups use.
+
+        uid for the uid-only MATCHes it exists to index, (project_name, name) for
+        cross-project import resolution. Every other property is reached through a
+        primary label that has its own index, so indexing it here would buy no query
+        anything and cost every node write -- which is what v13 did and v14 undid.
+        """
+        assert {s.property for s in LABEL_PROPERTY_INDICES if s.label is NodeLabel.ENTITY} == {"uid"}
+        assert {s.properties for s in COMPOSITE_INDICES if s.label is NodeLabel.ENTITY} == {("project_name", "name")}
+
+
+class TestPrimaryLabelExpr:
+    """A node's own label must survive the marker every node also carries."""
+
+    def test_filters_every_marker_label(self):
+        expr = primary_label_expr("n")
+        assert expr.startswith("[")
+        assert expr.endswith("][0]")
+        for lbl in _MARKER_LABELS:
+            assert f"'{lbl.value}'" in expr
+
+    def test_binds_the_requested_variable(self):
+        assert "labels(affected)" in primary_label_expr("affected")
+        assert "labels(n)" in primary_label_expr()
+
+    def test_does_not_index_position_zero(self):
+        """Memgraph returns labels in write order, so labels(n)[0] is a convention
+        the write sites happen to keep rather than something the database promises.
+        A node written ':Entity:Callable' would report its type as 'Entity'."""
+        assert "labels(n)[0]" not in primary_label_expr("n")
+
+
+class TestMarkerDropDDL:
+    """v14 drops what v13 created on the marker and nothing queries."""
+
+    def test_drops_every_unqueried_index_and_constraint(self):
+        stmts = generate_drop_redundant_marker_ddl()
+        joined = " ".join(stmts)
+        for prop in ("qualified_name", "file_path", "name", "project_name", "kind", "content_hash"):
+            assert f"DROP INDEX ON :Entity({prop});" in stmts
+        assert "DROP INDEX ON :Entity(project_name, file_path);" in stmts
+        assert "DROP CONSTRAINT ON (n:Entity) ASSERT n.uid IS UNIQUE;" in stmts
+        assert "EXISTS (n.uid)" in joined
+        assert "EXISTS (n.project_name)" in joined
+
+    def test_keeps_the_two_indices_the_marker_exists_for(self):
+        stmts = generate_drop_redundant_marker_ddl()
+        assert "DROP INDEX ON :Entity(uid);" not in stmts
+        assert "DROP INDEX ON :Entity(project_name, name);" not in stmts
 
 
 class TestDDLGeneration:
@@ -164,7 +224,7 @@ class TestCompositeIndexDDL:
 
     def test_composite_index_covers_entity_labels(self):
         index_labels = {spec.label for spec in COMPOSITE_INDICES}
-        assert index_labels == _ENTITY_LABELS
+        assert index_labels == _ENTITY_LABELS | _MARKER_LABELS
 
     def test_composite_index_has_expected_property_combos(self):
         stmts = generate_composite_index_ddl()

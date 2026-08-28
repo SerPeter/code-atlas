@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
+from code_atlas.schema import primary_label_expr
 from code_atlas.search.engine import matches_test_pattern
 
 if TYPE_CHECKING:
@@ -1304,7 +1305,7 @@ async def fetch_entity_graph(graph: GraphBackend, project: str) -> tuple[list[di
     entities = await graph.execute(
         "MATCH (n {project_name: $project}) "
         "WHERE n.qualified_name IS NOT NULL AND NOT n:Project "
-        "RETURN n.uid AS uid, n.qualified_name AS qn, n.name AS name, labels(n)[0] AS label, "
+        f"RETURN n.uid AS uid, n.qualified_name AS qn, n.name AS name, {primary_label_expr('n')} AS label, "
         "n.kind AS kind, n.file_path AS file_path, n.line_start AS line_start, n.line_end AS line_end",
         params,
     )

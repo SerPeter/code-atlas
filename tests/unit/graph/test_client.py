@@ -5,6 +5,9 @@ No infrastructure required — these test pure functions and data structures.
 
 from __future__ import annotations
 
+import inspect
+import re
+import sys
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1116,3 +1119,42 @@ class TestCrossLanguageCandidateHygiene:
         )
         result = _resolve_one_call(self.PROJECT, self._rel("proj:c.caller", "helper"), lookup)
         assert result == (["proj:a.helper", "proj:b.helper"], "project_wide")
+
+
+class TestMarkerLabelStamping:
+    """Every node this module creates must carry the :Entity marker.
+
+    Three hot-path queries match a node by uid alone and now do it as
+    ``MATCH (a:Entity {uid: ...})``, so an entity node written without the marker is
+    invisible to relationship linking, package containment and cross-project import
+    resolution. Nothing raises when that happens -- the MATCH simply finds nothing
+    and the edge is never written, which is how an unmarked fixture turned
+    ``analyze_repo(analysis="structure")`` into an empty package list. A silent
+    failure mode earns a tripwire rather than a convention.
+    """
+
+    # MERGE/CREATE of a node pattern that pins a label: `MERGE (var:<chain>`.
+    # Relationship writes bind an already-matched variable (`MERGE (a)-[...]->(b)`)
+    # and have no colon after the variable, so they do not match.
+    _NODE_WRITE = re.compile(r"\b(?:MERGE|CREATE) \((?P<var>\w+):(?P<chain>[^\s)]+)")
+
+    # SchemaVersion is meta, not an entity: a singleton with no uid, never an edge
+    # endpoint, and deliberately outside _ENTITY_LABELS.
+    _EXEMPT = ("NodeLabel.SCHEMA_VERSION",)
+
+    def _node_writes(self):
+        src = inspect.getsource(sys.modules[GraphClient.__module__])
+        return [
+            (src[: m.start()].count("\n") + 1, m.group("chain"))
+            for m in self._NODE_WRITE.finditer(src)
+            if not any(x in m.group("chain") for x in self._EXEMPT)
+        ]
+
+    def test_every_created_entity_node_is_marked(self):
+        unmarked = [(line, chain) for line, chain in self._node_writes() if "NodeLabel.ENTITY" not in chain]
+        assert not unmarked, f"entity nodes created without the :Entity marker: {unmarked}"
+
+    def test_scan_actually_finds_the_node_writes(self):
+        """Guards the guard: a regex that stops matching would pass the test above
+        vacuously, which is the exact failure mode it exists to catch."""
+        assert len(self._node_writes()) >= 8

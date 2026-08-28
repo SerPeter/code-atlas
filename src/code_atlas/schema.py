@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 13
+SCHEMA_VERSION: int = 14
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -247,10 +247,17 @@ _TEXT_SEARCHABLE_LABELS: frozenset[NodeLabel] = frozenset(
 # so a caller holding only a uid (not knowing which of the other 12 labels it
 # belongs to) can MATCH (n:Entity {uid: ...}) against one shared index instead
 # of an unindexed ScanAll over the whole graph. See NodeLabel.ENTITY.
+#
+# Deliberately NOT folded into _ENTITY_LABELS: that set drives the constraint and
+# index registries, and a marker sits on *every node in the graph*, so each
+# registry it joins is a cost every write pays. uid/project_name existence and
+# uniqueness are already enforced by the primary label underneath it, and only
+# two of the seven indexed properties are ever reached through the marker --
+# see _MARKER_INDEX_PROPERTIES.
 _MARKER_LABELS: frozenset[NodeLabel] = frozenset({NodeLabel.ENTITY})
 
 # All non-meta labels (must have uid + project_name)
-_ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | _MARKER_LABELS
+_ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +373,24 @@ _INDEX_PROPERTIES: tuple[str, ...] = (
     "content_hash",
 )
 
-LABEL_PROPERTY_INDICES: tuple[IndexSpec, ...] = tuple(
-    IndexSpec(label=lbl, property=prop)
-    for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)
-    for prop in _INDEX_PROPERTIES
+# The only properties a marker label is looked up by: uid, for the uid-only
+# MATCHes the marker exists to index, and (project_name, name) for cross-project
+# import resolution. Everything else is reached through a primary label, which
+# has its own index -- indexing it on the marker too would buy no query anything
+# and cost every single node write.
+_MARKER_INDEX_PROPERTIES: tuple[str, ...] = ("uid",)
+
+LABEL_PROPERTY_INDICES: tuple[IndexSpec, ...] = (
+    *(
+        IndexSpec(label=lbl, property=prop)
+        for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)
+        for prop in _INDEX_PROPERTIES
+    ),
+    *(
+        IndexSpec(label=lbl, property=prop)
+        for lbl in sorted(_MARKER_LABELS, key=lambda lbl: lbl.value)
+        for prop in _MARKER_INDEX_PROPERTIES
+    ),
 )
 
 # Composite property indices for multi-property lookups
@@ -378,10 +399,19 @@ _COMPOSITE_PROPERTIES: tuple[tuple[str, ...], ...] = (
     ("project_name", "name"),
 )
 
-COMPOSITE_INDICES: tuple[CompositeIndexSpec, ...] = tuple(
-    CompositeIndexSpec(label=lbl, properties=props)
-    for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)
-    for props in _COMPOSITE_PROPERTIES
+_MARKER_COMPOSITE_PROPERTIES: tuple[tuple[str, ...], ...] = (("project_name", "name"),)
+
+COMPOSITE_INDICES: tuple[CompositeIndexSpec, ...] = (
+    *(
+        CompositeIndexSpec(label=lbl, properties=props)
+        for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)
+        for props in _COMPOSITE_PROPERTIES
+    ),
+    *(
+        CompositeIndexSpec(label=lbl, properties=props)
+        for lbl in sorted(_MARKER_LABELS, key=lambda lbl: lbl.value)
+        for props in _MARKER_COMPOSITE_PROPERTIES
+    ),
 )
 
 # Text (BM25) indices — one per searchable label
@@ -403,6 +433,29 @@ def build_vector_index_specs(dimension: int, capacity: int = 50_000) -> tuple[Ve
         )
         for lbl in sorted(_EMBEDDABLE_LABELS, key=lambda lbl: lbl.value)
     )
+
+
+# ---------------------------------------------------------------------------
+# Cypher fragments
+# ---------------------------------------------------------------------------
+
+
+def primary_label_expr(var: str = "n") -> str:
+    """Cypher expression for *var*'s own label, ignoring any marker label.
+
+    Every entity node carries a marker (:Entity) alongside the label saying what
+    it actually is, so ``labels(n)[0]`` is not reliably that label any more.
+    Memgraph returns labels in write order, which makes "primary label first" a
+    convention the write sites happen to keep, not something the database
+    promises -- and a node written ``:Entity:Callable`` would silently report its
+    type as ``Entity`` in every search result, diagram and impact row.
+
+    Filtering markers out instead survives a marker being added, reordered, or
+    missing altogether (a node written before the marker existed still yields its
+    real label rather than null).
+    """
+    markers = ", ".join(f"'{lbl.value}'" for lbl in sorted(_MARKER_LABELS, key=lambda lbl: lbl.value))
+    return f"[_lbl IN labels({var}) WHERE NOT _lbl IN [{markers}]][0]"
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +519,40 @@ def generate_drop_text_index_ddl() -> list[str]:
     return [f"DROP TEXT INDEX {spec.name};" for spec in TEXT_INDICES]
 
 
+def generate_drop_redundant_marker_ddl() -> list[str]:
+    """Generate DROP statements for marker-label indices and constraints nothing queries.
+
+    Schema v13 introduced :Entity by folding _MARKER_LABELS into _ENTITY_LABELS --
+    the set that drives every constraint and index registry -- so the marker picked
+    up all seven property indices, both composites, and uid/project_name uniqueness
+    and existence. A marker sits on *every node in the graph*, so that is nine index
+    structures and three constraint checks paid by every single write, from a label
+    whose entire purpose was to make writes cheaper.
+
+    Only _MARKER_INDEX_PROPERTIES and _MARKER_COMPOSITE_PROPERTIES are ever reached
+    through the marker. Everything else is reached through a primary label that has
+    its own index, and uid/project_name are already unique and mandatory there.
+
+    Schema application is additive -- _apply_full_schema/_migrate_indices only ever
+    CREATE -- so a database that ran v13 keeps all nine until these statements run.
+    """
+    stmts: list[str] = []
+    for lbl in sorted(_MARKER_LABELS, key=lambda lbl: lbl.value):
+        stmts.extend(
+            f"DROP INDEX ON :{lbl.value}({prop});"
+            for prop in sorted(set(_INDEX_PROPERTIES) - set(_MARKER_INDEX_PROPERTIES))
+        )
+        stmts.extend(
+            f"DROP INDEX ON :{lbl.value}({', '.join(props)});"
+            for props in sorted(set(_COMPOSITE_PROPERTIES) - set(_MARKER_COMPOSITE_PROPERTIES))
+        )
+        stmts.append(f"DROP CONSTRAINT ON (n:{lbl.value}) ASSERT n.uid IS UNIQUE;")
+        stmts.extend(
+            f"DROP CONSTRAINT ON (n:{lbl.value}) ASSERT EXISTS (n.{prop});" for prop in ("project_name", "uid")
+        )
+    return stmts
+
+
 # ---------------------------------------------------------------------------
 # Import-time validation
 # ---------------------------------------------------------------------------
@@ -478,22 +565,27 @@ def _validate_schema_completeness() -> None:
     the silent-drop bug (competitor insight P0).
     """
     all_labels = set(NodeLabel)
+    # A marker never carries uid/project_name of its own -- it is stamped onto a
+    # node that already has both, constrained by its primary label. Constraining
+    # them again on the marker would re-check every write for nothing.
+    constrained_labels = all_labels - _MARKER_LABELS
 
-    # Unique constraints: every label must appear
+    # Unique constraints: every non-marker label must appear
     unique_labels = {spec.label for spec in UNIQUE_CONSTRAINTS}
-    missing_unique = all_labels - unique_labels
+    missing_unique = constrained_labels - unique_labels
     if missing_unique:
         raise RuntimeError(f"NodeLabels missing from UNIQUE_CONSTRAINTS: {missing_unique}")
 
-    # Existence constraints: every label must appear
+    # Existence constraints: every non-marker label must appear
     existence_labels = {spec.label for spec in EXISTENCE_CONSTRAINTS}
-    missing_existence = all_labels - existence_labels
+    missing_existence = constrained_labels - existence_labels
     if missing_existence:
         raise RuntimeError(f"NodeLabels missing from EXISTENCE_CONSTRAINTS: {missing_existence}")
 
-    # Label property indices: all entity labels must appear (SchemaVersion exempt)
+    # Label property indices: entity and marker labels must appear (SchemaVersion exempt).
+    # Markers are here on purpose -- being indexed is the only reason one exists.
     index_labels = {spec.label for spec in LABEL_PROPERTY_INDICES}
-    missing_index = _ENTITY_LABELS - index_labels
+    missing_index = (_ENTITY_LABELS | _MARKER_LABELS) - index_labels
     if missing_index:
         raise RuntimeError(f"Entity labels missing from LABEL_PROPERTY_INDICES: {missing_index}")
 
