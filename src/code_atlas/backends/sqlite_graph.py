@@ -2255,14 +2255,20 @@ class SqliteGraphClient:
         if not items:
             return
         conn = await self._get_conn()
-        for uid, vector, h in items:
-            blob = sqlite_vec.serialize_float32(vector)
-            await conn.execute(
-                "UPDATE nodes SET embedding = ?, props_json = json_patch(props_json, ?) WHERE uid = ?",
-                (blob, json.dumps({"embed_hash": h}), uid),
-            )
-            await self._write_embedding_row(conn, uid, blob)
-        await conn.commit()
+        # This backend has ONE connection, so a commit here would otherwise land in the
+        # middle of another writer's transaction. It was safe only because the embed
+        # consumer happened to serialise its callers; that is the consumer's concurrency
+        # policy, not this backend's durability guarantee, and the two must not be the
+        # same knob. Every other writer here already takes this lock.
+        async with self._write_lock:
+            for uid, vector, h in items:
+                blob = sqlite_vec.serialize_float32(vector)
+                await conn.execute(
+                    "UPDATE nodes SET embedding = ?, props_json = json_patch(props_json, ?) WHERE uid = ?",
+                    (blob, json.dumps({"embed_hash": h}), uid),
+                )
+                await self._write_embedding_row(conn, uid, blob)
+            await conn.commit()
 
     async def clear_all_embeddings(self) -> None:
         conn = await self._get_conn()

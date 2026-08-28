@@ -103,6 +103,10 @@ class BatchPolicy:
 # Batches a message may fail before it is parked (ACKed + dropped) on the next PEL reclaim.
 _MAX_BATCH_FAILURES = 5
 
+# Concurrent embedding-write transactions per embed consumer. See EmbedConsumer
+# __init__ for the measurements and for why this is bounded rather than unbounded.
+_EMBED_WRITE_CONCURRENCY = 2
+
 # How long an entry must sit untouched before another consumer may adopt it. Long enough
 # that a live consumer's own in-flight batch never qualifies, short enough that a crash
 # does not strand work for a whole session.
@@ -1490,7 +1494,27 @@ class EmbedConsumer(TierConsumer):
         self._max_concurrency = _max_conc
         self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
-        self._write_lock = asyncio.Lock()
+        # Bounded, not serialised. The lock this replaces protected nothing that
+        # _inflight_uids does not already protect: concurrent embed workers hold
+        # provably disjoint uid sets (the membership test and the .update(claimed)
+        # are consecutive statements with no await between them, so the claim is
+        # atomic under asyncio), and every written uid comes from that claimed set.
+        #
+        # Measured against Memgraph 3.12 with live vector indices, disjoint uids,
+        # 250 entities per worker: serialised 702ms vs concurrent 592ms at 2 workers
+        # (1.19x), 1579 vs 1211 at 4 (1.30x), 2866 vs 2379 at 8 (1.20x). The ratio is
+        # flat, which says Memgraph already serialises most of this itself and the
+        # app-level lock was adding ~20-30% on top of that. So 2 buys essentially the
+        # whole win with a quarter of the exposure of 8.
+        #
+        # Exposure is the reason it is not simply removed. ADR-0024 records
+        # memgraph#4473, an unfixed Storage GC segfault during vector index GC with
+        # concurrent inserts. A stress run here -- 8 workers x 250 entities x 25
+        # rounds, 50k concurrent vector-index writes -- did not reproduce it
+        # (RestartCount 0, every row written), but that is one machine and the bug is
+        # intermittent, so this stays conservative rather than treating one clean run
+        # as proof of absence. Drop to 1 if a Storage GC crash ever appears.
+        self._write_gate = asyncio.Semaphore(_EMBED_WRITE_CONCURRENCY)
 
         # Uids currently being read+embedded+written by an in-flight worker.
         # A second concurrently-dispatched batch for the SAME uid is deferred
@@ -1641,17 +1665,18 @@ class EmbedConsumer(TierConsumer):
                 api_vectors = await self._embed_and_store(need_embed)
 
                 # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
-                #    Serialized via _write_lock to avoid Memgraph write-lock contention.
+                #    Bounded to _EMBED_WRITE_CONCURRENCY rather than fully serialised --
+                #    see the _write_gate comment in __init__ for the measurements.
                 all_resolved = cache_resolved + api_vectors
                 if all_resolved:
                     with _tracer.start_as_current_span("embed.write_lock_wait"):
-                        await self._write_lock.acquire()
+                        await self._write_gate.acquire()
                     try:
                         with _tracer.start_as_current_span("embed.write_embeddings"):
                             write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
                             await self.graph.write_embeddings_and_hashes(all_resolved, labels=write_labels)
                     finally:
-                        self._write_lock.release()
+                        self._write_gate.release()
 
                 elapsed = asyncio.get_event_loop().time() - t0
                 span.set_attribute("entities_count", total)
