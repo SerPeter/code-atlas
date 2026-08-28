@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 12
+SCHEMA_VERSION: int = 13
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -51,6 +51,11 @@ class NodeLabel(StrEnum):
     # Referenced-but-not-defined runtime surface (see _EXTERNAL_LABELS)
     ENV_VAR = "EnvVar"
     RESOURCE_FILE = "ResourceFile"
+    # Marker: stamped onto every _ENTITY_LABELS node alongside its primary
+    # label (see _MARKER_LABELS) so a uid-only lookup that doesn't know which
+    # of the 12 entity labels it's after can use one shared index instead of
+    # an unindexed ScanAll over the whole graph.
+    ENTITY = "Entity"
     # Meta
     SCHEMA_VERSION = "SchemaVersion"
 
@@ -238,8 +243,14 @@ _TEXT_SEARCHABLE_LABELS: frozenset[NodeLabel] = frozenset(
     }
 )
 
+# Stamped alongside a primary entity label on every node in this union, purely
+# so a caller holding only a uid (not knowing which of the other 12 labels it
+# belongs to) can MATCH (n:Entity {uid: ...}) against one shared index instead
+# of an unindexed ScanAll over the whole graph. See NodeLabel.ENTITY.
+_MARKER_LABELS: frozenset[NodeLabel] = frozenset({NodeLabel.ENTITY})
+
 # All non-meta labels (must have uid + project_name)
-_ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS
+_ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | _MARKER_LABELS
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +498,7 @@ def _validate_schema_completeness() -> None:
         raise RuntimeError(f"Entity labels missing from LABEL_PROPERTY_INDICES: {missing_index}")
 
     # Label groupings must cover all non-meta labels
-    grouped = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | {NodeLabel.SCHEMA_VERSION}
+    grouped = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | _MARKER_LABELS | {NodeLabel.SCHEMA_VERSION}
     missing_group = all_labels - grouped
     if missing_group:
         raise RuntimeError(f"NodeLabels not in any label group: {missing_group}")

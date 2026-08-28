@@ -25,6 +25,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
+    _ENTITY_LABELS,
     _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     GLOBAL_PROJECT,
@@ -1804,7 +1805,7 @@ class GraphClient:
         props = {"uid": uid, "project_name": project_name, "name": project_name, **metadata}
         set_clause = ", ".join(f"n.{k} = ${k}" for k in props)
         await self.execute_write(
-            f"MERGE (n:{NodeLabel.PROJECT} {{uid: $uid}}) SET {set_clause}",
+            f"MERGE (n:{NodeLabel.PROJECT}:{NodeLabel.ENTITY} {{uid: $uid}}) SET {set_clause}",
             props,
         )
 
@@ -1863,7 +1864,7 @@ class GraphClient:
         """Create or update a Package node by uid."""
         uid = f"{project_name}:{qualified_name}"
         await self.execute_write(
-            f"MERGE (n:{NodeLabel.PACKAGE} {{uid: $uid}}) "
+            f"MERGE (n:{NodeLabel.PACKAGE}:{NodeLabel.ENTITY} {{uid: $uid}}) "
             f"SET n.project_name = $project_name, n.name = $name, "
             f"n.qualified_name = $qualified_name, n.file_path = $file_path",
             {
@@ -1878,7 +1879,8 @@ class GraphClient:
     async def create_contains_edge(self, from_uid: str, to_uid: str) -> None:
         """Create an idempotent CONTAINS relationship between two nodes."""
         await self.execute_write(
-            f"MATCH (a {{uid: $from_uid}}), (b {{uid: $to_uid}}) MERGE (a)-[:{RelType.CONTAINS}]->(b)",
+            f"MATCH (a:{NodeLabel.ENTITY} {{uid: $from_uid}}), (b:{NodeLabel.ENTITY} {{uid: $to_uid}}) "
+            f"MERGE (a)-[:{RelType.CONTAINS}]->(b)",
             {"from_uid": from_uid, "to_uid": to_uid},
         )
 
@@ -1914,14 +1916,14 @@ class GraphClient:
 
         await self.execute_write(
             f"UNWIND $pkgs AS p "
-            f"MERGE (n:{NodeLabel.PACKAGE} {{uid: p.uid}}) "
+            f"MERGE (n:{NodeLabel.PACKAGE}:{NodeLabel.ENTITY} {{uid: p.uid}}) "
             f"SET n.project_name = p.project_name, n.name = p.name, "
             f"n.qualified_name = p.qualified_name, n.file_path = p.file_path",
             {"pkgs": params},
         )
         await self.execute_write(
             f"UNWIND $pkgs AS p "
-            f"MATCH (parent {{uid: p.parent_uid}}), (child {{uid: p.uid}}) "
+            f"MATCH (parent:{NodeLabel.ENTITY} {{uid: p.parent_uid}}), (child:{NodeLabel.ENTITY} {{uid: p.uid}}) "
             f"MERGE (parent)-[:{RelType.CONTAINS}]->(child)",
             {"pkgs": params},
         )
@@ -2132,7 +2134,7 @@ class GraphClient:
         if ext_packages:
             await self.execute_write(
                 f"UNWIND $packages AS pkg "
-                f"MERGE (n:{NodeLabel.EXTERNAL_PACKAGE} {{uid: pkg.uid}}) "
+                f"MERGE (n:{NodeLabel.EXTERNAL_PACKAGE}:{NodeLabel.ENTITY} {{uid: pkg.uid}}) "
                 f"ON CREATE SET n.project_name = pkg.project_name, n.name = pkg.name, "
                 f"n.qualified_name = pkg.qualified_name",
                 {"packages": list(ext_packages.values())},
@@ -2142,7 +2144,7 @@ class GraphClient:
         if ext_symbols:
             await self.execute_write(
                 f"UNWIND $symbols AS sym "
-                f"MERGE (n:{NodeLabel.EXTERNAL_SYMBOL} {{uid: sym.uid}}) "
+                f"MERGE (n:{NodeLabel.EXTERNAL_SYMBOL}:{NodeLabel.ENTITY} {{uid: sym.uid}}) "
                 f"ON CREATE SET n.project_name = sym.project_name, n.name = sym.name, "
                 f"n.qualified_name = sym.qualified_name, n.package = sym.package",
                 {"symbols": list(ext_symbols.values())},
@@ -2221,7 +2223,7 @@ class GraphClient:
                 continue
             await self.execute_write(
                 f"UNWIND $nodes AS n "
-                f"MERGE (x:{label} {{uid: n.uid}}) "
+                f"MERGE (x:{label}:{NodeLabel.ENTITY} {{uid: n.uid}}) "
                 f"ON CREATE SET x.project_name = n.project_name, x.name = n.name, "
                 f"x.qualified_name = n.qualified_name "
                 # Unconditional, unlike the rest, so nodes created before file_path was
@@ -2826,7 +2828,8 @@ class GraphClient:
                 f"UNWIND $rels AS r "
                 f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}) "
                 f"WHERE NOT (a)-[:{RelType.INHERITS}]->({{name: r.to_name}}) "
-                f"MERGE (b:{NodeLabel.EXTERNAL_SYMBOL} {{uid: r.project + ':ext/builtins.' + r.to_name}}) "
+                f"MERGE (b:{NodeLabel.EXTERNAL_SYMBOL}:{NodeLabel.ENTITY} "
+                f"{{uid: r.project + ':ext/builtins.' + r.to_name}}) "
                 f"ON CREATE SET b.project_name = r.project, b.name = r.to_name, "
                 f"b.qualified_name = 'builtins.' + r.to_name "
                 f"MERGE (a)-[:{RelType.INHERITS}]->(b)",
@@ -2903,7 +2906,8 @@ class GraphClient:
             )
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}), (b:{target} {{project_name: r.project, name: r.to_name}}) "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}), "
+                f"(b:{target} {{project_name: r.project, name: r.to_name}}) "
                 f"{scope}"
                 f"MERGE (a)-[e:{rel_type}]->(b) "
                 f"SET e.strategy = '{strategy}', e.confidence = '{confidence}', e.weight = {weight}",
@@ -3333,7 +3337,7 @@ class GraphClient:
         if lookup_pairs:
             real_matches = await self.execute(
                 "UNWIND $pairs AS p "
-                "MATCH (n {project_name: p.target_project, name: p.name}) "
+                f"MATCH (n:{NodeLabel.ENTITY} {{project_name: p.target_project, name: p.name}}) "
                 f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
                 f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
                 f"AND NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
@@ -4951,7 +4955,7 @@ class GraphClient:
             ]
             query = (
                 f"UNWIND $entities AS e "
-                f"MERGE (n:{label.value} {{uid: e.uid}}) "
+                f"MERGE (n:{label.value}:{NodeLabel.ENTITY} {{uid: e.uid}}) "
                 f"ON CREATE SET "
                 f"n.project_name = e.project_name, n.name = e.name, "
                 f"n.qualified_name = e.qualified_name, n.file_path = e.file_path, "
@@ -5211,7 +5215,8 @@ class GraphClient:
                 {"from_uid": r.from_qualified_name, "to_uid": r.to_name, "props": r.properties or {}} for r in group
             ]
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) "
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}), (b:{NodeLabel.ENTITY} {{uid: r.to_uid}}) "
                 f"MERGE (a)-[e:{rel_type}]->(b) SET e += r.props",
                 {"rels": rel_params},
             )
@@ -5580,6 +5585,7 @@ class GraphClient:
             (10, self._migrate_v10_stub_flag_moved_to_methods),
             (11, self._migrate_v11_clear_for_call_site_lines),
             (12, self._migrate_v12_clear_for_uid_discriminators),
+            (13, self._migrate_v13_add_entity_label),
         )
         for threshold, migrate in migrations:
             if stored < threshold:
@@ -5642,6 +5648,31 @@ class GraphClient:
             "C++ functions and Ruby singleton methods stop sharing one node"
         )
 
+    async def _migrate_v13_add_entity_label(self) -> None:
+        """v13: stamp :Entity onto every existing node in _ENTITY_LABELS.
+
+        Several hot-path queries (relationship linking, package-hierarchy CONTAINS
+        edges, cross-project import resolution) match a node by uid alone, not
+        knowing which of the 12 entity labels it carries. Memgraph has no
+        label-free index, so that MATCH was an unindexed ScanAll over the entire
+        graph -- measured at ~66k nodes, several seconds per batch, on every
+        single AST-tier write. :Entity is one shared label every entity label
+        also carries (see NodeLabel.ENTITY), letting those queries use one
+        index (:Entity(uid), applied by _apply_full_schema/_migrate_indices)
+        instead of scanning the whole graph.
+
+        One MATCH per label rather than a single `WHERE any(...)` pass: each
+        already has its own per-label index, so labelling is itself indexed
+        instead of being the second full scan this migration would otherwise
+        need to fix the first one.
+        """
+        for label in sorted(_ENTITY_LABELS - {NodeLabel.ENTITY}, key=lambda lbl: lbl.value):
+            await self._execute_write_patient(f"MATCH (n:{label}) SET n:{NodeLabel.ENTITY}")
+        logger.info(
+            "Schema v13: stamped :Entity on every existing entity node so uid-only "
+            "lookups can use an index instead of a full graph scan"
+        )
+
     async def _set_schema_version(self, version: int) -> None:
         """Create or update the SchemaVersion singleton node.
 
@@ -5668,10 +5699,39 @@ class GraphClient:
             {"version": version},
         )
 
+    @retry(
+        retry=retry_if_exception_type(TransientError),
+        stop=stop_after_attempt(20),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=15),
+        before_sleep=lambda rs: logger.warning(
+            "Schema write blocked by concurrent storage access, retrying in {:.1f}s (attempt {}): {}",
+            rs.next_action.sleep,
+            rs.attempt_number,
+            rs.outcome.exception(),
+        ),
+        reraise=True,
+    )
+    async def _execute_write_patient(self, stmt: str, params: dict[str, Any] | None = None) -> None:
+        """Like ``execute_write``, but for one-time schema operations (DDL, data
+        migrations) that need far more patience than a regular write.
+
+        DDL and migrations can need exclusive-ish storage access, which a concurrent
+        writer -- another session's daemon mid-index, most likely -- can hold for
+        minutes, not the sub-second MVCC conflicts _execute_write_with_retry's
+        4-attempt/2s-max backoff is tuned for. Reproduced directly: a schema
+        migration run against a database another process was actively indexing
+        failed with "Cannot get read-only access to the storage" after those 4
+        attempts, in both a plain DDL statement and a migration's own data write.
+        Both run once per version bump, never in a hot loop, so trading a slower
+        worst case for not hard-failing the whole migration is the right side of
+        that tradeoff.
+        """
+        await self.execute_write(stmt, params)
+
     async def _exec_ddl(self, stmt: str) -> None:
         """Execute a DDL statement, ignoring 'already exists' / 'doesn't exist' errors."""
         try:
-            await self.execute_write(stmt)
+            await self._execute_write_patient(stmt)
         except Exception as exc:
             msg = str(exc).lower()
             # Memgraph raises errors for duplicate constraints/indices and missing drops

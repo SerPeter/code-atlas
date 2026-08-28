@@ -240,6 +240,7 @@ class TestSchemaInfo:
             set(result["node_labels"]["code"])
             | set(result["node_labels"]["documentation"])
             | set(result["node_labels"]["external"])
+            | set(result["node_labels"]["marker"])
             | set(result["node_labels"]["meta"])
         )
         assert all_labels == {lbl.value for lbl in NodeLabel}

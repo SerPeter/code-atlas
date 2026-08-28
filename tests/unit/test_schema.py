@@ -11,6 +11,7 @@ from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
     _ENTITY_LABELS,
     _EXTERNAL_LABELS,
+    _MARKER_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     COMPOSITE_INDICES,
     EXISTENCE_CONSTRAINTS,
@@ -42,11 +43,18 @@ class TestLabelCompleteness:
         assert existence_labels == set(NodeLabel)
 
     def test_label_sets_cover_all(self):
-        grouped = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | {NodeLabel.SCHEMA_VERSION}
+        grouped = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | _MARKER_LABELS | {NodeLabel.SCHEMA_VERSION}
         assert grouped == set(NodeLabel)
 
     def test_entity_labels_exclude_meta(self):
         assert NodeLabel.SCHEMA_VERSION not in _ENTITY_LABELS
+
+    def test_entity_label_is_marker_on_every_entity(self):
+        """NodeLabel.ENTITY is a shared marker every _ENTITY_LABELS member carries
+        alongside its primary label, so a uid-only lookup can use one index
+        instead of an unindexed ScanAll (see GraphClient._migrate_v13_add_entity_label)."""
+        assert NodeLabel.ENTITY in _ENTITY_LABELS
+        assert {NodeLabel.ENTITY} == _MARKER_LABELS
 
     def test_index_registry_covers_entity_labels(self):
         index_labels = {spec.label for spec in LABEL_PROPERTY_INDICES}
