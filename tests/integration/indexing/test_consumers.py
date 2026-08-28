@@ -1401,7 +1401,7 @@ async def test_embed_concurrent_workers_no_lost_update(
     # Seed a Callable entity directly — this test targets the embed stage's
     # own concurrency, not the AST/parsing stage.
     await graph_client.execute_write(
-        "CREATE (c:Callable {uid: $uid, project_name: $p, qualified_name: 'mod.f', name: 'f', "
+        "CREATE (c:Callable:Entity {uid: $uid, project_name: $p, qualified_name: 'mod.f', name: 'f', "
         "kind: 'function', file_path: 'mod.py', signature: 'def f()', docstring: 'v1', source: ''})",
         {"uid": uid, "p": project_name},
     )

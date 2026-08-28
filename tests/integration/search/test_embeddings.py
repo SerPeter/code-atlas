@@ -46,7 +46,7 @@ class TestModelLock:
         # Create a test node with a correctly-dimensioned embedding (matches vector index)
         dim = graph_client._dimension
         await graph_client.execute_write(
-            "CREATE (n:Module {uid: 'test:mod', qualified_name: 'mod', project_name: 'test', "
+            "CREATE (n:Module:Entity {uid: 'test:mod', qualified_name: 'mod', project_name: 'test', "
             "name: 'mod', file_path: 'mod.py', content_hash: 'h', project_root: '/tmp', "
             "embedding: $emb})",
             {"emb": [0.1] * dim},

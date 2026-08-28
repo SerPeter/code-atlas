@@ -542,7 +542,7 @@ async def seeded_analysis_graph(graph_client):
         (f"{_PROJECT}:mypkg.sub.api", "api", "mypkg.sub.api", "mypkg/sub/api.py", 40),
     ]:
         await graph_client.execute_write(
-            "CREATE (n:Module {uid: $uid, project_name: $p, name: $name, "
+            "CREATE (n:Module:Entity {uid: $uid, project_name: $p, name: $name, "
             "qualified_name: $qn, file_path: $fp, kind: 'module', line_start: 1, line_end: $le})",
             {"uid": uid, "p": _PROJECT, "name": name, "qn": qn, "fp": fp, "le": le},
         )
@@ -554,14 +554,14 @@ async def seeded_analysis_graph(graph_client):
 
     # --- TypeDefs ---
     await graph_client.execute_write(
-        "CREATE (n:TypeDef {uid: $uid, project_name: $p, name: 'Base', "
+        "CREATE (n:TypeDef:Entity {uid: $uid, project_name: $p, name: 'Base', "
         "qualified_name: 'mypkg.models.Base', file_path: 'mypkg/models.py', "
         "kind: 'class', line_start: 5, line_end: 20, visibility: 'public', "
         "docstring: 'Base model class.'})",
         {"uid": f"{_PROJECT}:mypkg.models.Base", "p": _PROJECT},
     )
     await graph_client.execute_write(
-        "CREATE (n:TypeDef {uid: $uid, project_name: $p, name: 'User', "
+        "CREATE (n:TypeDef:Entity {uid: $uid, project_name: $p, name: 'User', "
         "qualified_name: 'mypkg.models.User', file_path: 'mypkg/models.py', "
         "kind: 'class', line_start: 22, line_end: 45, visibility: 'public', "
         "docstring: 'User model.', signature: 'class User(Base)'})",
@@ -614,7 +614,7 @@ async def seeded_analysis_graph(graph_client):
         ),
     ]:
         await graph_client.execute_write(
-            "CREATE (n:Callable {uid: $uid, project_name: $p, name: $name, "
+            "CREATE (n:Callable:Entity {uid: $uid, project_name: $p, name: $name, "
             "qualified_name: $qn, file_path: $fp, kind: $kind, "
             "line_start: $ls, line_end: $le, visibility: $vis, "
             "docstring: $doc, signature: $sig})",
@@ -635,7 +635,7 @@ async def seeded_analysis_graph(graph_client):
 
     # --- Value (no docstring) ---
     await graph_client.execute_write(
-        "CREATE (n:Value {uid: $uid, project_name: $p, name: 'MAX_SIZE', "
+        "CREATE (n:Value:Entity {uid: $uid, project_name: $p, name: 'MAX_SIZE', "
         "qualified_name: 'mypkg.utils.MAX_SIZE', file_path: 'mypkg/utils.py', "
         "kind: 'constant', line_start: 1, line_end: 1, visibility: 'public'})",
         {"uid": f"{_PROJECT}:mypkg.utils.MAX_SIZE", "p": _PROJECT},
@@ -675,12 +675,12 @@ async def seeded_analysis_graph(graph_client):
 
     # --- External dependency ---
     await graph_client.execute_write(
-        "CREATE (ep:ExternalPackage {uid: $uid, project_name: $p, "
+        "CREATE (ep:ExternalPackage:Entity {uid: $uid, project_name: $p, "
         "name: 'dataclasses', qualified_name: 'ext/dataclasses'})",
         {"uid": f"{_PROJECT}:ext/dataclasses", "p": _PROJECT},
     )
     await graph_client.execute_write(
-        "CREATE (es:ExternalSymbol {uid: $uid, project_name: $p, "
+        "CREATE (es:ExternalSymbol:Entity {uid: $uid, project_name: $p, "
         "name: 'dataclass', qualified_name: 'ext/dataclasses.dataclass', package: 'dataclasses'})",
         {"uid": f"{_PROJECT}:ext/dataclasses.dataclass", "p": _PROJECT},
     )
@@ -722,12 +722,12 @@ async def seeded_communities_bridge_graph(seeded_analysis_graph):
     # bridge callables never enter the clustered graph and the test is vacuous.
     for name in ("x1", "x2", "x3", "x4", "y1", "y2", "y3", "y4"):
         await graph_client.execute_write(
-            "CREATE (n:Callable {uid: $uid, project_name: $p, name: $name, "
+            "CREATE (n:Callable:Entity {uid: $uid, project_name: $p, name: $name, "
             "qualified_name: $name, file_path: $fp, kind: 'function', line_start: 1, line_end: 2})",
             {"uid": f"{_PROJECT}:{name}", "p": _PROJECT, "name": name, "fp": f"bridge/{name}.py"},
         )
         await graph_client.execute_write(
-            "CREATE (m:Module {uid: $uid, project_name: $p, name: $name, qualified_name: $qn, file_path: $fp})",
+            "CREATE (m:Module:Entity {uid: $uid, project_name: $p, name: $name, qualified_name: $qn, file_path: $fp})",
             {
                 "uid": f"{_PROJECT}:bridge.{name}",
                 "p": _PROJECT,
@@ -744,12 +744,12 @@ async def seeded_communities_bridge_graph(seeded_analysis_graph):
 
     # Shared external symbol — imported by every x/y node plus filler leaves.
     await graph_client.execute_write(
-        "CREATE (ep:ExternalPackage {uid: $uid, project_name: $p, "
+        "CREATE (ep:ExternalPackage:Entity {uid: $uid, project_name: $p, "
         "name: 'collections.abc', qualified_name: 'ext/collections.abc'})",
         {"uid": f"{_PROJECT}:ext/collections.abc", "p": _PROJECT},
     )
     await graph_client.execute_write(
-        "CREATE (es:ExternalSymbol {uid: $uid, project_name: $p, name: 'Coroutine', "
+        "CREATE (es:ExternalSymbol:Entity {uid: $uid, project_name: $p, name: 'Coroutine', "
         "qualified_name: 'ext/collections.abc.Coroutine', package: 'collections.abc'})",
         {"uid": f"{_PROJECT}:ext/collections.abc.Coroutine", "p": _PROJECT},
     )
@@ -768,7 +768,7 @@ async def seeded_communities_bridge_graph(seeded_analysis_graph):
     # needed for the shared node's fan-in to actually distort community boundaries.
     leaf_uids = [f"{_PROJECT}:bridge_leaf{i}" for i in range(20)]
     await graph_client.execute_write(
-        "UNWIND $uids AS uid CREATE (n:Callable {uid: uid, project_name: $p, name: uid, "
+        "UNWIND $uids AS uid CREATE (n:Callable:Entity {uid: uid, project_name: $p, name: uid, "
         "qualified_name: uid, file_path: 'bridge/leaf.py', kind: 'function', line_start: 1, line_end: 2})",
         {"uids": leaf_uids, "p": _PROJECT},
     )

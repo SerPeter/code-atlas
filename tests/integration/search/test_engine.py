@@ -24,7 +24,7 @@ class TestHybridSearchIntegration:
         dummy_vec = [0.1] * dim
 
         await graph_client.execute_write(
-            "CREATE (n:Callable {uid: 'proj:mod.get_user', project_name: 'proj', "
+            "CREATE (n:Callable:Entity {uid: 'proj:mod.get_user', project_name: 'proj', "
             "name: 'get_user', qualified_name: 'mod.get_user', file_path: 'mod.py', "
             "kind: 'function', line_start: 10, line_end: 20, "
             "visibility: 'public', docstring: 'Get a user by ID', signature: 'def get_user(uid):', "
@@ -32,7 +32,7 @@ class TestHybridSearchIntegration:
             {"vec": dummy_vec},
         )
         await graph_client.execute_write(
-            "CREATE (n:TypeDef {uid: 'proj:mod.UserService', project_name: 'proj', "
+            "CREATE (n:TypeDef:Entity {uid: 'proj:mod.UserService', project_name: 'proj', "
             "name: 'UserService', qualified_name: 'mod.UserService', file_path: 'mod.py', "
             "kind: 'class', line_start: 30, line_end: 50, "
             "visibility: 'public', docstring: 'Handles user operations', signature: 'class UserService:', "
@@ -40,7 +40,7 @@ class TestHybridSearchIntegration:
             {"vec": dummy_vec},
         )
         await graph_client.execute_write(
-            "CREATE (n:Callable {uid: 'other:lib.get_user', project_name: 'other', "
+            "CREATE (n:Callable:Entity {uid: 'other:lib.get_user', project_name: 'other', "
             "name: 'get_user', qualified_name: 'lib.get_user', file_path: 'lib.py', "
             "kind: 'function', line_start: 1, line_end: 5, "
             "visibility: 'public', docstring: 'Another get_user', signature: 'def get_user():', "
@@ -138,7 +138,7 @@ class TestHybridSearchIntegration:
 
         # Seed a test entity
         await seeded_graph.execute_write(
-            "CREATE (n:Callable {uid: 'proj:tests.test_mod.test_get_user', project_name: 'proj', "
+            "CREATE (n:Callable:Entity {uid: 'proj:tests.test_mod.test_get_user', project_name: 'proj', "
             "name: 'test_get_user', qualified_name: 'tests.test_mod.test_get_user', "
             "file_path: 'tests/test_mod.py', kind: 'function', line_start: 1, line_end: 5, "
             "visibility: 'public', docstring: 'Test get_user', signature: 'def test_get_user():', "

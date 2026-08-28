@@ -41,7 +41,7 @@ async def _seed_modules(graph_client: GraphClient) -> None:
     for fp in (_FILE_A, _FILE_B):
         uid = f"{_PROJECT}:{fp}"
         await graph_client.execute_write(
-            "CREATE (n:Module {uid: $uid, project_name: $p, name: $fp, qualified_name: $uid, "
+            "CREATE (n:Module:Entity {uid: $uid, project_name: $p, name: $fp, qualified_name: $uid, "
             "file_path: $fp, kind: 'module', line_start: 1, line_end: 1})",
             {"uid": uid, "p": _PROJECT, "fp": fp},
         )
