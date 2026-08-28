@@ -5,9 +5,19 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+import pytest
+
 from code_atlas.events import FileChanged, Topic, encode_event
 from code_atlas.graph.client import UpsertResult
-from code_atlas.indexing.consumers import _MAX_BATCH_FAILURES, ASTConsumer, BatchPolicy, TierConsumer
+from code_atlas.indexing.consumers import (
+    _MAX_BATCH_FAILURES,
+    _RESOLVE_DUTY_RATIO,
+    _RESOLVE_MAX_GAP_S,
+    ASTConsumer,
+    BatchPolicy,
+    TierConsumer,
+    _next_resolve_gap,
+)
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship
 from code_atlas.schema import RelType
 from code_atlas.settings import AtlasSettings, EmbeddingSettings
@@ -735,3 +745,64 @@ async def test_hash_survives_only_after_the_flush_so_a_crash_loop_cannot_strand_
     await consumer.process_batch([event], "b2")
     assert graph.hash_writes == [], "an unchanged-looking recovery run wrote the hash before its flush"
     assert "plain.py" in consumer._pending_file_hashes.get("proj", {})
+
+
+class TestAdaptiveResolveCadence:
+    """A resolution flush costs O(project size), and the number of flushes grows with
+    the project too, so a fixed every-5-batches cadence spends a growing share of a
+    reindex on resolution. The gap after each flush is therefore scaled by what that
+    flush actually cost.
+    """
+
+    @staticmethod
+    def _reindex(tmp_path: Path) -> ASTConsumer:
+        # Reuses the existing reindex-policy helper: time_window_s=0 is what sets
+        # _resolve_batch_interval=5, and therefore what makes _resolve_adaptive true.
+        return _reindex_consumer(tmp_path, StubGraph())
+
+    def test_adaptive_only_in_reindex_mode(self, tmp_path: Path):
+        """Watch mode keeps its fixed cadence: `final` there only arrives at shutdown,
+        so a stretched gap would delay one edited file's edges by that gap."""
+        assert self._reindex(tmp_path)._resolve_adaptive is True
+        assert _make_consumer(tmp_path)._resolve_adaptive is False
+
+    async def test_a_cheap_flush_sets_no_meaningful_gap(self, tmp_path: Path):
+        """Small projects must be unaffected — a fast flush yields a gap far below the
+        batch cadence that triggers it, so the controller never engages."""
+        consumer = self._reindex(tmp_path)
+        await consumer._flush_deferred_resolution()
+        assert consumer._resolve_min_gap_s < 1.0
+
+    def test_an_expensive_flush_stretches_the_gap(self):
+        """The gap is a multiple of the measured duration, so resolution stays roughly
+        1/(1+ratio) of wall time however large the project gets."""
+        assert _next_resolve_gap(3.0) == pytest.approx(3.0 * _RESOLVE_DUTY_RATIO)
+        assert _next_resolve_gap(0.05) == pytest.approx(0.05 * _RESOLVE_DUTY_RATIO)
+
+    def test_the_gap_is_capped(self):
+        """A pathologically slow flush must not stall resolution indefinitely."""
+        assert _next_resolve_gap(10_000.0) == _RESOLVE_MAX_GAP_S
+
+    def test_a_negative_duration_cannot_produce_a_negative_gap(self):
+        """The event loop clock is monotonic, but a negative gap would silently disable
+        the controller rather than fail, so it is clamped rather than assumed."""
+        assert _next_resolve_gap(-5.0) == 0.0
+
+    def test_pending_count_covers_every_buffer(self, tmp_path: Path):
+        """The ceiling that overrides the gap is only a memory guard if it counts every
+        buffer a deferred flush accumulates."""
+        consumer = self._reindex(tmp_path)
+        buffers = [
+            consumer._pending_import_rels,
+            consumer._pending_call_rels,
+            consumer._pending_type_rels,
+            consumer._pending_inherit_rels,
+            consumer._pending_ref_rels,
+            consumer._pending_member_rels,
+            consumer._pending_anchor_rels,
+            consumer._pending_config_rels,
+        ]
+        assert consumer._pending_rel_count() == 0
+        for i, buf in enumerate(buffers):
+            buf.append(object())  # type: ignore[arg-type]
+            assert consumer._pending_rel_count() == i + 1, "a buffer is missing from the count"

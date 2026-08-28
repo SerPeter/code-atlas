@@ -107,6 +107,33 @@ _MAX_BATCH_FAILURES = 5
 # __init__ for the measurements and for why this is bounded rather than unbounded.
 _EMBED_WRITE_CONCURRENCY = 2
 
+# Adaptive resolution cadence (reindex only) -- see _flush_deferred_resolution.
+#
+# A flush costs O(project size): build_resolution_lookup alone measured 405ms on a
+# 592-module project and 812ms on one of 581 with more classes, and it grows with the
+# project while the number of flushes grows with it too. A fixed every-5-batches
+# cadence therefore spends a growing share of a reindex on resolution.
+#
+# So the next flush waits at least this multiple of the last one's duration, which
+# caps resolution at roughly 1/(1+ratio) of wall time -- 20% at 4. Small projects are
+# unaffected: a 50ms flush yields a 200ms gap, far below the batch cadence that
+# triggers it anyway, so this only engages once flushes get expensive.
+_RESOLVE_DUTY_RATIO = 4.0
+_RESOLVE_MAX_GAP_S = 300.0
+
+# Safety valve, not a tuned number: deferring a flush accumulates unresolved
+# relationships in memory, so a flush happens regardless once the buffer reaches
+# this many. Set generously because the real ceiling should come from a measured
+# reindex rather than a guess; the count is logged at each flush to make that
+# measurement possible.
+_RESOLVE_PENDING_CEILING = 500_000
+
+
+def _next_resolve_gap(duration_s: float) -> float:
+    """Minimum spacing before the next resolution flush, given what the last cost."""
+    return min(_RESOLVE_MAX_GAP_S, max(0.0, duration_s) * _RESOLVE_DUTY_RATIO)
+
+
 # How long an entry must sit untouched before another consumer may adopt it. Long enough
 # that a live consumer's own in-flight batch never qualifies, short enough that a crash
 # does not strand work for a whole session.
@@ -685,6 +712,11 @@ class ASTConsumer(TierConsumer):
         self._resolve_time_interval_s: float = 30.0 if is_reindex else 5.0
         self._batches_since_resolve: int = 0
         self._last_resolve_time: float = 0.0
+        # Adaptivity is reindex-only. In watch mode `final` arrives at shutdown and a
+        # stretched gap would delay a single edited file's edges by that gap; there the
+        # flushes are small and frequent, which is the point of watch mode.
+        self._resolve_adaptive: bool = is_reindex
+        self._resolve_min_gap_s: float = 0.0
         self._pending_import_rels: list[ParsedRelationship] = []
         self._pending_call_rels: list[ParsedRelationship] = []
         self._pending_type_rels: list[ParsedRelationship] = []
@@ -756,6 +788,19 @@ class ASTConsumer(TierConsumer):
             # buffer is already empty — see _flush_deferred_resolution).
             await self._flush_deferred_resolution(final=True)
 
+    def _pending_rel_count(self) -> int:
+        """Relationships buffered since the last flush — what a deferred flush costs in memory."""
+        return (
+            len(self._pending_import_rels)
+            + len(self._pending_call_rels)
+            + len(self._pending_type_rels)
+            + len(self._pending_inherit_rels)
+            + len(self._pending_ref_rels)
+            + len(self._pending_member_rels)
+            + len(self._pending_anchor_rels)
+            + len(self._pending_config_rels)
+        )
+
     async def _flush_deferred_resolution(self, *, final: bool = False) -> None:  # noqa: PLR0912, PLR0915
         """Run resolution for all accumulated rels across batches.
 
@@ -779,6 +824,9 @@ class ASTConsumer(TierConsumer):
         visited even when this flush parsed nothing for them, which is what lets
         the final flush close out a full-index run.
         """
+        flush_started = asyncio.get_event_loop().time()
+        pending_before = self._pending_rel_count()
+
         if self._pending_anchor_rels:
             # Anchors may target code in any project (uid/project-prefixed/
             # absolute path forms) — resolved once, cross-project, rather
@@ -965,6 +1013,19 @@ class ASTConsumer(TierConsumer):
         self._pending_project_names.clear()
         self._batches_since_resolve = 0
         self._last_resolve_time = asyncio.get_event_loop().time()
+
+        # Pace the next flush by what this one cost. Reported unconditionally at debug
+        # level because the pending count is the number _RESOLVE_PENDING_CEILING should
+        # eventually be derived from.
+        duration = self._last_resolve_time - flush_started
+        if self._resolve_adaptive:
+            self._resolve_min_gap_s = _next_resolve_gap(duration)
+        logger.debug(
+            "Resolution flush took {:.2f}s over {} pending rel(s); next flush deferred at least {:.1f}s",
+            duration,
+            pending_before,
+            self._resolve_min_gap_s,
+        )
 
     async def _parse_file(
         self,
@@ -1389,10 +1450,14 @@ class ASTConsumer(TierConsumer):
 
             self._batches_since_resolve += 1
             now = asyncio.get_event_loop().time()
-            if (
-                self._batches_since_resolve >= self._resolve_batch_interval
-                or (now - self._last_resolve_time) >= self._resolve_time_interval_s
-            ):
+            elapsed = now - self._last_resolve_time
+            due = (
+                self._batches_since_resolve >= self._resolve_batch_interval or elapsed >= self._resolve_time_interval_s
+            )
+            # The adaptive gap only ever *delays* a due flush; it can never bring one
+            # forward, so the existing cadence stays an upper bound on staleness. The
+            # buffer ceiling overrides it so a long gap cannot grow memory without limit.
+            if (due and elapsed >= self._resolve_min_gap_s) or self._pending_rel_count() >= _RESOLVE_PENDING_CEILING:
                 await self._flush_deferred_resolution()
 
             # Anchor invalidation runs every batch, unlike the deferred-resolution
