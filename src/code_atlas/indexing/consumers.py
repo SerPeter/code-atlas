@@ -782,7 +782,32 @@ class ASTConsumer(TierConsumer):
             await self.graph.resolve_anchors(self._pending_anchor_rels)
             self.note_progress()
 
-        backlog = {p for p, r in self._retry_rels.items() if r}
+        # `_stale_candidate_rels is not None` is the reindex flag (set to {} only when
+        # is_reindex, see __init__), which the `final and ...` guard below already keys
+        # on. During a reindex the *retry* backlog is deferred to the final flush too.
+        #
+        # _retry_rels[p] is dominated by rels that never resolve -- builtins,
+        # third-party attribute calls, anything the receiver-type gate rejects -- so
+        # once a project has been touched it stays in the backlog for the whole run,
+        # and every later flush paid build_resolution_lookup(p) plus a full
+        # _resolve_one_call pass over p's entire retry buffer even when this flush
+        # parsed nothing for p. In a monorepo that is one such pass per sub-project per
+        # flush, and the sub-projects are exactly what a monorepo has many of.
+        #
+        # Only *untouched* projects are affected: a project this flush parsed for is in
+        # _pending_project_names already, and its retry buffer is merged inside the loop
+        # regardless. An untouched project's backlog cannot become resolvable through
+        # writes this consumer did not make, so replaying it mid-run is a no-op.
+        #
+        # Deliberately NOT deferred in watch mode. There `final` only arrives at
+        # shutdown, which can be hours; another session's consumer writing to an
+        # untouched project would otherwise leave its backlog unresolved until then.
+        # Watch-mode flushes carry few projects and small buffers, so per-flush replay
+        # costs little there — the amplification is a full-index problem.
+        reindexing = self._stale_candidate_rels is not None
+        backlog: set[str] = set()
+        if final or not reindexing:
+            backlog |= {p for p, r in self._retry_rels.items() if r}
         if final and self._stale_candidate_rels is not None:
             backlog |= {p for p, r in self._stale_candidate_rels.items() if r}
         for project_name in self._pending_project_names | backlog:
