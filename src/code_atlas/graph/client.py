@@ -5879,7 +5879,7 @@ class GraphClient:
         )
 
     @retry(
-        retry=retry_if_exception_type(TransientError),
+        retry=retry_if_exception_type((TransientError, QueryTimeoutError)),
         stop=stop_after_attempt(20),
         wait=wait_exponential(multiplier=0.5, min=0.5, max=15),
         before_sleep=lambda rs: logger.warning(
@@ -5904,8 +5904,33 @@ class GraphClient:
         Both run once per version bump, never in a hot loop, so trading a slower
         worst case for not hard-failing the whole migration is the right side of
         that tradeoff.
+
+        Two reasons this calls ``_execute_write_inner`` rather than ``execute_write``,
+        both of which defeated the patience above while it looked correct:
+
+        1. ``execute_write`` bounds every call with ``asyncio.wait_for(write_timeout_s)``
+           and converts the expiry into ``QueryTimeoutError``. A write that *blocks* --
+           which is exactly what a concurrent writer holding storage produces, as
+           opposed to one that errors fast -- therefore surfaced as a timeout, and
+           neither retry predicate caught it. The 20 attempts never ran: it failed once,
+           after 60s. QueryTimeoutError is now retryable here, and each attempt keeps
+           its own 60s bound, so the patience is real (up to ~20 blocked minutes) while
+           a genuinely wedged server still surfaces rather than hanging forever.
+        2. It also nested retries -- 20 outer x 4 inner = up to 80 round trips, with the
+           inner 2s-max schedule burning first, so the effective backoff was not the one
+           written here.
+
+        Inside a managed transaction the transaction owns retries, so this defers to
+        ``execute_write`` unchanged.
         """
-        await self.execute_write(stmt, params)
+        if _active_tx_var.get() is not None:
+            await self.execute_write(stmt, params)
+            return
+        with _tracer.start_as_current_span("graph.execute_write_patient", attributes={"db.statement": stmt[:200]}):
+            try:
+                await asyncio.wait_for(self._execute_write_inner(stmt, params), timeout=self._write_timeout_s)
+            except TimeoutError:
+                raise QueryTimeoutError(self._write_timeout_s, stmt[:120]) from None
 
     async def _exec_ddl(self, stmt: str) -> None:
         """Execute a DDL statement, ignoring 'already exists' / 'doesn't exist' errors."""

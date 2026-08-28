@@ -5,11 +5,16 @@ No infrastructure required — these test pure functions and data structures.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 import sys
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from tenacity import wait_none
 
 from code_atlas.graph.client import (
     _CODE_ENTITY_KINDS,
@@ -21,6 +26,8 @@ from code_atlas.graph.client import (
     _TYPE_REF_RANK,
     _UID_ROUTED_REL_TYPES,
     GraphClient,
+    QueryTimeoutError,
+    _active_tx_var,
     _call_edge_weight,
     _CallEdgeFacts,
     _CallLookup,
@@ -41,9 +48,6 @@ from code_atlas.parsing.languages.hcl import _KINDS as _HCL_FILE_KINDS
 from code_atlas.parsing.languages.sql import _KIND_COLUMN, _KIND_INDEX, _KIND_TABLE, _KIND_VIEW
 from code_atlas.schema import CallableKind, RelType, TypeDefKind
 from code_atlas.settings import AtlasSettings
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class TestRelationshipRouting:
@@ -1158,3 +1162,142 @@ class TestMarkerLabelStamping:
         """Guards the guard: a regex that stops matching would pass the test above
         vacuously, which is the exact failure mode it exists to catch."""
         assert len(self._node_writes()) >= 8
+
+
+class TestPatientWritePath:
+    """The schema/DDL write path must actually be patient when a write blocks.
+
+    Its whole reason to exist is that a concurrent writer can hold storage access for
+    minutes. But it delegated to ``execute_write``, which bounds every call with
+    ``asyncio.wait_for(write_timeout_s)`` and raises ``QueryTimeoutError`` -- and both
+    retry predicates listed only ``TransientError``. A write that *blocks*, which is
+    precisely what a busy writer produces, therefore failed on the first attempt and
+    the 20-attempt schedule never ran.
+    """
+
+    @staticmethod
+    def _fast_retry(monkeypatch):
+        """Keep the retry *policy* under test but drop its backoff to zero.
+
+        The real schedule is 20 attempts with up to 15s waits — ~4 minutes to exhaust.
+        Patching the wait, rather than the stop condition, means these tests still
+        exercise the real attempt count and the real retry predicate.
+        """
+        # `.retry` is attached by tenacity's decorator at runtime; ty cannot see it.
+        retrying = GraphClient._execute_write_patient.retry  # type: ignore[unresolved-attribute]
+        monkeypatch.setattr(retrying, "wait", wait_none())
+
+    @staticmethod
+    def _client(tmp_path: Path, *, run_side_effect):
+        settings = AtlasSettings(project_root=tmp_path)
+        session = AsyncMock()
+        session.run = AsyncMock(side_effect=run_side_effect)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=False)
+        driver = MagicMock()
+        driver.session = MagicMock(return_value=session_cm)
+        client = GraphClient(settings, driver=driver)
+        client._write_timeout_s = 0.05  # keep the test fast; the mechanism is what matters
+        return client, session
+
+    async def test_retries_a_blocking_write_instead_of_failing_once(self, tmp_path: Path, monkeypatch):
+        """Two blocked attempts then success must succeed, not raise."""
+        calls = {"n": 0}
+
+        async def run(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                await asyncio.sleep(10)  # blocks past write_timeout_s
+            result = AsyncMock()
+            result.consume = AsyncMock(return_value=None)
+            return result
+
+        self._fast_retry(monkeypatch)
+        client, _ = self._client(tmp_path, run_side_effect=run)
+        await client._execute_write_patient("CREATE INDEX ON :Thing(uid);")
+        assert calls["n"] == 3, "a blocked write was not retried"
+
+    async def test_gives_up_eventually_rather_than_hanging(self, tmp_path: Path, monkeypatch):
+        """Patience is bounded — a permanently wedged server must surface, not hang."""
+
+        async def run(*_a, **_k):
+            await asyncio.sleep(10)
+
+        self._fast_retry(monkeypatch)
+        client, _ = self._client(tmp_path, run_side_effect=run)
+        with pytest.raises(QueryTimeoutError):
+            await client._execute_write_patient("CREATE INDEX ON :Thing(uid);")
+
+    async def test_defers_to_execute_write_inside_a_managed_transaction(self, tmp_path: Path):
+        """A managed transaction owns its own retries; the patient path must not
+        open a second session inside one."""
+        client, _ = self._client(tmp_path, run_side_effect=AsyncMock())
+        tx = AsyncMock()
+        tx_result = AsyncMock()
+        tx_result.consume = AsyncMock(return_value=None)
+        tx.run = AsyncMock(return_value=tx_result)
+        token = _active_tx_var.set(tx)
+        try:
+            await client._execute_write_patient("MATCH (n) SET n.x = 1")
+        finally:
+            _active_tx_var.reset(token)
+        tx.run.assert_awaited_once()
+        client._driver.session.assert_not_called()
+
+
+class TestFixtureMarkerStamping:
+    """Test fixtures that build nodes with raw Cypher must stamp :Entity too.
+
+    Product code is covered by TestMarkerLabelStamping; fixtures were the gap, and the
+    gap is not cosmetic. Fourteen queries now match on :Entity, so an unmarked fixture
+    node is invisible to them -- silently, with no error. That is exactly how
+    ``test_upsert_with_documents_rels`` began asserting on an empty edge list: it
+    pre-created its target with a raw CREATE carrying only the Callable label, and the
+    doc-link query stopped finding it. (Phrased without the literal pattern on purpose --
+    the scan below covers this file too, and a worked example in prose would match it.)
+
+    A sweep at the time found 43 such creations across three files, after an earlier
+    automated audit had reported "exactly two" -- which is why this is a test and not a
+    one-off cleanup.
+    """
+
+    _NODE_WRITE = re.compile(
+        r"(?:CREATE|MERGE)\s*\(\w*:"
+        r"((?:\{NodeLabel\.\w+\}|[A-Za-z_]\w*)(?::(?:\{NodeLabel\.\w+\}|[A-Za-z_]\w*))*)"
+    )
+
+    def _unmarked(self) -> list[tuple[str, int, str]]:
+        from code_atlas.schema import _ENTITY_LABELS
+
+        values = {lbl.value for lbl in _ENTITY_LABELS}
+        enum_names = {lbl.name for lbl in _ENTITY_LABELS}
+        tests_root = Path(__file__).resolve().parents[2]
+        out: list[tuple[str, int, str]] = []
+        for path in sorted(tests_root.rglob("*.py")):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for m in self._NODE_WRITE.finditer(text):
+                chain = m.group(1)
+                names = {
+                    (mm.group(1) if (mm := re.fullmatch(r"\{NodeLabel\.(\w+)\}", part)) else part)
+                    for part in chain.split(":")
+                }
+                if not (names & values or names & enum_names):
+                    continue  # not an entity label (SchemaVersion, a plain alias, ...)
+                if "Entity" in names or "ENTITY" in names:
+                    continue
+                rel = path.relative_to(tests_root).as_posix()
+                out.append((rel, text[: m.start()].count("\n") + 1, chain))
+        return out
+
+    def test_no_fixture_creates_an_unmarked_entity_node(self):
+        unmarked = self._unmarked()
+        assert not unmarked, f"fixtures creating entity nodes without :Entity: {unmarked}"
+
+    def test_the_scan_still_finds_node_writes(self):
+        """Guards the guard: a regex that matched nothing would pass the test above
+        vacuously, which is the failure mode it exists to catch."""
+        text = "\n".join(
+            p.read_text(encoding="utf-8", errors="replace") for p in (Path(__file__).resolve().parents[2]).rglob("*.py")
+        )
+        assert len(self._NODE_WRITE.findall(text)) >= 40
