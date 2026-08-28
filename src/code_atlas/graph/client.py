@@ -117,6 +117,43 @@ _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
 # of edges. Chunking keeps any single transaction well inside the write timeout.
 _CALLS_WRITE_CHUNK = 2000
 
+# Labels the per-file content-hash reads cover: every entity label except the two
+# structural ones the hash gate deliberately ignores. Package and Project carry a
+# file_hash rather than per-entity content hashes, and the callers' `_classify_file`
+# would treat them as entities that vanished. Derived from _ENTITY_LABELS rather than
+# listed, so a new label joins the hash gate automatically instead of silently
+# looking like a deleted entity on its first re-parse.
+_HASHED_ENTITY_LABELS: tuple[NodeLabel, ...] = tuple(
+    sorted(_ENTITY_LABELS - {NodeLabel.PACKAGE, NodeLabel.PROJECT}, key=lambda lbl: lbl.value)
+)
+
+# Labels whose file_path names a file this project *indexed*. Reference-counted
+# stubs are excluded even though they carry a file_path: theirs names a file the
+# project merely mentions, and counting it made every referenced data file look
+# like a source file since deleted (see get_project_file_paths).
+_INDEXED_FILE_LABELS: tuple[NodeLabel, ...] = tuple(
+    sorted(
+        _ENTITY_LABELS - {NodeLabel.PROJECT, NodeLabel.RESOURCE_FILE, NodeLabel.ENV_VAR},
+        key=lambda lbl: lbl.value,
+    )
+)
+
+# Labels an in-project import may resolve onto: everything an entity can be except
+# the external stubs an unresolved import would itself mint, and the Project node.
+_IMPORT_TARGET_LABELS: tuple[NodeLabel, ...] = tuple(
+    sorted(
+        _ENTITY_LABELS
+        - {
+            NodeLabel.EXTERNAL_PACKAGE,
+            NodeLabel.EXTERNAL_SYMBOL,
+            NodeLabel.RESOURCE_FILE,
+            NodeLabel.ENV_VAR,
+            NodeLabel.PROJECT,
+        },
+        key=lambda lbl: lbl.value,
+    )
+)
+
 _POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
     {
         RelType.CALLS,
@@ -1561,40 +1598,56 @@ class GraphClient:
 
     async def get_file_content_hashes(self, project_name: str, file_path: str) -> dict[str, EntityHashData]:
         """Return ``{uid: EntityHashData}`` for non-structural nodes."""
-        records = await self.execute(
-            f"MATCH (n {{project_name: $p, file_path: $f}}) "
-            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le, "
-            f"n.signature AS sig, n.docstring AS doc, {primary_label_expr('n')} AS lbl",
-            {"p": project_name, "f": file_path},
-        )
-        return {
-            r["uid"]: EntityHashData(r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or "")
-            for r in records
-        }
+        out: dict[str, EntityHashData] = {}
+        for label in _HASHED_ENTITY_LABELS:
+            records = await self.execute(
+                f"MATCH (n:{label} {{project_name: $p, file_path: $f}}) "
+                "RETURN n.uid AS uid, n.content_hash AS hash, n.line_start AS ls, n.line_end AS le, "
+                "n.signature AS sig, n.docstring AS doc",
+                {"p": project_name, "f": file_path},
+            )
+            for r in records:
+                out[r["uid"]] = EntityHashData(
+                    r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], label.value
+                )
+        return out
 
     async def get_batch_file_content_hashes(
         self,
         project_name: str,
         file_paths: list[str],
     ) -> dict[str, dict[str, EntityHashData]]:
-        """Return ``{file_path: {uid: EntityHashData}}`` for multiple files in one RTT."""
+        """Return ``{file_path: {uid: EntityHashData}}`` for multiple files.
+
+        The label is inline on the pattern and there is one statement per label, for
+        the reason ``get_batch_file_hashes`` documents: ``UNWIND ... MATCH (n {{...}})
+        WHERE n:Label`` is order-sensitive in Memgraph and silently drops rows. It also
+        makes the match index-driven -- unlabelled, Memgraph could use neither the
+        ``(project_name, file_path)`` composite nor anything else, so it ran one full
+        graph scan *per file path*, measured at ~1.5s for a 30-file batch and paid up
+        to twice per batch (step 3, then step 4b for detector rels).
+
+        The :Entity marker is deliberately not used here: schema v14 trimmed the marker
+        down to ``(uid)`` and ``(project_name, name)``, so it carries no file_path index
+        and the planner would pick ``(project_name, name)`` -- a worse plan than the
+        per-label composite.
+        """
         if not file_paths:
             return {}
-        records = await self.execute(
-            f"UNWIND $fps AS fp "
-            f"MATCH (n {{project_name: $p, file_path: fp}}) "
-            f"WHERE NOT n:{NodeLabel.PACKAGE} AND NOT n:{NodeLabel.PROJECT} "
-            "RETURN n.file_path AS fp, n.uid AS uid, n.content_hash AS hash, "
-            "n.line_start AS ls, n.line_end AS le, "
-            f"n.signature AS sig, n.docstring AS doc, {primary_label_expr('n')} AS lbl",
-            {"p": project_name, "fps": file_paths},
-        )
         result: dict[str, dict[str, EntityHashData]] = defaultdict(dict)
-        for r in records:
-            result[r["fp"]][r["uid"]] = EntityHashData(
-                r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], r["lbl"] or ""
+        for label in _HASHED_ENTITY_LABELS:
+            records = await self.execute(
+                f"UNWIND $fps AS fp "
+                f"MATCH (n:{label} {{project_name: $p, file_path: fp}}) "
+                "RETURN n.file_path AS fp, n.uid AS uid, n.content_hash AS hash, "
+                "n.line_start AS ls, n.line_end AS le, "
+                "n.signature AS sig, n.docstring AS doc",
+                {"p": project_name, "fps": file_paths},
             )
+            for r in records:
+                result[r["fp"]][r["uid"]] = EntityHashData(
+                    r["hash"] or "", r["ls"] or 0, r["le"] or 0, r["sig"], r["doc"], label.value
+                )
         return dict(result)
 
     async def upsert_file_entities(
@@ -1982,14 +2035,20 @@ class GraphClient:
         # here would make every referenced data file look like a source file that had
         # since been deleted — inflating the delta ratio and publishing a `deleted`
         # FileChanged that DETACH DELETEs the node on every delta index.
-        records = await self.execute(
-            f"MATCH (n {{project_name: $p}}) "
-            f"WHERE NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
-            f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
-            "RETURN DISTINCT n.file_path AS fp",
-            {"p": project_name},
-        )
-        return {r["fp"] for r in records if r["fp"]}
+        #
+        # One indexed statement per label rather than one label-free MATCH: unlabelled
+        # this planned as a whole-graph ScanAll (~66k nodes visited to return a few
+        # hundred paths), twice per project at index start. The label list is derived
+        # from _ENTITY_LABELS so a new label joins automatically -- omitting one here
+        # makes its files look deleted and publishes a `deleted` FileChanged.
+        paths: set[str] = set()
+        for label in _INDEXED_FILE_LABELS:
+            records = await self.execute(
+                f"MATCH (n:{label} {{project_name: $p}}) RETURN DISTINCT n.file_path AS fp",
+                {"p": project_name},
+            )
+            paths.update(r["fp"] for r in records if r["fp"])
+        return paths
 
     async def count_entities(self, project_name: str) -> int:
         """Count all entity nodes (Module, TypeDef, Callable, Value, Package) for a project."""
@@ -2029,14 +2088,18 @@ class GraphClient:
         #    Every referenced-not-defined label is excluded: their
         #    qualified_names live in synthetic namespaces (ext/, res/) that an
         #    import must never resolve into.
-        records = await self.execute(
-            f"MATCH (n {{project_name: $p}}) "
-            f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
-            f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
-            f"AND NOT n:{NodeLabel.SCHEMA_VERSION} AND NOT n:{NodeLabel.PROJECT} "
-            f"RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp, {primary_label_expr('n')} AS lbl",
-            {"p": project_name},
-        )
+        # One indexed statement per label: unlabelled this planned as a whole-graph
+        # ScanAll (~66k nodes visited to return ~24k) on every flush. Splitting also
+        # removes the primary_label_expr round trip -- each statement already knows
+        # its label, which is exactly the value `lbl` was being read back for.
+        records = []
+        for label in _IMPORT_TARGET_LABELS:
+            rows = await self.execute(
+                f"MATCH (n:{label} {{project_name: $p}}) "
+                "RETURN n.qualified_name AS qn, n.uid AS uid, n.file_path AS fp",
+                {"p": project_name},
+            )
+            records.extend({**r, "lbl": label.value} for r in rows)
         internal_map: dict[str, str] = {}
         py_importers: set[str] = set()  # uids of Python-file entities (prefix fallback is Python-only)
         # uid -> label, so the IMPORTS write can match on a label-property index
@@ -2269,14 +2332,24 @@ class GraphClient:
         reparsed file's entities before recreating them, so the last reference
         vanishing from source is exactly the last incoming edge vanishing here.
 
-        Cost is bounded by the two smallest labels in the graph, not by the
-        graph: one label-index scan each, never a full scan.  Must run *after*
-        the batch's ``resolve_config_refs``, never between the edge-delete and
-        the recreate — in that window a still-referenced node has zero edges.
+        Must run *after* the batch's ``resolve_config_refs``, never between the
+        edge-delete and the recreate — in that window a still-referenced node has
+        zero edges.
+
+        The ``project_name IS NOT NULL`` predicate is not a filter, it is an index
+        hint. The schema registers no label-ONLY indices, so a bare ``MATCH (n:EnvVar)``
+        cannot be index-driven and Memgraph planned ``ScanAll -> Filter(:EnvVar)``,
+        evaluating the pattern filter once per node in the whole graph — twice per
+        flush. Every entity label carries an existence constraint on ``project_name``
+        (schema.EXISTENCE_CONSTRAINTS), so the predicate is a tautology no committed
+        node can fail, but it lets the planner use the ``(project_name)`` index. This
+        docstring previously claimed the scan was already label-indexed; it was not.
         """
         total = 0
         for label in sorted(_REFERENCE_COUNTED_LABELS, key=lambda lbl: lbl.value):
-            records = await self.execute(f"MATCH (n:{label}) WHERE NOT ()-[]->(n) RETURN n.uid AS uid")
+            records = await self.execute(
+                f"MATCH (n:{label}) WHERE n.project_name IS NOT NULL AND NOT ()-[]->(n) RETURN n.uid AS uid"
+            )
             uids = [r["uid"] for r in records if r["uid"]]
             if not uids:
                 continue
@@ -2484,22 +2557,34 @@ class GraphClient:
 
     async def build_anchor_lookup(self) -> _AnchorLookup:
         """Build the cross-project lookup tables needed for anchor resolution."""
-        file_records = await self.execute(
-            f"MATCH (n) WHERE n:{NodeLabel.MODULE} OR n:{NodeLabel.DOC_FILE} OR n:{NodeLabel.NOTE} "
-            "RETURN n.project_name AS project, n.file_path AS fp, n.uid AS uid, n.content_hash AS hash"
-        )
+        # Both sweeps are cross-project by design (an anchor may target any project),
+        # so there is no project_name to match on -- but `MATCH (n) WHERE n:Module OR ...`
+        # planned as a whole-graph ScanAll twice. One statement per label with the
+        # existence-constraint predicate as an index hint keeps the same rows.
+        # ``project_name IS NOT NULL`` is an index hint, not a filter: the schema
+        # registers no label-ONLY indices, so a bare ``MATCH (n:Label)`` plans as
+        # ScanAll + Filter over the whole graph. Every entity label carries an
+        # existence constraint on project_name, so the predicate is a tautology no
+        # committed node can fail, but it lets the planner use the (project_name) index.
         file_by_path: dict[str, dict[str, list[tuple[str, str]]]] = {}
-        for r in file_records:
-            file_by_path.setdefault(r["project"], {}).setdefault(r["fp"], []).append((r["uid"], r["hash"] or ""))
+        for label in (NodeLabel.MODULE, NodeLabel.DOC_FILE, NodeLabel.NOTE):
+            file_records = await self.execute(
+                f"MATCH (n:{label}) WHERE n.project_name IS NOT NULL "
+                "RETURN n.project_name AS project, n.file_path AS fp, n.uid AS uid, n.content_hash AS hash"
+            )
+            for r in file_records:
+                file_by_path.setdefault(r["project"], {}).setdefault(r["fp"], []).append((r["uid"], r["hash"] or ""))
 
-        symbol_records = await self.execute(
-            f"MATCH (n) WHERE n:{NodeLabel.CALLABLE} OR n:{NodeLabel.TYPE_DEF} OR n:{NodeLabel.VALUE} "
-            "RETURN n.project_name AS project, n.file_path AS fp, n.name AS name, n.uid AS uid, n.content_hash AS hash"
-        )
         symbols_by_path: dict[str, dict[str, dict[str, list[tuple[str, str]]]]] = {}
-        for r in symbol_records:
-            proj_map = symbols_by_path.setdefault(r["project"], {})
-            proj_map.setdefault(r["fp"] or "", {}).setdefault(r["name"], []).append((r["uid"], r["hash"] or ""))
+        for label in (NodeLabel.CALLABLE, NodeLabel.TYPE_DEF, NodeLabel.VALUE):
+            symbol_records = await self.execute(
+                f"MATCH (n:{label}) WHERE n.project_name IS NOT NULL "
+                "RETURN n.project_name AS project, n.file_path AS fp, n.name AS name, "
+                "n.uid AS uid, n.content_hash AS hash"
+            )
+            for r in symbol_records:
+                proj_map = symbols_by_path.setdefault(r["project"], {})
+                proj_map.setdefault(r["fp"] or "", {}).setdefault(r["name"], []).append((r["uid"], r["hash"] or ""))
 
         project_records = await self.execute(
             f"MATCH (p:{NodeLabel.PROJECT}) WHERE p.root_path IS NOT NULL "
@@ -2603,7 +2688,13 @@ class GraphClient:
         for start in range(0, len(uids), 500):
             records = await self.execute(
                 f"UNWIND $uids AS uid "
-                f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(e {{uid: uid}}) "
+                # `(e:Entity {uid})` rather than `(e {uid})`: unlabelled, Memgraph can
+                # index neither end, so it planned ScanAll(n) -> Filter(n :Note) -> Expand
+                # and re-scanned all ~66k nodes once per uid in the chunk. Driving from
+                # the indexed uid and filtering :Note on the far side is the same rows --
+                # measured 441x on this project's graph (500 uids: 4,855ms -> 11ms).
+                f"MATCH (n:{NodeLabel.NOTE})-[r:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->"
+                f"(e:{NodeLabel.ENTITY} {{uid: uid}}) "
                 "WHERE r.anchor_hash <> e.content_hash "
                 "SET r.stale = true "
                 "RETURN count(r) AS cnt",
@@ -2775,7 +2866,10 @@ class GraphClient:
 
         entity_updates = [{"uid": uid, "unresolved": unresolved_by_uid.get(uid, [])} for uid in pending]
         await self.execute_write(
-            "UNWIND $items AS item MATCH (n {uid: item.uid}) SET n.unresolved_citations = item.unresolved",
+            # Marker, for the same reason as invalidate_stale_anchors: unlabelled this
+            # was a full graph scan per uid. Measured 530x (50 uids: 1,592ms -> 3ms).
+            f"UNWIND $items AS item MATCH (n:{NodeLabel.ENTITY} {{uid: item.uid}}) "
+            f"SET n.unresolved_citations = item.unresolved",
             {"items": entity_updates},
         )
 
@@ -5289,7 +5383,13 @@ class GraphClient:
                 f"UNWIND $rels AS r "
                 f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}) "
                 f"WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
-                f"MATCH (b {{project_name: $project, name: r.to_name}}) "
+                # :Entity gives this the marker's (project_name, name) composite --
+                # the one index v14 kept. Unlabelled it was a whole-graph ScanAll per
+                # batch. One query still, so the never-multi-link `size(candidates) = 1`
+                # rule below still collects across every label and refuses ambiguity
+                # exactly as before; a per-label split would collect per label and turn
+                # a correctly-refused ambiguous link into two confident wrong ones.
+                f"MATCH (b:{NodeLabel.ENTITY} {{project_name: $project, name: r.to_name}}) "
                 f"WHERE NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
                 f"WITH r, a, collect(b) AS candidates WHERE size(candidates) = 1 "
                 f"WITH r, a, candidates[0] AS b "
