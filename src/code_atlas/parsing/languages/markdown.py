@@ -220,9 +220,13 @@ def _extract_wikilinks(content: str, project_name: str, from_qn: str) -> list[Pa
 
 
 def _extract_frontmatter_refs(fm: dict[str, Any], project_name: str, from_qn: str) -> list[ParsedRelationship]:
-    """Extract ``derived_from``/``supersedes`` frontmatter lists as relationships."""
+    """Extract ``derived_from``/``supersedes``/``contradicts`` frontmatter lists as relationships."""
     rels: list[ParsedRelationship] = []
-    for key, rel_type in (("derived_from", RelType.DERIVED_FROM), ("supersedes", RelType.SUPERSEDES)):
+    for key, rel_type in (
+        ("derived_from", RelType.DERIVED_FROM),
+        ("supersedes", RelType.SUPERSEDES),
+        ("contradicts", RelType.CONTRADICTS),
+    ):
         values = fm.get(key)
         if not isinstance(values, list):
             continue
@@ -325,7 +329,7 @@ def _extract_anchors(fm: dict[str, Any], from_qn: str) -> list[ParsedRelationshi
     return rels
 
 
-_HARNESS_DIALECT_EXTRA_KEYS = frozenset({"id", "kind", "tags", "derived_from", "supersedes", "anchors"})
+_HARNESS_DIALECT_EXTRA_KEYS = frozenset({"id", "kind", "tags", "derived_from", "supersedes", "contradicts", "anchors"})
 
 
 def _parse_markdown_note(

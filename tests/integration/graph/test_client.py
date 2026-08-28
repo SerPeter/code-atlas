@@ -5709,3 +5709,96 @@ async def test_receiver_gate_recognises_a_class_that_defines_no_methods(graph_cl
         "a call on a fields-only project class was dropped: Config defines no methods, "
         "so its name never reached typedef_names and the gate treated it as external"
     )
+
+
+@pytest.mark.integration
+class TestNoteSupersessionStamp:
+    """The stamp pass that lets ranking stay property-only (ATL-129)."""
+
+    @staticmethod
+    async def _note(graph_client, slug: str) -> str:
+        uid = f"test:note:{slug}"
+        await graph_client.execute_write(
+            "CREATE (n:Note:Entity {uid: $uid, qualified_name: $qn, project_name: 'test', "
+            "name: $slug, file_path: $fp, content_hash: 'h', kind: 'note'})",
+            {"uid": uid, "qn": f"note.{slug}", "slug": slug, "fp": f"wiki/notes/{slug}.md"},
+        )
+        return uid
+
+    @staticmethod
+    async def _stamp_of(graph_client, uid: str) -> tuple[str | None, list[str]]:
+        rows = await graph_client.execute(
+            "MATCH (n:Note {uid: $uid}) RETURN n.superseded_by AS s, n.contradicts_with AS c",
+            {"uid": uid},
+        )
+        return (rows[0]["s"], list(rows[0]["c"] or [])) if rows else (None, [])
+
+    async def test_a_supersedes_edge_stamps_its_target(self, graph_client):
+        await graph_client.ensure_schema()
+        new_uid = await self._note(graph_client, "thing-v2")
+        old_uid = await self._note(graph_client, "thing-v1")
+        await graph_client.execute_write(
+            "MATCH (a:Note {uid: $a}), (b:Note {uid: $b}) MERGE (a)-[:SUPERSEDES]->(b)",
+            {"a": new_uid, "b": old_uid},
+        )
+
+        await graph_client.stamp_note_relations([new_uid])
+
+        assert (await self._stamp_of(graph_client, old_uid))[0] == new_uid
+        assert (await self._stamp_of(graph_client, new_uid))[0] is None
+
+    async def test_removing_the_supersession_clears_the_stamp(self, graph_client):
+        """Scenario 2, and the reason the affected set is wider than the batch.
+
+        The edit is to the *superseding* note; the note that must be un-stamped is the
+        other one, which the batch never mentions. Scope the pass to the batch alone and
+        the target stays demoted forever with nothing to say why.
+        """
+        await graph_client.ensure_schema()
+        new_uid = await self._note(graph_client, "thing-v2")
+        old_uid = await self._note(graph_client, "thing-v1")
+        await graph_client.execute_write(
+            "MATCH (a:Note {uid: $a}), (b:Note {uid: $b}) MERGE (a)-[:SUPERSEDES]->(b)",
+            {"a": new_uid, "b": old_uid},
+        )
+        await graph_client.stamp_note_relations([new_uid])
+        assert (await self._stamp_of(graph_client, old_uid))[0] == new_uid
+
+        # The frontmatter entry goes away, so the edge does too — and the batch that
+        # re-parses carries only the superseding note.
+        await graph_client.execute_write("MATCH (:Note)-[r:SUPERSEDES]->(:Note) DELETE r")
+        await graph_client.stamp_note_relations([new_uid])
+
+        assert (await self._stamp_of(graph_client, old_uid))[0] is None
+
+    async def test_contradiction_is_symmetric_and_stamps_both_ends(self, graph_client):
+        await graph_client.ensure_schema()
+        x_uid = await self._note(graph_client, "x")
+        y_uid = await self._note(graph_client, "y")
+        await graph_client.execute_write(
+            "MATCH (a:Note {uid: $a}), (b:Note {uid: $b}) MERGE (a)-[:CONTRADICTS]->(b)",
+            {"a": x_uid, "b": y_uid},
+        )
+
+        await graph_client.stamp_note_relations([x_uid, y_uid])
+
+        assert (await self._stamp_of(graph_client, x_uid))[1] == [y_uid]
+        assert (await self._stamp_of(graph_client, y_uid))[1] == [x_uid]
+
+    async def test_re_stamping_an_unchanged_vault_is_idempotent(self, graph_client):
+        """Re-indexing an unchanged vault must not churn properties — a spurious write
+        marks the entity embed-dirty and re-bills the embedding."""
+        await graph_client.ensure_schema()
+        new_uid = await self._note(graph_client, "thing-v2")
+        old_uid = await self._note(graph_client, "thing-v1")
+        await graph_client.execute_write(
+            "MATCH (a:Note {uid: $a}), (b:Note {uid: $b}) MERGE (a)-[:SUPERSEDES]->(b)",
+            {"a": new_uid, "b": old_uid},
+        )
+
+        await graph_client.stamp_note_relations([new_uid])
+        first = await self._stamp_of(graph_client, old_uid)
+        await graph_client.stamp_note_relations([new_uid])
+        second = await self._stamp_of(graph_client, old_uid)
+
+        assert first == second

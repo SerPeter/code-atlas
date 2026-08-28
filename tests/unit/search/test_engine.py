@@ -1014,3 +1014,79 @@ class TestRankedScoreMatchesTheOrder:
 
         assert ranked.rrf_score == 0.02
         assert ranked.ranked_score > ranked.rrf_score, "a Callable boosts above its raw score"
+
+
+class TestSupersessionRanking:
+    """A note its own author replaced must not read as current guidance (ATL-129)."""
+
+    @staticmethod
+    def _note(name: str, score: float, *, superseded_by: str = "", contradicts: tuple[str, ...] = ()):
+        return SearchResult(
+            uid=f"wiki:note:{name}",
+            name=name,
+            qualified_name=name,
+            kind="note",
+            file_path=f"wiki/notes/{name}.md",
+            line_start=1,
+            line_end=2,
+            signature="",
+            docstring="",
+            labels=["Note"],
+            rrf_score=score,
+            superseded_by=superseded_by,
+            contradicts_with=contradicts,
+        )
+
+    def test_a_superseded_note_loses_to_its_successor_on_an_equal_score(self):
+        """The case the story exists for: identical raw scores, opposite currency.
+
+        Without the demotion these two tie and the order is arbitrary, so an agent
+        asking a why-question gets the replaced answer half the time.
+        """
+        old = self._note("thing-v1", 0.01, superseded_by="wiki:note:thing-v2")
+        new = self._note("thing-v2", 0.01)
+
+        ranked = _boost_results([old, new])
+
+        assert ranked[0].uid == "wiki:note:thing-v2"
+        assert ranked[1].uid == "wiki:note:thing-v1"
+
+    def test_the_demotion_is_not_an_exclusion(self):
+        """A superseded note stays findable — it is the successor's provenance."""
+        old = self._note("thing-v1", 0.09, superseded_by="wiki:note:thing-v2")
+        unrelated = self._note("other", 0.01)
+
+        ranked = _boost_results([unrelated, old])
+
+        assert [r.uid for r in ranked] == ["wiki:note:thing-v1", "wiki:note:other"]
+
+    def test_the_successors_uid_survives_ranking(self):
+        """The annotation is the point — a demoted hit with no pointer is just a
+        result that ranks oddly for no stated reason."""
+        old = self._note("thing-v1", 0.01, superseded_by="wiki:note:thing-v2")
+
+        ranked = _boost_results([old])
+
+        assert ranked[0].superseded_by == "wiki:note:thing-v2"
+
+    def test_an_unresolved_contradiction_is_annotated_but_not_demoted(self):
+        """Neither side is known wrong, so demoting one would be the system picking a
+        winner nobody picked. Flag both, rank neither down."""
+        x = self._note("x", 0.01, contradicts=("wiki:note:y",))
+        plain = self._note("plain", 0.01)
+
+        ranked = _boost_results([x, plain])
+
+        assert {r.ranked_score for r in ranked} == {ranked[0].ranked_score}
+        assert next(r for r in ranked if r.name == "x").contradicts_with == ("wiki:note:y",)
+
+    def test_code_results_are_untouched(self):
+        """The new properties exist only on Notes; code ranking must not move."""
+        a = _result(name="alpha")
+        b = _result(name="beta")
+
+        before = [r.uid for r in _boost_results([a, b])]
+        after = [r.uid for r in _boost_results([a, b])]
+
+        assert before == after
+        assert all(r.superseded_by == "" and r.contradicts_with == () for r in _boost_results([a, b]))

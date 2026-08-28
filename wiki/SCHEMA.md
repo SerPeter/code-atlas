@@ -36,7 +36,8 @@ anchors: # explicit code links (Phase 3 — not resolved yet)
   - code-atlas:code_atlas.indexing.watcher.FileWatcher._flush
 created: 2026-07-11
 derived_from: [inbox-2026-07-10-flush-bug] # dream-mode provenance
-supersedes: []
+supersedes: [] # notes this one replaces — the target is demoted in search
+contradicts: [] # notes this one disagrees with, unresolved — both are flagged, neither demoted
 archived: false
 ---
 ```
@@ -53,9 +54,23 @@ metadata:
 ---
 ```
 
-Both dialects index into the same `Note` label. `derived_from`/`supersedes` entries and wikilink targets are plain slugs
-for same-project references, or `project:slug` for cross-project references (the global vault, the memory dir, or any
-other indexed project).
+Both dialects index into the same `Note` label. `derived_from`/`supersedes`/`contradicts` entries and wikilink targets
+are plain slugs for same-project references, or `project:slug` for cross-project references (the global vault, the
+memory dir, or any other indexed project).
+
+### Supersession and contradiction
+
+`supersedes:` and `contradicts:` are the two keys that change how a note _ranks_, not just how it links.
+
+- **`supersedes: [older-note]`** creates a `SUPERSEDES` edge, and the target is stamped `superseded_by`. Search demotes
+  it and every hit carries the successor's uid. It is demoted, not hidden — a replaced note is the provenance for the
+  one that replaced it.
+- **`contradicts: [other-note]`** creates a symmetric `CONTRADICTS` edge, and **both** ends are stamped. Neither is
+  demoted: in an unresolved contradiction neither side is known wrong, so ranking one down would be the system picking a
+  winner nobody picked. Both hits say the dispute exists.
+
+Neither is ever written automatically. There is no contradiction _detection_ — the edge exists so a human, or dream-mode
+consolidation landing on "contradiction, can't auto-resolve", has somewhere durable to record the verdict.
 
 ## Identity
 

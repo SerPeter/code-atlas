@@ -103,6 +103,10 @@ class RelType(StrEnum):
     LINKS_TO = "LINKS_TO"
     DERIVED_FROM = "DERIVED_FROM"
     SUPERSEDES = "SUPERSEDES"
+    # Symmetric: two notes that disagree and nobody has resolved which is right.
+    # Written only from frontmatter -- there is no automated contradiction detection,
+    # and inventing one would be a machine asserting a dispute a human never made.
+    CONTRADICTS = "CONTRADICTS"
     # Git-derived signals (Module <-> Module, out-of-band — see git_signals.py)
     CO_CHANGES_WITH = "CO_CHANGES_WITH"
 

@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 # markdown.py's _resolve_note_ref) — an exact-uid miss means the link is
 # genuinely dangling. DOCUMENTS targets resolve heuristically by name instead,
 # so an unresolved one is an expected heuristic-miss, not a lint finding.
-_LINK_REL_TYPES = frozenset({RelType.LINKS_TO, RelType.DERIVED_FROM, RelType.SUPERSEDES})
+_LINK_REL_TYPES = frozenset({RelType.LINKS_TO, RelType.DERIVED_FROM, RelType.SUPERSEDES, RelType.CONTRADICTS})
 
 _DEFAULT_SIMILARITY_THRESHOLD = 0.92
 

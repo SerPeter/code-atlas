@@ -90,6 +90,7 @@ _UID_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
         RelType.LINKS_TO,
         RelType.DERIVED_FROM,
         RelType.SUPERSEDES,
+        RelType.CONTRADICTS,
     }
 )
 
@@ -2739,6 +2740,73 @@ class GraphClient:
             for key, rank in keys:
                 by_key.setdefault(key, []).append((rank, r["uid"]))
         return _CitationLookup(by_key=by_key, uid_label=uid_label)
+
+    async def stamp_note_relations(self, note_uids: list[str]) -> int:
+        """Recompute ``superseded_by``/``contradicts_with`` for notes touched by a batch.
+
+        Ranking stays property-only: the search channels return node properties, so a
+        per-result edge subquery in three channels would be new per-query cost for a
+        fact that only changes at index time. Stamp it once here instead.
+
+        **The affected set is wider than the batch**, and that is the whole difficulty.
+        Adding a `supersedes:` entry stamps a note the batch does contain a link to.
+        *Removing* one has to un-stamp a note the batch may not mention at all — the
+        edit was to the superseding note, and its target is elsewhere. So the set is:
+
+        1. notes the batch's notes point at now (stamp them), and
+        2. notes currently stamped as superseded/contradicted *by* one of the batch's
+           notes (recompute them, which clears the ones whose edge is gone).
+
+        Without (2) a removed `supersedes:` line leaves its target demoted forever, and
+        nothing would ever say why.
+
+        Scoped to those uids, never a project-wide sweep inside the batch loop: a
+        whole-project pass is erased by the next batch, the same way batch-local call
+        resolution was (ADR-0026).
+        """
+        if not note_uids:
+            return 0
+
+        # Two statements, not one WITH chain. A hard MATCH after a WITH drops the row
+        # entirely when it finds nothing -- so on the first ever run, where no note
+        # carries a stamp yet, a combined query returns zero rows and stamps nothing.
+        # Same row-loss family as the UNWIND/MATCH ordering trap.
+        affected = set(note_uids)
+
+        targets = await self.execute(
+            f"UNWIND $uids AS u "
+            f"MATCH (b:{NodeLabel.NOTE} {{uid: u}})-[:{RelType.SUPERSEDES}|{RelType.CONTRADICTS}]->"
+            f"(t:{NodeLabel.NOTE}) "
+            "RETURN DISTINCT t.uid AS uid",
+            {"uids": note_uids},
+        )
+        affected.update(r["uid"] for r in targets if r["uid"])
+
+        stamped = await self.execute(
+            f"MATCH (s:{NodeLabel.NOTE}) "
+            "WHERE s.superseded_by IN $uids OR any(c IN coalesce(s.contradicts_with, []) WHERE c IN $uids) "
+            "RETURN s.uid AS uid",
+            {"uids": note_uids},
+        )
+        affected.update(r["uid"] for r in stamped if r["uid"])
+
+        # Clear then stamp, in one statement per property, over the affected set only.
+        # REMOVE before SET so a note that lost its last incoming edge ends up clean
+        # rather than keeping a stamp nothing points at any more.
+        result = await self.execute(
+            f"UNWIND $uids AS u "
+            f"MATCH (n:{NodeLabel.NOTE} {{uid: u}}) "
+            "REMOVE n.superseded_by, n.contradicts_with "
+            f"WITH n "
+            f"OPTIONAL MATCH (newer:{NodeLabel.NOTE})-[:{RelType.SUPERSEDES}]->(n) "
+            f"OPTIONAL MATCH (n)-[:{RelType.CONTRADICTS}]-(other:{NodeLabel.NOTE}) "
+            "WITH n, collect(DISTINCT newer.uid) AS newers, collect(DISTINCT other.uid) AS others "
+            "SET n.superseded_by = head([x IN newers WHERE x IS NOT NULL]) "
+            "SET n.contradicts_with = [x IN others WHERE x IS NOT NULL] "
+            "RETURN count(n) AS c",
+            {"uids": sorted(affected)},
+        )
+        return result[0]["c"] if result else 0
 
     async def resolve_citations(
         self,

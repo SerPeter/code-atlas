@@ -105,6 +105,13 @@ class SearchResult:
     # number beside it — `atlas search fetch` printed 0.0078 at rank 5 and 0.0076 at
     # rank 4, which reads as a broken ranker rather than a deliberate demotion.
     ranked_score: float = 0.0
+    # Stamped at index time by the supersession sweep, never traversed per query.
+    # A note whose author explicitly replaced it must not read as current guidance,
+    # and the successor's uid travels with the hit so the reader can follow it.
+    superseded_by: str = ""
+    # Symmetric and NOT demoted: in an unresolved contradiction neither side is known
+    # wrong, so demoting one would be the system picking a winner nobody picked.
+    contradicts_with: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -749,13 +756,20 @@ def _is_doc_result(result: SearchResult) -> bool:
     return bool(_DOC_LABELS & set(result.labels))
 
 
+# Demotion, not exclusion. A superseded note stays findable -- it is the provenance
+# for the note that replaced it, and the dream-mode archive-stub decision keeps it
+# reachable for the same reason. 0.5 is stronger than any label boost and weaker than
+# a filter: it loses to its own successor on an equal raw score, without vanishing.
+_SUPERSEDED_PENALTY = 0.5
+
+
 def _boost_results(
     results: list[SearchResult],
     *,
     label_boost: dict[str, float] | None = None,
     secondary_projects: frozenset[str] | None = None,
 ) -> list[SearchResult]:
-    """Re-rank by RRF score * visibility boost * label boost * project-scope boost."""
+    """Re-rank by RRF score * visibility * label * project-scope * supersession."""
     boost_table = label_boost if label_boost is not None else _LABEL_BOOST_BLENDED
 
     def _project_boost(result: SearchResult) -> float:
@@ -770,6 +784,7 @@ def _boost_results(
             * _VIS_BOOST.get(result.visibility, 1.0)
             * max((boost_table.get(lbl, 1.0) for lbl in result.labels), default=1.0)
             * _project_boost(result)
+            * (_SUPERSEDED_PENALTY if result.superseded_by else 1.0)
         )
 
     # Recorded on each result rather than discarded with the sort key, so a consumer can
@@ -930,6 +945,8 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
                 sources=uid_ranks.get(uid, {}),
                 visibility=props_by_uid.get(uid, {}).get("visibility", "public"),
                 source=props_by_uid.get(uid, {}).get("source", "") or "",
+                superseded_by=props_by_uid.get(uid, {}).get("superseded_by", "") or "",
+                contradicts_with=tuple(props_by_uid.get(uid, {}).get("contradicts_with") or ()),
             )
             for uid, rrf_score in fused_scores.items()
         ]

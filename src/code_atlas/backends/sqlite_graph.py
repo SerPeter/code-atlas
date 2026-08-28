@@ -2351,6 +2351,74 @@ class SqliteGraphClient:
             await cur.close()
         return out
 
+    async def stamp_note_relations(self, note_uids: list[str]) -> int:
+        """Recompute ``superseded_by``/``contradicts_with`` for notes touched by a batch.
+
+        Same contract as the Memgraph implementation, including the wider affected set:
+        removing a ``supersedes:`` entry has to un-stamp a note the batch never
+        mentions, so notes currently stamped *by* a batch note are recomputed too.
+        """
+        if not note_uids:
+            return 0
+        conn = await self._get_conn()
+        placeholders = ",".join("?" * len(note_uids))
+
+        cur = await conn.execute(
+            f"SELECT to_uid FROM edges WHERE rel_type IN ('SUPERSEDES', 'CONTRADICTS') "
+            f"AND from_uid IN ({placeholders})",
+            tuple(note_uids),
+        )
+        affected = {r[0] for r in await cur.fetchall()}
+        await cur.close()
+
+        cur = await conn.execute(
+            "SELECT uid FROM nodes WHERE labels = 'Note' AND ("
+            f"json_extract(props_json, '$.superseded_by') IN ({placeholders}) "
+            "OR EXISTS (SELECT 1 FROM json_each(json_extract(props_json, '$.contradicts_with')) "
+            f"WHERE value IN ({placeholders})))",
+            (*note_uids, *note_uids),
+        )
+        affected.update(r[0] for r in await cur.fetchall())
+        await cur.close()
+        affected.update(note_uids)
+
+        async with self._write_lock:
+            for uid in sorted(affected):
+                cur = await conn.execute(
+                    "SELECT from_uid FROM edges WHERE rel_type = 'SUPERSEDES' AND to_uid = ? LIMIT 1", (uid,)
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                newer = row[0] if row else None
+
+                cur = await conn.execute(
+                    "SELECT to_uid FROM edges WHERE rel_type = 'CONTRADICTS' AND from_uid = ? "
+                    "UNION SELECT from_uid FROM edges WHERE rel_type = 'CONTRADICTS' AND to_uid = ?",
+                    (uid, uid),
+                )
+                others = sorted({r[0] for r in await cur.fetchall()})
+                await cur.close()
+
+                # Clear both first, so a note that lost its last incoming edge ends up
+                # clean rather than keeping a stamp nothing points at any more.
+                await conn.execute(
+                    "UPDATE nodes SET props_json = json_remove(props_json, "
+                    "'$.superseded_by', '$.contradicts_with') WHERE uid = ?",
+                    (uid,),
+                )
+                patch: dict[str, object] = {}
+                if newer:
+                    patch["superseded_by"] = newer
+                if others:
+                    patch["contradicts_with"] = others
+                if patch:
+                    await conn.execute(
+                        "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
+                        (json.dumps(patch), uid),
+                    )
+            await conn.commit()
+        return len(affected)
+
     async def clear_embeddings(self, project: str | None = None) -> int:
         """Strip vectors for one project, or the whole store when *project* is None.
 

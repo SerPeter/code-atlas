@@ -1494,6 +1494,17 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 "rrf_score": round(r.rrf_score, 6),
                 "sources": r.sources,
             }
+            # Emitted only when set, so an ordinary hit costs no tokens to say
+            # nothing. A demoted result with no stated reason reads as a broken
+            # ranker; a disputed one that looks settled is worse.
+            if r.superseded_by:
+                entry["superseded_by"] = r.superseded_by
+                entry["caveat"] = f"Superseded by {r.superseded_by} — this is the note its author replaced."
+            if r.contradicts_with:
+                entry["contradicts_with"] = list(r.contradicts_with)
+                entry["caveat"] = (
+                    "Unresolved contradiction with " + ", ".join(r.contradicts_with) + " — neither is settled."
+                )
             if detail == "full":
                 entry["docstring"] = r.docstring or ""
                 if r.source:

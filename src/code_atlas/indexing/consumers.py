@@ -724,6 +724,10 @@ class ASTConsumer(TierConsumer):
         self._pending_ref_rels: list[ParsedRelationship] = []
         self._pending_member_rels: list[ParsedRelationship] = []
         self._pending_anchor_rels: list[ParsedRelationship] = []
+        # Notes re-parsed this flush. Drives the supersession stamp pass, which is
+        # scoped to these rather than sweeping the project: a project-wide pass
+        # inside the batch loop is erased by the next batch (ADR-0026).
+        self._pending_note_uids: set[str] = set()
         self._pending_config_rels: list[ParsedRelationship] = []
         self._pending_citations: dict[str, dict[str, list[str]]] = {}  # project_name -> {uid: citations}
         # Every file this flush's batches actually re-parsed, per project — the
@@ -798,6 +802,7 @@ class ASTConsumer(TierConsumer):
             + len(self._pending_ref_rels)
             + len(self._pending_member_rels)
             + len(self._pending_anchor_rels)
+            + len(self._pending_note_uids)
             + len(self._pending_config_rels)
         )
 
@@ -832,6 +837,13 @@ class ASTConsumer(TierConsumer):
             # absolute path forms) — resolved once, cross-project, rather
             # than per-project like CALLS/IMPORTS/USES_TYPE below.
             await self.graph.resolve_anchors(self._pending_anchor_rels)
+            self.note_progress()
+
+        if self._pending_note_uids:
+            # After the note edges for this flush exist, not before: the pass reads
+            # SUPERSEDES/CONTRADICTS to decide what to stamp.
+            stamped = await self.graph.stamp_note_relations(sorted(self._pending_note_uids))
+            logger.debug("Stamped supersession/contradiction on {} note(s)", stamped)
             self.note_progress()
 
         # `_stale_candidate_rels is not None` is the reindex flag (set to {} only when
@@ -1006,6 +1018,7 @@ class ASTConsumer(TierConsumer):
         self._pending_ref_rels.clear()
         self._pending_member_rels.clear()
         self._pending_anchor_rels.clear()
+        self._pending_note_uids.clear()
         self._pending_config_rels.clear()
         self._pending_citations.clear()
         self._pending_citation_files.clear()
@@ -1427,6 +1440,12 @@ class ASTConsumer(TierConsumer):
                 self._pending_ref_rels.extend(group_ref_rels)
                 self._pending_member_rels.extend(group_member_rels)
                 self._pending_anchor_rels.extend(group_anchor_rels)
+                self._pending_note_uids.update(
+                    f"{project_name}:{e.qualified_name}"
+                    for pfd in parsed_files.values()
+                    for e in pfd.entities
+                    if e.label is NodeLabel.NOTE
+                )
                 self._pending_config_rels.extend(group_config_rels)
                 self._pending_project_names.add(project_name)
                 self._projects_seen.add(project_name)
