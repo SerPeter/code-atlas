@@ -2246,7 +2246,9 @@ class GraphClient:
             if not edges:
                 continue
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a {{uid: r.from_uid}}), (b {{uid: r.to_uid}}) MERGE (a)-[:{rel_type}]->(b)",
+                f"UNWIND $rels AS r "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}), (b:{NodeLabel.ENTITY} {{uid: r.to_uid}}) "
+                f"MERGE (a)-[:{rel_type}]->(b)",
                 {"rels": edges},
             )
 
@@ -2878,7 +2880,7 @@ class GraphClient:
                 # functions, classes and constants alike.
                 await self.execute_write(
                     f"UNWIND $rels AS r "
-                    f"MATCH (m {{uid: r.from_uid}})-[:{RelType.IMPORTS}]->(t {{name: r.to_name}}) "
+                    f"MATCH (m:{NodeLabel.ENTITY} {{uid: r.from_uid}})-[:{RelType.IMPORTS}]->(t {{name: r.to_name}}) "
                     f"MERGE (m)-[:{RelType.EXPORTS}]->(t)",
                     {"rels": params},
                 )
@@ -3090,7 +3092,7 @@ class GraphClient:
             ]
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.f}}), (b:{NodeLabel.TYPE_DEF} {{uid: r.t}}) "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.f}}), (b:{NodeLabel.TYPE_DEF} {{uid: r.t}}) "
                 f"MERGE (a)-[e:{RelType.USES_TYPE}]->(b) "
                 f"SET e.strategy = r.strategy, e.confidence = r.confidence, e.weight = r.weight",
                 {"rels": edge_params},
@@ -3173,20 +3175,20 @@ class GraphClient:
         # cross-file DEFINES edges (see _recreate_file_relationships), so a
         # stale type edge would otherwise linger next to the new resolution.
         await self.execute_write(
-            f"UNWIND $uids AS uid MATCH (a)-[r:{RelType.DEFINES}]->(b {{uid: uid}}) "
+            f"UNWIND $uids AS uid MATCH (a)-[r:{RelType.DEFINES}]->(b:{NodeLabel.ENTITY} {{uid: uid}}) "
             f"WHERE a:{NodeLabel.TYPE_DEF} OR a:{NodeLabel.MODULE} DELETE r",
             {"uids": sorted({rel.to_name for rel in member_rels})},
         )
 
         if type_edges:
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.f}}), (b {{uid: r.t}}) "
+                f"UNWIND $rels AS r MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.f}}), (b:{NodeLabel.ENTITY} {{uid: r.t}}) "
                 f"MERGE (a)-[:{RelType.DEFINES}]->(b)",
                 {"rels": [{"f": f, "t": t} for f, t in type_edges]},
             )
         if module_edges:
             await self.execute_write(
-                f"UNWIND $rels AS r MATCH (a:{NodeLabel.MODULE} {{uid: r.f}}), (b {{uid: r.t}}) "
+                f"UNWIND $rels AS r MATCH (a:{NodeLabel.MODULE} {{uid: r.f}}), (b:{NodeLabel.ENTITY} {{uid: r.t}}) "
                 f"MERGE (a)-[:{RelType.DEFINES}]->(b)",
                 {"rels": [{"f": f, "t": t} for f, t in module_edges]},
             )
@@ -3407,7 +3409,7 @@ class GraphClient:
             await self.execute_write(
                 f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
                 f"(es:{NodeLabel.EXTERNAL_SYMBOL} {{uid: $es_uid}}) "
-                f"MATCH (real {{uid: $real_uid}}) "
+                f"MATCH (real:{NodeLabel.ENTITY} {{uid: $real_uid}}) "
                 f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
                 {"es_uid": es_uid, "real_uid": real_uid},
@@ -3499,7 +3501,7 @@ class GraphClient:
         items = [{"uid": e.qualified_name, "props": e.properties} for e in enrichments if e.properties]
         if items:
             await self.execute_write(
-                "UNWIND $items AS item MATCH (n {uid: item.uid}) SET n += item.props",
+                f"UNWIND $items AS item MATCH (n:{NodeLabel.ENTITY} {{uid: item.uid}}) SET n += item.props",
                 {"items": items},
             )
 
@@ -4836,7 +4838,9 @@ class GraphClient:
         """Which of *uids* exist in the graph — dream-mode dangling-link check."""
         if not uids:
             return set()
-        records = await self.execute("UNWIND $uids AS uid MATCH (n {uid: uid}) RETURN uid", {"uids": uids})
+        records = await self.execute(
+            f"UNWIND $uids AS uid MATCH (n:{NodeLabel.ENTITY} {{uid: uid}}) RETURN uid", {"uids": uids}
+        )
         return {r["uid"] for r in records}
 
     async def get_orphan_notes(self) -> list[dict[str, Any]]:
@@ -5283,7 +5287,8 @@ class GraphClient:
         if symbol_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}) WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}) "
+                f"WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
                 f"MATCH (b {{project_name: $project, name: r.to_name}}) "
                 f"WHERE NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
                 f"WITH r, a, collect(b) AS candidates WHERE size(candidates) = 1 "
@@ -5297,7 +5302,8 @@ class GraphClient:
         if file_params:
             records = await self.execute(
                 f"UNWIND $rels AS r "
-                f"MATCH (a {{uid: r.from_uid}}) WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}) "
+                f"WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
                 f"MATCH (b {{project_name: $project}}) WHERE b.file_path ENDS WITH r.to_name "
                 f"AND NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
                 f"WITH r, a, collect(b) AS candidates WHERE size(candidates) = 1 "
