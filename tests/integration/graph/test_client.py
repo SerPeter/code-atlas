@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from code_atlas.graph.client import QueryTimeoutError
+from code_atlas.graph.client import _HASHED_ENTITY_LABELS, QueryTimeoutError
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
-from code_atlas.schema import GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
+from code_atlas.schema import _ENTITY_LABELS, GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
 from code_atlas.server.analysis import _analyze_communities
 
 if TYPE_CHECKING:
@@ -5544,3 +5544,163 @@ async def test_resolve_calls_declines_when_the_receiver_type_is_not_a_project_cl
         "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN b.uid AS t", {"a": f"{project}:src.m.caller"}
     )
     assert rows == [], rows  # no edge at all, not a damped guess
+
+
+async def test_content_hash_read_covers_every_entity_label(graph_client: GraphClient):
+    """Every label the hash gate is supposed to see must come back from the batched read.
+
+    ``get_batch_file_content_hashes`` used one label-free ``UNWIND ... MATCH (n {..})
+    WHERE NOT n:Package AND NOT n:Project``, which cost a full graph scan per file path
+    (~1.5s for a 30-file batch, paid up to twice per batch). It is now one indexed
+    statement per label -- the same idiom, and for the same order-sensitivity reason, as
+    ``get_batch_file_hashes`` above.
+
+    Splitting by label introduces a failure this test exists to catch: a label omitted
+    from the enumeration is not an error, it is an entity that reads back as absent. The
+    caller's ``_classify_file`` then sees it as deleted and removes it on the next
+    re-parse. ``_HASHED_ENTITY_LABELS`` is derived from ``_ENTITY_LABELS`` rather than
+    hand-listed so it cannot drift, and this asserts the derivation end to end.
+    """
+    project = "test_hash_label_coverage"
+    file_path = "cover.py"
+    await graph_client.ensure_schema()
+
+    # Enumerated from the semantic contract (_ENTITY_LABELS minus the two structural
+    # labels the gate ignores), NOT from _HASHED_ENTITY_LABELS. Deriving the fixture
+    # from the constant under test makes this vacuous: drop a label and the test simply
+    # stops seeding it. Verified by dropping Value from _HASHED_ENTITY_LABELS -- the
+    # earlier, self-referential version still passed.
+    contract = sorted(_ENTITY_LABELS - {NodeLabel.PACKAGE, NodeLabel.PROJECT}, key=lambda lbl: lbl.value)
+    assert set(contract) == set(_HASHED_ENTITY_LABELS), (
+        "the hash gate no longer covers every entity label it is supposed to: "
+        f"{sorted(lbl.value for lbl in set(contract) ^ set(_HASHED_ENTITY_LABELS))}"
+    )
+
+    expected: dict[str, str] = {}
+    for i, label in enumerate(contract):
+        uid = f"{project}:cover.e{i}"
+        expected[uid] = label.value
+        await graph_client.execute_write(
+            f"CREATE (n:{label.value}:{NodeLabel.ENTITY.value} {{uid: $uid, project_name: $p, "
+            f"name: $name, qualified_name: $qn, file_path: $fp, content_hash: 'h', "
+            f"line_start: 1, line_end: 2}})",
+            {"uid": uid, "p": project, "name": f"e{i}", "qn": f"cover.e{i}", "fp": file_path},
+        )
+
+    got = await graph_client.get_batch_file_content_hashes(project, [file_path])
+    by_uid = got.get(file_path, {})
+
+    missing = sorted(set(expected) - set(by_uid))
+    assert not missing, f"labels dropped by the per-label split: {[expected[u] for u in missing]}"
+    # The label each entity reports must still be its own, not the marker.
+    assert {uid: data.label for uid, data in by_uid.items()} == expected
+
+    # The single-file variant reads the same set — it was split the same way.
+    single = await graph_client.get_file_content_hashes(project, file_path)
+    assert set(single) == set(expected)
+
+
+async def test_receiver_gate_recognises_a_class_that_defines_no_methods(graph_client: GraphClient):
+    """A fields-only project class is still a project class.
+
+    ``typedef_names`` is what lets the receiver gate decline `seen.add(x)` on a builtin
+    `set`. Its docstring promises "Every TypeDef name in the project", but it was
+    populated from the rows of the ``TypeDef-[:DEFINES]->Callable`` join, so a class with
+    no methods contributed no name -- a fields-only dataclass, a TypedDict, a plain enum,
+    a Go struct whose methods live outside the indexed set. Measured on this repo's own
+    graph: 691 distinct TypeDef names, 514 reachable through that join. 177 of them --
+    26% of the classes -- were invisible.
+
+    The failure is silent edge loss, not a wrong edge: the gate concludes the receiver
+    leaves the project and ``_resolve_one_call`` returns None, so the call is dropped
+    with nothing to show for it.
+    """
+    await graph_client.ensure_schema()
+    project = "fieldsonly_recv"
+    fp = "src/m.py"
+    await graph_client.upsert_file_entities(
+        project,
+        fp,
+        [
+            ParsedEntity(
+                name="m",
+                qualified_name=f"{project}:src.m",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=30,
+                file_path=fp,
+                content_hash="m",
+            ),
+            # A class with fields but no methods -- nothing on the DEFINES join.
+            ParsedEntity(
+                name="Config",
+                qualified_name=f"{project}:src.m.Config",
+                label=NodeLabel.TYPE_DEF,
+                kind="class",
+                line_start=2,
+                line_end=5,
+                file_path=fp,
+                content_hash="cfg",
+            ),
+            # A second class that does define one, so the join is non-empty overall and
+            # the gate is genuinely active rather than disabled by an empty set.
+            ParsedEntity(
+                name="Loader",
+                qualified_name=f"{project}:src.m.Loader",
+                label=NodeLabel.TYPE_DEF,
+                kind="class",
+                line_start=8,
+                line_end=14,
+                file_path=fp,
+                content_hash="ld",
+            ),
+            ParsedEntity(
+                name="reload",
+                qualified_name=f"{project}:src.m.Loader.reload",
+                label=NodeLabel.CALLABLE,
+                kind="method",
+                line_start=9,
+                line_end=11,
+                file_path=fp,
+                content_hash="rl",
+            ),
+            ParsedEntity(
+                name="caller",
+                qualified_name=f"{project}:src.m.caller",
+                label=NodeLabel.CALLABLE,
+                kind="function",
+                line_start=20,
+                line_end=24,
+                file_path=fp,
+                content_hash="c",
+            ),
+        ],
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.m.Loader",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project}:src.m.Loader.reload",
+            )
+        ],
+    )
+
+    await graph_client.resolve_calls(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.m.caller",
+                rel_type=RelType.CALLS,
+                to_name="reload",
+                properties={"receiver": "cfg", "receiver_type": "Config"},
+            )
+        ],
+    )
+
+    rows = await graph_client.execute(
+        "MATCH (a {uid: $a})-[r:CALLS]->(b) RETURN b.uid AS t", {"a": f"{project}:src.m.caller"}
+    )
+    assert [r["t"] for r in rows] == [f"{project}:src.m.Loader.reload"], (
+        "a call on a fields-only project class was dropped: Config defines no methods, "
+        "so its name never reached typedef_names and the gate treated it as external"
+    )

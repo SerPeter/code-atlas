@@ -3322,14 +3322,24 @@ class GraphClient:
         caller_to_parent: dict[str, str] = {}
         parent_children: dict[str, list[str]] = {}
         stub_callables: set[str] = set()
-        typedef_names: set[str] = set()
         for r in parent_records:
-            if r["td_name"]:
-                typedef_names.add(r["td_name"])
             caller_to_parent[r["c_uid"]] = r["td_uid"]
             parent_children.setdefault(r["td_uid"], []).append(r["c_uid"])
             if r["c_stub"]:
                 stub_callables.add(r["c_uid"])
+
+        # Its own query, not the td_name column of the DEFINES join above. Sourced from
+        # the join, a class that defines no Callable never contributed a name -- a
+        # fields-only dataclass, a TypedDict, a plain enum, a Go struct whose methods
+        # are outside the indexed set. Measured on this repo: 691 distinct TypeDef
+        # names, 514 reachable through that join; 177 (26%) were missing, and the
+        # receiver gate reads absence as "this receiver leaves the project" and drops
+        # the call outright. The field's contract is every TypeDef name; this is it.
+        typedef_records = await self.execute(
+            f"MATCH (n:{NodeLabel.TYPE_DEF} {{project_name: $p}}) RETURN DISTINCT n.name AS name",
+            {"p": project_name},
+        )
+        typedef_names = {r["name"] for r in typedef_records if r["name"]}
 
         return _CallLookup(
             name_to_callables=name_to_callables,
