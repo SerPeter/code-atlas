@@ -5802,3 +5802,82 @@ class TestNoteSupersessionStamp:
         second = await self._stamp_of(graph_client, old_uid)
 
         assert first == second
+
+
+@pytest.mark.integration
+class TestDbtModelDescription:
+    """A dbt model's description comes from schema.yml; its structure comes from the
+    .sql file. Two files, one concept — so the question is what happens when both
+    upsert.
+
+    ATL-132 proposed re-upserting the model's own uid from the yml carrying only a
+    docstring, **conditional on** upsert-by-uid merging property-sparse entities.
+    These tests are what settled it: it does not merge, it replaces, and whichever
+    file indexed second won outright. The description lives on its own DocSection
+    instead, linked by DOCUMENTS.
+    """
+
+    NL = b"\n"
+    MODEL_SQL = b"{{ config(materialized='table') }}" + NL + b"select * from {{ ref('stg_orders') }}" + NL
+    SCHEMA_YML = (
+        b"version: 2"
+        + NL
+        + b"models:"
+        + NL
+        + b"  - name: orders"
+        + NL
+        + b"    description: Order facts, one row per order."
+        + NL
+    )
+
+    @staticmethod
+    async def _upsert(graph_client, project: str, path: str, source: bytes) -> None:
+        parsed = parse_file(path, source, project)
+        assert parsed is not None
+        await graph_client.upsert_file_entities(project, path, parsed.entities, parsed.relationships)
+
+    @staticmethod
+    async def _state(graph_client, project: str) -> tuple[list[str], str | None]:
+        model = await graph_client.execute(
+            "MATCH (n:TypeDef {uid: $uid}) RETURN n.tags AS tags", {"uid": f"{project}:dbt.model.orders"}
+        )
+        doc = await graph_client.execute(
+            "MATCH (d:DocSection {uid: $uid}) RETURN d.docstring AS doc",
+            {"uid": f"{project}:dbt.model.orders.description"},
+        )
+        assert model, "the model node does not exist"
+        return (list(model[0]["tags"] or []), doc[0]["doc"] if doc else None)
+
+    async def test_sql_then_yml_loses_nothing(self, graph_client):
+        await graph_client.ensure_schema()
+        project = "test-dbt-a"
+        await self._upsert(graph_client, project, "models/orders.sql", self.MODEL_SQL)
+        await self._upsert(graph_client, project, "models/schema.yml", self.SCHEMA_YML)
+
+        tags, doc = await self._state(graph_client, project)
+        assert "materialized:table" in tags
+        assert doc == "Order facts, one row per order."
+
+    async def test_yml_then_sql_loses_nothing(self, graph_client):
+        """The order that actually tests it: nothing controls which file the watcher
+        hands over first, so both have to be safe."""
+        await graph_client.ensure_schema()
+        project = "test-dbt-b"
+        await self._upsert(graph_client, project, "models/schema.yml", self.SCHEMA_YML)
+        await self._upsert(graph_client, project, "models/orders.sql", self.MODEL_SQL)
+
+        tags, doc = await self._state(graph_client, project)
+        assert "materialized:table" in tags
+        assert doc == "Order facts, one row per order."
+
+    async def test_the_description_is_linked_to_the_model_it_describes(self, graph_client):
+        await graph_client.ensure_schema()
+        project = "test-dbt-c"
+        await self._upsert(graph_client, project, "models/orders.sql", self.MODEL_SQL)
+        await self._upsert(graph_client, project, "models/schema.yml", self.SCHEMA_YML)
+
+        rows = await graph_client.execute(
+            "MATCH (d:DocSection {uid: $doc})-[:DOCUMENTS]->(m:TypeDef) RETURN m.uid AS uid",
+            {"doc": f"{project}:dbt.model.orders.description"},
+        )
+        assert [r["uid"] for r in rows] == [f"{project}:dbt.model.orders"]

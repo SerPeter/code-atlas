@@ -594,6 +594,193 @@ def _recover_routines(root: Node, ctx: _Ctx) -> None:
             ctx.defines(ctx.module_uid, uid)
 
 
+# ---------------------------------------------------------------------------
+# dbt mode (ATL-132)
+#
+# A dbt model is Jinja-templated SQL, and both halves defeat the plain path: the
+# file is a bare SELECT (dbt wraps it in DDL at run time) so the DDL walker finds
+# no entities at all, and the `{{ ref('x') }}` calls that carry the entire
+# dependency structure live inside exactly the spans the grammar chokes on.
+#
+# Neutralization is length-preserving, the same rule apex.py follows: every span is
+# overwritten in place with an equal-length replacement and newlines are never
+# touched, so line numbers on the shimmed text match the original file byte for
+# byte. Expression spans become identifier-shaped padding so `from {{ ref('x') }}`
+# still parses as a FROM clause; statement and comment spans become spaces.
+#
+# The original spans are scanned separately for refs, sources and macros -- by
+# regex, not by a Jinja engine. dbt's own manifest.json holds the fully resolved
+# DAG, and was rejected: it needs a dbt install and a `dbt parse` run, it goes
+# stale against the working tree, and it breaks the file-is-the-event unit the
+# pipeline is built on. Source files stay the system of record.
+# ---------------------------------------------------------------------------
+
+_JINJA_SPAN = re.compile(rb"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", re.DOTALL)
+_REF_CALL = re.compile(rb"\bref\s*\(\s*(['\"])(.+?)\1\s*(?:,\s*(['\"])(.+?)\3\s*)?\)")
+_SOURCE_CALL = re.compile(rb"\bsource\s*\(\s*(['\"])(.+?)\1\s*,\s*(['\"])(.+?)\3\s*\)")
+_MACRO_DEF = re.compile(rb"\{%-?\s*macro\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*-?%\}", re.DOTALL)
+_SNAPSHOT_DEF = re.compile(rb"\{%-?\s*snapshot\s+([A-Za-z_][A-Za-z0-9_]*)\s*-?%\}")
+_MATERIALIZED = re.compile(rb"materialized\s*=\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]")
+_CALLABLE_JINJA = re.compile(rb"\{\{-?\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\(|\{%-?\s*call\s+([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
+
+# Jinja builtins and dbt globals that are not macros anyone defined.
+_NOT_A_MACRO = frozenset({b"ref", b"source", b"config", b"var", b"env_var", b"this", b"target", b"log", b"return"})
+
+_KIND_DBT_MODEL = "dbt_model"
+_KIND_DBT_SNAPSHOT = "dbt_snapshot"
+_KIND_DBT_MACRO = "dbt_macro"
+
+
+def _has_jinja(source: bytes) -> bool:
+    return b"{{" in source or b"{%" in source
+
+
+def _neutralize_jinja(source: bytes) -> bytes:
+    """Blank every Jinja span, preserving length and every newline.
+
+    Expression spans (``{{ }}``) become ``_``-padding rather than whitespace: a bare
+    ``from   `` does not parse, while ``from ______`` does, and keeping the FROM clause
+    intact is what lets the rest of the statement survive.
+    """
+    buf = bytearray(source)
+    for match in _JINJA_SPAN.finditer(source):
+        start, end = match.span()
+        expression = source[start : start + 2] == b"{{"
+        fill = ord("_") if expression else ord(" ")
+        for i in range(start, end):
+            if buf[i] != ord("\n"):
+                buf[i] = fill
+    return bytes(buf)
+
+
+def _line_of(source: bytes, offset: int) -> int:
+    return source.count(b"\n", 0, offset) + 1
+
+
+def _decode(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="replace")
+
+
+def _parse_dbt(path: str, source: bytes, project_name: str) -> ParsedFile:
+    """Extract a dbt model (or snapshot) plus its refs, sources and macros."""
+    norm_path = path.replace("\\", "/")
+    shimmed = _neutralize_jinja(source)
+    shimmed_root = Parser(_SQL_LANGUAGE).parse(shimmed).root_node
+
+    module_uid = f"{project_name}:{_module_qualified_name(norm_path)}"
+    ctx = _Ctx(project_name=project_name, path=norm_path, module_uid=module_uid)
+    ctx.uids.add(module_uid)
+    ctx.entities.append(
+        ParsedEntity(
+            name=PurePosixPath(norm_path).name,
+            qualified_name=module_uid,
+            label=NodeLabel.MODULE,
+            kind=_KIND_FILE,
+            line_start=1,
+            line_end=shimmed_root.end_point[0] + 1,
+            file_path=norm_path,
+        )
+    )
+
+    # Any real DDL in the file still counts -- a dbt project can hold plain SQL too.
+    for node in _walk(shimmed_root):
+        if node.type == "create_table":
+            _extract_table(node, ctx)
+
+    macros = _extract_dbt_macros(source, ctx, norm_path)
+    owner_uid = _extract_dbt_model(source, ctx, norm_path, shimmed_root) if not macros else None
+    _extract_dbt_edges(source, ctx, owner_uid or module_uid, defined_macros=macros)
+
+    return ParsedFile(file_path=norm_path, language="sql", entities=ctx.entities, relationships=ctx.relationships)
+
+
+def _extract_dbt_macros(source: bytes, ctx: _Ctx, norm_path: str) -> set[bytes]:
+    """``{% macro name(args) %}`` -> Callable. Detected by block, not by directory.
+
+    dbt keeps macros in ``macros/`` by convention, but the convention is not the
+    contract -- a macro defined beside a model is still a macro.
+    """
+    defined: set[bytes] = set()
+    for match in _MACRO_DEF.finditer(source):
+        name = _decode(match.group(1))
+        defined.add(match.group(1))
+        uid = ctx.claim(f"{ctx.project_name}:dbt.macro.{name}")
+        ctx.entities.append(
+            ParsedEntity(
+                name=name,
+                qualified_name=uid,
+                label=NodeLabel.CALLABLE,
+                kind=_KIND_DBT_MACRO,
+                line_start=_line_of(source, match.start()),
+                line_end=_line_of(source, match.end()),
+                file_path=norm_path,
+                signature=f"{name}({_decode(match.group(2)).strip()})",
+            )
+        )
+        ctx.defines(ctx.module_uid, uid)
+    return defined
+
+
+def _extract_dbt_model(source: bytes, ctx: _Ctx, norm_path: str, root: Node) -> str | None:
+    """The file itself is the model. dbt enforces project-unique model names, so the
+    schema-wide identity that makes SQL cross-file references work applies verbatim."""
+    snapshot = _SNAPSHOT_DEF.search(source)
+    stem = _decode(snapshot.group(1)) if snapshot else PurePosixPath(norm_path).stem
+    kind = _KIND_DBT_SNAPSHOT if snapshot else _KIND_DBT_MODEL
+    uid = ctx.claim(f"{ctx.project_name}:dbt.model.{stem}")
+
+    tags: list[str] = []
+    materialized = _MATERIALIZED.search(source)
+    if materialized:
+        tags.append(f"materialized:{_decode(materialized.group(1))}")
+
+    ctx.entities.append(
+        ParsedEntity(
+            name=stem,
+            qualified_name=uid,
+            label=NodeLabel.TYPE_DEF,
+            kind=kind,
+            line_start=1,
+            line_end=root.end_point[0] + 1,
+            file_path=norm_path,
+            tags=tags,
+        )
+    )
+    ctx.defines(ctx.module_uid, uid)
+    return uid
+
+
+def _extract_dbt_edges(source: bytes, ctx: _Ctx, owner_uid: str, *, defined_macros: set[bytes]) -> None:
+    """Scan the Jinja spans for the dependency structure.
+
+    ``ref``/``source`` become USES_TYPE by bare name, which the existing post-batch
+    ``resolve_type_refs`` pass lands on the target model -- the same machinery FK
+    references already use, so cross-file dbt lineage needs no new resolver.
+    """
+    for span in _JINJA_SPAN.finditer(source):
+        text = span.group(0)
+
+        for ref in _REF_CALL.finditer(text):
+            # ref('pkg', 'model') -- the model name is the last argument.
+            target = ref.group(4) or ref.group(2)
+            ctx.uses(owner_uid, _decode(target))
+
+        for src in _SOURCE_CALL.finditer(text):
+            ctx.uses(owner_uid, f"{_decode(src.group(2))}.{_decode(src.group(4))}")
+
+        for call in _CALLABLE_JINJA.finditer(text):
+            name = call.group(1) or call.group(2)
+            if name in _NOT_A_MACRO or name in defined_macros:
+                continue
+            key = (RelType.CALLS, owner_uid, _decode(name))
+            if key in ctx.edges:
+                continue
+            ctx.edges.add(key)
+            ctx.relationships.append(
+                ParsedRelationship(from_qualified_name=owner_uid, rel_type=RelType.CALLS, to_name=_decode(name))
+            )
+
+
 def _parse_sql(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile:
     """Extract entities from a SQL file.
 
@@ -606,6 +793,11 @@ def _parse_sql(path: str, source: bytes, root: Node, project_name: str) -> Parse
         # No Module node for an empty file — it would be an unsearchable stub
         # that still costs an embedding.
         return ParsedFile(file_path=norm_path, language=language, entities=[], relationships=[])
+
+    # dbt files take a different path entirely: the passed `root` is a parse of raw
+    # Jinja-in-SQL and is unusable, so _parse_dbt reparses its own neutralized shim.
+    if _has_jinja(source):
+        return _parse_dbt(path, source, project_name)
 
     module_uid = f"{project_name}:{_module_qualified_name(norm_path)}"
     ctx = _Ctx(project_name=project_name, path=norm_path, module_uid=module_uid)
@@ -645,7 +837,7 @@ def _parse_sql(path: str, source: bytes, root: Node, project_name: str) -> Parse
 
 try:
     import tree_sitter_sql as _ts_sql
-    from tree_sitter import Language, Query
+    from tree_sitter import Language, Parser, Query
 
     _SQL_LANGUAGE = Language(_ts_sql.language())
     _SQL_QUERY = Query(_SQL_LANGUAGE, "(program) @root")

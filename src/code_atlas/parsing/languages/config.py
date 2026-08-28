@@ -134,7 +134,7 @@ from code_atlas.parsing.languages.salesforce import (
 from code_atlas.schema import NodeLabel, RelType
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from tree_sitter import Node
 
@@ -144,6 +144,7 @@ _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
 # to the generic key-tree parse — see the module docstring.
 _MODULE_KINDS: dict[str, str] = {
     "k8s": "k8s_manifest",
+    "dbt_properties": "dbt_properties",
     "compose": "compose_file",
     "github_workflow": "github_workflow",
     "ansible_playbook": "ansible_playbook",
@@ -544,16 +545,39 @@ def _ansible_task_file_kind(path: str) -> str | None:
     return None
 
 
+def _is_dbt_properties(data: Any) -> bool:
+    """dbt property file: ``version: 2`` plus at least one dbt top-level collection.
+
+    ``version: 2`` alone is far too weak a marker -- plenty of YAML carries it -- so
+    one of dbt's own collections has to corroborate it, the same way ``_is_compose``
+    makes ``services`` carry the weight rather than ``version``.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("version") != 2:
+        return False
+    return any(isinstance(data.get(key), list) for key in ("models", "sources", "seeds", "snapshots"))
+
+
+# Content markers before conventions, and order is significant within each: a
+# document matching two markers gets the first. A table rather than a chain of ifs
+# because the chain only ever grows and it had already outgrown the branch limit.
+_CONTENT_DIALECTS: tuple[tuple[str, Callable[[Any], bool]], ...] = (
+    ("k8s", _is_k8s),
+    ("compose", _is_compose),
+    ("dbt_properties", _is_dbt_properties),
+    ("ansible_playbook", _is_ansible_playbook),
+)
+
+
 def _document_dialect(path: str, data: Any) -> str | None:
     """Classify one document. Order matters: content markers before conventions."""
-    if _is_k8s(data):
-        return "k8s"
-    if _is_compose(data):
-        return "compose"
+    for name, matches in _CONTENT_DIALECTS:
+        if matches(data):
+            return name
+    # Path-dependent, so it cannot join the table above.
     if _is_workflow(path, data):
         return "github_workflow"
-    if _is_ansible_playbook(data):
-        return "ansible_playbook"
     if isinstance(data, list) and data and any(isinstance(item, dict) for item in data):
         return _ansible_task_file_kind(path)
     return None
@@ -1603,6 +1627,79 @@ def _parse_toml(path: str, source: bytes, root: Node, project_name: str) -> Pars
 # ---------------------------------------------------------------------------
 
 
+def _extract_dbt_properties(out: _Out, doc: _Doc, module_uid: str) -> None:
+    """``sources:`` -> TypeDef per table; ``models:`` -> description onto the model node.
+
+    Sources are declared *only* in YAML -- there is no .sql file for them -- so there is
+    no cross-file identity question and this is their sole definition site.
+
+    Models are the opposite: the .sql file defines them, and this pass re-upserts the
+    same uid carrying only a docstring. That relies on upsert-by-uid merging a
+    property-sparse entity without clobbering the SQL-side props, in either indexing
+    order -- the same shape ALTER TABLE already depends on after CREATE TABLE.
+    """
+    data = doc.data
+    if not isinstance(data, dict):
+        return
+    line_start, line_end = out.lines(doc.node)
+
+    for source in data.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        source_name = source.get("name")
+        if not isinstance(source_name, str) or not source_name:
+            continue
+        for table in source.get("tables") or []:
+            if not isinstance(table, dict):
+                continue
+            table_name = table.get("name")
+            if not isinstance(table_name, str) or not table_name:
+                continue
+            description = table.get("description") or source.get("description")
+            uid = out.add(
+                # The dotted form, not the bare table name: resolve_type_refs matches
+                # TypeDefs by `name`, and `source('shop','raw_orders')` emits
+                # `shop.raw_orders` as its to_name. A bare name here never resolves.
+                name=f"{source_name}.{table_name}",
+                qn_suffix=f"dbt.source.{source_name}.{table_name}",
+                label=NodeLabel.TYPE_DEF,
+                kind="dbt_source",
+                line_start=line_start,
+                line_end=line_end,
+                docstring=str(description).strip() if description else None,
+            )
+            out.rel(module_uid, RelType.DEFINES, uid)
+
+    for model in data.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        model_name = model.get("name")
+        description = model.get("description")
+        if not isinstance(model_name, str) or not model_name or not description:
+            continue
+        # A DocSection plus a DOCUMENTS edge, NOT a re-upsert of the model's own uid.
+        #
+        # ATL-132 proposed carrying the description by re-upserting `dbt.model.{name}`
+        # with only a docstring, conditional on upsert-by-uid merging property-sparse
+        # entities. It does not: upsert is a full property replace, so whichever file
+        # indexed second won outright -- schema.yml last cleared the model's
+        # `materialized:` tags, and orders.sql last cleared the description. Both
+        # orders were tested; both lost data. The description therefore lives on its
+        # own node, linked by name, which is the shape the rest of the graph already
+        # uses for prose about code.
+        doc_uid = out.add(
+            name=model_name,
+            qn_suffix=f"dbt.model.{model_name}.description",
+            label=NodeLabel.DOC_SECTION,
+            kind="dbt_model_doc",
+            line_start=line_start,
+            line_end=line_end,
+            docstring=str(description).strip(),
+        )
+        out.rel(module_uid, RelType.DEFINES, doc_uid)
+        out.rel(doc_uid, RelType.DOCUMENTS, model_name)
+
+
 def _extract_document(out: _Out, doc: _Doc, dialect: str, module_uid: str) -> _K8sResource | None:
     """Route one classified document to its dialect handler."""
     if dialect == "k8s":
@@ -1615,7 +1712,9 @@ def _extract_document(out: _Out, doc: _Doc, dialect: str, module_uid: str) -> _K
             line_end=line_end,
             source=out.slice(doc.node),
         )
-    if dialect == "compose":
+    if dialect == "dbt_properties":
+        _extract_dbt_properties(out, doc, module_uid)
+    elif dialect == "compose":
         _extract_compose(out, doc, module_uid)
     elif dialect == "github_workflow":
         _extract_workflow(out, doc, module_uid)

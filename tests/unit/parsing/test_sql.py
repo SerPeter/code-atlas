@@ -506,3 +506,114 @@ def test_an_oversized_dump_is_refused_before_it_reaches_the_grammar():
     # Just under the ceiling the same content still parses — the guard is about
     # size, not about refusing T-SQL.
     assert parse_file("db/small.sql", (unit * 4).encode(), PROJECT) is not None
+
+
+# ---------------------------------------------------------------------------
+# dbt mode (ATL-132)
+# ---------------------------------------------------------------------------
+
+
+class TestDbtModels:
+    """A dbt model file is a bare SELECT wrapped in Jinja: the DDL walker finds no
+    entities in it, and the ref() calls carrying the whole dependency structure live
+    inside exactly the spans the grammar chokes on."""
+
+    def test_a_model_file_becomes_a_model_entity(self):
+        parsed = _parse(
+            "select * from {{ ref('stg_orders') }}",
+            path="models/marts/orders.sql",
+        )
+        model = _entity_by_qn(parsed, f"{PROJECT}:dbt.model.orders")
+        assert model.label is NodeLabel.TYPE_DEF
+        assert model.kind == "dbt_model"
+
+    def test_ref_becomes_a_resolvable_edge(self):
+        parsed = _parse("select * from {{ ref('stg_orders') }}", path="models/orders.sql")
+        rels = [r for r in parsed.relationships if r.rel_type is RelType.USES_TYPE]
+        assert [r.to_name for r in rels] == ["stg_orders"]
+        assert rels[0].from_qualified_name == f"{PROJECT}:dbt.model.orders"
+
+    def test_two_arg_ref_uses_the_model_name_not_the_package(self):
+        """`ref('pkg', 'model')` names the package first. Taking group 1 would emit an
+        edge to the package and the model DAG would be quietly wrong."""
+        parsed = _parse("select * from {{ ref('jaffle', 'stg_customers') }}", path="models/orders.sql")
+        names = [r.to_name for r in parsed.relationships if r.rel_type is RelType.USES_TYPE]
+        assert names == ["stg_customers"]
+
+    def test_source_edges_use_the_dotted_name(self):
+        """resolve_type_refs matches TypeDefs by `name`, and the source node declared in
+        schema.yml is named `shop.raw_orders` — a bare `raw_orders` never resolves."""
+        parsed = _parse("select * from {{ source('shop', 'raw_orders') }}", path="models/stg.sql")
+        names = [r.to_name for r in parsed.relationships if r.rel_type is RelType.USES_TYPE]
+        assert names == ["shop.raw_orders"]
+
+    def test_a_macro_call_becomes_a_calls_edge(self):
+        parsed = _parse(
+            "select {{ cents_to_dollars('amount') }} as usd from {{ ref('stg') }}",
+            path="models/orders.sql",
+        )
+        calls = [r.to_name for r in parsed.relationships if r.rel_type is RelType.CALLS]
+        assert calls == ["cents_to_dollars"]
+
+    def test_dbt_builtins_are_not_treated_as_macros(self):
+        """ref/source/config/var are dbt's own, not macros anybody defined. Emitting
+        CALLS edges to them would attach a guessed edge to every model in the project."""
+        parsed = _parse(
+            "{{ config(materialized='view') }} select {{ var('x') }} from {{ ref('a') }}",
+            path="models/orders.sql",
+        )
+        assert [r.to_name for r in parsed.relationships if r.rel_type is RelType.CALLS] == []
+
+    def test_materialized_config_is_recorded_as_a_tag(self):
+        parsed = _parse("{{ config(materialized='incremental') }} select 1", path="models/orders.sql")
+        model = _entity_by_qn(parsed, f"{PROJECT}:dbt.model.orders")
+        assert "materialized:incremental" in model.tags
+
+    def test_a_snapshot_block_names_the_snapshot_not_the_file(self):
+        parsed = _parse(
+            "{% snapshot orders_snapshot %}\nselect * from {{ ref('orders') }}\n{% endsnapshot %}",
+            path="snapshots/whatever.sql",
+        )
+        snap = _entity_by_qn(parsed, f"{PROJECT}:dbt.model.orders_snapshot")
+        assert snap.kind == "dbt_snapshot"
+
+    def test_line_numbers_survive_neutralization(self):
+        """The shim is length-preserving and never touches a newline, so a macro on
+        line 4 must still report line 4 — that is the whole reason for the technique."""
+        source = "\n\n\n{% macro late(x) %}\n  {{ x }}\n{% endmacro %}\n"
+        parsed = _parse(source, path="macros/late.sql")
+        macro = _entity_by_qn(parsed, f"{PROJECT}:dbt.macro.late")
+        assert macro.line_start == 4
+
+    def test_plain_sql_is_untouched_by_dbt_mode(self):
+        """No Jinja, no dbt mode — the DDL path must behave exactly as before."""
+        parsed = _parse("CREATE TABLE users (id INT PRIMARY KEY);")
+        assert _entity_by_qn(parsed, f"{PROJECT}:sql.table.users").kind == "sql_table"
+        assert not [e for e in parsed.entities if e.kind.startswith("dbt")]
+
+
+class TestDbtMacros:
+    def test_a_macro_definition_becomes_a_callable_with_its_signature(self):
+        parsed = _parse(
+            "{% macro cents_to_dollars(column_name, scale=2) %}\n  {{ column_name }} / 100\n{% endmacro %}",
+            path="macros/cents.sql",
+        )
+        macro = _entity_by_qn(parsed, f"{PROJECT}:dbt.macro.cents_to_dollars")
+        assert macro.label is NodeLabel.CALLABLE
+        assert macro.kind == "dbt_macro"
+        assert macro.signature == "cents_to_dollars(column_name, scale=2)"
+
+    def test_a_macro_file_does_not_also_become_a_model(self):
+        """Macros are not models. Emitting both would put a phantom `cents` model in
+        every project's DAG, named after a file that selects nothing."""
+        parsed = _parse("{% macro cents(x) %}{{ x }}{% endmacro %}", path="macros/cents.sql")
+        assert not [e for e in parsed.entities if e.kind == "dbt_model"]
+
+    def test_a_macro_does_not_call_itself(self):
+        """The macro body references its own parameters inside {{ }}; a naive scan
+        turns the definition into a self-call."""
+        parsed = _parse(
+            "{% macro cents(x) %}{{ cents(x) }}{% endmacro %}",
+            path="macros/cents.sql",
+        )
+        assert [r.to_name for r in parsed.relationships if r.rel_type is RelType.CALLS] == []

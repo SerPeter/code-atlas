@@ -280,6 +280,11 @@ class MonorepoSettings(StrictSection):
             "go.mod",
             "pom.xml",
             "build.gradle",
+            # A dbt project is a project: its own models, its own name, and a DAG that
+            # does not cross into the service that happens to contain it. Adding this
+            # is a behaviour change for existing indexes -- a `dbt/` directory inside a
+            # service repo becomes its own sub-project on the next re-index.
+            "dbt_project.yml",
         ],
         description="Files that indicate a directory is a sub-project root.",
     )
