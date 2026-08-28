@@ -126,19 +126,38 @@ async def test_text_search_latency(seeded_graph: GraphClient):
     assert stats["p95"] < 200, f"text_search p95 too high: {stats['p95']}ms"
 
 
+# Warmup iterations, discarded. The first few vector searches pay index page-in and
+# driver connection setup, and at 50 samples two slow readings move p95 by ~40%.
+_VECTOR_WARMUP = 10
+_VECTOR_SAMPLES = 200
+
+
 async def test_vector_search_latency(seeded_graph: GraphClient):
-    """Measure vector_search p50/p95/p99/max over 50 iterations."""
+    """Measure vector_search p50/p95/p99/max, as a complexity tripwire.
+
+    Sized for stability, not for speed. This assertion failed three full-suite runs in
+    a row while passing in isolation at less than half its budget: at 50 samples p95 is
+    the 47th value, and Memgraph's periodic snapshot (every 300s) lands randomly inside
+    a window that short. A tripwire that fires on co-tenancy is not measuring
+    complexity, it is measuring what else was running -- and the cost is real, because
+    a red gate gets re-run rather than read.
+
+    200 samples after 10 warmup, so a couple of snapshot-stalled readings cannot carry
+    p95 on their own. The budget stays at 200ms deliberately: isolated p95 is ~95ms, so
+    the tripwire still fires on any change that doubles it.
+    """
     dim = seeded_graph._dimension
     rng = np.random.default_rng(42)
     latencies: list[float] = []
 
-    for _ in range(50):
+    for i in range(_VECTOR_WARMUP + _VECTOR_SAMPLES):
         vec = rng.standard_normal(dim).tolist()
         t0 = time.perf_counter()
         await seeded_graph.vector_search(vec, limit=10)
-        latencies.append((time.perf_counter() - t0) * 1000)
+        if i >= _VECTOR_WARMUP:
+            latencies.append((time.perf_counter() - t0) * 1000)
 
     stats = _percentiles(latencies)
-    report = {"benchmark": "vector_search_latency", "iterations": 50, **stats}
+    report = {"benchmark": "vector_search_latency", "iterations": len(latencies), **stats}
     print(f"\n{json.dumps(report, indent=2)}")
     assert stats["p95"] < 200, f"vector_search p95 too high: {stats['p95']}ms"
