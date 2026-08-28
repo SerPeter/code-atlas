@@ -17,6 +17,8 @@ import redis.asyncio as aioredis
 from loguru import logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from code_atlas.search.ratelimit import ConcurrencyGate, RateLimiter
+from code_atlas.settings import _PROVIDER_DEFAULTS
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
@@ -48,7 +50,7 @@ class EmbedClient:
     litellm treats it as an OpenAI-compatible API.
     """
 
-    def __init__(self, settings: EmbeddingSettings) -> None:
+    def __init__(self, settings: EmbeddingSettings, redis_settings: RedisSettings | None = None) -> None:
         self._settings = settings
         # batch_size and max_concurrency are guaranteed non-None after the
         # _apply_provider_defaults model validator runs on EmbeddingSettings.
@@ -84,6 +86,25 @@ class EmbedClient:
         # Infer max input tokens from litellm's model registry
         self._max_input_tokens = self._resolve_max_input_tokens()
 
+        # One gate for the whole client, not one per embed_batch call. A per-call
+        # semaphore bounded the chunks of a single call while the embed consumer ran
+        # max_concurrency of those calls at once, so the real ceiling was
+        # max_concurrency squared -- 64 requests in flight for a configured 8.
+        self._gate = ConcurrencyGate(self._max_concurrency)
+        self._rpm = self._resolve_rate_limit(settings.rpm, "rpm")
+        self._tpm = self._resolve_rate_limit(settings.tpm, "tpm")
+        self._limiter: RateLimiter | None = None
+        if redis_settings is not None:
+            self._limiter = RateLimiter(
+                redis_settings, model=self._model, rpm=self._rpm, tpm=self._tpm, gate=self._gate
+            )
+            logger.debug(
+                "Embedding rate limits for '{}': rpm={} tpm={} (0 = unlimited)",
+                self._model,
+                self._rpm,
+                self._tpm,
+            )
+
     @property
     def batch_size(self) -> int:
         """Resolved batch_size (after provider defaults)."""
@@ -93,6 +114,27 @@ class EmbedClient:
     def max_concurrency(self) -> int:
         """Resolved max_concurrency (after provider defaults)."""
         return self._max_concurrency
+
+    def _resolve_rate_limit(self, configured: int | None, field: str) -> int:
+        """Resolve a per-minute budget: explicit config, then litellm's registry, then
+        the provider default. 0 means unlimited at every level.
+
+        The registry sits in the middle because it is authoritative when it has an
+        answer and absent otherwise -- it publishes rpm/tpm for 4 of its 134 embedding
+        models. A model it does not know falls through to the provider default rather
+        than to a guess, and ``get_model_info`` raises outright for unmapped models, so
+        the lookup is exception-guarded exactly like _resolve_max_input_tokens below.
+        """
+        if configured is not None:
+            return configured
+        try:
+            value = litellm.get_model_info(self._model).get(field)
+        except Exception:
+            value = None
+        if value:
+            return int(value)
+        defaults = _PROVIDER_DEFAULTS.get(self._settings.provider, _PROVIDER_DEFAULTS["tei"])
+        return defaults.get(field, 0)
 
     def _resolve_max_input_tokens(self) -> int | None:
         """Resolve the model's max input token limit from litellm's model registry.
@@ -114,20 +156,29 @@ class EmbedClient:
         logger.debug("Could not determine max input tokens for '{}'; truncation disabled", self._model)
         return None
 
-    def _truncate_texts(self, texts: list[str]) -> list[str]:
-        """Truncate texts exceeding the model's max input token limit."""
+    def _truncate_texts(self, texts: list[str]) -> tuple[list[str], list[int]]:
+        """Truncate texts over the model's input limit; return them with token counts.
+
+        The counts are a by-product: every text is encoded here anyway to decide whether
+        it needs truncating, so exact accounting for the tokens-per-minute budget costs
+        nothing. When the model's limit is unknown nothing is encoded, and the counts
+        fall back to the same ~4-chars-per-token approximation the truncation path uses.
+        """
         if self._max_input_tokens is None:
-            return texts
+            return texts, [len(t) // 4 for t in texts]
         limit = self._max_input_tokens
         result: list[str] = []
+        counts: list[int] = []
         for text in texts:
             try:
                 tokens = litellm.encode(model=self._model, text=text)
             except Exception:
                 result.append(text)
+                counts.append(len(text) // 4)
                 continue
             if len(tokens) <= limit:
                 result.append(text)
+                counts.append(len(tokens))
             else:
                 try:
                     truncated = litellm.decode(model=self._model, tokens=tokens[:limit])
@@ -138,7 +189,8 @@ class EmbedClient:
                     truncated = truncated[:last_nl]
                 logger.warning("Truncated embed text from {} to ~{} tokens", len(tokens), limit)
                 result.append(truncated)
-        return result
+                counts.append(limit)
+        return result, counts
 
     @retry(
         retry=retry_if_exception_type(_RETRYABLE_ERRORS),
@@ -157,7 +209,16 @@ class EmbedClient:
         connection issues, timeouts, 5xx) — a burst of embedding calls during a large
         index/catchup is exactly the pattern that trips cloud provider rate limits.
         """
-        return await litellm.aembedding(**kwargs)
+        try:
+            return await litellm.aembedding(**kwargs)
+        except litellm.RateLimitError:
+            # Tell every process, not just this one: the scale factor lives in Valkey, so
+            # a single 429 damps the whole fleet's buckets and concurrency before the
+            # retry above sleeps. Without it the sibling processes keep pushing at the
+            # rate that just failed, and the backoff here is wasted.
+            if self._limiter is not None:
+                await self._limiter.penalize()
+            raise
 
     def _build_kwargs(self, chunk: list[str]) -> dict[str, Any]:
         """Build keyword arguments for a single litellm.aembedding call."""
@@ -190,15 +251,19 @@ class EmbedClient:
         if not texts:
             return []
 
-        texts = self._truncate_texts(texts)
+        texts, token_counts = self._truncate_texts(texts)
 
         with _tracer.start_as_current_span(
             "embed.embed_batch", attributes={"batch_size": len(texts), "model": self._model}
         ):
-            sem = asyncio.Semaphore(self._max_concurrency)
 
-            async def _do_chunk(chunk_idx: int, chunk: list[str]) -> tuple[int, list[list[float]]]:
-                async with sem:
+            async def _do_chunk(chunk_idx: int, chunk: list[str], chunk_tokens: int) -> tuple[int, list[list[float]]]:
+                # Gate first, budget second. The gate bounds sockets and costs nothing to
+                # hold; taking rate budget first would debit it and then block on the gate,
+                # leaving the scarcer resource reserved and unused.
+                async with self._gate:
+                    if self._limiter is not None:
+                        await self._limiter.acquire(tokens=chunk_tokens)
                     try:
                         kwargs = self._build_kwargs(chunk)
                         response = await self._embed_call(kwargs)
@@ -214,7 +279,11 @@ class EmbedClient:
                         return chunk_idx, vectors
 
             tasks = [
-                _do_chunk(i, texts[i * self._batch_size : (i + 1) * self._batch_size])
+                _do_chunk(
+                    i,
+                    texts[i * self._batch_size : (i + 1) * self._batch_size],
+                    sum(token_counts[i * self._batch_size : (i + 1) * self._batch_size]),
+                )
                 for i in range((len(texts) + self._batch_size - 1) // self._batch_size)
             ]
             results = await asyncio.gather(*tasks)

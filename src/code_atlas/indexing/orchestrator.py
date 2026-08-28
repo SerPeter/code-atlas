@@ -1957,7 +1957,7 @@ async def _index_project_inner(  # noqa: PLR0915
     embed: EmbedClient | None = None
     cache: EmbedCache | None = None
     if settings.embeddings.enabled:
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, settings.redis)
         if settings.embeddings.cache_ttl_days > 0:
             cache = EmbedCache(settings.redis, settings.embeddings)
 
@@ -2240,7 +2240,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     embed: EmbedClient | None = None
     cache: EmbedCache | None = None
     if settings.embeddings.enabled:
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, settings.redis)
         if settings.embeddings.cache_ttl_days > 0:
             cache = EmbedCache(settings.redis, settings.embeddings)
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)

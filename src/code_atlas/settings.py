@@ -285,10 +285,15 @@ class MonorepoSettings(StrictSection):
     )
 
 
+# ``rpm``/``tpm`` of 0 mean unlimited. That is the last-resort default on purpose:
+# litellm's registry publishes rate limits for 4 of its 134 embedding models, so a
+# non-zero guess here would throttle the overwhelming majority of users based on
+# nothing. Unlimited is not unbounded -- max_concurrency still caps calls in flight,
+# and the AIMD backoff reacts to a real 429 whatever the configured limits are.
 _PROVIDER_DEFAULTS: dict[str, dict[str, int]] = {
-    "tei": {"batch_size": 32, "max_concurrency": 4},
-    "ollama": {"batch_size": 32, "max_concurrency": 2},
-    "litellm": {"batch_size": 128, "max_concurrency": 8},
+    "tei": {"batch_size": 32, "max_concurrency": 4, "rpm": 0, "tpm": 0},
+    "ollama": {"batch_size": 32, "max_concurrency": 2, "rpm": 0, "tpm": 0},
+    "litellm": {"batch_size": 128, "max_concurrency": 8, "rpm": 0, "tpm": 0},
 }
 
 
@@ -306,6 +311,22 @@ class EmbeddingSettings(StrictSection):
     max_concurrency: int | None = Field(
         default=None, description="Max concurrent embedding API calls / embed consumers. Auto from provider."
     )
+    rpm: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Provider requests-per-minute budget, shared across processes via Valkey. "
+            "None resolves from litellm's model registry, then the provider default. 0 means unlimited."
+        ),
+    )
+    tpm: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Provider tokens-per-minute budget, shared across processes via Valkey. "
+            "None resolves from litellm's model registry, then the provider default. 0 means unlimited."
+        ),
+    )
     timeout_s: float = Field(default=30.0, description="Timeout in seconds for embedding API calls.")
     truncate_ratio: float = Field(
         default=0.9, gt=0, le=1, description="Fraction of max input tokens to use as truncation limit."
@@ -320,6 +341,11 @@ class EmbeddingSettings(StrictSection):
             self.batch_size = defaults["batch_size"]
         if self.max_concurrency is None:
             self.max_concurrency = defaults["max_concurrency"]
+        # rpm/tpm are deliberately NOT resolved here. The registry is keyed by the
+        # litellm model string, which EmbeddingClient builds (it prefixes "openai/"
+        # for TEI), so only the client can look them up. None survives to there and
+        # means "not configured"; the provider default below is the floor of that
+        # lookup, applied by EmbeddingClient._resolve_rate_limit.
         return self
 
 

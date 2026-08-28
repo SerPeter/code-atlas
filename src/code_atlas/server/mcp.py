@@ -213,7 +213,7 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
         app.embed = None
         app.vector_enabled = False
     else:
-        app.embed = EmbedClient(app.settings.embeddings)
+        app.embed = EmbedClient(app.settings.embeddings, app.settings.redis)
         app.vector_enabled = True
         stored_config = await app.graph.get_embedding_config()
         if stored_config is not None:
@@ -793,7 +793,7 @@ def create_mcp_server(  # noqa: PLR0915
                     )
                     vector_enabled = False
 
-            embed = EmbedClient(settings.embeddings)
+            embed = EmbedClient(settings.embeddings, settings.redis)
             # Implicit degradation: probe TEI, fall back to lightweight if unreachable
             tei_ok = False
             with contextlib.suppress(Exception):

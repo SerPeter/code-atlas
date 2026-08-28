@@ -489,7 +489,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     if settings.embeddings.enabled and settings.embeddings.dimension is None:
         from code_atlas.search.embeddings import EmbedClient as _EmbedClient
 
-        _probe = _EmbedClient(settings.embeddings)
+        _probe = _EmbedClient(settings.embeddings, settings.redis)
         try:
             resolved_dim = await _probe.detect_dimension()
         except Exception:
@@ -810,7 +810,7 @@ async def _run_search(  # noqa: PLR0912, PLR0915
             )
 
         if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
-            embed = EmbedClient(settings.embeddings)
+            embed = EmbedClient(settings.embeddings, settings.redis)
 
     try:
         results = await hybrid_search(

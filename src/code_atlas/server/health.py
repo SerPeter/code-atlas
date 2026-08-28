@@ -443,6 +443,9 @@ async def run_health_checks(
     if own_graph:
         graph = await create_graph_client(settings)
     if embed is None and settings.embeddings.enabled:
+        # No redis_settings on purpose: a health probe must answer "is the provider
+        # reachable" immediately. Handing it the rate limiter would let a drained
+        # bucket block the check and report the provider down when it is merely busy.
         embed = EmbedClient(settings.embeddings)
     if bus is None and daemon is not None:
         bus = daemon.bus

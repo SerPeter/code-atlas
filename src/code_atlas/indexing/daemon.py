@@ -125,7 +125,7 @@ class DaemonManager:
         embed: EmbedClient | None = None
         cache: EmbedCache | None = None
         if settings.embeddings.enabled:
-            embed = EmbedClient(settings.embeddings)
+            embed = EmbedClient(settings.embeddings, settings.redis)
             self._embed = embed
             if settings.embeddings.cache_ttl_days > 0:
                 cache = EmbedCache(settings.redis, settings.embeddings)
