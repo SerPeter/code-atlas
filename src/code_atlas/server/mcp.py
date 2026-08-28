@@ -215,16 +215,18 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
     else:
         app.embed = EmbedClient(app.settings.embeddings, app.settings.redis)
         app.vector_enabled = True
-        stored_config = await app.graph.get_embedding_config()
-        if stored_config is not None:
-            stored_model, _stored_dim = stored_config
-            if stored_model != app.settings.embeddings.model:
-                logger.warning(
-                    "Embedding model mismatch after root switch (stored='{}', current='{}'). Vector search disabled.",
-                    stored_model,
-                    app.settings.embeddings.model,
-                )
-                app.vector_enabled = False
+        # Per project, not database-wide: comparing against the database default
+        # disabled vector search for every project that was not the last one to
+        # index this shared store (ATL-135).
+        project_model = await app.graph.get_project_embedding_model(derive_project_name(app.settings.project_root))
+        if project_model is not None and project_model != app.settings.embeddings.model:
+            logger.warning(
+                "Embedding model mismatch after root switch (this project indexed under '{}', "
+                "current='{}'). Vector search disabled.",
+                project_model,
+                app.settings.embeddings.model,
+            )
+            app.vector_enabled = False
 
     started = await app.daemon.start(app.settings, app.graph)
     if started:

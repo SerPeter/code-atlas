@@ -1364,6 +1364,9 @@ class _StallingEmbedClient:
     def __init__(self, stall_marker: str, dimension: int = 8) -> None:
         self.max_concurrency = 2
         self.batch_size = 10
+        # Part of the EmbedClient contract since ATL-135: the consumer stamps this
+        # onto every vector it writes, so a fake without it writes nothing at all.
+        self.configured_model = "fake-model"
         self._dimension = dimension
         self._stall_marker = stall_marker
         self._release = asyncio.Event()

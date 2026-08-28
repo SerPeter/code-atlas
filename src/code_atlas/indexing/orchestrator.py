@@ -1099,53 +1099,119 @@ async def _resolve_dimension(embed: EmbedClient, configured: int | None) -> int:
     return configured
 
 
+def _describe_other_projects(models: dict[str, str], project: str) -> str:
+    """Render the other projects' models for a lock error message."""
+    others = sorted((p, m) for p, m in models.items() if p != project)
+    if not others:
+        return ""
+    listed = ", ".join(f"{p}='{m}'" for p, m in others)
+    return f" Other projects in this database: {listed}."
+
+
 async def _check_model_lock(
     graph: GraphClient,
     model: str,
     dimension: int,
     *,
+    project: str,
     reindex: bool,
     cache: EmbedCache | None = None,
 ) -> None:
-    """Enforce embedding model/dimension lock on the SchemaVersion node.
+    """Enforce the embedding locks: dimension database-wide, model per project.
 
-    - First run (no stored model): write current config.
-    - Stored config unchanged: no-op — a full reindex of one project must not
-      wipe other projects' embeddings in the shared database.
-    - Model or dimension changed with *reindex*: clear embeddings + embed_hash
-      database-wide, rebuild vector indices, flush all model keys from the
-      Valkey cache, write new config (vector indices are shared, so a config
-      change is necessarily database-wide).
-    - Model or dimension changed without *reindex*: raise RuntimeError with
-      clear guidance.
+    The split is not a preference, it is what the storage is. Vector indices are one
+    per label for the whole database and carry a single dimension, so **dimension has
+    to be global** — a change rebuilds indices everyone shares. A **model is per
+    project**: it decides which space a vector lives in, and nothing about it is
+    shared.
+
+    Both were global before ATL-135, and that made two projects on one Memgraph
+    mutually exclusive. Whichever indexed last owned the lock; every other project
+    got ``Embedding model changed from X to Y`` on every run, with `--full` as the
+    only offered remedy — and `--full` cleared embeddings database-wide, silently
+    destroying the other projects' vectors. Measured here: 25,305 vectors under one
+    model and 6,691 under another, coexisting at the same 1536 dimensions.
     """
     stored = await graph.get_embedding_config()
+
+    # -- First run against this store ---------------------------------------- #
     if stored is None:
         await graph.set_embedding_config(model, dimension)
+        await graph.set_project_embedding_model(project, model)
         return
 
-    stored_model, stored_dim = stored
-    if stored_model == model and stored_dim == dimension:
+    _stored_model, stored_dim = stored
+
+    # -- Dimension: global, because the vector indices are ------------------- #
+    if stored_dim != dimension:
+        counts = await graph.count_embeddings_by_project()
+        if not reindex:
+            affected = ", ".join(f"{p} ({c:,} vectors)" for p, c in sorted(counts.items()))
+            msg = (
+                f"Embedding dimension changed from {stored_dim} to {dimension}. "
+                "Vector indices are shared by every project in this database, so this "
+                "rebuilds all of them. Run 'atlas index --full' to proceed."
+                + (f" This will re-embed: {affected}." if affected else "")
+            )
+            raise RuntimeError(msg)
+        if counts:
+            logger.warning(
+                "Dimension {} → {}: clearing embeddings for EVERY project in this database "
+                "({}). Vector indices are shared and cannot be rebuilt per project.",
+                stored_dim,
+                dimension,
+                ", ".join(f"{p}={c:,}" for p, c in sorted(counts.items())),
+            )
+        cleared = await graph.clear_embeddings(None)
+        await graph.rebuild_vector_indices(dimension)
+        if cache is not None:
+            await cache.clear_all_models()
+        await graph.set_embedding_config(model, dimension)
+        await graph.set_project_embedding_model(project, model)
+        logger.info("Cleared {:,} vectors for the dimension change", cleared)
+        return
+
+    # -- Model: per project -------------------------------------------------- #
+    project_model = await graph.get_project_embedding_model(project)
+    if project_model == model:
+        return
+
+    if project_model is None:
+        # A project indexed before the per-project lock existed. Its vectors were
+        # written by runs using its own configuration, so the configured model is
+        # the right thing to record — but say so, because the one case this gets
+        # wrong is a model changed while indexing was already failing.
+        existing = (await graph.count_embeddings_by_project()).get(project, 0)
+        await graph.set_project_embedding_model(project, model)
+        if existing:
+            logger.warning(
+                "Project '{}' has {:,} vectors but no recorded embedding model; adopting the "
+                "configured '{}'. If you changed the model while indexing was failing, those "
+                "vectors are from the old one — run 'atlas index --full' to re-embed.",
+                project,
+                existing,
+                model,
+            )
         return
 
     if not reindex:
-        if stored_model != model:
-            msg = (
-                f"Embedding model changed from '{stored_model}' to '{model}'. "
-                "Run 'atlas index --full' to rebuild all embeddings."
-            )
-        else:
-            msg = (
-                f"Embedding dimension changed from {stored_dim} to {dimension}. "
-                "Run 'atlas index --full' to rebuild vector indices."
-            )
+        models = await graph.get_embedding_models_by_project()
+        msg = (
+            f"Embedding model for project '{project}' changed from '{project_model}' to "
+            f"'{model}'. Run 'atlas index --full' to re-embed this project — other projects "
+            "in this database are unaffected." + _describe_other_projects(models, project)
+        )
         raise RuntimeError(msg)
 
-    await graph.clear_all_embeddings()
-    await graph.rebuild_vector_indices(dimension)
-    if cache is not None:
-        await cache.clear_all_models()
-    await graph.set_embedding_config(model, dimension)
+    cleared = await graph.clear_embeddings(project)
+    await graph.set_project_embedding_model(project, model)
+    logger.info(
+        "Model '{}' → '{}' for project '{}': cleared {:,} vectors, other projects untouched",
+        project_model,
+        model,
+        project,
+        cleared,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1970,7 +2036,14 @@ async def _index_project_inner(  # noqa: PLR0915
 
     if settings.embeddings.enabled and embed is not None:
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
-        await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
+        await _check_model_lock(
+            graph,
+            settings.embeddings.model,
+            dimension,
+            project=project_name,
+            reindex=full_reindex,
+            cache=cache,
+        )
 
     # 3. Decide full vs. delta mode
     if full_reindex:
@@ -2244,7 +2317,14 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         if settings.embeddings.cache_ttl_days > 0:
             cache = EmbedCache(settings.redis, settings.embeddings)
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
-        await _check_model_lock(graph, settings.embeddings.model, dimension, reindex=full_reindex, cache=cache)
+        await _check_model_lock(
+            graph,
+            settings.embeddings.model,
+            dimension,
+            project=root_name,
+            reindex=full_reindex,
+            cache=cache,
+        )
 
     if full_reindex:
         await bus.flush()

@@ -791,10 +791,14 @@ async def _run_search(  # noqa: PLR0912, PLR0915
     # Check model lock — warn and disable vector if mismatch
     embed: EmbedClient | None = None
     if settings.embeddings.enabled:
-        stored_config = await graph.get_embedding_config()
-        model_mismatch = stored_config is not None and stored_config[0] != settings.embeddings.model
+        # Per project: the database default belongs to whichever project indexed
+        # last, and comparing against it disabled vector search for all the others
+        # (ATL-135).
+        from code_atlas.settings import derive_project_name
+
+        stored_model = await graph.get_project_embedding_model(derive_project_name(settings.project_root))
+        model_mismatch = stored_model is not None and stored_model != settings.embeddings.model
         if model_mismatch:
-            stored_model = stored_config[0]  # type: ignore[index]
             if search_types and SearchType.VECTOR in search_types:
                 logger.error(
                     "Cannot use vector search: model mismatch (stored='{}', current='{}'). Run 'atlas index --full'.",

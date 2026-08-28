@@ -1039,8 +1039,16 @@ class TestWaitForDrain:
 class FakeLockGraph:
     """Records destructive/config calls made by _check_model_lock."""
 
-    def __init__(self, stored: tuple[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        stored: tuple[str, int] | None = None,
+        *,
+        project_models: dict[str, str] | None = None,
+        counts: dict[str, int] | None = None,
+    ) -> None:
         self.stored = stored
+        self.project_models = dict(project_models or {})
+        self.counts = dict(counts or {})
         self.calls: list[tuple] = []
 
     async def get_embedding_config(self):
@@ -1049,8 +1057,22 @@ class FakeLockGraph:
     async def set_embedding_config(self, model, dimension):
         self.calls.append(("set_embedding_config", model, dimension))
 
-    async def clear_all_embeddings(self):
-        self.calls.append(("clear_all_embeddings",))
+    async def get_project_embedding_model(self, project):
+        return self.project_models.get(project)
+
+    async def set_project_embedding_model(self, project, model):
+        self.project_models[project] = model
+        self.calls.append(("set_project_embedding_model", project, model))
+
+    async def get_embedding_models_by_project(self):
+        return dict(self.project_models)
+
+    async def count_embeddings_by_project(self):
+        return dict(self.counts)
+
+    async def clear_embeddings(self, project=None):
+        self.calls.append(("clear_embeddings", project))
+        return self.counts.get(project, 0) if project else sum(self.counts.values())
 
     async def rebuild_vector_indices(self, dimension):
         self.calls.append(("rebuild_vector_indices", dimension))
@@ -1065,15 +1087,23 @@ class FakeLockCache:
 
 
 class TestCheckModelLock:
+    """The lock splits: dimension is database-wide, model is per project (ATL-135).
+
+    The split is forced by the storage. Vector indices are one per label for the whole
+    database and carry a single dimension, so a dimension change rebuilds indices every
+    project shares. A model decides only which space a vector lives in, and nothing
+    about that is shared -- so one project changing model must not touch another's.
+    """
+
     async def test_full_reindex_unchanged_config_is_not_destructive(self):
         """--full with unchanged model/dimension must not wipe other projects' embeddings."""
-        graph = FakeLockGraph(stored=("model-a", 768))
+        graph = FakeLockGraph(stored=("model-a", 768), project_models={"proj": "model-a"})
         cache = FakeLockCache()
 
-        await _check_model_lock(graph, "model-a", 768, reindex=True, cache=cache)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True, cache=cache)  # type: ignore[arg-type]
 
         call_names = {c[0] for c in graph.calls}
-        assert "clear_all_embeddings" not in call_names
+        assert "clear_embeddings" not in call_names
         assert "rebuild_vector_indices" not in call_names
         assert cache.cleared_all is False
 
@@ -1082,34 +1112,96 @@ class TestCheckModelLock:
         graph = FakeLockGraph(stored=None)
         cache = FakeLockCache()
 
-        await _check_model_lock(graph, "model-a", 768, reindex=True, cache=cache)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True, cache=cache)  # type: ignore[arg-type]
 
-        assert graph.calls == [("set_embedding_config", "model-a", 768)]
+        assert graph.calls == [
+            ("set_embedding_config", "model-a", 768),
+            ("set_project_embedding_model", "proj", "model-a"),
+        ]
         assert cache.cleared_all is False
 
-    async def test_full_reindex_model_change_rebuilds_globally(self):
-        """Changing the model with --full still wipes + rebuilds (shared vector indices)."""
-        graph = FakeLockGraph(stored=("model-a", 768))
+    async def test_model_change_clears_only_the_changing_project(self):
+        """The bug this class exists for: one project's model change destroyed the rest.
+
+        `other` keeps its 5,000 vectors. Before ATL-135 this call wiped them, because
+        the lock was global and its only remedy was `clear_all_embeddings`.
+        """
+        graph = FakeLockGraph(
+            stored=("model-a", 768),
+            project_models={"proj": "model-a", "other": "model-a"},
+            counts={"proj": 100, "other": 5_000},
+        )
         cache = FakeLockCache()
 
-        await _check_model_lock(graph, "model-b", 768, reindex=True, cache=cache)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-b", 768, project="proj", reindex=True, cache=cache)  # type: ignore[arg-type]
 
-        assert ("clear_all_embeddings",) in graph.calls
+        assert ("clear_embeddings", "proj") in graph.calls
+        assert ("clear_embeddings", None) not in graph.calls
+        assert ("set_project_embedding_model", "proj", "model-b") in graph.calls
+        # Shared vector indices are not rebuilt: the dimension did not change.
+        assert "rebuild_vector_indices" not in {c[0] for c in graph.calls}
+        # The other project keeps both its vectors and its model.
+        assert graph.project_models["other"] == "model-a"
+        assert cache.cleared_all is False
+
+    async def test_dimension_change_is_database_wide_because_indices_are(self):
+        graph = FakeLockGraph(
+            stored=("model-a", 512),
+            project_models={"proj": "model-a"},
+            counts={"proj": 100, "other": 5_000},
+        )
+        cache = FakeLockCache()
+
+        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True, cache=cache)  # type: ignore[arg-type]
+
+        assert ("clear_embeddings", None) in graph.calls
         assert ("rebuild_vector_indices", 768) in graph.calls
-        assert ("set_embedding_config", "model-b", 768) in graph.calls
+        assert ("set_embedding_config", "model-a", 768) in graph.calls
         assert cache.cleared_all is True
 
-    async def test_model_mismatch_without_reindex_raises(self):
-        graph = FakeLockGraph(stored=("model-a", 768))
+    async def test_model_mismatch_without_reindex_raises_and_names_the_other_projects(self):
+        """A message naming only two model strings cannot be acted on when the cause is
+        another project the reader was not thinking about."""
+        graph = FakeLockGraph(
+            stored=("model-a", 768),
+            project_models={"proj": "model-a", "other": "model-z"},
+        )
 
-        with pytest.raises(RuntimeError, match="model changed"):
-            await _check_model_lock(graph, "model-b", 768, reindex=False)  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError, match="model for project 'proj' changed") as exc:
+            await _check_model_lock(graph, "model-b", 768, project="proj", reindex=False)  # type: ignore[arg-type]
+
+        assert "other='model-z'" in str(exc.value)
+        assert "unaffected" in str(exc.value)
 
     async def test_dimension_mismatch_without_reindex_raises(self):
-        graph = FakeLockGraph(stored=("model-a", 512))
+        graph = FakeLockGraph(stored=("model-a", 512), counts={"proj": 100})
 
         with pytest.raises(RuntimeError, match="dimension changed"):
-            await _check_model_lock(graph, "model-a", 768, reindex=False)  # type: ignore[arg-type]
+            await _check_model_lock(graph, "model-a", 768, project="proj", reindex=False)  # type: ignore[arg-type]
+
+    async def test_a_project_with_no_recorded_model_adopts_the_configured_one(self):
+        """Bootstrap: vectors written before the per-project lock existed were written
+        under that project's own configuration, so adopting it is right -- and must not
+        clear anything."""
+        graph = FakeLockGraph(stored=("model-a", 768), counts={"proj": 6_691})
+
+        await _check_model_lock(graph, "model-b", 768, project="proj", reindex=False)  # type: ignore[arg-type]
+
+        assert ("set_project_embedding_model", "proj", "model-b") in graph.calls
+        assert "clear_embeddings" not in {c[0] for c in graph.calls}
+
+    async def test_two_projects_on_different_models_both_index(self):
+        """The deadlock, directly: neither project may lock the other out."""
+        graph = FakeLockGraph(
+            stored=("model-a", 768),
+            project_models={"alpha": "model-a", "beta": "model-b"},
+        )
+
+        # Both are already on their own model, so both are no-ops rather than errors.
+        await _check_model_lock(graph, "model-a", 768, project="alpha", reindex=False)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-b", 768, project="beta", reindex=False)  # type: ignore[arg-type]
+
+        assert graph.calls == []
 
 
 # ---------------------------------------------------------------------------

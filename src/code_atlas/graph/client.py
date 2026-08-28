@@ -3683,11 +3683,52 @@ class GraphClient:
         return (records[0]["model"], records[0]["dim"])
 
     async def set_embedding_config(self, model: str, dimension: int) -> None:
-        """Write embedding model and dimension to the SchemaVersion node."""
+        """Write embedding model and dimension to the SchemaVersion node.
+
+        The *dimension* half is the authority: vector indices are one per label for
+        the whole database and carry a single dimension, so every project must agree
+        on it. The *model* half is only the database default, shown by ``status`` and
+        ``health_check`` — what a given project actually embedded with lives on its
+        own Project node. See ``get_project_embedding_model``.
+        """
         await self.execute_write(
             f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.embedding_model = $model, sv.embedding_dimension = $dim",
             {"model": model, "dim": dimension},
         )
+
+    async def get_project_embedding_model(self, project: str) -> str | None:
+        """Return the embedding model *project* last indexed under, or ``None``.
+
+        Per project, because the model is per project. One shared Memgraph holds
+        several, and a global lock made them mutually exclusive: whichever project
+        wrote the lock last locked every other one out, with no remedy that did not
+        destroy someone else's vectors (ATL-135).
+        """
+        records = await self.execute(
+            f"MATCH (p:{NodeLabel.PROJECT} {{name: $project}}) RETURN p.embedding_model AS model LIMIT 1",
+            {"project": project},
+        )
+        return records[0]["model"] if records else None
+
+    async def set_project_embedding_model(self, project: str, model: str) -> None:
+        """Record the embedding model *project* is indexed under."""
+        await self.execute_write(
+            f"MATCH (p:{NodeLabel.PROJECT} {{name: $project}}) SET p.embedding_model = $model",
+            {"project": project, "model": model},
+        )
+
+    async def get_embedding_models_by_project(self) -> dict[str, str]:
+        """Return ``{project_name: model}`` for every project that has recorded one.
+
+        Used to name the conflicting projects in a lock error. A message saying only
+        "model changed from X to Y" cannot be acted on when the cause is another
+        project the reader was not thinking about.
+        """
+        records = await self.execute(
+            f"MATCH (p:{NodeLabel.PROJECT}) WHERE p.embedding_model IS NOT NULL "
+            "RETURN p.name AS name, p.embedding_model AS model"
+        )
+        return {r["name"]: r["model"] for r in records if r["name"]}
 
     async def read_entity_texts(
         self,
@@ -3872,16 +3913,23 @@ class GraphClient:
         items: list[tuple[str, list[float], str]],
         *,
         labels: list[str] | None = None,
+        model: str = "",
     ) -> None:
         """Batch-write embedding vectors **and** embed_hashes in a single UNWIND.
 
         Each *item* is ``(uid, vector, embed_hash)``.  When *labels* is
         provided (parallel to *items*), writes are grouped by label so the
         ``MATCH`` can use label-scoped uid indices.
+
+        *model* stamps ``embed_model`` alongside the vector. A vector only means
+        anything inside the space its model defines, and one database holds several:
+        two models were measured coexisting here at the same 1536 dimensions, which
+        no dimension check can tell apart (ATL-135). Left empty, the stamp is skipped.
         """
         if not items:
             return
 
+        stamp = ", n.embed_model = $model" if model else ""
         if labels is not None:
             by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for (uid, vec, h), lbl in zip(items, labels, strict=True):
@@ -3891,15 +3939,15 @@ class GraphClient:
                 await self.execute_write(
                     f"UNWIND $items AS item "
                     f"MATCH (n:{lbl}) WHERE n.uid = item.uid "
-                    "SET n.embedding = item.vector, n.embed_hash = item.hash",
-                    {"items": group},
+                    f"SET n.embedding = item.vector, n.embed_hash = item.hash{stamp}",
+                    {"items": group, "model": model},
                 )
         else:
             params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
             await self.execute_write(
                 "UNWIND $items AS item "
                 "MATCH (n) WHERE n.uid = item.uid "
-                "SET n.embedding = item.vector, n.embed_hash = item.hash",
+                f"SET n.embedding = item.vector, n.embed_hash = item.hash{stamp}",
                 {"items": params},
             )
 
@@ -3916,11 +3964,41 @@ class GraphClient:
         async with self._driver.session() as session:
             return await session.execute_write(_tx)
 
-    async def clear_all_embeddings(self) -> None:
-        """Remove embedding vectors and content hashes from all nodes."""
-        await self.execute_write(
-            "MATCH (n) WHERE n.embedding IS NOT NULL OR n.embed_hash IS NOT NULL REMOVE n.embedding, n.embed_hash"
+    async def clear_embeddings(self, project: str | None = None) -> int:
+        """Remove vectors and embed hashes, for one project or the whole database.
+
+        Returns the number of nodes stripped. ``project=None`` is database-wide and
+        is only correct for a *dimension* change, where the shared vector indices have
+        to be rebuilt anyway. A model change affects one project, and clearing every
+        project for it destroyed other projects' embeddings silently (ATL-135).
+        """
+        if project is None:
+            rows = await self.execute(
+                "MATCH (n) WHERE n.embedding IS NOT NULL OR n.embed_hash IS NOT NULL "
+                "REMOVE n.embedding, n.embed_hash, n.embed_model RETURN count(n) AS c"
+            )
+        else:
+            # Sub-projects of a monorepo are stored as "{root}/{sub}", and a model
+            # belongs to the tree, not the root alone -- clearing only the exact name
+            # would leave every sub-project's vectors under the old model.
+            rows = await self.execute(
+                f"MATCH (n:{NodeLabel.ENTITY}) "
+                "WHERE (n.project_name = $project OR n.project_name STARTS WITH $prefix) "
+                "AND (n.embedding IS NOT NULL OR n.embed_hash IS NOT NULL) "
+                "REMOVE n.embedding, n.embed_hash, n.embed_model RETURN count(n) AS c",
+                {"project": project, "prefix": f"{project}/"},
+            )
+        return rows[0]["c"] if rows else 0
+
+    async def count_embeddings_by_project(self) -> dict[str, int]:
+        """Return ``{project_name: vector_count}``.
+
+        So a destructive clear can say what it is about to destroy, before it does it.
+        """
+        rows = await self.execute(
+            f"MATCH (n:{NodeLabel.ENTITY}) WHERE n.embedding IS NOT NULL RETURN n.project_name AS name, count(n) AS c"
         )
+        return {r["name"]: r["c"] for r in rows if r["name"]}
 
     async def rebuild_vector_indices(self, dimension: int) -> None:
         """Drop and recreate vector indices at the specified dimension."""

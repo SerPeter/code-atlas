@@ -52,9 +52,106 @@ class TestModelLock:
             {"emb": [0.1] * dim},
         )
         # Clear all embeddings
-        await graph_client.clear_all_embeddings()
+        await graph_client.clear_embeddings()
         records = await graph_client.execute("MATCH (n {uid: 'test:mod'}) RETURN n.embedding AS emb")
         assert records[0]["emb"] is None
+
+    async def _make_embedded(self, graph_client, project: str, uid: str) -> None:
+        dim = graph_client._dimension
+        await graph_client.execute_write(
+            "CREATE (n:Module:Entity {uid: $uid, qualified_name: $uid, project_name: $p, "
+            "name: 'mod', file_path: 'mod.py', content_hash: 'h', project_root: '/tmp', "
+            "embedding: $emb, embed_hash: 'eh'})",
+            {"uid": uid, "p": project, "emb": [0.1] * dim},
+        )
+
+    async def test_clearing_one_project_leaves_the_others_embedded(self, graph_client):
+        """The ATL-135 defect, at the storage layer.
+
+        A model change belongs to one project. Clearing database-wide for it destroyed
+        every other project's vectors, and said nothing.
+        """
+        await graph_client.ensure_schema()
+        await self._make_embedded(graph_client, "test-alpha", "test-alpha:mod")
+        await self._make_embedded(graph_client, "test-beta", "test-beta:mod")
+
+        cleared = await graph_client.clear_embeddings("test-alpha")
+        assert cleared == 1
+
+        rows = await graph_client.execute(
+            "MATCH (n:Entity) WHERE n.uid IN ['test-alpha:mod', 'test-beta:mod'] "
+            "RETURN n.uid AS uid, n.embedding AS emb, n.embed_hash AS h ORDER BY uid"
+        )
+        by_uid = {r["uid"]: r for r in rows}
+        assert by_uid["test-alpha:mod"]["emb"] is None
+        assert by_uid["test-alpha:mod"]["h"] is None
+        assert by_uid["test-beta:mod"]["emb"] is not None, "beta lost its vectors to alpha's model change"
+
+    async def test_a_scoped_clear_reaches_sub_projects(self, graph_client):
+        """Monorepo sub-projects are stored as "{root}/{sub}" and share the root's model."""
+        await graph_client.ensure_schema()
+        await self._make_embedded(graph_client, "test-root", "test-root:mod")
+        await self._make_embedded(graph_client, "test-root/core", "test-root/core:mod")
+        await self._make_embedded(graph_client, "test-rooted", "test-rooted:mod")
+
+        cleared = await graph_client.clear_embeddings("test-root")
+        assert cleared == 2, "the sub-project must be cleared with its root"
+
+        rows = await graph_client.execute("MATCH (n:Entity {uid: 'test-rooted:mod'}) RETURN n.embedding AS emb")
+        assert rows[0]["emb"] is not None, "prefix matching must not catch a differently-named project"
+
+    async def test_project_embedding_model_is_recorded_per_project(self, graph_client):
+        await graph_client.ensure_schema()
+        for project in ("test-alpha", "test-beta"):
+            await graph_client.execute_write(
+                "CREATE (p:Project:Entity {uid: $uid, name: $name, project_name: $name, "
+                "qualified_name: $name, file_path: '', content_hash: 'h'})",
+                {"uid": f"{project}:project", "name": project},
+            )
+
+        assert await graph_client.get_project_embedding_model("test-alpha") is None
+
+        await graph_client.set_project_embedding_model("test-alpha", "model-a")
+        await graph_client.set_project_embedding_model("test-beta", "model-b")
+
+        assert await graph_client.get_project_embedding_model("test-alpha") == "model-a"
+        assert await graph_client.get_project_embedding_model("test-beta") == "model-b"
+        assert await graph_client.get_embedding_models_by_project() == {
+            "test-alpha": "model-a",
+            "test-beta": "model-b",
+        }
+
+    async def test_counts_by_project_report_what_a_clear_would_destroy(self, graph_client):
+        await graph_client.ensure_schema()
+        await self._make_embedded(graph_client, "test-alpha", "test-alpha:mod")
+        await self._make_embedded(graph_client, "test-beta", "test-beta:a")
+        await self._make_embedded(graph_client, "test-beta", "test-beta:b")
+
+        counts = await graph_client.count_embeddings_by_project()
+        assert counts["test-alpha"] == 1
+        assert counts["test-beta"] == 2
+
+    async def test_the_model_is_stamped_on_the_vector_it_made(self, graph_client):
+        """Two models at the same dimension are indistinguishable without the stamp --
+        measured coexisting on the production graph at 1536d (ATL-135)."""
+        await graph_client.ensure_schema()
+        dim = graph_client._dimension
+        await graph_client.execute_write(
+            "CREATE (n:Module:Entity {uid: 'test:stamped', qualified_name: 'stamped', "
+            "project_name: 'test', name: 'mod', file_path: 'mod.py', content_hash: 'h', "
+            "project_root: '/tmp'})"
+        )
+        await graph_client.write_embeddings_and_hashes(
+            [("test:stamped", [0.2] * dim, "hash-1")],
+            labels=["Module"],
+            model="openai/text-embedding-3-small",
+        )
+
+        rows = await graph_client.execute(
+            "MATCH (n:Entity {uid: 'test:stamped'}) RETURN n.embed_model AS m, n.embed_hash AS h"
+        )
+        assert rows[0]["m"] == "openai/text-embedding-3-small"
+        assert rows[0]["h"] == "hash-1"
 
 
 # ---------------------------------------------------------------------------

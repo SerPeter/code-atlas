@@ -2120,6 +2120,36 @@ class SqliteGraphClient:
             return None
         return (model, int(dim))
 
+    async def get_project_embedding_model(self, project: str) -> str | None:
+        """Embedding model *project* last indexed under, or ``None``.
+
+        Stored in ``meta`` keyed by project rather than on a Project row: this
+        backend is one database file per project root already, but a monorepo puts
+        several sub-projects in one file, which is exactly the case a single global
+        key gets wrong (ATL-135).
+        """
+        conn = await self._get_conn()
+        cur = await conn.execute("SELECT value FROM meta WHERE key = ?", (f"embedding_model:{project}",))
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else None
+
+    async def set_project_embedding_model(self, project: str, model: str) -> None:
+        conn = await self._get_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (f"embedding_model:{project}", model),
+            )
+            await conn.commit()
+
+    async def get_embedding_models_by_project(self) -> dict[str, str]:
+        conn = await self._get_conn()
+        cur = await conn.execute("SELECT key, value FROM meta WHERE key LIKE 'embedding_model:%'")
+        rows = await cur.fetchall()
+        await cur.close()
+        return {k.split(":", 1)[1]: v for k, v in rows}
+
     async def set_embedding_config(self, model: str, dimension: int) -> None:
         conn = await self._get_conn()
         await self._upsert_meta(conn, "embedding_model", model)
@@ -2251,6 +2281,7 @@ class SqliteGraphClient:
         items: list[tuple[str, list[float], str]],
         *,
         labels: list[str] | None = None,  # noqa: ARG002 — part of the GraphBackend contract, unused (unified table)
+        model: str = "",
     ) -> None:
         if not items:
             return
@@ -2261,24 +2292,62 @@ class SqliteGraphClient:
         # policy, not this backend's durability guarantee, and the two must not be the
         # same knob. Every other writer here already takes this lock.
         async with self._write_lock:
+            props = {"embed_hash": "", "embed_model": model} if model else {"embed_hash": ""}
             for uid, vector, h in items:
                 blob = sqlite_vec.serialize_float32(vector)
+                props["embed_hash"] = h
                 await conn.execute(
                     "UPDATE nodes SET embedding = ?, props_json = json_patch(props_json, ?) WHERE uid = ?",
-                    (blob, json.dumps({"embed_hash": h}), uid),
+                    (blob, json.dumps(props), uid),
                 )
                 await self._write_embedding_row(conn, uid, blob)
             await conn.commit()
 
-    async def clear_all_embeddings(self) -> None:
+    async def clear_embeddings(self, project: str | None = None) -> int:
+        """Strip vectors for one project, or the whole store when *project* is None.
+
+        Database-wide is only correct for a dimension change; a model change belongs
+        to one project, and clearing all of them for it destroyed other projects'
+        vectors silently (ATL-135).
+        """
         conn = await self._get_conn()
-        await conn.execute(
-            "UPDATE nodes SET embedding = NULL, props_json = json_remove(props_json, '$.embed_hash') "
-            "WHERE embedding IS NOT NULL OR json_extract(props_json, '$.embed_hash') IS NOT NULL"
+        where = (
+            "(embedding IS NOT NULL OR json_extract(props_json, '$.embed_hash') IS NOT NULL)"
+            if project is None
+            # "{root}/{sub}" sub-projects belong to the same model as their root.
+            else "(embedding IS NOT NULL OR json_extract(props_json, '$.embed_hash') IS NOT NULL) "
+            "AND (json_extract(props_json, '$.project_name') = ? "
+            "OR json_extract(props_json, '$.project_name') LIKE ?)"
         )
-        for spec in build_vector_index_specs(self._dimension):
-            await self._safe_exec(conn, f"DELETE FROM {spec.name}")
+        args: tuple[object, ...] = () if project is None else (project, f"{project}/%")
+        cur = await conn.execute(f"SELECT count(*) FROM nodes WHERE {where}", args)
+        row = await cur.fetchone()
+        await cur.close()
+        cleared = int(row[0]) if row else 0
+        await conn.execute(
+            "UPDATE nodes SET embedding = NULL, "
+            "props_json = json_remove(props_json, '$.embed_hash', '$.embed_model') "
+            f"WHERE {where}",
+            args,
+        )
+        # The vec0 shadow tables carry no project column, so a scoped clear cannot
+        # prune them selectively -- rows are re-keyed on the next write and a stale
+        # one is unreachable once `nodes.embedding` is NULL.
+        if project is None:
+            for spec in build_vector_index_specs(self._dimension):
+                await self._safe_exec(conn, f"DELETE FROM {spec.name}")
         await conn.commit()
+        return cleared
+
+    async def count_embeddings_by_project(self) -> dict[str, int]:
+        conn = await self._get_conn()
+        cur = await conn.execute(
+            "SELECT json_extract(props_json, '$.project_name') AS p, count(*) "
+            "FROM nodes WHERE embedding IS NOT NULL GROUP BY p"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return {p: c for p, c in rows if p}
 
     # -- Search -------------------------------------------------------------------
 

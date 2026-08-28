@@ -1555,6 +1555,10 @@ class EmbedConsumer(TierConsumer):
         )
         self.graph = graph
         self.embed = embed
+        # Read once, here, not per batch: reached lazily at write time a missing
+        # attribute surfaces as a swallowed per-batch error and the vectors simply
+        # never appear. Read at construction it is an immediate, obvious failure.
+        self._embed_model: str = embed.configured_model
         self.cache = cache
         self._max_concurrency = _max_conc
         self._sem = asyncio.Semaphore(self._max_concurrency)
@@ -1739,7 +1743,13 @@ class EmbedConsumer(TierConsumer):
                     try:
                         with _tracer.start_as_current_span("embed.write_embeddings"):
                             write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
-                            await self.graph.write_embeddings_and_hashes(all_resolved, labels=write_labels)
+                            # Stamp the model: a vector only means anything inside the space
+                            # its model defines, and one database holds several (ATL-135).
+                            await self.graph.write_embeddings_and_hashes(
+                                all_resolved,
+                                labels=write_labels,
+                                model=self._embed_model,
+                            )
                     finally:
                         self._write_gate.release()
 

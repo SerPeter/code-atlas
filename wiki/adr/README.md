@@ -45,6 +45,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0032](./0032-a-uid-must-identify-exactly-one-definition.md)      | A uid Must Identify Exactly One Definition                     | Accepted               | 2026-08-06 |
 | [0033](./0033-graph-renderer-must-be-permissively-licensed.md)    | The Graph Renderer Must Be Permissively Licensed               | Accepted               | 2026-08-08 |
 | [0034](./0034-architecture-snapshots-live-on-the-project-node.md) | Architecture Snapshots Live On The Project Node                | Accepted               | 2026-08-08 |
+| [0035](./0035-embedding-model-is-per-project-dimension-is-not.md) | Embedding Model Is Per Project, Dimension Is Not               | Accepted               | 2026-08-28 |
 
 ## Creating a New ADR
 

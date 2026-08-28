@@ -57,6 +57,11 @@ class EmbedClient:
         if settings.batch_size is None or settings.max_concurrency is None:
             msg = "EmbeddingSettings.batch_size and .max_concurrency must be set (provider defaults should apply)"
             raise ValueError(msg)
+        # The raw configured model, before the provider prefixing below. This is the
+        # value the SchemaVersion lock stores and the value stamped onto vectors --
+        # `self._model` is litellm-shaped ("openai/..." for TEI) and comparing the two
+        # produces a mismatch that never resolves.
+        self.configured_model: str = settings.model
         self._batch_size: int = settings.batch_size
         self._max_concurrency: int = settings.max_concurrency
         self._timeout = settings.timeout_s

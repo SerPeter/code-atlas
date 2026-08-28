@@ -16,7 +16,7 @@ from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import SCHEMA_VERSION
 from code_atlas.search.embeddings import EmbedClient
-from code_atlas.settings import _find_atlas_toml, find_git_root
+from code_atlas.settings import _find_atlas_toml, derive_project_name, find_git_root
 
 if TYPE_CHECKING:
     from code_atlas.events import EventBus
@@ -294,27 +294,42 @@ async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> Che
     return CheckResult(name, CheckStatus.OK, f"Valid root: {root}", detail=detail)
 
 
-async def check_embedding_model(graph: GraphClient, embed_settings: EmbeddingSettings) -> CheckResult:
-    """Check whether the stored embedding model matches the configured model."""
+async def check_embedding_model(
+    graph: GraphClient, embed_settings: EmbeddingSettings, project: str = ""
+) -> CheckResult:
+    """Check whether *project*'s embedding model matches the configured one.
+
+    Per project, not database-wide: one store holds several projects, each with its
+    own model, and comparing against the database default reported a mismatch — and
+    disabled vector search — for every project that was not the last one to index
+    (ATL-135). The dimension half stays global, because the vector indices are.
+    """
     name = "embedding_model"
     if not embed_settings.enabled:
         return CheckResult(name, CheckStatus.OK, "Skipped (embeddings disabled)")
     try:
         stored = await asyncio.wait_for(graph.get_embedding_config(), timeout=_CHECK_TIMEOUT)
+        project_model = (
+            await asyncio.wait_for(graph.get_project_embedding_model(project), timeout=_CHECK_TIMEOUT)
+            if project
+            else None
+        )
     except Exception as exc:
         return CheckResult(name, CheckStatus.WARN, "Cannot read embedding config", detail=str(exc))
 
     if stored is None:
         return CheckResult(name, CheckStatus.OK, "No model lock (fresh database)")
-    stored_model, stored_dim = stored
-    if stored_model == embed_settings.model:
-        return CheckResult(name, CheckStatus.OK, f"Model matches: {stored_model} ({stored_dim}d)")
+    _stored_model, stored_dim = stored
+    if project_model is None:
+        return CheckResult(name, CheckStatus.OK, f"No model recorded for this project yet ({stored_dim}d)")
+    if project_model == embed_settings.model:
+        return CheckResult(name, CheckStatus.OK, f"Model matches: {project_model} ({stored_dim}d)")
     return CheckResult(
         name,
         CheckStatus.WARN,
-        f"Mismatch: stored='{stored_model}', configured='{embed_settings.model}'",
+        f"Mismatch: this project indexed under '{project_model}', configured='{embed_settings.model}'",
         detail=f"Stored dimension: {stored_dim}. Vector search disabled until re-indexed.",
-        suggestion="Run 'atlas index --full' to re-embed with the new model.",
+        suggestion="Run 'atlas index --full' to re-embed this project with the new model.",
     )
 
 
@@ -484,7 +499,11 @@ async def run_health_checks(
             # they only call methods both backends implement, so the SqliteGraphClient case is safe.
             schema_res, model_res, index_res = await asyncio.gather(
                 check_schema(graph),  # type: ignore[invalid-argument-type]
-                check_embedding_model(graph, settings.embeddings),  # type: ignore[invalid-argument-type]
+                check_embedding_model(
+                    graph,  # type: ignore[invalid-argument-type]
+                    settings.embeddings,
+                    derive_project_name(settings.project_root),
+                ),
                 check_index(graph, settings),  # type: ignore[invalid-argument-type]
             )
             results.append(schema_res)
