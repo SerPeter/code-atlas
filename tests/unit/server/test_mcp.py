@@ -1640,3 +1640,104 @@ class TestSummarizeModule:
         result = await _invoke_tool(summary_app, "analyze_repo", analysis="module_summary", project="proj", path="pkg")
 
         assert result["analysis"] == "module_summary"
+
+
+# ---------------------------------------------------------------------------
+# Backend identity on every tool result (ATL-133)
+# ---------------------------------------------------------------------------
+
+
+class TestBackendStamp:
+    """`backend.graph` defaults to "auto" and falls back to SQLite whenever Memgraph
+    is unreachable, which on a machine without Docker is the ordinary outcome. Before
+    ATL-133 only index_status said so, and an agent reading find_dead_code or
+    blast_radius could not tell which engine answered it.
+    """
+
+    @staticmethod
+    def _server():
+        from code_atlas.server.mcp import create_mcp_server
+        from code_atlas.settings import AtlasSettings
+
+        return create_mcp_server(AtlasSettings())
+
+    async def test_every_registered_tool_is_stamped(self):
+        """Derived from the registry, never a hand-written list.
+
+        A hand-written list is how the 24th tool ships unstamped: nothing fails, the
+        payload is simply silent about a degraded backend, which is the exact failure
+        mode this story exists to remove.
+        """
+        server = self._server()
+        tools = await server.list_tools()
+        assert len(tools) >= 23
+
+        unwrapped = [t.name for t in server._tool_manager._tools.values() if not hasattr(t.fn, "__wrapped__")]
+        assert unwrapped == [], f"tools registered without the backend stamp: {unwrapped}"
+
+    async def test_the_stamp_is_transparent_to_the_schema(self):
+        """The wrapper must not eat the parameters — FastMCP builds each tool's schema
+        by inspecting the function, and a bare *args/**kwargs wrapper would publish
+        every tool as taking nothing."""
+        server = self._server()
+        tools = {t.name: t for t in await server.list_tools()}
+        params = set((tools["get_node"].inputSchema or {}).get("properties", {}))
+        assert {"name", "label", "limit"} <= params
+
+    async def test_a_healthy_backend_says_nothing(self, monkeypatch):
+        """Silence means the supported configuration. Adding a field to every healthy
+        result would cost tokens on every call to say nothing."""
+        import code_atlas.server.mcp as mcp_mod
+
+        monkeypatch.setattr(mcp_mod, "_BACKEND_NOTE", {})
+        server = self._server()
+        tool = next(t for t in server._tool_manager._tools.values() if t.name == "schema_info")
+
+        result = await tool.fn()
+
+        assert "backend" not in result
+        assert "backend_warning" not in result
+
+    async def test_a_degraded_backend_names_itself(self, monkeypatch):
+        import code_atlas.server.mcp as mcp_mod
+
+        note = {"backend": "sqlite-embedded", "backend_warning": "Answered by the embedded backend."}
+        monkeypatch.setattr(mcp_mod, "_BACKEND_NOTE", note)
+        server = self._server()
+        tool = next(t for t in server._tool_manager._tools.values() if t.name == "schema_info")
+
+        result = await tool.fn()
+
+        assert result["backend"] == "sqlite-embedded"
+        assert result["backend_warning"] == note["backend_warning"]
+
+    async def test_a_tool_that_already_named_the_backend_is_not_overwritten(self, monkeypatch):
+        """index_status carries the backend in its own payload shape. The stamp must
+        defer to it rather than double-writing a possibly different string."""
+        import code_atlas.server.mcp as mcp_mod
+
+        monkeypatch.setattr(mcp_mod, "_BACKEND_NOTE", {"backend": "sqlite-embedded"})
+        server = self._server()
+        server._tool_manager._tools.clear()
+
+        @server.tool(description="probe")
+        async def probe() -> dict:
+            return {"backend": "already-said-it", "ok": True}
+
+        tool = next(iter(server._tool_manager._tools.values()))
+        assert (await tool.fn())["backend"] == "already-said-it"
+
+    def test_the_warning_text_has_one_source(self):
+        """One string, one source. Two tools disagreeing about what "degraded" means is
+        worse than neither saying it, and a copied literal is how they drift apart."""
+        import inspect
+
+        import code_atlas.server.mcp as mcp_mod
+
+        source = inspect.getsource(mcp_mod)
+        assert source.count("Answered by the embedded SQLite fallback") == 1
+
+    def test_a_non_sqlite_backend_produces_no_note_at_all(self):
+        import code_atlas.server.mcp as mcp_mod
+
+        assert mcp_mod._backend_note(object()) == {}

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import re
 import time
 import tomllib
@@ -806,6 +807,10 @@ def create_mcp_server(  # noqa: PLR0915
                 vector_enabled = False
         staleness = StalenessChecker(settings.project_root)
         daemon = DaemonManager()
+        # Decided here and fixed for the life of the process, so every tool can share
+        # one dict rather than re-deriving it per call.
+        global _BACKEND_NOTE  # noqa: PLW0603 — process-wide, set once at startup
+        _BACKEND_NOTE = _backend_note(graph)
         app_ctx = AppContext(
             graph=graph,
             settings=settings,
@@ -886,6 +891,7 @@ def create_mcp_server(  # noqa: PLR0915
         lifespan=app_lifespan,
     )
 
+    _install_backend_stamp(mcp)
     _register_query_tools(mcp)
     _register_search_tools(mcp)
     _register_hybrid_tool(mcp)
@@ -1020,6 +1026,48 @@ def _register_node_tools(mcp: FastMCP) -> None:
         ranked = _rank_results([_compact_node(r, detail=detail) for r in found])
         await _enrich_with_calls(app.graph, ranked, detail=detail)
         return await _with_staleness(app, _result(ranked, limit=page_end, query_ms=elapsed, total=total))
+
+
+# The degraded-backend note, computed once at startup and merged into every tool's
+# answer. Module-level rather than threaded through 23 signatures because the backend
+# is chosen once in `app_lifespan` and cannot change while the process runs -- there is
+# no per-call state to carry.
+_BACKEND_NOTE: dict[str, Any] = {}
+
+
+def _install_backend_stamp(mcp: FastMCP) -> None:
+    """Wrap tool registration so every dict answer carries the backend note.
+
+    One interception instead of 23 edits. `_backend_note` had a single caller, and only
+    8 of the 23 tools route through the `_result` envelope, so there is no shared
+    payload seam to extend -- the registration decorator is the only place all of them
+    pass through.
+
+    Must be called **before** the `_register_*` functions, since it works by replacing
+    the decorator they use.
+    """
+    register = mcp.tool
+
+    def stamping_tool(*d_args: Any, **d_kwargs: Any) -> Any:
+        decorate = register(*d_args, **d_kwargs)
+
+        def wrap(fn: Any) -> Any:
+            @functools.wraps(fn)
+            async def stamped(*args: Any, **kwargs: Any) -> Any:
+                result = await fn(*args, **kwargs)
+                # Only dict answers, and never clobber a tool that already said it
+                # (index_status names the backend in its own payload shape).
+                if not _BACKEND_NOTE or not isinstance(result, dict) or "backend" in result:
+                    return result
+                return {**result, **_BACKEND_NOTE}
+
+            # functools.wraps sets __wrapped__, which inspect.signature follows, so
+            # FastMCP still builds the schema from the real parameters.
+            return decorate(stamped)
+
+        return wrap
+
+    mcp.tool = stamping_tool  # type: ignore[method-assign]
 
 
 def _register_query_tools(mcp: FastMCP) -> None:
