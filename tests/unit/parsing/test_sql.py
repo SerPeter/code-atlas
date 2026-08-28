@@ -12,6 +12,7 @@ from code_atlas.parsing.ast import (
     get_language_for_file,
     parse_file,
 )
+from code_atlas.parsing.languages.sql import _neutralize_jinja
 from code_atlas.schema import NodeLabel, RelType
 
 PROJECT = "test_project"
@@ -617,3 +618,47 @@ class TestDbtMacros:
             path="macros/cents.sql",
         )
         assert [r.to_name for r in parsed.relationships if r.rel_type is RelType.CALLS] == []
+
+
+_JINJA_CASES = [
+    b"select * from {{ ref('a') }}",
+    b"{{ config(materialized='table') }}\nselect 1\n",
+    b"{% macro m(x) %}\n  {{ x }}\n{% endmacro %}\n",
+    b"{# a comment #}\nselect 1",
+    b"{%- if target.name == 'prod' -%}\nselect 1\n{%- endif -%}",
+    b"select\n  {{ a }},\n  {{ b }}\nfrom {{ ref('t') }}\n",
+    b"no jinja here at all",
+    b"",
+]
+
+
+class TestJinjaNeutralization:
+    """The shim's whole justification is that offsets are unchanged.
+
+    If a rewrite alters length or eats a newline, every entity in every dbt file
+    silently points at the wrong line — and nothing else in the pipeline can detect
+    it, because a wrong-but-plausible line number looks exactly like a right one.
+    """
+
+    @pytest.mark.parametrize("source", _JINJA_CASES)
+    def test_length_is_preserved(self, source: bytes):
+        assert len(_neutralize_jinja(source)) == len(source)
+
+    @pytest.mark.parametrize("source", _JINJA_CASES)
+    def test_every_newline_survives_in_place(self, source: bytes):
+        """Not just the count — the offsets. A shim that kept the right number of
+        newlines but moved one would still shift every line after it."""
+        shimmed = _neutralize_jinja(source)
+        assert [i for i, b in enumerate(source) if b == 0x0A] == [i for i, b in enumerate(shimmed) if b == 0x0A]
+
+    def test_expression_spans_stay_identifier_shaped(self):
+        """`from {{ ref('x') }}` must still parse as a FROM clause. Blanking the span
+        to whitespace leaves `from` dangling and the statement stops parsing."""
+        shimmed = _neutralize_jinja(b"from {{ ref('x') }}")
+        assert shimmed == b"from ______________"
+
+    def test_statement_spans_become_whitespace(self):
+        """A `{% ... %}` block is control flow, not a value — padding it with
+        identifier characters would invent a token where there was none."""
+        shimmed = _neutralize_jinja(b"{% if x %}")
+        assert shimmed == b"          "
