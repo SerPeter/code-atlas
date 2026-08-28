@@ -27,8 +27,16 @@ services:
       resources:
         limits:
           memory: 4g # Docker-level limit — prevents OS OOM killer
+    # --storage-access-timeout-sec: Memgraph defaults this to 1s. CREATE VECTOR INDEX
+    # needs *unique* storage access, and on a graph this size it loses that race against
+    # ordinary query traffic and the 300s periodic snapshot. The result was silent: four
+    # of six vector indices (TypeDef, Value, Module, Note) went missing, and
+    # _reconcile_search_indices retried and failed on every single `atlas index` run --
+    # so `ensure_schema` never completed and 8,569 nodes stayed invisible to semantic
+    # search. One second is not a budget for a DDL statement that has to quiesce storage.
     command: >
       --log-level=WARNING --memory-limit=3800 --storage-wal-enabled=true --storage-snapshot-interval-sec=300
+      --storage-access-timeout-sec=30
     healthcheck:
       test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
       interval: 10s
