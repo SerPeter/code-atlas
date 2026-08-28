@@ -2,6 +2,97 @@
 
 <!-- version list -->
 
+## v0.9.0 (2026-08-28)
+
+### Bug Fixes
+
+- **embeddings**: Scope the model lock per project, keep dimension global
+  ([`47b4263`](https://github.com/SerPeter/code-atlas/commit/47b4263d6dd85e7d1cb66b9ffd0497a6a505f58f))
+
+- **graph**: Heal the :Entity marker instead of assuming it, on every ensure_schema
+  ([`04b12cf`](https://github.com/SerPeter/code-atlas/commit/04b12cf340bed05a1723d9ab549a817a97b096c6))
+
+- **graph**: Index uid-only lookups instead of scanning the whole graph
+  ([`466deb8`](https://github.com/SerPeter/code-atlas/commit/466deb8e50b791a80f059e94dfdc2724f9f5461c))
+
+- **graph**: Make the :Entity marker safe to read and cheap to write
+  ([`06760f4`](https://github.com/SerPeter/code-atlas/commit/06760f41bd974195348a531d6eb6c04f4857bdbe))
+
+- **graph**: Make the patient write path actually patient
+  ([`7906c17`](https://github.com/SerPeter/code-atlas/commit/7906c17dfd3a495246ffe32187ab86cf541bf9d5))
+
+- **graph**: Source typedef_names from every TypeDef, not the DEFINES join
+  ([`d3b4237`](https://github.com/SerPeter/code-atlas/commit/d3b42377c67e60f5baaedf7d96a288148c8d48a0))
+
+- **infra**: Give vector-index DDL a storage-access budget it can actually meet
+  ([`e11672e`](https://github.com/SerPeter/code-atlas/commit/e11672e4746597992adf4dc48c72a915ff8d124d))
+
+### Continuous Integration
+
+- **release**: Regenerate uv.lock as part of the release commit
+  ([`deae16e`](https://github.com/SerPeter/code-atlas/commit/deae16e00c5145e73029aa4bd39fc313dc2665ae))
+
+### Features
+
+- **dream**: Split dedup candidates into two bands and headline fragmentation
+  ([`3a1eac9`](https://github.com/SerPeter/code-atlas/commit/3a1eac93cb11d3954355da60d26641f8bf4e7e6f))
+
+- **embeddings**: Make the graph the dedup layer and delete the Valkey cache
+  ([`3ff4a13`](https://github.com/SerPeter/code-atlas/commit/3ff4a135c9faeb3e036f653154e4f47a4c506e8a))
+
+- **embeddings**: Pace provider calls with a shared budget and adaptive backoff
+  ([`b633e2f`](https://github.com/SerPeter/code-atlas/commit/b633e2fba29d4b9444cfd288db65d994d2233922))
+
+- **knowledge**: Demote superseded notes and flag unresolved contradictions
+  ([`4e95c11`](https://github.com/SerPeter/code-atlas/commit/4e95c11ecc8770b46650e96479ff3ed62398bbfd))
+
+- **mcp**: Every tool result names the backend that produced it
+  ([`3ba83b4`](https://github.com/SerPeter/code-atlas/commit/3ba83b45963f5212000e6d45d205852e9cf8fea5))
+
+- **parsing**: Index dbt models, sources and macros as a real DAG
+  ([`a6da0aa`](https://github.com/SerPeter/code-atlas/commit/a6da0aa0adc2ca585f66859c36162001e5c50e2d))
+
+### Performance Improvements
+
+- **graph**: Index eleven more uid lookups that were scanning the whole graph
+  ([`acbad29`](https://github.com/SerPeter/code-atlas/commit/acbad29e0143c286dbc462ed8c1616a3b35320e6))
+
+- **graph**: Stop scanning the whole graph on the indexing hot path
+  ([`b8b83f9`](https://github.com/SerPeter/code-atlas/commit/b8b83f9f4b6afddff9d4e2d09b6a0399e067755d))
+
+- **indexing**: Bound embed writes instead of serialising them
+  ([`96af241`](https://github.com/SerPeter/code-atlas/commit/96af2418a3deca54089221e342a51191bdeab6e9))
+
+- **indexing**: Defer backlog replay to the final flush during a reindex
+  ([`876be0d`](https://github.com/SerPeter/code-atlas/commit/876be0ddb64d91443dbc22d972e14ca9573be9d7))
+
+- **indexing**: Pace resolution flushes by what the last one cost
+  ([`24fb341`](https://github.com/SerPeter/code-atlas/commit/24fb341bbda2e89d6c4da3cc8c497bb402954505))
+
+- **indexing**: Skip the no-op entity transaction on the detector pass
+  ([`e34b2f9`](https://github.com/SerPeter/code-atlas/commit/e34b2f9b3bdec727aa86c820dbcb9d0e25800ef8))
+
+### Testing
+
+- **backends**: Conformance suite for the shared GraphBackend surface
+  ([`4de6ba3`](https://github.com/SerPeter/code-atlas/commit/4de6ba36408598bce3fbc4e7b87512f9dfb39e9a))
+
+- **bench**: Make the vector-search tripwire measure complexity, not co-tenancy
+  ([`ef237c5`](https://github.com/SerPeter/code-atlas/commit/ef237c58cefe8728550ebf18b847a25a918aec46))
+
+- **bench**: Size the vector-search budget for the load it actually runs under
+  ([`a4d186b`](https://github.com/SerPeter/code-atlas/commit/a4d186b7690899edba4f58175808d601fe88ef1d))
+
+- **integration**: Stamp :Entity on fixture nodes built by raw Cypher
+  ([`530283e`](https://github.com/SerPeter/code-atlas/commit/530283e7d67af29902984a77baebfff599b47bcf))
+
+- **integration**: Stamp :Entity on the remaining raw-Cypher fixtures
+  ([`4ef9c03`](https://github.com/SerPeter/code-atlas/commit/4ef9c03550046c3c7a6c48b8e90481180fed6364))
+
+- **parsing**: Pin the Jinja shim's offset invariant, and tell agents about dbt
+  ([`d6f6878`](https://github.com/SerPeter/code-atlas/commit/d6f687878e72afe7cebbc99800b4ca6ae9d0bfe7))
+
+
 ## v0.8.4 (2026-08-27)
 
 ### Bug Fixes
