@@ -41,7 +41,6 @@ async def test_full_index_throughput(
 
     with (
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
-        patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         start = time.perf_counter()
         result = await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
@@ -74,7 +73,6 @@ async def test_delta_index_throughput(
     # First do a full index
     with (
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
-        patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
 
@@ -89,7 +87,6 @@ async def test_delta_index_throughput(
     # Delta index
     with (
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
-        patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         start = time.perf_counter()
         result = await index_project(settings, graph_client, event_bus, drain_timeout_s=120.0)
@@ -133,7 +130,6 @@ async def test_indexing_a_medium_project_stays_inside_its_budget(
     budget_s = 900.0
     with (
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
-        patch("code_atlas.indexing.orchestrator.EmbedCache", return_value=None),
     ):
         start = time.perf_counter()
         result = await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=budget_s)

@@ -151,8 +151,9 @@ The indexing pipeline transforms source code into a searchable graph. Each stage
    functions, methods, imports) and their relationships.
 3. **Pattern Detectors** — Pluggable detectors that identify implicit patterns: decorator-based routing, event handlers,
    test-to-code mapping, method overrides.
-4. **Embedder** — Batches entities for embedding via TEI. Uses a content-hash cache to skip unchanged code. Operates on
-   logical chunks (functions, classes, doc sections).
+4. **Embedder** — Batches entities for embedding via TEI. Skips unchanged code by content hash, and copies any vector
+   the graph already holds for the same text under the same model (ADR-0036). Operates on logical chunks (functions,
+   classes, doc sections).
 5. **Graph Writer** — Batch-writes nodes and edges to Memgraph. Updates vector and BM25 indices.
 
 ### Query Pipeline
@@ -271,17 +272,17 @@ See [ADR-0005](adr/0005-deployment-process-model.md) for full rationale.
 
 ## Technology Stack
 
-| Layer      | Technology           | Purpose                            |
-| ---------- | -------------------- | ---------------------------------- |
-| CLI        | Typer                | Command-line interface             |
-| MCP        | mcp-python           | Model Context Protocol server      |
-| Config     | Pydantic             | Configuration management           |
-| Parsing    | Tree-sitter (Python) | Fast AST parsing                   |
-| Graph DB   | Memgraph             | Graph storage + vector + BM25      |
-| Event Bus  | Valkey (Redis)       | Pipeline streams + embedding cache |
-| Embeddings | TEI / LiteLLM        | Code embeddings                    |
-| HTTP       | httpx                | Async HTTP client                  |
-| Tokens     | tiktoken             | Token counting                     |
+| Layer      | Technology           | Purpose                                          |
+| ---------- | -------------------- | ------------------------------------------------ |
+| CLI        | Typer                | Command-line interface                           |
+| MCP        | mcp-python           | Model Context Protocol server                    |
+| Config     | Pydantic             | Configuration management                         |
+| Parsing    | Tree-sitter (Python) | Fast AST parsing                                 |
+| Graph DB   | Memgraph             | Graph storage + vector + BM25                    |
+| Event Bus  | Valkey (Redis)       | Pipeline streams, consumer groups, indexer lease |
+| Embeddings | TEI / LiteLLM        | Code embeddings                                  |
+| HTTP       | httpx                | Async HTTP client                                |
+| Tokens     | tiktoken             | Token counting                                   |
 
 ## Security
 

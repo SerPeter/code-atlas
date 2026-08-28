@@ -67,7 +67,7 @@ src/code_atlas/
 │
 ├── search/
 │   ├── engine.py        # Hybrid search — RRF fusion across graph/vector/BM25
-│   ├── embeddings.py    # Embedding client (litellm) + Valkey cache
+│   ├── embeddings.py    # Embedding client (litellm) + rate limiter
 │   └── guidance.py      # Cypher validation + search strategy for AI agents
 │
 ├── indexing/
@@ -90,6 +90,10 @@ src/code_atlas/
 **Event model:** Events are atomic — one logical change per event (one file per FileChanged, one entity per EmbedDirty). Never bundle lists of work items into a single event; use `EventBus.publish_many()` for network-efficient batch publishing. The consumer's `max_batch_size` must directly control work volume, not just message count.
 
 **Infrastructure:** Memgraph (graph DB, port 7687), TEI (embeddings, port 8080), Valkey (event bus, port 6379)
+
+**Embedding dedup:** the graph is the dedup layer, not Valkey (ADR-0036). Before calling the provider, the
+embed stage asks whether any node — any project, any label — already has a vector for the same `embed_hash`
+under the same model, and copies it. Valkey carries streams, consumer groups and the indexer lease only.
 
 ## Code Style
 

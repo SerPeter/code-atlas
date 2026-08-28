@@ -332,7 +332,6 @@ class EmbeddingSettings(StrictSection):
         default=0.9, gt=0, le=1, description="Fraction of max input tokens to use as truncation limit."
     )
     query_cache_size: int = Field(default=128, description="Max cached query embeddings (LRU eviction).")
-    cache_ttl_days: int = Field(default=7, description="Embedding cache TTL in days. 0 disables Valkey caching.")
 
     @model_validator(mode="after")
     def _apply_provider_defaults(self) -> EmbeddingSettings:

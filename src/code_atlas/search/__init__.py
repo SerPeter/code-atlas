@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from code_atlas.search.embeddings import EmbedCache, EmbedClient, EmbeddingError, build_embed_text
+from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
 from code_atlas.search.engine import (
     AssembledContext,
     CompactNode,
@@ -23,7 +23,6 @@ __all__ = [
     "AssembledContext",
     "CompactNode",
     "ContextItem",
-    "EmbedCache",
     "EmbedClient",
     "EmbeddingError",
     "ExpandedContext",
@@ -36,6 +35,7 @@ __all__ = [
     "expand_context",
     "expand_scope",
     "get_guide",
+    "hash_text",
     "hybrid_search",
     "plan_strategy",
     "validate_cypher_explain",

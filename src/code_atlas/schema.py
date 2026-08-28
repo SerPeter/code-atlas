@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 14
+SCHEMA_VERSION: int = 15
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -378,7 +378,16 @@ _INDEX_PROPERTIES: tuple[str, ...] = (
 # import resolution. Everything else is reached through a primary label, which
 # has its own index -- indexing it on the marker too would buy no query anything
 # and cost every single node write.
-_MARKER_INDEX_PROPERTIES: tuple[str, ...] = ("uid",)
+# ``embed_hash`` is here rather than in _INDEX_PROPERTIES on purpose. The
+# embedding dedup lookup (ATL-127) asks "does ANY node anywhere already carry a
+# vector for this text?" -- it is cross-label and cross-project by nature, so one
+# index on the marker answers it in a single seek where six per-label indices
+# would need six. It is also nearly free: a label-property index only holds nodes
+# that HAVE the property, and only embeddable nodes ever carry embed_hash.
+#
+# Adding it to _INDEX_PROPERTIES instead would make generate_drop_redundant_marker_ddl
+# emit a DROP for it, since that subtracts this tuple from that one.
+_MARKER_INDEX_PROPERTIES: tuple[str, ...] = ("uid", "embed_hash")
 
 LABEL_PROPERTY_INDICES: tuple[IndexSpec, ...] = (
     *(

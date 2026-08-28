@@ -131,6 +131,68 @@ class TestModelLock:
         assert counts["test-alpha"] == 1
         assert counts["test-beta"] == 2
 
+    async def _embedded(self, graph_client, uid: str, ehash: str, model: str, project: str = "test") -> None:
+        dim = graph_client._dimension
+        await graph_client.execute_write(
+            "CREATE (n:Module:Entity {uid: $uid, qualified_name: $uid, project_name: $p, name: 'mod', "
+            "file_path: 'mod.py', content_hash: 'h', project_root: '/tmp'})",
+            {"uid": uid, "p": project},
+        )
+        await graph_client.write_embeddings_and_hashes([(uid, [0.3] * dim, ehash)], labels=["Module"], model=model)
+
+    async def test_dedup_lookup_finds_a_vector_another_node_already_has(self, graph_client):
+        """The whole point of ADR-0036: the graph is the dedup layer."""
+        await graph_client.ensure_schema()
+        await self._embedded(graph_client, "test:a", "shared-hash", "model-a")
+
+        found = await graph_client.find_embeddings_by_hash(["shared-hash", "absent-hash"], "model-a")
+
+        assert set(found) == {"shared-hash"}
+        assert len(found["shared-hash"]) == graph_client._dimension
+
+    async def test_dedup_lookup_crosses_projects(self, graph_client):
+        """Cross-project dedup was the deleted cache's one real service; the graph
+        keeps it, because every project shares one Memgraph."""
+        await graph_client.ensure_schema()
+        await self._embedded(graph_client, "test-alpha:a", "shared-hash", "model-a", project="test-alpha")
+
+        found = await graph_client.find_embeddings_by_hash(["shared-hash"], "model-a")
+
+        assert "shared-hash" in found
+
+    async def test_dedup_lookup_refuses_a_different_models_vector(self, graph_client):
+        """The failure this predicate exists to prevent.
+
+        Two models produced 1536-dimensional vectors in this very database, so copying
+        without the filter mixes embedding spaces and *nothing downstream can tell* --
+        no dimension error, no exception, just silently meaningless distances.
+        """
+        await graph_client.ensure_schema()
+        await self._embedded(graph_client, "test:a", "shared-hash", "model-a")
+
+        found = await graph_client.find_embeddings_by_hash(["shared-hash"], "model-b")
+
+        assert found == {}, "a vector from another model's space must not be copied"
+
+    async def test_dedup_lookup_ignores_vectors_with_no_model_stamp(self, graph_client):
+        """Legacy vectors predate the stamp, so their space is unknown.
+
+        Dedup copies data, so it takes the strict half of the asymmetry: unknown means
+        excluded here, even though search still ranks them.
+        """
+        await graph_client.ensure_schema()
+        dim = graph_client._dimension
+        await graph_client.execute_write(
+            "CREATE (n:Module:Entity {uid: 'test:legacy', qualified_name: 'legacy', project_name: 'test', "
+            "name: 'mod', file_path: 'mod.py', content_hash: 'h', project_root: '/tmp', "
+            "embedding: $emb, embed_hash: 'legacy-hash'})",
+            {"emb": [0.4] * dim},
+        )
+
+        found = await graph_client.find_embeddings_by_hash(["legacy-hash"], "model-a")
+
+        assert found == {}
+
     async def test_the_model_is_stamped_on_the_vector_it_made(self, graph_client):
         """Two models at the same dimension are indistinguishable without the stamp --
         measured coexisting on the production graph at 1536d (ATL-135)."""

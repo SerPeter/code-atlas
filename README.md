@@ -97,7 +97,7 @@ For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code
 
 Token counts measured from the registered MCP tool definitions (tiktoken `cl100k_base`) — reproduce with `uv run python scripts/count_tool_tokens.py`. **Search** = name + description (2,360 total); **Full** = name + description + parameter schema with field descriptions, enums and constraints (5,791 total). All parameters are self-documented, so agents can one-shot any tool without calling `get_usage_guide` first.
 
-**Latency** was measured with local TEI embeddings on the code-atlas repo (~1,400 entities), 5 iterations, warm embedding cache — see `scripts/profile_query.py`. A `—` means that tool is not yet in the profiling harness; it is unmeasured, not instant.
+**Latency** was measured with local TEI embeddings on the code-atlas repo (~1,400 entities), 5 iterations, with embeddings already present — see `scripts/profile_query.py`. A `—` means that tool is not yet in the profiling harness; it is unmeasured, not instant.
 
 ## Quick Start
 

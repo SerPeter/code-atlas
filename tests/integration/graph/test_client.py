@@ -4957,7 +4957,7 @@ async def test_resolve_calls_will_not_resolve_a_call_on_an_unknown_receiver(grap
     """Uniqueness within the project is evidence of identity only if the name was looked
     up in the project's namespace.
 
-    Reproduces the reported defect: EmbedCache.clear called the Valkey client's .scan(),
+    Reproduces the reported defect: the old Valkey embed cache's clear() called .scan(),
     and because FileScope.scan was the only project entity named "scan", project_unique
     claimed it as confidence:"resolved" with full weight. Nothing downstream could see
     the doubt — ambiguous_only cannot flag a resolved edge and the outline's annotation

@@ -1,6 +1,6 @@
 """Daemon manager — reusable watcher + pipeline lifecycle.
 
-Encapsulates the EventBus, FileWatcher, EmbedClient, EmbedCache,
+Encapsulates the EventBus, FileWatcher, EmbedClient,
 and AST/Embed consumers.  Used by both the CLI (``atlas watch``,
 ``atlas daemon start``) and the MCP server for auto-indexing.
 """
@@ -27,7 +27,7 @@ from code_atlas.indexing.orchestrator import (
     publish_project_changes,
 )
 from code_atlas.indexing.watcher import FileWatcher
-from code_atlas.search.embeddings import EmbedCache, EmbedClient
+from code_atlas.search.embeddings import EmbedClient
 from code_atlas.settings import derive_project_name
 
 if TYPE_CHECKING:
@@ -44,7 +44,6 @@ class DaemonManager:
     _vault_watchers: list[FileWatcher] = field(default_factory=list, repr=False)
     _consumers: list[ASTConsumer | EmbedConsumer] = field(default_factory=list, repr=False)
     _tasks: list[asyncio.Task[None]] = field(default_factory=list, repr=False)
-    _cache: EmbedCache | None = field(default=None, repr=False)
     _embed: EmbedClient | None = field(default=None, repr=False)
     _crash_counts: dict[str, int] = field(default_factory=dict, repr=False)
     _last_crash: dict[str, str] = field(default_factory=dict, repr=False)
@@ -69,7 +68,7 @@ class DaemonManager:
             "last_crash": dict(self._last_crash),
         }
 
-    async def start(  # noqa: PLR0912
+    async def start(
         self,
         settings: AtlasSettings,
         graph: GraphClient,
@@ -123,19 +122,15 @@ class DaemonManager:
             logger.exception("Worktree GC sweep failed — continuing startup")
 
         embed: EmbedClient | None = None
-        cache: EmbedCache | None = None
         if settings.embeddings.enabled:
             embed = EmbedClient(settings.embeddings, settings.redis)
             self._embed = embed
-            if settings.embeddings.cache_ttl_days > 0:
-                cache = EmbedCache(settings.redis, settings.embeddings)
-            self._cache = cache
 
         consumers: list[ASTConsumer | EmbedConsumer] = [
             ASTConsumer(bus, graph, settings, cooldown_s=settings.watcher.cooldown_s, defer_to_lease=True),
         ]
         if embed is not None:
-            consumers.append(EmbedConsumer(bus, graph, embed, cache=cache, defer_to_lease=True))
+            consumers.append(EmbedConsumer(bus, graph, embed, defer_to_lease=True))
         self._consumers = consumers
 
         if include_watcher:
@@ -317,9 +312,6 @@ class DaemonManager:
                 task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-
-        if self._cache is not None:
-            await self._cache.close()
 
         if self._bus is not None:
             await self._bus.close()

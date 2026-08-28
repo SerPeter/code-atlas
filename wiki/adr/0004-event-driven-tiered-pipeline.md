@@ -3,7 +3,9 @@
 ## Status
 
 Accepted — amended by [ADR-0009](./0009-event-pipeline-durability-contract.md) (significance gating and durability
-guarantees superseded; tiered pipeline shape unchanged)
+guarantees superseded; tiered pipeline shape unchanged) and by
+[ADR-0036](./0036-the-graph-is-the-embedding-dedup-layer.md) (the Valkey embedding cache is deleted; the graph is the
+dedup layer, and Valkey carries coordination only)
 
 ## Date
 
@@ -37,7 +39,9 @@ Redis Streams provide the pub/sub backbone with consumer groups:
 
 - **Native batch-pull** (`XREADGROUP COUNT N BLOCK ms`) — consumers control their own pace
 - **Multi-process ready** — no single-process rewrite later when scaling
-- **Dual-use** — same Valkey instance serves as embedding cache (task 02-search-04)
+- ~~**Dual-use** — same Valkey instance serves as embedding cache (task 02-search-04)~~ — reversed by ADR-0036: the
+  cache measured 0% realized hit rate and 98.8% duplication of vectors the graph already held, and filled the shared
+  instance until it rejected the pipeline's own stream writes
 - **Lightweight** — 30MB Docker image, 5-10MB idle RAM
 - **Reliable** — failed batches stay in the pending entries list for redelivery
 
@@ -115,7 +119,7 @@ own retries through this mechanism, avoiding the need for a separate dead-letter
 - Decoupled stages can be developed, tested, and scaled independently
 - Batching per stage matches the cost profile of each operation
 - Multi-process from day one — no rewrite needed when scaling
-- Dual-use of Valkey for event bus + embedding cache
+- ~~Dual-use of Valkey for event bus + embedding cache~~ — reversed by ADR-0036
 - Natural extension point: new stages or event types can be added without restructuring
 
 ### Negative

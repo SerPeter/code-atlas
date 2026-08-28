@@ -36,7 +36,7 @@ from code_atlas.graph.client import _CONFIG_REF_REL_TYPES
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, parse_file
 from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, run_detectors
 from code_atlas.schema import NodeLabel, RelType
-from code_atlas.search.embeddings import EmbedCache, build_embed_text
+from code_atlas.search.embeddings import build_embed_text, hash_text
 from code_atlas.settings import derive_project_name
 from code_atlas.telemetry import get_metrics, get_tracer
 
@@ -1385,7 +1385,7 @@ class ASTConsumer(TierConsumer):
                                 }
                                 text = build_embed_text(props)
                                 if text:
-                                    text_hash = EmbedCache.hash_text(text)
+                                    text_hash = hash_text(text)
                                     embed_candidates[entity.qualified_name] = (ref, text_hash)
 
                 # 6. Withhold EVERY processed file's hash until the deferred flush.
@@ -1521,7 +1521,8 @@ class EmbedConsumer(TierConsumer):
 
     Implements a three-level lookup to minimize expensive embedding API calls:
       1. **Graph hit** — node already has ``embed_hash`` matching current text (free).
-      2. **Valkey cache hit** — vector stored in Redis from a previous run (1 round-trip).
+      2. **Graph dedup hit** — some node, in any project, already has a vector for
+         this exact text under this model (1 round-trip, ADR-0036).
       3. **API call** — embed via TEI / cloud provider (expensive).
     """
 
@@ -1531,7 +1532,6 @@ class EmbedConsumer(TierConsumer):
         graph: GraphClient,
         embed: EmbedClient,
         *,
-        cache: EmbedCache | None = None,
         project_filter: set[str] | None = None,
         policy: BatchPolicy | None = None,
         max_concurrency: int | None = None,
@@ -1559,7 +1559,6 @@ class EmbedConsumer(TierConsumer):
         # attribute surfaces as a swallowed per-batch error and the vectors simply
         # never appear. Read at construction it is an immediate, obvious failure.
         self._embed_model: str = embed.configured_model
-        self.cache = cache
         self._max_concurrency = _max_conc
         self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
@@ -1639,35 +1638,51 @@ class EmbedConsumer(TierConsumer):
         finally:
             self._sem.release()
 
-    async def _resolve_cache(
+    async def _resolve_from_graph(
         self, to_process: list[tuple[str, str, str]]
     ) -> tuple[list[tuple[str, list[float], str]], list[tuple[str, str, str]], int]:
-        """Resolve vectors from Valkey cache, returning (cache_resolved, need_embed, cache_hits)."""
-        if self.cache is not None and to_process:
-            remaining_hashes = [h for _, _, h in to_process]
-            cached = await self.cache.get_many(remaining_hashes)
-            cache_resolved: list[tuple[str, list[float], str]] = []
-            need_embed: list[tuple[str, str, str]] = []
-            hits = 0
-            for uid, text, text_hash in to_process:
-                if text_hash in cached:
-                    cache_resolved.append((uid, cached[text_hash], text_hash))
-                    hits += 1
-                else:
-                    need_embed.append((uid, text, text_hash))
-            return cache_resolved, need_embed, hits
-        return [], list(to_process), 0
+        """Copy vectors the graph already holds for these texts.
+
+        Returns ``(resolved, need_embed, hits)``. The graph is the dedup layer: the
+        vectors are already there, durably, keyed by exactly this hash, and a Valkey
+        copy of them was the thing that filled the shared instance and failed the
+        pipeline's stream writes (ADR-0036).
+        """
+        if not to_process:
+            return [], [], 0
+        found = await self.graph.find_embeddings_by_hash([h for _, _, h in to_process], self._embed_model)
+        if not found:
+            return [], list(to_process), 0
+        resolved: list[tuple[str, list[float], str]] = []
+        need_embed: list[tuple[str, str, str]] = []
+        for uid, text, text_hash in to_process:
+            vec = found.get(text_hash)
+            if vec is None:
+                need_embed.append((uid, text, text_hash))
+            else:
+                resolved.append((uid, vec, text_hash))
+        return resolved, need_embed, len(resolved)
 
     async def _embed_and_store(self, need_embed: list[tuple[str, str, str]]) -> list[tuple[str, list[float], str]]:
-        """Embed texts via API and store results in cache. Returns (uid, vector, hash) tuples."""
+        """Embed texts via the API. Returns (uid, vector, hash) tuples.
+
+        Identical texts inside one batch are embedded **once**. Two entities can share
+        a hash — a moved file, a copied helper, a re-exported symbol — and paying the
+        provider twice in the same request for the same string is pure waste. This is
+        the one hit class the old Valkey cache could never serve either, because a
+        ``--full`` reindex cleared it before the run started.
+        """
         if not need_embed:
             return []
-        texts = [text for _, text, _ in need_embed]
-        vectors = await self.embed.embed_batch(texts)
-        result = [(uid, vec, th) for (uid, _t, th), vec in zip(need_embed, vectors, strict=True)]
-        if self.cache is not None:
-            await self.cache.put_many([(th, vec) for _, vec, th in result])
-        return result
+        first_of: dict[str, str] = {}
+        unique: list[tuple[str, str, str]] = []
+        for uid, text, text_hash in need_embed:
+            if text_hash not in first_of:
+                first_of[text_hash] = text
+                unique.append((uid, text, text_hash))
+        vectors = await self.embed.embed_batch([text for _, text, _ in unique])
+        by_hash = {th: vec for (_u, _t, th), vec in zip(unique, vectors, strict=True)}
+        return [(uid, by_hash[th], th) for uid, _text, th in need_embed]
 
     async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:  # noqa: PLR0915
         # Collect and deduplicate entities across all events in the batch
@@ -1709,7 +1724,7 @@ class EmbedConsumer(TierConsumer):
                     if not text:
                         continue
                     uid = props["uid"]
-                    text_hash = EmbedCache.hash_text(text)
+                    text_hash = hash_text(text)
                     if lbl := props.get("_label"):
                         uid_to_label[uid] = lbl
                     if props.get("embed_hash") == text_hash and props.get("has_embedding"):
@@ -1721,7 +1736,7 @@ class EmbedConsumer(TierConsumer):
                 if not to_process:
                     elapsed = asyncio.get_event_loop().time() - t0
                     logger.debug(
-                        "Embed batch {}: {} entities, {} graph hits, 0 cache hits, 0 embedded ({:.1f}s)",
+                        "Embed batch {}: {} entities, {} unchanged, 0 deduped, 0 embedded ({:.1f}s)",
                         batch_id,
                         total,
                         graph_hits,
@@ -1729,14 +1744,14 @@ class EmbedConsumer(TierConsumer):
                     )
                     return deferred or None
 
-                # 3. Valkey cache check → 4. API call for misses
-                cache_resolved, need_embed, cache_hits = await self._resolve_cache(to_process)
+                # 3. Graph dedup check → 4. API call for what is genuinely new
+                dedup_resolved, need_embed, dedup_hits = await self._resolve_from_graph(to_process)
                 api_vectors = await self._embed_and_store(need_embed)
 
                 # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
                 #    Bounded to _EMBED_WRITE_CONCURRENCY rather than fully serialised --
                 #    see the _write_gate comment in __init__ for the measurements.
-                all_resolved = cache_resolved + api_vectors
+                all_resolved = dedup_resolved + api_vectors
                 if all_resolved:
                     with _tracer.start_as_current_span("embed.write_lock_wait"):
                         await self._write_gate.acquire()
@@ -1756,17 +1771,17 @@ class EmbedConsumer(TierConsumer):
                 elapsed = asyncio.get_event_loop().time() - t0
                 span.set_attribute("entities_count", total)
                 span.set_attribute("graph_hits", graph_hits)
-                span.set_attribute("cache_hits", cache_hits)
+                span.set_attribute("dedup_hits", dedup_hits)
                 span.set_attribute("api_embedded", len(api_vectors))
 
                 get_metrics().embedding_latency.record(elapsed)
 
                 logger.debug(
-                    "Embed batch {}: {} entities, {} graph hits, {} cache hits, {} embedded ({:.1f}s)",
+                    "Embed batch {}: {} entities, {} unchanged, {} deduped, {} embedded ({:.1f}s)",
                     batch_id,
                     total,
                     graph_hits,
-                    cache_hits,
+                    dedup_hits,
                     len(api_vectors),
                     elapsed,
                 )

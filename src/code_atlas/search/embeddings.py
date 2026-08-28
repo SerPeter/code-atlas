@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import struct
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 import litellm
-import redis.asyncio as aioredis
 from loguru import logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -336,147 +334,23 @@ class EmbedClient:
 
 
 # ---------------------------------------------------------------------------
-# Embedding cache (Valkey-backed)
-# ---------------------------------------------------------------------------
-
-
-class EmbedCache:
-    """Valkey-backed embedding vector cache.
-
-    Three-tier key scheme: ``{prefix}:emb:{model_hash}:{text_hash}`` where
-    *model_hash* is the first 8 hex chars of the SHA-256 of the model name
-    (auto-invalidates on model change) and *text_hash* is the SHA-256 hex
-    of the embed text.
-
-    Vectors are stored as compact little-endian float32 binary via
-    :mod:`struct` (e.g. 3072 bytes for 768-dim).
-    """
-
-    def __init__(self, redis_settings: RedisSettings, embed_settings: EmbeddingSettings) -> None:
-        url = f"redis://{redis_settings.host}:{redis_settings.port}/{redis_settings.db}"
-        if redis_settings.password:
-            url = f"redis://:{redis_settings.password}@{redis_settings.host}:{redis_settings.port}/{redis_settings.db}"
-        self._redis = aioredis.from_url(url, decode_responses=False)
-        self._prefix = redis_settings.stream_prefix
-        self._model_hash = hashlib.sha256(embed_settings.model.encode()).hexdigest()[:8]
-        self._dimension = embed_settings.dimension
-        self._ttl_s = embed_settings.cache_ttl_days * 86400
-        self._hits = 0
-        self._misses = 0
-        self._bg_tasks: set[asyncio.Task[None]] = set()
-
-    @property
-    def hits(self) -> int:
-        return self._hits
-
-    @property
-    def misses(self) -> int:
-        return self._misses
-
-    def _key(self, text_hash: str) -> str:
-        return f"{self._prefix}:emb:{self._model_hash}:{text_hash}"
-
-    @staticmethod
-    def hash_text(text: str) -> str:
-        """Return the SHA-256 hex digest of *text*."""
-        return hashlib.sha256(text.encode()).hexdigest()
-
-    def _pack_vector(self, vector: list[float]) -> bytes:
-        return struct.pack(f"<{len(vector)}f", *vector)
-
-    def _unpack_vector(self, data: bytes) -> list[float]:
-        count = len(data) // 4
-        return list(struct.unpack(f"<{count}f", data))
-
-    async def get_many(self, hashes: list[str]) -> dict[str, list[float]]:
-        """Batch-get cached vectors by text hash. Returns {hash: vector} for hits."""
-        if not hashes:
-            return {}
-        with _tracer.start_as_current_span("embed_cache.get_many", attributes={"count": len(hashes)}):
-            try:
-                keys = [self._key(h) for h in hashes]
-                pipe = self._redis.pipeline(transaction=False)
-                for k in keys:
-                    pipe.get(k)
-                values = await pipe.execute()
-            except Exception:
-                logger.warning("EmbedCache.get_many failed, treating as cache miss")
-                self._misses += len(hashes)
-                return {}
-
-            result: dict[str, list[float]] = {}
-            for h, val in zip(hashes, values, strict=True):
-                if val is not None:
-                    result[h] = self._unpack_vector(val)
-                    self._hits += 1
-                else:
-                    self._misses += 1
-            return result
-
-    async def put_many(self, items: list[tuple[str, list[float]]]) -> None:
-        """Fire-and-forget batch-store of vectors by text hash with TTL.
-
-        The cache is a write-behind optimisation (Memgraph is the source of
-        truth), so we don't need to block on Valkey confirmation.  Errors are
-        logged when the background task completes.
-        """
-        if not items or self._ttl_s <= 0:
-            return
-        with _tracer.start_as_current_span("embed_cache.put_many", attributes={"count": len(items)}):
-            pipe = self._redis.pipeline(transaction=False)
-            for text_hash, vector in items:
-                pipe.setex(self._key(text_hash), self._ttl_s, self._pack_vector(vector))
-            task = asyncio.create_task(self._bg_pipe_execute(pipe, len(items)))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
-
-    @staticmethod
-    async def _bg_pipe_execute(pipe: aioredis.client.Pipeline, count: int) -> None:
-        """Execute a pipeline in the background, logging failures."""
-        try:
-            await pipe.execute()
-        except Exception:
-            logger.warning("EmbedCache.put_many failed ({} vectors not cached)", count)
-
-    async def clear(self) -> None:
-        """Delete all cached embeddings for the current model."""
-        try:
-            pattern = f"{self._prefix}:emb:{self._model_hash}:*"
-            cursor: int | bytes = 0
-            while True:
-                cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=500)
-                if keys:
-                    await self._redis.delete(*keys)
-                if cursor == 0:
-                    break
-        except Exception:
-            logger.warning("EmbedCache.clear failed")
-
-    async def clear_all_models(self) -> None:
-        """Delete ALL cached embeddings across all models."""
-        try:
-            pattern = f"{self._prefix}:emb:*"
-            cursor: int | bytes = 0
-            while True:
-                cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=500)
-                if keys:
-                    await self._redis.delete(*keys)
-                if cursor == 0:
-                    break
-        except Exception:
-            logger.warning("EmbedCache.clear_all_models failed")
-
-    async def close(self) -> None:
-        """Close the Redis connection."""
-        await self._redis.aclose()
-
-
-# ---------------------------------------------------------------------------
 # Embed text builder
 # ---------------------------------------------------------------------------
 
 # Node labels that represent code entities (used for template selection)
 _CODE_ENTITY_LABELS = frozenset({"Callable", "TypeDef", "Value", "Module"})
+
+
+def hash_text(text: str) -> str:
+    """Return the SHA-256 hex digest of *text*.
+
+    Lives next to :func:`build_embed_text` because the pair is a contract, not two
+    utilities: a node's ``embed_hash`` is exactly ``hash_text(build_embed_text(props))``,
+    and the embed stage's short-circuit compares against it. It was a static method on
+    the Valkey cache until ATL-127 deleted that class; the hash outlived the cache
+    because the graph is what stores it.
+    """
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def build_embed_text(props: dict[str, Any]) -> str:

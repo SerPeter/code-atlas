@@ -232,11 +232,28 @@ def _prefix_clause_either(col_a: str, col_b: str, path: str) -> tuple[str, list[
     )
 
 
+# Derived from _NODE_COLUMNS rather than re-listed: two hand-maintained lists of the
+# same columns drift, and the failure mode is silent (an index on a column that is
+# really a props_json key, or DDL that will not parse).
+_REAL_NODE_COLUMNS: frozenset[str] = frozenset(c.strip() for c in _NODE_COLUMNS.split(","))
+
+
+def _index_expr(prop: str) -> str:
+    """Render *prop* as an indexable expression: a column, or a props_json extract.
+
+    Everything schema.py names that is not a real column lives inside props_json, and
+    indexing it needs an expression index. Rendered as a bare column reference it is
+    not a slow index -- it is DDL that fails at ensure_schema, on all three branches,
+    taking every already-initialised database down on every startup.
+    """
+    return prop if prop in _REAL_NODE_COLUMNS else f"json_extract(props_json, '$.{prop}')"
+
+
 def _node_index_ddl() -> list[str]:
     """Per-(label, property) partial indices, sourced from schema.py's registries."""
     stmts = [
         f"CREATE INDEX IF NOT EXISTS idx_nodes_{spec.label.value.lower()}_{spec.property} "
-        f"ON nodes({spec.property}) WHERE labels = '{spec.label.value}';"
+        f"ON nodes({_index_expr(spec.property)}) WHERE labels = '{spec.label.value}';"
         for spec in LABEL_PROPERTY_INDICES
     ]
     stmts += [
@@ -2302,6 +2319,37 @@ class SqliteGraphClient:
                 )
                 await self._write_embedding_row(conn, uid, blob)
             await conn.commit()
+
+    async def find_embeddings_by_hash(self, hashes: list[str], model: str) -> dict[str, list[float]]:
+        """Return ``{embed_hash: vector}`` for texts already embedded under *model*.
+
+        Same contract as the Memgraph implementation (ADR-0036), with one honest
+        difference worth stating: this backend is one database file per project root,
+        so its dedup reaches only within a root (its monorepo sub-projects included),
+        never across separate repositories.
+        """
+        if not hashes:
+            return {}
+        conn = await self._get_conn()
+        out: dict[str, list[float]] = {}
+        unique = list(dict.fromkeys(hashes))
+        # SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds; +1 for the model.
+        for i in range(0, len(unique), 900):
+            chunk = unique[i : i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            cur = await conn.execute(
+                "SELECT json_extract(props_json, '$.embed_hash') AS h, embedding FROM nodes "
+                f"WHERE json_extract(props_json, '$.embed_hash') IN ({placeholders}) "
+                "AND embedding IS NOT NULL "
+                "AND json_extract(props_json, '$.embed_model') = ?",
+                (*chunk, model),
+            )
+            for h, blob in await cur.fetchall():
+                if h in out or not blob:
+                    continue
+                out[h] = list(struct.unpack(f"<{len(blob) // 4}f", blob))
+            await cur.close()
+        return out
 
     async def clear_embeddings(self, project: str | None = None) -> int:
         """Strip vectors for one project, or the whole store when *project* is None.

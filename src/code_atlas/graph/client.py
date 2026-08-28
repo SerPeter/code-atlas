@@ -1075,7 +1075,7 @@ def _resolve_one_call(  # noqa: PLR0911, PLR0912
         # receiver's type may never have been indexed, so the single same-named entity
         # is a coincidence, not the callee. The edge is still worth recording — it is
         # the best guess available — but it must not claim to be resolved. Verified in
-        # the field: EmbedCache.clear called Valkey's .scan() and this branch pointed it
+        # the field: the old Valkey embed cache's clear() called .scan() and this branch pointed it
         # at FileScope.scan with confidence "resolved" and full weight.
         if receiver and receiver not in _SELF_RECEIVERS:
             return (non_self, "unverified_receiver")
@@ -3963,6 +3963,38 @@ class GraphClient:
 
         async with self._driver.session() as session:
             return await session.execute_write(_tx)
+
+    async def find_embeddings_by_hash(self, hashes: list[str], model: str) -> dict[str, list[float]]:
+        """Return ``{embed_hash: vector}`` for texts something already has a vector for.
+
+        The graph is the dedup layer (ADR-0036). The same text produces the same vector
+        whichever project it lives in, so one exemplar per hash — from any project, any
+        label — is a correct answer, and that is what makes a file rename, a worktree
+        copy or a second checkout free instead of re-billed.
+
+        **Filtered on the model.** Two models can produce same-dimension vectors in one
+        database — measured here, 25,305 at 1536d under one and 6,691 under another
+        (ADR-0035) — so copying without the predicate would mix embedding spaces with
+        no dimension error to catch it. Vectors written before the stamp existed carry
+        no ``embed_model`` and are deliberately invisible here: dedup copies data, so it
+        gets the strict half of the asymmetry.
+
+        Reads through the ``:Entity(embed_hash)`` index. Unindexed this is one full scan
+        *per hash* — measured at a 10s timeout for 3,000 hashes over 66k nodes.
+        """
+        if not hashes:
+            return {}
+        rows = await self.execute(
+            # Label inline on the pattern, not a trailing WHERE: `UNWIND ... MATCH (n {..})
+            # WHERE n:Label` is order-sensitive in Memgraph and silently drops rows.
+            f"UNWIND $hashes AS h "
+            f"MATCH (n:{NodeLabel.ENTITY} {{embed_hash: h}}) "
+            "WHERE n.embedding IS NOT NULL AND n.embed_model = $model "
+            "WITH h AS h, collect(n.embedding)[0] AS vec "
+            "RETURN h AS h, vec AS vec",
+            {"hashes": list(dict.fromkeys(hashes)), "model": model},
+        )
+        return {r["h"]: r["vec"] for r in rows if r["vec"]}
 
     async def clear_embeddings(self, project: str | None = None) -> int:
         """Remove vectors and embed hashes, for one project or the whole database.

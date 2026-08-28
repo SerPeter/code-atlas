@@ -255,10 +255,9 @@ def patch_all():
         gc.GraphClient.write_embeddings_and_hashes
     )
     emb_mod.EmbedClient.embed_batch = timed_async("embed.embed_api")(emb_mod.EmbedClient.embed_batch)
-
-    # Embed cache
-    emb_mod.EmbedCache.get_many = timed_async("embed.cache_get_many")(emb_mod.EmbedCache.get_many)
-    emb_mod.EmbedCache.put_many = timed_async("embed.cache_put_many")(emb_mod.EmbedCache.put_many)
+    gc.GraphClient.find_embeddings_by_hash = timed_async("embed.find_embeddings_by_hash")(
+        gc.GraphClient.find_embeddings_by_hash
+    )
 
     # --- EventBus ---
     EventBus.publish_many = timed_async("bus.publish_many")(EventBus.publish_many)
@@ -371,9 +370,8 @@ def print_report(wall_time: float):
         ],
         "Embed Stage (Embeddings)": [
             "embed.read_entity_texts",
-            "embed.cache_get_many",
+            "embed.find_embeddings_by_hash",
             "embed.embed_api",
-            "embed.cache_put_many",
             "embed.write_embeddings_and_hashes",
         ],
         "Event Bus (Valkey)": [
@@ -480,7 +478,6 @@ async def main():
     global _t0_ref
 
     full_reindex = "--full" in sys.argv
-    no_cache = "--no-cache" in sys.argv
 
     patch_all()
 
@@ -488,7 +485,6 @@ async def main():
     from code_atlas.events import EventBus
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.orchestrator import index_project
-    from code_atlas.search.embeddings import EmbedCache
     from code_atlas.settings import AtlasSettings
 
     project_root = Path().resolve()
@@ -497,7 +493,6 @@ async def main():
     print(f"Profiling index on: {project_root}")
     print(f"Mode: {'full' if full_reindex else 'auto (delta/full)'}")
     print(f"Embeddings: {'enabled' if settings.embeddings.enabled else 'disabled'}")
-    print(f"Cache: {'disabled (--no-cache)' if no_cache else 'enabled'}")
     print()
 
     graph = GraphClient(settings)
@@ -505,11 +500,6 @@ async def main():
 
     try:
         await graph.ensure_schema()
-
-        if no_cache and settings.embeddings.enabled and settings.embeddings.cache_ttl_days > 0:
-            cache = EmbedCache(settings.redis, settings.embeddings)
-            await cache.clear_all_models()
-            print("Flushed embedding cache")
 
         _t0_ref = time.monotonic()
         result = await index_project(

@@ -70,14 +70,21 @@ class TestLabelCompleteness:
         assert index_labels == _ENTITY_LABELS | _MARKER_LABELS
 
     def test_marker_label_indexed_only_on_what_is_queried(self):
-        """The marker carries exactly the two indices its own lookups use.
+        """The marker carries exactly the indices whose lookups are genuinely its own.
 
-        uid for the uid-only MATCHes it exists to index, (project_name, name) for
-        cross-project import resolution. Every other property is reached through a
-        primary label that has its own index, so indexing it here would buy no query
-        anything and cost every node write -- which is what v13 did and v14 undid.
+        - ``uid`` -- the uid-only MATCHes the marker exists to index.
+        - ``(project_name, name)`` -- cross-project import resolution.
+        - ``embed_hash`` -- the embedding dedup lookup (ATL-127), which asks "does ANY
+          node, any label, any project, already carry a vector for this text?" There is
+          no primary label to reach that through, and unindexed it is one full scan per
+          hash -- measured at a 10s timeout for 3,000 hashes over 66k nodes.
+
+        Anything else is reached through a primary label that has its own index, so
+        indexing it here would buy no query anything and cost every node write -- which
+        is what v13 did and v14 undid. Adding to this list needs the same argument
+        embed_hash makes: a real lookup that no primary-label index can serve.
         """
-        assert {s.property for s in LABEL_PROPERTY_INDICES if s.label is NodeLabel.ENTITY} == {"uid"}
+        assert {s.property for s in LABEL_PROPERTY_INDICES if s.label is NodeLabel.ENTITY} == {"uid", "embed_hash"}
         assert {s.properties for s in COMPOSITE_INDICES if s.label is NodeLabel.ENTITY} == {("project_name", "name")}
 
 

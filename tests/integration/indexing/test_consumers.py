@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,7 +23,7 @@ from code_atlas.events import (
 )
 from code_atlas.indexing.consumers import _MAX_BATCH_FAILURES, ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.indexing.orchestrator import _wait_for_drain
-from code_atlas.search.embeddings import EmbedCache, build_embed_text
+from code_atlas.search.embeddings import build_embed_text, hash_text
 
 if TYPE_CHECKING:
     from code_atlas.events import Event
@@ -1447,7 +1448,7 @@ async def test_embed_concurrent_workers_no_lost_update(
         {"uid": uid},
     )
     assert rows
-    expected_hash_v2 = EmbedCache.hash_text(
+    expected_hash_v2 = hash_text(
         build_embed_text(
             {
                 "_label": "Callable",
@@ -1487,7 +1488,11 @@ async def test_embed_poison_capped_not_infinite(event_bus: EventBus, graph_clien
     consumer = _AlwaysFailEmbedConsumer(
         event_bus,
         graph_client,
-        None,  # type: ignore[arg-type]  # never touched — process_batch raises before any embed call
+        # `None` used to work here because nothing read the client before
+        # process_batch raised. EmbedConsumer now reads configured_model in
+        # __init__ (ATL-135) precisely so a client missing it fails loudly at
+        # construction instead of silently writing no vectors.
+        SimpleNamespace(configured_model="unused"),  # type: ignore[arg-type]
         policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
         max_concurrency=1,
     )

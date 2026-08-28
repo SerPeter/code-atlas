@@ -24,7 +24,7 @@ from code_atlas.events import EmbedDirty, EntityRef, Event, EventBus, FileChange
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
-from code_atlas.search.embeddings import EmbedCache, EmbedClient, EmbeddingError
+from code_atlas.search.embeddings import EmbedClient, EmbeddingError
 from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
@@ -1115,7 +1115,6 @@ async def _check_model_lock(
     *,
     project: str,
     reindex: bool,
-    cache: EmbedCache | None = None,
 ) -> None:
     """Enforce the embedding locks: dimension database-wide, model per project.
 
@@ -1164,8 +1163,6 @@ async def _check_model_lock(
             )
         cleared = await graph.clear_embeddings(None)
         await graph.rebuild_vector_indices(dimension)
-        if cache is not None:
-            await cache.clear_all_models()
         await graph.set_embedding_config(model, dimension)
         await graph.set_project_embedding_model(project, model)
         logger.info("Cleared {:,} vectors for the dimension change", cleared)
@@ -1590,7 +1587,6 @@ async def _run_pipeline(
     graph: GraphClient,
     settings: AtlasSettings,
     embed: EmbedClient | None,
-    cache: EmbedCache | None,
     drain_timeout_s: float,
     *,
     project_root: Path | None = None,
@@ -1628,7 +1624,6 @@ async def _run_pipeline(
             bus,
             graph,
             embed,
-            cache=cache,
             project_filter=project_filter,
             policy=embed_policy,
         )
@@ -1664,8 +1659,6 @@ async def _run_pipeline(
         finished = await _stop_consumer_tasks([ast_task, embed_task], [ast_consumer, embed_consumer])
         if not finished:
             drained = False
-        if cache is not None:
-            await cache.close()
 
     return ast_consumer, drained
 
@@ -1993,7 +1986,7 @@ async def index_project(
         )
 
 
-async def _index_project_inner(  # noqa: PLR0915
+async def _index_project_inner(
     settings: AtlasSettings,
     graph: GraphClient,
     bus: EventBus,
@@ -2021,18 +2014,13 @@ async def _index_project_inner(  # noqa: PLR0915
 
     # 2. Embedding setup + model lock check (skipped in lightweight mode)
     embed: EmbedClient | None = None
-    cache: EmbedCache | None = None
     if settings.embeddings.enabled:
         embed = EmbedClient(settings.embeddings, settings.redis)
-        if settings.embeddings.cache_ttl_days > 0:
-            cache = EmbedCache(settings.redis, settings.embeddings)
 
     if full_reindex:
         logger.debug("Full reindex: deleting existing data for '{}'", project_name)
         await bus.flush()
         await graph.delete_project_data(project_name)
-        if cache is not None:
-            await cache.clear()
 
     if settings.embeddings.enabled and embed is not None:
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
@@ -2042,7 +2030,6 @@ async def _index_project_inner(  # noqa: PLR0915
             dimension,
             project=project_name,
             reindex=full_reindex,
-            cache=cache,
         )
 
     # 3. Decide full vs. delta mode
@@ -2073,7 +2060,6 @@ async def _index_project_inner(  # noqa: PLR0915
             graph,
             settings,
             embed,
-            cache,
             drain_timeout_s,
             project_root=project_root,
             project_filter={project_name},
@@ -2311,11 +2297,8 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
     # --- Shared embedding resources (created once) ---
     embed: EmbedClient | None = None
-    cache: EmbedCache | None = None
     if settings.embeddings.enabled:
         embed = EmbedClient(settings.embeddings, settings.redis)
-        if settings.embeddings.cache_ttl_days > 0:
-            cache = EmbedCache(settings.redis, settings.embeddings)
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
         await _check_model_lock(
             graph,
@@ -2323,13 +2306,10 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             dimension,
             project=root_name,
             reindex=full_reindex,
-            cache=cache,
         )
 
     if full_reindex:
         await bus.flush()
-        if cache is not None:
-            await cache.clear()
 
     # --- Start shared consumers (once for entire monorepo) ---
     reindex_mode = full_reindex
@@ -2351,7 +2331,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     embed_consumer: EmbedConsumer | None = None
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "embed")
-        embed_consumer = EmbedConsumer(bus, graph, embed, cache=cache, policy=embed_policy)
+        embed_consumer = EmbedConsumer(bus, graph, embed, policy=embed_policy)
         consumer_tasks.append(asyncio.create_task(embed_consumer.run()))
 
     start = time.monotonic()
@@ -2431,8 +2411,6 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         if embed_consumer is not None:
             embed_consumer.stop()
         await _stop_consumer_tasks(consumer_tasks, [ast_consumer, embed_consumer])
-        if cache is not None:
-            await cache.close()
 
     # --- Update metadata + build results per project ---
     results: list[IndexResult] = []

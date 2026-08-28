@@ -12,7 +12,7 @@ import pytest
 
 from code_atlas.events import EmbedDirty, EntityRef
 from code_atlas.indexing.consumers import EmbedConsumer
-from code_atlas.search.embeddings import EmbedCache, EmbedClient, EmbeddingError, build_embed_text
+from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
 from code_atlas.settings import EmbeddingSettings
 
 # ---------------------------------------------------------------------------
@@ -409,8 +409,18 @@ class TestEmbedClient:
 # ---------------------------------------------------------------------------
 
 
-class TestEmbedCacheLookup:
-    """Test the three-level lookup logic in EmbedConsumer with mocks."""
+class TestEmbedDedupLookup:
+    """The embed stage's two-level lookup, with mocks (ADR-0036).
+
+    1. unchanged -- the node's own embed_hash still matches, nothing to do
+    2. dedup     -- some node somewhere already has a vector for this exact text
+    3. API       -- genuinely new text
+
+    Level 2 used to be a Valkey cache holding a copy of what level 1 reads out of the
+    graph. Measured on the production instance, 98.8% of its 32,385 keys were already
+    on a graph node, it shared a `noeviction` instance with the event streams and the
+    indexer lease, and it filled that instance and failed their writes.
+    """
 
     @staticmethod
     def _make_entity_ref(qn: str) -> EntityRef:
@@ -426,125 +436,124 @@ class TestEmbedCacheLookup:
         mock = AsyncMock()
         mock.batch_size = 32
         mock.max_concurrency = 4
+        # Not a MagicMock: the consumer stamps this onto every vector it writes, and a
+        # MagicMock reaches the Bolt driver as an unserialisable parameter.
+        mock.configured_model = "test-model"
         return mock
 
-    async def test_graph_hit_skips_all(self):
-        """When graph node has matching embed_hash+embedding, no cache or API call needed."""
-        bus = AsyncMock()
-        graph = AsyncMock()
-        embed = self._mock_embed()
-        cache = AsyncMock()
+    @staticmethod
+    def _props(text_hash: str | None, has_embedding: bool) -> dict:
+        return {
+            "uid": "foo.bar",
+            "qualified_name": "foo.bar",
+            "name": "bar",
+            "signature": "",
+            "docstring": "",
+            "kind": "function",
+            "_label": "Callable",
+            "embed_hash": text_hash,
+            "has_embedding": has_embedding,
+        }
 
-        text = "Module: foo\nFunction: bar"
-        text_hash = EmbedCache.hash_text(text)
+    async def test_unchanged_entity_skips_everything(self):
+        """Level 1: the node's own hash still matches, so nothing downstream runs."""
+        bus, graph, embed = AsyncMock(), AsyncMock(), self._mock_embed()
+        text_hash = hash_text("Module: foo\nFunction: bar")
+        graph.read_entity_texts = AsyncMock(return_value=[self._props(text_hash, True)])
+        graph.find_embeddings_by_hash = AsyncMock(return_value={})
 
-        graph.read_entity_texts = AsyncMock(
-            return_value=[
-                {
-                    "uid": "foo.bar",
-                    "qualified_name": "foo.bar",
-                    "name": "bar",
-                    "signature": "",
-                    "docstring": "",
-                    "kind": "function",
-                    "_label": "Callable",
-                    "embed_hash": text_hash,
-                    "has_embedding": True,
-                }
-            ]
-        )
-
-        consumer = EmbedConsumer(bus, graph, embed, cache=cache)
-        entity = self._make_entity_ref("foo.bar")
-        event = self._make_embed_dirty(entity)
-
-        await consumer.process_batch([event], "test01")
+        consumer = EmbedConsumer(bus, graph, embed)
+        await consumer.process_batch([self._make_embed_dirty(self._make_entity_ref("foo.bar"))], "t01")
 
         embed.embed_batch.assert_not_called()
-        cache.get_many.assert_not_called()
+        graph.find_embeddings_by_hash.assert_not_called()
         graph.write_embeddings_and_hashes.assert_not_called()
 
-    async def test_cache_hit_skips_embed(self):
-        """When Valkey cache has the vector, API call is skipped."""
-        bus = AsyncMock()
-        graph = AsyncMock()
-        embed = self._mock_embed()
-        cache = AsyncMock()
+    async def test_duplicate_text_is_copied_from_the_graph(self):
+        """Level 2: another node already has a vector for this text -- no API call.
 
-        text = "Module: foo\nFunction: bar"
-        text_hash = EmbedCache.hash_text(text)
-        cached_vec = [0.1, 0.2, 0.3]
+        This is the moved-file / second-worktree / copied-helper case, and it is the
+        one thing the deleted Valkey cache genuinely did that level 1 does not.
+        """
+        bus, graph, embed = AsyncMock(), AsyncMock(), self._mock_embed()
+        text_hash = hash_text("Module: foo\nFunction: bar")
+        existing_vec = [0.1, 0.2, 0.3]
+        graph.read_entity_texts = AsyncMock(return_value=[self._props(None, False)])
+        graph.find_embeddings_by_hash = AsyncMock(return_value={text_hash: existing_vec})
 
-        graph.read_entity_texts = AsyncMock(
-            return_value=[
-                {
-                    "uid": "foo.bar",
-                    "qualified_name": "foo.bar",
-                    "name": "bar",
-                    "signature": "",
-                    "docstring": "",
-                    "kind": "function",
-                    "_label": "Callable",
-                    "embed_hash": None,
-                    "has_embedding": False,
-                }
-            ]
-        )
-        cache.get_many = AsyncMock(return_value={text_hash: cached_vec})
-
-        consumer = EmbedConsumer(bus, graph, embed, cache=cache)
-        entity = self._make_entity_ref("foo.bar")
-        event = self._make_embed_dirty(entity)
-
-        await consumer.process_batch([event], "test02")
+        consumer = EmbedConsumer(bus, graph, embed)
+        await consumer.process_batch([self._make_embed_dirty(self._make_entity_ref("foo.bar"))], "t02")
 
         embed.embed_batch.assert_not_called()
-        cache.get_many.assert_called_once()
+        graph.find_embeddings_by_hash.assert_called_once()
+        assert graph.find_embeddings_by_hash.call_args[0][1] == "test-model"
         graph.write_embeddings_and_hashes.assert_called_once()
+        assert graph.write_embeddings_and_hashes.call_args[0][0][0] == ("foo.bar", existing_vec, text_hash)
 
-        # Verify correct vector was written (uid, vector, hash)
-        write_args = graph.write_embeddings_and_hashes.call_args[0][0]
-        assert write_args[0] == ("foo.bar", cached_vec, text_hash)
-
-    async def test_cache_miss_embeds_and_stores(self):
-        """When no hits anywhere, API is called and result stored in cache."""
-        bus = AsyncMock()
-        graph = AsyncMock()
-        embed = self._mock_embed()
-        cache = AsyncMock()
-
+    async def test_genuinely_new_text_calls_the_api(self):
+        bus, graph, embed = AsyncMock(), AsyncMock(), self._mock_embed()
+        text_hash = hash_text("Module: foo\nFunction: bar")
         api_vec = [0.5, 0.6, 0.7]
-        text = "Module: foo\nFunction: bar"
-        text_hash = EmbedCache.hash_text(text)
-
-        graph.read_entity_texts = AsyncMock(
-            return_value=[
-                {
-                    "uid": "foo.bar",
-                    "qualified_name": "foo.bar",
-                    "name": "bar",
-                    "signature": "",
-                    "docstring": "",
-                    "kind": "function",
-                    "_label": "Callable",
-                    "embed_hash": None,
-                    "has_embedding": False,
-                }
-            ]
-        )
-        cache.get_many = AsyncMock(return_value={})  # no cache hit
+        graph.read_entity_texts = AsyncMock(return_value=[self._props(None, False)])
+        graph.find_embeddings_by_hash = AsyncMock(return_value={})
         embed.embed_batch = AsyncMock(return_value=[api_vec])
 
-        consumer = EmbedConsumer(bus, graph, embed, cache=cache)
-        entity = self._make_entity_ref("foo.bar")
-        event = self._make_embed_dirty(entity)
-
-        await consumer.process_batch([event], "test03")
+        consumer = EmbedConsumer(bus, graph, embed)
+        await consumer.process_batch([self._make_embed_dirty(self._make_entity_ref("foo.bar"))], "t03")
 
         embed.embed_batch.assert_called_once()
-        cache.put_many.assert_called_once()
         graph.write_embeddings_and_hashes.assert_called_once()
+        assert graph.write_embeddings_and_hashes.call_args[0][0][0] == ("foo.bar", api_vec, text_hash)
 
-        # Verify the API vector was written to graph (uid, vector, hash)
-        write_args = graph.write_embeddings_and_hashes.call_args[0][0]
-        assert write_args[0] == ("foo.bar", api_vec, text_hash)
+    async def test_the_lookup_is_asked_for_this_projects_model(self):
+        """A vector only means anything inside its own model's space.
+
+        The backend filters on the model; this pins that the consumer actually passes
+        the configured one rather than letting the predicate default away. Two models
+        were measured coexisting at 1536d in one database (ADR-0035), so an unfiltered
+        copy mixes spaces with no dimension error to catch it.
+        """
+        bus, graph, embed = AsyncMock(), AsyncMock(), self._mock_embed()
+        embed.configured_model = "model-b"
+        graph.read_entity_texts = AsyncMock(return_value=[self._props(None, False)])
+        graph.find_embeddings_by_hash = AsyncMock(return_value={})
+        embed.embed_batch = AsyncMock(return_value=[[0.1, 0.2]])
+
+        consumer = EmbedConsumer(bus, graph, embed)
+        await consumer.process_batch([self._make_embed_dirty(self._make_entity_ref("foo.bar"))], "t04")
+
+        assert graph.find_embeddings_by_hash.call_args[0][1] == "model-b"
+        assert graph.write_embeddings_and_hashes.call_args[1]["model"] == "model-b"
+
+    async def test_identical_texts_in_one_batch_embed_once(self):
+        """Two entities sharing a text pay the provider once, not twice.
+
+        The one hit class the Valkey cache could never serve: `--full` cleared it
+        before the run, so within-run duplicates always missed it.
+        """
+        bus, graph, embed = AsyncMock(), AsyncMock(), self._mock_embed()
+        shared = [0.9, 0.8]
+        graph.read_entity_texts = AsyncMock(
+            return_value=[
+                {**self._props(None, False), "uid": "a", "qualified_name": "foo.bar"},
+                {**self._props(None, False), "uid": "b", "qualified_name": "foo.bar"},
+            ]
+        )
+        graph.find_embeddings_by_hash = AsyncMock(return_value={})
+        embed.embed_batch = AsyncMock(return_value=[shared])
+
+        consumer = EmbedConsumer(bus, graph, embed)
+        await consumer.process_batch(
+            [
+                self._make_embed_dirty(self._make_entity_ref("a")),
+                self._make_embed_dirty(self._make_entity_ref("b")),
+            ],
+            "t05",
+        )
+
+        # One text sent to the provider...
+        assert len(embed.embed_batch.call_args[0][0]) == 1
+        # ...and both entities written, from that one vector.
+        written = graph.write_embeddings_and_hashes.call_args[0][0]
+        assert len(written) == 2
+        assert all(w[1] == shared for w in written)
