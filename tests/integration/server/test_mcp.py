@@ -39,7 +39,7 @@ async def seeded_graph(graph_client):
 
     # Create some entities
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.MODULE} {{"
+        f"CREATE (n:{NodeLabel.MODULE}:{NodeLabel.ENTITY} {{"
         "uid: 'test-project:mypackage.mymodule', "
         "project_name: 'test-project', "
         "name: 'mymodule', "
@@ -51,7 +51,7 @@ async def seeded_graph(graph_client):
     )
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "uid: 'test-project:mypackage.mymodule.my_function', "
         "project_name: 'test-project', "
         "name: 'my_function', "
@@ -65,7 +65,7 @@ async def seeded_graph(graph_client):
     )
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.TYPE_DEF} {{"
+        f"CREATE (n:{NodeLabel.TYPE_DEF}:{NodeLabel.ENTITY} {{"
         "uid: 'test-project:mypackage.mymodule.MyClass', "
         "project_name: 'test-project', "
         "name: 'MyClass', "
@@ -79,7 +79,7 @@ async def seeded_graph(graph_client):
     )
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "uid: 'test-project:mypackage.mymodule.MyClass.my_method', "
         "project_name: 'test-project', "
         "name: 'my_method', "
@@ -172,7 +172,7 @@ class TestCypherQuery:
         await graph_client.ensure_schema()
         await graph_client.execute_write(
             "UNWIND range(1, 25) AS i "
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "uid: 'trunc-project:foo' + toString(i), project_name: 'trunc-project', name: 'foo', "
             "qualified_name: 'mod.foo' + toString(i), file_path: 'mod.py', kind: 'function', "
             "line_start: i, line_end: i})"
@@ -189,7 +189,7 @@ class TestCypherQuery:
         await graph_client.ensure_schema()
         await graph_client.execute_write(
             "UNWIND range(1, 5) AS i "
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "uid: 'trunc-project2:foo' + toString(i), project_name: 'trunc-project2', name: 'foo', "
             "qualified_name: 'mod.foo' + toString(i), file_path: 'mod.py', kind: 'function', "
             "line_start: i, line_end: i})"
@@ -205,7 +205,7 @@ class TestCypherQuery:
         await graph_client.ensure_schema()
         await graph_client.execute_write(
             "UNWIND range(1, 25) AS i "
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "uid: 'trunc-project3:foo' + toString(i), project_name: 'trunc-project3', name: 'foo', "
             "qualified_name: 'mod.foo' + toString(i), file_path: 'mod.py', kind: 'function', "
             "line_start: i, line_end: i})"
@@ -265,7 +265,7 @@ class TestGetNode:
         await graph_client.ensure_schema()
         await graph_client.execute_write(
             "UNWIND range(1, 25) AS i "
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "uid: 'gn-trunc:foo' + toString(i), project_name: 'gn-trunc', name: 'shared_name', "
             "qualified_name: 'mod.shared_name' + toString(i), file_path: 'mod.py', kind: 'function', "
             "line_start: i, line_end: i})"
@@ -283,7 +283,7 @@ class TestGetNode:
         await graph_client.ensure_schema()
         await graph_client.execute_write(
             "UNWIND range(1, 5) AS i "
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "uid: 'gn-trunc2:foo' + toString(i), project_name: 'gn-trunc2', name: 'shared_name2', "
             "qualified_name: 'mod.shared_name2' + toString(i), file_path: 'mod.py', kind: 'function', "
             "line_start: i, line_end: i})"
@@ -391,7 +391,7 @@ class TestKnowledgeHealth:
     async def test_knowledge_health_flags_orphan_note(self, app_ctx, graph_client):
         await graph_client.ensure_schema()
         await graph_client.execute_write(
-            f"CREATE (n:{NodeLabel.NOTE} {{"
+            f"CREATE (n:{NodeLabel.NOTE}:{NodeLabel.ENTITY} {{"
             "uid: 'test-project:note:solo', project_name: 'test-project', "
             "name: 'Solo', qualified_name: 'note:solo', file_path: 'solo.md', "
             "kind: 'note', line_start: 1, line_end: 5"
@@ -461,14 +461,14 @@ class TestDefaultScopeMonorepo:
         await graph_client.merge_project_node(sub_name, file_count=1, entity_count=1)
 
         await graph_client.execute_write(
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "uid: $uid, project_name: $project_name, name: 'root_only_fn', "
             "qualified_name: 'root_only_fn', file_path: 'root.py', kind: 'function', "
             "line_start: 1, line_end: 2})",
             {"uid": f"{root_name}:root_only_fn", "project_name": root_name},
         )
         await graph_client.execute_write(
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "uid: $uid, project_name: $project_name, name: 'sub_only_fn', "
             "qualified_name: 'sub_only_fn', file_path: 'sub/sub.py', kind: 'function', "
             "line_start: 1, line_end: 2})",
@@ -1145,7 +1145,7 @@ async def seeded_detail_graph(graph_client):
     await graph_client.merge_project_node(_DETAIL_PROJECT, file_count=1, entity_count=3)
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.MODULE} {{"
+        f"CREATE (n:{NodeLabel.MODULE}:{NodeLabel.ENTITY} {{"
         "uid: $uid, project_name: $p, name: 'mod', qualified_name: 'mod', "
         "file_path: 'mod.py', kind: 'module', line_start: 1, line_end: 50"
         "})",
@@ -1153,7 +1153,7 @@ async def seeded_detail_graph(graph_client):
     )
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "uid: $uid, project_name: $p, name: 'caller_fn', qualified_name: 'mod.caller_fn', "
         "file_path: 'mod.py', kind: 'function', line_start: 5, line_end: 10, "
         "signature: 'def caller_fn() -> None', docstring: 'Calls helper.', "
@@ -1163,7 +1163,7 @@ async def seeded_detail_graph(graph_client):
     )
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "uid: $uid, project_name: $p, name: 'helper', qualified_name: 'mod.helper', "
         "file_path: 'mod.py', kind: 'function', line_start: 15, line_end: 20, "
         "signature: 'def helper() -> str', docstring: 'A helper function.', "
@@ -1243,7 +1243,7 @@ async def seeded_traversal_graph(graph_client):
 
     for name in ("a", "b", "c", "d", "entry", "amb1", "amb2", "resolved_target"):
         await graph_client.execute_write(
-            f"CREATE (n:{NodeLabel.CALLABLE} {{uid: $uid, project_name: $p, name: $name, "
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: $uid, project_name: $p, name: $name, "
             "qualified_name: $qn, file_path: 'mod.py', kind: 'function', line_start: 1, line_end: 5})",
             {
                 "uid": f"{_TRAVERSAL_PROJECT}:mod.{name}",

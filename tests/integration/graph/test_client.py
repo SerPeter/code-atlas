@@ -154,14 +154,15 @@ async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.MODULE} {{"
+        f"CREATE (:{NodeLabel.MODULE}:{NodeLabel.ENTITY} {{"
         "  uid: 'mig3:mod', project_name: 'mig3', name: 'mod',"
         "  qualified_name: 'mod', file_path: 'mod.py', kind: 'module',"
         "  content_hash: 'ch', file_hash: 'stale'"
         "})"
     )
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.PROJECT} {{uid: 'mig3', project_name: 'mig3', name: 'mig3', git_hash: 'oldcommit'}})"
+        f"CREATE (:{NodeLabel.PROJECT}:{NodeLabel.ENTITY} "
+        f"{{uid: 'mig3', project_name: 'mig3', name: 'mig3', git_hash: 'oldcommit'}})"
     )
     # Force the stored version back to 2 (pre-v3 database)
     await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 2")
@@ -185,7 +186,7 @@ async def test_create_code_nodes(graph_client: GraphClient):
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.TYPE_DEF} {{"
+        f"CREATE (n:{NodeLabel.TYPE_DEF}:{NodeLabel.ENTITY} {{"
         "  uid: $uid, project_name: $project, name: $name,"
         "  qualified_name: $qn, kind: $kind, file_path: $fp,"
         "  line_start: 10, line_end: 50, visibility: 'public',"
@@ -202,7 +203,7 @@ async def test_create_code_nodes(graph_client: GraphClient):
     )
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.CALLABLE} {{"
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: $uid, project_name: $project, name: $name,"
         "  qualified_name: $qn, kind: $kind, file_path: $fp,"
         "  line_start: 15, line_end: 30, visibility: 'public',"
@@ -219,7 +220,7 @@ async def test_create_code_nodes(graph_client: GraphClient):
     )
 
     await graph_client.execute_write(
-        f"CREATE (n:{NodeLabel.VALUE} {{"
+        f"CREATE (n:{NodeLabel.VALUE}:{NodeLabel.ENTITY} {{"
         "  uid: $uid, project_name: $project, name: $name,"
         "  qualified_name: $qn, kind: $kind, file_path: $fp,"
         "  line_start: 1, line_end: 1, content_hash: 'ghi789'"
@@ -341,7 +342,7 @@ async def test_project_isolation(graph_client: GraphClient):
 
     for project in ("alpha", "beta"):
         await graph_client.execute_write(
-            f"CREATE (n:{NodeLabel.CALLABLE} {{"
+            f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "  uid: $uid, project_name: $project, name: 'main',"
             "  qualified_name: $qn, kind: 'function', file_path: 'main.py',"
             "  content_hash: $hash"
@@ -366,7 +367,7 @@ async def test_uniqueness_constraint_enforced(graph_client: GraphClient):
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.MODULE} {{"
+        f"CREATE (:{NodeLabel.MODULE}:{NodeLabel.ENTITY} {{"
         "  uid: 'dup:test', project_name: 'dup', name: 'test',"
         "  qualified_name: 'test', file_path: 'test.py', kind: 'module',"
         "  content_hash: 'h1'"
@@ -375,7 +376,7 @@ async def test_uniqueness_constraint_enforced(graph_client: GraphClient):
 
     with pytest.raises(Exception, match="uid"):
         await graph_client.execute_write(
-            f"CREATE (:{NodeLabel.MODULE} {{"
+            f"CREATE (:{NodeLabel.MODULE}:{NodeLabel.ENTITY} {{"
             "  uid: 'dup:test', project_name: 'dup', name: 'test2',"
             "  qualified_name: 'test2', file_path: 'test2.py', kind: 'module',"
             "  content_hash: 'h2'"
@@ -388,14 +389,14 @@ async def test_tags_query(graph_client: GraphClient):
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: 'tag:proj.async_func', project_name: 'tag', name: 'async_func',"
         "  qualified_name: 'proj.async_func', kind: 'function', file_path: 'f.py',"
         "  tags: ['async', 'generator'], content_hash: 'th1'"
         "})"
     )
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: 'tag:proj.sync_func', project_name: 'tag', name: 'sync_func',"
         "  qualified_name: 'proj.sync_func', kind: 'function', file_path: 'f.py',"
         "  tags: [], content_hash: 'th2'"
@@ -430,7 +431,7 @@ async def test_write_and_search_embeddings(graph_client: GraphClient):
 
     # Create a Callable node
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: 'vec:proj.my_func', project_name: 'vec', name: 'my_func',"
         "  qualified_name: 'proj.my_func', kind: 'function', file_path: 'f.py',"
         "  content_hash: 'v1'"
@@ -473,7 +474,7 @@ async def test_vector_search_survives_an_index_full_of_deleted_nodes(graph_clien
     for i in range(40):
         uid = f"dead:n{i}"
         await graph_client.execute_write(
-            f"CREATE (:{NodeLabel.CALLABLE} {{uid: $uid, project_name: 'dead', name: $n, "
+            f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: $uid, project_name: 'dead', name: $n, "
             "qualified_name: $n, kind: 'function', file_path: 'f.py', content_hash: 'h'})",
             {"uid": uid, "n": f"n{i}"},
         )
@@ -483,7 +484,7 @@ async def test_vector_search_survives_an_index_full_of_deleted_nodes(graph_clien
     for i in range(2):
         uid = f"live:n{i}"
         await graph_client.execute_write(
-            f"CREATE (:{NodeLabel.CALLABLE} {{uid: $uid, project_name: 'live', name: $n, "
+            f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: $uid, project_name: 'live', name: $n, "
             "qualified_name: $n, kind: 'function', file_path: 'f.py', content_hash: 'h'})",
             {"uid": uid, "n": f"n{i}"},
         )
@@ -504,7 +505,7 @@ async def test_vector_search_scope_filter(graph_client: GraphClient):
     for project, vec, name in [("alpha", vector_a, "func_a"), ("beta", vector_b, "func_b")]:
         uid = f"{project}:{name}"
         await graph_client.execute_write(
-            f"CREATE (:{NodeLabel.CALLABLE} {{"
+            f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "  uid: $uid, project_name: $project, name: $name,"
             "  qualified_name: $qn, kind: 'function', file_path: 'f.py',"
             "  content_hash: $hash"
@@ -541,7 +542,7 @@ async def test_vector_search_threshold(graph_client: GraphClient):
     for name, vec in [("near", vector_a), ("far", vector_b)]:
         uid = f"thresh:{name}"
         await graph_client.execute_write(
-            f"CREATE (:{NodeLabel.CALLABLE} {{"
+            f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "  uid: $uid, project_name: 'thresh', name: $name,"
             "  qualified_name: $qn, kind: 'function', file_path: 'f.py',"
             "  content_hash: $hash"
@@ -568,7 +569,7 @@ async def test_text_search_method(graph_client: GraphClient):
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: 'txt:proj.search_func', project_name: 'txt', name: 'search_func',"
         "  qualified_name: 'proj.search_func', kind: 'function', file_path: 'f.py',"
         "  docstring: 'A function that searches things.'"
@@ -585,7 +586,7 @@ async def test_text_search_with_project_filter(graph_client: GraphClient):
 
     for project in ("alpha", "beta"):
         await graph_client.execute_write(
-            f"CREATE (:{NodeLabel.CALLABLE} {{"
+            f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
             "  uid: $uid, project_name: $project, name: 'common_func',"
             "  qualified_name: $qn, kind: 'function', file_path: 'f.py',"
             "  docstring: 'A common function.'"
@@ -614,7 +615,7 @@ async def test_text_search_escapes_syntax_special_chars(graph_client: GraphClien
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: 'bm25esc:proj.embed_batch', project_name: 'bm25esc', name: 'embed_batch',"
         "  qualified_name: 'proj.embed_batch', kind: 'function', file_path: 'f.py',"
         "  docstring: 'embed_batch(texts) processes a dict[str, Any] of embeddings.'"
@@ -755,7 +756,7 @@ async def test_write_embed_hashes(graph_client: GraphClient):
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: 'eh:proj.func', project_name: 'eh', name: 'func',"
         "  qualified_name: 'proj.func', kind: 'function', file_path: 'f.py'"
         "})"
@@ -774,7 +775,7 @@ async def test_read_entity_texts_includes_embed_fields(graph_client: GraphClient
     dim = graph_client._dimension
     embedding = [0.1] * dim
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: 'ret:proj.func', project_name: 'ret', name: 'func',"
         "  qualified_name: 'proj.func', kind: 'function', file_path: 'f.py',"
         "  embed_hash: 'abc', embedding: $emb, content_hash: 'ch'"
@@ -802,7 +803,7 @@ async def test_upsert_with_documents_rels(graph_client: GraphClient):
 
     # Pre-create a code entity (the target of the doc link)
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.CALLABLE} {{"
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
         "  uid: $uid, project_name: $project, name: $name,"
         "  qualified_name: $qn, kind: 'function', file_path: 'src/auth.py'"
         "})",
@@ -4623,14 +4624,18 @@ async def test_new_labels_inherit_the_entity_constraints(graph_client: GraphClie
     await graph_client.ensure_schema()
 
     with pytest.raises(Exception, match=r"(?i)constraint"):
-        await graph_client.execute_write(f"CREATE (:{NodeLabel.ENV_VAR} {{uid: 'env/NO_PROJECT', name: 'NO_PROJECT'}})")
+        await graph_client.execute_write(
+            f"CREATE (:{NodeLabel.ENV_VAR}:{NodeLabel.ENTITY} {{uid: 'env/NO_PROJECT', name: 'NO_PROJECT'}})"
+        )
 
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.RESOURCE_FILE} {{uid: 'p:res/a.json', project_name: 'p', name: 'a.json'}})"
+        f"CREATE (:{NodeLabel.RESOURCE_FILE}:{NodeLabel.ENTITY} "
+        f"{{uid: 'p:res/a.json', project_name: 'p', name: 'a.json'}})"
     )
     with pytest.raises(Exception, match="uid"):
         await graph_client.execute_write(
-            f"CREATE (:{NodeLabel.RESOURCE_FILE} {{uid: 'p:res/a.json', project_name: 'p', name: 'dup'}})"
+            f"CREATE (:{NodeLabel.RESOURCE_FILE}:{NodeLabel.ENTITY} "
+            f"{{uid: 'p:res/a.json', project_name: 'p', name: 'dup'}})"
         )
 
 
@@ -4736,7 +4741,7 @@ async def test_gc_keeps_referenced_nodes_and_sweeps_unreferenced_ones(graph_clie
     )
     # An unreferenced node, as a project wipe or a crashed run would leave one.
     await graph_client.execute_write(
-        f"CREATE (:{NodeLabel.ENV_VAR} {{uid: 'env/STRAY', project_name: $pn, "
+        f"CREATE (:{NodeLabel.ENV_VAR}:{NodeLabel.ENTITY} {{uid: 'env/STRAY', project_name: $pn, "
         "name: 'STRAY', qualified_name: 'env/STRAY'})",
         {"pn": GLOBAL_PROJECT},
     )

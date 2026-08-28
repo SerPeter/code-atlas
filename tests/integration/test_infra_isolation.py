@@ -41,7 +41,7 @@ async def test_guard_refuses_non_test_database(settings, monkeypatch):
     monkeypatch.delenv("ATLAS_TEST_DB", raising=False)
     client = GraphClient(settings)
     await client.execute_write(
-        "CREATE (:Project {name: 'trading-bot', project_name: 'trading-bot', uid: 'guard-test:trading-bot'})"
+        "CREATE (:Project:Entity {name: 'trading-bot', project_name: 'trading-bot', uid: 'guard-test:trading-bot'})"
     )
     _GUARD_OK.clear()
     try:
@@ -57,7 +57,7 @@ async def test_guard_allows_test_prefixed_data(settings, monkeypatch):
     monkeypatch.delenv("ATLAS_TEST_DB", raising=False)
     client = GraphClient(settings)
     await client.execute_write(
-        "CREATE (:Project {name: 'test_guard_ok', project_name: 'test_guard_ok', uid: 'test_guard_ok:root'}), "
+        "CREATE (:Project:Entity {name: 'test_guard_ok', project_name: 'test_guard_ok', uid: 'test_guard_ok:root'}), "
         "(:Module {project_name: 'test_guard_ok', uid: 'test_guard_ok:m'})"
     )
     _GUARD_OK.clear()
