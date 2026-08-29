@@ -648,30 +648,31 @@ async def indexed_corpus(corpus_root, _infra_endpoints) -> AsyncIterator[tuple[G
         ),
         embeddings=NO_EMBED,
     )
-    client = GraphClient(settings)
-    try:
-        await client.ping()
-    except Exception:
-        pytest.skip("Memgraph not available")
-
     from code_atlas.events import EventBus
 
-    bus = EventBus(settings.redis, project_name=project)
-    await client.ensure_schema()
-    await index_project(
-        settings,
-        client,
-        bus,
-        project_name=project,
-        project_root=corpus_root,
-        drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
-    )
-    try:
-        yield client, project
-    finally:
-        await client.execute_write("MATCH (n) WHERE n.project_name = $p DETACH DELETE n", {"p": project})
-        await bus.close()
-        await client.close()
+    # Both scoped to blocks: the skip below, ensure_schema and the whole index_project
+    # run all sit between construction and the old try/finally, so any of them raising
+    # abandoned an open driver.
+    async with GraphClient(settings) as client:
+        try:
+            await client.ping()
+        except Exception:
+            pytest.skip("Memgraph not available")
+
+        async with EventBus(settings.redis, project_name=project) as bus:
+            await client.ensure_schema()
+            await index_project(
+                settings,
+                client,
+                bus,
+                project_name=project,
+                project_root=corpus_root,
+                drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            )
+            try:
+                yield client, project
+            finally:
+                await client.execute_write("MATCH (n) WHERE n.project_name = $p DETACH DELETE n", {"p": project})
 
 
 async def _hits(client: GraphClient, project: str, case: Case) -> list[Any]:

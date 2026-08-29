@@ -39,31 +39,30 @@ def test_atlas_env_exported_for_bare_settings(_infra_endpoints, tmp_path):  # no
 
 async def test_guard_refuses_non_test_database(settings, monkeypatch):
     monkeypatch.delenv("ATLAS_TEST_DB", raising=False)
-    client = GraphClient(settings)
-    await client.execute_write(
-        "CREATE (:Project:Entity {name: 'trading-bot', project_name: 'trading-bot', uid: 'guard-test:trading-bot'})"
-    )
-    _GUARD_OK.clear()
-    try:
-        with pytest.raises(pytest.exit.Exception):
-            await _assert_disposable_db(client, settings.memgraph.host, settings.memgraph.port)
-    finally:
-        await client.execute_write("MATCH (p:Project {uid: 'guard-test:trading-bot'}) DETACH DELETE p")
+    async with GraphClient(settings) as client:
+        await client.execute_write(
+            "CREATE (:Project:Entity {name: 'trading-bot', project_name: 'trading-bot', uid: 'guard-test:trading-bot'})"
+        )
         _GUARD_OK.clear()
-        await client.close()
+        try:
+            with pytest.raises(pytest.exit.Exception):
+                await _assert_disposable_db(client, settings.memgraph.host, settings.memgraph.port)
+        finally:
+            await client.execute_write("MATCH (p:Project {uid: 'guard-test:trading-bot'}) DETACH DELETE p")
+            _GUARD_OK.clear()
 
 
 async def test_guard_allows_test_prefixed_data(settings, monkeypatch):
     monkeypatch.delenv("ATLAS_TEST_DB", raising=False)
-    client = GraphClient(settings)
-    await client.execute_write(
-        "CREATE (:Project:Entity {name: 'test_guard_ok', project_name: 'test_guard_ok', uid: 'test_guard_ok:root'}), "
-        "(:Module {project_name: 'test_guard_ok', uid: 'test_guard_ok:m'})"
-    )
-    _GUARD_OK.clear()
-    try:
-        await _assert_disposable_db(client, settings.memgraph.host, settings.memgraph.port)
-    finally:
-        await client.execute_write("MATCH (n) WHERE n.uid STARTS WITH 'test_guard_ok' DETACH DELETE n")
+    async with GraphClient(settings) as client:
+        await client.execute_write(
+            "CREATE (:Project:Entity {name: 'test_guard_ok', project_name: 'test_guard_ok', "
+            "uid: 'test_guard_ok:root'}), "
+            "(:Module {project_name: 'test_guard_ok', uid: 'test_guard_ok:m'})"
+        )
         _GUARD_OK.clear()
-        await client.close()
+        try:
+            await _assert_disposable_db(client, settings.memgraph.host, settings.memgraph.port)
+        finally:
+            await client.execute_write("MATCH (n) WHERE n.uid STARTS WITH 'test_guard_ok' DETACH DELETE n")
+            _GUARD_OK.clear()
