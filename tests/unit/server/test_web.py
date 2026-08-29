@@ -979,15 +979,23 @@ class TestUiInstances:
             probe.bind(("127.0.0.1", 0))
             return probe.getsockname()[1]
 
-    def test_a_second_claim_moves_to_the_next_port(self):
+    def test_a_second_claim_does_not_reuse_the_first_port(self):
+        """Asserts the contract, not an exact number.
+
+        The first version demanded `base` then `base + 1`, and it failed on a busy
+        machine when something else already held `base + 1` -- the scan correctly moved
+        on to `base + 2`, which is the behaviour being tested. Any port the OS happens to
+        have free is outside this code's control; that the two claims differ and the scan
+        moves upward is not.
+        """
         from code_atlas.server.web.instances import claim_port
 
         base = self._free_base()
         first, port_a = claim_port("127.0.0.1", base)
         second, port_b = claim_port("127.0.0.1", base)
         try:
-            assert port_a == base
-            assert port_b == base + 1, "the second invocation took the first one's port"
+            assert port_a != port_b, "the second invocation took the first one's port"
+            assert base <= port_a < port_b, "the scan should move upward from the preferred port"
         finally:
             first.close()
             second.close()
@@ -1006,19 +1014,24 @@ class TestUiInstances:
             sock.close()
 
     def test_running_out_of_ports_is_an_error_not_a_silent_reuse(self):
+        """Exhaustion must raise rather than hand back a port someone already holds.
+
+        Uses span=1 so the only candidate is the one port this test is itself holding.
+        The first version claimed a span of three and assumed the OS had left three
+        *contiguous* ports free; when something else held one of them, the setup loop
+        raised the very OSError the assertion was waiting for, outside pytest.raises,
+        and the test failed claiming the code was broken. Second time that assumption
+        bit -- a free port is the OS's to give, a held port is ours to guarantee.
+        """
         from code_atlas.server.web.instances import claim_port
 
         base = self._free_base()
-        held = []
+        held, _port = claim_port("127.0.0.1", base, span=1)
         try:
-            for _ in range(3):
-                sock, _port = claim_port("127.0.0.1", base, span=3)
-                held.append(sock)
             with pytest.raises(OSError, match="No free port"):
-                claim_port("127.0.0.1", base, span=3)
+                claim_port("127.0.0.1", base, span=1)
         finally:
-            for sock in held:
-                sock.close()
+            held.close()
 
     def test_a_record_whose_port_is_free_is_pruned(self, tmp_path, monkeypatch):
         """The record is a report, not evidence. A hard kill leaves one behind, and the
