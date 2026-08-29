@@ -32,6 +32,30 @@ if TYPE_CHECKING:
     from tests.conftest import InfraEndpoints
 
 
+@pytest.fixture(autouse=True)
+def _fast_pipeline_timings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the pipeline's production pacing to test scale.
+
+    These tests assert on what ends up in the graph, never on how long a drain settles
+    or how wide a batch window is, so shrinking the pacing cannot make any of them
+    vacuous. Autouse because every test that drives a real pipeline pays all of it.
+
+    Deliberately in *this* conftest and not ``tests/conftest.py``: ``tests/bench/``
+    inherits the root conftest, and bench exists to measure throughput in wall clock.
+    An autouse timing patch visible from there would silently move the numbers the
+    benchmarks are for. ``tests/bench/`` has its own conftest and does not see this file.
+
+    ``_AST_WINDOW_S`` is 0.1 and not 0: ``is_reindex`` in consumers.py tests
+    ``time_window_s == 0``, so zero would switch the resolution cadence rather than just
+    speed the batch window up.
+    """
+    monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_SETTLE_S", 0.1)
+    monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_POLL_S", 0.05)
+    monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_POLL_MAX_S", 0.1)
+    monkeypatch.setattr("code_atlas.indexing.consumers._AST_WINDOW_S", 0.1)
+    monkeypatch.setattr("code_atlas.indexing.daemon._RESTART_BACKOFF_S", 0.01)
+
+
 def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
     """Check if a TCP port is accepting connections."""
     try:

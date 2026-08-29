@@ -831,6 +831,19 @@ class TestStandDownForAForeignLease:
     exists to prevent, produced by the guard against it.
     """
 
+    @pytest.fixture(autouse=True)
+    def _fast_poll(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Shrink the stand-down poll interval so these tests do not sit through it.
+
+        `_defer_to_foreign_lease` sleeps `_LEASE_POLL_S` (1s) between checks, and it reads
+        the module global each time round, so patching the attribute is enough. Without
+        this the two resume-path tests cost 1.00s and 1.01s of doing nothing -- measured,
+        not assumed. What is under test is *that* the consumer stands down and resumes,
+        never how long it naps between looks, so a smaller number cannot make these
+        vacuous.
+        """
+        monkeypatch.setattr("code_atlas.indexing.consumers._LEASE_POLL_S", 0.01)
+
     @staticmethod
     def _consumer(bus, **kwargs):
         class _Probe(TierConsumer):

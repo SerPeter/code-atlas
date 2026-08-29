@@ -1526,6 +1526,18 @@ _CONSUMER_STALL_S = 120.0
 _CONSUMER_TEARDOWN_CAP_S = 3600.0
 _TEARDOWN_POLL_S = 2.0
 
+# Drain polling: start fast, back off while nothing is moving, snap back to fast the
+# moment work appears. Named rather than left as locals so tests can shrink them -- as
+# locals they were unpatchable, and three drain tests each paid ~1s of real sleeping.
+_DRAIN_POLL_S = 0.5
+_DRAIN_POLL_MAX_S = 2.0
+# How long `lag == 0` must hold before a drain is believed. Costs more than it reads:
+# the poll interval grows 1.5x per idle poll, so with the defaults the sleeps after the
+# first idle poll are 0.75, 1.125 and 1.6875 and the `>= settle_s` check first passes at
+# t=3.56s, not 2.0s. Named so the integration suite can shrink it -- it was five inline
+# literals, and every real index in that suite paid the overshoot.
+_DRAIN_SETTLE_S = 2.0
+
 
 async def _stop_consumer_tasks(
     tasks: Sequence[asyncio.Task[None] | None],
@@ -1635,7 +1647,7 @@ async def _run_pipeline(
             drain_timeout_s,
             embed_enabled=embed is not None,
             on_drain_progress=on_drain_progress,
-            settle_s=2.0,
+            settle_s=_DRAIN_SETTLE_S,
         )
         # Only worth reconciling once the run's own work has settled, and only while
         # these consumers are still alive to act on what it finds.
@@ -1650,7 +1662,7 @@ async def _run_pipeline(
                 drain_timeout_s,
                 embed_enabled=True,
                 on_drain_progress=on_drain_progress,
-                settle_s=2.0,
+                settle_s=_DRAIN_SETTLE_S,
             )
     finally:
         ast_consumer.stop()
@@ -2392,7 +2404,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             drain_timeout_s,
             embed_enabled=embed is not None,
             on_drain_progress=on_drain_progress,
-            settle_s=2.0,
+            settle_s=_DRAIN_SETTLE_S,
         )
         if drained and embed is not None:
             names = [pr.project_name for pr in publish_results]
@@ -2402,7 +2414,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                     drain_timeout_s,
                     embed_enabled=True,
                     on_drain_progress=on_drain_progress,
-                    settle_s=2.0,
+                    settle_s=_DRAIN_SETTLE_S,
                 )
 
     finally:
@@ -2528,7 +2540,7 @@ async def _wait_for_drain(
     *,
     embed_enabled: bool = True,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
-    settle_s: float = 2.0,
+    settle_s: float = _DRAIN_SETTLE_S,
 ) -> bool:
     """Poll stream groups until AST and (optionally) Embed consumers are drained.
 
@@ -2544,7 +2556,7 @@ async def _wait_for_drain(
     """
     deadline = time.monotonic() + timeout_s
     settled_since: float | None = None
-    poll_interval = 0.5
+    poll_interval = _DRAIN_POLL_S
     t2_remaining: int | None = -1
     t3_remaining: int | None = -1
     infos = []
@@ -2577,10 +2589,10 @@ async def _wait_for_drain(
                 logger.debug("Pipeline drained after {:.1f}s settling", time.monotonic() - settled_since)
                 return True
             # Adaptive backoff: poll less frequently once idle
-            poll_interval = min(2.0, poll_interval * 1.5)
+            poll_interval = min(_DRAIN_POLL_MAX_S, poll_interval * 1.5)
         else:
             settled_since = None
-            poll_interval = 0.5  # reset to fast polling when work is happening
+            poll_interval = _DRAIN_POLL_S  # reset to fast polling when work is happening
 
         await asyncio.sleep(poll_interval)
 

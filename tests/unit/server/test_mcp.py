@@ -835,6 +835,18 @@ class TestPlanSearchStrategy:
 
 
 class TestWithStaleness:
+    @pytest.fixture(autouse=True)
+    def _fast_staleness_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Shrink the staleness budget so the timeout tests do not sit through it.
+
+        Two tests here drive the timeout branch by making the check block, and with the
+        real 5s budget each cost 5.01s -- measured, a third of this suite's runtime for
+        two tests. What is under test is what the code *does* when the check does not
+        finish in time, never how long "in time" is, so a smaller budget cannot make them
+        vacuous. It was an inline literal until now, which left them no way to shrink it.
+        """
+        monkeypatch.setattr("code_atlas.server.mcp._STALENESS_TIMEOUT_S", 0.05)
+
     async def test_scope_matching_comma_separated(self, settings):
         """Comma-separated scope with matching project triggers staleness check."""
         from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo

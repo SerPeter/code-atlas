@@ -981,6 +981,19 @@ class FakeDrainBus:
         return [dict(self._info) for _ in queries]
 
 
+@pytest.fixture(autouse=True)
+def _fast_drain_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the drain poll so these tests do not sit through it.
+
+    `_wait_for_drain` sleeps `_DRAIN_POLL_S` between checks, backing off toward
+    `_DRAIN_POLL_MAX_S` while nothing moves. Three tests here paid ~1s each for the
+    privilege of watching a counter not change. They assert what the loop concludes --
+    drained, not drained, timed out -- never the cadence it concludes it at.
+    """
+    monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_POLL_S", 0.01)
+    monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_POLL_MAX_S", 0.02)
+
+
 class TestWaitForDrain:
     async def test_drained_returns_true(self):
         """pending == 0 and lag == 0 sustained for settle_s returns True."""

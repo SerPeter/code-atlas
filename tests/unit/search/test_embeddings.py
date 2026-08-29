@@ -281,8 +281,14 @@ class TestEmbedClient:
         ):
             await client.embed_one("test")
 
-    async def test_embed_transient_error_retries_then_succeeds(self):
-        """A transient provider error (rate limit) is retried, not raised immediately."""
+    async def test_embed_transient_error_retries_then_succeeds(self, no_retry_backoff):
+        """A transient provider error (rate limit) is retried, not raised immediately.
+
+        The backoff is zeroed, not the policy: two real retries at the shipped
+        wait_exponential(min=1) cost 3.02s of sleeping, and the attempt count and retry
+        predicate -- the parts actually under test -- are untouched by dropping it.
+        """
+        no_retry_backoff(EmbedClient._embed_call)
         client = EmbedClient(_make_settings())
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1, 0.2, 0.3])])
 

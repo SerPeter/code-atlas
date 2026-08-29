@@ -397,7 +397,9 @@ class TestPipelineDurabilityIntegration:
         await graph_client.ensure_schema()
         project_name = derive_project_name(tmp_path)
 
-        # settle_s=2.0 inside the pipeline makes draining within 0.01s impossible
+        # The pipeline's drain settle window (_DRAIN_SETTLE_S, shrunk to 0.1s for this
+        # suite) still makes draining within 0.01s impossible -- a 10x margin, not the
+        # 200x the unpatched 2.0s gave. Raise drain_timeout_s here if that ever tightens.
         r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=0.01)
 
         assert r1.drained is False

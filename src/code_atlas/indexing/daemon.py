@@ -40,6 +40,16 @@ if TYPE_CHECKING:
 # Slow enough to be free, fast enough to see a stall inside a minute.
 _BACKLOG_SAMPLE_S = 15.0
 
+# Restart backoff for the three supervised loops (watcher, consumer, vault watcher):
+# first pause after a crash, doubling to the cap, reset once a run has been healthy for
+# a while. Named rather than left as a local `backoff = 1.0` in each loop so tests can
+# shrink it -- as locals they were unpatchable, and the three crash-restart tests each
+# paid the full second.
+_RESTART_BACKOFF_S = 1.0
+_RESTART_BACKOFF_MAX_S = 60.0
+# How long a run must survive before its next crash is treated as unrelated.
+_RESTART_HEALTHY_S = 60.0
+
 # Startup catch-up waits for the indexer lease, but on a much shorter leash than a
 # foreground `atlas index`. The reason to wait at all is a holder that is already dead:
 # its lease expires within INDEXER_LEASE_TTL_MS (60s), so a little over a minute covers
@@ -389,7 +399,7 @@ class DaemonManager:
         watcher = self._watcher
         if watcher is None:  # pragma: no cover — spawned only when a watcher was built
             return
-        backoff = 1.0
+        backoff = _RESTART_BACKOFF_S
         while not watcher.stopped:
             started = asyncio.get_running_loop().time()
             try:
@@ -400,10 +410,10 @@ class DaemonManager:
                 self._crash_counts["watcher"] = self._crash_counts.get("watcher", 0) + 1
                 self._last_crash["watcher"] = repr(exc)
                 logger.exception("File watcher crashed — restarting in {:.0f}s", backoff)
-                if asyncio.get_running_loop().time() - started > 60.0:
-                    backoff = 1.0  # healthy for a while before this crash — reset
+                if asyncio.get_running_loop().time() - started > _RESTART_HEALTHY_S:
+                    backoff = _RESTART_BACKOFF_S  # healthy for a while before this crash — reset
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                backoff = min(backoff * 2, _RESTART_BACKOFF_MAX_S)
             else:
                 return  # clean exit via stop()
 
@@ -413,7 +423,7 @@ class DaemonManager:
         ``run()`` re-runs ``ensure_group()`` at its top, so a Valkey restart
         that lost the consumer group (NOGROUP) heals on the first restart.
         """
-        backoff = 1.0
+        backoff = _RESTART_BACKOFF_S
         while not consumer.stopped:
             started = asyncio.get_running_loop().time()
             try:
@@ -424,10 +434,10 @@ class DaemonManager:
                 self._crash_counts[consumer.consumer_name] = self._crash_counts.get(consumer.consumer_name, 0) + 1
                 self._last_crash[consumer.consumer_name] = repr(exc)
                 logger.exception("Consumer {} crashed — restarting in {:.0f}s", consumer.consumer_name, backoff)
-                if asyncio.get_running_loop().time() - started > 60.0:
-                    backoff = 1.0  # healthy for a while before this crash — reset
+                if asyncio.get_running_loop().time() - started > _RESTART_HEALTHY_S:
+                    backoff = _RESTART_BACKOFF_S  # healthy for a while before this crash — reset
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                backoff = min(backoff * 2, _RESTART_BACKOFF_MAX_S)
             else:
                 return  # clean exit via stop()
 
@@ -470,7 +480,7 @@ class DaemonManager:
     async def _run_vault_watcher(self, label: str, watcher: FileWatcher) -> None:
         """Run one extra vault's FileWatcher under supervision: crash → log + backoff restart."""
         crash_key = f"vault:{label}"
-        backoff = 1.0
+        backoff = _RESTART_BACKOFF_S
         while not watcher.stopped:
             started = asyncio.get_running_loop().time()
             try:
@@ -481,9 +491,9 @@ class DaemonManager:
                 self._crash_counts[crash_key] = self._crash_counts.get(crash_key, 0) + 1
                 self._last_crash[crash_key] = repr(exc)
                 logger.exception("Vault watcher '{}' crashed — restarting in {:.0f}s", label, backoff)
-                if asyncio.get_running_loop().time() - started > 60.0:
-                    backoff = 1.0  # healthy for a while before this crash — reset
+                if asyncio.get_running_loop().time() - started > _RESTART_HEALTHY_S:
+                    backoff = _RESTART_BACKOFF_S  # healthy for a while before this crash — reset
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                backoff = min(backoff * 2, _RESTART_BACKOFF_MAX_S)
             else:
                 return  # clean exit via stop()

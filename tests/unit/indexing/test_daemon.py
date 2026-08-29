@@ -117,6 +117,19 @@ class FakeBus:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _fast_restart_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the supervised-restart pause so the crash tests do not sit through it.
+
+    All three supervised loops wait `_RESTART_BACKOFF_S` (1s) before restarting a crashed
+    watcher or consumer, and each of the three crash-restart tests paid it in full --
+    measured at 1.03s, 1.02s and 1.01s. What they assert is that a crash is counted and
+    the loop comes back, never how long it pauses first, so a smaller pause cannot make
+    them vacuous. Autouse at module scope because every restart path in this file wants it.
+    """
+    monkeypatch.setattr("code_atlas.indexing.daemon._RESTART_BACKOFF_S", 0.01)
+
+
 class TestConsumerSupervision:
     """Consumer tasks are supervised: crash → recorded + backoff restart."""
 

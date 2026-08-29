@@ -145,6 +145,12 @@ _ABANDONED_MIN_IDLE_MS = 120_000
 # and it is the work you compare when asking which stage the time went into.
 _STAGE_BY_TOPIC = {Topic.FILE_CHANGED: "ast", Topic.EMBED_DIRTY: "embed"}
 
+# The AST consumer's default batch window. Also sets the blocking read: block_ms is
+# max(100, time_window_s * 1000 // 2), so 3.0s here means every XREADGROUP blocks 1.5s.
+# Named so the integration suite can shrink it. Do NOT shrink it to 0 -- `is_reindex`
+# below tests `time_window_s == 0` and zero silently switches the resolution cadence.
+_AST_WINDOW_S = 3.0
+
 # How often a paused consumer re-checks whether the foreign lease has been released.
 _LEASE_POLL_S = 1.0
 
@@ -729,7 +735,7 @@ class ASTConsumer(TierConsumer):
             input_topic=Topic.FILE_CHANGED,
             group="ast",
             consumer_name=f"ast-{_process_tag()}",
-            policy=policy or BatchPolicy(time_window_s=3.0, max_batch_size=30),
+            policy=policy or BatchPolicy(time_window_s=_AST_WINDOW_S, max_batch_size=30),
             project_filter=project_filter,
             defer_to_lease=defer_to_lease,
             lease_owner=lease_owner,

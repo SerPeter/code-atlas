@@ -165,6 +165,11 @@ class AppContext:
 
 _ROOTS_TIMEOUT = 2.0  # seconds — fast fail for broken/missing clients
 
+# Named rather than inlined at the call site so a test can shrink it. As a literal it was
+# unpatchable, and the two tests that exercise the timeout branch had no choice but to sit
+# through the real five seconds -- a third of that suite's runtime in two tests.
+_STALENESS_TIMEOUT_S = 5.0
+
 
 def _file_uri_to_path(uri: str) -> Path:
     """Convert a ``file://`` URI to a local :class:`Path` (cross-platform)."""
@@ -591,7 +596,7 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
     try:
         info = await asyncio.wait_for(
             checker.check(app.graph, include_changed=(stale_mode == "warn")),
-            timeout=5.0,
+            timeout=_STALENESS_TIMEOUT_S,
         )
     except TimeoutError, QueryTimeoutError:
         logger.warning("Staleness check timed out")
