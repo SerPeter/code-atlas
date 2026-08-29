@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+
+import time_machine
 
 from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.events import FileChanged, Topic, decode_event
@@ -239,3 +242,82 @@ class TestStreamGroupInfo:
             await bus.stream_group_info(Topic.EMBED_DIRTY, "embed"),
         ]
         await bus.close()
+
+
+class TestIndexerLeaseExpiry:
+    """A lease outliving its holder is the whole reason the TTL exists.
+
+    Every recovery path in the system rests on this: the daemon's catch-up waits 90s
+    because a dead holder's lease expires inside 60, `atlas index` waits rather than
+    skipping, and --force exists only for the window before expiry. None of it was
+    covered, because covering it meant a test that sleeps for a minute.
+
+    time-machine moves the clock instead. The lease is real and the SQLite row is real;
+    only `time.time()` is a fiction.
+    """
+
+    @staticmethod
+    def _bus(tmp_path: Path) -> SqliteEventBus:
+        return SqliteEventBus(tmp_path / "queue.sqlite3")
+
+    async def test_a_live_lease_blocks_a_second_holder(self, tmp_path: Path) -> None:
+        bus = self._bus(tmp_path)
+        try:
+            assert await bus.acquire_indexer_lease("first", 60_000) is True
+            assert await bus.acquire_indexer_lease("second", 60_000) is False
+            assert await bus.read_indexer_lease() == "first"
+        finally:
+            await bus.close()
+
+    async def test_an_expired_lease_passes_to_the_next_taker(self, tmp_path: Path) -> None:
+        """The dead-holder case: without it the 60s TTL was an untested assumption that
+        three separate waiting strategies had been built on top of."""
+        bus = self._bus(tmp_path)
+        try:
+            assert await bus.acquire_indexer_lease("dead-holder", 60_000) is True
+
+            with time_machine.travel(datetime.now(UTC) + timedelta(seconds=61), tick=False):
+                assert await bus.read_indexer_lease() is None, "an expired lease must read as free"
+                assert await bus.acquire_indexer_lease("next", 60_000) is True
+                assert await bus.read_indexer_lease() == "next"
+        finally:
+            await bus.close()
+
+    async def test_a_lease_just_short_of_expiry_still_holds(self, tmp_path: Path) -> None:
+        """The other side of the boundary, so the test above cannot pass by the TTL being
+        ignored altogether."""
+        bus = self._bus(tmp_path)
+        try:
+            assert await bus.acquire_indexer_lease("holder", 60_000) is True
+
+            with time_machine.travel(datetime.now(UTC) + timedelta(seconds=59), tick=False):
+                assert await bus.acquire_indexer_lease("interloper", 60_000) is False
+                assert await bus.read_indexer_lease() == "holder"
+        finally:
+            await bus.close()
+
+    async def test_renewal_pushes_the_expiry_out(self, tmp_path: Path) -> None:
+        bus = self._bus(tmp_path)
+        try:
+            await bus.acquire_indexer_lease("holder", 60_000)
+
+            with time_machine.travel(datetime.now(UTC) + timedelta(seconds=30), tick=False):
+                assert await bus.renew_indexer_lease("holder", 60_000) is True
+
+            # 61s after the original take, but only 31s after the renewal.
+            with time_machine.travel(datetime.now(UTC) + timedelta(seconds=61), tick=False):
+                assert await bus.acquire_indexer_lease("interloper", 60_000) is False
+                assert await bus.read_indexer_lease() == "holder"
+        finally:
+            await bus.close()
+
+    async def test_renewal_by_a_stranger_is_refused(self, tmp_path: Path) -> None:
+        """Compare-and-set: a process that stalled past its TTL must not renew a lease
+        that has since passed to someone else."""
+        bus = self._bus(tmp_path)
+        try:
+            await bus.acquire_indexer_lease("holder", 60_000)
+            assert await bus.renew_indexer_lease("stranger", 60_000) is False
+            assert await bus.read_indexer_lease() == "holder"
+        finally:
+            await bus.close()
