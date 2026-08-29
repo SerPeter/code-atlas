@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from code_atlas.backends import create_event_bus
 from code_atlas.events import EventBus, IndexerBusyError, Topic, hold_indexer_lease
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
@@ -103,6 +102,7 @@ class DaemonManager:
         self,
         settings: AtlasSettings,
         graph: GraphClient,
+        bus: EventBus,
         *,
         include_watcher: bool = True,
         catchup: bool = True,
@@ -111,8 +111,11 @@ class DaemonManager:
     ) -> bool:
         """Try to start watcher + pipeline.
 
-        Returns ``False`` if Valkey is unreachable (graceful degradation).
-        The caller-owned *graph* is shared — **not** closed by this manager.
+        Returns ``False`` if the queue backend is unreachable (graceful degradation).
+        Both *graph* and *bus* are caller-owned and shared — **not** closed by this
+        manager. It used to build its own bus while being handed a graph, which left
+        ownership split down the middle of one object: the caller closed half of what
+        this used and the manager closed the other, and neither could see the whole.
 
         Parameters
         ----------
@@ -138,16 +141,13 @@ class DaemonManager:
             keeps its lease for the whole session rather than releasing it after
             the pass.
         """
-        # Declared type stays EventBus (the network backend) — SqliteEventBus is a
-        # structurally-compatible fallback, but full retyping of every downstream
-        # consumer/watcher signature to the union is an explicitly deferred,
-        # mechanical follow-up (see backends/__init__.py factory docstring).
-        bus: EventBus = await create_event_bus(settings)  # type: ignore[invalid-assignment]
         try:
             await bus.ping()
         except Exception:
-            logger.warning("Valkey unavailable — running without auto-indexing")
-            await bus.close()
+            # Not closed here: the caller opened it and will close it. Reporting the
+            # degradation is this manager's job; disposing of someone else's connection
+            # is not.
+            logger.warning("Queue backend unavailable — running without auto-indexing")
             return False
 
         self._bus = bus
@@ -389,9 +389,8 @@ class DaemonManager:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-        if self._bus is not None:
-            await self._bus.close()
-
+        # The bus is deliberately not closed: it is the caller's, and closing it here
+        # once meant a restart_daemon() left the MCP server holding a dead connection.
         logger.debug("DaemonManager stopped")
 
     async def _run_watcher(self) -> None:

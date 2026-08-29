@@ -75,7 +75,7 @@ async def test_consumer_restarts_after_group_destroyed(
     await graph_client.ensure_schema()
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=False)
+    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=False)
     assert started is True
     try:
         bus = daemon._bus
@@ -142,7 +142,7 @@ async def test_daemon_start_runs_catchup_delta(
     _write_python_file(settings.project_root, "added_later.py", "def beta():\n    return 42\n")
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=True)
+    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=True)
     assert started is True
     try:
         # Catch-up is awaited inside start(): the new file's entities must
@@ -183,7 +183,7 @@ async def test_daemon_indexes_extra_vault(
     settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=True)
+    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=True)
     assert started is True
     try:
         rows = await _wait_for_rows(
@@ -217,7 +217,7 @@ async def test_daemon_live_watches_extra_vault(
     settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, include_watcher=False, catchup=True)
+    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=True)
     assert started is True
     try:
         assert len(daemon._vault_watchers) == 1

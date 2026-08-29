@@ -296,7 +296,12 @@ class TestStartupCatchup:
 
     async def test_catchup_runs_before_consumers(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
         manager = DaemonManager()
-        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False)  # type: ignore[arg-type]
+        started = await manager.start(
+            _make_settings(tmp_path),
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+        )
         assert started is True
         await asyncio.sleep(0.05)
 
@@ -316,7 +321,12 @@ class TestStartupCatchup:
         settings.index.drain_timeout_s = 3600.0
 
         manager = DaemonManager()
-        started = await manager.start(settings, object(), include_watcher=False)  # type: ignore[arg-type]
+        started = await manager.start(
+            settings,
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+        )
         assert started is True
         await asyncio.sleep(0.05)
 
@@ -326,7 +336,13 @@ class TestStartupCatchup:
 
     async def test_catchup_false_skips_index(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
         manager = DaemonManager()
-        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False, catchup=False)  # type: ignore[arg-type]
+        started = await manager.start(
+            _make_settings(tmp_path),
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+            catchup=False,
+        )
         assert started is True
         await asyncio.sleep(0.05)
 
@@ -337,7 +353,12 @@ class TestStartupCatchup:
     async def test_catchup_routes_monorepo(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
         patched_daemon["monorepo"] = True
         manager = DaemonManager()
-        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False)  # type: ignore[arg-type]
+        started = await manager.start(
+            _make_settings(tmp_path),
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+        )
         assert started is True
 
         assert patched_daemon["order"][0] == "catchup-monorepo"
@@ -347,7 +368,12 @@ class TestStartupCatchup:
     async def test_catchup_failure_is_non_fatal(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
         patched_daemon["fail_catchup"] = True
         manager = DaemonManager()
-        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False)  # type: ignore[arg-type]
+        started = await manager.start(
+            _make_settings(tmp_path),
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+        )
         assert started is True
         await asyncio.sleep(0.05)
 
@@ -359,7 +385,12 @@ class TestStartupCatchup:
     async def test_catchup_holds_and_releases_lease(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
         """A successful catch-up must not leave the lease held afterwards."""
         manager = DaemonManager()
-        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False)  # type: ignore[arg-type]
+        started = await manager.start(
+            _make_settings(tmp_path),
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+        )
         assert started is True
         await asyncio.sleep(0.05)
 
@@ -380,8 +411,6 @@ class TestStartupCatchup:
                 super().__init__(settings, project_name=project_name)
                 self._lease_holder = "peer-host:999:deadbeef"
 
-        monkeypatch.setattr("code_atlas.backends.EventBus", BusyFakeBus)
-
         # Zero, so the skip is immediate. With the default this test waited out the whole
         # lease budget -- it still passed, and the unit suite silently went from ~60s to
         # ~620s. A test that waits for a timeout is not testing the timeout; the bound
@@ -396,7 +425,12 @@ class TestStartupCatchup:
         # catch-up gained a lease wait, this test quietly took the entire budget and
         # still passed. A tight bound turns that into a failure in seconds.
         started = await asyncio.wait_for(
-            manager.start(settings, object(), include_watcher=False),  # type: ignore[arg-type]
+            manager.start(
+                settings,
+                object(),  # type: ignore[invalid-argument-type]
+                BusyFakeBus(settings),  # type: ignore[invalid-argument-type]
+                include_watcher=False,
+            ),  # type: ignore[arg-type]
             timeout=5.0,
         )
         assert started is True
@@ -439,7 +473,12 @@ class TestStartupCatchup:
         monkeypatch.setattr("code_atlas.indexing.daemon.hold_indexer_lease", spy_lease)
 
         manager = DaemonManager()
-        await manager.start(settings, object(), include_watcher=False)  # type: ignore[arg-type]
+        await manager.start(
+            settings,
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+        )
         await manager.stop()
 
         assert captured["wait_s"] == _CATCHUP_LEASE_WAIT_S
@@ -515,6 +554,7 @@ class TestWatcherScopeScan:
         started = await manager.start(
             _make_settings(tmp_path),
             object(),  # type: ignore[arg-type]
+            FakeBus(_make_settings(tmp_path)),  # type: ignore[arg-type]
             include_watcher=True,
             catchup=False,
         )
@@ -586,7 +626,13 @@ class TestVaultTaskSpawning:
         settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
 
         manager = DaemonManager()
-        started = await manager.start(settings, object(), include_watcher=False, catchup=True)  # type: ignore[arg-type]
+        started = await manager.start(
+            settings,
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+            catchup=True,
+        )
         assert started is True
         await asyncio.sleep(0.05)
 
@@ -605,7 +651,13 @@ class TestVaultTaskSpawning:
         ]
 
         manager = DaemonManager()
-        started = await manager.start(settings, object(), include_watcher=False, catchup=True)  # type: ignore[arg-type]
+        started = await manager.start(
+            settings,
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+            catchup=True,
+        )
         assert started is True
         assert manager._vault_watchers == []
         await manager.stop()
@@ -649,7 +701,13 @@ class TestVaultStartupIsolation:
         ]
 
         manager = DaemonManager()
-        started = await manager.start(settings, object(), include_watcher=False, catchup=True)  # type: ignore[arg-type]
+        started = await manager.start(
+            settings,
+            object(),  # type: ignore[invalid-argument-type]
+            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            include_watcher=False,
+            catchup=True,
+        )
         assert started is True
 
         # The bad vault must not have produced a watcher; the good vault still gets one.
@@ -678,7 +736,7 @@ class TestDaemonCliWiring:
                 return None
 
         class FakeDaemon:
-            async def start(self, settings: object, graph: object, **kwargs: object) -> bool:
+            async def start(self, settings: object, graph: object, bus: object, **kwargs: object) -> bool:
                 captured.update(kwargs)
                 return False  # short-circuit _run_daemon after capturing
 

@@ -17,10 +17,10 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-async def app_ctx(graph_client, settings):
+async def app_ctx(graph_client, event_bus, settings):
     """Create an AppContext for testing tools directly."""
     embed = EmbedClient(settings.embeddings)
-    return AppContext(graph=graph_client, settings=settings, embed=embed)
+    return AppContext(graph=graph_client, bus=event_bus, settings=settings, embed=embed)
 
 
 @pytest.fixture

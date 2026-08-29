@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import pytest
 from typer.testing import CliRunner
 
-from code_atlas.backends import create_graph_client
+from code_atlas.backends import create_event_bus, create_graph_client
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.cli import app
 from code_atlas.server.mcp import AppContext, create_mcp_server
@@ -161,14 +161,19 @@ async def app_ctx(embedded_settings: AtlasSettings) -> AsyncIterator[AppContext]
     graph = await create_graph_client(embedded_settings)
     assert isinstance(graph, SqliteGraphClient)
     await graph.ping()
+    # A real embedded bus, not a mock: this fixture exists to prove the sqlite backends
+    # work as a pair, and a mocked half would be exactly the wrong thing to assert on.
+    bus = await create_event_bus(embedded_settings)
     try:
         yield AppContext(
+            bus=bus,  # type: ignore[invalid-argument-type]
             graph=graph,  # type: ignore[invalid-argument-type]
             settings=embedded_settings,
             embed=None,
             vector_enabled=False,
         )
     finally:
+        await bus.close()
         await graph.close()
 
 

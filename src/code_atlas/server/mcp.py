@@ -15,7 +15,7 @@ import time
 import tomllib
 import urllib.parse
 import urllib.request
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -25,7 +25,7 @@ from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
-from code_atlas.backends import create_graph_client, graph_backend_label
+from code_atlas.backends import graph_backend_label, use_backends
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.dream import VaultRoot, build_dream_report, report_to_dict
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
@@ -83,6 +83,8 @@ from code_atlas.telemetry import get_metrics, get_tracer, init_telemetry, mark_s
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
+
+    from code_atlas.events import EventBus
 
 _tracer = get_tracer(__name__)
 
@@ -148,6 +150,11 @@ def _ready_event() -> asyncio.Event:
 @dataclass
 class AppContext:
     graph: GraphClient
+    #: Owned by the lifespan, shared with the daemon and the health check. Held here
+    #: rather than reached for through `daemon.bus`, which is None whenever indexing is
+    #: off and left the health check opening a second connection to answer "are you
+    #: reachable".
+    bus: EventBus
     settings: AtlasSettings
     embed: EmbedClient | None
     staleness: StalenessChecker | None = None
@@ -234,7 +241,7 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
             )
             app.vector_enabled = False
 
-    started = await app.daemon.start(app.settings, app.graph)
+    started = await app.daemon.start(app.settings, app.graph, app.bus)
     if started:
         logger.info("Daemon restarted for new root: {}", new_root)
     else:
@@ -751,11 +758,15 @@ def create_mcp_server(  # noqa: PLR0915
         # is a structurally-compatible fallback, but full retyping of every
         # downstream signature to the union is an explicitly deferred, mechanical
         # follow-up (see backends/__init__.py factory docstring).
-        graph: GraphClient = await create_graph_client(settings)  # type: ignore[invalid-assignment]
+        stack = AsyncExitStack()
+        backends = await stack.enter_async_context(use_backends(settings))
+        graph: GraphClient = backends.graph  # type: ignore[invalid-assignment]
+        bus: EventBus = backends.bus  # type: ignore[invalid-assignment]
         try:
             await graph.ping()
         except Exception as exc:
             logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
+            await stack.aclose()
             raise
 
         logger.info("MCP connected to {}", graph_backend_label(graph, settings))
@@ -825,6 +836,7 @@ def create_mcp_server(  # noqa: PLR0915
         _BACKEND_NOTE = _backend_note(graph)
         app_ctx = AppContext(
             graph=graph,
+            bus=bus,
             settings=settings,
             embed=embed,
             staleness=staleness,
@@ -860,6 +872,7 @@ def create_mcp_server(  # noqa: PLR0915
             daemon,
             settings,
             graph,
+            bus,
             catchup=catchup,
             auto_index=auto_index,
             first_index_ready=first_index_ready,
@@ -873,7 +886,7 @@ def create_mcp_server(  # noqa: PLR0915
                 with contextlib.suppress(asyncio.CancelledError):
                     await daemon_start_task
             await app_ctx.daemon.stop()
-            await graph.close()
+            await stack.aclose()
             shutdown_telemetry()
             logger.info("MCP server shut down")
 
@@ -1045,6 +1058,7 @@ def _spawn_indexing(
     daemon: DaemonManager,
     settings: AtlasSettings,
     graph: GraphClient,
+    bus: EventBus,
     *,
     catchup: bool,
     auto_index: bool,
@@ -1066,7 +1080,7 @@ def _spawn_indexing(
         return None
 
     task = asyncio.get_running_loop().create_task(
-        daemon.start(settings, graph, catchup=catchup, first_index_ready=first_index_ready)
+        daemon.start(settings, graph, bus, catchup=catchup, first_index_ready=first_index_ready)
     )
 
     def _on_daemon_started(finished: asyncio.Task) -> None:

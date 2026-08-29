@@ -275,7 +275,7 @@ class TestVectorSearchMock:
         """Vector search returns EMBED_ERROR when TEI is unavailable."""
         graph = GraphClient(settings)
         embed = EmbedClient(settings.embeddings)
-        app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
+        app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         patch_target = "code_atlas.search.embeddings.litellm.aembedding"
         with patch(patch_target, new_callable=AsyncMock, side_effect=Exception("down")):
@@ -288,7 +288,7 @@ class TestVectorSearchMock:
         mock_vector = [0.1] * (settings.embeddings.dimension or 768)
         graph = GraphClient(settings)
         embed = EmbedClient(settings.embeddings)
-        app_ctx = AppContext(graph=graph, settings=settings, embed=embed)
+        app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=mock_vector) as mock_embed:
             result = await _invoke_tool(app_ctx, "vector_search", query="test query")
@@ -312,7 +312,7 @@ class TestSearchLabelValidation:
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock()
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "text_search", query="x", label=_MALICIOUS_LABEL)
         assert "error" in result
@@ -323,7 +323,7 @@ class TestSearchLabelValidation:
         graph = AsyncMock(spec=GraphClient)
         graph.vector_search = AsyncMock()
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed, vector_enabled=True)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, vector_enabled=True)
 
         result = await _invoke_tool(app, "vector_search", query="x", label=_MALICIOUS_LABEL)
         assert "error" in result
@@ -335,7 +335,7 @@ class TestSearchLabelValidation:
         graph.text_search = AsyncMock(return_value=[])
         graph.batch_call_stats = AsyncMock(return_value={})
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "text_search", query="x", label="Callable")
         assert "error" not in result
@@ -356,7 +356,7 @@ class TestDefaultScopeProjects:
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(side_effect=RuntimeError("db down"))
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         root_name = derive_project_name(settings.project_root)
         result = await _default_scope_projects(app)
@@ -376,7 +376,7 @@ class TestDefaultScopeProjects:
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=rows)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _default_scope_projects(app)
         assert set(result) == {root_name, f"{root_name}/sub"}
@@ -388,7 +388,7 @@ class TestDefaultScopeProjects:
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=[{"n": {"name": root_name}}])
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _default_scope_projects(app)
         assert result == [root_name]
@@ -411,7 +411,7 @@ class TestDefaultScopeProjects:
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=rows)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _default_scope_projects(app)
         assert result == [root_name, f"{root_name}/sub", "global-vault"]
@@ -428,7 +428,7 @@ class TestDefaultScopeProjects:
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(side_effect=RuntimeError("db down"))
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _default_scope_projects(app)
         assert result == [root_name, "global-vault"]
@@ -444,7 +444,7 @@ class TestHybridSearchValidation:
         """An unknown channel name must return a clean error envelope, not raise ValueError."""
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "hybrid_search", query="foo", search_types="bogus_channel")
         assert "error" in result
@@ -454,7 +454,7 @@ class TestHybridSearchValidation:
         """Valid JSON that isn't an object (e.g. a list) must be rejected cleanly."""
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "hybrid_search", query="foo", weights="[1, 2, 3]")
         assert "error" in result
@@ -474,7 +474,7 @@ class TestResolveHybridScopeZeroMatch:
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "libs-shared"}}])
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         resolved = await _resolve_hybrid_scope(app, "totally-nonexistent-*")
         assert resolved is None
@@ -485,7 +485,7 @@ class TestResolveHybridScopeZeroMatch:
             return_value=[{"n": {"name": "libs-shared"}}, {"n": {"name": "libs-other"}}]
         )
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         resolved = await _resolve_hybrid_scope(app, "libs-*")
         assert resolved == "libs-shared,libs-other"
@@ -498,7 +498,7 @@ class TestHybridSearchZeroMatchScope:
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "libs-shared"}}])
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         with patch("code_atlas.server.mcp._hybrid_search", new_callable=AsyncMock) as fake_search:
             result = await _invoke_tool(app, "hybrid_search", query="foo", scope="totally-nonexistent-*")
@@ -535,7 +535,7 @@ class TestTruncatedField:
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock(side_effect=_fake_text_search)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["count"] == 20
@@ -555,7 +555,7 @@ class TestTruncatedField:
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock(side_effect=_fake_text_search)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["count"] == 5
@@ -570,7 +570,7 @@ class TestTruncatedField:
         graph = AsyncMock(spec=GraphClient)
         graph.vector_search = AsyncMock(side_effect=_fake_vector_search)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed, vector_enabled=True)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, vector_enabled=True)
 
         with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=[0.1] * 768):
             result = await _invoke_tool(app, "vector_search", query="e", limit=20)
@@ -607,7 +607,7 @@ class TestTruncatedField:
 
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
             result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
@@ -644,7 +644,7 @@ class TestTruncatedField:
 
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
             result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
@@ -667,7 +667,7 @@ class TestTruncatedField:
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock(side_effect=_fake_text_search)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["truncated"]["cut"] is None, "a fetch-bounded count must not be reported as `cut`"
@@ -745,7 +745,7 @@ class TestCypherQueryWriteKeywordGuard:
         graph = AsyncMock(spec=GraphClient)
         graph.execute = AsyncMock(return_value=[{"name": "set"}])
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "cypher_query", query="MATCH (n) WHERE n.name = 'set' RETURN n.name AS name")
         assert "error" not in result
@@ -754,7 +754,7 @@ class TestCypherQueryWriteKeywordGuard:
     async def test_still_rejects_unquoted_write_keyword(self, settings):
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
         result = await _invoke_tool(app, "cypher_query", query="MATCH (n) WHERE n.name = 'x' SET n.name = 'y'")
         assert result["code"] == "WRITE_REJECTED"
@@ -772,7 +772,7 @@ class TestCypherToolsSqliteBackendGuard:
     async def test_cypher_query_returns_unsupported_backend_error(self, settings, tmp_path):
         graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
 
         result = await _invoke_tool(app, "cypher_query", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
@@ -783,7 +783,7 @@ class TestCypherToolsSqliteBackendGuard:
     async def test_validate_cypher_skips_explain_with_info_issue_not_crash(self, settings, tmp_path):
         graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
 
         result = await _invoke_tool(app, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
@@ -857,7 +857,7 @@ class TestWithStaleness:
         mock_graph.get_project_git_hash = AsyncMock(return_value="abc123")
 
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
 
         # Patch checker.check to return a known StalenessInfo
         with patch.object(
@@ -874,7 +874,7 @@ class TestWithStaleness:
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
 
         result = {"results": []}
         annotated = await _with_staleness(app, result, scope="other_project")
@@ -888,7 +888,7 @@ class TestWithStaleness:
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
 
         # Simulate never-indexed: stale=True but no last_indexed_commit
         with patch.object(
@@ -909,7 +909,7 @@ class TestWithStaleness:
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
 
         with patch.object(
             checker,
@@ -930,7 +930,7 @@ class TestWithStaleness:
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
 
         with patch.object(
             checker,
@@ -957,7 +957,7 @@ class TestWithStaleness:
         lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(graph=AsyncMock(), settings=lock_settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=AsyncMock(), settings=lock_settings, embed=embed, staleness=checker)
 
         async def _slow_check(*_args, **_kwargs):
             await asyncio.sleep(60)
@@ -986,7 +986,7 @@ class TestWithStaleness:
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=ignore_settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=ignore_settings, embed=embed, staleness=checker)
 
         with patch.object(checker, "check", new_callable=AsyncMock) as mock_check:
             result = {"results": []}
@@ -1010,7 +1010,7 @@ class TestWithStaleness:
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
 
         async def _slow_check(*_args, **_kwargs):
             await asyncio.sleep(60)
@@ -1032,7 +1032,7 @@ class TestWithStaleness:
         checker = StalenessChecker(settings.project_root, project_name="myproject")
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
 
         with patch.object(checker, "check", side_effect=QueryTimeoutError(5.0, "get_project_git_hash")):
             result = {"results": [{"uid": "test:foo"}]}
@@ -1089,7 +1089,7 @@ class TestMaybeUpdateRoot:
         """roots_checked=True → no-op, no session access."""
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=settings, embed=embed, roots_checked=True)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, roots_checked=True)
         ctx = MagicMock()
         await _maybe_update_root(app, ctx)
         # Should not have touched session at all
@@ -1100,7 +1100,7 @@ class TestMaybeUpdateRoot:
         """list_roots() times out → keeps current root."""
         embed = EmbedClient(settings.embeddings)
         mock_graph = AsyncMock()
-        app = AppContext(graph=mock_graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed)
         ctx = MagicMock()
         # Simulate a timeout on list_roots
         ctx.session.list_roots = AsyncMock(side_effect=TimeoutError)
@@ -1120,6 +1120,7 @@ class TestMaybeUpdateRoot:
         old_daemon = AsyncMock()
         old_daemon.stop = AsyncMock()
         app = AppContext(
+            bus=AsyncMock(),
             graph=mock_graph,
             settings=settings,
             embed=embed,
@@ -1158,6 +1159,7 @@ class TestMaybeUpdateRoot:
         old_daemon = AsyncMock()
         old_daemon.stop = AsyncMock()
         app = AppContext(
+            bus=AsyncMock(),
             graph=mock_graph,
             settings=settings,
             embed=embed,
@@ -1221,7 +1223,7 @@ class TestQueryTimeout:
             side_effect=QueryTimeoutError(10.0, "get_project_dependency_edges")
         )
         embed = EmbedClient(settings.embeddings)
-        return AppContext(graph=mock_graph, settings=settings, embed=embed)
+        return AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed)
 
     async def test_get_node_timeout(self, timeout_app):
         result = await _invoke_tool(timeout_app, "get_node", name="Foo")
@@ -1406,6 +1408,25 @@ class _FakeDaemonManager:
         self.stop = AsyncMock()
 
 
+def _stub_backends(monkeypatch, graph):
+    """Stub the one scope the lifespan opens, rather than the factory it used to call.
+
+    The lifespan takes its graph and bus from a single `use_backends` context now, so
+    patching `create_graph_client` no longer intercepts anything -- it is not imported
+    there any more, and monkeypatch fails loudly rather than silently passing, which is
+    how these four tests caught the change.
+    """
+    import contextlib
+
+    from code_atlas.backends import Backends
+
+    @contextlib.asynccontextmanager
+    async def fake_scope(_settings, **_kw):
+        yield Backends(graph=graph, bus=AsyncMock())
+
+    monkeypatch.setattr("code_atlas.server.mcp.use_backends", fake_scope)
+
+
 class TestAppLifespanNeedsFirstIndex:
     """needs_first_index/first_index_ready computed in app_lifespan (mcp.py)."""
 
@@ -1414,7 +1435,7 @@ class TestAppLifespanNeedsFirstIndex:
 
         settings.embeddings.enabled = False
         graph = _FakeSchemaGraph(initial_version=SCHEMA_VERSION)
-        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        _stub_backends(monkeypatch, graph)
         monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
 
         mcp = create_mcp_server(settings, catchup=False)
@@ -1429,7 +1450,7 @@ class TestAppLifespanNeedsFirstIndex:
 
         settings.embeddings.enabled = False
         graph = _FakeSchemaGraph(initial_version=None)
-        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        _stub_backends(monkeypatch, graph)
         monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
 
         mcp = create_mcp_server(settings, catchup=False)
@@ -1451,7 +1472,7 @@ class TestFindCommunitiesBackendVisibility:
 
         settings.embeddings.enabled = False
         graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
-        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        _stub_backends(monkeypatch, graph)
         monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
 
         mcp = create_mcp_server(settings, catchup=False)
@@ -1467,7 +1488,7 @@ class TestFindCommunitiesBackendVisibility:
 
         settings.embeddings.enabled = False
         graph = _FakeSchemaGraph(initial_version=SCHEMA_VERSION)
-        monkeypatch.setattr("code_atlas.server.mcp.create_graph_client", AsyncMock(return_value=graph))
+        _stub_backends(monkeypatch, graph)
         monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
 
         mcp = create_mcp_server(settings, catchup=False)
@@ -1487,7 +1508,14 @@ class TestEnsureRootGate:
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
         ready = asyncio.Event()
-        app = AppContext(graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=ready)
+        app = AppContext(
+            bus=AsyncMock(),
+            graph=graph,
+            settings=settings,
+            embed=embed,
+            needs_first_index=True,
+            first_index_ready=ready,
+        )
         ctx = _FakeCtx(app)
 
         async def _unblock_shortly():
@@ -1506,7 +1534,12 @@ class TestEnsureRootGate:
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
         app = AppContext(
-            graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=asyncio.Event()
+            bus=AsyncMock(),
+            graph=graph,
+            settings=settings,
+            embed=embed,
+            needs_first_index=True,
+            first_index_ready=asyncio.Event(),
         )
         ctx = _FakeCtx(app)
 
@@ -1519,7 +1552,12 @@ class TestEnsureRootGate:
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
         app = AppContext(
-            graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=asyncio.Event()
+            bus=AsyncMock(),
+            graph=graph,
+            settings=settings,
+            embed=embed,
+            needs_first_index=True,
+            first_index_ready=asyncio.Event(),
         )
         ctx = _FakeCtx(app)
 
@@ -1536,7 +1574,12 @@ class TestGatedToolsSurfaceIndexRequired:
         graph = AsyncMock(spec=GraphClient)
         embed = EmbedClient(settings.embeddings)
         app = AppContext(
-            graph=graph, settings=settings, embed=embed, needs_first_index=True, first_index_ready=asyncio.Event()
+            bus=AsyncMock(),
+            graph=graph,
+            settings=settings,
+            embed=embed,
+            needs_first_index=True,
+            first_index_ready=asyncio.Event(),
         )
 
         result = await asyncio.wait_for(_invoke_tool(app, "get_node", name="Foo"), timeout=2.0)
@@ -1554,6 +1597,7 @@ class TestGatedToolsSurfaceIndexRequired:
         embed = EmbedClient(settings.embeddings)
         daemon = AsyncMock()
         app = AppContext(
+            bus=AsyncMock(),
             graph=graph,
             settings=settings,
             embed=embed,
@@ -1591,7 +1635,7 @@ class TestSummarizeModule:
                 "docs": [],
             }
         )
-        return AppContext(graph=mock_graph, settings=settings, embed=EmbedClient(settings.embeddings))
+        return AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=EmbedClient(settings.embeddings))
 
     async def test_shortcut_delegates_with_analysis_preset(self, summary_app):
         result = await _invoke_tool(summary_app, "summarize_module", path="pkg", project="proj")
@@ -1721,7 +1765,15 @@ class TestNoIndexMode:
         daemon.start = lambda *a, **kw: started.append(a)
 
         # graph is only forwarded to daemon.start, which is stubbed here
-        task = _spawn_indexing(daemon, settings, None, catchup=True, auto_index=auto_index, first_index_ready=ready)  # type: ignore[invalid-argument-type]
+        task = _spawn_indexing(
+            daemon,
+            settings,
+            None,  # type: ignore[invalid-argument-type]
+            None,  # type: ignore[invalid-argument-type]
+            catchup=True,
+            auto_index=auto_index,
+            first_index_ready=ready,
+        )
 
         assert task is None
         assert started == []
@@ -1739,6 +1791,7 @@ class TestNoIndexMode:
         _spawn_indexing(
             daemon,
             settings,
+            None,  # type: ignore[invalid-argument-type]
             None,  # type: ignore[invalid-argument-type]
             catchup=True,
             auto_index=auto_index,
@@ -1760,7 +1813,15 @@ class TestNoIndexMode:
         daemon.start = fake_start
 
         # graph is only forwarded to daemon.start, which is stubbed here
-        task = _spawn_indexing(daemon, settings, None, catchup=True, auto_index=auto_index, first_index_ready=ready)  # type: ignore[invalid-argument-type]
+        task = _spawn_indexing(
+            daemon,
+            settings,
+            None,  # type: ignore[invalid-argument-type]
+            None,  # type: ignore[invalid-argument-type]
+            catchup=True,
+            auto_index=auto_index,
+            first_index_ready=ready,
+        )
         assert task is not None
         await task
 

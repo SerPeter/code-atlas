@@ -853,7 +853,7 @@ async def _watch_after_index(settings: Any, graph: Any, bus: Any, lease_owner: s
     from code_atlas.indexing.daemon import DaemonManager
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph, include_watcher=True, catchup=False, lease_owner=lease_owner)
+    started = await daemon.start(settings, graph, bus, include_watcher=True, catchup=False, lease_owner=lease_owner)
     if not started:
         logger.error("Cannot watch — the event queue backend is unreachable")
         raise typer.Exit(code=1)
@@ -1322,7 +1322,7 @@ def _print_report(report: object, *, detailed: bool) -> None:
 
 async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None, no_git_check: bool = False) -> None:
     """Async implementation of the ``atlas watch`` command."""
-    from code_atlas.backends import create_graph_client, graph_backend_label
+    from code_atlas.backends import graph_backend_label, use_backends
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings, derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -1341,31 +1341,31 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     if max_wait is not None:
         settings.watcher.max_wait_s = max_wait
 
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        raise typer.Exit(code=1) from exc
-    logger.info("Connected to {}", graph_backend_label(graph, settings))
-    await graph.ensure_schema()
+    async with use_backends(settings) as backends:
+        graph, bus = backends.graph, backends.bus
+        assert bus is not None
+        try:
+            await graph.ping()
+        except Exception as exc:
+            logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
+            raise typer.Exit(code=1) from exc
+        logger.info("Connected to {}", graph_backend_label(graph, settings))
+        await graph.ensure_schema()
 
-    daemon = DaemonManager()
-    started = await daemon.start(settings, graph)  # type: ignore[invalid-argument-type]
-    if not started:
-        logger.error("Valkey required for watch mode")
-        await graph.close()
-        raise typer.Exit(code=1)
+        daemon = DaemonManager()
+        started = await daemon.start(settings, graph, bus)  # type: ignore[invalid-argument-type]
+        if not started:
+            logger.error("A reachable queue backend is required for watch mode")
+            raise typer.Exit(code=1)
 
-    try:
-        await daemon.wait()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await daemon.stop()
-        await graph.close()
-        shutdown_telemetry()
-        logger.info("Watch stopped")
+        try:
+            await daemon.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await daemon.stop()
+            shutdown_telemetry()
+            logger.info("Watch stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -1375,7 +1375,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 
 async def _run_daemon(*, no_embed: bool = False) -> None:
     """Start the EventBus, file watcher, and all tier consumers, run until interrupted."""
-    from code_atlas.backends import create_graph_client, graph_backend_label
+    from code_atlas.backends import graph_backend_label, use_backends
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -1391,31 +1391,31 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
         indexing=True,
     )
 
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        raise typer.Exit(code=1) from exc
-    logger.info("Connected to {}", graph_backend_label(graph, settings))
-    await graph.ensure_schema()
+    async with use_backends(settings) as backends:
+        graph, bus = backends.graph, backends.bus
+        assert bus is not None
+        try:
+            await graph.ping()
+        except Exception as exc:
+            logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
+            raise typer.Exit(code=1) from exc
+        logger.info("Connected to {}", graph_backend_label(graph, settings))
+        await graph.ensure_schema()
 
-    daemon = DaemonManager()
-    started = await daemon.start(settings, graph, include_watcher=True)  # type: ignore[invalid-argument-type]
-    if not started:
-        logger.error("Valkey required for daemon mode")
-        await graph.close()
-        raise typer.Exit(code=1)
+        daemon = DaemonManager()
+        started = await daemon.start(settings, graph, bus, include_watcher=True)  # type: ignore[invalid-argument-type]
+        if not started:
+            logger.error("A reachable queue backend is required for daemon mode")
+            raise typer.Exit(code=1)
 
-    try:
-        await daemon.wait()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await daemon.stop()
-        await graph.close()
-        shutdown_telemetry()
-        logger.info("Daemon stopped")
+        try:
+            await daemon.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await daemon.stop()
+            shutdown_telemetry()
+            logger.info("Daemon stopped")
 
 
 @daemon_app.command("start")
