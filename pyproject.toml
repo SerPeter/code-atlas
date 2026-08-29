@@ -227,20 +227,22 @@ filterwarnings = [
     # drills into model_config for it), but settings_customise_sources adds that source
     # conditionally, so pydantic-settings cannot see it and warns. See settings.py.
     "ignore:Config key `pyproject_toml_table_header` is set in model_config:UserWarning",
-    # ResourceWarning cannot be an error in an async suite, and it took a tracemalloc run
-    # to establish why rather than assume it. The warnings are raised from `__del__`
-    # during garbage collection, gathered by pytest's unraisableexception plugin, and
-    # charged to whichever test happens to be running -- six integration tests went red
-    # naming different victims on each run, none of which reproduced alone or even as a
-    # whole file. Worse, the objects are `socket.socket` and `_ProactorSocketTransport`:
-    # asyncio transport internals underneath our clients, whose teardown no application
-    # close() controls deterministically on Windows' proactor loop.
+    # ResourceWarning is deliberately NOT ignored. It was, with a long note blaming
+    # asyncio transport internals below our clients whose teardown no application
+    # close() controls on Windows' proactor loop. That was wrong: the sockets and
+    # _ProactorSocketTransports were downstream of four genuinely leaked Bolt drivers
+    # and one abandoned aiosqlite connection. Fix those and the suite reports nothing --
+    # 2787 unit and 427 integration, repeatedly, with no unclosed objects of any kind.
     #
-    # Real leaks above that layer are still worth fixing -- one was, in the four infra
-    # fixtures that skipped before closing. To hunt them, run a scoped suite with
-    # `-W error::ResourceWarning -X tracemalloc=15` and read the *objects* reported,
-    # never the test names.
-    "ignore::ResourceWarning",
+    # Keeping it fatal is what caught them. The ignore had also been hiding the cause of
+    # an intermittent failure that named a different test on each run: aiosqlite warns
+    # from Connection.__del__ on its worker thread, pytest re-reports that as a thread
+    # exception, and it lands on whoever happens to be running.
+    #
+    # If this ever turns flaky in CI, the honest response is to find the leak -- run the
+    # scoped suite and read the *objects* reported, never the test names. Re-adding
+    # "ignore::ResourceWarning" here silences the messenger and is how the last one
+    # stayed hidden.
 ]
 
 # --------------------------------------------------------------------------- #
