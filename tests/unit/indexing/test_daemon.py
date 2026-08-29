@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -368,8 +369,15 @@ class TestStartupCatchup:
 
         monkeypatch.setattr("code_atlas.backends.EventBus", BusyFakeBus)
 
+        # Zero, so the skip is immediate. With the default this test waited out the whole
+        # lease budget -- it still passed, and the unit suite silently went from ~60s to
+        # ~620s. A test that waits for a timeout is not testing the timeout; the bound
+        # itself is asserted separately below.
+        settings = _make_settings(tmp_path)
+        settings.index.lease_wait_s = 0
+
         manager = DaemonManager()
-        started = await manager.start(_make_settings(tmp_path), object(), include_watcher=False)  # type: ignore[arg-type]
+        started = await manager.start(settings, object(), include_watcher=False)  # type: ignore[arg-type]
         assert started is True
         await asyncio.sleep(0.05)
 
@@ -379,6 +387,41 @@ class TestStartupCatchup:
         # Live-event consumption still starts -- it'll pick up work once the peer
         # holding the lease finishes, via the stream rather than this inline pass.
         assert "consumer-run" in order
+
+    async def test_the_catchup_wait_is_bounded_far_below_the_cli_budget(
+        self, tmp_path: Path, patched_daemon: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`start()` does not return until catch-up finishes, so whatever it waits for,
+        the caller waits for too -- for the MCP server that is first_index_ready staying
+        clear the whole time.
+
+        The only reason to wait at all is a holder that is already dead, and its lease
+        expires within the 60s TTL. Anything past that is a live indexer doing the same
+        work, so waiting longer buys nothing and costs startup. Asserted against the
+        constant rather than a sleep, because a test that actually waits 90s is how the
+        suite grew tenfold in the first place.
+        """
+        from code_atlas.events import INDEXER_LEASE_TTL_MS
+        from code_atlas.indexing.daemon import _CATCHUP_LEASE_WAIT_S
+
+        settings = _make_settings(tmp_path)
+        assert _CATCHUP_LEASE_WAIT_S > INDEXER_LEASE_TTL_MS / 1000, "must outlast a dead holder's lease"
+        assert settings.index.lease_wait_s > _CATCHUP_LEASE_WAIT_S, "must be far below the foreground budget"
+
+        captured: dict[str, float] = {}
+
+        @contextlib.asynccontextmanager
+        async def spy_lease(_bus, *, wait_s: float = 0.0, **_kw):
+            captured["wait_s"] = wait_s
+            yield "owner"
+
+        monkeypatch.setattr("code_atlas.indexing.daemon.hold_indexer_lease", spy_lease)
+
+        manager = DaemonManager()
+        await manager.start(settings, object(), include_watcher=False)  # type: ignore[arg-type]
+        await manager.stop()
+
+        assert captured["wait_s"] == _CATCHUP_LEASE_WAIT_S
 
         await manager.stop()
 

@@ -40,6 +40,16 @@ if TYPE_CHECKING:
 # Slow enough to be free, fast enough to see a stall inside a minute.
 _BACKLOG_SAMPLE_S = 15.0
 
+# Startup catch-up waits for the indexer lease, but on a much shorter leash than a
+# foreground `atlas index`. The reason to wait at all is a holder that is already dead:
+# its lease expires within INDEXER_LEASE_TTL_MS (60s), so a little over a minute covers
+# the entire case. A holder still there after that is alive and doing the same work, and
+# waiting longer buys nothing -- while `start()` does not return until catch-up finishes,
+# which for the MCP server means first_index_ready stays clear that whole time.
+#
+# index.lease_wait_s still applies as a ceiling, so setting it to 0 restores fail-fast.
+_CATCHUP_LEASE_WAIT_S = 90.0
+
 
 @dataclass
 class DaemonManager:
@@ -278,7 +288,8 @@ class DaemonManager:
         a caller waiting on it (MCP's first-index readiness gate), never hang forever.
         """
         try:
-            async with hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s):
+            wait_s = min(settings.index.lease_wait_s, _CATCHUP_LEASE_WAIT_S)
+            async with hold_indexer_lease(bus, wait_s=wait_s):
                 if detect_sub_projects(settings.project_root, settings.monorepo):
                     await index_monorepo(settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s)
                 else:
@@ -287,7 +298,7 @@ class DaemonManager:
             logger.info(
                 "Skipping startup catch-up — another indexer still holds the lease after "
                 "waiting {:.0f}s ({}); live events will still be consumed once it finishes",
-                settings.index.lease_wait_s,
+                wait_s,
                 exc.holder,
             )
         except Exception:
