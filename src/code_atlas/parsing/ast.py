@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,7 @@ from loguru import logger
 from tree_sitter import Language, Parser, Query
 
 from code_atlas.schema import NodeLabel, RelType, Visibility
+from code_atlas.telemetry import get_metrics
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -845,9 +847,19 @@ def parse_file(
         logger.warning("parse: refusing {} — {}", path, hazard)
         return None
 
+    # Measured, not spanned. This runs once per file -- a full index is ~60k calls --
+    # so a span apiece would bury the batch-level trace it belongs to under its own
+    # children. The batch gets one `ast.parse` span in the consumer; this level answers
+    # the aggregate question instead: which language costs what, and is it the grammar
+    # or our handler. Tree-sitter's error recovery is superlinear (an unparseable 4 MiB
+    # T-SQL dump measured four minutes), so the grammar/handler split is not academic.
     parser = Parser(lang_config.language)
+    _t0 = time.perf_counter()
     tree = parser.parse(source)
+    _lang_attrs = {"language": lang_config.name}
+    get_metrics().stage_seconds.record(time.perf_counter() - _t0, {"stage": "parse", "phase": "tree_sitter"})
 
+    _t1 = time.perf_counter()
     try:
         result = lang_config.parse_func(path, source, tree.root_node, project_name)
     except RecursionError:
@@ -859,6 +871,8 @@ def parse_file(
         # forever. Same clean skip as the pre-parse refusal.
         logger.warning("parse: refusing {} — handler recursion limit exceeded", path)
         return None
+    finally:
+        get_metrics().stage_seconds.record(time.perf_counter() - _t1, {"stage": "parse", "phase": "handler"})
 
     if result is None:
         # A handler declining a file (e.g. the config parser meeting a generic
@@ -892,6 +906,10 @@ def parse_file(
         elif max_source_chars <= 0:
             updates["source"] = None
         return replace(e, **updates)
+
+    metrics = get_metrics()
+    metrics.parse_seconds.record(time.perf_counter() - _t0, _lang_attrs)
+    metrics.parse_bytes.record(len(source), _lang_attrs)
 
     return ParsedFile(
         file_path=result.file_path,

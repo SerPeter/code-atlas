@@ -10,7 +10,7 @@ import inspect
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1301,3 +1301,109 @@ class TestFixtureMarkerStamping:
             p.read_text(encoding="utf-8", errors="replace") for p in (Path(__file__).resolve().parents[2]).rglob("*.py")
         )
         assert len(self._NODE_WRITE.findall(text)) >= 40
+
+
+class _StubResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __aiter__(self):
+        async def gen():
+            for row in self._rows:
+                yield row
+
+        return gen()
+
+    async def consume(self):
+        return None
+
+
+class _StubSession:
+    def __init__(self, rows):
+        self._rows = rows
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def run(self, _query, _params=None):
+        return _StubResult(self._rows)
+
+
+class _StubDriver:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def session(self):
+        return _StubSession(self._rows)
+
+
+def _client_with(tmp_path, rows) -> GraphClient:
+    """A client over a stub driver. The cast is the same deferred-retyping convention
+    used at the other construction sites: _StubDriver implements the two methods this
+    path touches, not the whole neo4j AsyncDriver surface."""
+    return GraphClient(AtlasSettings(project_root=tmp_path), driver=cast("Any", _StubDriver(rows)))
+
+
+class TestGraphQueryTiming:
+    """Round-trips are attributed to the method that made them.
+
+    The query text cannot be the label: `cypher_query` passes agent-authored Cypher
+    straight through, so the label set would be unbounded and would carry user content
+    into the metrics store. Method names are a closed set at exactly the granularity
+    "which read is costing me" needs.
+
+    This test also pins the stack depth `caller_name` walks. That depth is the fragile
+    part -- a decorator or an extra wrapper on `execute` silently shifts it, and the
+    symptom would be a dashboard full of `_execute_inner` rather than an error.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch):
+        import code_atlas.telemetry as tel
+
+        recorded: list[tuple] = []
+        monkeypatch.setattr(
+            tel._metrics,
+            "graph_query_seconds",
+            type("H", (), {"record": lambda _s, v, a=None: recorded.append((v, a))})(),
+        )
+        monkeypatch.setattr(tel, "_enabled", True)
+        return recorded
+
+    async def test_a_read_is_labelled_with_the_calling_method(self, monkeypatch, tmp_path: Path):
+        recorded = self._capture(monkeypatch)
+        client = _client_with(tmp_path, [{"n": 1}])
+
+        await client.ping()  # ping() -> execute() -> the timed block
+
+        assert len(recorded) == 1
+        elapsed, attrs = recorded[0]
+        assert attrs == {"op": "ping", "kind": "read"}, "wrong stack depth — see caller_name"
+        assert elapsed >= 0
+
+    async def test_a_write_is_labelled_and_marked_as_a_write(self, monkeypatch, tmp_path: Path):
+        recorded = self._capture(monkeypatch)
+        client = _client_with(tmp_path, [])
+
+        async def set_schema_version_probe():
+            await client.execute_write("RETURN 1")
+
+        await set_schema_version_probe()
+
+        assert [a for _v, a in recorded] == [{"op": "set_schema_version_probe", "kind": "write"}]
+
+    async def test_nothing_is_recorded_while_telemetry_is_off(self, monkeypatch, tmp_path: Path):
+        """The frame walk is the only part of this with a real cost, and it must not
+        happen for the overwhelmingly common case of telemetry being disabled."""
+        import code_atlas.telemetry as tel
+
+        recorded = self._capture(monkeypatch)
+        monkeypatch.setattr(tel, "_enabled", False)
+        client = _client_with(tmp_path, [{"n": 1}])
+
+        await client.ping()
+
+        assert recorded == []

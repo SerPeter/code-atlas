@@ -60,7 +60,22 @@ must be verified against a running backend, not asserted.
 6. The web UI, which had never called `init_telemetry` at all, reports `role="web"` and carries a span and a latency
    sample per request — identified by Litestar's route template rather than the request path, since per-path series is
    how a metrics database is taken down by its own instrumentation.
-7. The backends ship as `docker compose --profile telemetry`: VictoriaMetrics, VictoriaLogs, VictoriaTraces, an OTel
+7. Time is attributed at three granularities, because "which tier is slow" and "which call is slow" are different
+   questions. `atlas_stage_seconds{stage,phase}` splits each pipeline stage into its steps;
+   `atlas_parse_seconds{language}` and the `parse/tree_sitter` vs `parse/handler` split separate grammar cost from our
+   own extraction; `atlas_graph_query_seconds{op,kind}` attributes every round-trip to the `GraphClient` method that
+   made it.
+
+   Query text cannot be the label -- `cypher_query` passes agent-authored Cypher straight through, so the label set
+   would be unbounded and would carry user content into the metrics store. Method names are a closed set of about a
+   hundred, at exactly the granularity the question needs. They are found by walking the stack past known plumbing
+   rather than counting frames: a fixed depth landed on tenacity's `__call__` for every write, which would have produced
+   a plausible-looking dashboard reporting nothing.
+
+   Parsing is measured but not spanned. It runs once per file -- ~60k calls in a full index -- so a span apiece would
+   bury the batch trace it belongs to under its own children.
+
+8. The backends ship as `docker compose --profile telemetry`: VictoriaMetrics, VictoriaLogs, VictoriaTraces, an OTel
    Collector, and Grafana with datasources provisioned as code.
 
 ## Consequences

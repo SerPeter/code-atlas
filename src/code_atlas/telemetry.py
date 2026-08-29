@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import os
 import socket
+import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -209,6 +211,10 @@ class _Metrics:
     embeddings_total: Any = field(default_factory=_NoOpCounter)
     web_requests: Any = field(default_factory=_NoOpCounter)
     web_latency: Any = field(default_factory=_NoOpHistogram)
+    stage_seconds: Any = field(default_factory=_NoOpHistogram)
+    parse_seconds: Any = field(default_factory=_NoOpHistogram)
+    parse_bytes: Any = field(default_factory=_NoOpHistogram)
+    graph_query_seconds: Any = field(default_factory=_NoOpHistogram)
 
 
 _metrics = _Metrics()
@@ -347,6 +353,16 @@ def init_telemetry(
         web_latency=meter.create_histogram(
             "atlas_web_latency_seconds", description="Web UI request wall time", unit="s"
         ),
+        stage_seconds=meter.create_histogram(
+            "atlas_stage_seconds", description="Time inside one pipeline phase", unit="s"
+        ),
+        parse_seconds=meter.create_histogram(
+            "atlas_parse_seconds", description="Tree-sitter parse time per file", unit="s"
+        ),
+        parse_bytes=meter.create_histogram("atlas_parse_bytes", description="Source size parsed per file", unit="By"),
+        graph_query_seconds=meter.create_histogram(
+            "atlas_graph_query_seconds", description="Graph round-trip time, by calling method", unit="s"
+        ),
     )
 
     # A gauge, because backlog is the one pipeline number that goes down as well as up.
@@ -367,6 +383,61 @@ def init_telemetry(
         settings.sample_rate,
         settings.log_level if settings.export_logs else "off",
     )
+
+
+_phase_tracer = _LazyTracer("code_atlas.phase")
+
+
+@contextmanager
+def timed_phase(stage: str, phase: str, **attributes: Any) -> Iterator[Any]:
+    """Time one step of a pipeline stage as *both* a span and a histogram sample.
+
+    The two answer different questions and neither substitutes for the other. A span
+    says where a *particular* slow batch spent its time and what ran inside it; the
+    histogram says where the stage spends its time *in general*, which is the one that
+    identifies a bottleneck. Recording them from the same block is what keeps the trace
+    view and the aggregate view from disagreeing.
+
+    `stage` is the pipeline stage (``ast``, ``embed``, ``parse``), `phase` the step
+    within it. Both must stay a small closed set -- they are metric labels.
+    """
+    started = time.perf_counter()
+    with _phase_tracer.start_as_current_span(f"{stage}.{phase}", attributes=attributes) as span:
+        try:
+            yield span
+        finally:
+            _metrics.stage_seconds.record(time.perf_counter() - started, {"stage": stage, "phase": phase})
+
+
+def caller_name(skip: frozenset[str] = frozenset(), limit: int = 12) -> str:
+    """The nearest frame up the stack that is not plumbing, for use as a metric label.
+
+    Used to attribute graph round-trips to the ``GraphClient`` method that made them --
+    the query text is unusable as a label (high cardinality, and it carries user content
+    in the one place arbitrary Cypher is allowed). Method names are a closed set of about
+    a hundred, which is exactly the granularity "where is the time going" needs.
+
+    A scan rather than a fixed depth, because a fixed depth was wrong and did not say so.
+    ``execute_write`` is wrapped by tenacity's retry, so counting frames landed on
+    tenacity's ``__call__`` -- every write in the system would have been labelled
+    ``op="__call__"``, a plausible-looking dashboard reporting nothing. Dunders and
+    tenacity's own frames are skipped; *skip* names the caller's own pass-through methods.
+
+    Costs roughly a microsecond against a network round-trip, and callers only reach it
+    when telemetry is on.
+    """
+    try:
+        frame: Any = sys._getframe(1)  # noqa: SLF001
+    except ValueError:  # pragma: no cover - no caller frame
+        return "unknown"
+    for _ in range(limit):
+        if frame is None:
+            break
+        name = frame.f_code.co_name
+        if not name.startswith("__") and name not in skip and "tenacity" not in frame.f_code.co_filename:
+            return name
+        frame = frame.f_back
+    return "unknown"
 
 
 # Queue depth per topic, refreshed by the daemon's sampler. "How far behind is the

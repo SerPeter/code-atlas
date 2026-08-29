@@ -14,6 +14,7 @@ import hashlib
 import os
 import re
 import socket
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -38,7 +39,7 @@ from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, 
 from code_atlas.schema import NodeLabel, RelType
 from code_atlas.search.embeddings import build_embed_text, hash_text
 from code_atlas.settings import derive_project_name
-from code_atlas.telemetry import get_metrics, get_tracer
+from code_atlas.telemetry import get_metrics, get_tracer, timed_phase
 
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
@@ -138,6 +139,11 @@ def _next_resolve_gap(duration_s: float) -> float:
 # that a live consumer's own in-flight batch never qualifies, short enough that a crash
 # does not strand work for a whole session.
 _ABANDONED_MIN_IDLE_MS = 120_000
+
+# Which pipeline stage each topic belongs to, for the `stage` metric label. The topic
+# name ("file-changed") describes the event; the stage name ("ast") describes the work,
+# and it is the work you compare when asking which stage the time went into.
+_STAGE_BY_TOPIC = {Topic.FILE_CHANGED: "ast", Topic.EMBED_DIRTY: "embed"}
 
 # How often a paused consumer re-checks whether the foreign lease has been released.
 _LEASE_POLL_S = 1.0
@@ -431,6 +437,27 @@ class TierConsumer(ABC):
             self._fail_counts[mid] = self._fail_counts.get(mid, 0) + 1
         self._pel_dirty = True
 
+    def _record_batch(self, *, events: int, outcome: str, started: float) -> None:
+        """Stage total plus batch/event counters, for one finished batch.
+
+        Called from **both** dispatch paths. `_worker` (the embed consumer's async
+        dispatch) and `_dispatch_batch` (everything else, including the CLI's inline
+        index pipeline) are separate code paths, and instrumenting only the first meant
+        `atlas index` -- much the most common way anyone indexes -- reported no stage
+        totals and no batch counters at all. Found by running an index and querying for
+        the series, not by reading the code.
+
+        `phase="total"` is the whole batch, so `sum by (stage)` answers "which stage
+        costs the most" directly; summing the individual phases would miss whatever is
+        not inside one of them and quietly under-report.
+        """
+        topic = self.input_topic.value
+        stage = _STAGE_BY_TOPIC.get(self.input_topic, topic)
+        metrics = get_metrics()
+        metrics.stage_seconds.record(time.perf_counter() - started, {"stage": stage, "phase": "total"})
+        metrics.batches_processed.add(1, {"topic": topic, "outcome": outcome})
+        metrics.events_consumed.add(events, {"topic": topic})
+
     async def _dispatch_batch(
         self,
         events: list[Event],
@@ -441,14 +468,19 @@ class TierConsumer(ABC):
 
         Default: process inline, ACK non-deferred on success, leave in PEL on failure.
         """
+        outcome = "ok"
+        started = time.perf_counter()
         try:
             with logger.contextualize(consumer=self.consumer_name):
                 deferred = await self.process_batch(events, batch_id) or set()
             await self._ack_processed(events, msg_ids, deferred)
             self.note_progress()
         except Exception:
+            outcome = "failed"
             logger.exception("{} batch {} failed, will retry", self.consumer_name, batch_id)
             self._note_batch_failure(msg_ids)
+        finally:
+            self._record_batch(events=len(events), outcome=outcome, started=started)
 
     async def run(self) -> None:  # noqa: PLR0912, PLR0915
         """Main consumer loop — runs until ``stop()`` is called."""
@@ -1270,19 +1302,20 @@ class ASTConsumer(TierConsumer):
                 # 1. Parse loop (async, per-file) — no graph writes
                 parsed_files: dict[str, _ParsedFileData] = {}
 
-                for file_idx, file_path in enumerate(live_paths, 1):
-                    if file_idx % 50 == 0:
-                        logger.debug("AST batch {}: parsed {}/{} files", batch_id, file_idx, len(live_paths))
-                    pfd = await self._parse_file(
-                        project_name,
-                        file_path,
-                        project_root=effective_root,
-                        source=file_sources.get(file_path),
-                    )
-                    if pfd is _SENTINEL_DELETED:
-                        deleted_files.append(file_path)
-                    elif pfd is not None:
-                        parsed_files[file_path] = pfd
+                with timed_phase("ast", "parse", files=len(live_paths)):
+                    for file_idx, file_path in enumerate(live_paths, 1):
+                        if file_idx % 50 == 0:
+                            logger.debug("AST batch {}: parsed {}/{} files", batch_id, file_idx, len(live_paths))
+                        pfd = await self._parse_file(
+                            project_name,
+                            file_path,
+                            project_root=effective_root,
+                            source=file_sources.get(file_path),
+                        )
+                        if pfd is _SENTINEL_DELETED:
+                            deleted_files.append(file_path)
+                        elif pfd is not None:
+                            parsed_files[file_path] = pfd
 
                 # 2. Handle deleted files
                 for fp in deleted_files:
@@ -1300,20 +1333,25 @@ class ASTConsumer(TierConsumer):
                 #    otherwise silently miss subjects added in the same batch).
                 if parsed_files:
                     file_data = {fp: (pfd.entities, pfd.non_import_rels) for fp, pfd in parsed_files.items()}
-                    results = await self.graph.upsert_batch_entities(project_name, file_data)
+                    with timed_phase("ast", "upsert", files=len(file_data)):
+                        results = await self.graph.upsert_batch_entities(project_name, file_data)
 
                     # 3.5. Graph-querying detectors, now that this batch's entities exist.
                     det_results: dict[str, DetectorResult] = {}
                     if self._detectors:
-                        for fp, pfd in parsed_files.items():
-                            det_result = await run_detectors(self._detectors, pfd.parsed_file, project_name, self.graph)
-                            if det_result.relationships or det_result.enrichments:
-                                det_results[fp] = det_result
+                        with timed_phase("ast", "detectors", detectors=len(self._detectors)):
+                            for fp, pfd in parsed_files.items():
+                                det_result = await run_detectors(
+                                    self._detectors, pfd.parsed_file, project_name, self.graph
+                                )
+                                if det_result.relationships or det_result.enrichments:
+                                    det_results[fp] = det_result
 
                     # 4. Batched enrichments
                     all_enrichments = [e for det in det_results.values() for e in det.enrichments]
                     if all_enrichments:
-                        await self.graph.apply_property_enrichments(all_enrichments)
+                        with timed_phase("ast", "enrich", count=len(all_enrichments)):
+                            await self.graph.apply_property_enrichments(all_enrichments)
 
                     # 4b. Re-write relationships for files with new detector-emitted
                     #     rels — merged with the original parser rels, since TX2
@@ -1487,7 +1525,8 @@ class ASTConsumer(TierConsumer):
             # forward, so the existing cadence stays an upper bound on staleness. The
             # buffer ceiling overrides it so a long gap cannot grow memory without limit.
             if (due and elapsed >= self._resolve_min_gap_s) or self._pending_rel_count() >= _RESOLVE_PENDING_CEILING:
-                await self._flush_deferred_resolution()
+                with timed_phase("ast", "resolve", rels=self._pending_rel_count()):
+                    await self._flush_deferred_resolution()
 
             # Anchor invalidation runs every batch, unlike the deferred-resolution
             # cadence above — a docstring-only edit that never clears the embed
@@ -1658,11 +1697,8 @@ class EmbedConsumer(TierConsumer):
         batch_id: str,
     ) -> None:
         """Execute process_batch for a single batch, then release the semaphore."""
-        # One counter for both consumers, recorded where both already pass through.
-        # The rate of this is the answer to "is the pipeline moving at all", which the
-        # last investigation could only get by diffing XINFO entries-read by hand.
-        topic = self.input_topic.value
         outcome = "ok"
+        started = time.perf_counter()
         try:
             logger.debug("{} dispatching batch {} ({} events)", self.consumer_name, batch_id, len(events))
             with logger.contextualize(consumer=self.consumer_name):
@@ -1673,8 +1709,7 @@ class EmbedConsumer(TierConsumer):
             logger.exception("{} batch {} failed, will retry via PEL", self.consumer_name, batch_id)
             self._note_batch_failure(msg_ids)
         finally:
-            get_metrics().batches_processed.add(1, {"topic": topic, "outcome": outcome})
-            get_metrics().events_consumed.add(len(events), {"topic": topic})
+            self._record_batch(events=len(events), outcome=outcome, started=started)
             self._sem.release()
 
     async def _resolve_from_graph(
@@ -1752,7 +1787,8 @@ class EmbedConsumer(TierConsumer):
                 #    Pass labels so queries use per-label indices instead of full scans.
                 qns = [e.qualified_name for e in entities]
                 entity_labels = [e.node_type for e in entities]
-                entity_props = await self.graph.read_entity_texts(qns, labels=entity_labels)
+                with timed_phase("embed", "read_entities", entities=len(qns)):
+                    entity_props = await self.graph.read_entity_texts(qns, labels=entity_labels)
 
                 # 2. Build embed texts — graph-check for unchanged content
                 to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
@@ -1784,18 +1820,22 @@ class EmbedConsumer(TierConsumer):
                     return deferred or None
 
                 # 3. Graph dedup check → 4. API call for what is genuinely new
-                dedup_resolved, need_embed, dedup_hits = await self._resolve_from_graph(to_process)
-                api_vectors = await self._embed_and_store(need_embed)
+                with timed_phase("embed", "dedup", candidates=len(to_process)):
+                    dedup_resolved, need_embed, dedup_hits = await self._resolve_from_graph(to_process)
+                # The expensive one, and the only phase whose cost is someone else's
+                # network: split out so a slow provider cannot be mistaken for a slow graph.
+                with timed_phase("embed", "provider", entities=len(need_embed)):
+                    api_vectors = await self._embed_and_store(need_embed)
 
                 # 5. Write all new/changed vectors + embed_hashes to graph (single UNWIND)
                 #    Bounded to _EMBED_WRITE_CONCURRENCY rather than fully serialised --
                 #    see the _write_gate comment in __init__ for the measurements.
                 all_resolved = dedup_resolved + api_vectors
                 if all_resolved:
-                    with _tracer.start_as_current_span("embed.write_lock_wait"):
+                    with timed_phase("embed", "write_lock_wait"):
                         await self._write_gate.acquire()
                     try:
-                        with _tracer.start_as_current_span("embed.write_embeddings"):
+                        with timed_phase("embed", "write", vectors=len(all_resolved)):
                             write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
                             # Stamp the model: a vector only means anything inside the space
                             # its model defines, and one database holds several (ATL-135).

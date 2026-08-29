@@ -11,7 +11,9 @@ import builtins
 import contextlib
 import contextvars
 import re
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import batched, groupby
 from operator import attrgetter
@@ -51,10 +53,11 @@ from code_atlas.schema import (
 )
 from code_atlas.search.engine import matches_test_pattern
 from code_atlas.settings import SearchSettings
-from code_atlas.telemetry import get_tracer
+from code_atlas.telemetry import caller_name, get_metrics, get_tracer
+from code_atlas.telemetry import is_enabled as telemetry_enabled
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 
     from neo4j import AsyncDriver
 
@@ -63,6 +66,47 @@ if TYPE_CHECKING:
     from code_atlas.settings import AtlasSettings
 
 _tracer = get_tracer(__name__)
+
+
+#: This module's own pass-through frames. `execute` and friends are what every read
+#: and write goes through, so labelling by them would say "the time went into
+#: execute" for every query in the system.
+_QUERY_PLUMBING = frozenset(
+    {
+        "_timed_query",
+        "execute",
+        "execute_write",
+        "execute_write_patient",
+        "_execute_inner",
+        "_execute_write_inner",
+        "_execute_write_with_retry",
+    }
+)
+
+
+@contextmanager
+def _timed_query(kind: str) -> Iterator[None]:
+    """Record one graph round-trip against the method that made it.
+
+    Attributed by *calling method*, not by query text. The text is unusable as a metric
+    label -- a hundred-odd distinct statements is survivable, but `cypher_query` passes
+    agent-authored Cypher straight through, so the label set would be unbounded and would
+    carry user content into the metrics store. Method names are a closed set at exactly
+    the granularity "which read is costing me" needs.
+
+    The frame walk only happens when telemetry is on, and costs about a microsecond
+    against a network round-trip.
+    """
+    if not telemetry_enabled():
+        yield
+        return
+    op = caller_name(_QUERY_PLUMBING)
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        get_metrics().graph_query_seconds.record(time.perf_counter() - started, {"op": op, "kind": kind})
+
 
 _VALID_LABELS: frozenset[str] = frozenset(lbl.value for lbl in NodeLabel)
 
@@ -1491,9 +1535,17 @@ class GraphClient:
         """Execute a read query and return results as a list of dicts."""
         active_tx = _active_tx_var.get()
         if active_tx is not None:
-            result = await active_tx.run(query, params or {})
-            return [dict(record) async for record in result]
-        with _tracer.start_as_current_span("graph.execute", attributes={"db.statement": query[:200]}):
+            # Timed too, and separately labelled. The batched upserts run every one of
+            # their statements through here, so leaving this branch out would have made
+            # atlas_graph_query_seconds silently exclude the heaviest writes in the
+            # system while still looking like total database time.
+            with _timed_query("read_tx"):
+                result = await active_tx.run(query, params or {})
+                return [dict(record) async for record in result]
+        with (
+            _tracer.start_as_current_span("graph.execute", attributes={"db.statement": query[:200]}),
+            _timed_query("read"),
+        ):
             try:
                 return await asyncio.wait_for(self._execute_inner(query, params), timeout=self._query_timeout_s)
             except TimeoutError:
@@ -1516,9 +1568,10 @@ class GraphClient:
         """
         active_tx = _active_tx_var.get()
         if active_tx is not None:
-            result = await active_tx.run(query, params or {})
-            await result.consume()
-            return
+            with _timed_query("write_tx"):
+                result = await active_tx.run(query, params or {})
+                await result.consume()
+                return
         await self._execute_write_with_retry(query, params)
 
     @retry(
@@ -1538,7 +1591,8 @@ class GraphClient:
         """Standalone write with retry + timeout (not used inside managed transactions)."""
         with _tracer.start_as_current_span("graph.execute_write", attributes={"db.statement": query[:200]}):
             try:
-                await asyncio.wait_for(self._execute_write_inner(query, params), timeout=self._write_timeout_s)
+                with _timed_query("write"):
+                    await asyncio.wait_for(self._execute_write_inner(query, params), timeout=self._write_timeout_s)
             except TimeoutError:
                 raise QueryTimeoutError(self._write_timeout_s, query[:120]) from None
 
