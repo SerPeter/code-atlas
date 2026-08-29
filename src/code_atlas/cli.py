@@ -420,6 +420,14 @@ def mcp(
     host: str = typer.Option(None, "--host", help="Bind address for HTTP transports (ignored for stdio)."),
     port: int = typer.Option(None, "--port", "-p", help="Bind port for HTTP transports (ignored for stdio)."),
     strict: bool = typer.Option(None, "--strict", help="Refuse to start if embedding model mismatch."),
+    no_index: bool = typer.Option(
+        False,
+        "--no-index",
+        help="Serve queries only: no file watcher, no pipeline, no startup catch-up. "
+        "For the second and later agent sessions sharing one worktree — indexing is "
+        "per-worktree, so exactly one indexer (a daemon, or one server without this "
+        "flag) must still cover that checkout.",
+    ),
 ) -> None:
     """Start the MCP server for AI agent connections."""
     from code_atlas.server.mcp import create_mcp_server
@@ -433,11 +441,20 @@ def mcp(
     host = host or mcp_cfg.host
     port = port or mcp_cfg.port
     strict = strict if strict is not None else mcp_cfg.strict
+    # The flag can only switch indexing off, never force it on over a config that
+    # deliberately disabled it.
+    auto_index = mcp_cfg.auto_index and not no_index
 
     init_telemetry(settings.observability, role="mcp", project=derive_project_name(settings.project_root))
     try:
-        server = create_mcp_server(settings, strict=strict, host=host, port=port)
-        logger.info("Starting MCP server (transport={}, host={}, port={})", transport, host, port)
+        server = create_mcp_server(settings, strict=strict, host=host, port=port, auto_index=auto_index)
+        logger.info(
+            "Starting MCP server (transport={}, host={}, port={}, indexing={})",
+            transport,
+            host,
+            port,
+            "on" if auto_index else "off",
+        )
         server.run(transport=transport)  # type: ignore[arg-type]  # typer gives str, FastMCP expects Literal
     finally:
         shutdown_telemetry()

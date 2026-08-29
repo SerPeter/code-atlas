@@ -723,12 +723,19 @@ def create_mcp_server(  # noqa: PLR0915
     host: str = "127.0.0.1",
     port: int = 8000,
     catchup: bool = True,
+    auto_index: bool = True,
 ) -> FastMCP:
     """Create and configure the Code Atlas MCP server.
 
     *catchup* (default True) runs one blocking delta index pass at startup so
     edits made while the daemon was down are indexed before live consumption.
     Set False to skip it (faster startup at the cost of missing offline edits).
+
+    *auto_index* False is the stronger form: no watcher, no consumers, no catch-up
+    — the server only reads. Indexing is per-worktree, not per-session, so when
+    several agent sessions share one checkout the extra servers contribute nothing
+    but lease contention and duplicate watchers over the same files. Exactly one
+    indexer per worktree is still required; this flag is for the others.
     """
 
     @asynccontextmanager
@@ -844,29 +851,22 @@ def create_mcp_server(  # noqa: PLR0915
         # clients' connect timeout. Run daemon startup in the background instead
         # so tools are reachable immediately; health_check reports pipeline state
         # and result staleness already surfaces an index that's still catching up.
-        daemon_start_task = asyncio.get_running_loop().create_task(
-            daemon.start(settings, graph, catchup=catchup, first_index_ready=first_index_ready)
+        daemon_start_task = _spawn_indexing(
+            daemon,
+            settings,
+            graph,
+            catchup=catchup,
+            auto_index=auto_index,
+            first_index_ready=first_index_ready,
         )
-
-        def _on_daemon_started(task: asyncio.Task) -> None:
-            if task.cancelled():
-                return
-            exc = task.exception()
-            if exc is not None:
-                logger.exception("Daemon startup failed", exc_info=exc)
-            elif task.result():
-                logger.info("Auto-indexing active (watching {})", settings.project_root)
-            else:
-                logger.info("Query-only mode (no Valkey)")
-
-        daemon_start_task.add_done_callback(_on_daemon_started)
 
         try:
             yield app_ctx
         finally:
-            daemon_start_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await daemon_start_task
+            if daemon_start_task is not None:
+                daemon_start_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await daemon_start_task
             await app_ctx.daemon.stop()
             await graph.close()
             shutdown_telemetry()
@@ -1034,6 +1034,49 @@ def _register_node_tools(mcp: FastMCP) -> None:
 # is chosen once in `app_lifespan` and cannot change while the process runs -- there is
 # no per-call state to carry.
 _BACKEND_NOTE: dict[str, Any] = {}
+
+
+def _spawn_indexing(
+    daemon: DaemonManager,
+    settings: AtlasSettings,
+    graph: GraphClient,
+    *,
+    catchup: bool,
+    auto_index: bool,
+    first_index_ready: asyncio.Event,
+) -> asyncio.Task | None:
+    """Start the watcher + pipeline in the background, or explain why we did not.
+
+    Returns the startup task, or ``None`` when indexing is off for this process.
+    """
+    if not auto_index:
+        # Nothing will ever set this, and every tool call that needs an index would
+        # otherwise block on it for the full readiness timeout before answering.
+        first_index_ready.set()
+        daemon.disabled_reason = "indexing disabled (--no-index)"
+        logger.info(
+            "Query-only mode (--no-index): no watcher, no pipeline, no catch-up. Another process must index {}",
+            settings.project_root,
+        )
+        return None
+
+    task = asyncio.get_running_loop().create_task(
+        daemon.start(settings, graph, catchup=catchup, first_index_ready=first_index_ready)
+    )
+
+    def _on_daemon_started(finished: asyncio.Task) -> None:
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is not None:
+            logger.exception("Daemon startup failed", exc_info=exc)
+        elif finished.result():
+            logger.info("Auto-indexing active (watching {})", settings.project_root)
+        else:
+            logger.info("Query-only mode (no Valkey)")
+
+    task.add_done_callback(_on_daemon_started)
+    return task
 
 
 def _install_tool_tracing(mcp: FastMCP) -> None:

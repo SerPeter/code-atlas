@@ -408,6 +408,11 @@ async def check_indexer_lease(bus: EventBus | SqliteEventBus | None) -> CheckRes
 def check_pipeline(daemon: DaemonManager) -> CheckResult:
     """Report in-process indexing pipeline liveness from the DaemonManager."""
     st = daemon.status()
+    if st["disabled_reason"]:
+        # Distinct from a pipeline that started and died. Both leave zero tasks running,
+        # and "0 task(s) running -- OK" is the report that sends someone looking for a
+        # bug instead of reading their own configuration.
+        return CheckResult("pipeline", CheckStatus.OK, f"not running — {st['disabled_reason']}")
     if st["crash_counts"]:
         worst = max(st["crash_counts"], key=st["crash_counts"].get)
         return CheckResult(

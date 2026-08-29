@@ -53,6 +53,10 @@ class DaemonManager:
     _embed: EmbedClient | None = field(default=None, repr=False)
     _crash_counts: dict[str, int] = field(default_factory=dict, repr=False)
     _last_crash: dict[str, str] = field(default_factory=dict, repr=False)
+    #: Why this manager was never started, if it deliberately wasn't. Without it the
+    #: pipeline health check reports "0 task(s) running" as OK, which reads identically
+    #: to a pipeline that died on startup.
+    disabled_reason: str = ""
 
     @property
     def bus(self) -> EventBus | None:
@@ -72,6 +76,7 @@ class DaemonManager:
             "tasks_total": len(self._tasks),
             "crash_counts": dict(self._crash_counts),
             "last_crash": dict(self._last_crash),
+            "disabled_reason": self.disabled_reason,
         }
 
     async def start(

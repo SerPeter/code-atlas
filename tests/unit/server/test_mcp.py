@@ -1685,6 +1685,78 @@ class _RecordingTracer:
         return span
 
 
+class TestNoIndexMode:
+    """Indexing is per-worktree, not per-session.
+
+    When several agent sessions share one checkout, each MCP server starts its own
+    watcher over the same files and its own catch-up against the same lease. The extra
+    ones contribute nothing but contention -- and one such collision is what left a
+    real index idle with 30k embeddings outstanding.
+    """
+
+    @staticmethod
+    def _args(auto_index: bool):
+        from code_atlas.indexing.daemon import DaemonManager
+        from code_atlas.settings import AtlasSettings
+
+        return DaemonManager(), AtlasSettings(), asyncio.Event(), auto_index
+
+    async def test_disabled_starts_nothing_and_says_why(self):
+        from code_atlas.server.mcp import _spawn_indexing
+
+        daemon, settings, ready, auto_index = self._args(False)
+        started: list[object] = []
+        daemon.start = lambda *a, **kw: started.append(a)  # type: ignore[method-assign]
+
+        # graph is only forwarded to daemon.start, which is stubbed here
+        task = _spawn_indexing(daemon, settings, None, catchup=True, auto_index=auto_index, first_index_ready=ready)  # type: ignore[invalid-argument-type]
+
+        assert task is None
+        assert started == []
+        assert "--no-index" in daemon.disabled_reason
+
+    async def test_disabled_still_releases_the_readiness_gate(self):
+        """Nothing else will ever set this event. Left clear, every tool call that needs
+        an index blocks on it for the full readiness timeout before answering -- a
+        query-only server that is slow for no reason."""
+        from code_atlas.server.mcp import _spawn_indexing
+
+        daemon, settings, ready, auto_index = self._args(False)
+        assert not ready.is_set()
+
+        _spawn_indexing(
+            daemon,
+            settings,
+            None,  # type: ignore[invalid-argument-type]
+            catchup=True,
+            auto_index=auto_index,
+            first_index_ready=ready,
+        )
+
+        assert ready.is_set()
+
+    async def test_enabled_starts_the_daemon(self):
+        from code_atlas.server.mcp import _spawn_indexing
+
+        daemon, settings, ready, auto_index = self._args(True)
+        calls: list[dict] = []
+
+        async def fake_start(*_a, **kw):
+            calls.append(kw)
+            return True
+
+        daemon.start = fake_start
+
+        # graph is only forwarded to daemon.start, which is stubbed here
+        task = _spawn_indexing(daemon, settings, None, catchup=True, auto_index=auto_index, first_index_ready=ready)  # type: ignore[invalid-argument-type]
+        assert task is not None
+        await task
+
+        assert calls, "daemon.start was never called"
+        assert calls[0]["catchup"] is True
+        assert daemon.disabled_reason == ""
+
+
 class TestToolTracing:
     """`_tracer` existed in mcp.py from the day telemetry was added and was never used.
 

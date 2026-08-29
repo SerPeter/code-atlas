@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from code_atlas.server.health import (
@@ -86,12 +87,36 @@ def test_report_degraded_when_fail():
 
 
 class _FakeDaemon:
+    """Defaults filled in so each test states only the keys it is about.
+
+    A literal status dict per test means every new field DaemonManager reports breaks
+    five unrelated tests with a KeyError, which is noise, not signal.
+    """
+
+    _DEFAULTS: ClassVar[dict] = {
+        "tasks_running": 0,
+        "tasks_total": 0,
+        "crash_counts": {},
+        "last_crash": {},
+        "disabled_reason": "",
+    }
+
     def __init__(self, status: dict, bus: object | None = None) -> None:
-        self._status = status
+        self._status = {**self._DEFAULTS, **status}
         self.bus = bus
 
     def status(self) -> dict:
         return self._status
+
+
+def test_check_pipeline_reports_a_deliberately_disabled_pipeline():
+    """`--no-index` and a pipeline that died on startup both leave zero tasks running.
+    Reporting the first as "0 task(s) running -- OK" sends someone hunting a bug
+    instead of reading their own configuration."""
+    daemon = _FakeDaemon({"disabled_reason": "indexing disabled (--no-index)"})
+    result = check_pipeline(daemon)  # type: ignore[arg-type]
+    assert result.status == CheckStatus.OK
+    assert "--no-index" in result.message
 
 
 def test_check_pipeline_ok():

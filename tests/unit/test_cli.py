@@ -635,7 +635,7 @@ class TestIndexExitCode:
         monkeypatch.setattr(cli, "_index_single_with_spinner", AsyncMock(return_value=result))
 
         @contextlib.asynccontextmanager
-        async def _lease(_bus):
+        async def _lease(_bus, **_kwargs):
             yield "owner"
 
         monkeypatch.setattr("code_atlas.events.hold_indexer_lease", _lease)
@@ -726,3 +726,48 @@ class TestConfigSectionsRejectUnknownKeys:
         ]
         assert len(sections) >= 15, "expected every atlas.toml section to inherit StrictSection"
         assert all(s.model_config.get("extra") == "forbid" for s in sections)
+
+
+class TestMcpNoIndexFlag:
+    """The flag is only useful if it survives the settings-precedence dance."""
+
+    @staticmethod
+    def _capture(monkeypatch):
+        captured: dict = {}
+
+        def fake_create(_settings, **kwargs):
+            captured.update(kwargs)
+
+            class _Server:
+                def run(self, transport: str) -> None:
+                    pass
+
+            return _Server()
+
+        monkeypatch.setattr("code_atlas.server.mcp.create_mcp_server", fake_create)
+        return captured
+
+    def test_no_index_disables_auto_index(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        result = runner.invoke(app, ["mcp", "--no-index"])
+        assert result.exit_code == 0, result.output
+        assert captured["auto_index"] is False
+
+    def test_default_leaves_indexing_on(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        result = runner.invoke(app, ["mcp"])
+        assert result.exit_code == 0, result.output
+        assert captured["auto_index"] is True
+
+    def test_the_flag_cannot_switch_indexing_back_on(self, monkeypatch):
+        """A config that deliberately disabled indexing wins. The flag only subtracts."""
+        import code_atlas.cli as cli_mod
+
+        captured = self._capture(monkeypatch)
+        base = cli_mod._load_settings()
+        base.mcp.auto_index = False
+        monkeypatch.setattr(cli_mod, "_load_settings", lambda: base)
+
+        result = runner.invoke(app, ["mcp"])
+        assert result.exit_code == 0, result.output
+        assert captured["auto_index"] is False
