@@ -327,7 +327,9 @@ def dream() -> None:
 @app.command()
 def ui(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address. Non-loopback exposes the whole graph."),
-    port: int = typer.Option(8420, "--port", "-p", help="Bind port."),
+    port: int = typer.Option(
+        8420, "--port", "-p", help="Preferred bind port. Moves to the next free one if it is taken."
+    ),
     project: str = typer.Option("", "--project", help="Project to view. Empty = detect from the working directory."),
     reload: bool = typer.Option(False, "--reload", help="Enable debug mode and template auto-reload."),
     export: Path = typer.Option(
@@ -392,6 +394,7 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
         raise typer.Exit(code=1) from None
 
     from code_atlas.backends import create_graph_client
+    from code_atlas.server.web.instances import claim_port, live_instances, registered
     from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -417,9 +420,26 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
             # outward is a deliberate act and is worth saying out loud once.
             logger.warning("Binding {} — the UI has no authentication and exposes the whole graph.", host)
 
+        # Several UIs at once is the normal case, not an error: one per worktree, and
+        # sometimes two sessions in the same one. They all defaulted to 8420, so the
+        # second invocation died on "address already in use". Bind here rather than
+        # letting uvicorn do it, and hand the socket over: a check-then-bind would leave
+        # two simultaneous invocations able to pick the same port and both think they won.
+        peers = live_instances()
+        try:
+            sock, port = claim_port(host, port)
+        except OSError as exc:
+            logger.error("{}", exc)
+            raise typer.Exit(code=1) from exc
+
         _echo(f"code-atlas UI for '{project_name}' — http://{host}:{port}")
+        for peer in peers:
+            if peer.port != port:
+                _echo(f"  also serving: {peer.url} — {peer.project}")
+
         config = uvicorn.Config(app_instance, host=host, port=port, log_level="warning")
-        await uvicorn.Server(config).serve()
+        with registered(host, port, project_name, str(settings.project_root)):
+            await uvicorn.Server(config).serve(sockets=[sock])
     finally:
         await graph.close()
         shutdown_telemetry()

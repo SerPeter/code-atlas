@@ -963,3 +963,113 @@ def _picker(graph: FakeGraph, project: str = "demo"):
     from code_atlas.server.web.services import ProjectPickerService
 
     return ProjectPickerService(cast("GraphBackend", graph), project)
+
+
+class TestUiInstances:
+    """`atlas ui` is run by hand, per checkout, so several are live at once as a matter
+    of course. All of them defaulted to 8420 and the second one died on "address already
+    in use"."""
+
+    @staticmethod
+    def _free_base() -> int:
+        """A port number nothing is using, as a starting point for these tests."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_a_second_claim_moves_to_the_next_port(self):
+        from code_atlas.server.web.instances import claim_port
+
+        base = self._free_base()
+        first, port_a = claim_port("127.0.0.1", base)
+        second, port_b = claim_port("127.0.0.1", base)
+        try:
+            assert port_a == base
+            assert port_b == base + 1, "the second invocation took the first one's port"
+        finally:
+            first.close()
+            second.close()
+
+    def test_the_socket_is_returned_still_bound(self):
+        """Returning the bound socket rather than closing it is the whole point: a
+        check-then-bind leaves two simultaneous invocations able to pick the same port
+        and both believe they won."""
+        from code_atlas.server.web.instances import claim_port, port_is_free
+
+        base = self._free_base()
+        sock, port = claim_port("127.0.0.1", base)
+        try:
+            assert not port_is_free("127.0.0.1", port), "claim_port released the port it claimed"
+        finally:
+            sock.close()
+
+    def test_running_out_of_ports_is_an_error_not_a_silent_reuse(self):
+        from code_atlas.server.web.instances import claim_port
+
+        base = self._free_base()
+        held = []
+        try:
+            for _ in range(3):
+                sock, _port = claim_port("127.0.0.1", base, span=3)
+                held.append(sock)
+            with pytest.raises(OSError, match="No free port"):
+                claim_port("127.0.0.1", base, span=3)
+        finally:
+            for sock in held:
+                sock.close()
+
+    def test_a_record_whose_port_is_free_is_pruned(self, tmp_path, monkeypatch):
+        """The record is a report, not evidence. A hard kill leaves one behind, and the
+        same probe that decides availability is what decides staleness -- which is why
+        no pid liveness check is needed. (os.kill(pid, 0) would be the usual one and
+        terminates the process on Windows.)"""
+        import code_atlas.server.web.instances as mod
+
+        monkeypatch.setattr(mod, "RUNTIME_DIR", tmp_path)
+        base = self._free_base()
+        with mod.registered("127.0.0.1", base, "ghost", "/tmp/ghost"):
+            assert list(tmp_path.glob("*.json"))
+            # nothing is listening on that port — the record outlived its process
+            assert mod.live_instances() == []
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_a_record_whose_port_is_held_survives(self, tmp_path, monkeypatch):
+        import code_atlas.server.web.instances as mod
+
+        monkeypatch.setattr(mod, "RUNTIME_DIR", tmp_path)
+        base = self._free_base()
+        sock, port = mod.claim_port("127.0.0.1", base)
+        try:
+            with mod.registered("127.0.0.1", port, "alive", "/tmp/alive"):
+                live = mod.live_instances()
+                assert [i.project for i in live] == ["alive"]
+                assert live[0].url == f"http://127.0.0.1:{port}"
+        finally:
+            sock.close()
+
+    def test_an_unreadable_record_is_pruned_not_raised(self, tmp_path, monkeypatch):
+        """A record written by an older shape must not break the CLI that reads it."""
+        import code_atlas.server.web.instances as mod
+
+        monkeypatch.setattr(mod, "RUNTIME_DIR", tmp_path)
+        (tmp_path / "127.0.0.1-9999.json").write_text("{not json", encoding="utf-8")
+
+        assert mod.live_instances() == []
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_registration_failure_does_not_stop_the_server(self, tmp_path, monkeypatch):
+        """A UI that cannot write its record still serves perfectly well. Refusing to
+        start over a bookkeeping detail trades a working tool for a nicety."""
+        import code_atlas.server.web.instances as mod
+
+        monkeypatch.setattr(mod, "RUNTIME_DIR", tmp_path / "nested")
+        monkeypatch.setattr(mod.Path, "mkdir", _raise_oserror)
+
+        with mod.registered("127.0.0.1", 8420, "proj", "/tmp/proj"):
+            pass  # must not raise
+
+
+def _raise_oserror(*_args, **_kwargs):
+    raise OSError("read-only filesystem")

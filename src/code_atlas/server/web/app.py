@@ -13,7 +13,8 @@ from urllib.parse import unquote
 
 from litestar import Litestar, Request
 from litestar.di import NamedDependency, Provide
-from litestar.middleware import AbstractMiddleware
+from litestar.enums import ScopeType
+from litestar.middleware import ASGIMiddleware
 from litestar.static_files import create_static_files_router
 from litestar.template.config import TemplateConfig
 
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 _tracer = get_tracer(__name__)
 
 
-class TelemetryMiddleware(AbstractMiddleware):
+class TelemetryMiddleware(ASGIMiddleware):
     """A span and a latency sample per request.
 
     Identified by Litestar's route template rather than the request path. `/entity/abc123`
@@ -63,11 +64,11 @@ class TelemetryMiddleware(AbstractMiddleware):
     but the request counter is "requests that matched a route", not "requests received".
     """
 
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
+    #: HTTP only. A websocket has no status code or route latency in the sense measured
+    #: here, and the UI has no websocket routes anyway.
+    scopes = (ScopeType.HTTP,)
 
+    async def handle(self, scope: Any, receive: Any, send: Any, next_app: Any) -> None:
         method = scope.get("method", "")
         route = _route_template(scope)
         started = time.perf_counter()
@@ -84,7 +85,7 @@ class TelemetryMiddleware(AbstractMiddleware):
             attributes={"http.request.method": method, "http.route": route, "url.path": scope.get("path", "")},
         ) as span:
             try:
-                await self.app(scope, receive, send_wrapper)
+                await next_app(scope, receive, send_wrapper)
             except Exception as exc:
                 mark_span_error(span, exc)
                 status = 500
@@ -213,7 +214,7 @@ def create_app(
         # Litestar's own parameter is `TemplateConfig[EngineType] | None`, so the
         # inferred `TemplateConfig[JinjaTemplateEngine]` reads as a variance error at
         # the call site. Naming the wider type is the fix; the runtime value is the same.
-        middleware=[TelemetryMiddleware],
+        middleware=[TelemetryMiddleware()],
         template_config=template_config,
         debug=debug,
     )
