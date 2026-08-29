@@ -21,7 +21,7 @@ from loguru import logger
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from code_atlas.settings import RedisSettings
 
@@ -184,7 +184,7 @@ async def _await_indexer_lease(bus: Any, owner: str, ttl_ms: int, wait_s: float)
 @asynccontextmanager
 async def hold_indexer_lease(
     bus: Any, *, ttl_ms: int = INDEXER_LEASE_TTL_MS, wait_s: float = 0.0, force: bool = False
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str]:
     """Hold the project's indexer lease for the duration of the block.
 
     Raises :class:`IndexerBusyError` if someone else holds it, rather than indexing anyway —
@@ -255,7 +255,15 @@ class EventBus:
         url = f"redis://{settings.host}:{settings.port}/{settings.db}"
         if settings.password:
             url = f"redis://:{settings.password}@{settings.host}:{settings.port}/{settings.db}"
-        self._redis = aioredis.from_url(url, decode_responses=False)
+        # health_check_interval defaults to 0 -- no checking at all. The daemon and each
+        # MCP server hold this connection for days, so a Valkey restart or an idle
+        # timeout would otherwise surface as a failed publish on next use rather than a
+        # transparent reconnect. 30s is well inside any sensible idle timeout and costs
+        # one PING per idle connection per interval.
+        #
+        # This is the layer that owns connection *liveness*; the scope below owns when a
+        # connection exists at all. A DI container would give you neither.
+        self._redis = aioredis.from_url(url, decode_responses=False, health_check_interval=30)
         self._prefix = settings.stream_prefix
         self._project = project_name
         self._maxlen: int | None = settings.stream_maxlen if settings.stream_maxlen > 0 else None

@@ -7,6 +7,8 @@ Memgraph ``GraphClient``) or its embedded SQLite counterpart.
 
 from __future__ import annotations
 
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -18,11 +20,77 @@ from code_atlas.graph.client import GraphClient
 from code_atlas.settings import derive_project_name
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
     from code_atlas.settings import AtlasSettings
 
-__all__ = ["create_event_bus", "create_graph_client", "graph_backend_label", "queue_backend_label"]
+__all__ = [
+    "Backends",
+    "create_event_bus",
+    "create_graph_client",
+    "graph_backend_label",
+    "queue_backend_label",
+    "use_backends",
+]
+
+
+@dataclass(frozen=True)
+class Backends:
+    """The connections one process owns, handed down rather than reconstructed.
+
+    `bus` is None only when the caller asked for a graph alone -- `atlas search` and
+    `atlas ui` never publish, and opening a queue connection they will not use is a
+    connection to leak.
+    """
+
+    graph: GraphClient | SqliteGraphClient
+    bus: EventBus | SqliteEventBus | None = None
+
+
+@asynccontextmanager
+async def use_backends(
+    settings: AtlasSettings,
+    *,
+    graph: GraphClient | SqliteGraphClient | None = None,
+    bus: EventBus | SqliteEventBus | None = None,
+    with_bus: bool = True,
+) -> AsyncGenerator[Backends]:
+    """Use the connections this process needs, opening only the ones it does not have.
+
+    Named for borrowing rather than for opening or owning, because it may do neither:
+    hand it a live client and it reuses that one untouched. `open_*` promised an open
+    that often does not happen, and "scope" described the mechanism rather than what a
+    caller wants from it.
+
+    The single place a command acquires connections. Before this, eleven CLI entry
+    points each ran their own construct/ping/report/close sequence, and every one was a
+    chance to miss an exit path -- which is how four fixtures came to call pytest.skip()
+    between constructing a client and closing it.
+
+    Pass *graph* or *bus* to reuse a connection the caller already holds. A reused client
+    is deliberately not entered into the stack, so **ownership follows creation**: this
+    closes what it opened and never what it was handed. That distinction is not
+    hypothetical -- the MCP server's health check already holds a live graph and, usually,
+    the daemon's bus, and opening a second connection to the same Memgraph to ask it
+    whether it is reachable would be absurd. It is the same `own_graph`/`own_bus`
+    bookkeeping health.py did by hand, expressed once and structurally.
+
+    AsyncExitStack rather than nested `async with` because both connections are
+    conditional: if the bus fails to open, the stack still unwinds a graph it created,
+    which a hand-written try/finally over two optional objects gets wrong more often
+    than not.
+
+    Reachability stays the caller's business -- `atlas index` exits 1 on an unreachable
+    graph while the MCP server degrades to query-only, and folding that choice in here
+    would force one of them to fight it.
+    """
+    async with AsyncExitStack() as stack:
+        if graph is None:
+            graph = await stack.enter_async_context(await create_graph_client(settings))
+        if bus is None and with_bus:
+            bus = await stack.enter_async_context(await create_event_bus(settings))
+        yield Backends(graph=graph, bus=bus)
 
 
 def _sqlite_queue_path(settings: AtlasSettings) -> Path:

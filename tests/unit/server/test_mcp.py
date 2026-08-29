@@ -1718,7 +1718,7 @@ class TestNoIndexMode:
 
         daemon, settings, ready, auto_index = self._args(False)
         started: list[object] = []
-        daemon.start = lambda *a, **kw: started.append(a)  # type: ignore[method-assign]
+        daemon.start = lambda *a, **kw: started.append(a)
 
         # graph is only forwarded to daemon.start, which is stubbed here
         task = _spawn_indexing(daemon, settings, None, catchup=True, auto_index=auto_index, first_index_ready=ready)  # type: ignore[invalid-argument-type]

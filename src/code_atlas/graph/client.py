@@ -57,7 +57,7 @@ from code_atlas.telemetry import caller_name, get_metrics, get_tracer
 from code_atlas.telemetry import is_enabled as telemetry_enabled
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Generator, Mapping, Sequence
 
     from neo4j import AsyncDriver
 
@@ -85,7 +85,7 @@ _QUERY_PLUMBING = frozenset(
 
 
 @contextmanager
-def _timed_query(kind: str) -> Iterator[None]:
+def _timed_query(kind: str) -> Generator[None]:
     """Record one graph round-trip against the method that made it.
 
     Attributed by *calling method*, not by query text. The text is unusable as a metric

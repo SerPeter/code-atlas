@@ -243,9 +243,9 @@ class _CapturingLogExporter:
 
     def export(self, batch):
         self.records.extend(batch)
-        from opentelemetry.sdk._logs.export import LogExportResult
+        from opentelemetry.sdk._logs.export import LogRecordExportResult
 
-        return LogExportResult.SUCCESS
+        return LogRecordExportResult.SUCCESS
 
     def shutdown(self) -> None:
         pass

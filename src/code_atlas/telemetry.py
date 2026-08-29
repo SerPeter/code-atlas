@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     from code_atlas.settings import ObservabilitySettings
 
@@ -69,7 +69,7 @@ class _NoOpTracer:
         return _NoOpSpan()
 
     @contextmanager
-    def start_span(self, name: str, **kwargs: Any) -> Iterator[_NoOpSpan]:  # noqa: ARG002
+    def start_span(self, name: str, **kwargs: Any) -> Generator[_NoOpSpan]:  # noqa: ARG002
         yield _NoOpSpan()
 
 
@@ -389,7 +389,7 @@ _phase_tracer = _LazyTracer("code_atlas.phase")
 
 
 @contextmanager
-def timed_phase(stage: str, phase: str, **attributes: Any) -> Iterator[Any]:
+def timed_phase(stage: str, phase: str, **attributes: Any) -> Generator[Any]:
     """Time one step of a pipeline stage as *both* a span and a histogram sample.
 
     The two answer different questions and neither substitutes for the other. A span

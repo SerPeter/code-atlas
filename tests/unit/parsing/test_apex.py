@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 pytest.importorskip("tree_sitter_java", reason="tree-sitter-java not installed")
 
@@ -47,7 +47,7 @@ def _labelled(parsed: ParsedFile, label: NodeLabel):
 
 
 @contextmanager
-def _captured_warnings() -> Iterator[list[str]]:
+def _captured_warnings() -> Generator[list[str]]:
     """Collect loguru WARNING output — the project logs through loguru, not stdlib logging."""
     messages: list[str] = []
     sink_id = logger.add(lambda message: messages.append(str(message)), level="WARNING")

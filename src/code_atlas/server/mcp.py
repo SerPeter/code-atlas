@@ -82,7 +82,7 @@ from code_atlas.settings import AtlasSettings, SearchSettings, derive_project_na
 from code_atlas.telemetry import get_metrics, get_tracer, init_telemetry, mark_span_error, shutdown_telemetry
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
 _tracer = get_tracer(__name__)
 
@@ -744,7 +744,7 @@ def create_mcp_server(  # noqa: PLR0915
     """
 
     @asynccontextmanager
-    async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: PLR0915
+    async def app_lifespan(server: FastMCP) -> AsyncGenerator[AppContext]:  # noqa: PLR0915
         init_telemetry(settings.observability, role="mcp", project=derive_project_name(settings.project_root))
 
         # Declared type stays GraphClient (the network backend) — SqliteGraphClient
