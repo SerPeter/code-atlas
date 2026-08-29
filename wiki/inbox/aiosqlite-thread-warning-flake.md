@@ -40,38 +40,29 @@ either, so a live aiosqlite connection was abandoned on every run. Fixed in `d59
 That was the whole of it for unit: **2785 tests now pass under `-W error::ResourceWarning`, twice**, where both prior
 runs failed deterministically. So the unit suite can carry that flag as a real guard.
 
-## Integration: the drivers were test-side, the redis pools are not
+## Integration, measured by object across three runs
 
-Running `-m integration -W error::ResourceWarning` reported, by object:
+| object                     | before | after `17349c9` | after `152c13a` |
+| -------------------------- | ------ | --------------- | --------------- |
+| `_ProactorSocketTransport` | 6      | —               | 4               |
+| `socket.socket`            | 6      | —               | 4               |
+| `neo4j AsyncBoltDriver`    | 4      | —               | **4**           |
+| `redis.asyncio Connection` | 2      | —               | **0**           |
 
-| count | object                     | outcome                                       |
-| ----- | -------------------------- | --------------------------------------------- |
-| 6     | `_ProactorSocketTransport` | below our clients — the known unfixable class |
-| 6     | `socket.socket`            | same                                          |
-| 4     | `neo4j AsyncBoltDriver`    | **fixed** in `17349c9`                        |
-| 2     | `redis.asyncio Connection` | **open** — see below                          |
+**The EmbedClient fix removed the redis pools.** It had no `close()`, no `__aenter__` and no `__aexit__` while owning a
+`RateLimiter` that holds a pool, at eight construction sites. Fixed in `152c13a`; the two unclosed Connections are gone.
 
-The four Bolt drivers were three test sites that close in a `finally` but do their _setup_ before the `try`: two seeding
-writes in `test_infra_isolation`, and in `test_relationship_coverage` a `pytest.skip()` on ping failure — the same leak
-already fixed in the four infra fixtures — followed by `ensure_schema` and a whole `index_project` run, all outside the
-guard. Those two files now pass 39 tests with zero unclosed objects.
+**The driver count did not move, and `17349c9`'s commit message implies it should have.** That message reads as though
+the three test sites it fixed were the four observed drivers. They were not. Those sites leak only when the setup
+_between the constructor and the `try`_ raises — a seeding write, a `pytest.skip` on an unreachable Memgraph, a failing
+`index_project`. In a green run none of that raises, so they never leaked and fixing them removed nothing observable.
+The fix is still right, because the bug is real the moment anything there fails; it is preventive, not corrective.
 
-This also corrects the `filterwarnings` comment's claim that the objects are only transport internals below our clients.
-Two of the four categories were above that line.
-
-### Still open: EmbedClient has no lifecycle at all
-
-`EmbedClient` constructs a `RateLimiter` (`embeddings.py:101`), which holds a redis connection pool — and `EmbedClient`
-has no `close()`, no `__aenter__`, no `__aexit__`. It is constructed at **eight** sites and closed at none:
-
-- `cli.py:590` (the dimension probe), `cli.py:949`
-- `indexing/daemon.py:164`
-- `indexing/orchestrator.py:2030`, `:2313`
-- `server/health.py:468`, `server/mcp.py:229`, `:822`
-
-`RateLimiter` gained the protocol in `8b3f0de`, so the owner above it is what is missing. This is product code, not test
-scaffolding — unlike everything else in this note — so it is left for a deliberate pass rather than folded into a test
-cleanup.
+So four unclosed `AsyncBoltDriver`s remain and their source is still unfound. They surface against the
+`test_git_signals` CLI tests, but that attribution is GC timing and means little. Every `GraphClient` in the tree is
+accounted for: `cli.py:605` inside its stack, `use_backends` which closes what it opened, and test sites that are all
+now scoped or in a `finally`. Finding it needs `-X tracemalloc` on integration, which is too slow to run casually — one
+attempt reached two tests in eight minutes.
 
 ## If it gets fixed
 
