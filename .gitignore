@@ -76,3 +76,6 @@ wiki/HOME.md
 .env
 .env.*
 !.env.dist
+
+# pytest-testmon's change-impact database (local iteration only)
+.testmondata*

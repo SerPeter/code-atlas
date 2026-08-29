@@ -163,6 +163,20 @@ times. Almost all of that is avoidable.
   once _per worker_, so with the env overrides unset each worker gets its own container and is isolated —
   but with them set, every worker shares one instance and they wipe each other's data mid-test. The
   failures look like nondeterministic product bugs.
+- **Iterate with `--testmon`, gate without it.** `uv run pytest --testmon` runs only the
+  tests its dependency database says your changes can affect. The first run pays for a full
+  pass to build `.testmondata`; after that a one-file edit runs seconds of tests instead of
+  minutes. It is **not compatible with `-n`** (xdist), and it trusts a database rather than
+  the test selection you would make by hand -- so it is an iteration tool and never the
+  final gate. Delete `.testmondata` if selection ever looks wrong.
+- **A hang now fails.** `--timeout=300` (thread method, the portable one) is in `addopts`.
+  It is a tripwire for "this will never finish", not a performance budget -- the slowest
+  legitimate test is two orders of magnitude under it. If one test genuinely needs longer,
+  mark it `@pytest.mark.timeout(N)`; do not raise the global value. This exists because a
+  lease-wait regression made one daemon test sit for its full 600s budget: it **passed**,
+  and the only symptom was the unit suite going from ~60s to 623s, which reads as green.
+- **Watch the suite's wall-clock, not just the count.** Unit is ~50s with `-n auto`. A run
+  that takes ten times that has told you something, even when every test passes.
 - **Never pass an extra `-q`.** `addopts` already contains one; a second makes `-qq`, which suppresses the
   totals line entirely. That has repeatedly produced "tests pass" reports with no count behind them.
 

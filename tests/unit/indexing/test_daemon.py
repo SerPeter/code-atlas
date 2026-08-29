@@ -377,7 +377,15 @@ class TestStartupCatchup:
         settings.index.lease_wait_s = 0
 
         manager = DaemonManager()
-        started = await manager.start(settings, object(), include_watcher=False)  # type: ignore[arg-type]
+        # Bounded at 5s, not left to the suite's 300s cap. `start()` is the call that
+        # blocks, and this file's other eleven timeouts are all on the things its author
+        # expected to block -- consumer/watcher readiness, task completion. So when
+        # catch-up gained a lease wait, this test quietly took the entire budget and
+        # still passed. A tight bound turns that into a failure in seconds.
+        started = await asyncio.wait_for(
+            manager.start(settings, object(), include_watcher=False),  # type: ignore[arg-type]
+            timeout=5.0,
+        )
         assert started is True
         await asyncio.sleep(0.05)
 

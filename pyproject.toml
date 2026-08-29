@@ -116,6 +116,14 @@ dev = [
     "pytest-asyncio~=1.1",
     "pytest-cov~=7.0",
     "pytest-xdist~=3.8",
+    # A wall-clock cap per test. Added after a lease-wait regression made one daemon test
+    # sit for its full 600s budget: it still PASSED, and the unit suite went from ~60s to
+    # 623s with nothing to read but a green count. A hang is a failure; without this it
+    # looks like patience.
+    "pytest-timeout~=2.4",
+    # Runs only the tests affected by the current diff. Not compatible with -n (xdist), so
+    # it is an iteration tool, never the gate -- see CLAUDE.md.
+    "pytest-testmon~=2.1",
     "pre-commit~=4.5",
     "ruff~=0.15",
     "ty==0.0.15",             # pinned exact: 0.0.60 stopped honoring existing `# type: ignore[...]` comments and got much stricter about dict variance, surfacing 182 diagnostics across ~25 unrelated files — pre-1.0 tool, revisit deliberately
@@ -166,6 +174,15 @@ addopts = [
     # Vendored corpus for the extraction-coverage floors — real third-party
     # sources, not tests. Some are named test_*.py upstream.
     "--ignore=tests/fixtures",
+    # A wall-clock cap per test, so a hang fails instead of looking like patience.
+    # Deliberately generous: it is a tripwire for "this will never finish", not a
+    # performance budget. The slowest legitimate test here is an integration index,
+    # two orders of magnitude under this. Raise it for one test with
+    # @pytest.mark.timeout(N) rather than raising it globally.
+    "--timeout=300",
+    # signal-based timeouts do not exist on Windows; thread is the portable method and
+    # dumps the stack of every thread when it fires, which names the hang.
+    "--timeout-method=thread",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
