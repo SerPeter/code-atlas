@@ -187,6 +187,9 @@ Running several agent sessions against **one** checkout? Give the extra ones
 (or a `atlas daemon start`) should watch and index a given checkout. The others just
 query.
 
+Several `atlas ui` at once (one per worktree, say) is fine too: each takes the first
+free port from 8420 upward and prints where the others are serving.
+
 See [CLI usage guide](wiki/guides/usage.md) for more commands and options.
 
 ### Development

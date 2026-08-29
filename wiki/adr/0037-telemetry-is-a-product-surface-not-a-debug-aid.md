@@ -41,11 +41,26 @@ must be verified against a running backend, not asserted.
 3. loguru is bridged to OTLP logs through OTel's `LoggingHandler`, which stamps each record with the active span's trace
    and span id. Correlation is therefore structural, not a convention. The OTLP sink has its own level, separate from
    the console: DEBUG is useful locally and ruinous as remote volume at one line per file across a 60k-file index.
-4. The resource names the process — role, project, `service.instance.id`. A daemon plus one MCP server per agent session
-   per worktree all reporting at once is the normal shape of this deployment, not an edge case.
+4. The resource names the process well enough to separate every way atlas processes overlap. One collector serves them
+   all, and the three overlaps need three different discriminators:
+
+   | Overlap                         | Discriminator         | Why the others do not suffice                             |
+   | ------------------------------- | --------------------- | --------------------------------------------------------- |
+   | Several repos                   | `atlas.project`       | —                                                         |
+   | Several worktrees of one repo   | `atlas.root`          | `atlas.project` is the directory name; basenames collide  |
+   | Several processes, one worktree | `service.instance.id` | host:pid — shares its prefix with the indexer lease owner |
+
+   `atlas.indexing` is deliberately separate from `atlas.role`. An MCP server started without `--no-index` runs the
+   watcher and pipeline itself, so `role="mcp"` covered both a query-only server and the machine's only indexer. "Who is
+   actually indexing this checkout" is the first question asked when nothing is being indexed, or when two things are,
+   and role could not answer it.
+
 5. Backlog, batch outcome, events consumed, embedding provenance and watcher activity are exported where the values
    already exist.
-6. The backends ship as `docker compose --profile telemetry`: VictoriaMetrics, VictoriaLogs, VictoriaTraces, an OTel
+6. The web UI, which had never called `init_telemetry` at all, reports `role="web"` and carries a span and a latency
+   sample per request — identified by Litestar's route template rather than the request path, since per-path series is
+   how a metrics database is taken down by its own instrumentation.
+7. The backends ship as `docker compose --profile telemetry`: VictoriaMetrics, VictoriaLogs, VictoriaTraces, an OTel
    Collector, and Grafana with datasources provisioned as code.
 
 ## Consequences
@@ -62,6 +77,20 @@ match, not because a field was named `trace_id`.
 Cost: the OTel packages remain an optional extra, so nothing changes for a default install. With telemetry off, tracer
 handles resolve to no-ops, no log sink is installed, and the daemon does not start its backlog sampler — the sampler is
 an XINFO round-trip on a timer and would otherwise run forever for nobody.
+
+One measurement is narrower than it looks, deliberately. Litestar applies middleware inside routing, so an unrouted path
+never reaches the telemetry middleware: `atlas_web_requests` counts requests that matched a route, not requests
+received. That was verified rather than assumed, and it cuts both ways — a 404 sweep cannot mint one metric series per
+probed URL. A test pins the behaviour, so a future Litestar that moves middleware outside routing surfaces as a failure
+rather than as a silent change of meaning.
+
+VictoriaMetrics promotes resource attributes to metric labels, so concurrent processes do not overwrite each other's
+counters — verified with two processes writing the same instrument under different roots. The price is that
+`service_instance_id` is host:pid, so every process start mints a new series set. That is correct for the question it
+answers ("which of the two servers in this worktree") and cheap for long-lived daemons, but a frequently-run
+`atlas index` accumulates series over the retention window. If cardinality ever becomes the problem, the fix is to strip
+`service.instance.id` and `process.pid` from the collector's **metrics** pipeline only — logs and traces need them and
+cost nothing to keep.
 
 Grafana (3000) and VictoriaMetrics (8428) use popular ports. A second local stack — the trading-engine monitoring
 compose is the obvious one — will collide, and the host-side mapping is the place to fix that.
