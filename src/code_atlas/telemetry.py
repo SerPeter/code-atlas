@@ -85,6 +85,9 @@ class _NoOpMeter:
     def create_histogram(self, name: str, **kwargs: Any) -> _NoOpHistogram:  # noqa: ARG002
         return _NoOpHistogram()
 
+    def create_observable_gauge(self, name: str, **kwargs: Any) -> None:  # noqa: ARG002
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Singleton state
@@ -94,22 +97,87 @@ _initialized: bool = False
 _enabled: bool = False
 
 # ---------------------------------------------------------------------------
-# Factory functions (safe to call at module level)
+# Lazy handles
+#
+# Every module in this package binds its tracer once, at import time
+# (``_tracer = get_tracer(__name__)``), and every entry point imports its
+# dependencies *before* it reads settings and calls ``init_telemetry`` --
+# ``cli.mcp`` imports ``server.mcp`` (and transitively graph, engine, consumers,
+# events) on its first line, then initializes telemetry three lines later.
+#
+# So a factory that decided on ``_enabled`` at call time froze all ~25 span sites
+# in the codebase as no-ops *even with telemetry enabled and OTel installed*.
+# Measured, not theorized: after ``init_telemetry``, ``graph.client._tracer`` was
+# still a ``_NoOpTracer`` while a fresh ``get_tracer()`` returned a real
+# ``Tracer``. Nothing errored and nothing was logged -- the traces were simply
+# never emitted, which is the worst failure mode an observability layer has.
+#
+# Metrics were never affected: ``get_metrics()`` is called at use time and reads
+# the module global that ``init_telemetry`` rebinds. That asymmetry is why the
+# hole survived -- whatever dashboard existed had numbers on it.
 # ---------------------------------------------------------------------------
+
+_NOOP_TRACER = _NoOpTracer()
+_NOOP_METER = _NoOpMeter()
+
+
+class _LazyTracer:
+    """Tracer handle that resolves on first use after ``init_telemetry``."""
+
+    __slots__ = ("_name", "_real")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._real: Any = None
+
+    def _resolve(self) -> Any:
+        if not (_HAS_OTEL and _enabled):
+            return _NOOP_TRACER
+        if self._real is None:
+            self._real = otel_trace.get_tracer(self._name)
+        return self._real
+
+    def start_as_current_span(self, name: str, **kwargs: Any) -> Any:
+        return self._resolve().start_as_current_span(name, **kwargs)
+
+    def start_span(self, name: str, **kwargs: Any) -> Any:
+        return self._resolve().start_span(name, **kwargs)
+
+
+class _LazyMeter:
+    """Meter handle that resolves on first use after ``init_telemetry``."""
+
+    __slots__ = ("_name", "_real")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._real: Any = None
+
+    def _resolve(self) -> Any:
+        if not (_HAS_OTEL and _enabled):
+            return _NOOP_METER
+        if self._real is None:
+            self._real = otel_metrics.get_meter(self._name)
+        return self._real
+
+    def create_counter(self, name: str, **kwargs: Any) -> Any:
+        return self._resolve().create_counter(name, **kwargs)
+
+    def create_histogram(self, name: str, **kwargs: Any) -> Any:
+        return self._resolve().create_histogram(name, **kwargs)
+
+    def create_observable_gauge(self, name: str, **kwargs: Any) -> Any:
+        return self._resolve().create_observable_gauge(name, **kwargs)
 
 
 def get_tracer(name: str) -> Any:
-    """Return an OTel ``Tracer`` or a ``_NoOpTracer``."""
-    if _HAS_OTEL and _enabled:
-        return otel_trace.get_tracer(name)
-    return _NoOpTracer()
+    """Return a tracer handle. Safe to call at module import time."""
+    return _LazyTracer(name)
 
 
 def get_meter(name: str) -> Any:
-    """Return an OTel ``Meter`` or a ``_NoOpMeter``."""
-    if _HAS_OTEL and _enabled:
-        return otel_metrics.get_meter(name)
-    return _NoOpMeter()
+    """Return a meter handle. Safe to call at module import time."""
+    return _LazyMeter(name)
 
 
 # ---------------------------------------------------------------------------

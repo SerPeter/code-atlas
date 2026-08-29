@@ -64,22 +64,19 @@ class TestFactoryFunctions:
     """Factory functions return no-ops when telemetry is not initialized."""
 
     def test_get_tracer_returns_noop_when_not_enabled(self) -> None:
-        from code_atlas.telemetry import _NoOpTracer, get_tracer
+        from code_atlas.telemetry import _NoOpSpan, _NoOpTracer, get_tracer
 
         tracer = get_tracer("test.module")
-        # When not enabled, always a no-op (or OTel's own no-op tracer)
-        # Either way, start_as_current_span should work
-        span = tracer.start_as_current_span("test")
-        if isinstance(tracer, _NoOpTracer):
-            assert isinstance(span, type(span))  # just check it doesn't explode
+        assert isinstance(tracer._resolve(), _NoOpTracer)
+        assert isinstance(tracer.start_as_current_span("test"), _NoOpSpan)
 
     def test_get_meter_returns_noop_when_not_enabled(self) -> None:
-        from code_atlas.telemetry import _NoOpMeter, get_meter
+        from code_atlas.telemetry import _NoOpCounter, _NoOpHistogram, _NoOpMeter, get_meter
 
         meter = get_meter("test.module")
-        if isinstance(meter, _NoOpMeter):
-            counter = meter.create_counter("test")
-            counter.add(1)
+        assert isinstance(meter._resolve(), _NoOpMeter)
+        assert isinstance(meter.create_counter("test"), _NoOpCounter)
+        assert isinstance(meter.create_histogram("test"), _NoOpHistogram)
 
     def test_get_metrics_returns_dataclass(self) -> None:
         from code_atlas.telemetry import get_metrics
@@ -145,6 +142,85 @@ class TestInitTelemetry:
         mod._initialized = False
         mod._enabled = False
         shutdown_telemetry()  # should not raise
+
+
+class _StubTracer:
+    """Stands in for an OTel ``Tracer`` so this runs without the ``[otel]`` extra."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _StubApi:
+    """Stands in for ``opentelemetry.trace`` / ``opentelemetry.metrics``."""
+
+    def get_tracer(self, name: str) -> _StubTracer:
+        return _StubTracer(name)
+
+    def get_meter(self, name: str) -> _StubTracer:
+        return _StubTracer(name)
+
+
+class TestLazyResolution:
+    """Handles bound at import time must still trace once telemetry is switched on.
+
+    This is the shape of the real defect: every module does
+    ``_tracer = get_tracer(__name__)`` at import, and every entry point imports its
+    dependencies before it calls ``init_telemetry``. A factory that decided on
+    ``_enabled`` at *call* time therefore handed out permanent no-ops, and all ~25
+    span sites in the package silently emitted nothing with telemetry fully enabled.
+
+    Stubbing the OTel boundary rather than skipping without it is deliberate: the
+    defect was in this module's binding logic, not in OTel, so the test that pins it
+    must run on every CI job -- including the ones without the extra installed.
+    """
+
+    def test_tracer_bound_before_init_resolves_after(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import code_atlas.telemetry as mod
+
+        tracer = mod.get_tracer("bound.early")
+        assert isinstance(tracer._resolve(), mod._NoOpTracer), "must be inert while disabled"
+
+        monkeypatch.setattr(mod, "_HAS_OTEL", True)
+        monkeypatch.setattr(mod, "otel_trace", _StubApi(), raising=False)
+        monkeypatch.setattr(mod, "_enabled", True)
+
+        resolved = tracer._resolve()
+        assert isinstance(resolved, _StubTracer), "a handle taken before init stayed a no-op"
+        assert resolved.name == "bound.early"
+        assert tracer._resolve() is resolved, "resolution should be cached, not re-derived per span"
+
+    def test_meter_bound_before_init_resolves_after(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import code_atlas.telemetry as mod
+
+        meter = mod.get_meter("bound.early")
+        assert isinstance(meter._resolve(), mod._NoOpMeter)
+
+        monkeypatch.setattr(mod, "_HAS_OTEL", True)
+        monkeypatch.setattr(mod, "otel_metrics", _StubApi(), raising=False)
+        monkeypatch.setattr(mod, "_enabled", True)
+
+        assert isinstance(meter._resolve(), _StubTracer)
+
+    def test_module_level_tracers_are_lazy(self) -> None:
+        """The regression is only prevented if the real modules use the lazy handle.
+
+        A future refactor that resolves eagerly again would leave these as plain
+        ``_NoOpTracer`` instances and reintroduce the silent hole.
+        """
+        import code_atlas.events
+        import code_atlas.graph.client
+        import code_atlas.indexing.consumers
+        import code_atlas.search.engine
+        import code_atlas.telemetry as mod
+
+        for module in (
+            code_atlas.events,
+            code_atlas.graph.client,
+            code_atlas.indexing.consumers,
+            code_atlas.search.engine,
+        ):
+            assert isinstance(module._tracer, mod._LazyTracer), f"{module.__name__} binds a frozen tracer"
 
 
 # ---------------------------------------------------------------------------
