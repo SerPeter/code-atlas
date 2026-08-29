@@ -9,6 +9,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# `uv sync --locked` rather than a bare `uv sync`, in every job. A bare sync
+# silently *updates* a stale lockfile instead of failing, which is precisely how
+# uv.lock sat at 0.7.0 while pyproject.toml said 0.8.4 across several releases with
+# nothing to notice. --locked asserts the lock is up to date with pyproject and
+# errors if it is not, so drift is a red PR instead of an invisible rewrite.
+#
+# Not --frozen: that installs the lock without checking it against pyproject, which
+# is the same blind spot wearing a different hat.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -20,7 +28,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14-dev"
-      - run: uv sync --group dev --all-extras
+      - run: uv sync --locked --group dev --all-extras
       - run: uv run ruff check .
 
   format:
@@ -33,7 +41,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14-dev"
-      - run: uv sync --group dev --all-extras
+      - run: uv sync --locked --group dev --all-extras
       - run: uv run ruff format --check .
 
   typecheck:
@@ -46,7 +54,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14-dev"
-      - run: uv sync --group dev --all-extras
+      - run: uv sync --locked --group dev --all-extras
       - run: uv run ty check
 
   test:
@@ -59,7 +67,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14-dev"
-      - run: uv sync --group dev --all-extras
+      - run: uv sync --locked --group dev --all-extras
       - run: uv run pytest -m "not integration and not bench and not tei"
 
   # The suite that actually validates the product. CI ran only
@@ -98,7 +106,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14-dev"
-      - run: uv sync --group dev --all-extras
+      - run: uv sync --locked --group dev --all-extras
       # Pointing the tests at the service containers rather than letting
       # testcontainers start its own: one instance, already health-gated by the job.
       #
