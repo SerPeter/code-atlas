@@ -40,38 +40,32 @@ either, so a live aiosqlite connection was abandoned on every run. Fixed in `d59
 That was the whole of it for unit: **2785 tests now pass under `-W error::ResourceWarning`, twice**, where both prior
 runs failed deterministically. So the unit suite can carry that flag as a real guard.
 
-## Integration, measured by object across three runs
+## Resolved
 
-| object                     | before | after `17349c9` | after `152c13a` |
-| -------------------------- | ------ | --------------- | --------------- |
-| `_ProactorSocketTransport` | 6      | —               | 4               |
-| `socket.socket`            | 6      | —               | 4               |
-| `neo4j AsyncBoltDriver`    | 4      | —               | **4**           |
-| `redis.asyncio Connection` | 2      | —               | **0**           |
+All of it. The flake was a symptom, never a plumbing problem.
 
-**The EmbedClient fix removed the redis pools.** It had no `close()`, no `__aenter__` and no `__aexit__` while owning a
-`RateLimiter` that holds a pool, at eight construction sites. Fixed in `152c13a`; the two unclosed Connections are gone.
+| leak                                                              | fix       |
+| ----------------------------------------------------------------- | --------- |
+| aiosqlite connection abandoned by `test_hidden_on_sqlite_backend` | `d592eaf` |
+| 8 `EmbedClient` sites with no lifecycle at all                    | `152c13a` |
+| 4 Bolt drivers held unclosable by a class-level `close` mock      | `8753e43` |
 
-**The driver count did not move, and `17349c9`'s commit message implies it should have.** That message reads as though
-the three test sites it fixed were the four observed drivers. They were not. Those sites leak only when the setup
-_between the constructor and the `try`_ raises — a seeding write, a `pytest.skip` on an unreachable Memgraph, a failing
-`index_project`. In a green run none of that raises, so they never leaked and fixing them removed nothing observable.
-The fix is still right, because the bug is real the moment anything there fails; it is preventive, not corrective.
+The last one is the interesting one. Two `test_git_signals` tests tried to hand the CLI the fixture's connection with
+`monkeypatch.setattr("code_atlas.graph.client.GraphClient", ...)`, but `backends/__init__.py` binds `GraphClient` at
+import, so the patch missed and a second real driver was built anyway -- the exact thing it existed to prevent. The
+accompanying `monkeypatch.setattr(GraphClient, "close", AsyncMock())` then made that driver, and the fixture's,
+impossible to close. Two tests, two drivers each.
 
-So four unclosed `AsyncBoltDriver`s remain and their source is still unfound. They surface against the
-`test_git_signals` CLI tests, but that attribution is GC timing and means little. Every `GraphClient` in the tree is
-accounted for: `cli.py:605` inside its stack, `use_backends` which closes what it opened, and test sites that are all
-now scoped or in a `finally`. Finding it needs `-X tracemalloc` on integration, which is too slow to run casually — one
-attempt reached two tests in eight minutes.
+The sockets and `_ProactorSocketTransport`s were downstream of those drivers, not the unfixable asyncio internals the
+`filterwarnings` comment claimed. With the drivers fixed they disappeared too, so `ignore::ResourceWarning` came out in
+`fdbc22a` and the warning is fatal again.
 
-## If it gets fixed
+**Eight consecutive clean unit runs** against a rate that was roughly one in four, plus integration clean with the
+warning fatal.
 
-A narrow ignore keyed on the thread name would do it, and would keep every other thread exception fatal:
+### How to find the next one
 
-```toml
-"ignore:Exception in thread Thread-\d+ \(_connection_worker_thread\):pytest.PytestUnhandledThreadExceptionWarning",
-```
-
-Worth checking first whether an aiosqlite connection is genuinely being abandoned somewhere — the narrow ignore silences
-the messenger either way, and the reason `ResourceWarning` was ignored wholesale was that the objects were transport
-internals below our clients. That argument has not been re-established for this one.
+Not tracemalloc -- it never finished on the integration suite, reaching two tests in eight minutes. Wrap the factory and
+hang a `weakref.finalize` on each object, checking a `closed` flag the wrapper sets. A first attempt that looked for
+objects _still alive and unclosed at session end_ reported zero and proved nothing: a leaked object is collected
+mid-run, and that is exactly when it warns, so the check skipped the entire population it was hunting.
