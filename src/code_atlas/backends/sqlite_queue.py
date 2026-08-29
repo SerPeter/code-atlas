@@ -328,6 +328,17 @@ class SqliteEventBus:
         await conn.commit()
         return True
 
+    async def force_acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        """Take the lease out from under whoever holds it. See EventBus for why."""
+        conn = await self._get_conn()
+        await conn.execute(
+            "INSERT INTO leases(name, owner, expires_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at",
+            (self._LEASE_NAME, owner, time.time() + ttl_ms / 1000.0),
+        )
+        await conn.commit()
+        return True
+
     async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
         conn = await self._get_conn()
         cur = await conn.execute(

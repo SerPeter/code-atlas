@@ -194,6 +194,7 @@ class TierConsumer(ABC):
         *,
         project_filter: set[str] | None = None,
         defer_to_lease: bool = False,
+        lease_owner: str | None = None,
         abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
         stale_consumer_idle_ms: int = _STALE_CONSUMER_IDLE_MS,
     ) -> None:
@@ -210,7 +211,14 @@ class TierConsumer(ABC):
         # Long-lived consumers (daemon, MCP server) stand down while a CLI index holds the
         # lease; a CLI index's own inline consumers hold it and must not wait on it.
         self.defer_to_lease = defer_to_lease
-        self._lease_owner: str | None = None
+        # Whose lease is *ours*. Until a persistent indexer existed nothing ever set
+        # this: the daemon released its lease as soon as catch-up finished, so every
+        # holder it could see afterwards genuinely was foreign and None was right by
+        # accident. `atlas index --watch` holds its lease for the whole session, so
+        # without this its own consumers would stand down against it and the pipeline
+        # would idle forever with a full backlog -- the exact symptom the lease exists
+        # to prevent, produced by the guard against it.
+        self._lease_owner: str | None = lease_owner
         self._lease_waiting = False
         # Injectable so crash recovery is testable: a test cannot wait out the production
         # threshold, and an untestable recovery path is how the old shared consumer name
@@ -681,6 +689,7 @@ class ASTConsumer(TierConsumer):
         policy: BatchPolicy | None = None,
         cooldown_s: float = 0.0,
         defer_to_lease: bool = False,
+        lease_owner: str | None = None,
         abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
     ) -> None:
         super().__init__(
@@ -691,6 +700,7 @@ class ASTConsumer(TierConsumer):
             policy=policy or BatchPolicy(time_window_s=3.0, max_batch_size=30),
             project_filter=project_filter,
             defer_to_lease=defer_to_lease,
+            lease_owner=lease_owner,
             abandoned_min_idle_ms=abandoned_min_idle_ms,
         )
         self.graph = graph
@@ -1555,6 +1565,7 @@ class EmbedConsumer(TierConsumer):
         policy: BatchPolicy | None = None,
         max_concurrency: int | None = None,
         defer_to_lease: bool = False,
+        lease_owner: str | None = None,
         abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
     ) -> None:
         _max_conc = max_concurrency or embed.max_concurrency
@@ -1570,6 +1581,7 @@ class EmbedConsumer(TierConsumer):
             ),
             project_filter=project_filter,
             defer_to_lease=defer_to_lease,
+            lease_owner=lease_owner,
             abandoned_min_idle_ms=abandoned_min_idle_ms,
         )
         self.graph = graph

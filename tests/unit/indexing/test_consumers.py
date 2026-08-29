@@ -806,3 +806,81 @@ class TestAdaptiveResolveCadence:
         for i, buf in enumerate(buffers):
             buf.append(object())  # type: ignore[arg-type]
             assert consumer._pending_rel_count() == i + 1, "a buffer is missing from the count"
+
+
+class _LeaseBus:
+    """Just enough bus for the stand-down check."""
+
+    def __init__(self, holder: str | None) -> None:
+        self.holder = holder
+        self.reads = 0
+
+    async def read_indexer_lease(self) -> str | None:
+        self.reads += 1
+        return self.holder
+
+
+class TestStandDownForAForeignLease:
+    """`_lease_owner` was initialised to None and never assigned by anything.
+
+    It read as harmless because the daemon released its lease the moment catch-up
+    finished, so every holder a consumer saw afterwards genuinely was foreign. A
+    persistent indexer (`atlas index --watch`) keeps its lease for the whole session,
+    and against that the daemon's own consumers would have stood down for their own
+    caller -- idling forever with a full backlog, which is the exact symptom the lease
+    exists to prevent, produced by the guard against it.
+    """
+
+    @staticmethod
+    def _consumer(bus, **kwargs):
+        class _Probe(TierConsumer):
+            async def process_batch(self, events, batch_id):  # pragma: no cover - never reached
+                return None
+
+        return _Probe(
+            bus,
+            Topic.FILE_CHANGED,
+            group="g",
+            consumer_name="probe",
+            policy=BatchPolicy(max_batch_size=1, time_window_s=0),
+            **kwargs,
+        )
+
+    async def test_a_consumer_does_not_stand_down_for_its_own_lease(self):
+        bus = _LeaseBus(holder="host:1:mine")
+        consumer = self._consumer(bus, defer_to_lease=True, lease_owner="host:1:mine")
+
+        await asyncio.wait_for(consumer._defer_to_foreign_lease(), timeout=2)
+
+        assert bus.reads == 1
+
+    async def test_a_consumer_stands_down_for_someone_else(self):
+        bus = _LeaseBus(holder="host:2:theirs")
+        consumer = self._consumer(bus, defer_to_lease=True, lease_owner="host:1:mine")
+
+        task = asyncio.create_task(consumer._defer_to_foreign_lease())
+        await asyncio.sleep(0.05)
+        assert not task.done(), "should still be waiting for a foreign lease"
+
+        bus.holder = None  # the other indexer finished
+        await asyncio.wait_for(task, timeout=5)
+
+    async def test_no_owner_means_every_lease_is_foreign(self):
+        """The previous behaviour, still correct for a consumer that holds no lease."""
+        bus = _LeaseBus(holder="host:2:theirs")
+        consumer = self._consumer(bus, defer_to_lease=True)
+
+        task = asyncio.create_task(consumer._defer_to_foreign_lease())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+
+        consumer._stop = True
+        await asyncio.wait_for(task, timeout=5)
+
+    async def test_a_consumer_that_does_not_defer_never_asks(self):
+        bus = _LeaseBus(holder="host:2:theirs")
+        consumer = self._consumer(bus, defer_to_lease=False)
+
+        await asyncio.wait_for(consumer._defer_to_foreign_lease(), timeout=2)
+
+        assert bus.reads == 0

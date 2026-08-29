@@ -222,6 +222,20 @@ def index(
         "--co-change-threshold",
         help="Minimum shared commits for a CO_CHANGES_WITH edge (used with --with-git-signals).",
     ),
+    watch: bool = typer.Option(
+        False,
+        "--watch",
+        help="Stay running after the index and keep watching the files, holding the indexer "
+        "lease. Lets a checkout have one persistent indexer that is not an MCP server, so "
+        "every 'atlas mcp' there can run --no-index.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Take the indexer lease even if another process holds it, instead of waiting. "
+        "For a lease left behind by a process that is gone; if that process is in fact alive, "
+        "two indexers will write the same nodes.",
+    ),
 ) -> None:
     """Index a codebase into the graph."""
     asyncio.run(
@@ -234,6 +248,8 @@ def index(
             no_git_check=no_git_check,
             with_git_signals=with_git_signals,
             co_change_threshold=co_change_threshold,
+            watch=watch,
+            force=force,
         )
     )
 
@@ -514,6 +530,8 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     no_git_check: bool = False,
     with_git_signals: bool = False,
     co_change_threshold: int = 3,
+    watch: bool = False,
+    force: bool = False,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
     from code_atlas.backends import create_event_bus, create_graph_client, graph_backend_label, queue_backend_label
@@ -529,7 +547,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         settings.embeddings.enabled = False
     init_telemetry(
         settings.observability,
-        role="index",
+        role="watch" if watch else "index",
         project=derive_project_name(settings.project_root),
         root=str(settings.project_root),
         indexing=True,
@@ -584,7 +602,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     from code_atlas.events import IndexerBusyError, hold_indexer_lease
 
     try:
-        lease = hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s)
+        lease = hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s, force=force)
         owner = await lease.__aenter__()
     except IndexerBusyError as exc:
         logger.error("{}", exc)
@@ -688,15 +706,27 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                     _echo("WARNING: pipeline did not drain — index incomplete; re-run 'atlas index' to retry")
                 if git_signals_stats is not None:
                     _echo(_git_signals_summary_line(git_signals_stats, co_change_threshold))
+        if watch:
+            # Inside the try, so the lease is still held: a persistent indexer that
+            # released it would let every MCP server in the worktree start its own
+            # catch-up against the same graph, which is the collision this whole
+            # mechanism exists to prevent.
+            await _watch_after_index(settings, graph, bus, owner)
     finally:
         # Release before closing the bus — the release is a compare-and-delete over it.
         await lease.__aexit__(None, None, None)
         await graph.close()
         await bus.close()
-
-    if incomplete:
-        raise typer.Exit(code=1)
+        # Flush spans, metrics and buffered log records. This used to sit *after* a
+        # `raise typer.Exit`, one level in, so it never ran on any path -- `atlas index`
+        # dropped every signal it had produced at exit.
         shutdown_telemetry()
+
+    # An undrained pass is a hard failure for a one-shot run, and only a warning under
+    # --watch: there the consumers stay up and keep draining, which is the entire
+    # difference between the two modes.
+    if incomplete and not watch:
+        raise typer.Exit(code=1)
 
 
 async def _index_monorepo_with_progress(
@@ -804,6 +834,37 @@ async def _index_single_with_spinner(
         )
 
     return result  # noqa: RET504
+
+
+async def _watch_after_index(settings: Any, graph: Any, bus: Any, lease_owner: str) -> None:
+    """Keep watching after the index pass, holding the lease, until interrupted.
+
+    Exists so a checkout can have one persistent indexer that is not an MCP server.
+    Every `atlas mcp` in that worktree can then run --no-index and simply query, which
+    is both cheaper and the only way to stop N agent sessions each running their own
+    watcher over the same files.
+
+    ``catchup=False`` because the pass that just ran *was* the catch-up, and it honoured
+    --full/--scope/--project, which the daemon's own generic pass would not.
+
+    ``lease_owner`` is what makes this work at all: the daemon's consumers stand down
+    for a foreign lease, and ours is not foreign.
+    """
+    from code_atlas.indexing.daemon import DaemonManager
+
+    daemon = DaemonManager()
+    started = await daemon.start(settings, graph, include_watcher=True, catchup=False, lease_owner=lease_owner)
+    if not started:
+        logger.error("Cannot watch — the event queue backend is unreachable")
+        raise typer.Exit(code=1)
+
+    _echo(f"Watching {settings.project_root} — Ctrl+C to stop. Holding the indexer lease.")
+    try:
+        await daemon.wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await daemon.stop()
 
 
 async def _run_search(  # noqa: PLR0912, PLR0915

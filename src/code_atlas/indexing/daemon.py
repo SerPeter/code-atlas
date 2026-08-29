@@ -87,6 +87,7 @@ class DaemonManager:
         include_watcher: bool = True,
         catchup: bool = True,
         first_index_ready: asyncio.Event | None = None,
+        lease_owner: str | None = None,
     ) -> bool:
         """Try to start watcher + pipeline.
 
@@ -110,6 +111,12 @@ class DaemonManager:
             or is skipped — lets a caller (MCP's first-index readiness gate)
             block tool calls against a genuinely fresh backend without hanging
             forever. ``None`` (default) means no one is waiting on it.
+        lease_owner:
+            The indexer lease this process already holds, if any. Consumers stand
+            down for a *foreign* lease; without this they would stand down for
+            their own caller's, which is what ``atlas index --watch`` does — it
+            keeps its lease for the whole session rather than releasing it after
+            the pass.
         """
         # Declared type stays EventBus (the network backend) — SqliteEventBus is a
         # structurally-compatible fallback, but full retyping of every downstream
@@ -138,10 +145,17 @@ class DaemonManager:
             self._embed = embed
 
         consumers: list[ASTConsumer | EmbedConsumer] = [
-            ASTConsumer(bus, graph, settings, cooldown_s=settings.watcher.cooldown_s, defer_to_lease=True),
+            ASTConsumer(
+                bus,
+                graph,
+                settings,
+                cooldown_s=settings.watcher.cooldown_s,
+                defer_to_lease=True,
+                lease_owner=lease_owner,
+            ),
         ]
         if embed is not None:
-            consumers.append(EmbedConsumer(bus, graph, embed, defer_to_lease=True))
+            consumers.append(EmbedConsumer(bus, graph, embed, defer_to_lease=True, lease_owner=lease_owner))
         self._consumers = consumers
 
         if include_watcher:

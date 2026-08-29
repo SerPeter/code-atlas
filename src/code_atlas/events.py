@@ -183,7 +183,7 @@ async def _await_indexer_lease(bus: Any, owner: str, ttl_ms: int, wait_s: float)
 
 @asynccontextmanager
 async def hold_indexer_lease(
-    bus: Any, *, ttl_ms: int = INDEXER_LEASE_TTL_MS, wait_s: float = 0.0
+    bus: Any, *, ttl_ms: int = INDEXER_LEASE_TTL_MS, wait_s: float = 0.0, force: bool = False
 ) -> AsyncIterator[str]:
     """Hold the project's indexer lease for the duration of the block.
 
@@ -199,12 +199,26 @@ async def hold_indexer_lease(
     is correct either way — if the holder finishes normally the deferred pass is a cheap
     no-op behind the hash gate, and if it dies the waiter picks the work up.
 
+    *force* takes the lease regardless of who holds it. It exists for the one case the
+    TTL handles badly -- a holder that is already gone but whose lease has not expired --
+    and it genuinely does allow two indexers to write the same nodes, which is the thing
+    this lease exists to prevent. So it is loud, and it is never a default.
+
     Renewal runs in the background so a long index cannot lose the lease mid-run, and the
     release is a compare-and-delete, so a process that stalled past its TTL cannot free a
     lease that has since passed to someone else.
     """
     owner = new_lease_owner()
-    if not await _await_indexer_lease(bus, owner, ttl_ms, wait_s):
+    if force:
+        displaced = await bus.read_indexer_lease()
+        await bus.force_acquire_indexer_lease(owner, ttl_ms)
+        if displaced:
+            logger.warning(
+                "Forced the indexer lease away from {} — if that process is still alive, "
+                "two indexers are now writing the same nodes",
+                displaced,
+            )
+    elif not await _await_indexer_lease(bus, owner, ttl_ms, wait_s):
         holder = await bus.read_indexer_lease()
         raise IndexerBusyError(holder or "unknown")
 
@@ -437,6 +451,17 @@ class EventBus:
     async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
         """Take the indexer lease, or return False if someone else holds it."""
         return bool(await self._redis.set(self._lease_key(), owner.encode(), nx=True, px=ttl_ms))
+
+    async def force_acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        """Take the lease out from under whoever holds it.
+
+        Deliberately not a compare-and-set: this is the escape hatch for a lease left
+        behind by a process that is gone but whose TTL has not run out, and the whole
+        point is that the current value does not matter. The displaced holder discovers
+        it on its next renew, which is a compare-and-set and therefore fails cleanly.
+        """
+        await self._redis.set(self._lease_key(), owner.encode(), px=ttl_ms)
+        return True
 
     async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
         """Extend the lease, but only while *owner* still holds it.

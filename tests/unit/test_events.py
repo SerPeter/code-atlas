@@ -326,3 +326,70 @@ class TestIndexerLeaseWaiting:
         assert clock.delays, "should have slept at least once"
         assert all(d <= 0.5 for d in clock.delays), clock.delays
         assert clock.now <= 1000.5
+
+
+class TestForcedLease:
+    """--force exists for the case the TTL handles badly: a holder that is already gone
+    but whose 60s lease has not run out yet. It genuinely allows two indexers to write
+    the same nodes, so it is never a default and it says so out loud."""
+
+    async def test_force_takes_a_held_lease(self, clock) -> None:
+        from code_atlas.events import hold_indexer_lease
+
+        bus = FakeForcedBus(holder="host:123:gone")
+
+        async with hold_indexer_lease(bus, force=True) as owner:
+            assert owner
+
+        assert bus.forced == 1
+        assert bus.attempts == 0, "force must not politely try the compare-and-set first"
+        assert clock.delays == [], "force must not wait"
+
+    async def test_force_names_who_it_displaced(self, clock, caplog) -> None:
+        """Two indexers writing the same nodes is the failure this lease exists to
+        prevent. Doing it deliberately is allowed; doing it quietly is not."""
+        from loguru import logger
+
+        from code_atlas.events import hold_indexer_lease
+
+        messages: list[str] = []
+        sink = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+        try:
+            bus = FakeForcedBus(holder="host:123:gone")
+            async with hold_indexer_lease(bus, force=True):
+                pass
+        finally:
+            logger.remove(sink)
+
+        assert any("host:123:gone" in m for m in messages), messages
+
+    async def test_force_on_a_free_lease_says_nothing(self, clock) -> None:
+        from loguru import logger
+
+        from code_atlas.events import hold_indexer_lease
+
+        messages: list[str] = []
+        sink = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+        try:
+            bus = FakeForcedBus(holder=None)
+            async with hold_indexer_lease(bus, force=True):
+                pass
+        finally:
+            logger.remove(sink)
+
+        assert messages == [], "nothing was displaced, so there is nothing to warn about"
+
+
+class FakeForcedBus(FakeLeaseBus):
+    def __init__(self, holder: str | None) -> None:
+        super().__init__(busy_for=float("inf"), holder=holder or "")
+        self._holder = holder
+        self.forced = 0
+
+    async def read_indexer_lease(self):
+        return self._holder
+
+    async def force_acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        self.forced += 1
+        self._holder = owner
+        return True
