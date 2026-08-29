@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 import redis.asyncio as aioredis
 from loguru import logger
@@ -322,3 +322,15 @@ class RateLimiter:
 
     async def close(self) -> None:
         await self._redis.aclose()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Close on the way out, the same contract GraphClient and EventBus carry.
+
+        The limiter was the one client left without it, so its ten tests each closed by
+        hand on their last line -- and skipped the close whenever an assertion above it
+        failed.
+        """
+        await self.close()
