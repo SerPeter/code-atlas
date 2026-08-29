@@ -40,6 +40,8 @@ docker compose down              # Stop services
 
 # CLI
 atlas index /path/to/project     # Index a codebase
+atlas index --watch              # Index, then keep watching (holds the indexer lease)
+atlas index --watch --force      # ...taking the lease from a holder that is gone
 atlas search "query"             # Hybrid search
 atlas status                     # Check index status
 atlas mcp                        # Start MCP server

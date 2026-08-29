@@ -184,8 +184,11 @@ claude mcp add code-atlas -- uvx --from code-atlas-mcp atlas mcp
 
 Running several agent sessions against **one** checkout? Give the extra ones
 `atlas mcp --no-index` — indexing is per-worktree, not per-session, so only one server
-(or a `atlas daemon start`) should watch and index a given checkout. The others just
-query.
+should watch and index a given checkout. The others just query.
+
+Better still, take indexing out of the agent sessions entirely: `atlas index --watch`
+indexes and then keeps watching, holding the indexer lease for as long as it runs. Then
+every `atlas mcp` for that checkout can use `--no-index`.
 
 Several `atlas ui` at once (one per worktree, say) is fine too: each takes the first
 free port from 8420 upward and prints where the others are serving.
