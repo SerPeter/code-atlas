@@ -427,14 +427,19 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
     project_name = project or derive_project_name(settings.project_root)
     # The UI was the one entry point that never initialised telemetry, so it produced
     # no signals at all even with everything else exporting.
-    init_telemetry(
-        settings.observability,
-        role="web",
-        project=project_name,
-        root=str(settings.project_root),
-        indexing=False,
-    )
-    async with use_backends(settings, with_bus=False) as backends:
+    async with AsyncExitStack() as stack:
+        init_telemetry(
+            settings.observability,
+            role="web",
+            project=project_name,
+            root=str(settings.project_root),
+            indexing=False,
+        )
+        # Registered here rather than called at the end, where it almost never ran: the
+        # normal way to stop a UI server is Ctrl-C, which unwinds out of serve() and
+        # skipped it every time. The failed-port-claim exit skipped it too.
+        stack.callback(shutdown_telemetry)
+        backends = await stack.enter_async_context(use_backends(settings, with_bus=False))
         graph = backends.graph
         from code_atlas.server.web.app import create_app
 
@@ -465,7 +470,6 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
         config = uvicorn.Config(app_instance, host=host, port=port, log_level="warning")
         with registered(host, port, project_name, str(settings.project_root)):
             await uvicorn.Server(config).serve(sockets=[sock])
-        shutdown_telemetry()
 
 
 @app.command()
@@ -898,16 +902,22 @@ async def _run_search(
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = _load_settings()
-    init_telemetry(
-        settings.observability,
-        role="search",
-        project=derive_project_name(settings.project_root),
-        root=str(settings.project_root),
-    )
-    async with (
-        connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends,
-        AsyncExitStack() as stack,
-    ):
+    async with AsyncExitStack() as stack:
+        init_telemetry(
+            settings.observability,
+            role="search",
+            project=derive_project_name(settings.project_root),
+            root=str(settings.project_root),
+        )
+        # Registered immediately after init, before anything that can raise, so it runs
+        # last and on every path. It used to sit at the end of the function, which the
+        # three `raise typer.Exit`s skipped -- and so did the two `return`s below, the
+        # ordinary JSON-output and no-results cases. A search that found nothing
+        # reported nothing.
+        stack.callback(shutdown_telemetry)
+        backends = await stack.enter_async_context(
+            connected(settings, with_bus=False, on_unreachable=_unreachable_backend)
+        )
         graph = backends.graph
 
         # Map CLI type names to SearchType lists
@@ -997,7 +1007,6 @@ async def _run_search(
             logger.warning("Index is stale (last indexed: {})", commit_str)
             if info.changed_files:
                 logger.warning("  {} file(s) changed since last index", len(info.changed_files))
-        shutdown_telemetry()
 
 
 async def _run_status() -> None:
@@ -1309,43 +1318,47 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 
     project_root, _auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
     settings = AtlasSettings(project_root=project_root)
-    init_telemetry(
-        settings.observability,
-        role="watch",
-        project=derive_project_name(settings.project_root),
-        root=str(settings.project_root),
-        indexing=True,
-    )
-    if debounce is not None:
-        settings.watcher.debounce_s = debounce
-    if max_wait is not None:
-        settings.watcher.max_wait_s = max_wait
+    async with AsyncExitStack() as stack:
+        init_telemetry(
+            settings.observability,
+            role="watch",
+            project=derive_project_name(settings.project_root),
+            root=str(settings.project_root),
+            indexing=True,
+        )
+        # Above the connect, not inside the finally below: init_telemetry used to sit
+        # above the `try` with use_backends() in between, so an unreachable backend --
+        # the failure most worth exporting -- initialised telemetry and never flushed it.
+        stack.callback(shutdown_telemetry)
+        if debounce is not None:
+            settings.watcher.debounce_s = debounce
+        if max_wait is not None:
+            settings.watcher.max_wait_s = max_wait
 
-    async with use_backends(settings) as backends:
-        graph, bus = backends.graph, backends.bus
-        assert bus is not None
-        try:
-            await graph.ping()
-        except Exception as exc:
-            logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-            raise typer.Exit(code=1) from exc
-        logger.info("Connected to {}", graph_backend_label(graph, settings))
-        await graph.ensure_schema()
+        async with use_backends(settings) as backends:
+            graph, bus = backends.graph, backends.bus
+            assert bus is not None
+            try:
+                await graph.ping()
+            except Exception as exc:
+                logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
+                raise typer.Exit(code=1) from exc
+            logger.info("Connected to {}", graph_backend_label(graph, settings))
+            await graph.ensure_schema()
 
-        daemon = DaemonManager()
-        started = await daemon.start(settings, graph, bus)  # ty: ignore[invalid-argument-type]
-        if not started:
-            logger.error("A reachable queue backend is required for watch mode")
-            raise typer.Exit(code=1)
+            daemon = DaemonManager()
+            started = await daemon.start(settings, graph, bus)  # ty: ignore[invalid-argument-type]
+            if not started:
+                logger.error("A reachable queue backend is required for watch mode")
+                raise typer.Exit(code=1)
 
-        try:
-            await daemon.wait()
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await daemon.stop()
-            shutdown_telemetry()
-            logger.info("Watch stopped")
+            try:
+                await daemon.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await daemon.stop()
+                logger.info("Watch stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -1363,39 +1376,42 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
     settings = _load_settings()
     if no_embed:
         settings.embeddings.enabled = False
-    init_telemetry(
-        settings.observability,
-        role="daemon",
-        project=derive_project_name(settings.project_root),
-        root=str(settings.project_root),
-        indexing=True,
-    )
+    async with AsyncExitStack() as stack:
+        init_telemetry(
+            settings.observability,
+            role="daemon",
+            project=derive_project_name(settings.project_root),
+            root=str(settings.project_root),
+            indexing=True,
+        )
+        # Above the connect for the same reason as _run_watch: an unreachable backend
+        # used to initialise telemetry and never flush it.
+        stack.callback(shutdown_telemetry)
 
-    async with use_backends(settings) as backends:
-        graph, bus = backends.graph, backends.bus
-        assert bus is not None
-        try:
-            await graph.ping()
-        except Exception as exc:
-            logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-            raise typer.Exit(code=1) from exc
-        logger.info("Connected to {}", graph_backend_label(graph, settings))
-        await graph.ensure_schema()
+        async with use_backends(settings) as backends:
+            graph, bus = backends.graph, backends.bus
+            assert bus is not None
+            try:
+                await graph.ping()
+            except Exception as exc:
+                logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
+                raise typer.Exit(code=1) from exc
+            logger.info("Connected to {}", graph_backend_label(graph, settings))
+            await graph.ensure_schema()
 
-        daemon = DaemonManager()
-        started = await daemon.start(settings, graph, bus, include_watcher=True)  # ty: ignore[invalid-argument-type]
-        if not started:
-            logger.error("A reachable queue backend is required for daemon mode")
-            raise typer.Exit(code=1)
+            daemon = DaemonManager()
+            started = await daemon.start(settings, graph, bus, include_watcher=True)  # ty: ignore[invalid-argument-type]
+            if not started:
+                logger.error("A reachable queue backend is required for daemon mode")
+                raise typer.Exit(code=1)
 
-        try:
-            await daemon.wait()
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await daemon.stop()
-            shutdown_telemetry()
-            logger.info("Daemon stopped")
+            try:
+                await daemon.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await daemon.stop()
+                logger.info("Daemon stopped")
 
 
 @daemon_app.command("start")
