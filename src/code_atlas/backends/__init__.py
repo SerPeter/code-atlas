@@ -20,13 +20,14 @@ from code_atlas.graph.client import GraphClient
 from code_atlas.settings import derive_project_name
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
     from pathlib import Path
 
     from code_atlas.settings import AtlasSettings
 
 __all__ = [
     "Backends",
+    "connected",
     "create_event_bus",
     "create_graph_client",
     "graph_backend_label",
@@ -46,6 +47,38 @@ class Backends:
 
     graph: GraphClient | SqliteGraphClient
     bus: EventBus | SqliteEventBus | None = None
+
+
+@asynccontextmanager
+async def connected(
+    settings: AtlasSettings,
+    *,
+    with_bus: bool = True,
+    on_unreachable: Callable[[str], Exception] | None = None,
+) -> AsyncGenerator[Backends]:
+    """`use_backends`, plus the reachability check every command was writing by hand.
+
+    Eight commands opened a graph, pinged it, logged the same message and exited 1 --
+    the same five lines each time, and in most of them the `raise` happened *before* the
+    try/finally that closed the client, so a failed ping leaked the connection it had
+    just opened. Doing it once fixes that everywhere, since the scope closes on the way
+    out however the block ends.
+
+    *on_unreachable* builds the exception to raise, because the CLI wants
+    `typer.Exit(1)` and nothing in this package should import typer. Omitting it
+    re-raises the original error.
+    """
+    async with use_backends(settings, with_bus=with_bus) as backends:
+        label = graph_backend_label(backends.graph, settings)
+        try:
+            await backends.graph.ping()
+        except Exception as exc:
+            logger.error("Cannot reach {} — {}", label, exc)
+            if on_unreachable is not None:
+                raise on_unreachable(label) from exc
+            raise
+        logger.info("Connected to {}", label)
+        yield backends
 
 
 @asynccontextmanager

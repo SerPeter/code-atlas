@@ -371,13 +371,13 @@ async def _run_export(*, path: Path, project: str) -> None:
         logger.error("The HTML export needs the 'ui' extra. Install it with: pip install 'code-atlas-mcp[ui]'")
         raise typer.Exit(code=1) from None
 
-    from code_atlas.backends import create_graph_client
+    from code_atlas.backends import use_backends
     from code_atlas.settings import derive_project_name
 
     settings = _load_settings()
     project_name = project or derive_project_name(settings.project_root)
-    graph = await create_graph_client(settings)
-    try:
+    async with use_backends(settings, with_bus=False) as backends:
+        graph = backends.graph
         from code_atlas.server.web.export import ProjectNotIndexedError, export_project
 
         try:
@@ -392,8 +392,6 @@ async def _run_export(*, path: Path, project: str) -> None:
         if not result.map_available:
             _echo("  The map is not in this export: community detection needs the Memgraph backend.")
         _echo("  Self-contained: open it directly, no server and no network.")
-    finally:
-        await graph.close()
 
 
 async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
@@ -409,7 +407,7 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
         logger.error("The web UI needs the 'ui' extra. Install it with: pip install 'code-atlas-mcp[ui]'")
         raise typer.Exit(code=1) from None
 
-    from code_atlas.backends import create_graph_client
+    from code_atlas.backends import use_backends
     from code_atlas.server.web.instances import claim_port, live_instances, registered
     from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -425,8 +423,8 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
         root=str(settings.project_root),
         indexing=False,
     )
-    graph = await create_graph_client(settings)
-    try:
+    async with use_backends(settings, with_bus=False) as backends:
+        graph = backends.graph
         from code_atlas.server.web.app import create_app
 
         app_instance = create_app(graph, project_name, debug=debug)
@@ -456,8 +454,6 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
         config = uvicorn.Config(app_instance, host=host, port=port, log_level="warning")
         with registered(host, port, project_name, str(settings.project_root)):
             await uvicorn.Server(config).serve(sockets=[sock])
-    finally:
-        await graph.close()
         shutdown_telemetry()
 
 
