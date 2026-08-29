@@ -1466,17 +1466,19 @@ class TestFindCommunitiesBackendVisibility:
         from code_atlas.server.mcp import create_mcp_server
 
         settings.embeddings.enabled = False
-        graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
-        _stub_backends(monkeypatch, graph)
-        monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
+        # The test owns this one: _stub_backends yields it without closing it, because
+        # the real use_backends() closes only what it opened itself.
+        async with SqliteGraphClient(tmp_path / "graph.sqlite3") as graph:
+            _stub_backends(monkeypatch, graph)
+            monkeypatch.setattr("code_atlas.server.mcp.DaemonManager", _FakeDaemonManager)
 
-        mcp = create_mcp_server(settings, catchup=False)
-        lifespan = mcp.settings.lifespan
-        assert lifespan is not None
-        async with lifespan(mcp):
-            tool_names = {t.name for t in await mcp.list_tools()}
-            assert "find_communities" not in tool_names
-            assert "find_dead_code" in tool_names  # sanity: other shortcut tools stay
+            mcp = create_mcp_server(settings, catchup=False)
+            lifespan = mcp.settings.lifespan
+            assert lifespan is not None
+            async with lifespan(mcp):
+                tool_names = {t.name for t in await mcp.list_tools()}
+                assert "find_communities" not in tool_names
+                assert "find_dead_code" in tool_names  # sanity: other shortcut tools stay
 
     async def test_present_on_memgraph_backend(self, settings, monkeypatch):
         from code_atlas.server.mcp import create_mcp_server
