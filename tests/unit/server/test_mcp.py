@@ -1647,6 +1647,165 @@ class TestSummarizeModule:
 # ---------------------------------------------------------------------------
 
 
+class _RecordingSpan:
+    """Captures what a tool span was told, without needing the OTel SDK."""
+
+    def __init__(self, name: str, attributes: dict | None = None) -> None:
+        self.name = name
+        self.attributes = dict(attributes or {})
+        self.exceptions: list[BaseException] = []
+        self.status: object = None
+
+    def set_attribute(self, key, value) -> None:
+        self.attributes[key] = value
+
+    def set_status(self, status, description=None) -> None:
+        self.status = status if description is None else (status, description)
+
+    def record_exception(self, exception, **_kwargs) -> None:
+        self.exceptions.append(exception)
+
+    def end(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        pass
+
+
+class _RecordingTracer:
+    def __init__(self) -> None:
+        self.spans: list[_RecordingSpan] = []
+
+    def start_as_current_span(self, name, **kwargs):
+        span = _RecordingSpan(name, kwargs.get("attributes"))
+        self.spans.append(span)
+        return span
+
+
+class TestToolTracing:
+    """`_tracer` existed in mcp.py from the day telemetry was added and was never used.
+
+    Every trace the system produced started in the middle of the stack -- graph.execute,
+    hybrid_search, embed.embed_one -- with nothing above it naming the tool an agent had
+    called. On an agent-facing server that is the one span you cannot do without.
+    """
+
+    @staticmethod
+    def _server():
+        from code_atlas.server.mcp import create_mcp_server
+        from code_atlas.settings import AtlasSettings
+
+        return create_mcp_server(AtlasSettings())
+
+    async def test_a_tool_call_opens_a_named_span(self, monkeypatch):
+        import code_atlas.server.mcp as mcp_mod
+
+        tracer = _RecordingTracer()
+        monkeypatch.setattr(mcp_mod, "_tracer", tracer)
+        server = self._server()
+        tool = next(t for t in server._tool_manager._tools.values() if t.name == "schema_info")
+
+        await tool.fn()
+
+        assert [sp.name for sp in tracer.spans] == ["mcp.tool.schema_info"]
+        assert tracer.spans[0].attributes["mcp.tool"] == "schema_info"
+        assert tracer.spans[0].attributes["mcp.status"] == "ok"
+
+    async def test_every_registered_tool_is_traced(self, monkeypatch):
+        """Derived from the registry, not a hand-written list -- same reason as the
+        backend stamp: a 24th tool must not ship silently untraced."""
+        import code_atlas.server.mcp as mcp_mod
+
+        tracer = _RecordingTracer()
+        monkeypatch.setattr(mcp_mod, "_tracer", tracer)
+        server = self._server()
+        server._tool_manager._tools.clear()
+
+        @server.tool(description="probe")
+        async def probe() -> dict:
+            return {"ok": True}
+
+        tool = next(iter(server._tool_manager._tools.values()))
+        await tool.fn()
+        assert tracer.spans[0].name == "mcp.tool.probe"
+
+    async def test_an_error_payload_marks_the_span_failed(self, monkeypatch):
+        """Most tools here report failure by *returning* {"error": ...}. Without this
+        the span looks clean and the failure is invisible to every error filter."""
+        import code_atlas.server.mcp as mcp_mod
+
+        tracer = _RecordingTracer()
+        monkeypatch.setattr(mcp_mod, "_tracer", tracer)
+        server = self._server()
+        server._tool_manager._tools.clear()
+
+        @server.tool(description="probe")
+        async def probe() -> dict:
+            return {"error": "boom", "code": "QUERY_ERROR"}
+
+        tool = next(iter(server._tool_manager._tools.values()))
+        await tool.fn()
+
+        span = tracer.spans[0]
+        assert span.attributes["mcp.status"] == "error"
+        assert span.attributes["mcp.code"] == "QUERY_ERROR"
+        assert span.status is not None, "an error payload must set span status"
+
+    async def test_a_raised_exception_is_recorded_and_re_raised(self, monkeypatch):
+        import code_atlas.server.mcp as mcp_mod
+
+        tracer = _RecordingTracer()
+        monkeypatch.setattr(mcp_mod, "_tracer", tracer)
+        server = self._server()
+        server._tool_manager._tools.clear()
+
+        @server.tool(description="probe")
+        async def probe() -> dict:
+            raise RuntimeError("kaboom")
+
+        tool = next(iter(server._tool_manager._tools.values()))
+        with pytest.raises(RuntimeError):
+            await tool.fn()
+
+        span = tracer.spans[0]
+        assert [type(e) for e in span.exceptions] == [RuntimeError]
+        assert span.attributes["mcp.status"] == "exception"
+
+    async def test_a_tool_call_records_its_metrics(self, monkeypatch):
+        import code_atlas.server.mcp as mcp_mod
+        import code_atlas.telemetry as tel
+
+        calls: list[tuple] = []
+        latencies: list[tuple] = []
+        monkeypatch.setattr(
+            tel._metrics, "tool_calls", type("C", (), {"add": lambda _s, n, a=None: calls.append((n, a))})()
+        )
+        monkeypatch.setattr(
+            tel._metrics, "tool_latency", type("H", (), {"record": lambda _s, n, a=None: latencies.append((n, a))})()
+        )
+        monkeypatch.setattr(mcp_mod, "_tracer", _RecordingTracer())
+
+        server = self._server()
+        tool = next(t for t in server._tool_manager._tools.values() if t.name == "schema_info")
+        await tool.fn()
+
+        assert calls == [(1, {"tool": "schema_info", "status": "ok"})]
+        assert latencies[0][1] == {"tool": "schema_info"}
+        assert latencies[0][0] >= 0
+
+    async def test_tracing_and_stamping_compose_without_eating_the_schema(self):
+        """Two wrappers now sit between FastMCP and each tool. FastMCP builds schemas by
+        inspecting the function, so a wrapper that dropped __wrapped__ would publish
+        every tool as taking no arguments -- silently, and only visible to a client."""
+        server = self._server()
+        tools = {t.name: t for t in await server.list_tools()}
+        params = set((tools["get_node"].inputSchema or {}).get("properties", {}))
+        assert {"name", "label", "limit", "offset", "detail"} <= params
+
+
 class TestBackendStamp:
     """`backend.graph` defaults to "auto" and falls back to SQLite whenever Memgraph
     is unreachable, which on a machine without Docker is the ordinary outcome. Before

@@ -79,7 +79,7 @@ from code_atlas.server.analysis import generate_diagram as _generate_diagram
 from code_atlas.server.analysis import trace_path as _trace_path
 from code_atlas.server.health import run_health_checks
 from code_atlas.settings import AtlasSettings, SearchSettings, derive_project_name, find_git_root
-from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
+from code_atlas.telemetry import get_metrics, get_tracer, init_telemetry, mark_span_error, shutdown_telemetry
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -733,7 +733,7 @@ def create_mcp_server(  # noqa: PLR0915
 
     @asynccontextmanager
     async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: PLR0915
-        init_telemetry(settings.observability)
+        init_telemetry(settings.observability, role="mcp", project=derive_project_name(settings.project_root))
 
         # Declared type stays GraphClient (the network backend) — SqliteGraphClient
         # is a structurally-compatible fallback, but full retyping of every
@@ -891,6 +891,7 @@ def create_mcp_server(  # noqa: PLR0915
         lifespan=app_lifespan,
     )
 
+    _install_tool_tracing(mcp)
     _install_backend_stamp(mcp)
     _register_query_tools(mcp)
     _register_search_tools(mcp)
@@ -1033,6 +1034,79 @@ def _register_node_tools(mcp: FastMCP) -> None:
 # is chosen once in `app_lifespan` and cannot change while the process runs -- there is
 # no per-call state to carry.
 _BACKEND_NOTE: dict[str, Any] = {}
+
+
+def _install_tool_tracing(mcp: FastMCP) -> None:
+    """Wrap tool registration so every MCP call opens a span and records a metric.
+
+    `_tracer` has existed in this module since telemetry was added and was never
+    used: every trace the system produced started somewhere in the middle of the
+    stack (`graph.execute`, `hybrid_search`, `embed.embed_one`) with no parent
+    naming the tool an agent actually called. Traces answered "what did the graph
+    do" but never "which request asked for it", which is the whole point of having
+    them on an agent-facing server.
+
+    Installed through the same `mcp.tool` seam as `_install_backend_stamp` -- one
+    interception rather than 23 decorated functions -- and composes with it: this
+    runs first, so the span encloses the envelope stamping as well as the tool body.
+
+    Errors are recorded two ways because they arrive two ways. A raised exception
+    gets `record_exception` + ERROR status; a returned `{"error": ...}` payload (how
+    most tools here report failure) would otherwise look like a clean span, so the
+    status is set from the payload too.
+    """
+    register = mcp.tool
+
+    def tracing_tool(*d_args: Any, **d_kwargs: Any) -> Any:
+        decorate = register(*d_args, **d_kwargs)
+
+        def wrap(fn: Any) -> Any:
+            tool_name = fn.__name__
+
+            @functools.wraps(fn)
+            async def traced(*args: Any, **kwargs: Any) -> Any:
+                started = time.perf_counter()
+                status = "ok"
+                with _tracer.start_as_current_span(f"mcp.tool.{tool_name}", attributes={"mcp.tool": tool_name}) as span:
+                    try:
+                        result = await fn(*args, **kwargs)
+                    except Exception as exc:
+                        status = "exception"
+                        mark_span_error(span, exc)
+                        raise
+                    else:
+                        if isinstance(result, dict):
+                            _annotate_tool_span(span, result)
+                            if result.get("error"):
+                                status = "error"
+                                mark_span_error(span, description=str(result["error"])[:200])
+                        return result
+                    finally:
+                        elapsed = time.perf_counter() - started
+                        span.set_attribute("mcp.status", status)
+                        attrs = {"tool": tool_name, "status": status}
+                        get_metrics().tool_calls.add(1, attrs)
+                        get_metrics().tool_latency.record(elapsed, {"tool": tool_name})
+
+            # functools.wraps sets __wrapped__, which inspect.signature follows, so
+            # FastMCP still builds the schema from the real parameters.
+            return decorate(traced)
+
+        return wrap
+
+    mcp.tool = tracing_tool  # type: ignore[method-assign]
+
+
+def _annotate_tool_span(span: Any, result: dict[str, Any]) -> None:
+    """Copy the few result fields worth filtering traces on.
+
+    Deliberately a fixed allowlist of scalars, not the payload: spans travel over the
+    wire on every call, and tool results here carry source code and docstrings.
+    """
+    for key in ("count", "truncated", "query_ms", "code"):
+        value = result.get(key)
+        if isinstance(value, (int, float, bool, str)):
+            span.set_attribute(f"mcp.{key}", value)
 
 
 def _install_backend_stamp(mcp: FastMCP) -> None:

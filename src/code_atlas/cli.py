@@ -423,6 +423,7 @@ def mcp(
 ) -> None:
     """Start the MCP server for AI agent connections."""
     from code_atlas.server.mcp import create_mcp_server
+    from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = _load_settings()
@@ -433,7 +434,7 @@ def mcp(
     port = port or mcp_cfg.port
     strict = strict if strict is not None else mcp_cfg.strict
 
-    init_telemetry(settings.observability)
+    init_telemetry(settings.observability, role="mcp", project=derive_project_name(settings.project_root))
     try:
         server = create_mcp_server(settings, strict=strict, host=host, port=port)
         logger.info("Starting MCP server (transport={}, host={}, port={})", transport, host, port)
@@ -461,7 +462,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     """Async implementation of the ``atlas index`` command."""
     from code_atlas.backends import create_event_bus, create_graph_client, graph_backend_label, queue_backend_label
     from code_atlas.indexing.orchestrator import detect_sub_projects
-    from code_atlas.settings import AtlasSettings
+    from code_atlas.settings import AtlasSettings, derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     project_root, auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
@@ -470,9 +471,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     settings = AtlasSettings(project_root=project_root)
     if no_embed:
         settings.embeddings.enabled = False
-    init_telemetry(settings.observability)
-
-    from code_atlas.settings import derive_project_name
+    init_telemetry(settings.observability, role="index", project=derive_project_name(settings.project_root))
 
     project_name = derive_project_name(settings.project_root)
 
@@ -758,10 +757,11 @@ async def _run_search(  # noqa: PLR0912, PLR0915
     from code_atlas.indexing.orchestrator import StalenessChecker
     from code_atlas.search.embeddings import EmbedClient
     from code_atlas.search.engine import SearchType, hybrid_search
+    from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = _load_settings()
-    init_telemetry(settings.observability)
+    init_telemetry(settings.observability, role="search", project=derive_project_name(settings.project_root))
     graph = await create_graph_client(settings)
     try:
         await graph.ping()
@@ -1194,12 +1194,12 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     """Async implementation of the ``atlas watch`` command."""
     from code_atlas.backends import create_graph_client, graph_backend_label
     from code_atlas.indexing.daemon import DaemonManager
-    from code_atlas.settings import AtlasSettings
+    from code_atlas.settings import AtlasSettings, derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     project_root, _auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
     settings = AtlasSettings(project_root=project_root)
-    init_telemetry(settings.observability)
+    init_telemetry(settings.observability, role="watch", project=derive_project_name(settings.project_root))
     if debounce is not None:
         settings.watcher.debounce_s = debounce
     if max_wait is not None:
@@ -1241,12 +1241,13 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
     """Start the EventBus, file watcher, and all tier consumers, run until interrupted."""
     from code_atlas.backends import create_graph_client, graph_backend_label
     from code_atlas.indexing.daemon import DaemonManager
+    from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = _load_settings()
     if no_embed:
         settings.embeddings.enabled = False
-    init_telemetry(settings.observability)
+    init_telemetry(settings.observability, role="daemon", project=derive_project_name(settings.project_root))
 
     graph = await create_graph_client(settings)
     try:

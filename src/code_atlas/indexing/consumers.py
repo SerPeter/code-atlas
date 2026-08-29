@@ -1646,15 +1646,23 @@ class EmbedConsumer(TierConsumer):
         batch_id: str,
     ) -> None:
         """Execute process_batch for a single batch, then release the semaphore."""
+        # One counter for both consumers, recorded where both already pass through.
+        # The rate of this is the answer to "is the pipeline moving at all", which the
+        # last investigation could only get by diffing XINFO entries-read by hand.
+        topic = self.input_topic.value
+        outcome = "ok"
         try:
             logger.debug("{} dispatching batch {} ({} events)", self.consumer_name, batch_id, len(events))
             with logger.contextualize(consumer=self.consumer_name):
                 deferred = await self.process_batch(events, batch_id) or set()
             await self._ack_processed(events, msg_ids, deferred)
         except Exception:
+            outcome = "failed"
             logger.exception("{} batch {} failed, will retry via PEL", self.consumer_name, batch_id)
             self._note_batch_failure(msg_ids)
         finally:
+            get_metrics().batches_processed.add(1, {"topic": topic, "outcome": outcome})
+            get_metrics().events_consumed.add(len(events), {"topic": topic})
             self._sem.release()
 
     async def _resolve_from_graph(
@@ -1794,6 +1802,13 @@ class EmbedConsumer(TierConsumer):
                 span.set_attribute("api_embedded", len(api_vectors))
 
                 get_metrics().embedding_latency.record(elapsed)
+                # Where each vector came from. "2,346 API calls, 0 cache hits" was the
+                # measurement that justified ADR-0036; nothing was reporting it, so it
+                # had to be reconstructed from logs after the fact.
+                embeddings = get_metrics().embeddings_total
+                embeddings.add(graph_hits, {"source": "unchanged"})
+                embeddings.add(dedup_hits, {"source": "dedup"})
+                embeddings.add(len(api_vectors), {"source": "api"})
 
                 logger.debug(
                     "Embed batch {}: {} entities, {} unchanged, {} deduped, {} embedded ({:.1f}s)",

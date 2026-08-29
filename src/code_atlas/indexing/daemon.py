@@ -29,10 +29,16 @@ from code_atlas.indexing.orchestrator import (
 from code_atlas.indexing.watcher import FileWatcher
 from code_atlas.search.embeddings import EmbedClient
 from code_atlas.settings import derive_project_name
+from code_atlas.telemetry import is_enabled as telemetry_enabled
+from code_atlas.telemetry import set_backlog
 
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
     from code_atlas.settings import AtlasSettings, ExtraVaultSettings
+
+
+# Slow enough to be free, fast enough to see a stall inside a minute.
+_BACKLOG_SAMPLE_S = 15.0
 
 
 @dataclass
@@ -170,6 +176,8 @@ class DaemonManager:
         for consumer in self._consumers:
             self._tasks.append(asyncio.get_running_loop().create_task(self._run_consumer(consumer)))
 
+        self._start_backlog_sampler()
+
         # Extra vaults (global vault, harness memory dir) live outside project_root,
         # so each gets its own FileWatcher instance rather than riding the main
         # project's one (FileWatcher itself is single-root — see watcher.py). This
@@ -272,6 +280,33 @@ class DaemonManager:
         """Block until all background tasks finish (or are cancelled)."""
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    def _start_backlog_sampler(self) -> None:
+        """Spawn the backlog sampler, but only when something is collecting.
+
+        It is an XINFO round-trip on a timer; with no exporter attached it would be
+        pure overhead for the life of the daemon.
+        """
+        if telemetry_enabled():
+            self._tasks.append(asyncio.get_running_loop().create_task(self._sample_backlog()))
+
+    async def _sample_backlog(self) -> None:
+        """Feed the backlog gauge on a timer.
+
+        Backlog is the one pipeline number that falls as well as rises, so it has to be
+        a gauge, and observable-gauge callbacks are synchronous while the depth comes
+        from an async XINFO. Hence a sampler that pushes into a cache the callback
+        reads, rather than a callback that queries.
+        """
+        while True:
+            await asyncio.sleep(_BACKLOG_SAMPLE_S)
+            try:
+                counts = await self.pending_event_counts()
+            except Exception:
+                logger.debug("Backlog sample failed — will retry")
+                continue
+            for topic, pending in (counts or {}).items():
+                set_backlog(topic, pending)
 
     async def pending_event_counts(self) -> dict[str, int] | None:
         """Current backlog size per topic (file_changed, embed_dirty), or ``None`` if not running.

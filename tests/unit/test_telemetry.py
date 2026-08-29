@@ -234,6 +234,26 @@ except ModuleNotFoundError:
     _has_otel_sdk = False
 
 
+class _CapturingLogExporter:
+    """Stands in for an OTLP log exporter. Implements the three methods
+    ``BatchLogRecordProcessor`` calls, and nothing else."""
+
+    def __init__(self) -> None:
+        self.records: list = []
+
+    def export(self, batch):
+        self.records.extend(batch)
+        from opentelemetry.sdk._logs.export import LogExportResult
+
+        return LogExportResult.SUCCESS
+
+    def shutdown(self) -> None:
+        pass
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return True
+
+
 @pytest.mark.skipif(not _has_otel_sdk, reason="opentelemetry-sdk not installed")
 class TestOTelSDKIntegration:
     """Tests that require the OTel SDK to be installed."""
@@ -259,6 +279,136 @@ class TestOTelSDKIntegration:
         assert mod._enabled is True
 
         shutdown_telemetry()
+
+    def test_log_records_carry_the_active_trace_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The point of exporting logs at all.
+
+        A span says a step ran and how long it took; the log line says what it
+        *decided* -- "skipping startup catch-up", "lease lost while still indexing".
+        Those two are only useful together, and they are joined by the trace id OTel's
+        LoggingHandler stamps from the active span, not by any id of ours.
+        """
+        from loguru import logger
+
+        import code_atlas.telemetry as mod
+        from code_atlas.settings import ObservabilitySettings
+        from code_atlas.telemetry import get_tracer, init_telemetry, shutdown_telemetry
+
+        self._reset_module()
+        captured = _CapturingLogExporter()
+        monkeypatch.setattr(mod, "_build_log_exporter", lambda _s: captured)
+
+        init_telemetry(ObservabilitySettings(enabled=True, exporter="none", log_level="INFO"))
+        tracer = get_tracer("test.logs")
+        with tracer.start_as_current_span("probe.span"):
+            logger.info("inside the span")
+        logger.info("outside the span")
+        shutdown_telemetry()
+
+        bodies = {r.log_record.body: r.log_record for r in captured.records}
+        assert "inside the span" in bodies, "loguru output never reached the OTLP sink"
+        assert bodies["inside the span"].trace_id != 0, "log line not correlated to its span"
+        assert bodies["outside the span"].trace_id == 0
+
+    def test_export_logs_false_installs_no_sink(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from loguru import logger
+
+        import code_atlas.telemetry as mod
+        from code_atlas.settings import ObservabilitySettings
+        from code_atlas.telemetry import init_telemetry, shutdown_telemetry
+
+        self._reset_module()
+        captured = _CapturingLogExporter()
+        monkeypatch.setattr(mod, "_build_log_exporter", lambda _s: captured)
+
+        init_telemetry(ObservabilitySettings(enabled=True, exporter="none", export_logs=False))
+        logger.warning("should not be exported")
+        shutdown_telemetry()
+
+        assert captured.records == []
+        assert mod._log_sink_id is None
+
+    def test_the_otlp_level_is_independent_of_the_console_level(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DEBUG is useful locally and ruinous as remote volume -- a 60k-file index
+        emits a line per file. The two sinks must not share a level."""
+        from loguru import logger
+
+        import code_atlas.telemetry as mod
+        from code_atlas.settings import ObservabilitySettings
+        from code_atlas.telemetry import init_telemetry, shutdown_telemetry
+
+        self._reset_module()
+        captured = _CapturingLogExporter()
+        monkeypatch.setattr(mod, "_build_log_exporter", lambda _s: captured)
+
+        init_telemetry(ObservabilitySettings(enabled=True, exporter="none", log_level="WARNING"))
+        logger.info("chatty")
+        logger.warning("important")
+        shutdown_telemetry()
+
+        bodies = [r.log_record.body for r in captured.records]
+        assert "important" in bodies
+        assert "chatty" not in bodies
+
+    def test_shutdown_detaches_the_loguru_sink(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A sink left pointing at a shut-down provider turns every subsequent log line
+        into a handler error on stderr, which is the noisiest way to end a clean run."""
+        import code_atlas.telemetry as mod
+        from code_atlas.settings import ObservabilitySettings
+        from code_atlas.telemetry import init_telemetry, shutdown_telemetry
+
+        self._reset_module()
+        monkeypatch.setattr(mod, "_build_log_exporter", lambda _s: _CapturingLogExporter())
+
+        init_telemetry(ObservabilitySettings(enabled=True, exporter="none"))
+        assert mod._log_sink_id is not None
+        shutdown_telemetry()
+        assert mod._log_sink_id is None
+        assert mod._logger_provider is None
+
+    def test_the_resource_names_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A daemon, one MCP server per agent session per worktree, and an ad-hoc CLI
+        index all report at once by design. Without role/project/instance their signals
+        merge into one stream nobody can read."""
+        import code_atlas.telemetry as mod
+        from code_atlas.settings import ObservabilitySettings
+        from code_atlas.telemetry import init_telemetry, shutdown_telemetry
+
+        self._reset_module()
+        captured = _CapturingLogExporter()
+        monkeypatch.setattr(mod, "_build_log_exporter", lambda _s: captured)
+
+        init_telemetry(ObservabilitySettings(enabled=True, exporter="none"), role="daemon", project="code-atlas")
+        from loguru import logger
+
+        logger.warning("probe")
+        shutdown_telemetry()
+
+        attrs = captured.records[-1].resource.attributes
+        assert attrs["atlas.role"] == "daemon"
+        assert attrs["atlas.project"] == "code-atlas"
+        assert ":" in attrs["service.instance.id"]
+
+    def test_the_backlog_gauge_reports_what_the_sampler_pushed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Backlog is the one pipeline number that falls as well as rises, so it is a
+        gauge -- and observable-gauge callbacks are synchronous while the depth comes
+        from an async XINFO. The sampler pushes into a cache the callback reads; if that
+        seam breaks, the gauge silently reports nothing rather than erroring.
+        """
+        import code_atlas.telemetry as mod
+        from code_atlas.settings import ObservabilitySettings
+        from code_atlas.telemetry import init_telemetry, set_backlog, shutdown_telemetry
+
+        self._reset_module()
+        monkeypatch.setattr(mod, "_backlog", {})
+        init_telemetry(ObservabilitySettings(enabled=True, exporter="none", export_logs=False))
+
+        set_backlog("file-changed", 1_205)
+        set_backlog("embed-dirty", 0)
+        observed = {obs.attributes["topic"]: obs.value for obs in mod._observe_backlog(None)}
+        shutdown_telemetry()
+
+        assert observed == {"file-changed": 1205, "embed-dirty": 0}
 
     def test_init_with_none_exporter(self) -> None:
         """init_telemetry with exporter='none' still enables tracing but without export."""

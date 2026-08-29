@@ -19,10 +19,13 @@ from watchfiles import Change, awatch
 
 from code_atlas.events import EventBus, FileChanged, Topic
 from code_atlas.indexing.orchestrator import classify_file_project
+from code_atlas.telemetry import get_metrics, get_tracer, mark_span_error
 
 if TYPE_CHECKING:
     from code_atlas.indexing.orchestrator import DetectedProject, FileScope
     from code_atlas.settings import WatcherSettings
+
+_tracer = get_tracer(__name__)
 
 # Map watchfiles Change enum → FileChanged.change_type strings
 _CHANGE_TYPE_MAP: dict[Change, str] = {
@@ -287,17 +290,29 @@ class FileWatcher:
         # Publish outside the lock so new changes can accumulate
         logger.info("Flushing {} file change(s)", len(batch))
         items = list(batch.items())
-        for i, (_, event) in enumerate(items):
-            try:
-                await self._bus.publish(Topic.FILE_CHANGED, event)
-            except Exception:
-                # Never drop the snapshotted batch: re-queue the unpublished
-                # remainder so the next flush retries it (S7 durability spirit).
-                remainder = items[i:]
-                logger.exception("Publish failed — re-queueing {} unpublished change(s) for retry", len(remainder))
-                for key, ev in remainder:
-                    # A newer event that arrived mid-publish wins over the requeued one
-                    self._pending.setdefault(key, ev)
-                if not self._stop_event.is_set():
-                    self._reset_debounce()  # schedule the retry flush
-                return
+        # The front of the pipeline, and until now the only stage with no signal at all.
+        # A trace that begins at ast.process_batch cannot show that a change was seen,
+        # debounced and published -- only that something was eventually consumed, which
+        # is no help at all when the question is why nothing was.
+        with _tracer.start_as_current_span(
+            "watcher.flush", attributes={"files": len(items), "root": self._root_name}
+        ) as span:
+            for i, (_, event) in enumerate(items):
+                try:
+                    await self._bus.publish(Topic.FILE_CHANGED, event)
+                except Exception as exc:
+                    # Never drop the snapshotted batch: re-queue the unpublished
+                    # remainder so the next flush retries it (S7 durability spirit).
+                    remainder = items[i:]
+                    logger.exception("Publish failed — re-queueing {} unpublished change(s) for retry", len(remainder))
+                    for key, ev in remainder:
+                        # A newer event that arrived mid-publish wins over the requeued one
+                        self._pending.setdefault(key, ev)
+                    span.set_attribute("published", i)
+                    span.set_attribute("requeued", len(remainder))
+                    mark_span_error(span, exc)
+                    if not self._stop_event.is_set():
+                        self._reset_debounce()  # schedule the retry flush
+                    return
+                get_metrics().watcher_events.add(1, {"change_type": event.change_type})
+            span.set_attribute("published", len(items))

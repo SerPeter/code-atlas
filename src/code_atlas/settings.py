@@ -502,6 +502,17 @@ class ObservabilitySettings(StrictSection):
     endpoint: str = Field(default="http://localhost:4317", description="OTLP collector endpoint.")
     service_name: str = Field(default="code-atlas", description="OTel service.name resource attribute.")
     sample_rate: float = Field(default=1.0, description="Trace sample rate (1.0 = all, 0.1 = 10%).")
+    export_logs: bool = Field(
+        default=True,
+        description="Ship log records over OTLP alongside traces and metrics. Each record carries the "
+        "active span's trace_id, so a log line and the span it happened inside are joined without a "
+        "correlation id of our own. Only takes effect when `enabled` is true.",
+    )
+    log_level: str = Field(
+        default="INFO",
+        description="Minimum level for OTLP log export, separate from the console sink's level. "
+        "DEBUG is useful locally and ruinous as remote volume -- a 60k-file index emits a line per file.",
+    )
 
 
 class WatcherSettings(StrictSection):
