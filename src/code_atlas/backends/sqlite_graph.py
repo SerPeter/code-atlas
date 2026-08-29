@@ -44,7 +44,7 @@ import asyncio
 import json
 import struct
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import aiosqlite
 import sqlite_vec
@@ -587,6 +587,20 @@ class SqliteGraphClient:
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Close on the way out, including on an exception.
+
+        The point is that closing stops being something each caller has to remember at
+        every exit path. It was forgotten on four of them at once -- all four infra
+        fixtures called `pytest.skip()` between constructing a client and closing it, so
+        every skipped run abandoned a live connection and the resulting ResourceWarning
+        was blamed on whichever unrelated test the GC happened to interrupt.
+        """
+        await self.close()
 
     # -- Internal helpers -----------------------------------------------------
 

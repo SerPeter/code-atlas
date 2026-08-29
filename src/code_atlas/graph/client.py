@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from itertools import batched, groupby
 from operator import attrgetter
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
 from loguru import logger
 from neo4j import AsyncGraphDatabase
@@ -5292,6 +5292,20 @@ class GraphClient:
     async def close(self) -> None:
         """Close the driver and release connections."""
         await self._driver.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Close on the way out, including on an exception.
+
+        The point is that closing stops being something each caller has to remember at
+        every exit path. It was forgotten on four of them at once -- all four infra
+        fixtures called `pytest.skip()` between constructing a client and closing it, so
+        every skipped run abandoned a live connection and the resulting ResourceWarning
+        was blamed on whichever unrelated test the GC happened to interrupt.
+        """
+        await self.close()
 
     # -- Private helpers -----------------------------------------------------
 

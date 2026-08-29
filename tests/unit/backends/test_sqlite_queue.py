@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+import pytest
 import time_machine
 
 from code_atlas.backends.sqlite_queue import SqliteEventBus
@@ -321,3 +322,66 @@ class TestIndexerLeaseExpiry:
             assert await bus.read_indexer_lease() == "holder"
         finally:
             await bus.close()
+
+
+class TestAsyncContextManager:
+    """Closing has to survive the exit paths nobody remembers.
+
+    The bug that prompted this: all four infra fixtures called `pytest.skip()` between
+    constructing a client and closing it. `Skipped` is a BaseException, so it is not even
+    caught by `except Exception`, and every skipped run abandoned a live connection --
+    surfacing later as a ResourceWarning blamed on whichever unrelated test the GC
+    happened to interrupt.
+    """
+
+    async def test_exit_closes_on_the_happy_path(self, tmp_path: Path) -> None:
+        async with SqliteEventBus(tmp_path / "queue.sqlite3") as bus:
+            await bus.ping()
+            assert bus._conn is not None
+        assert bus._conn is None
+
+    async def test_exit_closes_when_the_body_raises(self, tmp_path: Path) -> None:
+        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+
+        async def use_and_raise() -> None:
+            async with bus:
+                await bus.ping()
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            await use_and_raise()
+
+        assert bus._conn is None, "an exception must not leak the connection"
+
+    async def test_exit_closes_on_a_base_exception(self, tmp_path: Path) -> None:
+        """pytest.skip raises BaseException, which is exactly the path that leaked.
+
+        A bare `try/except Exception` around the body would not have caught this; the
+        context manager does.
+        """
+
+        class _SkipLike(BaseException):
+            pass
+
+        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+
+        async def use_and_skip() -> None:
+            async with bus:
+                await bus.ping()
+                raise _SkipLike
+
+        with pytest.raises(_SkipLike):
+            await use_and_skip()
+
+        assert bus._conn is None, "a BaseException must not leak the connection either"
+
+    def test_every_client_supports_the_protocol(self) -> None:
+        """Derived from the classes, not a hand-written list -- a fifth backend that
+        forgets the protocol should fail here rather than leak in production."""
+        from code_atlas.backends.sqlite_graph import SqliteGraphClient
+        from code_atlas.events import EventBus
+        from code_atlas.graph.client import GraphClient
+
+        for cls in (GraphClient, SqliteGraphClient, EventBus, SqliteEventBus):
+            assert hasattr(cls, "__aenter__"), f"{cls.__name__} cannot be used with async with"
+            assert hasattr(cls, "__aexit__"), f"{cls.__name__} cannot be used with async with"
