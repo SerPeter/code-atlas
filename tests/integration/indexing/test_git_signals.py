@@ -9,18 +9,18 @@ and via the `atlas mine-git-history` CLI command end-to-end.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
 
 import pytest
 
 from code_atlas import cli
-from code_atlas.graph.client import GraphClient
 from code_atlas.indexing.git_signals import mine_git_signals, write_git_signals
 from code_atlas.schema import RelType
 from code_atlas.settings import derive_project_name, find_git_root
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from code_atlas.graph.client import GraphClient
 
 pytestmark = pytest.mark.integration
 
@@ -85,12 +85,16 @@ class TestMineGitHistoryCliCommand:
     async def test_cli_command_mines_and_writes_signals(self, graph_client, monkeypatch):
         await _seed_modules(graph_client)
 
-        # Reuse the fixture's already-connected client instead of opening a
-        # second driver connection; keep the shared connection open past the
-        # CLI helper's own `finally: await graph.close()`.
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda settings: graph_client)
-        monkeypatch.setattr(GraphClient, "close", AsyncMock())
-
+        # The CLI opens and closes its own client, as it does in production. It reaches
+        # the same test Memgraph -- tests/conftest.py exports ATLAS_MEMGRAPH__* -- so the
+        # assertions below still read what the command wrote.
+        #
+        # This used to patch code_atlas.graph.client.GraphClient to hand the CLI this
+        # fixture's client, and mock GraphClient.close so the CLI could not close the
+        # shared connection. Neither worked: backends/__init__.py binds GraphClient at
+        # import, so the patch missed and a second real driver was built anyway -- and
+        # the class-level close mock then leaked both it and this fixture's client. The
+        # `finally: await graph.close()` the mock was guarding against no longer exists.
         await cli._run_mine_git_history(str(_REPO_ROOT), 3, no_git_check=False)
 
         rows = await graph_client.execute(
@@ -121,10 +125,8 @@ class TestIndexCommandWithGitSignals:
             calls.append("index")
             return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=0.0)
 
-        # Reuse the fixture's already-connected client instead of opening a
-        # second driver connection (same pattern as TestMineGitHistoryCliCommand).
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda settings: graph_client)
-        monkeypatch.setattr(GraphClient, "close", AsyncMock())
+        # The CLI owns its own client here too -- see TestMineGitHistoryCliCommand for
+        # why the old sharing patch was both ineffective and leaky.
         monkeypatch.setattr("code_atlas.indexing.orchestrator.detect_sub_projects", lambda root, mono: [])
         monkeypatch.setattr(cli, "_index_single_with_spinner", fake_single_with_spinner)
 
