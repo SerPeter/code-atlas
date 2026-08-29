@@ -81,7 +81,7 @@ def mine_git_signals(repo_root: Path, *, co_change_threshold: int = DEFAULT_CO_C
 
     for commit in commits:
         commits_scanned += 1
-        files = sorted(commit.stats.files.keys())
+        files = sorted(commit.stats.files.keys())  # ty: ignore[invalid-argument-type]  # GitPython's commit.stats.files is untyped
         author = commit.author.email or commit.author.name or "unknown"
         committed_ts = commit.committed_date
         for f in files:

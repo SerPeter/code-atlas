@@ -343,7 +343,7 @@ def detect_sub_projects(
             # Check for marker files
             matched_markers = markers & set(filenames)
             if matched_markers:
-                marker = sorted(matched_markers)[0]  # deterministic
+                marker = min(matched_markers)  # deterministic
                 if rel_dir not in explicit_by_path:
                     auto_by_path[rel_dir] = DetectedProject(
                         name="",  # placeholder — resolved below

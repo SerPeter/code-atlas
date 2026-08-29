@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Self
 
 import aiosqlite
 
-from code_atlas.events import Event, Topic, encode_event
+from code_atlas.events import Event, StreamGroupInfo, Topic, encode_event
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -367,7 +367,7 @@ class SqliteEventBus:
         await cur.close()
         return row[0] if row else None
 
-    async def stream_group_info(self, topic: Topic, group: str) -> dict[str, int | None]:
+    async def stream_group_info(self, topic: Topic, group: str) -> StreamGroupInfo:
         """Return pending + lag counts for a consumer group.
 
         Returns ``{"pending": 0, "lag": 0}`` if the group was never
@@ -402,7 +402,7 @@ class SqliteEventBus:
         await cur.close()
         return {"pending": pending, "lag": lag}
 
-    async def stream_group_info_multi(self, queries: list[tuple[Topic, str]]) -> list[dict[str, int | None]]:
+    async def stream_group_info_multi(self, queries: list[tuple[Topic, str]]) -> list[StreamGroupInfo]:
         """Return pending + lag counts for multiple consumer groups."""
         return [await self.stream_group_info(topic, group) for topic, group in queries]
 

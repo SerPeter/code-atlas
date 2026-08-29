@@ -114,14 +114,14 @@ def test_check_pipeline_reports_a_deliberately_disabled_pipeline():
     Reporting the first as "0 task(s) running -- OK" sends someone hunting a bug
     instead of reading their own configuration."""
     daemon = _FakeDaemon({"disabled_reason": "indexing disabled (--no-index)"})
-    result = check_pipeline(daemon)  # type: ignore[arg-type]
+    result = check_pipeline(daemon)  # ty: ignore[invalid-argument-type]
     assert result.status == CheckStatus.OK
     assert "--no-index" in result.message
 
 
 def test_check_pipeline_ok():
     daemon = _FakeDaemon({"tasks_running": 2, "tasks_total": 2, "crash_counts": {}, "last_crash": {}})
-    result = check_pipeline(daemon)  # type: ignore[arg-type]
+    result = check_pipeline(daemon)  # ty: ignore[invalid-argument-type]
     assert result.status == CheckStatus.OK
     assert "2" in result.message
 
@@ -130,14 +130,14 @@ def test_check_pipeline_warn_on_crash():
     daemon = _FakeDaemon(
         {"tasks_running": 2, "tasks_total": 2, "crash_counts": {"ast-0": 3}, "last_crash": {"ast-0": "ValueError()"}}
     )
-    result = check_pipeline(daemon)  # type: ignore[arg-type]
+    result = check_pipeline(daemon)  # ty: ignore[invalid-argument-type]
     assert result.status == CheckStatus.WARN
     assert "ast-0" in result.message
 
 
 def test_check_pipeline_fail_on_dead_task():
     daemon = _FakeDaemon({"tasks_running": 1, "tasks_total": 2, "crash_counts": {}, "last_crash": {}})
-    result = check_pipeline(daemon)  # type: ignore[arg-type]
+    result = check_pipeline(daemon)  # ty: ignore[invalid-argument-type]
     assert result.status == CheckStatus.FAIL
     assert "dead" in result.message.lower()
 
@@ -548,7 +548,7 @@ async def test_pipeline_check_appended_when_daemon_passed(tmp_path):
             settings,
             graph=graph,
             embed=embed,
-            daemon=daemon,  # type: ignore[arg-type]
+            daemon=daemon,  # ty: ignore[invalid-argument-type]
             bus=bus,
         )
 
@@ -605,7 +605,7 @@ async def test_the_daemon_is_only_consulted_for_pipeline_liveness(tmp_path):
     daemon_bus = AsyncMock()
     daemon = _FakeDaemon({"tasks_running": 1, "tasks_total": 1}, bus=daemon_bus)
 
-    report = await run_health_checks(settings, graph=graph, bus=bus, embed=embed, daemon=daemon)  # type: ignore[arg-type]
+    report = await run_health_checks(settings, graph=graph, bus=bus, embed=embed, daemon=daemon)  # ty: ignore[invalid-argument-type]
 
     by_name = {c.name: c for c in report.checks}
     assert by_name["valkey"].status == CheckStatus.OK

@@ -496,13 +496,13 @@ async def run_health_checks(
         # (same "deferred retyping" convention as the ~10 construction call sites elsewhere) —
         # they only call methods both backends implement, so the SqliteGraphClient case is safe.
         schema_res, model_res, index_res = await asyncio.gather(
-            check_schema(graph),  # type: ignore[invalid-argument-type]
+            check_schema(graph),  # ty: ignore[invalid-argument-type]
             check_embedding_model(
-                graph,  # type: ignore[invalid-argument-type]
+                graph,  # ty: ignore[invalid-argument-type]
                 settings.embeddings,
                 derive_project_name(settings.project_root),
             ),
-            check_index(graph, settings),  # type: ignore[invalid-argument-type]
+            check_index(graph, settings),  # ty: ignore[invalid-argument-type]
         )
         results.append(schema_res)
         results.append(model_res)

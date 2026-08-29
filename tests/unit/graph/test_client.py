@@ -1184,7 +1184,7 @@ class TestPatientWritePath:
         exercise the real attempt count and the real retry predicate.
         """
         # `.retry` is attached by tenacity's decorator at runtime; ty cannot see it.
-        retrying = GraphClient._execute_write_patient.retry  # type: ignore[unresolved-attribute]
+        retrying = GraphClient._execute_write_patient.retry  # ty: ignore[unresolved-attribute]
         monkeypatch.setattr(retrying, "wait", wait_none())
 
     @staticmethod

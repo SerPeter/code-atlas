@@ -760,8 +760,8 @@ def create_mcp_server(  # noqa: PLR0915
         # follow-up (see backends/__init__.py factory docstring).
         stack = AsyncExitStack()
         backends = await stack.enter_async_context(use_backends(settings))
-        graph: GraphClient = backends.graph  # type: ignore[invalid-assignment]
-        bus: EventBus = backends.bus  # type: ignore[invalid-assignment]
+        graph: GraphClient = backends.graph  # ty: ignore[invalid-assignment]
+        bus: EventBus = backends.bus  # ty: ignore[invalid-assignment]
         try:
             await graph.ping()
         except Exception as exc:
@@ -857,7 +857,7 @@ def create_mcp_server(  # noqa: PLR0915
                 app_ctx.roots_checked = False
                 logger.debug("Received roots/list_changed — will re-probe on next tool call")
 
-            raw.notification_handlers["notifications/roots/list_changed"] = _on_roots_changed  # type: ignore[index]
+            raw.notification_handlers["notifications/roots/list_changed"] = _on_roots_changed  # ty: ignore[invalid-assignment]
         except Exception:
             logger.debug("Could not register roots/list_changed handler — root updates via notification disabled")
 
@@ -979,7 +979,7 @@ def _register_node_tools(mcp: FastMCP) -> None:
                 ),
             ),
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -1156,7 +1156,7 @@ def _install_tool_tracing(mcp: FastMCP) -> None:
 
         return wrap
 
-    mcp.tool = tracing_tool  # type: ignore[method-assign]
+    mcp.tool = tracing_tool  # ty: ignore[invalid-assignment]
 
 
 def _annotate_tool_span(span: Any, result: dict[str, Any]) -> None:
@@ -1203,7 +1203,7 @@ def _install_backend_stamp(mcp: FastMCP) -> None:
 
         return wrap
 
-    mcp.tool = stamping_tool  # type: ignore[method-assign]
+    mcp.tool = stamping_tool  # ty: ignore[invalid-assignment]
 
 
 def _register_query_tools(mcp: FastMCP) -> None:
@@ -1220,7 +1220,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
     async def cypher_query(
         query: Annotated[str, Field(description="Read-only Cypher query. LIMIT is auto-appended if missing.")],
         limit: Annotated[int, Field(20, description="Max results (auto-appended as LIMIT clause).", ge=1, le=100)] = 20,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -1282,7 +1282,7 @@ def _register_query_tools(mcp: FastMCP) -> None:
             int, Field(1, description="CALLS traversal hops (1 = direct callers/callees only).", ge=1, le=3)
         ] = 1,
         include_docs: Annotated[bool, Field(True, description="Include linked documentation sections.")] = True,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -1354,7 +1354,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
                 description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
             ),
         ] = "summary",
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -1419,7 +1419,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
                 description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
             ),
         ] = "summary",
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -1601,7 +1601,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 description="'summary' (default) or 'full' (add source, full docstrings, call stats).",
             ),
         ] = "summary",
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -1718,7 +1718,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
             "label_counts, vector_indices, text_indices, schema_version, query_ms}."
         ),
     )
-    async def index_status(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def index_status(ctx: Context = None) -> dict[str, Any]:  # ty: ignore[invalid-parameter-default]
         # Exempted from the first-index gate — must stay reachable so a blocked
         # caller can see the pipeline state that's blocking the other tools.
         app = await _ensure_root(ctx, require_index=False)
@@ -1772,7 +1772,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
             "git_hash, depends_on, depended_by}], count, truncated, query_ms}."
         ),
     )
-    async def list_projects(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def list_projects(ctx: Context = None) -> dict[str, Any]:  # ty: ignore[invalid-parameter-default]
         try:
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
@@ -1871,7 +1871,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
             "elapsed_ms}. degraded is true when any check is WARN/FAIL (e.g. Valkey down = auto-indexing off)."
         ),
     )
-    async def health_check(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def health_check(ctx: Context = None) -> dict[str, Any]:  # ty: ignore[invalid-parameter-default]
         # Exempted from the first-index gate — must stay reachable so a blocked
         # caller can see the pipeline state that's blocking the other tools.
         app = await _ensure_root(ctx, require_index=False)
@@ -1908,7 +1908,7 @@ def _register_knowledge_tools(mcp: FastMCP) -> None:
             "similar_pairs, promotion_candidates, memory_index_issues, broken_anchors, query_ms}."
         ),
     )
-    async def knowledge_health(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    async def knowledge_health(ctx: Context = None) -> dict[str, Any]:  # ty: ignore[invalid-parameter-default]
         try:
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
@@ -1945,7 +1945,7 @@ def _register_subagent_tools(mcp: FastMCP) -> None:
     )
     async def validate_cypher(
         query: Annotated[str, Field(description="Cypher query to validate (not executed).")],
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         issues = validate_cypher_static(query)
 
@@ -2069,7 +2069,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
                 "modules, hotspots, community members, etc.). Default true — override to include tests.",
             ),
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2113,7 +2113,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             bool | None,
             Field(None, description="Exclude test modules from the imports graph. Default true."),
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2155,7 +2155,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
         exclude_tests: Annotated[
             bool | None, Field(None, description="Exclude test files/entities. Default true — override to include.")
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2188,7 +2188,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
         exclude_tests: Annotated[
             bool | None, Field(None, description="Exclude test files/entities. Default true — override to include.")
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2235,7 +2235,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
                 "production subsystems; including them typically pairs each module with its own test modules.",
             ),
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2271,7 +2271,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
         exclude_tests: Annotated[
             bool | None, Field(None, description="Exclude test files/entities. Default true — override to include.")
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2320,7 +2320,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
                 "override to include. Entities inside 'path' are never filtered: you asked for that path.",
             ),
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2363,7 +2363,7 @@ def _register_traversal_tools(mcp: FastMCP) -> None:
             str,
             Field("", description="Comma-separated relationship types to traverse. Empty = CALLS,IMPORTS,USES_TYPE."),
         ] = "",
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)
@@ -2420,7 +2420,7 @@ def _register_traversal_tools(mcp: FastMCP) -> None:
                 ),
             ),
         ] = None,
-        ctx: Context = None,  # type: ignore[assignment]
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
     ) -> dict[str, Any]:
         try:
             app = await _ensure_root(ctx)

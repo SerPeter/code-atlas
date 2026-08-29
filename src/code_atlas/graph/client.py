@@ -1554,7 +1554,7 @@ class GraphClient:
     async def _execute_inner(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Inner execute without timeout — used by ``execute()``."""
         async with self._driver.session() as session:
-            result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+            result = await session.run(query, params or {})  # ty: ignore[invalid-argument-type]  # dynamic Cypher
             return [dict(record) async for record in result]
 
     async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> None:
@@ -1580,10 +1580,10 @@ class GraphClient:
         wait=wait_exponential(multiplier=0.1, min=0.1, max=2),
         before_sleep=lambda rs: logger.warning(
             "Transient conflict, retrying {} in {:.1f}s (attempt {}): {}",
-            rs.fn.__qualname__,
-            rs.next_action.sleep,
+            rs.fn.__qualname__,  # ty: ignore[unresolved-attribute]  # tenacity's RetryCallState is loosely typed in its stubs
+            rs.next_action.sleep,  # ty: ignore[unresolved-attribute]  # tenacity's RetryCallState is loosely typed in its stubs
             rs.attempt_number,
-            rs.outcome.exception(),
+            rs.outcome.exception(),  # ty: ignore[unresolved-attribute]  # tenacity's RetryCallState is loosely typed in its stubs
         ),
         reraise=True,
     )
@@ -1599,7 +1599,7 @@ class GraphClient:
     async def _execute_write_inner(self, query: str, params: dict[str, Any] | None = None) -> None:
         """Inner execute_write without timeout."""
         async with self._driver.session() as session:
-            result = await session.run(query, params or {})  # type: ignore[arg-type]  # dynamic Cypher
+            result = await session.run(query, params or {})  # ty: ignore[invalid-argument-type]  # dynamic Cypher
             await result.consume()
 
     async def get_schema_version(self) -> int | None:
@@ -6156,9 +6156,9 @@ class GraphClient:
         wait=wait_exponential(multiplier=0.5, min=0.5, max=15),
         before_sleep=lambda rs: logger.warning(
             "Schema write blocked by concurrent storage access, retrying in {:.1f}s (attempt {}): {}",
-            rs.next_action.sleep,
+            rs.next_action.sleep,  # ty: ignore[unresolved-attribute]  # tenacity's RetryCallState is loosely typed in its stubs
             rs.attempt_number,
-            rs.outcome.exception(),
+            rs.outcome.exception(),  # ty: ignore[unresolved-attribute]  # tenacity's RetryCallState is loosely typed in its stubs
         ),
         reraise=True,
     )

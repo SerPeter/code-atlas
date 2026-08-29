@@ -96,7 +96,7 @@ def _make_watcher(
     """Create a FileWatcher with fast timers for testing."""
     scope = StubScope(excluded=excluded)
     settings = WatcherSettings(debounce_s=debounce_s, max_wait_s=max_wait_s)
-    return FileWatcher(tmp_path, bus, scope, settings)  # type: ignore[arg-type]
+    return FileWatcher(tmp_path, bus, scope, settings)  # ty: ignore[invalid-argument-type]
 
 
 def _make_monorepo_watcher(
@@ -109,8 +109,8 @@ def _make_monorepo_watcher(
     """Create a monorepo FileWatcher with detected sub-projects."""
     return FileWatcher(
         tmp_path,
-        bus,  # type: ignore[arg-type]
-        StubScope(),  # type: ignore[arg-type]
+        bus,  # ty: ignore[invalid-argument-type]
+        StubScope(),  # ty: ignore[invalid-argument-type]
         WatcherSettings(debounce_s=0.05, max_wait_s=0.5),
         sub_projects=subs,
         root_name=root_name,
@@ -435,7 +435,7 @@ class TestDirectoryRenameExpansion:
     async def test_directory_delete_expands_to_known_files(self, tmp_path: Path) -> None:
         bus = RecordingBus()
         settings = WatcherSettings(debounce_s=0.05, max_wait_s=5.0)
-        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # type: ignore[arg-type]
+        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # ty: ignore[invalid-argument-type]
         watcher._known_files = {"pkg/mod_a.py", "pkg/mod_b.py", "other.py"}
 
         await watcher._on_change({(Change.deleted, str(tmp_path / "pkg"))})
@@ -448,7 +448,7 @@ class TestDirectoryRenameExpansion:
     async def test_directory_delete_without_known_children_is_ignored(self, tmp_path: Path) -> None:
         bus = RecordingBus()
         settings = WatcherSettings(debounce_s=0.05, max_wait_s=5.0)
-        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # type: ignore[arg-type]
+        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # ty: ignore[invalid-argument-type]
 
         await watcher._on_change({(Change.deleted, str(tmp_path / "empty_dir"))})
         assert watcher._pending == {}
@@ -462,7 +462,7 @@ class TestDirectoryRenameExpansion:
         (new_dir / "readme.txt").write_text("not code\n")
 
         settings = WatcherSettings(debounce_s=0.05, max_wait_s=5.0)
-        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # type: ignore[arg-type]
+        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # ty: ignore[invalid-argument-type]
 
         await watcher._on_change({(Change.added, str(new_dir))})
         await watcher._flush()
@@ -493,7 +493,7 @@ class TestDirectoryRenameExpansion:
 
         bus = RecordingBus()
         settings = WatcherSettings(debounce_s=0.05, max_wait_s=5.0)
-        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # type: ignore[arg-type]
+        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # ty: ignore[invalid-argument-type]
 
         ticks = 0
 
@@ -517,7 +517,7 @@ class TestDirectoryRenameExpansion:
         """Regression guard: ordinary per-file changes keep updating _known_files."""
         bus = RecordingBus()
         settings = WatcherSettings(debounce_s=0.05, max_wait_s=5.0)
-        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # type: ignore[arg-type]
+        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # ty: ignore[invalid-argument-type]
         watcher._known_files = {"solo.py"}
 
         await watcher._on_change({(Change.deleted, str(tmp_path / "solo.py"))})

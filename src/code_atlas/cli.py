@@ -199,7 +199,7 @@ def _load_settings(**overrides: object) -> AtlasSettings:
     from code_atlas.settings import AtlasSettings
 
     try:
-        return AtlasSettings(**overrides)  # type: ignore[arg-type]
+        return AtlasSettings(**overrides)  # ty: ignore[invalid-argument-type]
     except RuntimeError as exc:
         logger.error("{}", exc)
         raise typer.Exit(code=1) from None
@@ -517,7 +517,7 @@ def mcp(
             port,
             "on" if auto_index else "off",
         )
-        server.run(transport=transport)  # type: ignore[arg-type]  # typer gives str, FastMCP expects Literal
+        server.run(transport=transport)  # ty: ignore[invalid-argument-type]  # typer gives str, FastMCP expects Literal
     finally:
         shutdown_telemetry()
 
@@ -963,7 +963,7 @@ async def _run_search(
 
         # Staleness check (before output so JSON can include it)
         checker = StalenessChecker(settings.project_root)
-        info = await checker.check(graph, include_changed=True)  # type: ignore[invalid-argument-type]
+        info = await checker.check(graph, include_changed=True)  # ty: ignore[invalid-argument-type]
 
         if _output.json:
             _json_output(
@@ -1245,7 +1245,7 @@ async def _run_doctor() -> None:
 def _print_report(report: object, *, detailed: bool) -> None:
     from code_atlas.server.health import CheckStatus, HealthReport
 
-    rpt: HealthReport = report  # type: ignore[assignment]
+    rpt: HealthReport = report  # ty: ignore[invalid-assignment]
 
     if _output.json:
         _json_output(
@@ -1326,7 +1326,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
         await graph.ensure_schema()
 
         daemon = DaemonManager()
-        started = await daemon.start(settings, graph, bus)  # type: ignore[invalid-argument-type]
+        started = await daemon.start(settings, graph, bus)  # ty: ignore[invalid-argument-type]
         if not started:
             logger.error("A reachable queue backend is required for watch mode")
             raise typer.Exit(code=1)
@@ -1376,7 +1376,7 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
         await graph.ensure_schema()
 
         daemon = DaemonManager()
-        started = await daemon.start(settings, graph, bus, include_watcher=True)  # type: ignore[invalid-argument-type]
+        started = await daemon.start(settings, graph, bus, include_watcher=True)  # ty: ignore[invalid-argument-type]
         if not started:
             logger.error("A reachable queue backend is required for daemon mode")
             raise typer.Exit(code=1)

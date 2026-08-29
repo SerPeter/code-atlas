@@ -67,7 +67,7 @@ def _make_watcher(
     """Create a FileWatcher with fast timers for testing."""
     scope = StubScope(excluded=excluded)
     settings = WatcherSettings(debounce_s=debounce_s, max_wait_s=max_wait_s)
-    return FileWatcher(tmp_path, bus, scope, settings)  # type: ignore[arg-type]
+    return FileWatcher(tmp_path, bus, scope, settings)  # ty: ignore[invalid-argument-type]
 
 
 # ---------------------------------------------------------------------------

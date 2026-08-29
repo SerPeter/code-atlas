@@ -626,13 +626,17 @@ def test_custom_metadata_filename_that_already_carries_mdt_is_not_doubled():
     [
         (
             "web/lwc/propertyTile/propertyTile.js-meta.xml",
-            '<?xml version="1.0"?>\n<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-            "  <isExposed>true</isExposed>\n</LightningComponentBundle>\n",
+            (
+                '<?xml version="1.0"?>\n<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <isExposed>true</isExposed>\n</LightningComponentBundle>\n"
+            ),
         ),
         (
             "force-app/main/default/permissionsets/Admin.permissionset-meta.xml",
-            '<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-            "  <label>Admin</label>\n</PermissionSet>\n",
+            (
+                '<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <label>Admin</label>\n</PermissionSet>\n"
+            ),
         ),
         ("pom.xml", "<project>\n  <artifactId>acme</artifactId>\n</project>\n"),
     ],
@@ -691,20 +695,26 @@ def test_malformed_documents_never_raise(source: str):
     [
         (
             f"{OBJECTS}/Property__c/fields/X.field-meta.xml",
-            '<?xml version="1.0"?>\n<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-            "  <fullName></fullName>\n  <type></type>\n</CustomField>\n",
+            (
+                '<?xml version="1.0"?>\n<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <fullName></fullName>\n  <type></type>\n</CustomField>\n"
+            ),
         ),
         (
             f"{FLOWS}/Empty.flow-meta.xml",
-            '<?xml version="1.0"?>\n<Flow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-            "  <recordCreates><object/></recordCreates>\n"
-            "  <subflows><flowName/></subflows>\n"
-            "  <actionCalls><actionType>apex</actionType></actionCalls>\n</Flow>\n",
+            (
+                '<?xml version="1.0"?>\n<Flow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <recordCreates><object/></recordCreates>\n"
+                "  <subflows><flowName/></subflows>\n"
+                "  <actionCalls><actionType>apex</actionType></actionCalls>\n</Flow>\n"
+            ),
         ),
         (
             "force-app/main/default/labels/CustomLabels.labels-meta.xml",
-            '<?xml version="1.0"?>\n<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-            "  <labels><value>orphan</value></labels>\n</CustomLabels>\n",
+            (
+                '<?xml version="1.0"?>\n<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <labels><value>orphan</value></labels>\n</CustomLabels>\n"
+            ),
         ),
     ],
     ids=["nameless-field", "empty-flow-refs", "nameless-label"],

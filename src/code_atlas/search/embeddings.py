@@ -201,9 +201,9 @@ class EmbedClient:
         wait=wait_exponential(multiplier=1, min=1, max=20),
         before_sleep=lambda rs: logger.warning(
             "Embedding call transient error, retrying in {:.1f}s (attempt {}): {}",
-            rs.next_action.sleep,
+            rs.next_action.sleep,  # ty: ignore[unresolved-attribute]  # tenacity's RetryCallState is loosely typed in its stubs
             rs.attempt_number,
-            rs.outcome.exception(),
+            rs.outcome.exception(),  # ty: ignore[unresolved-attribute]  # tenacity's RetryCallState is loosely typed in its stubs
         ),
         reraise=True,
     )

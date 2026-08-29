@@ -1867,7 +1867,7 @@ def _walk_all_nodes(root: Node) -> Iterator[Node]:
     """
     cursor = root.walk()
     while True:
-        yield cursor.node
+        yield cursor.node  # ty: ignore[invalid-yield]  # cursor.node is Optional in the stubs, never None mid-walk
         if cursor.goto_first_child():
             continue
         while not cursor.goto_next_sibling():

@@ -87,7 +87,7 @@ class FakeRedis:
 
 def _make_bus(fake: FakeRedis, *, stream_maxlen: int = 1_000_000) -> EventBus:
     bus = EventBus(RedisSettings(stream_maxlen=stream_maxlen))
-    bus._redis = fake
+    bus._redis = fake  # ty: ignore[invalid-assignment]  # a deliberate fake in place of the real client
     return bus
 
 
@@ -127,9 +127,9 @@ class TestPublishMaxlen:
     async def test_callers_cannot_pass_their_own_maxlen(self) -> None:
         bus = _make_bus(FakeRedis())
         with pytest.raises(TypeError):
-            await bus.publish(Topic.FILE_CHANGED, _event(), maxlen=10)  # type: ignore[call-arg]
+            await bus.publish(Topic.FILE_CHANGED, _event(), maxlen=10)  # ty: ignore[unknown-argument]
         with pytest.raises(TypeError):
-            await bus.publish_many(Topic.FILE_CHANGED, [_event()], maxlen=10)  # type: ignore[call-arg]
+            await bus.publish_many(Topic.FILE_CHANGED, [_event()], maxlen=10)  # ty: ignore[unknown-argument]
 
 
 # ---------------------------------------------------------------------------

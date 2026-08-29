@@ -145,7 +145,7 @@ dev = [
     "hypothesis~=6.140",
     "pre-commit~=4.5",
     "ruff~=0.15",
-    "ty==0.0.15",             # pinned exact: 0.0.60 stopped honoring existing `# type: ignore[...]` comments and got much stricter about dict variance, surfacing 182 diagnostics across ~25 unrelated files — pre-1.0 tool, revisit deliberately
+    "ty==0.0.75",             # still pinned exact -- pre-1.0, and 0.0.60 once surfaced 182 diagnostics across ~25 files in a single bump. Moved deliberately, not by --upgrade: see the commit that raised it for what the newer checks caught.
     "psutil~=7.2",
     "testcontainers>=4.10",
 ]

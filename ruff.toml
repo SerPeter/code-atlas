@@ -53,6 +53,8 @@ ignore = [
     "COM812",   # trailing comma — conflicts with formatter
     "ISC001",   # single-line implicit string concat — conflicts with formatter
     "PLR0913",  # too many arguments — common in config-heavy code
+    "PLR0917",  # too many positional arguments — same call as PLR0913, and three of
+                # the sites are signatures Typer/Litestar/FastMCP define for us
     "PLR2004",  # magic value comparison — too noisy
     "TRY003",   # long exception messages — we prefer descriptive errors
 ]

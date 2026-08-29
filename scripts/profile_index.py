@@ -169,7 +169,7 @@ def _patch_handles():
                     prev = _task_oncpu.get(tid)
                     _task_oncpu[tid] = (cb.get_name(), (prev[1] if prev else 0.0) + elapsed)
 
-    asyncio.events.Handle = _TimedHandle  # type: ignore[misc]
+    asyncio.events.Handle = _TimedHandle  # ty: ignore[invalid-assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +278,7 @@ def patch_all():
             _bus_metrics.total_messages += len(result)
         return result
 
-    EventBus.read_batch = _counting_read_batch  # type: ignore[invalid-assignment]  # monkey-patch
+    EventBus.read_batch = _counting_read_batch  # ty: ignore[invalid-assignment]  # monkey-patch
 
 
 # ---------------------------------------------------------------------------

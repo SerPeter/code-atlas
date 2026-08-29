@@ -165,7 +165,7 @@ class FakeStreamBus:
 
 
 def _make_consumer(tmp_path: Path, *, cooldown_s: float = 0.0) -> ASTConsumer:
-    return ASTConsumer(RecordingBus(), StubGraph(), AtlasSettings(project_root=tmp_path), cooldown_s=cooldown_s)  # type: ignore[arg-type]
+    return ASTConsumer(RecordingBus(), StubGraph(), AtlasSettings(project_root=tmp_path), cooldown_s=cooldown_s)  # ty: ignore[invalid-argument-type]
 
 
 def _event(path: str, project_name: str, project_root: str = "", change_type: str = "modified") -> FileChanged:
@@ -188,7 +188,7 @@ async def test_dedup_key_scoped_by_project(tmp_path: Path) -> None:
     await consumer._dedup_put(pending, consumer.dedup_key(ev_b), b"2-0", ev_b)
 
     assert len(pending) == 2
-    assert consumer.bus.acked == []  # type: ignore[attr-defined]
+    assert consumer.bus.acked == []  # ty: ignore[unresolved-attribute]
 
 
 async def test_dedup_same_project_supersedes(tmp_path: Path) -> None:
@@ -202,7 +202,7 @@ async def test_dedup_same_project_supersedes(tmp_path: Path) -> None:
     await consumer._dedup_put(pending, consumer.dedup_key(ev2), b"2-0", ev2)
 
     assert len(pending) == 1
-    assert consumer.bus.acked == [b"1-0"]  # type: ignore[attr-defined]
+    assert consumer.bus.acked == [b"1-0"]  # ty: ignore[unresolved-attribute]
 
 
 async def test_dedup_pel_reread_does_not_self_ack(tmp_path: Path) -> None:
@@ -215,7 +215,7 @@ async def test_dedup_pel_reread_does_not_self_ack(tmp_path: Path) -> None:
     await consumer._dedup_put(pending, key, b"1-0", ev)
     await consumer._dedup_put(pending, key, b"1-0", ev)
 
-    assert consumer.bus.acked == []  # type: ignore[attr-defined]
+    assert consumer.bus.acked == []  # ty: ignore[unresolved-attribute]
     assert pending[key] == (b"1-0", ev)
 
 
@@ -237,7 +237,7 @@ async def test_dedup_reclaim_never_acks_newer_pending_message(tmp_path: Path) ->
     await consumer._dedup_put(pending, key, b"3-0", ev1)
     await consumer._dedup_put(pending, key, b"5-0", ev2)
 
-    assert consumer.bus.acked == [b"3-0"]  # type: ignore[attr-defined]
+    assert consumer.bus.acked == [b"3-0"]  # ty: ignore[unresolved-attribute]
     assert pending[key] == (b"5-0", ev2)
 
 
@@ -252,7 +252,7 @@ async def test_dedup_compares_stream_ids_numerically(tmp_path: Path) -> None:
 
     await consumer._dedup_put(pending, key, b"9-0", ev1)
 
-    assert consumer.bus.acked == [b"9-0"]  # type: ignore[attr-defined]
+    assert consumer.bus.acked == [b"9-0"]  # ty: ignore[unresolved-attribute]
     assert pending[key] == (b"10-0", ev2)
 
 
@@ -268,7 +268,7 @@ async def test_dedup_supersession_prunes_fail_count(tmp_path: Path) -> None:
     await consumer._dedup_put(pending, consumer.dedup_key(ev1), b"1-0", ev1)
     await consumer._dedup_put(pending, consumer.dedup_key(ev2), b"2-0", ev2)
 
-    assert consumer.bus.acked == [b"1-0"]  # type: ignore[attr-defined]
+    assert consumer.bus.acked == [b"1-0"]  # ty: ignore[unresolved-attribute]
     assert consumer._fail_counts == {}
 
 
@@ -284,7 +284,7 @@ async def test_ack_processed_only_acks_non_deferred(tmp_path: Path) -> None:
 
     await consumer._ack_processed([ev1, ev2], [b"1-0", b"2-0"], {"p:b.py"})
 
-    assert consumer.bus.acked == [b"1-0"]  # type: ignore[attr-defined]
+    assert consumer.bus.acked == [b"1-0"]  # ty: ignore[unresolved-attribute]
     assert consumer._pel_dirty is True
 
 
@@ -294,10 +294,10 @@ async def test_dispatch_batch_retains_deferred_in_pel(tmp_path: Path) -> None:
     root = str(tmp_path)
 
     await consumer._dispatch_batch([_event("src/x.py", "p", root, "deleted")], [b"1-0"], "b1")
-    assert consumer.bus.acked == [b"1-0"]  # type: ignore[attr-defined]
+    assert consumer.bus.acked == [b"1-0"]  # ty: ignore[unresolved-attribute]
 
     await consumer._dispatch_batch([_event("src/x.py", "p", root, "deleted")], [b"2-0"], "b2")
-    assert consumer.bus.acked == [b"1-0"]  # type: ignore[attr-defined]
+    assert consumer.bus.acked == [b"1-0"]  # ty: ignore[unresolved-attribute]
     assert consumer._pel_dirty is True
 
 
@@ -317,7 +317,7 @@ async def test_cooldown_scoped_by_project(tmp_path: Path) -> None:
     deferred = await consumer.process_batch([_event("src/main.py", "mono/b", root, "deleted")], "b2")
     assert deferred == set()
 
-    assert consumer.graph.deleted == [("mono/a", "src/main.py"), ("mono/b", "src/main.py")]  # type: ignore[attr-defined]
+    assert consumer.graph.deleted == [("mono/a", "src/main.py"), ("mono/b", "src/main.py")]  # ty: ignore[unresolved-attribute]
 
 
 async def test_cooldown_defers_same_project(tmp_path: Path) -> None:
@@ -329,7 +329,7 @@ async def test_cooldown_defers_same_project(tmp_path: Path) -> None:
 
     deferred = await consumer.process_batch([_event("src/main.py", "mono/a", root, "deleted")], "b2")
     assert deferred == {"mono/a:src/main.py"}
-    assert consumer.graph.deleted == [("mono/a", "src/main.py")]  # type: ignore[attr-defined]
+    assert consumer.graph.deleted == [("mono/a", "src/main.py")]  # ty: ignore[unresolved-attribute]
     assert consumer.stats.files_deferred == 1
 
 
@@ -343,7 +343,7 @@ class FailingConsumer(TierConsumer):
 
     def __init__(self, bus: FakeStreamBus) -> None:
         super().__init__(
-            bus=bus,  # type: ignore[arg-type]
+            bus=bus,  # ty: ignore[invalid-argument-type]
             input_topic=Topic.FILE_CHANGED,
             group="ast",
             consumer_name="ast-0",
@@ -361,7 +361,7 @@ class FlakyConsumer(TierConsumer):
 
     def __init__(self, bus: FakeStreamBus) -> None:
         super().__init__(
-            bus=bus,  # type: ignore[arg-type]
+            bus=bus,  # ty: ignore[invalid-argument-type]
             input_topic=Topic.FILE_CHANGED,
             group="ast",
             consumer_name="ast-0",
@@ -418,7 +418,7 @@ async def test_pel_reclaimed_messages_survive_failed_first_flush() -> None:
         consumer.stop()
         await asyncio.wait_for(task, timeout=5.0)
 
-    assert {e.path for e in consumer.processed} == {"a.py", "b.py"}  # type: ignore[union-attr]
+    assert {e.path for e in consumer.processed} == {"a.py", "b.py"}  # ty: ignore[unresolved-attribute]
     assert bus.pel == {}
 
 
@@ -466,7 +466,7 @@ async def test_flush_routes_member_rels_to_resolve_member_defines(tmp_path: Path
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.member_calls == [("proj", [rel])]  # type: ignore[attr-defined]
+    assert consumer.graph.member_calls == [("proj", [rel])]  # ty: ignore[unresolved-attribute]
     assert consumer._pending_member_rels == []
 
 
@@ -524,8 +524,8 @@ async def test_flush_resolves_config_refs_then_runs_gc(tmp_path: Path) -> None:
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.config_calls == [("proj", [rel])]  # type: ignore[attr-defined]
-    assert consumer.graph.gc_calls == 1  # type: ignore[attr-defined]
+    assert consumer.graph.config_calls == [("proj", [rel])]  # ty: ignore[unresolved-attribute]
+    assert consumer.graph.gc_calls == 1  # ty: ignore[unresolved-attribute]
     assert consumer._pending_config_rels == []
 
 
@@ -539,8 +539,8 @@ async def test_flush_runs_gc_even_with_no_config_rels(tmp_path: Path) -> None:
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.config_calls == []  # type: ignore[attr-defined]
-    assert consumer.graph.gc_calls == 1  # type: ignore[attr-defined]
+    assert consumer.graph.config_calls == []  # ty: ignore[unresolved-attribute]
+    assert consumer.graph.gc_calls == 1  # ty: ignore[unresolved-attribute]
 
 
 async def test_flush_skips_gc_when_nothing_was_processed(tmp_path: Path) -> None:
@@ -548,7 +548,7 @@ async def test_flush_skips_gc_when_nothing_was_processed(tmp_path: Path) -> None
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.gc_calls == 0  # type: ignore[attr-defined]
+    assert consumer.graph.gc_calls == 0  # ty: ignore[unresolved-attribute]
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +567,7 @@ async def test_indexing_a_document_retries_that_projects_unresolved_citations(tm
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.citation_calls == [("proj", {}, None, True)]  # type: ignore[attr-defined]
+    assert consumer.graph.citation_calls == [("proj", {}, None, True)]  # ty: ignore[unresolved-attribute]
     assert consumer._citation_retry_projects == set()
 
 
@@ -582,7 +582,7 @@ async def test_new_citations_and_a_document_change_resolve_in_one_pass(tmp_path:
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.citation_calls == [  # type: ignore[attr-defined]
+    assert consumer.graph.citation_calls == [  # ty: ignore[unresolved-attribute]
         ("proj", {"proj:src.mod.f": ["ADR-0014"]}, {"src/mod.py"}, True)
     ]
 
@@ -594,7 +594,7 @@ async def test_flush_without_documents_or_citations_does_not_sweep(tmp_path: Pat
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.citation_calls == []  # type: ignore[attr-defined]
+    assert consumer.graph.citation_calls == []  # ty: ignore[unresolved-attribute]
 
 
 async def test_a_reparsed_file_with_no_citations_still_reaches_the_resolver(tmp_path: Path) -> None:
@@ -608,23 +608,23 @@ async def test_a_reparsed_file_with_no_citations_still_reaches_the_resolver(tmp_
 
     await consumer._flush_deferred_resolution()
 
-    assert consumer.graph.citation_calls == [("proj", {}, {"src/mod.py"}, False)]  # type: ignore[attr-defined]
+    assert consumer.graph.citation_calls == [("proj", {}, {"src/mod.py"}, False)]  # ty: ignore[unresolved-attribute]
     assert consumer._pending_citation_files == {}
 
 
 async def test_process_batch_scopes_every_parsed_file_not_just_citing_ones(tmp_path: Path) -> None:
     """The scope is built from the parse, not from the citations it produced."""
     settings = AtlasSettings(project_root=tmp_path, embeddings=EmbeddingSettings(enabled=False))
-    consumer = ASTConsumer(RecordingBus(), StubGraph(), settings)  # type: ignore[arg-type]
+    consumer = ASTConsumer(RecordingBus(), StubGraph(), settings)  # ty: ignore[invalid-argument-type]
     (tmp_path / "cited.py").write_text("# WHY: see ADR-0014\ndef f():\n    return 1\n", encoding="utf-8")
     (tmp_path / "plain.py").write_text("def g():\n    return 2\n", encoding="utf-8")
 
     events = [_event("cited.py", "proj", str(tmp_path)), _event("plain.py", "proj", str(tmp_path))]
-    await consumer.process_batch(events, "b1")
+    await consumer.process_batch(events, "b1")  # ty: ignore[invalid-argument-type]  # a list of one event subtype, which the signature widens
 
     # The batch's own flush already drained the buffers, so assert on what
     # actually reached the resolver.
-    assert consumer.graph.citation_calls == [  # type: ignore[attr-defined]
+    assert consumer.graph.citation_calls == [  # ty: ignore[unresolved-attribute]
         ("proj", {"proj:cited.f": ["ADR-0014"]}, {"cited.py", "plain.py"}, False)
     ]
 
@@ -637,7 +637,7 @@ async def test_final_flush_sweeps_every_project_that_saw_a_citation(tmp_path: Pa
 
     await consumer._flush_deferred_resolution(final=True)
 
-    assert consumer.graph.citation_calls == [("proj", {}, None, True)]  # type: ignore[attr-defined]
+    assert consumer.graph.citation_calls == [("proj", {}, None, True)]  # ty: ignore[unresolved-attribute]
     assert consumer._citation_projects == set()
 
 
@@ -671,8 +671,8 @@ def _reindex_consumer(tmp_path: Path, graph: StubGraph) -> ASTConsumer:
     does NOT flush — which is what makes ``_pending_file_hashes`` observable.
     """
     return ASTConsumer(
-        RecordingBus(),  # type: ignore[arg-type]
-        graph,  # type: ignore[arg-type]
+        RecordingBus(),  # ty: ignore[invalid-argument-type]
+        graph,  # ty: ignore[invalid-argument-type]
         AtlasSettings(project_root=tmp_path, embeddings=EmbeddingSettings(enabled=False)),
         policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
     )
@@ -804,7 +804,7 @@ class TestAdaptiveResolveCadence:
         ]
         assert consumer._pending_rel_count() == 0
         for i, buf in enumerate(buffers):
-            buf.append(object())  # type: ignore[arg-type]
+            buf.append(object())  # ty: ignore[invalid-argument-type]
             assert consumer._pending_rel_count() == i + 1, "a buffer is missing from the count"
 
 

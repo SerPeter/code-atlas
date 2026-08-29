@@ -455,14 +455,16 @@ class TestApexOnlySyntax:
         [
             (
                 "sharing + global + soql + dml",
-                "public with sharing class A {\n"
-                "    @AuraEnabled\n"
-                "    global static List<Account> f() {\n"
-                "        List<Account> rows = [SELECT Id, Name FROM Account WHERE Name LIKE :x];\n"
-                "        insert rows;\n"
-                "        return rows;\n"
-                "    }\n"
-                "}\n",
+                (
+                    "public with sharing class A {\n"
+                    "    @AuraEnabled\n"
+                    "    global static List<Account> f() {\n"
+                    "        List<Account> rows = [SELECT Id, Name FROM Account WHERE Name LIKE :x];\n"
+                    "        insert rows;\n"
+                    "        return rows;\n"
+                    "    }\n"
+                    "}\n"
+                ),
             ),
             (
                 "list literal",
@@ -470,11 +472,13 @@ class TestApexOnlySyntax:
             ),
             (
                 "map literal with fat arrows",
-                "public class A {\n"
-                "    void f() {\n"
-                "        Map<Id, String> m = new Map<Id, String>{ '1' => 'a', '2' => 'b' };\n"
-                "    }\n"
-                "}\n",
+                (
+                    "public class A {\n"
+                    "    void f() {\n"
+                    "        Map<Id, String> m = new Map<Id, String>{ '1' => 'a', '2' => 'b' };\n"
+                    "    }\n"
+                    "}\n"
+                ),
             ),
             (
                 "auto-implemented property",
@@ -482,36 +486,44 @@ class TestApexOnlySyntax:
             ),
             (
                 "property with accessor bodies",
-                "public class A {\n"
-                "    public Integer Count {\n"
-                "        get { return 1; }\n"
-                "        set { this.x = value; }\n"
-                "    }\n"
-                "}\n",
+                (
+                    "public class A {\n"
+                    "    public Integer Count {\n"
+                    "        get { return 1; }\n"
+                    "        set { this.x = value; }\n"
+                    "    }\n"
+                    "}\n"
+                ),
             ),
             (
                 "virtual/override/webservice/testmethod",
-                "global virtual class Base {\n"
-                "    public virtual override void run() { }\n"
-                "    webservice static void ping() { }\n"
-                "    static testmethod void check() { }\n"
-                "}\n",
+                (
+                    "global virtual class Base {\n"
+                    "    public virtual override void run() { }\n"
+                    "    webservice static void ping() { }\n"
+                    "    static testmethod void check() { }\n"
+                    "}\n"
+                ),
             ),
             (
                 "trigger context variables",
-                "trigger T on Account (before insert, before update) {\n"
-                "    for (Account a : Trigger.new) {\n"
-                "        a.Name = Trigger.oldMap.get(a.Id).Name;\n"
-                "    }\n"
-                "}\n",
+                (
+                    "trigger T on Account (before insert, before update) {\n"
+                    "    for (Account a : Trigger.new) {\n"
+                    "        a.Name = Trigger.oldMap.get(a.Id).Name;\n"
+                    "    }\n"
+                    "}\n"
+                ),
             ),
             (
                 "sosl",
-                "public class A {\n"
-                "    void f() {\n"
-                "        List<List<SObject>> r = [FIND 'x*' IN NAME FIELDS RETURNING Account(Id, Name)];\n"
-                "    }\n"
-                "}\n",
+                (
+                    "public class A {\n"
+                    "    void f() {\n"
+                    "        List<List<SObject>> r = [FIND 'x*' IN NAME FIELDS RETURNING Account(Id, Name)];\n"
+                    "    }\n"
+                    "}\n"
+                ),
             ),
         ],
     )

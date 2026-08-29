@@ -668,7 +668,7 @@ async def test_poison_batch_parked_after_retry_cap(
 async def test_publish_many_does_not_trim_backlog(event_bus: EventBus) -> None:
     """publish_many must not silently trim an unconsumed backlog (old hard 10k cap)."""
     events = [FileChanged(path=f"f_{i}.py", change_type="modified", timestamp=float(i)) for i in range(20_000)]
-    await event_bus.publish_many(Topic.FILE_CHANGED, events)
+    await event_bus.publish_many(Topic.FILE_CHANGED, events)  # ty: ignore[invalid-argument-type]  # a list of one event subtype, which the signature widens
 
     key = f"{event_bus._prefix}:{Topic.FILE_CHANGED.value}"
     assert await event_bus._redis.xlen(key) == 20_000
@@ -720,7 +720,7 @@ async def test_flush_preserves_consumer_groups(event_bus: EventBus) -> None:
     # A consumer keeps receiving new events without NOGROUP
     await event_bus.publish(Topic.FILE_CHANGED, FileChanged(path="post.py", change_type="modified"))
     messages = await event_bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", count=10, block_ms=1000)
-    paths = {decode_event(Topic.FILE_CHANGED, fields).path for _, fields in messages}  # type: ignore[union-attr]
+    paths = {decode_event(Topic.FILE_CHANGED, fields).path for _, fields in messages}  # ty: ignore[unresolved-attribute]
     assert "post.py" in paths
 
 
@@ -1414,7 +1414,7 @@ async def test_embed_concurrent_workers_no_lost_update(
     consumer = EmbedConsumer(
         event_bus,
         graph_client,
-        embed,  # type: ignore[arg-type]
+        embed,  # ty: ignore[invalid-argument-type]
         policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
         max_concurrency=2,
     )
@@ -1492,7 +1492,7 @@ async def test_embed_poison_capped_not_infinite(event_bus: EventBus, graph_clien
         # process_batch raised. EmbedConsumer now reads configured_model in
         # __init__ (ATL-135) precisely so a client missing it fails loudly at
         # construction instead of silently writing no vectors.
-        SimpleNamespace(configured_model="unused"),  # type: ignore[arg-type]
+        SimpleNamespace(configured_model="unused"),  # ty: ignore[invalid-argument-type]
         policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
         max_concurrency=1,
     )

@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, TypedDict
 
 import orjson
 import redis.asyncio as aioredis
@@ -130,6 +130,19 @@ _LEASE_RENEW_S = INDEXER_LEASE_TTL_MS / 3000
 # they retry in lockstep forever, and each round the same one tends to win.
 _LEASE_POLL_S = 2.0
 _LEASE_POLL_JITTER = 0.5
+
+
+class StreamGroupInfo(TypedDict):
+    """Backlog for one consumer group.
+
+    A TypedDict rather than ``dict[str, int | None]`` because the two keys do not have
+    the same nullability, and saying they do pushed the imprecision into every caller:
+    both compute ``pending + lag``, which against the loose type is `None + int`. Only
+    ``lag`` is ever None -- Valkey omits it when the group's position predates a trim.
+    """
+
+    pending: int
+    lag: int | None
 
 
 class IndexerBusyError(RuntimeError):
@@ -275,7 +288,7 @@ class EventBus:
 
     async def ping(self) -> bool:
         """Health check — returns True if Redis is reachable."""
-        return await self._redis.ping()  # type: ignore[invalid-await]  # stub widened to Awaitable[bool] | bool
+        return await self._redis.ping()  # ty: ignore[invalid-await]  # stub widened to Awaitable[bool] | bool
 
     async def ensure_group(self, topic: Topic, group: str) -> None:
         """Idempotently create a consumer group (starts reading new messages)."""
@@ -294,7 +307,7 @@ class EventBus:
         with _tracer.start_as_current_span("eventbus.publish", attributes={"topic": topic.value}):
             return await self._redis.xadd(
                 self._stream_key(topic),
-                encode_event(event),  # type: ignore[invalid-argument-type]  # dict[bytes,bytes] is invariant-incompatible with the stub's broader byte-like union
+                encode_event(event),  # ty: ignore[invalid-argument-type]  # dict[bytes,bytes] is invariant-incompatible with the stub's broader byte-like union
                 maxlen=self._maxlen,
                 approximate=True,
             )
@@ -311,7 +324,7 @@ class EventBus:
                 for event in events:
                     pipe.xadd(
                         key,
-                        encode_event(event),  # type: ignore[invalid-argument-type]  # see publish()
+                        encode_event(event),  # ty: ignore[invalid-argument-type]  # see publish()
                         maxlen=self._maxlen,
                         approximate=True,
                     )
@@ -482,7 +495,7 @@ class EventBus:
             "return 0 end"
         )
         return bool(
-            await self._redis.eval(  # type: ignore[invalid-await]  # stub widened to Awaitable[str] | str
+            await self._redis.eval(  # ty: ignore[invalid-await]  # stub widened to Awaitable[str] | str
                 script, 1, self._lease_key(), owner.encode(), str(ttl_ms)
             )
         )
@@ -492,7 +505,7 @@ class EventBus:
         never free a lease that has already passed to someone else."""
         script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
         return bool(
-            await self._redis.eval(  # type: ignore[invalid-await]  # stub widened to Awaitable[str] | str
+            await self._redis.eval(  # ty: ignore[invalid-await]  # stub widened to Awaitable[str] | str
                 script, 1, self._lease_key(), owner.encode()
             )
         )
@@ -502,7 +515,7 @@ class EventBus:
         raw = await self._redis.get(self._lease_key())
         return raw.decode() if raw else None
 
-    async def stream_group_info(self, topic: Topic, group: str) -> dict[str, int | None]:
+    async def stream_group_info(self, topic: Topic, group: str) -> StreamGroupInfo:
         """Return pending + lag counts for a consumer group via XINFO GROUPS.
 
         Returns ``{"pending": N, "lag": N}``. ``lag`` is ``None`` when Redis
@@ -528,7 +541,7 @@ class EventBus:
 
         return {"pending": 0, "lag": 0}
 
-    async def stream_group_info_multi(self, queries: list[tuple[Topic, str]]) -> list[dict[str, int | None]]:
+    async def stream_group_info_multi(self, queries: list[tuple[Topic, str]]) -> list[StreamGroupInfo]:
         """Return pending + lag counts for multiple consumer groups in one pipelined RTT.
 
         Each entry in *queries* is ``(topic, group_name)``.  Returns a list of
@@ -544,7 +557,7 @@ class EventBus:
             pipe.xinfo_groups(self._stream_key(topic))
         results = await pipe.execute()
 
-        out: list[dict[str, int | None]] = []
+        out: list[StreamGroupInfo] = []
         for (_topic, group), raw in zip(queries, results, strict=True):
             if isinstance(raw, Exception):
                 out.append({"pending": 0, "lag": 0})

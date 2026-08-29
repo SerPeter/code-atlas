@@ -1440,7 +1440,7 @@ async def test_module_exports_no_shadowing_by_module_entity():
     )
 
     det = ModuleExportsDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
 
     assert len(result.relationships) == 1
     assert result.relationships[0].to_name == "proj:src.app.app"

@@ -137,7 +137,7 @@ class TestConsumerSupervision:
         manager = DaemonManager()
         consumer = FakeConsumer(crashes=1)
 
-        task = asyncio.create_task(manager._run_consumer(consumer))  # type: ignore[arg-type]
+        task = asyncio.create_task(manager._run_consumer(consumer))  # ty: ignore[invalid-argument-type]
         # First run crashes; supervision restarts after ~1s backoff
         await asyncio.wait_for(consumer.running.wait(), timeout=5.0)
 
@@ -153,7 +153,7 @@ class TestConsumerSupervision:
         manager = DaemonManager()
         consumer = FakeConsumer()
 
-        task = asyncio.create_task(manager._run_consumer(consumer))  # type: ignore[arg-type]
+        task = asyncio.create_task(manager._run_consumer(consumer))  # ty: ignore[invalid-argument-type]
         await asyncio.wait_for(consumer.running.wait(), timeout=2.0)
         consumer.stop()
         await asyncio.wait_for(task, timeout=2.0)
@@ -168,7 +168,7 @@ class TestWatcherSupervision:
     async def test_watcher_restarts_after_crash(self) -> None:
         manager = DaemonManager()
         watcher = FakeWatcher(crashes=1)
-        manager._watcher = watcher  # type: ignore[assignment]
+        manager._watcher = watcher  # ty: ignore[invalid-assignment]
 
         task = asyncio.create_task(manager._run_watcher())
         await asyncio.wait_for(watcher.running.wait(), timeout=5.0)
@@ -189,7 +189,7 @@ class TestStatus:
     async def test_status_counts_running_tasks(self) -> None:
         manager = DaemonManager()
         consumer = FakeConsumer()
-        task = asyncio.create_task(manager._run_consumer(consumer))  # type: ignore[arg-type]
+        task = asyncio.create_task(manager._run_consumer(consumer))  # ty: ignore[invalid-argument-type]
         manager._tasks.append(task)
         await asyncio.wait_for(consumer.running.wait(), timeout=2.0)
 
@@ -213,8 +213,8 @@ class TestPendingEventCounts:
         manager = DaemonManager()
         bus = FakeBus(object())
         bus.group_info = {"ast": {"pending": 2, "lag": 3}, "embed": {"pending": 1, "lag": 0}}
-        manager._bus = bus  # type: ignore[assignment]
-        manager._embed = object()  # type: ignore[assignment]  # non-None signals embed consumer active
+        manager._bus = bus  # ty: ignore[invalid-assignment]
+        manager._embed = object()  # ty: ignore[invalid-assignment]  # non-None signals embed consumer active
 
         counts = await manager.pending_event_counts()
         assert counts == {"file-changed": 5, "embed-dirty": 1}
@@ -223,7 +223,7 @@ class TestPendingEventCounts:
         manager = DaemonManager()
         bus = FakeBus(object())
         bus.group_info = {"ast": {"pending": 4, "lag": None}}
-        manager._bus = bus  # type: ignore[assignment]
+        manager._bus = bus  # ty: ignore[invalid-assignment]
 
         counts = await manager.pending_event_counts()
         assert counts == {"file-changed": 4}
@@ -240,7 +240,7 @@ class TestStopOrdering:
     async def test_stop_lets_watcher_drain_pending(self) -> None:
         manager = DaemonManager()
         watcher = FakeWatcher()
-        manager._watcher = watcher  # type: ignore[assignment]
+        manager._watcher = watcher  # ty: ignore[invalid-assignment]
         manager._tasks.append(asyncio.get_running_loop().create_task(manager._run_watcher()))
         await asyncio.wait_for(watcher.running.wait(), timeout=2.0)
 
@@ -298,8 +298,8 @@ class TestStartupCatchup:
         manager = DaemonManager()
         started = await manager.start(
             _make_settings(tmp_path),
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
         )
         assert started is True
@@ -323,8 +323,8 @@ class TestStartupCatchup:
         manager = DaemonManager()
         started = await manager.start(
             settings,
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
         )
         assert started is True
@@ -338,8 +338,8 @@ class TestStartupCatchup:
         manager = DaemonManager()
         started = await manager.start(
             _make_settings(tmp_path),
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=False,
         )
@@ -355,8 +355,8 @@ class TestStartupCatchup:
         manager = DaemonManager()
         started = await manager.start(
             _make_settings(tmp_path),
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
         )
         assert started is True
@@ -370,8 +370,8 @@ class TestStartupCatchup:
         manager = DaemonManager()
         started = await manager.start(
             _make_settings(tmp_path),
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
         )
         assert started is True
@@ -387,15 +387,15 @@ class TestStartupCatchup:
         manager = DaemonManager()
         started = await manager.start(
             _make_settings(tmp_path),
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(_make_settings(tmp_path)),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
         )
         assert started is True
         await asyncio.sleep(0.05)
 
         assert "catchup-project" in patched_daemon["order"]
-        assert manager.bus._lease_holder is None  # type: ignore[union-attr]
+        assert manager.bus._lease_holder is None  # ty: ignore[unresolved-attribute]
 
         await manager.stop()
 
@@ -427,8 +427,8 @@ class TestStartupCatchup:
         started = await asyncio.wait_for(
             manager.start(
                 settings,
-                object(),  # type: ignore[invalid-argument-type]
-                BusyFakeBus(settings),  # type: ignore[invalid-argument-type]
+                object(),  # ty: ignore[invalid-argument-type]
+                BusyFakeBus(settings),  # ty: ignore[invalid-argument-type]
                 include_watcher=False,
             ),  # type: ignore[arg-type]
             timeout=5.0,
@@ -475,8 +475,8 @@ class TestStartupCatchup:
         manager = DaemonManager()
         await manager.start(
             settings,
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
         )
         await manager.stop()
@@ -553,8 +553,8 @@ class TestWatcherScopeScan:
         manager = DaemonManager()
         started = await manager.start(
             _make_settings(tmp_path),
-            object(),  # type: ignore[arg-type]
-            FakeBus(_make_settings(tmp_path)),  # type: ignore[arg-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=True,
             catchup=False,
         )
@@ -573,7 +573,7 @@ class TestVaultCatchupAndWatching:
 
     async def test_catchup_vault_swallows_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = DaemonManager()
-        manager._bus = FakeBus(object())  # type: ignore[assignment]
+        manager._bus = FakeBus(object())  # ty: ignore[invalid-assignment]
 
         async def boom(*_args: object, **_kwargs: object) -> None:
             raise RuntimeError("boom")
@@ -581,13 +581,13 @@ class TestVaultCatchupAndWatching:
         monkeypatch.setattr(daemon_module, "publish_project_changes", boom)
 
         # Must not raise — a failed vault catch-up shouldn't take down startup.
-        await manager._catchup_vault("test-vault", tmp_path, [], _make_settings(tmp_path), object())  # type: ignore[arg-type]
+        await manager._catchup_vault("test-vault", tmp_path, [], _make_settings(tmp_path), object())  # ty: ignore[invalid-argument-type]
 
     async def test_vault_watcher_restarts_after_crash(self) -> None:
         manager = DaemonManager()
         watcher = FakeWatcher(crashes=1)
 
-        task = asyncio.create_task(manager._run_vault_watcher("test-vault", watcher))  # type: ignore[arg-type]
+        task = asyncio.create_task(manager._run_vault_watcher("test-vault", watcher))  # ty: ignore[invalid-argument-type]
         await asyncio.wait_for(watcher.running.wait(), timeout=5.0)
 
         assert watcher.runs == 2
@@ -628,8 +628,8 @@ class TestVaultTaskSpawning:
         manager = DaemonManager()
         started = await manager.start(
             settings,
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=True,
         )
@@ -653,8 +653,8 @@ class TestVaultTaskSpawning:
         manager = DaemonManager()
         started = await manager.start(
             settings,
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=True,
         )
@@ -703,8 +703,8 @@ class TestVaultStartupIsolation:
         manager = DaemonManager()
         started = await manager.start(
             settings,
-            object(),  # type: ignore[invalid-argument-type]
-            FakeBus(settings),  # type: ignore[invalid-argument-type]
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=True,
         )

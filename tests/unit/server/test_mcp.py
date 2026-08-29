@@ -230,7 +230,7 @@ class TestRankResults:
 
 class TestSchemaInfo:
     async def test_schema_info_returns_complete_schema(self, settings):
-        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "schema_info")  # ty: ignore[invalid-argument-type]
 
         assert result["schema_version"] == SCHEMA_VERSION
         assert result["uid_format"] == "{project_name}:{qualified_name}"
@@ -259,7 +259,7 @@ class TestSchemaInfo:
         assert set(result["vector_searchable_labels"]) == {lbl.value for lbl in _EMBEDDABLE_LABELS}
 
     async def test_schema_info_label_groups_correct(self, settings):
-        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "schema_info")  # ty: ignore[invalid-argument-type]
         assert sorted(result["node_labels"]["code"]) == sorted(lbl.value for lbl in _CODE_LABELS)
         assert sorted(result["node_labels"]["documentation"]) == sorted(lbl.value for lbl in _DOC_LABELS)
         assert sorted(result["node_labels"]["external"]) == sorted(lbl.value for lbl in _EXTERNAL_LABELS)
@@ -688,7 +688,7 @@ class TestTruncatedField:
 
 class TestSchemaInfoEnhanced:
     async def test_schema_info_has_cypher_examples(self, settings):
-        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "schema_info")  # ty: ignore[invalid-argument-type]
         assert "cypher_examples" in result
         assert isinstance(result["cypher_examples"], list)
         assert len(result["cypher_examples"]) >= 5
@@ -697,7 +697,7 @@ class TestSchemaInfoEnhanced:
             assert "query" in ex
 
     async def test_schema_info_has_relationship_summary(self, settings):
-        result = await _invoke_tool(None, "schema_info")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "schema_info")  # ty: ignore[invalid-argument-type]
         assert "relationship_summary" in result
         summary = result["relationship_summary"]
         assert isinstance(summary, dict)
@@ -713,23 +713,23 @@ class TestSchemaInfoEnhanced:
 
 class TestValidateCypher:
     async def test_valid_query(self, settings):
-        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")  # ty: ignore[invalid-argument-type]
         assert result["valid"] is True
         errors = [i for i in result["issues"] if i["level"] == "error"]
         assert errors == []
 
     async def test_invalid_write_query(self, settings):
-        result = await _invoke_tool(None, "validate_cypher", query="CREATE (n:Foo {name: 'bar'})")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "validate_cypher", query="CREATE (n:Foo {name: 'bar'})")  # ty: ignore[invalid-argument-type]
         assert result["valid"] is False
         assert any("write" in i["message"].lower() for i in result["issues"])
 
     async def test_invalid_label(self, settings):
-        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Function) RETURN n LIMIT 10")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Function) RETURN n LIMIT 10")  # ty: ignore[invalid-argument-type]
         assert result["valid"] is False
         assert any("unknown label" in i["message"].lower() for i in result["issues"])
 
     async def test_missing_return(self, settings):
-        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Callable)")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "validate_cypher", query="MATCH (n:Callable)")  # ty: ignore[invalid-argument-type]
         warnings = [i for i in result["issues"] if i["level"] == "warning"]
         assert any("return" in i["message"].lower() for i in warnings)
 
@@ -772,7 +772,7 @@ class TestCypherToolsSqliteBackendGuard:
     async def test_cypher_query_returns_unsupported_backend_error(self, settings, tmp_path):
         graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
 
         result = await _invoke_tool(app, "cypher_query", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
@@ -783,7 +783,7 @@ class TestCypherToolsSqliteBackendGuard:
     async def test_validate_cypher_skips_explain_with_info_issue_not_crash(self, settings, tmp_path):
         graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
         embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # type: ignore[invalid-argument-type]
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
 
         result = await _invoke_tool(app, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
@@ -794,38 +794,38 @@ class TestCypherToolsSqliteBackendGuard:
 
 class TestGetUsageGuide:
     async def test_default_guide(self, settings):
-        result = await _invoke_tool(None, "get_usage_guide")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "get_usage_guide")  # ty: ignore[invalid-argument-type]
         assert result["topic"] == "quickstart"
         assert len(result["guide"]) > 50
 
     async def test_specific_topic(self, settings):
-        result = await _invoke_tool(None, "get_usage_guide", topic="cypher")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "get_usage_guide", topic="cypher")  # ty: ignore[invalid-argument-type]
         assert result["topic"] == "cypher"
         assert "cypher" in result["guide"].lower()
 
     async def test_unknown_topic(self, settings):
-        result = await _invoke_tool(None, "get_usage_guide", topic="nonexistent")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "get_usage_guide", topic="nonexistent")  # ty: ignore[invalid-argument-type]
         assert "unknown topic" in result["guide"].lower()
 
     async def test_available_topics(self, settings):
-        result = await _invoke_tool(None, "get_usage_guide")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "get_usage_guide")  # ty: ignore[invalid-argument-type]
         assert "available_topics" in result
         assert "searching" in result["available_topics"]
 
 
 class TestPlanSearchStrategy:
     async def test_identifier_query(self, settings):
-        result = await _invoke_tool(None, "plan_search_strategy", question="MyClass")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "plan_search_strategy", question="MyClass")  # ty: ignore[invalid-argument-type]
         assert result["recommended_tool"] == "get_node"
         assert "alternatives" in result
 
     async def test_natural_language_query(self, settings):
-        result = await _invoke_tool(None, "plan_search_strategy", question="how does authentication handle tokens")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "plan_search_strategy", question="how does authentication handle tokens")  # ty: ignore[invalid-argument-type]
         assert result["recommended_tool"] in ("hybrid_search", "cypher_query")
         assert "explanation" in result
 
     async def test_structural_query(self, settings):
-        result = await _invoke_tool(None, "plan_search_strategy", question="what calls the process function")  # type: ignore[arg-type]
+        result = await _invoke_tool(None, "plan_search_strategy", question="what calls the process function")  # ty: ignore[invalid-argument-type]
         assert result["recommended_tool"] == "cypher_query"
 
 
@@ -1524,7 +1524,7 @@ class TestEnsureRootGate:
 
         asyncio.get_running_loop().create_task(_unblock_shortly())
 
-        result = await asyncio.wait_for(_ensure_root(ctx), timeout=2.0)  # type: ignore[arg-type]
+        result = await asyncio.wait_for(_ensure_root(ctx), timeout=2.0)  # ty: ignore[invalid-argument-type]
         assert result is app
 
     async def test_never_unblocked_raises_index_not_ready_within_bounded_time(self, settings, monkeypatch):
@@ -1544,7 +1544,7 @@ class TestEnsureRootGate:
         ctx = _FakeCtx(app)
 
         with pytest.raises(IndexNotReadyError):
-            await asyncio.wait_for(_ensure_root(ctx), timeout=2.0)  # type: ignore[arg-type]
+            await asyncio.wait_for(_ensure_root(ctx), timeout=2.0)  # ty: ignore[invalid-argument-type]
 
     async def test_require_index_false_bypasses_wait(self, settings):
         """health_check/index_status pass require_index=False — must return
@@ -1561,7 +1561,7 @@ class TestEnsureRootGate:
         )
         ctx = _FakeCtx(app)
 
-        result = await asyncio.wait_for(_ensure_root(ctx, require_index=False), timeout=1.0)  # type: ignore[arg-type]
+        result = await asyncio.wait_for(_ensure_root(ctx, require_index=False), timeout=1.0)  # ty: ignore[invalid-argument-type]
         assert result is app
 
 
@@ -1768,8 +1768,8 @@ class TestNoIndexMode:
         task = _spawn_indexing(
             daemon,
             settings,
-            None,  # type: ignore[invalid-argument-type]
-            None,  # type: ignore[invalid-argument-type]
+            None,  # ty: ignore[invalid-argument-type]
+            None,  # ty: ignore[invalid-argument-type]
             catchup=True,
             auto_index=auto_index,
             first_index_ready=ready,
@@ -1791,8 +1791,8 @@ class TestNoIndexMode:
         _spawn_indexing(
             daemon,
             settings,
-            None,  # type: ignore[invalid-argument-type]
-            None,  # type: ignore[invalid-argument-type]
+            None,  # ty: ignore[invalid-argument-type]
+            None,  # ty: ignore[invalid-argument-type]
             catchup=True,
             auto_index=auto_index,
             first_index_ready=ready,
@@ -1816,8 +1816,8 @@ class TestNoIndexMode:
         task = _spawn_indexing(
             daemon,
             settings,
-            None,  # type: ignore[invalid-argument-type]
-            None,  # type: ignore[invalid-argument-type]
+            None,  # ty: ignore[invalid-argument-type]
+            None,  # ty: ignore[invalid-argument-type]
             catchup=True,
             auto_index=auto_index,
             first_index_ready=ready,

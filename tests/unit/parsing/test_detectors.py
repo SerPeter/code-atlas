@@ -133,7 +133,7 @@ def test_get_enabled_empty_registry(monkeypatch):
 async def test_run_detectors_empty_list():
     """No detectors -> empty result."""
     parsed = _make_parsed_file()
-    result = await run_detectors([], parsed, "proj", None)  # type: ignore[arg-type]
+    result = await run_detectors([], parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert result.relationships == []
     assert result.enrichments == []
 
@@ -154,7 +154,7 @@ async def test_run_detectors_merges_results():
     det_b = FakeDetector("det_b", DetectorResult(enrichments=[enrichment]))
 
     parsed = _make_parsed_file()
-    result = await run_detectors([det_a, det_b], parsed, "proj", None)  # type: ignore[arg-type]
+    result = await run_detectors([det_a, det_b], parsed, "proj", None)  # ty: ignore[invalid-argument-type]
 
     assert len(result.relationships) == 1
     assert result.relationships[0].rel_type == RelType.OVERRIDES
@@ -172,7 +172,7 @@ async def test_run_detectors_isolates_failures():
     bad_det = FailingDetector()
 
     parsed = _make_parsed_file()
-    result = await run_detectors([bad_det, good_det], parsed, "proj", None)  # type: ignore[arg-type]
+    result = await run_detectors([bad_det, good_det], parsed, "proj", None)  # ty: ignore[invalid-argument-type]
 
     # Good detector's output is present despite bad detector raising
     assert len(result.enrichments) == 1
@@ -196,7 +196,7 @@ def test_property_enrichment_frozen():
     """PropertyEnrichment is immutable."""
     enrichment = PropertyEnrichment(qualified_name="proj:x", properties={"a": 1})
     with pytest.raises(AttributeError):
-        enrichment.qualified_name = "proj:y"  # type: ignore[misc]
+        enrichment.qualified_name = "proj:y"  # ty: ignore[invalid-assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +299,7 @@ async def test_di_injection_depends():
     entity = _make_entity(signature="def handler(db=Depends(get_db))")
     parsed = _make_parsed(entities=[entity])
     det = DIInjectionDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert len(result.enrichments) == 1
     assert result.enrichments[0].properties["di_framework"] == "fastapi"
     assert result.enrichments[0].properties["dependencies"] == ["get_db"]
@@ -443,7 +443,7 @@ async def test_dataclass_synthesis_decorator():
     )
     parsed = _make_parsed(entities=[entity])
     det = DataclassSynthesisDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert len(result.enrichments) == 1
     assert result.enrichments[0].properties["synthesis_framework"] == "dataclasses"
     assert "__init__" in result.enrichments[0].properties["synthesized_methods"]
@@ -461,7 +461,7 @@ async def test_dataclass_synthesis_attrs():
     )
     parsed = _make_parsed(entities=[entity])
     det = DataclassSynthesisDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert len(result.enrichments) == 1
     assert result.enrichments[0].properties["synthesis_framework"] == "attrs"
 
@@ -481,7 +481,7 @@ async def test_dataclass_synthesis_pydantic():
     )
     parsed = _make_parsed(entities=[entity], relationships=[inherits_rel])
     det = DataclassSynthesisDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert len(result.enrichments) == 1
     assert result.enrichments[0].properties["synthesis_framework"] == "pydantic"
     assert "__init__" in result.enrichments[0].properties["synthesized_methods"]
@@ -497,7 +497,7 @@ async def test_dataclass_synthesis_no_match():
     )
     parsed = _make_parsed(entities=[entity])
     det = DataclassSynthesisDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert result.enrichments == []
 
 
@@ -538,7 +538,7 @@ async def test_module_exports_basic():
     )
     parsed = _make_parsed(entities=[module, func_a, func_b, all_val])
     det = ModuleExportsDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert len(result.enrichments) == 1
     assert result.enrichments[0].properties["public_api"] == ["func_a", "func_b"]
     assert len(result.relationships) == 2
@@ -558,7 +558,7 @@ async def test_module_exports_no_all():
     )
     parsed = _make_parsed(entities=[module])
     det = ModuleExportsDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert result.enrichments == []
     assert result.relationships == []
 
@@ -591,7 +591,7 @@ async def test_module_exports_unresolved_name():
     )
     parsed = _make_parsed(entities=[module, all_val])
     det = ModuleExportsDetector()
-    result = await det.detect(parsed, "proj", None)  # type: ignore[arg-type]
+    result = await det.detect(parsed, "proj", None)  # ty: ignore[invalid-argument-type]
     assert len(result.enrichments) == 1
     assert result.enrichments[0].properties["public_api"] == ["missing_func"]
     assert len(result.relationships) == 1

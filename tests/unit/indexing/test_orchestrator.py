@@ -999,7 +999,7 @@ class TestWaitForDrain:
         """pending == 0 and lag == 0 sustained for settle_s returns True."""
         bus = FakeDrainBus({"pending": 0, "lag": 0})
 
-        drained = await _wait_for_drain(bus, 5.0, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+        drained = await _wait_for_drain(bus, 5.0, embed_enabled=False, settle_s=0.0)  # ty: ignore[invalid-argument-type]
 
         assert drained is True
 
@@ -1007,7 +1007,7 @@ class TestWaitForDrain:
         """Outstanding work at the deadline returns False instead of falling through."""
         bus = FakeDrainBus({"pending": 3, "lag": 2})
 
-        drained = await _wait_for_drain(bus, 0.6, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+        drained = await _wait_for_drain(bus, 0.6, embed_enabled=False, settle_s=0.0)  # ty: ignore[invalid-argument-type]
 
         assert drained is False
 
@@ -1015,7 +1015,7 @@ class TestWaitForDrain:
         """lag=None (stream trimmed past group read position) means unknown → not drained."""
         bus = FakeDrainBus({"pending": 0, "lag": None})
 
-        drained = await _wait_for_drain(bus, 0.6, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+        drained = await _wait_for_drain(bus, 0.6, embed_enabled=False, settle_s=0.0)  # ty: ignore[invalid-argument-type]
 
         assert drained is False
 
@@ -1023,7 +1023,7 @@ class TestWaitForDrain:
         """timeout_s <= 0 returns False immediately (no NameError on unset locals)."""
         bus = FakeDrainBus({"pending": 0, "lag": 0})
 
-        drained = await _wait_for_drain(bus, 0.0, embed_enabled=False, settle_s=0.0)  # type: ignore[arg-type]
+        drained = await _wait_for_drain(bus, 0.0, embed_enabled=False, settle_s=0.0)  # ty: ignore[invalid-argument-type]
 
         assert drained is False
 
@@ -1033,7 +1033,7 @@ class TestWaitForDrain:
         bus = FakeDrainBus({"pending": 4, "lag": None})
 
         await _wait_for_drain(
-            bus,  # type: ignore[arg-type]
+            bus,  # ty: ignore[invalid-argument-type]
             0.3,
             embed_enabled=False,
             settle_s=0.0,
@@ -1104,7 +1104,7 @@ class TestCheckModelLock:
         """--full with unchanged model/dimension must not wipe other projects' embeddings."""
         graph = FakeLockGraph(stored=("model-a", 768), project_models={"proj": "model-a"})
 
-        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True)  # ty: ignore[invalid-argument-type]
 
         call_names = {c[0] for c in graph.calls}
         assert "clear_embeddings" not in call_names
@@ -1114,7 +1114,7 @@ class TestCheckModelLock:
         """--full on a fresh database writes config without a destructive pass."""
         graph = FakeLockGraph(stored=None)
 
-        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True)  # ty: ignore[invalid-argument-type]
 
         assert graph.calls == [
             ("set_embedding_config", "model-a", 768),
@@ -1133,7 +1133,7 @@ class TestCheckModelLock:
             counts={"proj": 100, "other": 5_000},
         )
 
-        await _check_model_lock(graph, "model-b", 768, project="proj", reindex=True)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-b", 768, project="proj", reindex=True)  # ty: ignore[invalid-argument-type]
 
         assert ("clear_embeddings", "proj") in graph.calls
         assert ("clear_embeddings", None) not in graph.calls
@@ -1150,7 +1150,7 @@ class TestCheckModelLock:
             counts={"proj": 100, "other": 5_000},
         )
 
-        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-a", 768, project="proj", reindex=True)  # ty: ignore[invalid-argument-type]
 
         assert ("clear_embeddings", None) in graph.calls
         assert ("rebuild_vector_indices", 768) in graph.calls
@@ -1165,7 +1165,7 @@ class TestCheckModelLock:
         )
 
         with pytest.raises(RuntimeError, match="model for project 'proj' changed") as exc:
-            await _check_model_lock(graph, "model-b", 768, project="proj", reindex=False)  # type: ignore[arg-type]
+            await _check_model_lock(graph, "model-b", 768, project="proj", reindex=False)  # ty: ignore[invalid-argument-type]
 
         assert "other='model-z'" in str(exc.value)
         assert "unaffected" in str(exc.value)
@@ -1174,7 +1174,7 @@ class TestCheckModelLock:
         graph = FakeLockGraph(stored=("model-a", 512), counts={"proj": 100})
 
         with pytest.raises(RuntimeError, match="dimension changed"):
-            await _check_model_lock(graph, "model-a", 768, project="proj", reindex=False)  # type: ignore[arg-type]
+            await _check_model_lock(graph, "model-a", 768, project="proj", reindex=False)  # ty: ignore[invalid-argument-type]
 
     async def test_a_project_with_no_recorded_model_adopts_the_configured_one(self):
         """Bootstrap: vectors written before the per-project lock existed were written
@@ -1182,7 +1182,7 @@ class TestCheckModelLock:
         clear anything."""
         graph = FakeLockGraph(stored=("model-a", 768), counts={"proj": 6_691})
 
-        await _check_model_lock(graph, "model-b", 768, project="proj", reindex=False)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-b", 768, project="proj", reindex=False)  # ty: ignore[invalid-argument-type]
 
         assert ("set_project_embedding_model", "proj", "model-b") in graph.calls
         assert "clear_embeddings" not in {c[0] for c in graph.calls}
@@ -1195,8 +1195,8 @@ class TestCheckModelLock:
         )
 
         # Both are already on their own model, so both are no-ops rather than errors.
-        await _check_model_lock(graph, "model-a", 768, project="alpha", reindex=False)  # type: ignore[arg-type]
-        await _check_model_lock(graph, "model-b", 768, project="beta", reindex=False)  # type: ignore[arg-type]
+        await _check_model_lock(graph, "model-a", 768, project="alpha", reindex=False)  # ty: ignore[invalid-argument-type]
+        await _check_model_lock(graph, "model-b", 768, project="beta", reindex=False)  # ty: ignore[invalid-argument-type]
 
         assert graph.calls == []
 
@@ -1232,7 +1232,7 @@ class TestGcVanishedWorktreeProjects:
         )
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: [tmp_path.resolve()])
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == ["code-atlas@feature-x"]
         assert graph.deleted == ["code-atlas@feature-x"]
@@ -1240,7 +1240,7 @@ class TestGcVanishedWorktreeProjects:
     async def test_spares_worktree_project_whose_root_path_still_exists(self, tmp_path: Path):
         graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path)}}])
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1250,7 +1250,7 @@ class TestGcVanishedWorktreeProjects:
         with a vanished root_path (e.g. moved checkout) is not auto-GC'd."""
         graph = FakeGCGraph([{"n": {"project_name": "code-atlas", "root_path": str(tmp_path / "gone")}}])
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1259,7 +1259,7 @@ class TestGcVanishedWorktreeProjects:
         """No root_path stored (pre-orchestrator-fix data) — nothing to check against, so skip rather than guess."""
         graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x"}}])
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1272,7 +1272,7 @@ class TestGcVanishedWorktreeProjects:
         calls: list[Path] = []
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", calls.append)
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1291,7 +1291,7 @@ class TestGcVanishedWorktreeProjects:
         calls: list[Path] = []
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", calls.append)
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1309,7 +1309,7 @@ class TestGcVanishedWorktreeProjects:
         )
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: None)
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1329,7 +1329,7 @@ class TestGcVanishedWorktreeProjects:
             orchestrator_module, "_git_worktree_list", lambda base_root: [tmp_path.resolve(), vanished.resolve()]
         )
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1337,7 +1337,7 @@ class TestGcVanishedWorktreeProjects:
     async def test_empty_project_list_is_noop(self):
         graph = FakeGCGraph([])
 
-        removed = await gc_vanished_worktree_projects(graph)  # type: ignore[arg-type]
+        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []

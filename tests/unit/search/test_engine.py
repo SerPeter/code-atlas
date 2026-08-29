@@ -327,7 +327,7 @@ class TestApplyFilters:
             "generated_patterns": ["*_pb2.py", "*_pb2_grpc.py", "*.generated.*"],
         }
         defaults.update(overrides)
-        return SearchSettings(**defaults)  # type: ignore[arg-type]
+        return SearchSettings(**defaults)  # ty: ignore[invalid-argument-type]
 
     def test_default_excludes_tests(self):
         results = [
@@ -528,7 +528,7 @@ class TestCodeOnlyFilter:
             "generated_patterns": [],
         }
         defaults.update(overrides)
-        return SearchSettings(**defaults)  # type: ignore[arg-type]
+        return SearchSettings(**defaults)  # ty: ignore[invalid-argument-type]
 
     def test_code_only_excludes_doc_section(self):
         results = [
@@ -610,7 +610,7 @@ class TestRenderNodeText:
             "docstring": "A function.",
         }
         defaults.update(kwargs)
-        return CompactNode(**defaults)  # type: ignore[arg-type]
+        return CompactNode(**defaults)  # ty: ignore[invalid-argument-type]
 
     def test_with_signature(self):
         text = _render_node_text(self._node())

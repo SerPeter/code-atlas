@@ -166,8 +166,8 @@ async def app_ctx(embedded_settings: AtlasSettings) -> AsyncIterator[AppContext]
     bus = await create_event_bus(embedded_settings)
     try:
         yield AppContext(
-            bus=bus,  # type: ignore[invalid-argument-type]
-            graph=graph,  # type: ignore[invalid-argument-type]
+            bus=bus,  # ty: ignore[invalid-argument-type]
+            graph=graph,  # ty: ignore[invalid-argument-type]
             settings=embedded_settings,
             embed=None,
             vector_enabled=False,

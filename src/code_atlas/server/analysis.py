@@ -782,7 +782,7 @@ def _compute_quality_flags(
             for m in all_modules
             if fi_counts[m] > _TANGLED_FAN_THRESHOLD and fo_counts[m] > _TANGLED_FAN_THRESHOLD
         ],
-        key=lambda x: x["fan_in"] + x["fan_out"],
+        key=lambda x: x["fan_in"] + x["fan_out"],  # ty: ignore[unsupported-operator]  # row payloads are dict[str, Any] by construction
         reverse=True,
     )
 
@@ -960,7 +960,7 @@ def _aggregate_worst_modules(
             }
             for m, flags in issues.items()
         ],
-        key=lambda x: (len(x["issues"]), x["entity_count"]),
+        key=lambda x: (len(x["issues"]), x["entity_count"]),  # ty: ignore[invalid-argument-type]  # row payloads are dict[str, Any] by construction
         reverse=True,
     )[:limit]
 
@@ -1903,8 +1903,10 @@ def _render_grouped_adjacency(
     in_deg = Counter(b for (_a, b), _w in edges)
     lines = [
         f"IMPORTS {len(nodes)} modules, {len(edges)} edges, {len(communities)} clusters",
-        "LEGEND 'a > b, c': a imports b and c | Cn: target is in cluster n | *N: N import "
-        "statements | '(<-N)': imported by N of these modules | a bare name imports none of them",
+        (
+            "LEGEND 'a > b, c': a imports b and c | Cn: target is in cluster n | *N: N import "
+            "statements | '(<-N)': imported by N of these modules | a bare name imports none of them"
+        ),
         "CLUSTERS are computed by greedy modularity over this import graph, not by directory.",
         # Silence reads as "there are none", which is the wrong conclusion to invite from a
         # document someone is using to reason about a dependency surface.

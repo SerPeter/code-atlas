@@ -147,7 +147,7 @@ def _row(slug: str, vec: list[float] | None, *, name: str | None = None, project
 async def test_find_similar_pairs_respects_threshold() -> None:
     graph = _FakeGraph([_row("a", [1.0, 0.0]), _row("b", [1.0, 0.0]), _row("c", [0.0, 1.0])])
 
-    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # ty: ignore[invalid-argument-type]
 
     assert len(pairs) == 1
     assert {pairs[0].uid_a, pairs[0].uid_b} == {"p:note:a", "p:note:b"}
@@ -160,7 +160,7 @@ async def test_a_gray_zone_pair_lands_in_the_review_band_only() -> None:
     # cos ~= 0.8944 — between the two thresholds.
     graph = _FakeGraph([_row("a", [1.0, 0.0]), _row("b", [2.0, 1.0])])
 
-    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # ty: ignore[invalid-argument-type]
 
     assert len(pairs) == 1
     assert pairs[0].band == "review"
@@ -177,7 +177,7 @@ async def test_a_title_collision_surfaces_without_any_embedding() -> None:
         ]
     )
 
-    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # ty: ignore[invalid-argument-type]
 
     assert len(pairs) == 1
     assert pairs[0].band == "merge"
@@ -187,7 +187,7 @@ async def test_a_title_collision_surfaces_without_any_embedding() -> None:
 async def test_merge_band_sorts_ahead_of_review_band() -> None:
     graph = _FakeGraph([_row("a", [1.0, 0.0]), _row("b", [1.0, 0.0]), _row("c", [2.0, 1.0])])
 
-    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # ty: ignore[invalid-argument-type]
 
     assert [p.band for p in pairs] == ["merge", "review", "review"]
 
@@ -216,7 +216,7 @@ async def test_fragmentation_of_a_clean_vault_is_one_concept_per_note() -> None:
 
 async def test_find_similar_pairs_empty_when_no_rows() -> None:
     graph = _FakeGraph([])
-    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # type: ignore[arg-type]
+    pairs = await _find_similar_pairs(graph, 0.92, 0.80)  # ty: ignore[invalid-argument-type]
     assert pairs == []
 
 
@@ -238,7 +238,7 @@ async def test_find_broken_anchors_maps_rows_to_dataclass() -> None:
         ]
     )
 
-    broken = await _find_broken_anchors(graph)  # type: ignore[arg-type]
+    broken = await _find_broken_anchors(graph)  # ty: ignore[invalid-argument-type]
 
     assert broken == [
         BrokenAnchor(
@@ -261,14 +261,14 @@ async def test_find_broken_anchors_defaults_null_unresolved_to_empty_list() -> N
         ]
     )
 
-    broken = await _find_broken_anchors(graph)  # type: ignore[arg-type]
+    broken = await _find_broken_anchors(graph)  # ty: ignore[invalid-argument-type]
 
     assert broken == [BrokenAnchor(uid="p:note:b", name="B", project_name="p", file_path="b.md", unresolved_anchors=[])]
 
 
 async def test_find_broken_anchors_empty_when_no_rows() -> None:
     graph = _FakeGraph([])
-    broken = await _find_broken_anchors(graph)  # type: ignore[arg-type]
+    broken = await _find_broken_anchors(graph)  # ty: ignore[invalid-argument-type]
     assert broken == []
 
 
