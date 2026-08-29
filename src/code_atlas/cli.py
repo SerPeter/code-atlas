@@ -359,6 +359,16 @@ def ui(
     asyncio.run(_run_ui(host=host, port=port, project=project, debug=reload))
 
 
+def _unreachable_backend(_label: str) -> typer.Exit:
+    """What a CLI command does when the graph cannot be reached.
+
+    `connected()` has already logged which backend and why; all that is left is the exit
+    code. It lives here rather than in backends/ because nothing in that package should
+    import typer.
+    """
+    return typer.Exit(code=1)
+
+
 async def _run_export(*, path: Path, project: str) -> None:
     """Write a static snapshot instead of serving one.
 
@@ -992,17 +1002,11 @@ async def _run_search(  # noqa: PLR0912, PLR0915
 
 async def _run_status() -> None:
     """Async implementation of the ``atlas status`` command."""
-    from code_atlas.backends import create_graph_client, graph_backend_label
+    from code_atlas.backends import connected
 
     settings = _load_settings()
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        raise typer.Exit(code=1) from exc
-
-    try:
+    async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
+        graph = backends.graph
         projects = await graph.get_project_status()
 
         import datetime
@@ -1055,8 +1059,6 @@ async def _run_status() -> None:
             _echo(
                 f"Project: {name} | indexed: {ts} | files: {files} | entities: {entities} | git: {git_hash}{deps_str}"
             )
-    finally:
-        await graph.close()
 
 
 @project_app.command("rm")
@@ -1076,17 +1078,11 @@ def project_rm(
 
 async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
     """Async implementation of the ``atlas project rm`` command."""
-    from code_atlas.backends import create_graph_client, graph_backend_label
+    from code_atlas.backends import connected
 
     settings = _load_settings()
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        raise typer.Exit(code=1) from exc
-
-    try:
+    async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
+        graph = backends.graph
         rows = await graph.get_project_status(name)
         if not rows:
             logger.error("No project named '{}' found in the graph.", name)
@@ -1106,8 +1102,6 @@ async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
         _echo(f"Removed project '{name}'.")
         if _output.json:
             _json_output({"removed": name})
-    finally:
-        await graph.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1119,7 +1113,7 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
     """Async implementation of the ``atlas mine-git-history`` command."""
     from git.exc import InvalidGitRepositoryError, NoSuchPathError
 
-    from code_atlas.backends import create_graph_client, graph_backend_label
+    from code_atlas.backends import connected
     from code_atlas.indexing.git_signals import mine_git_signals, write_git_signals
     from code_atlas.settings import AtlasSettings, derive_project_name
 
@@ -1127,14 +1121,8 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
     settings = AtlasSettings(project_root=project_root)
     project_name = derive_project_name(settings.project_root)
 
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        raise typer.Exit(code=1) from exc
-
-    try:
+    async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
+        graph = backends.graph
         _echo(f"Mining git history for '{project_name}'...")
         try:
             result = mine_git_signals(project_root, co_change_threshold=co_change_threshold)
@@ -1152,8 +1140,6 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
                 f"{stats['co_change_edges']} co-change edges ({stats['co_change_pairs_mined']} pairs mined, "
                 f"threshold={co_change_threshold})"
             )
-    finally:
-        await graph.close()
 
 
 def _git_signals_summary_line(stats: dict[str, int], co_change_threshold: int) -> str:
@@ -1196,19 +1182,13 @@ async def _mine_and_write_git_signals(
 
 async def _run_dream() -> None:
     """Async implementation of the ``atlas dream`` command."""
-    from code_atlas.backends import create_graph_client, graph_backend_label
+    from code_atlas.backends import connected
     from code_atlas.dream import VaultRoot, build_dream_report, render_home_md, report_to_dict
     from code_atlas.settings import derive_project_name
 
     settings = _load_settings()
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        raise typer.Exit(code=1) from exc
-
-    try:
+    async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
+        graph = backends.graph
         project_name = derive_project_name(settings.project_root)
         vault_roots = [VaultRoot(path=settings.project_root / settings.knowledge.vault_path, project_name=project_name)]
         vault_roots.extend(
@@ -1227,8 +1207,6 @@ async def _run_dream() -> None:
         else:
             _print_dream_report(report)
             _echo(f"Wrote {home_path}")
-    finally:
-        await graph.close()
 
 
 def _print_dream_report(report: Any) -> None:

@@ -482,7 +482,9 @@ class TestDreamCommand:
         # create_graph_client's "auto" resolution probes ping() once itself before
         # _run_dream's own explicit check pings again — awaited, not exactly-once.
         mock_graph.ping.assert_awaited()
-        mock_graph.close.assert_awaited_once()
+        # Closed by the use_backends scope, so the assertion is on the exit it drives
+        # rather than on close() -- which the command no longer calls by hand.
+        mock_graph.__aexit__.assert_awaited_once()
 
 
 class TestProjectRm:
@@ -510,7 +512,9 @@ class TestProjectRm:
         await cli._run_project_rm("myproject", skip_confirm=True)
 
         mock_graph.delete_project_data.assert_awaited_once_with("myproject")
-        mock_graph.close.assert_awaited_once()
+        # Closed by the use_backends scope, so the assertion is on the exit it drives
+        # rather than on close() -- which the command no longer calls by hand.
+        mock_graph.__aexit__.assert_awaited_once()
 
     async def test_missing_project_exits_with_error(self, tmp_path, monkeypatch) -> None:
         import pytest
@@ -608,7 +612,9 @@ class TestProjectRm:
         await cli._run_project_rm("myproject", skip_confirm=True)
 
         mock_graph.delete_project_data.assert_awaited_once_with("myproject")
-        mock_graph.close.assert_awaited_once()
+        # Closed by the use_backends scope, so the assertion is on the exit it drives
+        # rather than on close() -- which the command no longer calls by hand.
+        mock_graph.__aexit__.assert_awaited_once()
 
 
 class TestIndexExitCode:

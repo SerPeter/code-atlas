@@ -119,10 +119,18 @@ async def use_backends(
     would force one of them to fight it.
     """
     async with AsyncExitStack() as stack:
+        # Enter for the lifecycle, but keep the object we constructed rather than what
+        # __aenter__ hands back. Our clients return self, so the two are the same thing
+        # in production -- but binding the return value means a test double whose
+        # __aenter__ yields a fresh auto-mock silently swaps the client underneath the
+        # caller, and the body then operates on an object the test never sees. The
+        # reference we close and the reference we hand out should be the same one.
         if graph is None:
-            graph = await stack.enter_async_context(await create_graph_client(settings))
+            graph = await create_graph_client(settings)
+            await stack.enter_async_context(graph)
         if bus is None and with_bus:
-            bus = await stack.enter_async_context(await create_event_bus(settings))
+            bus = await create_event_bus(settings)
+            await stack.enter_async_context(bus)
         yield Backends(graph=graph, bus=bus)
 
 
