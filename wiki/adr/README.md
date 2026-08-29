@@ -47,6 +47,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0034](./0034-architecture-snapshots-live-on-the-project-node.md) | Architecture Snapshots Live On The Project Node                | Accepted                      | 2026-08-08 |
 | [0035](./0035-embedding-model-is-per-project-dimension-is-not.md) | Embedding Model Is Per Project, Dimension Is Not               | Accepted                      | 2026-08-28 |
 | [0036](./0036-the-graph-is-the-embedding-dedup-layer.md)          | The Graph Is The Embedding Dedup Layer                         | Accepted                      | 2026-08-28 |
+| [0037](./0037-telemetry-is-a-product-surface-not-a-debug-aid.md)  | Telemetry Is A Product Surface, Not A Debug Aid                | Accepted                      | 2026-08-29 |
 
 ## Creating a New ADR
 

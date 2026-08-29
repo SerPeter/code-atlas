@@ -130,6 +130,18 @@ Optional — add local embeddings (no API keys needed):
 docker compose --profile tei up -d
 ```
 
+Optional — metrics, traces and logs (Grafana on <http://localhost:3000>, admin/admin):
+
+```bash
+docker compose --profile telemetry up -d
+uv sync --extra otel                      # the OTel packages are an optional extra
+export ATLAS_OBSERVABILITY__ENABLED=true
+```
+
+Brings up VictoriaMetrics, VictoriaLogs, VictoriaTraces and an OTel Collector, with
+Grafana datasources provisioned. Log records carry the trace id of the span they
+happened inside, so a trace links straight to the lines that explain it.
+
 ### 2. Index your project
 
 ```bash
@@ -169,6 +181,11 @@ claude mcp add code-atlas -- uvx --from code-atlas-mcp atlas mcp
   }
 }
 ```
+
+Running several agent sessions against **one** checkout? Give the extra ones
+`atlas mcp --no-index` — indexing is per-worktree, not per-session, so only one server
+(or a `atlas daemon start`) should watch and index a given checkout. The others just
+query.
 
 See [CLI usage guide](wiki/guides/usage.md) for more commands and options.
 

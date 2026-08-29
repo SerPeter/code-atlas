@@ -35,6 +35,7 @@ uv run pre-commit run --all-files  # Run all hooks manually
 docker compose up -d             # Start Memgraph + Valkey (production index: 7687/6379)
 docker compose --profile test up -d  # Optional integration-test fast path (memgraph-test :7688, valkey-test :6380, see Testing)
 docker compose --profile tei up -d  # Include local embeddings (TEI)
+docker compose --profile telemetry up -d  # Victoria stack + OTel Collector + Grafana (:3000)
 docker compose down              # Stop services
 
 # CLI
@@ -42,6 +43,7 @@ atlas index /path/to/project     # Index a codebase
 atlas search "query"             # Hybrid search
 atlas status                     # Check index status
 atlas mcp                        # Start MCP server
+atlas mcp --no-index             # Query-only: no watcher/pipeline (2nd+ session in a worktree)
 atlas daemon start               # Start indexing daemon (watcher + pipeline)
 atlas dream                      # Knowledge-vault lint report (inbox, orphans, dangling links, duplicates) + wiki/HOME.md
 atlas project rm <name>          # Delete a project's graph data (e.g. a stale worktree project)
