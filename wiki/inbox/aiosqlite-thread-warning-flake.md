@@ -40,21 +40,38 @@ either, so a live aiosqlite connection was abandoned on every run. Fixed in `d59
 That was the whole of it for unit: **2785 tests now pass under `-W error::ResourceWarning`, twice**, where both prior
 runs failed deterministically. So the unit suite can carry that flag as a real guard.
 
-## Integration is not clean, and not only for the reason recorded
+## Integration: the drivers were test-side, the redis pools are not
 
-Running `-m integration -W error::ResourceWarning` gives 6 failures and 3 errors. The objects, which are what to read:
+Running `-m integration -W error::ResourceWarning` reported, by object:
 
-| count | object                     | verdict                                               |
-| ----- | -------------------------- | ----------------------------------------------------- |
-| 6     | `_ProactorSocketTransport` | below our clients — the known unfixable class         |
-| 6     | `socket.socket`            | same                                                  |
-| 4     | `neo4j AsyncBoltDriver`    | **our layer** — a GraphClient somewhere is not closed |
-| 2     | `redis.asyncio Connection` | **our layer** — same for an EventBus                  |
+| count | object                     | outcome                                       |
+| ----- | -------------------------- | --------------------------------------------- |
+| 6     | `_ProactorSocketTransport` | below our clients — the known unfixable class |
+| 6     | `socket.socket`            | same                                          |
+| 4     | `neo4j AsyncBoltDriver`    | **fixed** in `17349c9`                        |
+| 2     | `redis.asyncio Connection` | **open** — see below                          |
 
-The `filterwarnings` comment says the objects are transport internals. That is now demonstrably incomplete: four
-unclosed Bolt drivers and two unclosed redis connections are above that line. They are not in test scaffolding — every
-`GraphClient(`/`EventBus(` in `tests/integration/` closes in a `finally` — so they are in the product paths those tests
-drive (the CLI commands in `test_git_signals`, the orchestrator drain, the MCP server). Unchased.
+The four Bolt drivers were three test sites that close in a `finally` but do their _setup_ before the `try`: two seeding
+writes in `test_infra_isolation`, and in `test_relationship_coverage` a `pytest.skip()` on ping failure — the same leak
+already fixed in the four infra fixtures — followed by `ensure_schema` and a whole `index_project` run, all outside the
+guard. Those two files now pass 39 tests with zero unclosed objects.
+
+This also corrects the `filterwarnings` comment's claim that the objects are only transport internals below our clients.
+Two of the four categories were above that line.
+
+### Still open: EmbedClient has no lifecycle at all
+
+`EmbedClient` constructs a `RateLimiter` (`embeddings.py:101`), which holds a redis connection pool — and `EmbedClient`
+has no `close()`, no `__aenter__`, no `__aexit__`. It is constructed at **eight** sites and closed at none:
+
+- `cli.py:590` (the dimension probe), `cli.py:949`
+- `indexing/daemon.py:164`
+- `indexing/orchestrator.py:2030`, `:2313`
+- `server/health.py:468`, `server/mcp.py:229`, `:822`
+
+`RateLimiter` gained the protocol in `8b3f0de`, so the owner above it is what is missing. This is product code, not test
+scaffolding — unlike everything else in this note — so it is left for a deliberate pass rather than folded into a test
+cleanup.
 
 ## If it gets fixed
 
