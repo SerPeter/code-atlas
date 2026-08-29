@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+import pytest
+
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.graph.client import (
     _citation_key,
@@ -28,12 +30,24 @@ from code_atlas.parsing.ast import ParsedEntity
 from code_atlas.schema import NodeLabel
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
 # Canonical form
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def client(tmp_path: Path) -> AsyncGenerator[SqliteGraphClient]:
+    """An open client per test, closed even when the test fails.
+
+    These tests built it identically and closed it on their last line, which meant
+    any failing assertion skipped the close. Teardown does not skip.
+    """
+    async with SqliteGraphClient(tmp_path / "graph.sqlite3") as opened:
+        yield opened
 
 
 class TestCitationKey:
@@ -241,8 +255,7 @@ async def _unresolved(client: SqliteGraphClient, uid: str) -> list[str] | None:
 
 
 class TestSqliteResolveCitations:
-    async def test_padded_and_bare_citations_both_reach_the_adr(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_padded_and_bare_citations_both_reach_the_adr(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         project = "cit"
         adr = _adr_docfile(project, "0014", "calls-edge-confidence")
@@ -257,12 +270,10 @@ class TestSqliteResolveCitations:
             (adr.qualified_name, bare.qualified_name, "ADR-14"),
             (adr.qualified_name, padded.qualified_name, "ADR-14"),
         ]
-        await client.close()
 
-    async def test_rfc_stays_a_property_with_no_local_document(self, tmp_path: Path) -> None:
+    async def test_rfc_stays_a_property_with_no_local_document(self, client: SqliteGraphClient) -> None:
         """RFCs are external — no node is invented for them, and the citation is
         recorded as unresolved rather than silently dropped."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_rfc"
         entity = _citing_callable(project, "parse_headers", ["RFC-7231"])
@@ -273,12 +284,10 @@ class TestSqliteResolveCitations:
         assert await _citation_edges(client) == []
         assert await _unresolved(client, entity.qualified_name) == ["RFC-7231"]
         assert await client.count_entities(project) == 1  # no phantom RFC node
-        await client.close()
 
-    async def test_a_vendored_rfc_document_resolves_with_no_special_casing(self, tmp_path: Path) -> None:
+    async def test_a_vendored_rfc_document_resolves_with_no_special_casing(self, client: SqliteGraphClient) -> None:
         """The resolver is scheme-agnostic: if a repo does vendor the spec, the
         same code links it — which is why RFCs need no node of their own."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_vendored"
         rfc = _adr_docfile(project, "793", "tcp", directory="wiki/rfc")
@@ -289,10 +298,8 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {entity.qualified_name: ["RFC-793"]})
 
         assert await _citation_edges(client) == [(rfc.qualified_name, entity.qualified_name, "RFC-793")]
-        await client.close()
 
-    async def test_is_idempotent_across_replays(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_is_idempotent_across_replays(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         project = "cit_idem"
         adr = _adr_docfile(project, "0014", "x")
@@ -305,10 +312,10 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, payload)
 
         assert len(await _citation_edges(client)) == 1
-        await client.close()
 
-    async def test_a_citation_that_starts_resolving_clears_its_unresolved_entry(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_a_citation_that_starts_resolving_clears_its_unresolved_entry(
+        self, client: SqliteGraphClient
+    ) -> None:
         await client.ensure_schema()
         project = "cit_late"
         entity = _citing_callable(project, "f", ["ADR-0014"])
@@ -324,12 +331,10 @@ class TestSqliteResolveCitations:
 
         assert await _unresolved(client, entity.qualified_name) == []
         assert len(await _citation_edges(client)) == 1
-        await client.close()
 
-    async def test_retry_sweep_links_documents_indexed_after_the_citing_file(self, tmp_path: Path) -> None:
+    async def test_retry_sweep_links_documents_indexed_after_the_citing_file(self, client: SqliteGraphClient) -> None:
         """The ordering case that makes a cold full index work: src/ is published
         before wiki/, so the first pass cannot possibly find the ADR."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_retry"
         entity = _citing_callable(project, "f", ["ADR-0014"])
@@ -343,10 +348,8 @@ class TestSqliteResolveCitations:
 
         assert await _citation_edges(client) == [(adr.qualified_name, entity.qualified_name, "ADR-14")]
         assert await _unresolved(client, entity.qualified_name) == []
-        await client.close()
 
-    async def test_retry_sweep_clears_bookkeeping_for_a_deleted_citation(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_retry_sweep_clears_bookkeeping_for_a_deleted_citation(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         project = "cit_gone"
         entity = _citing_callable(project, "f", ["ADR-9999"])
@@ -361,10 +364,8 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {}, retry_unresolved=True)
 
         assert await _unresolved(client, entity.qualified_name) == []
-        await client.close()
 
-    async def test_ambiguous_number_creates_no_edge(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_ambiguous_number_creates_no_edge(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         project = "cit_ambig"
         first = _adr_docfile(project, "0014", "a")
@@ -378,11 +379,9 @@ class TestSqliteResolveCitations:
 
         assert await _citation_edges(client) == []
         assert await _unresolved(client, entity.qualified_name) == ["ADR-0014"]
-        await client.close()
 
-    async def test_resolution_does_not_cross_project_boundaries(self, tmp_path: Path) -> None:
+    async def test_resolution_does_not_cross_project_boundaries(self, client: SqliteGraphClient) -> None:
         """Every repo has an ADR-0001; a cross-project lookup would collide."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         other_adr = _adr_docfile("other", "0001", "x")
         await client.upsert_file_entities("other", other_adr.file_path, [other_adr], [])
@@ -392,22 +391,20 @@ class TestSqliteResolveCitations:
         await client.resolve_citations("mine", {entity.qualified_name: ["ADR-0001"]})
 
         assert await _citation_edges(client) == []
-        await client.close()
 
-    async def test_empty_input_without_retry_is_a_no_op(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_empty_input_without_retry_is_a_no_op(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         await client.resolve_citations("cit_noop", {})
 
         assert await _citation_edges(client) == []
-        await client.close()
 
-    async def test_the_edge_runs_document_to_code_like_every_other_documents_edge(self, tmp_path: Path) -> None:
+    async def test_the_edge_runs_document_to_code_like_every_other_documents_edge(
+        self, client: SqliteGraphClient
+    ) -> None:
         """Direction is the whole point of the read paths: get_linked_docs,
         get_module_summary and the module-summary renderer all treat the
         DOCUMENTS source as the documentation node."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_dir"
         adr = _adr_docfile(project, "0014", "x")
@@ -418,12 +415,10 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {entity.qualified_name: ["ADR-0014"]})
 
         assert await _citation_edges(client) == [(adr.qualified_name, entity.qualified_name, "ADR-14")]
-        await client.close()
 
-    async def test_the_cited_document_surfaces_in_get_linked_docs(self, tmp_path: Path) -> None:
+    async def test_the_cited_document_surfaces_in_get_linked_docs(self, client: SqliteGraphClient) -> None:
         """The reader that expand_context/get_context uses. A DocFile is the
         usual citation target, so the doc-side label filter has to admit it."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_ctx"
         adr = _adr_docfile(project, "0014", "x")
@@ -435,12 +430,10 @@ class TestSqliteResolveCitations:
         docs = await client.get_linked_docs(entity.qualified_name, "", 10)
 
         assert [(d["node"]["uid"], d["link_type"]) for d in docs] == [(adr.qualified_name, "citation")]
-        await client.close()
 
-    async def test_a_title_only_match_does_not_claim_full_confidence(self, tmp_path: Path) -> None:
+    async def test_a_title_only_match_does_not_claim_full_confidence(self, client: SqliteGraphClient) -> None:
         """The ADR lives outside a scheme-named directory, so only its H1
         identifies it — a real link, but an inferred one."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_conf"
         section = ParsedEntity(
@@ -468,12 +461,10 @@ class TestSqliteResolveCitations:
         rows = await cur.fetchall()
         await cur.close()
         assert rows == [(section.qualified_name, 0.8)]
-        await client.close()
 
-    async def test_a_subsection_mentioning_the_adr_is_not_linked(self, tmp_path: Path) -> None:
+    async def test_a_subsection_mentioning_the_adr_is_not_linked(self, client: SqliteGraphClient) -> None:
         """A confidently wrong edge is worse than no edge: with no real ADR-0014
         document indexed, the passage discussing it must not stand in for one."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_mention"
         mention = ParsedEntity(
@@ -495,15 +486,13 @@ class TestSqliteResolveCitations:
 
         assert await _citation_edges(client) == []
         assert await _unresolved(client, entity.qualified_name) == ["ADR-0014"]
-        await client.close()
 
-    async def test_deleting_the_citing_comment_revokes_the_edge(self, tmp_path: Path) -> None:
+    async def test_deleting_the_citing_comment_revokes_the_edge(self, client: SqliteGraphClient) -> None:
         """The removal case. The edge points INTO the citing file's entity, so
         the file's own relationship-delete phase (outgoing edges only) can never
         reach it — only the file-scoped revoke pass can, and it has to fire on a
         parse that produced no citations at all, which is what removal looks
         like."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_revoke"
         adr = _adr_docfile(project, "0014", "x")
@@ -519,12 +508,12 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {}, file_paths={"src/mod.py"})
 
         assert await _citation_edges(client) == []
-        await client.close()
 
-    async def test_reparsing_the_citing_file_keeps_a_citation_that_is_still_written(self, tmp_path: Path) -> None:
+    async def test_reparsing_the_citing_file_keeps_a_citation_that_is_still_written(
+        self, client: SqliteGraphClient
+    ) -> None:
         """Delete-then-recreate, not delete: an untouched citation survives its
         own file being reparsed, exactly once."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_keep"
         adr = _adr_docfile(project, "0014", "x")
@@ -536,10 +525,8 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, payload, file_paths={"src/mod.py"})
 
         assert await _citation_edges(client) == [(adr.qualified_name, entity.qualified_name, "ADR-14")]
-        await client.close()
 
-    async def test_only_the_dropped_citation_of_several_is_revoked(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_only_the_dropped_citation_of_several_is_revoked(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         project = "cit_partial"
         first = _adr_docfile(project, "0014", "a")
@@ -556,12 +543,10 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {entity.qualified_name: ["ADR-0015"]}, file_paths={"src/mod.py"})
 
         assert await _citation_edges(client) == [(second.qualified_name, entity.qualified_name, "ADR-15")]
-        await client.close()
 
-    async def test_the_revoke_pass_spares_files_outside_its_scope(self, tmp_path: Path) -> None:
+    async def test_the_revoke_pass_spares_files_outside_its_scope(self, client: SqliteGraphClient) -> None:
         """A batch reparsing one file must not touch another file's citations —
         the whole reason the scope is file paths and not the project."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_scope"
         adr = _adr_docfile(project, "0014", "x")
@@ -581,15 +566,13 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {}, file_paths={"src/mod.py"})
 
         assert await _citation_edges(client) == [(adr.qualified_name, theirs.qualified_name, "ADR-14")]
-        await client.close()
 
-    async def test_the_retry_sweep_revokes_nothing(self, tmp_path: Path) -> None:
+    async def test_the_retry_sweep_revokes_nothing(self, client: SqliteGraphClient) -> None:
         """The sweep is project-wide and reparses nothing, so it gets no scope.
         Deleting there would wipe every citation in the project on the first
         newly-indexed ADR. The unresolved entity deliberately shares a file with
         a resolved one, so a scope wrongly derived from the sweep's own pending
         set would take the good edge with it."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_sweep"
         adr = _adr_docfile(project, "0014", "x")
@@ -614,13 +597,11 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {}, retry_unresolved=True)
 
         assert await _citation_edges(client) == before
-        await client.close()
 
-    async def test_reparsing_the_cited_document_keeps_its_citation_edges(self, tmp_path: Path) -> None:
+    async def test_reparsing_the_cited_document_keeps_its_citation_edges(self, client: SqliteGraphClient) -> None:
         """The edge leaves the document's node but is owned by the citing file's
         parse — the document's own relationship-delete phase must skip it, or
         every ADR edit would silently drop every citation pointing at it."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_reparse"
         adr = _adr_docfile(project, "0014", "x")
@@ -634,16 +615,16 @@ class TestSqliteResolveCitations:
         await client.upsert_file_entities(project, edited.file_path, [edited], [])
 
         assert await _citation_edges(client) == [(adr.qualified_name, entity.qualified_name, "ADR-14")]
-        await client.close()
 
-    async def test_the_revoke_pass_keeps_citations_when_the_cited_document_is_reparsed(self, tmp_path: Path) -> None:
+    async def test_the_revoke_pass_keeps_citations_when_the_cited_document_is_reparsed(
+        self, client: SqliteGraphClient
+    ) -> None:
         """Same carve-out, now against the revoke pass rather than the relationship
         delete phase: editing the ADR puts the ADR's OWN file in the scope, and
         the scope is read on the citing (target) side of the edge, so it must not
         match. Scoping it on the source side would drop every citation the ADR
         answers to on every edit — the failure the carve-out exists to prevent,
         reintroduced one layer down."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         project = "cit_reparse_scoped"
         adr = _adr_docfile(project, "0014", "x")
@@ -658,4 +639,3 @@ class TestSqliteResolveCitations:
         await client.resolve_citations(project, {}, file_paths={adr.file_path}, retry_unresolved=True)
 
         assert await _citation_edges(client) == [(adr.qualified_name, entity.qualified_name, "ADR-14")]
-        await client.close()

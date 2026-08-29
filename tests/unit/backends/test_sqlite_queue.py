@@ -12,7 +12,19 @@ from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.events import FileChanged, Topic, decode_event
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
+
+
+@pytest.fixture
+async def bus(tmp_path: Path) -> AsyncGenerator[SqliteEventBus]:
+    """An open bus per test, closed even when the test fails.
+
+    These tests built it identically and closed it on their last line, which meant
+    any failing assertion skipped the close. Teardown does not skip.
+    """
+    async with SqliteEventBus(tmp_path / "queue.sqlite3") as opened:
+        yield opened
 
 
 def _event(path: str = "a.py") -> FileChanged:
@@ -35,8 +47,7 @@ def _decode_file_changed(fields: dict[bytes, bytes]) -> FileChanged:
 
 
 class TestPublishAndReadBatch:
-    async def test_read_batch_delivers_published_event(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_read_batch_delivers_published_event(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         await bus.publish(Topic.FILE_CHANGED, _event("a.py"))
 
@@ -48,10 +59,8 @@ class TestPublishAndReadBatch:
         assert event.path == "a.py"
         assert event.change_type == "modified"
         assert msg_id  # non-empty
-        await bus.close()
 
-    async def test_publish_many_and_read_batch_delivers_all(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_publish_many_and_read_batch_delivers_all(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         ids = await bus.publish_many(Topic.FILE_CHANGED, [_event("a.py"), _event("b.py"), _event("c.py")])
         assert len(ids) == 3
@@ -60,10 +69,8 @@ class TestPublishAndReadBatch:
         assert len(batch) == 3
         paths = {_decode_file_changed(fields).path for _mid, fields in batch}
         assert paths == {"a.py", "b.py", "c.py"}
-        await bus.close()
 
-    async def test_read_batch_does_not_redeliver_already_claimed_messages(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_read_batch_does_not_redeliver_already_claimed_messages(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         await bus.publish(Topic.FILE_CHANGED, _event("a.py"))
         first = await bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", block_ms=100)
@@ -71,14 +78,11 @@ class TestPublishAndReadBatch:
 
         second = await bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", block_ms=50)
         assert second == []
-        await bus.close()
 
-    async def test_read_batch_returns_empty_when_nothing_published(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_read_batch_returns_empty_when_nothing_published(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         batch = await bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", block_ms=50)
         assert batch == []
-        await bus.close()
 
 
 # ---------------------------------------------------------------------------
@@ -87,17 +91,14 @@ class TestPublishAndReadBatch:
 
 
 class TestMessageIdFormat:
-    async def test_publish_returns_int_dash_int_bytes(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_publish_returns_int_dash_int_bytes(self, bus: SqliteEventBus) -> None:
         msg_id = await bus.publish(Topic.FILE_CHANGED, _event())
         assert isinstance(msg_id, bytes)
         ms, _, seq = msg_id.partition(b"-")
         assert ms.isdigit()
         assert seq.isdigit()
-        await bus.close()
 
-    async def test_read_batch_ids_are_int_dash_int_bytes(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_read_batch_ids_are_int_dash_int_bytes(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         await bus.publish_many(Topic.FILE_CHANGED, [_event("a.py"), _event("b.py")])
         batch = await bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", block_ms=100)
@@ -105,7 +106,6 @@ class TestMessageIdFormat:
             ms, _, seq = msg_id.partition(b"-")
             assert ms.isdigit()
             assert seq.isdigit()
-        await bus.close()
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +152,7 @@ class TestReadPendingCrashRecovery:
 
 
 class TestAck:
-    async def test_ack_removes_from_pending(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_ack_removes_from_pending(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         await bus.publish(Topic.FILE_CHANGED, _event("a.py"))
         delivered = await bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", block_ms=100)
@@ -166,13 +165,10 @@ class TestAck:
 
         pending = await bus.read_pending(Topic.FILE_CHANGED, "ast", "ast-0")
         assert pending == []
-        await bus.close()
 
-    async def test_ack_of_unknown_id_returns_zero(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_ack_of_unknown_id_returns_zero(self, bus: SqliteEventBus) -> None:
         acked = await bus.ack(Topic.FILE_CHANGED, "ast", b"9999-0")
         assert acked == 0
-        await bus.close()
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +177,7 @@ class TestAck:
 
 
 class TestFlush:
-    async def test_flush_clears_messages_but_group_still_usable(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_flush_clears_messages_but_group_still_usable(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         await bus.publish(Topic.FILE_CHANGED, _event("a.py"))
         delivered = await bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", block_ms=100)
@@ -199,7 +194,6 @@ class TestFlush:
         batch = await bus.read_batch(Topic.FILE_CHANGED, "ast", "ast-0", block_ms=100)
         assert len(batch) == 1
         assert _decode_file_changed(batch[0][1]).path == "b.py"
-        await bus.close()
 
 
 # ---------------------------------------------------------------------------
@@ -208,14 +202,11 @@ class TestFlush:
 
 
 class TestStreamGroupInfo:
-    async def test_unknown_group_reports_zero(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_unknown_group_reports_zero(self, bus: SqliteEventBus) -> None:
         info = await bus.stream_group_info(Topic.FILE_CHANGED, "ast")
         assert info == {"pending": 0, "lag": 0}
-        await bus.close()
 
-    async def test_pending_and_lag_counts(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_pending_and_lag_counts(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         await bus.publish_many(Topic.FILE_CHANGED, [_event("a.py"), _event("b.py"), _event("c.py")])
 
@@ -229,10 +220,8 @@ class TestStreamGroupInfo:
         await bus.ack(Topic.FILE_CHANGED, "ast", delivered[0][0])
         info = await bus.stream_group_info(Topic.FILE_CHANGED, "ast")
         assert info == {"pending": 1, "lag": 1}
-        await bus.close()
 
-    async def test_stream_group_info_multi_matches_individual_calls(self, tmp_path: Path) -> None:
-        bus = SqliteEventBus(tmp_path / "queue.sqlite3")
+    async def test_stream_group_info_multi_matches_individual_calls(self, bus: SqliteEventBus) -> None:
         await bus.ensure_group(Topic.FILE_CHANGED, "ast")
         await bus.ensure_group(Topic.EMBED_DIRTY, "embed")
         await bus.publish(Topic.FILE_CHANGED, _event("a.py"))
@@ -242,7 +231,6 @@ class TestStreamGroupInfo:
             await bus.stream_group_info(Topic.FILE_CHANGED, "ast"),
             await bus.stream_group_info(Topic.EMBED_DIRTY, "embed"),
         ]
-        await bus.close()
 
 
 class TestIndexerLeaseExpiry:

@@ -187,15 +187,14 @@ async def test_check_memgraph_warns_when_the_sqlite_fallback_is_active(tmp_path)
     """
     from code_atlas.backends.sqlite_graph import SqliteGraphClient
 
-    graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
-    mg_settings = MemgraphSettings()
+    async with SqliteGraphClient(tmp_path / "graph.sqlite3") as graph:
+        mg_settings = MemgraphSettings()
 
-    result = await check_memgraph(graph, mg_settings)
-    assert result.status == CheckStatus.WARN
-    assert "SQLite" in result.message
-    assert "NOT Memgraph" in result.message, "it must say which engine it is *not*"
-    assert result.suggestion, "a warning without a remedy is just noise"
-    await graph.close()
+        result = await check_memgraph(graph, mg_settings)
+        assert result.status == CheckStatus.WARN
+        assert "SQLite" in result.message
+        assert "NOT Memgraph" in result.message, "it must say which engine it is *not*"
+        assert result.suggestion, "a warning without a remedy is just noise"
 
 
 async def test_a_healthy_memgraph_check_stays_a_plain_ok(tmp_path):
@@ -312,15 +311,14 @@ async def test_check_valkey_warns_when_the_sqlite_fallback_is_active(tmp_path):
     """
     from code_atlas.backends.sqlite_queue import SqliteEventBus
 
-    bus = SqliteEventBus(tmp_path / "queue.sqlite3")
-    redis_settings = RedisSettings()
+    async with SqliteEventBus(tmp_path / "queue.sqlite3") as bus:
+        redis_settings = RedisSettings()
 
-    result = await check_valkey(bus, redis_settings)
-    assert result.status == CheckStatus.WARN
-    assert "SQLite" in result.message
-    assert "NOT Valkey" in result.message
-    assert result.suggestion
-    await bus.close()
+        result = await check_valkey(bus, redis_settings)
+        assert result.status == CheckStatus.WARN
+        assert "SQLite" in result.message
+        assert "NOT Valkey" in result.message
+        assert result.suggestion
 
 
 # ---------------------------------------------------------------------------

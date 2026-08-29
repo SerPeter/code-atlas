@@ -2166,34 +2166,32 @@ async def _seed_sqlite_scope(client: SqliteGraphClient) -> None:
 
 
 async def test_module_summary_sqlite_backend_end_to_end(tmp_path):
-    client = SqliteGraphClient(tmp_path / "graph.sqlite3")
-    await client.ensure_schema()
-    await _seed_sqlite_scope(client)
+    async with SqliteGraphClient(tmp_path / "graph.sqlite3") as client:
+        await client.ensure_schema()
+        await _seed_sqlite_scope(client)
 
-    result = await analyze_repo(client, "module_summary", "proj", path="pkg/")
+        result = await analyze_repo(client, "module_summary", "proj", path="pkg/")
 
-    outline = result["outline"]
-    assert result["entity_count"] == 3
-    assert "pkg.mod (pkg/mod.py)" in outline
-    assert "# Scope module." in outline
-    # Class members indented under the class, private marker preserved.
-    assert "  class Widget L5-40 # A widget." in outline  # 35 lines -> span end kept
-    assert "    def draw(self) -> None L10" in outline  # 10 lines -> span end dropped
-    assert "  def _hidden() L45" in outline
-    # Intra-scope edge with its ADR-0014 confidence annotation.
-    assert "Widget.draw > _hidden[confidence=ambiguous]" in outline
-    # Boundary: an external caller in, an external package out.
-    assert "Widget.draw < other.cli.main" in outline
-    assert "Widget.draw > requests" in outline
-    assert (result["fan_in_count"], result["fan_out_count"]) == (1, 1)
-    await client.close()
+        outline = result["outline"]
+        assert result["entity_count"] == 3
+        assert "pkg.mod (pkg/mod.py)" in outline
+        assert "# Scope module." in outline
+        # Class members indented under the class, private marker preserved.
+        assert "  class Widget L5-40 # A widget." in outline  # 35 lines -> span end kept
+        assert "    def draw(self) -> None L10" in outline  # 10 lines -> span end dropped
+        assert "  def _hidden() L45" in outline
+        # Intra-scope edge with its ADR-0014 confidence annotation.
+        assert "Widget.draw > _hidden[confidence=ambiguous]" in outline
+        # Boundary: an external caller in, an external package out.
+        assert "Widget.draw < other.cli.main" in outline
+        assert "Widget.draw > requests" in outline
+        assert (result["fan_in_count"], result["fan_out_count"]) == (1, 1)
 
 
 async def test_module_summary_sqlite_backend_reports_not_found(tmp_path):
-    client = SqliteGraphClient(tmp_path / "graph.sqlite3")
-    await client.ensure_schema()
+    async with SqliteGraphClient(tmp_path / "graph.sqlite3") as client:
+        await client.ensure_schema()
 
-    result = await analyze_repo(client, "module_summary", "proj", path="nope/")
+        result = await analyze_repo(client, "module_summary", "proj", path="nope/")
 
-    assert result["code"] == "NOT_FOUND"
-    await client.close()
+        assert result["code"] == "NOT_FOUND"

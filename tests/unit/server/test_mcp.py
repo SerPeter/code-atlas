@@ -273,30 +273,27 @@ class TestSchemaInfo:
 class TestVectorSearchMock:
     async def test_vector_search_embed_error(self, settings):
         """Vector search returns EMBED_ERROR when TEI is unavailable."""
-        graph = GraphClient(settings)
-        embed = EmbedClient(settings.embeddings)
-        app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        async with GraphClient(settings) as graph:
+            embed = EmbedClient(settings.embeddings)
+            app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
-        patch_target = "code_atlas.search.embeddings.litellm.aembedding"
-        with patch(patch_target, new_callable=AsyncMock, side_effect=Exception("down")):
-            result = await _invoke_tool(app_ctx, "vector_search", query="test query")
-        await graph.close()
+            patch_target = "code_atlas.search.embeddings.litellm.aembedding"
+            with patch(patch_target, new_callable=AsyncMock, side_effect=Exception("down")):
+                result = await _invoke_tool(app_ctx, "vector_search", query="test query")
         assert result["code"] == "EMBED_ERROR"
 
     async def test_vector_search_mock_tei(self, settings):
         """Vector search with mocked embedding client."""
         mock_vector = [0.1] * (settings.embeddings.dimension or 768)
-        graph = GraphClient(settings)
-        embed = EmbedClient(settings.embeddings)
-        app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        async with GraphClient(settings) as graph:
+            embed = EmbedClient(settings.embeddings)
+            app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
 
-        with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=mock_vector) as mock_embed:
-            result = await _invoke_tool(app_ctx, "vector_search", query="test query")
-            # Structure is correct even if vector index search fails on Memgraph
-            assert "results" in result or "code" in result
-            mock_embed.assert_called_once_with("test query")
-
-        await graph.close()
+            with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=mock_vector) as mock_embed:
+                result = await _invoke_tool(app_ctx, "vector_search", query="test query")
+                # Structure is correct even if vector index search fails on Memgraph
+                assert "results" in result or "code" in result
+                mock_embed.assert_called_once_with("test query")
 
 
 # ---------------------------------------------------------------------------
@@ -770,26 +767,24 @@ class TestCypherQueryWriteKeywordGuard:
 
 class TestCypherToolsSqliteBackendGuard:
     async def test_cypher_query_returns_unsupported_backend_error(self, settings, tmp_path):
-        graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
+        async with SqliteGraphClient(tmp_path / "graph.sqlite3") as graph:
+            embed = EmbedClient(settings.embeddings)
+            app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
 
-        result = await _invoke_tool(app, "cypher_query", query="MATCH (n:Callable) RETURN n LIMIT 10")
+            result = await _invoke_tool(app, "cypher_query", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
-        assert result["code"] == "UNSUPPORTED_BACKEND"
-        assert "error" in result
-        await graph.close()
+            assert result["code"] == "UNSUPPORTED_BACKEND"
+            assert "error" in result
 
     async def test_validate_cypher_skips_explain_with_info_issue_not_crash(self, settings, tmp_path):
-        graph = SqliteGraphClient(tmp_path / "graph.sqlite3")
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
+        async with SqliteGraphClient(tmp_path / "graph.sqlite3") as graph:
+            embed = EmbedClient(settings.embeddings)
+            app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
 
-        result = await _invoke_tool(app, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")
+            result = await _invoke_tool(app, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
-        assert result["valid"] is True  # static checks alone still pass
-        assert any("sqlite" in i["message"].lower() for i in result["issues"])
-        await graph.close()
+            assert result["valid"] is True  # static checks alone still pass
+            assert any("sqlite" in i["message"].lower() for i in result["issues"])
 
 
 class TestGetUsageGuide:

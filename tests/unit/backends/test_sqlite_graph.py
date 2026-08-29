@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+import pytest
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
@@ -15,7 +16,19 @@ from code_atlas.schema import GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
 from code_atlas.server.analysis import _analyze_communities
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
+
+
+@pytest.fixture
+async def client(tmp_path: Path) -> AsyncGenerator[SqliteGraphClient]:
+    """An open client per test, closed even when the test fails.
+
+    Seventy-five tests built this identically and closed it on their last line, which
+    meant any failing assertion skipped the close. Teardown does not skip.
+    """
+    async with SqliteGraphClient(tmp_path / "graph.sqlite3") as open_client:
+        yield open_client
 
 
 def _entity(
@@ -68,27 +81,21 @@ async def _insert_edge(
 
 
 class TestSchemaBootstrap:
-    async def test_ensure_schema_fresh_db(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_ensure_schema_fresh_db(self, client: SqliteGraphClient) -> None:
 
         assert await client.get_schema_version() is None
         await client.ensure_schema()
 
         assert await client.get_schema_version() == SCHEMA_VERSION
-        await client.close()
 
-    async def test_ensure_schema_idempotent(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_ensure_schema_idempotent(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.ensure_schema()
 
         assert await client.get_schema_version() == SCHEMA_VERSION
-        await client.close()
 
-    async def test_ping(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_ping(self, client: SqliteGraphClient) -> None:
         assert await client.ping() is True
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +104,7 @@ class TestSchemaBootstrap:
 
 
 class TestUpsertRoundTrip:
-    async def test_upsert_then_graph_search_round_trip(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_upsert_then_graph_search_round_trip(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         entity = _entity("my_func", "mod.my_func", docstring="A test function.", signature="my_func()")
@@ -112,10 +118,8 @@ class TestUpsertRoundTrip:
         assert found[0]["node"]["uid"] == "proj:mod.my_func"
         assert found[0]["node"]["docstring"] == "A test function."
         assert found[0]["node"]["_labels"] == ["Callable"]
-        await client.close()
 
-    async def test_reupsert_unchanged_entity_reports_no_changes(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_reupsert_unchanged_entity_reports_no_changes(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         entity = _entity("my_func", "mod.my_func")
 
@@ -125,10 +129,8 @@ class TestUpsertRoundTrip:
         assert result.added == []
         assert result.modified == []
         assert result.unchanged == ["mod.my_func"]
-        await client.close()
 
-    async def test_delete_file_entities_removes_node(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_delete_file_entities_removes_node(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         entity = _entity("my_func", "mod.my_func")
         await client.upsert_file_entities("proj", "mod.py", [entity], [])
@@ -137,10 +139,8 @@ class TestUpsertRoundTrip:
 
         assert deleted == ["mod.my_func"]
         assert await client.count_entities("proj") == 0
-        await client.close()
 
-    async def test_upsert_creates_uid_routed_relationship(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_upsert_creates_uid_routed_relationship(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         parent = _entity("MyClass", "mod.MyClass", label=NodeLabel.TYPE_DEF)
@@ -155,7 +155,6 @@ class TestUpsertRoundTrip:
 
         lookup, _typedefs = await client.build_resolution_lookup("proj")
         assert lookup.caller_to_parent.get("proj:mod.MyClass.method") == "proj:mod.MyClass"
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -166,39 +165,37 @@ class TestUpsertRoundTrip:
 class TestVectorSearch:
     async def test_vector_search_returns_nearest_neighbor_first(self, tmp_path: Path) -> None:
         dim = 4
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3", dimension=dim)
-        await client.ensure_schema()
+        async with SqliteGraphClient(tmp_path / "graph.sqlite3", dimension=dim) as client:
+            await client.ensure_schema()
 
-        close = _entity("close_func", "mod.close_func")
-        far = _entity("far_func", "mod.far_func")
-        await client.upsert_file_entities("proj", "mod.py", [close, far], [])
+            close = _entity("close_func", "mod.close_func")
+            far = _entity("far_func", "mod.far_func")
+            await client.upsert_file_entities("proj", "mod.py", [close, far], [])
 
-        await client.write_embeddings(
-            [
-                ("proj:mod.close_func", [1.0, 0.0, 0.0, 0.0]),
-                ("proj:mod.far_func", [0.0, 0.0, 0.0, 1.0]),
-            ]
-        )
+            await client.write_embeddings(
+                [
+                    ("proj:mod.close_func", [1.0, 0.0, 0.0, 0.0]),
+                    ("proj:mod.far_func", [0.0, 0.0, 0.0, 1.0]),
+                ]
+            )
 
-        results = await client.vector_search([0.9, 0.1, 0.0, 0.0], project="proj", limit=5)
+            results = await client.vector_search([0.9, 0.1, 0.0, 0.0], project="proj", limit=5)
 
-        assert len(results) == 2
-        assert results[0]["node"]["uid"] == "proj:mod.close_func"
-        assert results[0]["similarity"] > results[1]["similarity"]
-        await client.close()
+            assert len(results) == 2
+            assert results[0]["node"]["uid"] == "proj:mod.close_func"
+            assert results[0]["similarity"] > results[1]["similarity"]
 
     async def test_read_embed_hashes_reflects_written_embedding(self, tmp_path: Path) -> None:
         dim = 4
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3", dimension=dim)
-        await client.ensure_schema()
-        entity = _entity("my_func", "mod.my_func")
-        await client.upsert_file_entities("proj", "mod.py", [entity], [])
+        async with SqliteGraphClient(tmp_path / "graph.sqlite3", dimension=dim) as client:
+            await client.ensure_schema()
+            entity = _entity("my_func", "mod.my_func")
+            await client.upsert_file_entities("proj", "mod.py", [entity], [])
 
-        await client.write_embeddings_and_hashes([("proj:mod.my_func", [1.0, 0.0, 0.0, 0.0], "embedhash1")])
+            await client.write_embeddings_and_hashes([("proj:mod.my_func", [1.0, 0.0, 0.0, 0.0], "embedhash1")])
 
-        hashes = await client.read_embed_hashes(["proj:mod.my_func"])
-        assert hashes["proj:mod.my_func"] == ("embedhash1", True)
-        await client.close()
+            hashes = await client.read_embed_hashes(["proj:mod.my_func"])
+            assert hashes["proj:mod.my_func"] == ("embedhash1", True)
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +204,7 @@ class TestVectorSearch:
 
 
 class TestTextSearch:
-    async def test_text_search_ranks_exact_match_above_unrelated(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_text_search_ranks_exact_match_above_unrelated(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         target = _entity("frobnicate", "mod.frobnicate", docstring="Frobnicate the given widget.")
@@ -219,10 +215,8 @@ class TestTextSearch:
 
         assert len(results) >= 1
         assert results[0]["node"]["uid"] == "proj:mod.frobnicate"
-        await client.close()
 
-    async def test_text_search_no_match_returns_empty(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_text_search_no_match_returns_empty(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         entity = _entity("my_func", "mod.my_func", docstring="Nothing special.")
         await client.upsert_file_entities("proj", "mod.py", [entity], [])
@@ -230,7 +224,6 @@ class TestTextSearch:
         results = await client.text_search("zzz_nonexistent_term", project="proj")
 
         assert results == []
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +232,7 @@ class TestTextSearch:
 
 
 class TestCommunitiesGuard:
-    async def test_communities_analysis_returns_unsupported_error(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_communities_analysis_returns_unsupported_error(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         result = await _analyze_communities(client, "proj", "", 10)
@@ -252,7 +244,6 @@ class TestCommunitiesGuard:
         # regression.
         assert result["analysis"] == "communities"
         assert "unsupported on the sqlite backend" in result["error"]
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -278,13 +269,12 @@ class TestConstructorInjection:
         settings-based construction (opening ``db_path`` itself) never runs.
         """
         conn = await aiosqlite.connect(tmp_path / "real.sqlite3")
-        client = SqliteGraphClient(tmp_path / "never-opened.sqlite3", conn=conn)
+        async with SqliteGraphClient(tmp_path / "never-opened.sqlite3", conn=conn) as client:
+            with patch("code_atlas.backends.sqlite_graph.aiosqlite.connect") as mock_connect:
+                assert await client.ping() is True
+                mock_connect.assert_not_called()
 
-        with patch("code_atlas.backends.sqlite_graph.aiosqlite.connect") as mock_connect:
-            assert await client.ping() is True
-            mock_connect.assert_not_called()
-
-        await client.close()
+        # Asserted after the block, because the point is that closing never created it.
         assert not (tmp_path / "never-opened.sqlite3").exists()
 
     async def test_no_injected_connection_falls_back_to_settings_based_construction(self, tmp_path: Path) -> None:
@@ -292,11 +282,9 @@ class TestConstructorInjection:
         connection at *db_path* lazily on first use.
         """
         db_path = tmp_path / "graph.sqlite3"
-        client = SqliteGraphClient(db_path)
-
-        assert await client.ping() is True
-        assert db_path.exists()
-        await client.close()
+        async with SqliteGraphClient(db_path) as client:
+            assert await client.ping() is True
+            assert db_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -306,19 +294,16 @@ class TestConstructorInjection:
 
 
 class TestNodeExists:
-    async def test_true_for_existing_uid_false_otherwise(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_true_for_existing_uid_false_otherwise(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
 
         assert await client.node_exists("proj:mod.f") is True
         assert await client.node_exists("proj:mod.missing") is False
-        await client.close()
 
 
 class TestTracePathBetween:
-    async def test_found_path_reports_hops_with_confidence(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_found_path_reports_hops_with_confidence(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         a, b, c = _entity("a", "mod.a"), _entity("b", "mod.b"), _entity("c", "mod.c")
         await client.upsert_file_entities("proj", "mod.py", [a, b, c], [])
@@ -338,10 +323,8 @@ class TestTracePathBetween:
         assert result["hops"][0]["edge_type"] == "CALLS"
         assert result["hops"][0]["confidence"] == "resolved"
         assert result["hops"][1]["to"]["uid"] == "proj:mod.c"
-        await client.close()
 
-    async def test_missing_node_reports_exists_false(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_missing_node_reports_exists_false(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("a", "mod.a")], [])
 
@@ -350,10 +333,8 @@ class TestTracePathBetween:
         assert result["from_exists"] is True
         assert result["to_exists"] is False
         assert result["found"] is False
-        await client.close()
 
-    async def test_no_path_within_max_depth(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_no_path_within_max_depth(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         a, b, c = _entity("a", "mod.a"), _entity("b", "mod.b"), _entity("c", "mod.c")
         await client.upsert_file_entities("proj", "mod.py", [a, b, c], [])
@@ -363,12 +344,10 @@ class TestTracePathBetween:
         result = await client.trace_path_between("proj:mod.a", "proj:mod.c", 1, ("CALLS",))
 
         assert result["found"] is False
-        await client.close()
 
 
 class TestComputeBlastRadius:
-    async def test_callers_direction_flags_ambiguous_entries(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_callers_direction_flags_ambiguous_entries(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         target = _entity("target", "mod.target")
         resolved_caller = _entity("resolved_caller", "mod.resolved_caller")
@@ -384,22 +363,18 @@ class TestComputeBlastRadius:
         assert by_uid["proj:mod.resolved_caller"]["ambiguous_only"] is False
         assert by_uid["proj:mod.ambiguous_caller"]["ambiguous_only"] is True
         assert all(r["min_depth"] == 1 for r in results)
-        await client.close()
 
-    async def test_no_reachable_nodes_returns_empty(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_no_reachable_nodes_returns_empty(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("solo", "mod.solo")], [])
 
         results = await client.compute_blast_radius("proj:mod.solo", "out", ("CALLS",), 3)
 
         assert results == []
-        await client.close()
 
 
 class TestGetStructureOverview:
-    async def test_counts_packages_largest_modules_and_external_deps(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_counts_packages_largest_modules_and_external_deps(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         module = _entity("mod", "pkg.mod", label=NodeLabel.MODULE, file_path="pkg/mod.py")
         f1 = _entity("f1", "pkg.mod.f1", file_path="pkg/mod.py")
@@ -425,10 +400,8 @@ class TestGetStructureOverview:
         assert data["largest_modules"][0]["entities"] == 2
         assert data["external_deps"][0]["package"] == "requests"
         assert data["external_deps"][0]["imported_by"] == 1
-        await client.close()
 
-    async def test_path_scope_filters_to_matching_files(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_path_scope_filters_to_matching_files(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         in_scope = _entity("a", "pkg.in_scope.a", file_path="pkg/in_scope/a.py")
         out_scope = _entity("b", "pkg.out_scope.b", file_path="pkg/out_scope/b.py")
@@ -438,12 +411,10 @@ class TestGetStructureOverview:
         data = await client.get_structure_overview("proj", "pkg/in_scope", 20)
 
         assert sum(r["cnt"] for r in data["counts"]) == 1
-        await client.close()
 
 
 class TestGetCentralityData:
-    async def test_hub_entity_and_leaf_entity(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_hub_entity_and_leaf_entity(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         hub, caller, leaf = _entity("hub", "mod.hub"), _entity("caller", "mod.caller"), _entity("leaf", "mod.leaf")
         await client.upsert_file_entities("proj", "mod.py", [hub, caller, leaf], [])
@@ -455,12 +426,10 @@ class TestGetCentralityData:
         leaf_qns = {r["qn"] for r in data["leaves"]}
         assert "mod.leaf" in leaf_qns
         assert "mod.hub" not in leaf_qns
-        await client.close()
 
 
 class TestGetModuleImportEdges:
-    async def test_direct_module_edge(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_direct_module_edge(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
@@ -473,10 +442,8 @@ class TestGetModuleImportEdges:
         assert ("pkg.a", "pkg.b") in [(r["from_mod"], r["to_mod"]) for r in data["direct"]]
         # file_path rides along so generate_diagram can locate the module on disk
         assert all("from_path" in r and "to_path" in r for r in data["direct"])
-        await client.close()
 
-    async def test_indirect_edge_via_entity_import(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_indirect_edge_via_entity_import(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
@@ -493,12 +460,10 @@ class TestGetModuleImportEdges:
         assert ("pkg.a", "pkg.b") in [(r["from_mod"], r["to_mod"]) for r in data["indirect"]]
         # file_path rides along so generate_diagram can locate the module on disk
         assert all("from_path" in r and "to_path" in r for r in data["indirect"])
-        await client.close()
 
 
 class TestGetDependencyExternalCounts:
-    async def test_counts_grouped_by_package(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_counts_grouped_by_package(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         await client.upsert_file_entities("proj", "pkg/a.py", [mod], [])
@@ -518,12 +483,10 @@ class TestGetDependencyExternalCounts:
         sym_counts = {r["package"]: r["cnt"] for r in data["ext_symbols"]}
         assert pkg_counts.get("requests") == 1
         assert sym_counts.get("requests") == 1
-        await client.close()
 
 
 class TestGetQualityData:
-    async def test_entities_and_either_side_path_scope(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_entities_and_either_side_path_scope(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
@@ -543,12 +506,10 @@ class TestGetQualityData:
         assert ("pkg.b", "pkg.a") in [(r["from_mod"], r["to_mod"]) for r in data["direct"]]
         # file_path rides along so generate_diagram can locate the module on disk
         assert all("from_path" in r and "to_path" in r for r in data["direct"])
-        await client.close()
 
 
 class TestGetPatternsData:
-    async def test_inheritance_and_enum_members(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_inheritance_and_enum_members(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         base = _entity("Base", "mod.Base", label=NodeLabel.TYPE_DEF)
         child = _entity("Child", "mod.Child", label=NodeLabel.TYPE_DEF)
@@ -571,10 +532,8 @@ class TestGetPatternsData:
             {"child": "Child", "child_qn": "mod.Child", "parent": "Base", "parent_qn": "mod.Base"}
         ]
         assert data["enums"] == [{"name": "Color", "qn": "mod.Color", "file_path": "mod.py", "members": 1}]
-        await client.close()
 
-    async def test_visibility_distribution_and_docstring_coverage(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_visibility_distribution_and_docstring_coverage(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         documented = _entity("documented_fn", "mod.documented_fn", docstring="Has docs.")
         undocumented = _entity("bare_fn", "mod.bare_fn", visibility=Visibility.PRIVATE)
@@ -585,10 +544,8 @@ class TestGetPatternsData:
         vis_counts = {r["visibility"]: r["cnt"] for r in data["visibility"]}
         assert vis_counts == {"public": 1, "private": 1}
         assert data["docstring"] == [{"total": 2, "documented": 1}]
-        await client.close()
 
-    async def test_detected_patterns(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_detected_patterns(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         handler = _entity("handle_x", "mod.handle_x")
         target = _entity("Target", "mod.Target", label=NodeLabel.TYPE_DEF)
@@ -602,12 +559,10 @@ class TestGetPatternsData:
         assert data["detected_patterns"] == [
             {"pattern_type": "HANDLES_ROUTE", "name": "handle_x", "qn": "mod.handle_x", "target_name": "Target"}
         ]
-        await client.close()
 
 
 class TestGetDeadCodeCandidates:
-    async def test_excludes_called_and_dunder_entities(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_excludes_called_and_dunder_entities(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         dead = _entity("dead_fn", "mod.dead_fn")
         called = _entity("called_fn", "mod.called_fn")
@@ -622,12 +577,10 @@ class TestGetDeadCodeCandidates:
         assert "dead_fn" in names
         assert "called_fn" not in names
         assert "__init__" not in names
-        await client.close()
 
 
 class TestGetComplexityHotspots:
-    async def test_sorted_by_loc_span_descending(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_sorted_by_loc_span_descending(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         small = ParsedEntity(
             name="small",
@@ -653,12 +606,10 @@ class TestGetComplexityHotspots:
 
         assert [h["name"] for h in hotspots] == ["big", "small"]
         assert hotspots[0]["loc_span"] == 104
-        await client.close()
 
 
 class TestGetGitSignalsData:
-    async def test_hotspots_bus_factor_and_co_change(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_hotspots_bus_factor_and_co_change(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
@@ -685,12 +636,10 @@ class TestGetGitSignalsData:
         assert {r["qn"] for r in data["bus_factor"]} == {"pkg.a"}
         assert data["co_change"][0]["a_qn"] == "pkg.a"
         assert data["co_change"][0]["count"] == 4
-        await client.close()
 
 
 class TestWriteGitFileSignals:
-    async def test_writes_signal_properties_and_returns_matched_count(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_writes_signal_properties_and_returns_matched_count(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
@@ -713,19 +662,15 @@ class TestWriteGitFileSignals:
         assert by_qn["pkg.a"]["commit_count"] == 10
         assert by_qn["pkg.a"]["author_count"] == 2
         assert by_qn["pkg.b"]["commit_count"] == 3
-        await client.close()
 
-    async def test_empty_items_returns_zero_without_touching_db(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_empty_items_returns_zero_without_touching_db(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         assert await client.write_git_file_signals("proj", "Module", []) == 0
-        await client.close()
 
 
 class TestWriteCoChangeEdges:
-    async def test_creates_edge_between_matched_files_and_returns_count(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_creates_edge_between_matched_files_and_returns_count(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
@@ -745,10 +690,8 @@ class TestWriteCoChangeEdges:
         assert data["co_change"] == [
             {"a_qn": "pkg.a", "a_path": "pkg/a.py", "b_qn": "pkg.b", "b_path": "pkg/b.py", "count": 4}
         ]
-        await client.close()
 
-    async def test_rewriting_a_pair_updates_count_not_a_duplicate_edge(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_rewriting_a_pair_updates_count_not_a_duplicate_edge(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         mod_a = _entity("a", "pkg.a", label=NodeLabel.MODULE, file_path="pkg/a.py")
         mod_b = _entity("b", "pkg.b", label=NodeLabel.MODULE, file_path="pkg/b.py")
@@ -762,19 +705,15 @@ class TestWriteCoChangeEdges:
         data = await client.get_git_signals_data("proj", "", 20, 5)
         assert len(data["co_change"]) == 1
         assert data["co_change"][0]["count"] == 9
-        await client.close()
 
-    async def test_empty_pairs_returns_zero_without_touching_db(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_empty_pairs_returns_zero_without_touching_db(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         assert await client.write_co_change_edges("proj", []) == 0
-        await client.close()
 
 
 class TestGetDiagramPackages:
-    async def test_package_to_module_edge(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_package_to_module_edge(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         module = _entity("mod", "pkg.mod", label=NodeLabel.MODULE, file_path="pkg/mod.py")
         await client.upsert_file_entities("proj", "pkg/mod.py", [module], [])
@@ -792,12 +731,10 @@ class TestGetDiagramPackages:
                 "child_name": "mod",
             }
         ]
-        await client.close()
 
 
 class TestGetDiagramInheritance:
-    async def test_child_parent_edge(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_child_parent_edge(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         base = _entity("Base", "mod.Base", label=NodeLabel.TYPE_DEF)
         child = _entity("Child", "mod.Child", label=NodeLabel.TYPE_DEF, kind="class")
@@ -818,12 +755,10 @@ class TestGetDiagramInheritance:
                 "parent_qn": "mod.Base",
             }
         ]
-        await client.close()
 
 
 class TestGetDiagramModuleDetail:
-    async def test_module_entities_methods_and_inheritance(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_module_entities_methods_and_inheritance(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         module = _entity("mod", "pkg.mod", label=NodeLabel.MODULE, file_path="pkg/mod.py")
         base = _entity("Base", "pkg.mod.Base", label=NodeLabel.TYPE_DEF)
@@ -859,16 +794,13 @@ class TestGetDiagramModuleDetail:
         assert detail["inherits"] == [
             {"child_qn": "pkg.mod.Widget", "child_name": "Widget", "parent_qn": "pkg.mod.Base", "parent_name": "Base"}
         ]
-        await client.close()
 
-    async def test_no_matching_module_returns_none(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_no_matching_module_returns_none(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
 
         detail = await client.get_diagram_module_detail("proj", "nonexistent/path", 30)
 
         assert detail is None
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -878,8 +810,7 @@ class TestGetDiagramModuleDetail:
 
 
 class TestGetEntityByUid:
-    async def test_returns_node_or_none(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_returns_node_or_none(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
 
@@ -887,21 +818,17 @@ class TestGetEntityByUid:
         assert node is not None
         assert node["uid"] == "proj:mod.f"
         assert await client.get_entity_by_uid("proj:mod.missing") is None
-        await client.close()
 
-    async def test_label_mismatch_returns_none(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_label_mismatch_returns_none(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
 
         assert await client.get_entity_by_uid("proj:mod.f", label="TypeDef") is None
         assert await client.get_entity_by_uid("proj:mod.f", label="Callable") is not None
-        await client.close()
 
 
 class TestGetDefiningParentAndSiblings:
-    async def test_parent_and_siblings(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_parent_and_siblings(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         parent = _entity("MyClass", "mod.MyClass", label=NodeLabel.TYPE_DEF)
         m1 = _entity("m1", "mod.MyClass.m1")
@@ -924,12 +851,10 @@ class TestGetDefiningParentAndSiblings:
         assert {s["uid"] for s in siblings} == {"proj:mod.MyClass.m2"}
 
         assert await client.get_defining_parent("proj:mod.MyClass") is None
-        await client.close()
 
 
 class TestGetPackageDocstring:
-    async def test_walks_up_to_nearest_module(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_walks_up_to_nearest_module(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         module = _entity("mod", "pkg.mod", label=NodeLabel.MODULE, docstring="Module docs.")
         cls = _entity("MyClass", "pkg.mod.MyClass", label=NodeLabel.TYPE_DEF)
@@ -947,20 +872,16 @@ class TestGetPackageDocstring:
         await client.upsert_file_entities("proj", "pkg/mod.py", [module, cls, method], rels)
 
         assert await client.get_package_docstring("proj:pkg.mod.MyClass.method") == "Module docs."
-        await client.close()
 
-    async def test_no_enclosing_module_returns_none(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_no_enclosing_module_returns_none(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
 
         assert await client.get_package_docstring("proj:mod.f") is None
-        await client.close()
 
 
 class TestGetCallersAndCallees:
-    async def test_multi_hop_traversal_filters_by_callable_label(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_multi_hop_traversal_filters_by_callable_label(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         a, b, c = _entity("a", "mod.a"), _entity("b", "mod.b"), _entity("c", "mod.c")
         await client.upsert_file_entities("proj", "mod.py", [a, b, c], [])
@@ -972,22 +893,18 @@ class TestGetCallersAndCallees:
 
         callees = await client.get_callees("proj:mod.a", "", 2, 10)
         assert {r["uid"] for r in callees} == {"proj:mod.b", "proj:mod.c"}
-        await client.close()
 
-    async def test_label_mismatch_on_target_returns_empty(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_label_mismatch_on_target_returns_empty(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         a, b = _entity("a", "mod.a"), _entity("b", "mod.b")
         await client.upsert_file_entities("proj", "mod.py", [a, b], [])
         await _insert_edge(client, "proj:mod.a", "proj:mod.b", "CALLS")
 
         assert await client.get_callers("proj:mod.b", "TypeDef", 1, 10) == []
-        await client.close()
 
 
 class TestGetLinkedDocs:
-    async def test_returns_docs_with_anchor_metadata(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_returns_docs_with_anchor_metadata(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         target = _entity("f", "mod.f")
         doc = _entity("doc", "note:doc", label=NodeLabel.NOTE, kind="note", file_path="doc.md")
@@ -1008,12 +925,10 @@ class TestGetLinkedDocs:
         assert docs[0]["link_type"] == "anchor"
         assert docs[0]["stale"] is False
         assert docs[0]["anchor_hash"] == "h1"
-        await client.close()
 
 
 class TestGetNodeExactMatches:
-    async def test_matches_by_uid_and_name(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_matches_by_uid_and_name(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("my_func", "mod.my_func")], [])
 
@@ -1022,12 +937,10 @@ class TestGetNodeExactMatches:
 
         by_name = await client.get_node_exact_matches("my_func", "", 5)
         assert any(r["n"]["uid"] == "proj:mod.my_func" for r in by_name)
-        await client.close()
 
 
 class TestGetNodePartialMatches:
-    async def test_suffix_scores_highest(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_suffix_scores_highest(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("target_fn", "pkg.mod.target_fn")], [])
 
@@ -1038,12 +951,10 @@ class TestGetNodePartialMatches:
         # picking the max score per uid, so check that, not a single collapsed entry.
         best_score = max(r["_match_score"] for r in results if r["n"]["uid"] == "proj:pkg.mod.target_fn")
         assert best_score == 3  # suffix (.target_fn) is the highest-scored branch
-        await client.close()
 
 
 class TestGetLabelCounts:
-    async def test_counts_grouped_by_label(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_counts_grouped_by_label(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities(
             "proj",
@@ -1056,12 +967,10 @@ class TestGetLabelCounts:
 
         assert counts["Callable"] == 2
         assert counts["TypeDef"] == 1
-        await client.close()
 
 
 class TestGetProjectDependencyEdges:
-    async def test_project_to_project_edges(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_project_to_project_edges(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.merge_project_node("app")
         await client.merge_project_node("lib")
@@ -1070,30 +979,24 @@ class TestGetProjectDependencyEdges:
         edges = await client.get_project_dependency_edges()
 
         assert edges == [{"from_proj": "app", "to_proj": "lib"}]
-        await client.close()
 
 
 class TestGetExistingUids:
-    async def test_returns_only_existing(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_returns_only_existing(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
 
         existing = await client.get_existing_uids(["proj:mod.f", "proj:mod.missing"])
 
         assert existing == {"proj:mod.f"}
-        await client.close()
 
-    async def test_empty_input_returns_empty_set(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_empty_input_returns_empty_set(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         assert await client.get_existing_uids([]) == set()
-        await client.close()
 
 
 class TestGetOrphanNotes:
-    async def test_note_without_links_to_is_orphan(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_note_without_links_to_is_orphan(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         orphan = _entity("orphan", "note:orphan", label=NodeLabel.NOTE, kind="note", file_path="orphan.md")
         linked_a = _entity("a", "note:a", label=NodeLabel.NOTE, kind="note", file_path="a.md")
@@ -1106,12 +1009,10 @@ class TestGetOrphanNotes:
         orphans = await client.get_orphan_notes()
 
         assert {n["uid"] for n in orphans} == {"proj:note:orphan"}
-        await client.close()
 
 
 class TestGetBrokenAnchorNotes:
-    async def test_unresolved_anchors_flagged(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_unresolved_anchors_flagged(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         note = _entity("n", "note:n", label=NodeLabel.NOTE, kind="note", file_path="n.md")
         clean = _entity("clean", "note:clean", label=NodeLabel.NOTE, kind="note", file_path="clean.md")
@@ -1126,12 +1027,10 @@ class TestGetBrokenAnchorNotes:
         assert len(broken) == 1
         assert broken[0]["uid"] == "proj:note:n"
         assert broken[0]["unresolved_anchors"] == ["missing-target"]
-        await client.close()
 
 
 class TestGetInboxNotePaths:
-    async def test_draft_kind_and_inbox_path_included(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_draft_kind_and_inbox_path_included(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         draft = _entity("d", "note:d", label=NodeLabel.NOTE, kind="draft", file_path="d.md")
         inbox = _entity("i", "note:i", label=NodeLabel.NOTE, kind="note", file_path="wiki/inbox/i.md")
@@ -1143,7 +1042,6 @@ class TestGetInboxNotePaths:
         paths = await client.get_inbox_note_paths()
 
         assert set(paths) == {"d.md", "wiki/inbox/i.md"}
-        await client.close()
 
 
 class TestGetNotesForDedup:
@@ -1155,21 +1053,20 @@ class TestGetNotesForDedup:
         embeds make that common. Title blocking needs them (ATL-130).
         """
         dim = 3
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3", dimension=dim)
-        await client.ensure_schema()
-        with_emb = _entity("a", "note:a", label=NodeLabel.NOTE, kind="note", file_path="a.md")
-        without_emb = _entity("b", "note:b", label=NodeLabel.NOTE, kind="note", file_path="b.md")
-        await client.upsert_file_entities("proj", "a.md", [with_emb], [])
-        await client.upsert_file_entities("proj", "b.md", [without_emb], [])
-        await client.write_embeddings([("proj:note:a", [1.0, 2.0, 3.0])])
+        async with SqliteGraphClient(tmp_path / "graph.sqlite3", dimension=dim) as client:
+            await client.ensure_schema()
+            with_emb = _entity("a", "note:a", label=NodeLabel.NOTE, kind="note", file_path="a.md")
+            without_emb = _entity("b", "note:b", label=NodeLabel.NOTE, kind="note", file_path="b.md")
+            await client.upsert_file_entities("proj", "a.md", [with_emb], [])
+            await client.upsert_file_entities("proj", "b.md", [without_emb], [])
+            await client.write_embeddings([("proj:note:a", [1.0, 2.0, 3.0])])
 
-        rows = {r["uid"]: r for r in await client.get_notes_for_dedup()}
+            rows = {r["uid"]: r for r in await client.get_notes_for_dedup()}
 
-        assert set(rows) == {"proj:note:a", "proj:note:b"}
-        assert rows["proj:note:a"]["embedding"] == [1.0, 2.0, 3.0]
-        assert rows["proj:note:b"]["embedding"] is None
-        assert rows["proj:note:a"]["name"] == "a"
-        await client.close()
+            assert set(rows) == {"proj:note:a", "proj:note:b"}
+            assert rows["proj:note:a"]["embedding"] == [1.0, 2.0, 3.0]
+            assert rows["proj:note:b"]["embedding"] is None
+            assert rows["proj:note:a"]["name"] == "a"
 
 
 # ---------------------------------------------------------------------------
@@ -1208,8 +1105,7 @@ async def _scalar(client: SqliteGraphClient, sql: str, params: tuple[Any, ...] =
 
 
 class TestResolveConfigRefs:
-    async def test_creates_global_env_var_and_scoped_resource_file(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_creates_global_env_var_and_scoped_resource_file(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
 
@@ -1221,14 +1117,12 @@ class TestResolveConfigRefs:
         assert env[:4] == ("EnvVar", GLOBAL_PROJECT, "DATABASE_URL", "env/DATABASE_URL")
         res = await _node_row(client, "proj:res/data/fixtures.json")
         assert res[:4] == ("ResourceFile", "proj", "fixtures.json", "res/data/fixtures.json")
-        await client.close()
 
-    async def test_stores_names_not_values(self, tmp_path: Path) -> None:
+    async def test_stores_names_not_values(self, client: SqliteGraphClient) -> None:
         """A default argument is a live-secret channel — nothing from the
         reference's properties may be persisted on the node, the edge, or the
         BM25 document.
         """
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
         secret = "sk-live-abc123"
@@ -1239,13 +1133,11 @@ class TestResolveConfigRefs:
         assert await _scalar(client, "SELECT props_json FROM edges WHERE rel_type = 'READS_ENV'") == "{}"
         fts_text = await _scalar(client, "SELECT text FROM text_envvar WHERE uid = 'env/API_KEY'")
         assert secret not in fts_text
-        await client.close()
 
-    async def test_env_var_is_text_searchable_from_a_scoped_search(self, tmp_path: Path) -> None:
+    async def test_env_var_is_text_searchable_from_a_scoped_search(self, client: SqliteGraphClient) -> None:
         """A project-scoped search must still surface the global node — the
         whole point of making these labels text-searchable.
         """
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
         await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "DATABASE_URL")])
@@ -1253,10 +1145,8 @@ class TestResolveConfigRefs:
         hits = await client.text_search("DATABASE_URL", project="proj")
 
         assert [h["node"]["uid"] for h in hits] == ["env/DATABASE_URL"]
-        await client.close()
 
-    async def test_reresolve_is_idempotent(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_reresolve_is_idempotent(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
         rels = [_env_ref("proj:mod.f", "X")]
@@ -1265,12 +1155,10 @@ class TestResolveConfigRefs:
         await client.resolve_config_refs("proj", rels)
 
         assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE rel_type = 'READS_ENV'") == 1
-        await client.close()
 
 
 class TestGcOrphanedReferenceNodes:
-    async def test_keeps_referenced_nodes(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_keeps_referenced_nodes(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
         await client.resolve_config_refs(
@@ -1281,14 +1169,12 @@ class TestGcOrphanedReferenceNodes:
 
         assert await _node_row(client, "env/KEEP") is not None
         assert await _node_row(client, "proj:res/data/keep.json") is not None
-        await client.close()
 
-    async def test_sweeps_node_after_its_last_reference_disappears(self, tmp_path: Path) -> None:
+    async def test_sweeps_node_after_its_last_reference_disappears(self, client: SqliteGraphClient) -> None:
         """The end-to-end reference-counting contract: re-upserting the file
         without the reference drops the edge (relationship recreation), and the
         sweep then reclaims the now-unreferenced node.
         """
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
         await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "GONE")])
@@ -1299,10 +1185,8 @@ class TestGcOrphanedReferenceNodes:
 
         assert await client.gc_orphaned_reference_nodes() == 1
         assert await _node_row(client, "env/GONE") is None
-        await client.close()
 
-    async def test_sweep_also_clears_the_fts_row(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_sweep_also_clears_the_fts_row(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
         await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "GONE")])
@@ -1311,10 +1195,8 @@ class TestGcOrphanedReferenceNodes:
         await client.gc_orphaned_reference_nodes()
 
         assert await client.text_search("GONE") == []
-        await client.close()
 
-    async def test_survives_while_one_of_two_referrers_remains(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_survives_while_one_of_two_referrers_remains(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "a.py", [_entity("f", "a.f", file_path="a.py")], [])
         await client.upsert_file_entities("proj", "b.py", [_entity("g", "b.g", file_path="b.py")], [])
@@ -1326,13 +1208,11 @@ class TestGcOrphanedReferenceNodes:
 
         assert await client.gc_orphaned_reference_nodes() == 0
         assert await _node_row(client, "env/SHARED") is not None
-        await client.close()
 
-    async def test_project_deletion_orphans_the_global_env_var(self, tmp_path: Path) -> None:
+    async def test_project_deletion_orphans_the_global_env_var(self, client: SqliteGraphClient) -> None:
         """``delete_project_data`` cannot reach a ``_global`` node — the sweep is
         what stops deleted projects from leaking env vars forever.
         """
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("f", "mod.f")], [])
         await client.resolve_config_refs("proj", [_env_ref("proj:mod.f", "ORPHANED")])
@@ -1342,7 +1222,6 @@ class TestGcOrphanedReferenceNodes:
 
         assert await client.gc_orphaned_reference_nodes() == 1
         assert await _node_row(client, "env/ORPHANED") is None
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1357,8 +1236,7 @@ class TestLikeMetacharacters:
     unescaped query silently returns the wrong rows rather than failing.
     """
 
-    async def test_underscore_does_not_match_an_arbitrary_character(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_underscore_does_not_match_an_arbitrary_character(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities(
             "proj",
@@ -1370,10 +1248,8 @@ class TestLikeMetacharacters:
         found = await client.graph_search("get_node", project="proj")
 
         assert {r["node"]["name"] for r in found} == {"get_node"}, "`_` matched any character"
-        await client.close()
 
-    async def test_a_percent_query_does_not_match_everything(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_a_percent_query_does_not_match_everything(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await client.upsert_file_entities(
             "proj",
@@ -1385,11 +1261,9 @@ class TestLikeMetacharacters:
         found = await client.graph_search("%", project="proj")
 
         assert found == [], "a bare `%` matched every node in the project"
-        await client.close()
 
-    async def test_get_node_by_name_escapes_too(self, tmp_path: Path) -> None:
+    async def test_get_node_by_name_escapes_too(self, client: SqliteGraphClient) -> None:
         """The same trap in the second cascade — fixing one site is not fixing the bug."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await client.upsert_file_entities(
             "proj",
@@ -1401,17 +1275,14 @@ class TestLikeMetacharacters:
         found = await client.get_node_partial_matches("do_thing", "", 20)
 
         assert {r["n"]["name"] for r in found} == {"do_thing"}
-        await client.close()
 
-    async def test_an_escaped_query_still_finds_its_literal_match(self, tmp_path: Path) -> None:
+    async def test_an_escaped_query_still_finds_its_literal_match(self, client: SqliteGraphClient) -> None:
         """Escaping must not break the ordinary case it exists to protect."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await client.upsert_file_entities("proj", "mod.py", [_entity("get_node", "mod.get_node")], [])
 
         assert len(await client.graph_search("get_node", project="proj")) == 1
         assert len(await client.graph_search("t_no", project="proj")) == 1, "substring search still works"
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1447,8 +1318,7 @@ class TestStructuralEdgesAreResolved:
         await _insert_edge(client, "proj:mod.resolved_caller", "proj:mod.target", "CALLS", {"confidence": "resolved"})
         await _insert_edge(client, "proj:mod.guessing_caller", "proj:mod.target", "CALLS", {"confidence": "ambiguous"})
 
-    async def test_a_structural_dependent_is_not_flagged_as_a_guess(self, tmp_path: Path) -> None:
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
+    async def test_a_structural_dependent_is_not_flagged_as_a_guess(self, client: SqliteGraphClient) -> None:
         await client.ensure_schema()
         await self._seed(client)
 
@@ -1457,11 +1327,9 @@ class TestStructuralEdgesAreResolved:
 
         assert by_uid["proj:mod.structural_caller"]["ambiguous_only"] is False
         assert by_uid["proj:mod.resolved_caller"]["ambiguous_only"] is False
-        await client.close()
 
-    async def test_an_ambiguous_dependent_is_still_flagged(self, tmp_path: Path) -> None:
+    async def test_an_ambiguous_dependent_is_still_flagged(self, client: SqliteGraphClient) -> None:
         """The fix must not make everything look resolved."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await self._seed(client)
 
@@ -1469,7 +1337,6 @@ class TestStructuralEdgesAreResolved:
         by_uid = {e["uid"]: e for e in entries}
 
         assert by_uid["proj:mod.guessing_caller"]["ambiguous_only"] is True
-        await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1493,51 +1360,41 @@ class TestDeadCodeExclusions:
     async def _dead(self, client: SqliteGraphClient) -> set[str]:
         return {r["name"] for r in await client.get_dead_code_candidates("proj", "")}
 
-    async def test_a_referenced_callable_is_alive(self, tmp_path: Path) -> None:
+    async def test_a_referenced_callable_is_alive(self, client: SqliteGraphClient) -> None:
         """REFERENCES is proof of life: handed to a registry, the framework calls it."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await self._seed(client, [_entity("handler", "mod.handler"), _entity("register", "mod.register")])
         await _insert_edge(client, "proj:mod.register", "proj:mod.handler", "REFERENCES", {})
 
         assert "handler" not in await self._dead(client)
-        await client.close()
 
-    async def test_an_override_is_reached_through_its_base(self, tmp_path: Path) -> None:
+    async def test_an_override_is_reached_through_its_base(self, client: SqliteGraphClient) -> None:
         """Liveness is an OUTBOUND test here — the override runs when the base is called."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await self._seed(client, [_entity("_pre_run", "mod._pre_run"), _entity("base_pre_run", "mod.base_pre_run")])
         await _insert_edge(client, "proj:mod._pre_run", "proj:mod.base_pre_run", "OVERRIDES", {})
 
         assert "_pre_run" not in await self._dead(client)
-        await client.close()
 
-    async def test_a_decorated_callable_is_registered_not_dead(self, tmp_path: Path) -> None:
+    async def test_a_decorated_callable_is_registered_not_dead(self, client: SqliteGraphClient) -> None:
         """`@app.command()` IS the inbound edge, but no relationship records it."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         decorated = _entity("mine_git_history", "mod.mine_git_history")
         decorated.extra_properties["decorator_name"] = "app.command"
         await self._seed(client, [decorated])
 
         assert "mine_git_history" not in await self._dead(client)
-        await client.close()
 
-    async def test_a_property_is_read_not_called(self, tmp_path: Path) -> None:
+    async def test_a_property_is_read_not_called(self, client: SqliteGraphClient) -> None:
         """Zero inbound edges is the expected state for a property, not evidence."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await self._seed(client, [_entity("ok", "mod.ok", kind="property")])
 
         assert "ok" not in await self._dead(client)
-        await client.close()
 
-    async def test_a_genuinely_unreferenced_function_is_still_reported(self, tmp_path: Path) -> None:
+    async def test_a_genuinely_unreferenced_function_is_still_reported(self, client: SqliteGraphClient) -> None:
         """The exclusions must not empty the result — then the tool would be useless."""
-        client = SqliteGraphClient(tmp_path / "graph.sqlite3")
         await client.ensure_schema()
         await self._seed(client, [_entity("orphan", "mod.orphan")])
 
         assert "orphan" in await self._dead(client)
-        await client.close()

@@ -249,32 +249,30 @@ async def graph_client(settings) -> AsyncIterator[GraphClient]:
     """
     from code_atlas.graph.client import GraphClient
 
-    client = GraphClient(settings)
-    try:
-        await client.ping()
-    except Exception:
-        # Close before skipping: a bare skip here abandons a live AsyncBoltDriver, and
-        # neo4j warns about it whenever the GC eventually notices -- blaming whichever
-        # unrelated test happens to be running. That mis-attribution is what turned five
-        # integration tests red once warnings became errors.
-        await client.close()
-        pytest.skip("Memgraph not available")
+    # Scoped to a block: an abandoned AsyncBoltDriver makes neo4j warn whenever the GC
+    # eventually notices, blaming whichever unrelated test is running by then -- which
+    # is how five integration tests went red once warnings became errors. The skip and
+    # the disposable-db guard below can both raise, and the block closes either way.
+    async with GraphClient(settings) as client:
+        try:
+            await client.ping()
+        except Exception:
+            pytest.skip("Memgraph not available")
 
-    await _assert_disposable_db(client, settings.memgraph.host, settings.memgraph.port)
-    # Clean slate: wipe nodes and drop search indices (dimension may differ)
-    await client.execute_write("MATCH (n) DETACH DELETE n")
-    for stmt in generate_drop_vector_index_ddl():
-        with contextlib.suppress(Exception):
-            await client.execute_write(stmt)
-    for stmt in generate_drop_text_index_ddl():
-        with contextlib.suppress(Exception):
-            await client.execute_write(stmt)
+        await _assert_disposable_db(client, settings.memgraph.host, settings.memgraph.port)
+        # Clean slate: wipe nodes and drop search indices (dimension may differ)
+        await client.execute_write("MATCH (n) DETACH DELETE n")
+        for stmt in generate_drop_vector_index_ddl():
+            with contextlib.suppress(Exception):
+                await client.execute_write(stmt)
+        for stmt in generate_drop_text_index_ddl():
+            with contextlib.suppress(Exception):
+                await client.execute_write(stmt)
 
-    yield client
+        yield client
 
-    # Clean up after test
-    await client.execute_write("MATCH (n) DETACH DELETE n")
-    await client.close()
+        # Clean up after test
+        await client.execute_write("MATCH (n) DETACH DELETE n")
 
 
 @pytest.fixture
@@ -286,19 +284,17 @@ async def event_bus(settings) -> AsyncIterator:
     """
     from code_atlas.events import EventBus, Topic
 
-    bus = EventBus(settings.redis)
-    try:
-        await bus.ping()
-    except Exception:
-        # Close before skipping -- see the graph_client fixture; an abandoned redis
-        # Connection produces the same misdirected ResourceWarning.
-        await bus.close()
-        pytest.skip("Valkey not available")
+    # Scoped to a block -- see the graph fixture; an abandoned redis Connection produces
+    # the same misdirected ResourceWarning.
+    async with EventBus(settings.redis) as bus:
+        try:
+            await bus.ping()
+        except Exception:
+            pytest.skip("Valkey not available")
 
-    # Clean slate: flush all pipeline streams
-    for topic in Topic:
-        key = f"{bus._prefix}:{topic.value}"
-        await bus._redis.delete(key)
+        # Clean slate: flush all pipeline streams
+        for topic in Topic:
+            key = f"{bus._prefix}:{topic.value}"
+            await bus._redis.delete(key)
 
-    yield bus
-    await bus.close()
+        yield bus
