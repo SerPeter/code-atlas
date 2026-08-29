@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -562,67 +563,77 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     project_name = derive_project_name(settings.project_root)
 
     # Connect to the event queue backend (Valkey or the SQLite fallback)
-    bus = await create_event_bus(settings)
-    try:
-        await bus.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", queue_backend_label(bus, settings), exc)
-        raise typer.Exit(code=1) from exc
-    logger.info("Connected to {}", queue_backend_label(bus, settings))
-
-    # Resolve embedding dimension before graph construction (vector indices need it)
-    if settings.embeddings.enabled and settings.embeddings.dimension is None:
-        from code_atlas.search.embeddings import EmbedClient as _EmbedClient
-
-        _probe = _EmbedClient(settings.embeddings, settings.redis)
+    # One stack, in acquisition order, because the order is load-bearing: the bus opens
+    # first, the embedding dimension is probed, and only then is the graph built --
+    # GraphClient reads settings.embeddings.dimension at construction to size its vector
+    # indices, so building it earlier would size them from an unresolved value. That is
+    # why this is an explicit stack and not use_backends(), which opens both at once.
+    # Unwinding is reverse order -- lease, graph, bus -- and the lease release is a
+    # compare-and-delete over the bus, so it has to go first.
+    async with AsyncExitStack() as stack:
+        # Registered first so it runs last. This used to sit after a `raise typer.Exit`
+        # and never ran on any path.
+        stack.callback(shutdown_telemetry)
+        bus = await create_event_bus(settings)
+        await stack.enter_async_context(bus)
         try:
-            resolved_dim = await _probe.detect_dimension()
-        except Exception:
-            logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
-            settings.embeddings.enabled = False
-            resolved_dim = None
-        if resolved_dim is not None:
-            settings.embeddings.dimension = resolved_dim
-            logger.debug("Auto-detected embedding dimension: {}", resolved_dim)
+            await bus.ping()
+        except Exception as exc:
+            logger.error("Cannot reach {} — {}", queue_backend_label(bus, settings), exc)
+            raise typer.Exit(code=1) from exc
+        logger.info("Connected to {}", queue_backend_label(bus, settings))
 
-    if not settings.embeddings.enabled:
-        logger.info("Lightweight mode: embeddings disabled, using graph + BM25 only")
+        # Resolve embedding dimension before graph construction (vector indices need it)
+        if settings.embeddings.enabled and settings.embeddings.dimension is None:
+            from code_atlas.search.embeddings import EmbedClient as _EmbedClient
 
-    # Connect to the graph backend (Memgraph or the SQLite fallback)
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        await bus.close()
-        raise typer.Exit(code=1) from exc
-    logger.info("Connected to {}", graph_backend_label(graph, settings))
+            _probe = _EmbedClient(settings.embeddings, settings.redis)
+            try:
+                resolved_dim = await _probe.detect_dimension()
+            except Exception:
+                logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
+                settings.embeddings.enabled = False
+                resolved_dim = None
+            if resolved_dim is not None:
+                settings.embeddings.dimension = resolved_dim
+                logger.debug("Auto-detected embedding dimension: {}", resolved_dim)
 
-    await graph.ensure_schema()
+        if not settings.embeddings.enabled:
+            logger.info("Lightweight mode: embeddings disabled, using graph + BM25 only")
 
-    # Wait rather than index alongside another process. Two indexers writing the same
-    # nodes is how one run got split across two code versions, and how Memgraph's MVCC
-    # conflicts turned into dropped files. Waiting is visible (a log line names the
-    # holder) and interruptible; refusing outright made a concurrent daemon catch-up
-    # into an exit code 1 for a human who only had to wait.
-    from code_atlas.events import IndexerBusyError, hold_indexer_lease
+        # Connect to the graph backend (Memgraph or the SQLite fallback)
+        graph = await create_graph_client(settings)
+        await stack.enter_async_context(graph)
+        try:
+            await graph.ping()
+        except Exception as exc:
+            logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
+            raise typer.Exit(code=1) from exc
+        logger.info("Connected to {}", graph_backend_label(graph, settings))
 
-    try:
-        lease = hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s, force=force)
-        owner = await lease.__aenter__()
-    except IndexerBusyError as exc:
-        logger.error("{}", exc)
-        await graph.close()
-        await bus.close()
-        raise typer.Exit(code=1) from exc
-    logger.debug("Holding indexer lease ({})", owner)
+        await graph.ensure_schema()
 
-    # An undrained pipeline means the graph does not reflect the working tree. Printing
-    # "Done" and exiting 0 for that made two incomplete indexes read as successes, to a
-    # human and to any CI step gating on the exit code.
-    incomplete = False
+        # Wait rather than index alongside another process. Two indexers writing the same
+        # nodes is how one run got split across two code versions, and how Memgraph's MVCC
+        # conflicts turned into dropped files. Waiting is visible (a log line names the
+        # holder) and interruptible; refusing outright made a concurrent daemon catch-up
+        # into an exit code 1 for a human who only had to wait.
+        from code_atlas.events import IndexerBusyError, hold_indexer_lease
 
-    try:
+        try:
+            owner = await stack.enter_async_context(
+                hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s, force=force)
+            )
+        except IndexerBusyError as exc:
+            logger.error("{}", exc)
+            raise typer.Exit(code=1) from exc
+        logger.debug("Holding indexer lease ({})", owner)
+
+        # An undrained pipeline means the graph does not reflect the working tree. Printing
+        # "Done" and exiting 0 for that made two incomplete indexes read as successes, to a
+        # human and to any CI step gating on the exit code.
+        incomplete = False
+
         # Auto-detect monorepo: if sub-projects detected or --project specified → monorepo mode
         sub_projects = detect_sub_projects(project_root, settings.monorepo)
         is_monorepo = bool(sub_projects) or bool(projects)
@@ -718,15 +729,6 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             # catch-up against the same graph, which is the collision this whole
             # mechanism exists to prevent.
             await _watch_after_index(settings, graph, bus, owner)
-    finally:
-        # Release before closing the bus — the release is a compare-and-delete over it.
-        await lease.__aexit__(None, None, None)
-        await graph.close()
-        await bus.close()
-        # Flush spans, metrics and buffered log records. This used to sit *after* a
-        # `raise typer.Exit`, one level in, so it never ran on any path -- `atlas index`
-        # dropped every signal it had produced at exit.
-        shutdown_telemetry()
 
     # An undrained pass is a hard failure for a one-shot run, and only a warning under
     # --watch: there the consumers stay up and keep draining, which is the entire

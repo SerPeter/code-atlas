@@ -217,6 +217,15 @@ class TestMonorepoScopeDispatch:
             def __init__(self, *args, **kwargs) -> None:
                 pass
 
+            # The CLI opens its backends through a scope now, so a double has to honour
+            # the same protocol the real client does -- otherwise it fails at the
+            # `async with`, which is a fake that stopped resembling the thing it stands in for.
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                await self.close()
+
             async def ping(self) -> None:
                 return None
 
@@ -239,6 +248,15 @@ class TestMonorepoScopeDispatch:
         class FakeGraph:
             def __init__(self, *args, **kwargs) -> None:
                 pass
+
+            # The CLI opens its backends through a scope now, so a double has to honour
+            # the same protocol the real client does -- otherwise it fails at the
+            # `async with`, which is a fake that stopped resembling the thing it stands in for.
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                await self.close()
 
             async def ping(self) -> None:
                 return None
@@ -331,6 +349,15 @@ class TestIndexWithGitSignals:
             def __init__(self, *args, **kwargs) -> None:
                 pass
 
+            # The CLI opens its backends through a scope now, so a double has to honour
+            # the same protocol the real client does -- otherwise it fails at the
+            # `async with`, which is a fake that stopped resembling the thing it stands in for.
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                await self.close()
+
             async def ping(self) -> None:
                 return None
 
@@ -353,6 +380,15 @@ class TestIndexWithGitSignals:
         class FakeGraph:
             def __init__(self, *args, **kwargs) -> None:
                 pass
+
+            # The CLI opens its backends through a scope now, so a double has to honour
+            # the same protocol the real client does -- otherwise it fails at the
+            # `async with`, which is a fake that stopped resembling the thing it stands in for.
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                await self.close()
 
             async def ping(self) -> None:
                 return None
