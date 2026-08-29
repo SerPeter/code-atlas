@@ -484,6 +484,16 @@ class IndexSettings(StrictSection):
     strip_whitespace: bool = Field(
         default=True, description="Normalize whitespace before hashing (ignores formatting-only changes)."
     )
+    lease_wait_s: float = Field(
+        default=600.0,
+        description="Max seconds to wait for the indexer lease before standing down. "
+        "Giving up immediately assumes whoever holds the lease will do the work, and that "
+        "breaks precisely when it matters -- a holder that is killed mid-run leaves the lease "
+        "to expire with the work undone and nothing to re-trigger it. A dead holder frees the "
+        "lease within its 60s TTL, so this only has to outlast that plus an ordinary delta "
+        "pass; a live holder genuinely covers the same work, which is why standing down after "
+        "the wait is still correct. 0 restores fail-fast.",
+    )
     drain_timeout_s: float = Field(
         default=600.0,
         description="Max seconds to wait for the AST/embed pipeline to drain after publishing. "

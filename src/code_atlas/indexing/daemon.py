@@ -259,15 +259,16 @@ class DaemonManager:
         a caller waiting on it (MCP's first-index readiness gate), never hang forever.
         """
         try:
-            async with hold_indexer_lease(bus):
+            async with hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s):
                 if detect_sub_projects(settings.project_root, settings.monorepo):
                     await index_monorepo(settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s)
                 else:
                     await index_project(settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s)
         except IndexerBusyError as exc:
             logger.info(
-                "Skipping startup catch-up — another indexer already holds the lease "
-                "({}); live events will still be consumed once it finishes",
+                "Skipping startup catch-up — another indexer still holds the lease after "
+                "waiting {:.0f}s ({}); live events will still be consumed once it finishes",
+                settings.index.lease_wait_s,
                 exc.holder,
             )
         except Exception:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import random
 import socket
 import time
 import uuid
@@ -123,6 +124,13 @@ def decode_event(topic: Topic, data: dict[bytes, bytes]) -> Event:
 INDEXER_LEASE_TTL_MS = 60_000
 _LEASE_RENEW_S = INDEXER_LEASE_TTL_MS / 3000
 
+# How often a waiter re-tries, and by how much that interval is randomised per waiter.
+# The jitter is the point, not the interval: several MCP sessions in one worktree start
+# within milliseconds of each other (an agent client spawns them together), so without it
+# they retry in lockstep forever, and each round the same one tends to win.
+_LEASE_POLL_S = 2.0
+_LEASE_POLL_JITTER = 0.5
+
 
 class IndexerBusyError(RuntimeError):
     """Another process holds the indexer lease for this project."""
@@ -141,20 +149,62 @@ def new_lease_owner() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
+async def _await_indexer_lease(bus: Any, owner: str, ttl_ms: int, wait_s: float) -> bool:
+    """Poll for the lease until *wait_s* elapses. ``True`` if it was acquired.
+
+    Retries are spaced by a jittered interval so that several waiters do not converge
+    on the same instant. ``wait_s <= 0`` collapses to exactly one attempt, which is the
+    original fail-fast behaviour.
+    """
+    deadline = time.monotonic() + wait_s
+    announced = False
+    while True:
+        if await bus.acquire_indexer_lease(owner, ttl_ms):
+            if announced:
+                logger.info("Indexer lease acquired after waiting")
+            return True
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+
+        if not announced:
+            announced = True
+            holder = await bus.read_indexer_lease()
+            logger.info(
+                "Waiting up to {:.0f}s for the indexer lease held by {}",
+                wait_s,
+                holder or "another process",
+            )
+
+        delay = _LEASE_POLL_S * random.uniform(1 - _LEASE_POLL_JITTER, 1 + _LEASE_POLL_JITTER)
+        await asyncio.sleep(min(delay, remaining))
+
+
 @asynccontextmanager
-async def hold_indexer_lease(bus: Any, *, ttl_ms: int = INDEXER_LEASE_TTL_MS) -> AsyncIterator[str]:
+async def hold_indexer_lease(
+    bus: Any, *, ttl_ms: int = INDEXER_LEASE_TTL_MS, wait_s: float = 0.0
+) -> AsyncIterator[str]:
     """Hold the project's indexer lease for the duration of the block.
 
     Raises :class:`IndexerBusyError` if someone else holds it, rather than indexing anyway —
     two processes writing the same nodes is how a single index run got split across two
     code versions, and how Memgraph's MVCC conflicts turned into dropped files.
 
+    *wait_s* watches the lease instead of giving up on the first refusal. Skipping on
+    contention quietly assumes the holder will do the work, and that assumption breaks
+    exactly when it matters: a reconnecting MCP server collided with the lease of a
+    process that was then killed, so the holder never finished, the lease expired
+    unnoticed, and nothing re-triggered the catch-up. The index simply sat idle. Waiting
+    is correct either way — if the holder finishes normally the deferred pass is a cheap
+    no-op behind the hash gate, and if it dies the waiter picks the work up.
+
     Renewal runs in the background so a long index cannot lose the lease mid-run, and the
     release is a compare-and-delete, so a process that stalled past its TTL cannot free a
     lease that has since passed to someone else.
     """
     owner = new_lease_owner()
-    if not await bus.acquire_indexer_lease(owner, ttl_ms):
+    if not await _await_indexer_lease(bus, owner, ttl_ms, wait_s):
         holder = await bus.read_indexer_lease()
         raise IndexerBusyError(holder or "unknown")
 

@@ -514,13 +514,15 @@ async def _run_index(  # noqa: PLR0912, PLR0915
 
     await graph.ensure_schema()
 
-    # Refuse rather than index alongside another process. Two indexers writing the same
+    # Wait rather than index alongside another process. Two indexers writing the same
     # nodes is how one run got split across two code versions, and how Memgraph's MVCC
-    # conflicts turned into dropped files. A running daemon stands down instead.
+    # conflicts turned into dropped files. Waiting is visible (a log line names the
+    # holder) and interruptible; refusing outright made a concurrent daemon catch-up
+    # into an exit code 1 for a human who only had to wait.
     from code_atlas.events import IndexerBusyError, hold_indexer_lease
 
     try:
-        lease = hold_indexer_lease(bus)
+        lease = hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s)
         owner = await lease.__aenter__()
     except IndexerBusyError as exc:
         logger.error("{}", exc)

@@ -187,3 +187,142 @@ class TestFlushPreservesGroups:
         await bus.flush()
         assert fake.destroyed == []
         assert sorted(fake.xtrims) == [("atlas:embed-dirty", 0), ("atlas:file-changed", 0)]
+
+
+# ---------------------------------------------------------------------------
+# Indexer lease
+# ---------------------------------------------------------------------------
+
+
+class FakeLeaseBus:
+    """A bus whose lease is held by someone else for the first *busy_for* attempts."""
+
+    def __init__(self, busy_for: float = 0, holder: str = "host:999:abc") -> None:
+        self.busy_for = busy_for
+        self.holder = holder
+        self.attempts = 0
+        self.released = False
+
+    async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        self.attempts += 1
+        return self.attempts > self.busy_for
+
+    async def read_indexer_lease(self) -> str:
+        return self.holder
+
+    async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        return True
+
+    async def release_indexer_lease(self, owner: str) -> bool:
+        self.released = True
+        return True
+
+
+class FakeClock:
+    """Drives the lease deadline from the sleeps the code asks for.
+
+    Without this the test either spins for `wait_s` of real time or -- worse -- never
+    reaches the deadline at all, because instant sleeps let it retry millions of times
+    and eventually satisfy any finite `busy_for`. Both were mistakes in the first draft
+    of these tests.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.delays: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    from code_atlas import events
+
+    c = FakeClock()
+    monkeypatch.setattr(events.time, "monotonic", c.monotonic)
+    monkeypatch.setattr("asyncio.sleep", c.sleep)
+    return c
+
+
+class TestIndexerLeaseWaiting:
+    """Standing down on the first refusal assumes the holder will do the work.
+
+    That assumption broke in the field: a reconnecting MCP server collided with the
+    lease of a process that was then killed, so the holder never finished, its lease
+    expired unnoticed, and nothing re-triggered the catch-up. The index sat idle with
+    30k embeddings outstanding and no error anywhere.
+    """
+
+    async def test_a_waiter_takes_the_lease_once_it_frees(self, clock) -> None:
+        from code_atlas.events import hold_indexer_lease
+
+        bus = FakeLeaseBus(busy_for=3)
+
+        async with hold_indexer_lease(bus, wait_s=600) as owner:
+            assert owner
+
+        assert bus.attempts == 4, "should have retried until the holder released"
+        assert bus.released
+
+    async def test_zero_wait_is_exactly_one_attempt(self, clock) -> None:
+        """The previous behaviour has to stay reachable: a human at a terminal may want
+        the refusal rather than a wait."""
+        from code_atlas.events import IndexerBusyError, hold_indexer_lease
+
+        bus = FakeLeaseBus(busy_for=1)
+
+        with pytest.raises(IndexerBusyError):
+            async with hold_indexer_lease(bus, wait_s=0):
+                pass
+
+        assert bus.attempts == 1
+        assert clock.delays == [], "fail-fast must not sleep at all"
+
+    async def test_giving_up_names_the_holder(self, clock) -> None:
+        from code_atlas.events import IndexerBusyError, hold_indexer_lease
+
+        bus = FakeLeaseBus(busy_for=float("inf"), holder="host:123:deadbeef")
+
+        with pytest.raises(IndexerBusyError) as exc:
+            async with hold_indexer_lease(bus, wait_s=30):
+                pass
+
+        assert exc.value.holder == "host:123:deadbeef"
+        assert bus.attempts > 1, "should have retried before giving up"
+
+    async def test_retries_are_jittered(self, clock) -> None:
+        """Several MCP sessions in one worktree start within milliseconds of each other
+        -- an agent client spawns them together. Retrying on a fixed interval keeps them
+        in lockstep, and the same one tends to win every round."""
+        from code_atlas import events
+        from code_atlas.events import hold_indexer_lease
+
+        bus = FakeLeaseBus(busy_for=6)
+
+        async with hold_indexer_lease(bus, wait_s=600):
+            pass
+
+        assert len(clock.delays) == 6
+        assert len(set(clock.delays)) > 1, "every retry waited the same -- no jitter"
+        low = events._LEASE_POLL_S * (1 - events._LEASE_POLL_JITTER)
+        high = events._LEASE_POLL_S * (1 + events._LEASE_POLL_JITTER)
+        assert all(low <= d <= high for d in clock.delays), clock.delays
+
+    async def test_no_sleep_overshoots_the_budget(self, clock) -> None:
+        """A caller that asked for half a second must not be held for two."""
+        from code_atlas.events import IndexerBusyError, hold_indexer_lease
+
+        bus = FakeLeaseBus(busy_for=float("inf"))
+
+        with pytest.raises(IndexerBusyError):
+            async with hold_indexer_lease(bus, wait_s=0.5):
+                pass
+
+        assert clock.delays, "should have slept at least once"
+        assert all(d <= 0.5 for d in clock.delays), clock.delays
+        assert clock.now <= 1000.5
