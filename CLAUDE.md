@@ -177,6 +177,25 @@ times. Almost all of that is avoidable.
   and the only symptom was the unit suite going from ~60s to 623s, which reads as green.
 - **Watch the suite's wall-clock, not just the count.** Unit is ~50s with `-n auto`. A run
   that takes ten times that has told you something, even when every test passes.
+- **Unit tests cannot reach off-box.** `tests/unit/conftest.py` allowlists loopback only, so
+  a test that stops intercepting litellm makes a named traceback instead of a real billed
+  call. A host allowlist rather than a blanket `disable_socket`, because on Windows
+  asyncio's event loop needs a loopback `socketpair()` to exist at all. Integration and
+  bench are untouched -- different conftest.
+- **Warnings are errors.** Every ignore in `filterwarnings` names why it is not ours to
+  fix; new ones need the same justification rather than being appended quietly.
+- **Property tests for invariants, not more examples.** `hypothesis` is in the dev group.
+  The pattern to copy is `tests/unit/parsing/test_source_shims.py`: the Apex and dbt
+  shims promise `len(out) == len(src)` with newline offsets intact, and that is one
+  property covering input nobody would think to write down.
+- **`time-machine` instead of sleeping.** Leases, TTLs, cooldowns and staleness are all
+  time-based; jump the clock (see `tests/unit/backends/test_sqlite_queue.py`) rather than
+  waiting or, worse, leaving the path uncovered because covering it took a minute.
+- **`pytest-randomly` is wanted but not yet added.** It is the highest-value plugin still
+  missing -- this codebase has module-level mutable singletons in `telemetry.py` and a
+  one-shot `_discovered` flag in the parser registry, and several tests monkeypatch
+  globals, so order-dependence is currently invisible. Expect adding it to surface work
+  rather than save it, and note it needs `-p no:randomly` alongside `--testmon`.
 - **Never pass an extra `-q`.** `addopts` already contains one; a second makes `-qq`, which suppresses the
   totals line entirely. That has repeatedly produced "tests pass" reports with no count behind them.
 
