@@ -221,7 +221,10 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
     app.resolved_root = new_root
     app.staleness = StalenessChecker(new_root)
 
-    # Re-check embedding model match for new root
+    # Re-check embedding model match for new root. The outgoing client is closed
+    # first: this runs on every root switch, and each one used to strand a redis pool.
+    if app.embed is not None:
+        await app.embed.close()
     if not app.settings.embeddings.enabled:
         app.embed = None
         app.vector_enabled = False
@@ -751,7 +754,7 @@ def create_mcp_server(  # noqa: PLR0915
     """
 
     @asynccontextmanager
-    async def app_lifespan(server: FastMCP) -> AsyncGenerator[AppContext]:  # noqa: PLR0915
+    async def app_lifespan(server: FastMCP) -> AsyncGenerator[AppContext]:  # noqa: PLR0912, PLR0915
         init_telemetry(settings.observability, role="mcp", project=derive_project_name(settings.project_root))
 
         # Declared type stays GraphClient (the network backend) — SqliteGraphClient
@@ -819,13 +822,18 @@ def create_mcp_server(  # noqa: PLR0915
                     )
                     vector_enabled = False
 
-            embed = EmbedClient(settings.embeddings, settings.redis)
-            # Implicit degradation: probe TEI, fall back to lightweight if unreachable
+            # Implicit degradation: probe TEI, fall back to lightweight if unreachable.
+            # Kept only once the probe passes -- on the failure path it is closed here,
+            # so lightweight mode does not hold an idle Valkey pool for the process.
+            candidate = EmbedClient(settings.embeddings, settings.redis)
             tei_ok = False
             with contextlib.suppress(Exception):
-                tei_ok = await embed.health_check()
-            if not tei_ok:
+                tei_ok = await candidate.health_check()
+            if tei_ok:
+                embed = candidate
+            else:
                 logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
+                await candidate.close()
                 embed = None
                 vector_enabled = False
         staleness = StalenessChecker(settings.project_root)
@@ -886,6 +894,11 @@ def create_mcp_server(  # noqa: PLR0915
                 with contextlib.suppress(asyncio.CancelledError):
                     await daemon_start_task
             await app_ctx.daemon.stop()
+            # Whatever the context currently holds, which is not necessarily the client
+            # built above: _maybe_update_root swaps it on every root switch. That is why
+            # this is not a stack registration.
+            if app_ctx.embed is not None:
+                await app_ctx.embed.close()
             await stack.aclose()
             shutdown_telemetry()
             logger.info("MCP server shut down")

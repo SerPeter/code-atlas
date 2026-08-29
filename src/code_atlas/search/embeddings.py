@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import litellm
 from loguru import logger
@@ -107,6 +107,21 @@ class EmbedClient:
                 self._rpm,
                 self._tpm,
             )
+
+    async def close(self) -> None:
+        """Release the rate limiter's redis pool.
+
+        Only a redis-configured client has one -- pass no *redis_settings* and this is a
+        no-op -- so every call site can close unconditionally.
+        """
+        if self._limiter is not None:
+            await self._limiter.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
 
     @property
     def batch_size(self) -> int:

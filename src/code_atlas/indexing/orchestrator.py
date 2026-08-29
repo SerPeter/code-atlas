@@ -1984,18 +1984,23 @@ async def index_project(
     """
     project_name = project_name or derive_project_name(Path(settings.project_root))
     with _tracer.start_as_current_span("index_project", attributes={"project_name": project_name}) as idx_span:
-        return await _index_project_inner(
-            settings,
-            graph,
-            bus,
-            scope_paths=scope_paths,
-            full_reindex=full_reindex,
-            drain_timeout_s=drain_timeout_s,
-            project_name=project_name,
-            project_root=project_root,
-            span=idx_span,
-            on_drain_progress=on_drain_progress,
-        )
+        # An entry point, so an owner: the EmbedClient below holds a redis pool through
+        # its rate limiter, and the inner returns from several places. Registering it on
+        # a stack here closes it on every one of them.
+        async with contextlib.AsyncExitStack() as stack:
+            return await _index_project_inner(
+                settings,
+                graph,
+                bus,
+                scope_paths=scope_paths,
+                full_reindex=full_reindex,
+                drain_timeout_s=drain_timeout_s,
+                project_name=project_name,
+                project_root=project_root,
+                span=idx_span,
+                on_drain_progress=on_drain_progress,
+                stack=stack,
+            )
 
 
 async def _index_project_inner(
@@ -2010,6 +2015,7 @@ async def _index_project_inner(
     project_root: Path | None = None,
     span: Any = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
+    stack: contextlib.AsyncExitStack,
 ) -> IndexResult:
     """Inner implementation of index_project with active span."""
     start = time.monotonic()
@@ -2027,7 +2033,7 @@ async def _index_project_inner(
     # 2. Embedding setup + model lock check (skipped in lightweight mode)
     embed: EmbedClient | None = None
     if settings.embeddings.enabled:
-        embed = EmbedClient(settings.embeddings, settings.redis)
+        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
 
     if full_reindex:
         logger.debug("Full reindex: deleting existing data for '{}'", project_name)
@@ -2158,16 +2164,19 @@ async def index_monorepo(
     with ``(project_name, current_1based, total)``.
     """
     with _tracer.start_as_current_span("index_monorepo"):
-        return await _index_monorepo_inner(
-            settings,
-            graph,
-            bus,
-            scope_projects=scope_projects,
-            full_reindex=full_reindex,
-            drain_timeout_s=drain_timeout_s,
-            on_progress=on_progress,
-            on_drain_progress=on_drain_progress,
-        )
+        # The other entry point -- same ownership, see index_project.
+        async with contextlib.AsyncExitStack() as stack:
+            return await _index_monorepo_inner(
+                settings,
+                graph,
+                bus,
+                scope_projects=scope_projects,
+                full_reindex=full_reindex,
+                drain_timeout_s=drain_timeout_s,
+                on_progress=on_progress,
+                on_drain_progress=on_drain_progress,
+                stack=stack,
+            )
 
 
 @dataclass
@@ -2248,6 +2257,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
+    stack: contextlib.AsyncExitStack,
 ) -> list[IndexResult]:
     """Inner implementation of index_monorepo.
 
@@ -2310,7 +2320,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     # --- Shared embedding resources (created once) ---
     embed: EmbedClient | None = None
     if settings.embeddings.enabled:
-        embed = EmbedClient(settings.embeddings, settings.redis)
+        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
         await _check_model_lock(
             graph,

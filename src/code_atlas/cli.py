@@ -587,13 +587,17 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         if settings.embeddings.enabled and settings.embeddings.dimension is None:
             from code_atlas.search.embeddings import EmbedClient as _EmbedClient
 
-            _probe = _EmbedClient(settings.embeddings, settings.redis)
-            try:
-                resolved_dim = await _probe.detect_dimension()
-            except Exception:
-                logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
-                settings.embeddings.enabled = False
-                resolved_dim = None
+            # A block, not the command's stack: the probe is used once and its redis
+            # pool should go with it rather than outlive the whole index run.
+            async with _EmbedClient(settings.embeddings, settings.redis) as _probe:
+                try:
+                    resolved_dim = await _probe.detect_dimension()
+                except Exception:
+                    logger.warning(
+                        "Embedding service unreachable — running in lightweight mode. Vector search disabled."
+                    )
+                    settings.embeddings.enabled = False
+                    resolved_dim = None
             if resolved_dim is not None:
                 settings.embeddings.dimension = resolved_dim
                 logger.debug("Auto-detected embedding dimension: {}", resolved_dim)
@@ -900,7 +904,10 @@ async def _run_search(
         project=derive_project_name(settings.project_root),
         root=str(settings.project_root),
     )
-    async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
+    async with (
+        connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends,
+        AsyncExitStack() as stack,
+    ):
         graph = backends.graph
 
         # Map CLI type names to SearchType lists
@@ -946,7 +953,7 @@ async def _run_search(
                 )
 
             if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
-                embed = EmbedClient(settings.embeddings, settings.redis)
+                embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
 
         results = await hybrid_search(
             graph=graph,

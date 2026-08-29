@@ -389,6 +389,13 @@ class DaemonManager:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
+        # The embed client, unlike the bus, IS ours -- start() constructed it, and it
+        # holds a redis pool through its rate limiter. Closed after the consumers stop
+        # so nothing is mid-embed, and cleared so a restart builds a fresh one.
+        if self._embed is not None:
+            await self._embed.close()
+            self._embed = None
+
         # The bus is deliberately not closed: it is the caller's, and closing it here
         # once meant a restart_daemon() left the MCP server holding a dead connection.
         logger.debug("DaemonManager stopped")
