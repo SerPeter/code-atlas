@@ -759,8 +759,7 @@ class TestMcpNoIndexFlag:
         assert result.exit_code == 0, result.output
         assert captured["auto_index"] is True
 
-    def test_the_flag_cannot_switch_indexing_back_on(self, monkeypatch):
-        """A config that deliberately disabled indexing wins. The flag only subtracts."""
+    def test_the_configured_value_applies_when_no_flag_is_given(self, monkeypatch):
         import code_atlas.cli as cli_mod
 
         captured = self._capture(monkeypatch)
@@ -771,3 +770,24 @@ class TestMcpNoIndexFlag:
         result = runner.invoke(app, ["mcp"])
         assert result.exit_code == 0, result.output
         assert captured["auto_index"] is False
+
+    def test_an_explicit_flag_overrides_the_configured_value(self, monkeypatch):
+        """--index wins over mcp.auto_index=false in atlas.toml or ATLAS_MCP__AUTO_INDEX.
+
+        The first version of this made the flag one-way -- it could disable indexing but
+        never re-enable it -- reasoning that a config which deliberately turned indexing
+        off should not be overridden. That is backwards: typing a flag is the more
+        explicit act of the two, and every other option on this command (--strict,
+        --host, --port, --transport) already resolves that way. An override you cannot
+        reach from the command line is not an override.
+        """
+        import code_atlas.cli as cli_mod
+
+        captured = self._capture(monkeypatch)
+        base = cli_mod._load_settings()
+        base.mcp.auto_index = False
+        monkeypatch.setattr(cli_mod, "_load_settings", lambda: base)
+
+        result = runner.invoke(app, ["mcp", "--index"])
+        assert result.exit_code == 0, result.output
+        assert captured["auto_index"] is True

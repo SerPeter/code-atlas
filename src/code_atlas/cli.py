@@ -451,13 +451,14 @@ def mcp(
     host: str = typer.Option(None, "--host", help="Bind address for HTTP transports (ignored for stdio)."),
     port: int = typer.Option(None, "--port", "-p", help="Bind port for HTTP transports (ignored for stdio)."),
     strict: bool = typer.Option(None, "--strict", help="Refuse to start if embedding model mismatch."),
-    no_index: bool = typer.Option(
-        False,
-        "--no-index",
-        help="Serve queries only: no file watcher, no pipeline, no startup catch-up. "
-        "For the second and later agent sessions sharing one worktree — indexing is "
-        "per-worktree, so exactly one indexer (a daemon, or one server without this "
-        "flag) must still cover that checkout.",
+    index_: bool = typer.Option(
+        None,
+        "--index/--no-index",
+        help="Whether this server also watches and indexes the checkout. Overrides "
+        "mcp.auto_index; omit to use it. --no-index serves queries only (no watcher, "
+        "no pipeline, no startup catch-up) — for the second and later agent sessions "
+        "sharing one worktree, since indexing is per-worktree. Exactly one indexer "
+        "must still cover that checkout.",
     ),
 ) -> None:
     """Start the MCP server for AI agent connections."""
@@ -472,9 +473,10 @@ def mcp(
     host = host or mcp_cfg.host
     port = port or mcp_cfg.port
     strict = strict if strict is not None else mcp_cfg.strict
-    # The flag can only switch indexing off, never force it on over a config that
-    # deliberately disabled it.
-    auto_index = mcp_cfg.auto_index and not no_index
+    # Same precedence as --strict directly above: a flag on the command line is an
+    # explicit act and wins over atlas.toml and the environment, in both directions.
+    # Omitting it defers to the configured value.
+    auto_index = index_ if index_ is not None else mcp_cfg.auto_index
 
     init_telemetry(
         settings.observability,
