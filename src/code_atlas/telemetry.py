@@ -207,6 +207,8 @@ class _Metrics:
     events_consumed: Any = field(default_factory=_NoOpCounter)
     watcher_events: Any = field(default_factory=_NoOpCounter)
     embeddings_total: Any = field(default_factory=_NoOpCounter)
+    web_requests: Any = field(default_factory=_NoOpCounter)
+    web_latency: Any = field(default_factory=_NoOpHistogram)
 
 
 _metrics = _Metrics()
@@ -222,17 +224,37 @@ def get_metrics() -> _Metrics:
 # ---------------------------------------------------------------------------
 
 
-def init_telemetry(settings: ObservabilitySettings, *, role: str = "", project: str = "") -> None:
+def init_telemetry(
+    settings: ObservabilitySettings,
+    *,
+    role: str = "",
+    project: str = "",
+    root: str = "",
+    indexing: bool | None = None,
+) -> None:
     """Configure OTel providers and instruments based on *settings*.
 
     Safe to call multiple times — only the first call has effect.
     When OTel packages are not installed this is a no-op.
 
-    *role* names which entry point this process is (``mcp``, ``daemon``, ``index``,
-    ``watch``, ``search``) and *project* which repo it is indexing. Both land on the
-    resource, so one collector receiving several checkouts and a handful of
-    concurrently-running MCP sessions can still tell the signals apart — which is the
-    normal shape of this deployment, not an edge case.
+    One collector serves every atlas process on the machine, and they overlap in three
+    separate ways. Each needs its own discriminator, because none of the others is
+    sufficient on its own:
+
+    - **Several repos.** ``atlas.project`` separates them.
+    - **Several worktrees of one repo.** ``atlas.project`` is derived from the directory
+      name, so two worktrees whose basename matches collide. ``atlas.root`` carries the
+      absolute path and cannot.
+    - **Several processes in one worktree** — the shape this deployment is built around,
+      an indexer plus one MCP server per agent session. ``service.instance.id`` is
+      host:pid. It shares its prefix with the indexer lease owner (host:pid:nonce), so
+      "which process holds the lease" resolves to a process you have signals for.
+
+    *role* names the entry point (``mcp``, ``daemon``, ``index``, ``watch``, ``search``,
+    ``web``). *indexing* is separate from it on purpose: an MCP server started without
+    ``--no-index`` runs the watcher and pipeline itself, so role alone cannot answer
+    "who is actually indexing this checkout" — the question you ask first when nothing
+    is being indexed, or when two things are.
     """
     global _initialized, _enabled, _metrics  # noqa: PLW0603
 
@@ -260,12 +282,17 @@ def init_telemetry(settings: ObservabilitySettings, *, role: str = "", project: 
         # server per agent session per worktree. Without an instance id their signals
         # merge into one indistinguishable stream.
         "service.instance.id": f"{socket.gethostname()}:{os.getpid()}",
+        "host.name": socket.gethostname(),
         "process.pid": os.getpid(),
     }
     if role:
         attributes["atlas.role"] = role
     if project:
         attributes["atlas.project"] = project
+    if root:
+        attributes["atlas.root"] = root
+    if indexing is not None:
+        attributes["atlas.indexing"] = "on" if indexing else "off"
     resource = Resource.create(attributes)
 
     # Tracer provider
@@ -315,6 +342,10 @@ def init_telemetry(settings: ObservabilitySettings, *, role: str = "", project: 
         ),
         embeddings_total=meter.create_counter(
             "atlas_embeddings_total", description="Entity embeddings, by where the vector came from"
+        ),
+        web_requests=meter.create_counter("atlas_web_requests", description="Web UI requests"),
+        web_latency=meter.create_histogram(
+            "atlas_web_latency_seconds", description="Web UI request wall time", unit="s"
         ),
     )
 

@@ -393,9 +393,19 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
 
     from code_atlas.backends import create_graph_client
     from code_atlas.settings import derive_project_name
+    from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = _load_settings()
     project_name = project or derive_project_name(settings.project_root)
+    # The UI was the one entry point that never initialised telemetry, so it produced
+    # no signals at all even with everything else exporting.
+    init_telemetry(
+        settings.observability,
+        role="web",
+        project=project_name,
+        root=str(settings.project_root),
+        indexing=False,
+    )
     graph = await create_graph_client(settings)
     try:
         from code_atlas.server.web.app import create_app
@@ -412,6 +422,7 @@ async def _run_ui(*, host: str, port: int, project: str, debug: bool) -> None:
         await uvicorn.Server(config).serve()
     finally:
         await graph.close()
+        shutdown_telemetry()
 
 
 @app.command()
@@ -445,7 +456,13 @@ def mcp(
     # deliberately disabled it.
     auto_index = mcp_cfg.auto_index and not no_index
 
-    init_telemetry(settings.observability, role="mcp", project=derive_project_name(settings.project_root))
+    init_telemetry(
+        settings.observability,
+        role="mcp",
+        project=derive_project_name(settings.project_root),
+        root=str(settings.project_root),
+        indexing=auto_index,
+    )
     try:
         server = create_mcp_server(settings, strict=strict, host=host, port=port, auto_index=auto_index)
         logger.info(
@@ -488,7 +505,13 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     settings = AtlasSettings(project_root=project_root)
     if no_embed:
         settings.embeddings.enabled = False
-    init_telemetry(settings.observability, role="index", project=derive_project_name(settings.project_root))
+    init_telemetry(
+        settings.observability,
+        role="index",
+        project=derive_project_name(settings.project_root),
+        root=str(settings.project_root),
+        indexing=True,
+    )
 
     project_name = derive_project_name(settings.project_root)
 
@@ -780,7 +803,12 @@ async def _run_search(  # noqa: PLR0912, PLR0915
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
     settings = _load_settings()
-    init_telemetry(settings.observability, role="search", project=derive_project_name(settings.project_root))
+    init_telemetry(
+        settings.observability,
+        role="search",
+        project=derive_project_name(settings.project_root),
+        root=str(settings.project_root),
+    )
     graph = await create_graph_client(settings)
     try:
         await graph.ping()
@@ -1218,7 +1246,13 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 
     project_root, _auto_scope = _resolve_project_root(path, no_git_check=no_git_check)
     settings = AtlasSettings(project_root=project_root)
-    init_telemetry(settings.observability, role="watch", project=derive_project_name(settings.project_root))
+    init_telemetry(
+        settings.observability,
+        role="watch",
+        project=derive_project_name(settings.project_root),
+        root=str(settings.project_root),
+        indexing=True,
+    )
     if debounce is not None:
         settings.watcher.debounce_s = debounce
     if max_wait is not None:
@@ -1266,7 +1300,13 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
     settings = _load_settings()
     if no_embed:
         settings.embeddings.enabled = False
-    init_telemetry(settings.observability, role="daemon", project=derive_project_name(settings.project_root))
+    init_telemetry(
+        settings.observability,
+        role="daemon",
+        project=derive_project_name(settings.project_root),
+        root=str(settings.project_root),
+        indexing=True,
+    )
 
     graph = await create_graph_client(settings)
     try:

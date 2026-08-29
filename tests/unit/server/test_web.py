@@ -206,6 +206,94 @@ def _client(graph: FakeGraph, project: str) -> TestClient:
     return TestClient(app=create_app(cast("GraphBackend", graph), project))
 
 
+class TestWebTelemetry:
+    """The UI was the one entry point producing no signals at all."""
+
+    @staticmethod
+    def _tracer(monkeypatch):
+        import code_atlas.server.web.app as app_mod
+
+        class _Span:
+            def __init__(self, name, attributes=None):
+                self.name = name
+                self.attributes = dict(attributes or {})
+
+            def set_attribute(self, key, value):
+                self.attributes[key] = value
+
+            def set_status(self, *_a, **_kw):
+                pass
+
+            def record_exception(self, *_a, **_kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                pass
+
+        class _Tracer:
+            def __init__(self):
+                self.spans = []
+
+            def start_as_current_span(self, name, **kwargs):
+                span = _Span(name, kwargs.get("attributes"))
+                self.spans.append(span)
+                return span
+
+        tracer = _Tracer()
+        monkeypatch.setattr(app_mod, "_tracer", tracer)
+        return tracer
+
+    def test_a_request_is_spanned_by_route_not_by_path(self, monkeypatch):
+        """`/entity/abc` and `/entity/def` are one route. Naming spans and metric series
+        after the raw path gives every entity its own series -- unbounded cardinality is
+        how a metrics database is taken down by its own instrumentation."""
+        tracer = self._tracer(monkeypatch)
+        client = _client(FakeGraph(), "demo")
+
+        client.get("/")
+
+        assert tracer.spans, "no span for a served request"
+        span = tracer.spans[0]
+        assert span.name == "web GET /"
+        assert span.attributes["http.route"] == "/"
+        assert span.attributes["http.response.status_code"] == 200
+
+    def test_an_unrouted_path_is_not_measured_at_all(self, monkeypatch):
+        """Litestar applies middleware *inside* routing, so a 404 never reaches this one.
+
+        Pinned because it cuts both ways and the reasoning is easy to lose: a 404 sweep
+        cannot mint one metric series per probed URL, but the request counter therefore
+        means "requests that matched a route", not "requests received". If a later
+        Litestar version moves middleware outside routing, this test says so.
+        """
+        tracer = self._tracer(monkeypatch)
+        client = _client(FakeGraph(), "demo")
+
+        assert client.get("/no-such-page-9f3a").status_code == 404
+        assert client.get("/no-such-page-b21c").status_code == 404
+
+        assert tracer.spans == []
+
+    def test_the_metric_records_method_route_and_status(self, monkeypatch):
+        import code_atlas.telemetry as tel
+
+        self._tracer(monkeypatch)
+        recorded: list[tuple] = []
+        monkeypatch.setattr(
+            tel._metrics,
+            "web_requests",
+            type("C", (), {"add": lambda _s, n, a=None: recorded.append((n, a))})(),
+        )
+        client = _client(FakeGraph(), "demo")
+
+        client.get("/")
+
+        assert recorded == [(1, {"method": "GET", "route": "/", "status": "200"})]
+
+
 class TestProjectViewService:
     """The service owns the use case and knows nothing about HTTP."""
 

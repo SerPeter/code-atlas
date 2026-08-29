@@ -7,11 +7,13 @@ below this module reaches out to construct its own dependencies.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
 
 from litestar import Litestar, Request
 from litestar.di import NamedDependency, Provide
+from litestar.middleware import AbstractMiddleware
 from litestar.static_files import create_static_files_router
 from litestar.template.config import TemplateConfig
 
@@ -33,11 +35,79 @@ from code_atlas.server.web.services import (
     ProjectViewService,
     SearchViewService,
 )
+from code_atlas.telemetry import get_metrics, get_tracer, mark_span_error
 
 if TYPE_CHECKING:
     from code_atlas.graph.protocol import GraphBackend
     from code_atlas.search.engine import EmbedOne
     from code_atlas.settings import SearchSettings
+
+_tracer = get_tracer(__name__)
+
+
+class TelemetryMiddleware(AbstractMiddleware):
+    """A span and a latency sample per request.
+
+    Identified by Litestar's route template rather than the request path. `/entity/abc123`
+    and `/entity/def456` are the same route, and using the raw path would make every
+    entity view its own metric series -- a metric with unbounded cardinality is how a
+    time-series database gets taken down by its own instrumentation. Traces keep the
+    concrete path, which is what traces are for.
+
+    Litestar has already resolved `scope["route_handler"]` by the time middleware runs,
+    so the template is available before the request is served, not only after.
+
+    A consequence of that ordering, verified rather than assumed: an unrouted path
+    never reaches this middleware at all, so 404s are not counted. That is the right
+    trade here -- it means a 404 sweep cannot mint one metric series per probed URL --
+    but the request counter is "requests that matched a route", not "requests received".
+    """
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "")
+        route = _route_template(scope)
+        started = time.perf_counter()
+        status = 0
+
+        async def send_wrapper(message: Any) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        with _tracer.start_as_current_span(
+            f"web {method} {route}",
+            attributes={"http.request.method": method, "http.route": route, "url.path": scope.get("path", "")},
+        ) as span:
+            try:
+                await self.app(scope, receive, send_wrapper)
+            except Exception as exc:
+                mark_span_error(span, exc)
+                status = 500
+                raise
+            finally:
+                elapsed = time.perf_counter() - started
+                span.set_attribute("http.response.status_code", status)
+                attrs = {"method": method, "route": route, "status": str(status)}
+                get_metrics().web_requests.add(1, attrs)
+                get_metrics().web_latency.record(elapsed, {"method": method, "route": route})
+
+
+def _route_template(scope: Any) -> str:
+    """The registered path pattern for this request, or a stable placeholder.
+
+    ``paths`` is a set; sorted() so a handler registered under two paths does not
+    alternate between them from request to request and split its own series. The
+    placeholder covers a handler that exposes no ``paths`` -- not an unmatched request,
+    which never gets this far.
+    """
+    handler = scope.get("route_handler")
+    paths = sorted(getattr(handler, "paths", ()) or ())
+    return paths[0] if paths else "unmatched"
 
 
 def _static_version() -> str:
@@ -143,6 +213,7 @@ def create_app(
         # Litestar's own parameter is `TemplateConfig[EngineType] | None`, so the
         # inferred `TemplateConfig[JinjaTemplateEngine]` reads as a variance error at
         # the call site. Naming the wider type is the fix; the runtime value is the same.
+        middleware=[TelemetryMiddleware],
         template_config=template_config,
         debug=debug,
     )
