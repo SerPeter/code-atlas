@@ -148,7 +148,112 @@ services:
       retries: 10
       start_period: 30s
 
+  # ---------------------------------------------------------------------------
+  # Telemetry — Victoria stack + OTel Collector + Grafana
+  # Optional: docker compose --profile telemetry up -d
+  #
+  # code-atlas exports to ONE OTLP endpoint (observability.endpoint), because that is
+  # what an OTLP SDK does; Victoria keeps metrics, logs and traces in three separate
+  # services. The collector is what bridges the two — see configs/otel-collector.yaml.
+  #
+  # Turn it on with:
+  #   ATLAS_OBSERVABILITY__ENABLED=true
+  #   uv sync --extra otel          # the OTel packages are an optional extra
+  #
+  # Ports: Grafana 3000, VictoriaMetrics 8428, VictoriaLogs 9428,
+  #        VictoriaTraces 10428, OTLP gRPC 4317, OTLP HTTP 4318.
+  # 3000 and 8428 are popular; if another local stack already owns them, change the
+  # host side of the mapping here rather than in the collector config.
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    profiles: [telemetry]
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector.yaml"]
+    ports:
+      - "4317:4317" # OTLP gRPC — what telemetry.py's default endpoint points at
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ./configs/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    depends_on:
+      - victoria-metrics
+      - victoria-logs
+      - victoria-traces
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  victoria-metrics:
+    profiles: [telemetry]
+    image: victoriametrics/victoria-metrics:v1.101.0
+    restart: unless-stopped
+    command:
+      - --storageDataPath=/storage
+      - --retentionPeriod=3
+      - --httpListenAddr=:8428
+      # OTLP is not on by default; without this the collector's metrics pipeline 404s.
+      - --opentelemetry.usePrometheusNaming
+    ports:
+      - "8428:8428"
+    volumes:
+      - victoria-metrics-data:/storage
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8428/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  victoria-logs:
+    profiles: [telemetry]
+    image: victoriametrics/victoria-logs:v1.50.0
+    restart: unless-stopped
+    command:
+      - --storageDataPath=/vlogs
+      - --httpListenAddr=:9428
+      - --retentionPeriod=30d
+    ports:
+      - "9428:9428"
+    volumes:
+      - victoria-logs-data:/vlogs
+
+  victoria-traces:
+    profiles: [telemetry]
+    image: victoriametrics/victoria-traces:v0.9.0
+    restart: unless-stopped
+    command:
+      - --storageDataPath=/vtraces
+      - --httpListenAddr=:10428
+      - --retentionPeriod=7d
+    ports:
+      - "10428:10428"
+    volumes:
+      - victoria-traces-data:/vtraces
+
+  grafana:
+    profiles: [telemetry]
+    image: grafana/grafana:11.1.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # VictoriaLogs needs its own datasource plugin; Prometheus and Jaeger are built in.
+      GF_INSTALL_PLUGINS: victoriametrics-logs-datasource
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - victoria-metrics
+      - victoria-logs
+      - victoria-traces
+
 volumes:
   memgraph-data:
   valkey-data:
   tei-models:
+  victoria-metrics-data:
+  victoria-logs-data:
+  victoria-traces-data:
+  grafana-data:

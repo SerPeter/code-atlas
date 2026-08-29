@@ -1,0 +1,55 @@
+# OpenTelemetry Collector — one OTLP endpoint in, three Victoria backends out.
+#
+# code-atlas ships a single `observability.endpoint`, because an OTLP SDK exports
+# every signal to one address. Victoria stores metrics, logs and traces in three
+# separate services on three ports, so something has to fan out. That is this file's
+# entire job — there is no processing here beyond batching.
+#
+# Started by: docker compose --profile telemetry up -d
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bounded queues, so a backend that stalls slows the collector instead of growing
+  # until the container is OOM-killed and takes the buffered signals with it.
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+exporters:
+  # The otlphttp exporter appends /v1/{metrics,logs,traces} to each endpoint, which is
+  # why these paths look truncated — they are the prefix, not the full URL.
+  otlphttp/metrics:
+    endpoint: http://victoria-metrics:8428/opentelemetry
+  otlphttp/logs:
+    endpoint: http://victoria-logs:9428/insert/opentelemetry
+  otlphttp/traces:
+    endpoint: http://victoria-traces:10428/insert/opentelemetry
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/logs]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/traces]
