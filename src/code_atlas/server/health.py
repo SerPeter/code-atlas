@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 from dotenv import find_dotenv
 
-from code_atlas.backends import create_event_bus, create_graph_client
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.indexing.orchestrator import StalenessChecker
@@ -439,10 +438,10 @@ _SKIPPED_DETAIL = "Skipped — Memgraph unreachable"
 async def run_health_checks(
     settings: AtlasSettings,
     *,
-    graph: GraphClient | SqliteGraphClient | None = None,
+    graph: GraphClient | SqliteGraphClient,
+    bus: EventBus | SqliteEventBus,
     embed: EmbedClient | None = None,
     daemon: DaemonManager | None = None,
-    bus: EventBus | SqliteEventBus | None = None,
     dotenv_path: str = "",
 ) -> HealthReport:
     """Run all health checks and return an aggregated report.
@@ -450,81 +449,68 @@ async def run_health_checks(
     Independent checks (config, memgraph, embeddings, valkey) run concurrently.
     Dependent checks (schema, index) only run if the graph backend is reachable.
 
-    When called from CLI, *graph*/*embed*/*bus* are ``None`` — temporary clients
-    are created (via the same backend-selection factories used everywhere else)
-    and closed.  MCP passes existing clients from AppContext; if *bus* isn't
-    passed explicitly but *daemon* is, the daemon's own live bus is used instead
-    of opening a redundant connection.
+    *graph* and *bus* are required and never created here. A health check that opens
+    its own connections is answering a slightly different question than the one asked --
+    "can a fresh connection reach these services", not "are the connections this process
+    is using healthy" -- and it used to track which ones it owned with a pair of booleans
+    and a finally. The caller holds them: the CLI from a `use_backends` scope, the MCP
+    server from its AppContext.
+
+    *embed* stays optional because it is genuinely optional (lightweight mode has none)
+    and needs no closing.
     """
     t0 = time.monotonic()
 
-    # Create temporary clients if not provided
-    own_graph = graph is None
-    if own_graph:
-        graph = await create_graph_client(settings)
     if embed is None and settings.embeddings.enabled:
         # No redis_settings on purpose: a health probe must answer "is the provider
         # reachable" immediately. Handing it the rate limiter would let a drained
         # bucket block the check and report the provider down when it is merely busy.
         embed = EmbedClient(settings.embeddings)
-    if bus is None and daemon is not None:
-        bus = daemon.bus
-    own_bus = bus is None
-    if own_bus:
-        bus = await create_event_bus(settings)
 
-    try:
-        # Mode indicator
-        mode_label = "full" if settings.embeddings.enabled else "lightweight (no embeddings)"
-        mode_res = CheckResult("mode", CheckStatus.OK, mode_label)
+    # Mode indicator
+    mode_label = "full" if settings.embeddings.enabled else "lightweight (no embeddings)"
+    mode_res = CheckResult("mode", CheckStatus.OK, mode_label)
 
-        # Phase 1: independent checks
-        config_res, mg_res, embed_res, valkey_res = await asyncio.gather(
-            check_config(settings, dotenv_path=dotenv_path),
-            check_memgraph(graph, settings.memgraph),
-            check_embeddings(embed, settings.embeddings),
-            check_valkey(bus, settings.redis),
+    # Phase 1: independent checks
+    config_res, mg_res, embed_res, valkey_res = await asyncio.gather(
+        check_config(settings, dotenv_path=dotenv_path),
+        check_memgraph(graph, settings.memgraph),
+        check_embeddings(embed, settings.embeddings),
+        check_valkey(bus, settings.redis),
+    )
+
+    results = [mode_res, config_res, mg_res, embed_res, valkey_res]
+
+    lease_res = await check_indexer_lease(bus)
+    if lease_res is not None:
+        results.append(lease_res)
+
+    # Phase 2: Memgraph-dependent checks
+    if mg_res.status == CheckStatus.FAIL:
+        results.append(CheckResult("schema", CheckStatus.FAIL, _SKIPPED_DETAIL))
+        results.append(CheckResult("embedding_model", CheckStatus.FAIL, _SKIPPED_DETAIL))
+        results.append(CheckResult("index", CheckStatus.FAIL, _SKIPPED_DETAIL))
+    else:
+        assert graph is not None
+        # check_schema/check_embedding_model/check_index stay declared as GraphClient-only
+        # (same "deferred retyping" convention as the ~10 construction call sites elsewhere) —
+        # they only call methods both backends implement, so the SqliteGraphClient case is safe.
+        schema_res, model_res, index_res = await asyncio.gather(
+            check_schema(graph),  # type: ignore[invalid-argument-type]
+            check_embedding_model(
+                graph,  # type: ignore[invalid-argument-type]
+                settings.embeddings,
+                derive_project_name(settings.project_root),
+            ),
+            check_index(graph, settings),  # type: ignore[invalid-argument-type]
         )
+        results.append(schema_res)
+        results.append(model_res)
+        results.append(index_res)
 
-        results = [mode_res, config_res, mg_res, embed_res, valkey_res]
-
-        lease_res = await check_indexer_lease(bus)
-        if lease_res is not None:
-            results.append(lease_res)
-
-        # Phase 2: Memgraph-dependent checks
-        if mg_res.status == CheckStatus.FAIL:
-            results.append(CheckResult("schema", CheckStatus.FAIL, _SKIPPED_DETAIL))
-            results.append(CheckResult("embedding_model", CheckStatus.FAIL, _SKIPPED_DETAIL))
-            results.append(CheckResult("index", CheckStatus.FAIL, _SKIPPED_DETAIL))
-        else:
-            assert graph is not None
-            # check_schema/check_embedding_model/check_index stay declared as GraphClient-only
-            # (same "deferred retyping" convention as the ~10 construction call sites elsewhere) —
-            # they only call methods both backends implement, so the SqliteGraphClient case is safe.
-            schema_res, model_res, index_res = await asyncio.gather(
-                check_schema(graph),  # type: ignore[invalid-argument-type]
-                check_embedding_model(
-                    graph,  # type: ignore[invalid-argument-type]
-                    settings.embeddings,
-                    derive_project_name(settings.project_root),
-                ),
-                check_index(graph, settings),  # type: ignore[invalid-argument-type]
-            )
-            results.append(schema_res)
-            results.append(model_res)
-            results.append(index_res)
-
-        # In-process pipeline liveness — only when a live DaemonManager is passed (MCP)
-        if daemon is not None:
-            results.append(check_pipeline(daemon))
-    finally:
-        if own_graph:
-            assert graph is not None
-            await graph.close()
-        if own_bus:
-            assert bus is not None
-            await bus.close()
+    # In-process pipeline liveness — only when a live DaemonManager is passed (MCP)
+    if daemon is not None:
+        results.append(check_pipeline(daemon))
 
     elapsed = (time.monotonic() - t0) * 1000
     return HealthReport(checks=results, elapsed_ms=elapsed)

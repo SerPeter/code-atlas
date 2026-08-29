@@ -1875,7 +1875,7 @@ def _register_info_tools(mcp: FastMCP) -> None:
         # Exempted from the first-index gate — must stay reachable so a blocked
         # caller can see the pipeline state that's blocking the other tools.
         app = await _ensure_root(ctx, require_index=False)
-        report = await run_health_checks(app.settings, graph=app.graph, embed=app.embed, daemon=app.daemon)
+        report = await run_health_checks(app.settings, graph=app.graph, bus=app.bus, embed=app.embed, daemon=app.daemon)
         return {
             "ok": report.ok,
             "degraded": report.degraded,

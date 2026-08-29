@@ -1252,19 +1252,25 @@ def _print_dream_report(report: Any) -> None:
 
 
 async def _run_health() -> None:
+    from code_atlas.backends import use_backends
     from code_atlas.server.health import run_health_checks
 
     settings = _load_settings()
-    report = await run_health_checks(settings, dotenv_path=_dotenv_path)
+    async with use_backends(settings) as backends:
+        assert backends.bus is not None
+        report = await run_health_checks(settings, graph=backends.graph, bus=backends.bus, dotenv_path=_dotenv_path)
     _print_report(report, detailed=False)
     raise typer.Exit(code=0 if report.ok else 1)
 
 
 async def _run_doctor() -> None:
+    from code_atlas.backends import use_backends
     from code_atlas.server.health import run_health_checks
 
     settings = _load_settings()
-    report = await run_health_checks(settings, dotenv_path=_dotenv_path)
+    async with use_backends(settings) as backends:
+        assert backends.bus is not None
+        report = await run_health_checks(settings, graph=backends.graph, bus=backends.bus, dotenv_path=_dotenv_path)
     _print_report(report, detailed=True)
     raise typer.Exit(code=0 if report.ok else 1)
 

@@ -577,9 +577,17 @@ async def test_no_pipeline_check_without_daemon(tmp_path):
     assert "pipeline" not in {c.name for c in report.checks}
 
 
-async def test_run_health_checks_uses_daemon_bus_when_not_explicitly_passed(tmp_path):
-    """No explicit *bus* is passed, but *daemon* has a live one — that live bus must be
-    probed (and left open) instead of opening a redundant new connection.
+async def test_the_daemon_is_only_consulted_for_pipeline_liveness(tmp_path):
+    """The daemon no longer doubles as a source of connections.
+
+    run_health_checks used to fall back to `daemon.bus` when no bus was passed, which
+    was the service-locator half of its design: a function reaching for a dependency
+    through an unrelated collaborator. It also could not work when indexing was off,
+    since `daemon.bus` is None then -- exactly when someone is most likely to be asking
+    what is wrong.
+
+    The caller passes the bus it holds; the daemon is consulted for one thing, which is
+    whether its pipeline tasks are alive.
     """
     (tmp_path / ".git").mkdir()
     settings = AtlasSettings(project_root=tmp_path)
@@ -590,23 +598,34 @@ async def test_run_health_checks_uses_daemon_bus_when_not_explicitly_passed(tmp_
     embed = AsyncMock()
     embed.health_check = AsyncMock(return_value=True)
 
-    daemon_bus = AsyncMock()
-    daemon_bus.read_indexer_lease.return_value = None  # no foreign indexer
-    daemon_bus.ping = AsyncMock(return_value=True)
-    daemon = _FakeDaemon({"tasks_running": 1, "tasks_total": 1, "crash_counts": {}, "last_crash": {}}, bus=daemon_bus)
+    bus = AsyncMock()
+    bus.read_indexer_lease.return_value = None  # no foreign indexer
+    bus.ping = AsyncMock(return_value=True)
 
-    report = await run_health_checks(settings, graph=graph, embed=embed, daemon=daemon)  # type: ignore[arg-type]
+    daemon_bus = AsyncMock()
+    daemon = _FakeDaemon({"tasks_running": 1, "tasks_total": 1}, bus=daemon_bus)
+
+    report = await run_health_checks(settings, graph=graph, bus=bus, embed=embed, daemon=daemon)  # type: ignore[arg-type]
 
     by_name = {c.name: c for c in report.checks}
     assert by_name["valkey"].status == CheckStatus.OK
-    daemon_bus.ping.assert_awaited_once()
+    bus.ping.assert_awaited_once()  # the passed bus is the one probed
+    daemon_bus.ping.assert_not_awaited()
+    assert by_name["pipeline"].status == CheckStatus.OK
     daemon_bus.close.assert_not_called()  # not owned by run_health_checks — must not be closed
 
 
-async def test_run_health_checks_builds_own_bus_when_none_available(tmp_path):
-    """Neither *bus* nor a daemon-provided one is available — run_health_checks falls
-    back to the same ``create_event_bus`` factory used everywhere else, and closes
-    what it opened.
+async def test_run_health_checks_closes_nothing_it_was_given(tmp_path):
+    """The inverse of what this test used to assert.
+
+    It previously checked that run_health_checks built its own bus and closed it. That
+    behaviour is gone: creating connections to report on connections answers a subtly
+    different question -- "can a fresh connection reach these services" rather than "are
+    the connections this process is using healthy" -- and it needed a pair of ownership
+    booleans and a finally to avoid closing a caller's client by accident.
+
+    Now the caller passes both and keeps them. A health check that closed the graph the
+    MCP session is serving from would end the session that asked how it was doing.
     """
     (tmp_path / ".git").mkdir()
     settings = AtlasSettings(project_root=tmp_path)
@@ -617,13 +636,12 @@ async def test_run_health_checks_builds_own_bus_when_none_available(tmp_path):
     embed = AsyncMock()
     embed.health_check = AsyncMock(return_value=True)
 
-    own_bus = AsyncMock()
-    own_bus.ping = AsyncMock(return_value=True)
+    bus = AsyncMock()
+    bus.ping = AsyncMock(return_value=True)
 
-    with patch("code_atlas.server.health.create_event_bus", AsyncMock(return_value=own_bus)) as mock_factory:
-        report = await run_health_checks(settings, graph=graph, embed=embed)
+    report = await run_health_checks(settings, graph=graph, bus=bus, embed=embed)
 
-    mock_factory.assert_awaited_once_with(settings)
     by_name = {c.name: c for c in report.checks}
     assert by_name["valkey"].status == CheckStatus.OK
-    own_bus.close.assert_awaited_once()  # owned by run_health_checks — must be closed
+    graph.close.assert_not_awaited()
+    bus.close.assert_not_awaited()

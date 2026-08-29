@@ -96,6 +96,7 @@ import asyncio  # noqa: E402
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
 
+from code_atlas.events import EventBus  # noqa: E402
 from code_atlas.graph.client import GraphClient  # noqa: E402
 from code_atlas.search.embeddings import EmbedClient  # noqa: E402
 from code_atlas.search.engine import SearchType, expand_context, hybrid_search  # noqa: E402
@@ -355,6 +356,7 @@ def _parse_args() -> tuple[int, bool, bool]:
 def _build_queries(
     graph: GraphClient,
     embed: EmbedClient | None,
+    bus: EventBus,
     settings: AtlasSettings,
     sample_uid: str,
     sample_vector: list[float] | None,
@@ -436,7 +438,9 @@ def _build_queries(
     # --- Status tools ---
     queries.append(QuerySpec("index_status", lambda: _index_status(graph), "status"))
     queries.append(QuerySpec("list_projects", lambda: _list_projects(graph), "status"))
-    queries.append(QuerySpec("health_check", lambda: run_health_checks(settings, graph=graph, embed=embed), "status"))
+    queries.append(
+        QuerySpec("health_check", lambda: run_health_checks(settings, graph=graph, bus=bus, embed=embed), "status")
+    )
 
     return queries
 
@@ -501,6 +505,9 @@ async def main() -> None:
     print()
 
     graph = GraphClient(settings)
+    # health_check needs a bus now that it no longer builds one; this script owns it and
+    # closes it alongside the graph.
+    bus = EventBus(settings.redis)
     embed: EmbedClient | None = None
     if use_vector and settings.embeddings.enabled:
         embed = EmbedClient(settings.embeddings)
@@ -523,7 +530,7 @@ async def main() -> None:
         if embed is not None:
             sample_vector = await embed.embed_one("parse file")
 
-        queries = _build_queries(graph, embed, settings, sample_uid, sample_vector)
+        queries = _build_queries(graph, embed, bus, settings, sample_uid, sample_vector)
 
         if warmup:
             print("Warmup pass...")
@@ -540,6 +547,7 @@ async def main() -> None:
 
     finally:
         await graph.close()
+        await bus.close()
 
 
 if __name__ == "__main__":
