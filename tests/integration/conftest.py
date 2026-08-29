@@ -159,6 +159,11 @@ async def tei_graph_client(tei_settings) -> AsyncIterator[GraphClient]:
     try:
         await client.ping()
     except Exception:
+        # Close before skipping: a bare skip here abandons a live AsyncBoltDriver, and
+        # neo4j warns about it whenever the GC eventually notices -- blaming whichever
+        # unrelated test happens to be running. That mis-attribution is what turned five
+        # integration tests red once warnings became errors.
+        await client.close()
         pytest.skip("Memgraph not available")
 
     await _assert_disposable_db(client, tei_settings.memgraph.host, tei_settings.memgraph.port)
@@ -185,6 +190,9 @@ async def tei_event_bus(tei_settings) -> AsyncIterator:
     try:
         await bus.ping()
     except Exception:
+        # Close before skipping -- see the graph_client fixture; an abandoned redis
+        # Connection produces the same misdirected ResourceWarning.
+        await bus.close()
         pytest.skip("Valkey not available")
     yield bus
     await bus.close()
