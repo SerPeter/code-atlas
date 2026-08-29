@@ -873,7 +873,7 @@ async def _watch_after_index(settings: Any, graph: Any, bus: Any, lease_owner: s
         await daemon.stop()
 
 
-async def _run_search(  # noqa: PLR0912, PLR0915
+async def _run_search(
     query: str,
     type_: str,
     scope: str | None,
@@ -884,7 +884,7 @@ async def _run_search(  # noqa: PLR0912, PLR0915
     exclude_generated: bool | None = None,
 ) -> None:
     """Async implementation of the ``atlas search`` command."""
-    from code_atlas.backends import create_graph_client, graph_backend_label
+    from code_atlas.backends import connected
     from code_atlas.indexing.orchestrator import StalenessChecker
     from code_atlas.search.embeddings import EmbedClient
     from code_atlas.search.engine import SearchType, hybrid_search
@@ -898,61 +898,54 @@ async def _run_search(  # noqa: PLR0912, PLR0915
         project=derive_project_name(settings.project_root),
         root=str(settings.project_root),
     )
-    graph = await create_graph_client(settings)
-    try:
-        await graph.ping()
-    except Exception as exc:
-        logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
-        raise typer.Exit(code=1) from exc
+    async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
+        graph = backends.graph
 
-    # Map CLI type names to SearchType lists
-    type_map: dict[str, list[SearchType] | None] = {
-        "hybrid": None,  # all channels
-        "graph": [SearchType.GRAPH],
-        "vector": [SearchType.VECTOR],
-        "bm25": [SearchType.BM25],
-    }
-    search_types = type_map.get(type_)
-    if type_ not in type_map:
-        logger.error("Unknown search type '{}' — use hybrid, graph, vector, or bm25", type_)
-        await graph.close()
-        raise typer.Exit(code=1)
+        # Map CLI type names to SearchType lists
+        type_map: dict[str, list[SearchType] | None] = {
+            "hybrid": None,  # all channels
+            "graph": [SearchType.GRAPH],
+            "vector": [SearchType.VECTOR],
+            "bm25": [SearchType.BM25],
+        }
+        search_types = type_map.get(type_)
+        if type_ not in type_map:
+            logger.error("Unknown search type '{}' — use hybrid, graph, vector, or bm25", type_)
+            raise typer.Exit(code=1)
 
-    # Check embeddings disabled — error on explicit vector search
-    if not settings.embeddings.enabled and search_types and SearchType.VECTOR in search_types:
-        logger.error("Vector search unavailable — embeddings are disabled")
-        await graph.close()
-        raise typer.Exit(code=1)
+        # Check embeddings disabled — error on explicit vector search
+        if not settings.embeddings.enabled and search_types and SearchType.VECTOR in search_types:
+            logger.error("Vector search unavailable — embeddings are disabled")
+            raise typer.Exit(code=1)
 
-    # Check model lock — warn and disable vector if mismatch
-    embed: EmbedClient | None = None
-    if settings.embeddings.enabled:
-        # Per project: the database default belongs to whichever project indexed
-        # last, and comparing against it disabled vector search for all the others
-        # (ATL-135).
-        from code_atlas.settings import derive_project_name
+        # Check model lock — warn and disable vector if mismatch
+        embed: EmbedClient | None = None
+        if settings.embeddings.enabled:
+            # Per project: the database default belongs to whichever project indexed
+            # last, and comparing against it disabled vector search for all the others
+            # (ATL-135).
+            from code_atlas.settings import derive_project_name
 
-        stored_model = await graph.get_project_embedding_model(derive_project_name(settings.project_root))
-        model_mismatch = stored_model is not None and stored_model != settings.embeddings.model
-        if model_mismatch:
-            if search_types and SearchType.VECTOR in search_types:
-                logger.error(
-                    "Cannot use vector search: model mismatch (stored='{}', current='{}'). Run 'atlas index --full'.",
+            stored_model = await graph.get_project_embedding_model(derive_project_name(settings.project_root))
+            model_mismatch = stored_model is not None and stored_model != settings.embeddings.model
+            if model_mismatch:
+                if search_types and SearchType.VECTOR in search_types:
+                    logger.error(
+                        "Cannot use vector search: model mismatch "
+                        "(stored='{}', current='{}'). Run 'atlas index --full'.",
+                        stored_model,
+                        settings.embeddings.model,
+                    )
+                    raise typer.Exit(code=1)
+                logger.warning(
+                    "Embedding model mismatch (stored='{}', current='{}') — vector search disabled",
                     stored_model,
                     settings.embeddings.model,
                 )
-                await graph.close()
-                raise typer.Exit(code=1)
-            logger.warning(
-                "Embedding model mismatch (stored='{}', current='{}') — vector search disabled",
-                stored_model,
-                settings.embeddings.model,
-            )
 
-        if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
-            embed = EmbedClient(settings.embeddings, settings.redis)
+            if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
+                embed = EmbedClient(settings.embeddings, settings.redis)
 
-    try:
         results = await hybrid_search(
             graph=graph,
             embed=embed,
@@ -995,8 +988,6 @@ async def _run_search(  # noqa: PLR0912, PLR0915
             logger.warning("Index is stale (last indexed: {})", commit_str)
             if info.changed_files:
                 logger.warning("  {} file(s) changed since last index", len(info.changed_files))
-    finally:
-        await graph.close()
         shutdown_telemetry()
 
 
