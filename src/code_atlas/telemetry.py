@@ -486,8 +486,22 @@ def _init_log_export(settings: ObservabilitySettings, resource: Any) -> None:
         return
 
     from opentelemetry._logs import set_logger_provider  # noqa: PLC0415
-    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler  # noqa: PLC0415
+    from opentelemetry.sdk._logs import LoggerProvider  # noqa: PLC0415
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor  # noqa: PLC0415
+
+    try:
+        # Not `opentelemetry.sdk._logs.LoggingHandler`: that one is deprecated in favour
+        # of this, and the two are interchangeable (same signature, same OTLP output).
+        from opentelemetry.instrumentation.logging.handler import LoggingHandler  # noqa: PLC0415
+    except ImportError:
+        # Degrade rather than crash, and never fall back to the deprecated handler --
+        # silently using it is how the warning would stop being actionable. Traces and
+        # metrics are unaffected; only log export is lost.
+        logger.warning(
+            "Log export unavailable — install opentelemetry-instrumentation-logging "
+            "(shipped with the [otel] extra). Traces and metrics are unaffected."
+        )
+        return
 
     provider = LoggerProvider(resource=resource)
     provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
@@ -509,9 +523,11 @@ def _build_log_exporter(settings: ObservabilitySettings) -> Any:
     if settings.exporter == "none":
         return None
     if settings.exporter == "console":
-        from opentelemetry.sdk._logs.export import ConsoleLogExporter  # noqa: PLC0415
+        # ConsoleLogExporter is the deprecated spelling; the logs SDK is still
+        # unstable and says it will remove it.
+        from opentelemetry.sdk._logs.export import ConsoleLogRecordExporter  # noqa: PLC0415
 
-        return ConsoleLogExporter()
+        return ConsoleLogRecordExporter()
     from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter  # noqa: PLC0415
 
     return OTLPLogExporter(endpoint=settings.endpoint)

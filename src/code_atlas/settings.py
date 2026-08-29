@@ -629,7 +629,16 @@ class AtlasSettings(BaseSettings):
     """Root configuration for Code Atlas."""
 
     model_config = SettingsConfigDict(
-        toml_file="atlas.toml",
+        # No `toml_file` here on purpose. Discovery is dynamic -- settings_customise_sources
+        # below finds the file relative to the *target* project_root and constructs each
+        # source with an explicit path -- so a static default would be dead config that
+        # reads as if the cwd's atlas.toml were loaded. pydantic-settings warned about it
+        # for exactly that reason: it could see the key and no matching source.
+        #
+        # `pyproject_toml_table_header` stays because it is genuinely read --
+        # PyprojectTomlConfigSettingsSource drills into model_config for it. That one's
+        # warning is a false positive (the source is added conditionally, so pydantic
+        # cannot see it) and is filtered in pyproject.toml.
         pyproject_toml_table_header=("tool", "atlas"),
         env_prefix="ATLAS_",
         env_nested_delimiter="__",

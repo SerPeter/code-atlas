@@ -133,8 +133,8 @@ class SearchController(Controller):
         view_service: NamedDependency[ProjectViewService],
         chrome_service: NamedDependency[ChromeService],
         q: FromQuery[str] = "",
-        channel: FromQuery[list[str]] | None = None,
-        kind: FromQuery[list[str]] | None = None,
+        channel: FromQuery[list[str] | None] = None,
+        kind: FromQuery[list[str] | None] = None,
         limit: FromQuery[int] = 20,
     ) -> Template:
         chrome = await chrome_service.chrome()
@@ -237,7 +237,7 @@ class MapController(Controller):
         show_noncode: FromQuery[bool] = False,
         show_external: FromQuery[bool] = False,
         show_guessed: FromQuery[bool] = True,
-        hide: FromQuery[str] | None = None,
+        hide: FromQuery[str | None] = None,
     ) -> MapPayload:
         """Whichever level was asked for, in the shape map.js renders.
 

@@ -69,6 +69,11 @@ otel = [
     "opentelemetry-sdk~=1.33",
     "opentelemetry-exporter-otlp-proto-grpc~=1.33",
     "opentelemetry-exporter-otlp-proto-http~=1.33",
+    # Supplies the LoggingHandler that bridges loguru to OTLP. The SDK's own copy is
+    # deprecated in favour of this one; the two take the same arguments and do the same
+    # job. Versioned on the semconv track (0.xxbN), not the SDK's 1.x, hence the split
+    # constraint style.
+    "opentelemetry-instrumentation-logging>=0.54b0",
 ]
 typescript = ["tree-sitter-typescript~=0.23", "tree-sitter-javascript~=0.25"]
 go = ["tree-sitter-go~=0.25"]
@@ -124,6 +129,20 @@ dev = [
     # Runs only the tests affected by the current diff. Not compatible with -n (xdist), so
     # it is an iteration tool, never the gate -- see CLAUDE.md.
     "pytest-testmon~=2.1",
+    # Unit tests must never reach Memgraph, Valkey, TEI or a paid embedding API. Patch
+    # targets move; without this a test that stopped intercepting litellm would make a
+    # real billed call and still pass. Enabled per-tree, not globally -- integration
+    # needs real sockets.
+    "pytest-socket~=0.7",
+    # Deterministic clock. Leases, TTLs, cooldowns, staleness and rate-limit buckets are
+    # all time-based, and each test file was otherwise going to grow its own fake clock.
+    "time-machine~=2.19",
+    # Instruction-count benchmarking. Wall-clock budgets are meaningless on a shared
+    # machine -- one here had to be widened 200ms->500ms purely for co-tenancy.
+    "pytest-codspeed~=4.1",
+    # Property-based testing, for the parsers and the round trips: uids, content hashes,
+    # and the length-preserving Apex/dbt source shims.
+    "hypothesis~=6.140",
     "pre-commit~=4.5",
     "ruff~=0.15",
     "ty==0.0.15",             # pinned exact: 0.0.60 stopped honoring existing `# type: ignore[...]` comments and got much stricter about dict variance, surfacing 182 diagnostics across ~25 unrelated files — pre-1.0 tool, revisit deliberately
@@ -166,6 +185,10 @@ installer = "uv"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# An xfail that starts passing is a failure, not a pass. Without this the one xfail here
+# -- "drop this marker once containerfile folds every path segment" -- would go green the
+# day it is fixed and the marker would stay forever, unnoticed.
+xfail_strict = true
 addopts = [
     "-ra",
     "--strict-markers",
@@ -190,12 +213,31 @@ markers = [
     "bench: performance benchmarks (deselect with '-m \"not bench\"')",
     "tei: requires TEI embeddings service",
 ]
+# Warnings are errors. This is what stops a suite rotting quietly across dependency
+# upgrades -- three deprecations were being swallowed 531 times per run before this, one
+# of them our own Litestar query-param style. Every ignore below names why it is not ours
+# to fix; anything new has to be justified the same way rather than accumulating.
 filterwarnings = [
+    "error",
     # litellm uses deprecated asyncio.iscoroutinefunction (removed in 3.16)
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:litellm",
     # aiohttp cleanup_closed deprecation on Python 3.14+
     "ignore:enable_cleanup_closed ignored:DeprecationWarning:aiohttp",
+    # False positive: pyproject_toml_table_header IS read (PyprojectTomlConfigSettingsSource
+    # drills into model_config for it), but settings_customise_sources adds that source
+    # conditionally, so pydantic-settings cannot see it and warns. See settings.py.
+    "ignore:Config key `pyproject_toml_table_header` is set in model_config:UserWarning",
 ]
+
+# --------------------------------------------------------------------------- #
+# Coverage
+# --------------------------------------------------------------------------- #
+[tool.coverage.run]
+# Branch coverage, because the risk here is branch-shaped: hash gate on/off, delta vs
+# full, monorepo vs single, stale_mode's three values. Line coverage calls all of those
+# covered after one pass through the happy path.
+branch = true
+source = ["src/code_atlas"]
 
 # --------------------------------------------------------------------------- #
 # ty (type checker)
