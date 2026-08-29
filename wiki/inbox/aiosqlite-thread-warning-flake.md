@@ -29,6 +29,33 @@ on the second run, so moving the closes into fixture teardown did not cause it. 
 runs at `-n auto`; six consecutive runs of a three-file subset did not reproduce it, so it needs the whole suite's
 concurrency.
 
+## Checked: a connection really was being abandoned
+
+The narrow ignore below would have buried a real leak, so it was not applied.
+
+`test_mcp.py::test_hidden_on_sqlite_backend` built a `SqliteGraphClient` and handed it to `_stub_backends`, which yields
+it without closing — correct, since the real `use_backends()` closes only what it opened. The test never closed it
+either, so a live aiosqlite connection was abandoned on every run. Fixed in `d592eaf`.
+
+That was the whole of it for unit: **2785 tests now pass under `-W error::ResourceWarning`, twice**, where both prior
+runs failed deterministically. So the unit suite can carry that flag as a real guard.
+
+## Integration is not clean, and not only for the reason recorded
+
+Running `-m integration -W error::ResourceWarning` gives 6 failures and 3 errors. The objects, which are what to read:
+
+| count | object                     | verdict                                               |
+| ----- | -------------------------- | ----------------------------------------------------- |
+| 6     | `_ProactorSocketTransport` | below our clients — the known unfixable class         |
+| 6     | `socket.socket`            | same                                                  |
+| 4     | `neo4j AsyncBoltDriver`    | **our layer** — a GraphClient somewhere is not closed |
+| 2     | `redis.asyncio Connection` | **our layer** — same for an EventBus                  |
+
+The `filterwarnings` comment says the objects are transport internals. That is now demonstrably incomplete: four
+unclosed Bolt drivers and two unclosed redis connections are above that line. They are not in test scaffolding — every
+`GraphClient(`/`EventBus(` in `tests/integration/` closes in a `finally` — so they are in the product paths those tests
+drive (the CLI commands in `test_git_signals`, the orchestrator drain, the MCP server). Unchased.
+
 ## If it gets fixed
 
 A narrow ignore keyed on the thread name would do it, and would keep every other thread exception fatal:
