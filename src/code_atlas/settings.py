@@ -383,6 +383,13 @@ class MemgraphSettings(StrictSection):
     password: str = Field(default="", description="Memgraph password.")
     query_timeout_s: float = Field(default=10.0, description="Timeout in seconds for read queries.")
     write_timeout_s: float = Field(default=60.0, description="Timeout in seconds for write queries.")
+    liveness_check_timeout_s: float = Field(
+        default=30.0,
+        description=(
+            "Recheck a pooled Bolt connection idle longer than this before reusing it. "
+            "0 disables the check (the driver's own default)."
+        ),
+    )
 
 
 class SearchSettings(StrictSection):

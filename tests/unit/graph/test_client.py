@@ -594,6 +594,35 @@ class TestConstructorInjection:
         assert client._driver is sentinel_driver
 
 
+class TestPooledConnectionLiveness:
+    """The driver never rechecks a pooled connection unless told to.
+
+    The daemon and every MCP server hold this pool for days, so a Memgraph restart or a
+    half-open socket otherwise gets handed out dead. Reads have no retry that would
+    cover it -- the @retry is writes-only and TransientError-only.
+    """
+
+    def test_liveness_timeout_reaches_the_driver(self, tmp_path: Path):
+        settings = AtlasSettings(project_root=tmp_path)
+        settings.memgraph.liveness_check_timeout_s = 30.0
+
+        with patch("code_atlas.graph.client.AsyncGraphDatabase.driver") as factory:
+            GraphClient(settings)
+
+        assert factory.call_args.kwargs["liveness_check_timeout"] == 30.0
+
+    def test_zero_disables_it_rather_than_checking_every_time(self, tmp_path: Path):
+        """0 has to mean "off", not "recheck on every acquisition" -- the driver reads
+        None as off, and a literal 0.0 would be the most expensive setting there is."""
+        settings = AtlasSettings(project_root=tmp_path)
+        settings.memgraph.liveness_check_timeout_s = 0.0
+
+        with patch("code_atlas.graph.client.AsyncGraphDatabase.driver") as factory:
+            GraphClient(settings)
+
+        assert factory.call_args.kwargs["liveness_check_timeout"] is None
+
+
 class _FakeRel(dict):
     """Minimal stand-in for a neo4j Relationship object: dict props + .type."""
 

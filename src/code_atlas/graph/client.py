@@ -1515,7 +1515,25 @@ class GraphClient:
         mg = settings.memgraph
         self._uri = f"bolt://{mg.host}:{mg.port}"
         auth = (mg.username, mg.password) if mg.username else None
-        self._driver: AsyncDriver = driver if driver is not None else AsyncGraphDatabase.driver(self._uri, auth=auth)
+        # liveness_check_timeout defaults to None in the driver -- pooled connections are
+        # never rechecked. The daemon and every MCP server hold this pool for days, so a
+        # Memgraph restart or a half-open socket (NAT timeout, laptop sleep) gets handed
+        # out dead and surfaces as a failed tool call. Reads make that worse than it is on
+        # the queue side: the @retry here covers writes on TransientError (MVCC
+        # conflicts), not ServiceUnavailable, and not reads at all.
+        #
+        # This is the Bolt half of the decision already recorded for Valkey in
+        # events.py's health_check_interval -- same processes, same lifetimes, same
+        # argument. 0 means "use the driver's default", i.e. no checking.
+        self._driver: AsyncDriver = (
+            driver
+            if driver is not None
+            else AsyncGraphDatabase.driver(
+                self._uri,
+                auth=auth,
+                liveness_check_timeout=mg.liveness_check_timeout_s or None,
+            )
+        )
         self._dimension = settings.embeddings.dimension or 768
         self._embeddings_enabled = settings.embeddings.enabled
         self._query_timeout_s = mg.query_timeout_s
