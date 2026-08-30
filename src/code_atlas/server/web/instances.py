@@ -63,11 +63,17 @@ class UiInstance:
 
 def _bind(host: str, port: int) -> socket.socket | None:
     """Bind *port*, or ``None`` if something already holds it."""
+    # No SO_REUSEADDR, on any platform. The question this asks is "can I hold this port
+    # exclusively", and SO_REUSEADDR is the option for answering it wrongly. It was set
+    # off Windows on the grounds that Windows' version lets a second socket steal a bound
+    # port -- true, but Linux's version allows a bind whenever nothing is *listening*, and
+    # claim_port hands back a socket that is bound and not yet listening. So on Linux two
+    # invocations both claimed the same port and each believed it had won, which is the
+    # precise failure this module exists to prevent.
+    #
+    # The cost is that a port in TIME_WAIT now reads as busy. For a probe that is the
+    # conservative answer, and claim_port simply scans past it.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    if os.name != "nt":
-        # Windows' SO_REUSEADDR lets a second socket steal a bound port, which would
-        # make this probe answer "free" for a port that is very much in use.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, port))
     except OSError:

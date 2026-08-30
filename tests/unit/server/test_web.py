@@ -967,11 +967,14 @@ def _picker(graph: FakeGraph, project: str = "demo"):
 
 # The one place ResourceWarning is not a defect signal. `claim_port` exists to hand a
 # still-bound socket to uvicorn -- releasing it first reopens the race it closes -- so
-# these tests deliberately hold raw sockets and pass ownership around. Under the fatal
-# ResourceWarning the rest of the suite runs with, a socket finalised mid-test raised
-# inside `pytest.raises`, skipped the cleanup that would have released the port, and
-# cascaded into three unrelated assertions about port numbers. Linux only: `_bind` sets
-# SO_REUSEADDR off Windows, so finalisation order differs from the local run.
+# these tests deliberately hold raw sockets and pass ownership around, and a warning
+# about an unclosed one says nothing about correctness here.
+#
+# It is kept narrow deliberately: a global ignore cannot tell this from an abandoned
+# client, which is how three real leaks stayed hidden. It may also no longer be needed --
+# the CI failure that prompted it turned out to be the SO_REUSEADDR bug in `_bind`, not
+# the warning -- but that was only ever reproducible on Linux, so it stays until someone
+# has evidence rather than a guess.
 @pytest.mark.filterwarnings("ignore::ResourceWarning")
 class TestUiInstances:
     """`atlas ui` is run by hand, per checkout, so several are live at once as a matter
