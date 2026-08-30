@@ -2690,18 +2690,13 @@ class SqliteGraphClient:
                 if model:
                     props["embed_model"] = model
                 blob = sqlite_vec.serialize_float32(item.vector)
+                # No name and no qualified_name on purpose: graph_search matches on both
+                # with CONTAINS, and a chunk is not a thing anyone searches for by name.
                 await conn.execute(
-                    "INSERT INTO nodes (uid, labels, project_name, name, props_json, embedding) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO nodes (uid, labels, project_name, props_json, embedding) "
+                    "VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(uid) DO UPDATE SET props_json = excluded.props_json, embedding = excluded.embedding",
-                    (
-                        item.uid,
-                        NodeLabel.EMBED_CHUNK.value,
-                        item.project_name,
-                        item.uid,
-                        json.dumps(props),
-                        blob,
-                    ),
+                    (item.uid, NodeLabel.EMBED_CHUNK.value, item.project_name, json.dumps(props), blob),
                 )
                 await self._write_embedding_row(conn, item.uid, blob)
             await conn.commit()

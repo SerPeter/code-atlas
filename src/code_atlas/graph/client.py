@@ -606,6 +606,18 @@ def _is_embed_chunk(record: dict[str, Any]) -> bool:
     return bool(labels) and NodeLabel.EMBED_CHUNK.value in labels
 
 
+def _node_has_label(record: dict[str, Any], label: str) -> bool:
+    """Whether the record's node carries *label*, case-insensitively.
+
+    The comparison is loose because the label reaching ``vector_search`` came from a
+    caller's argument, not from ``NodeLabel``.
+    """
+    node = record.get("node") or record.get("n")
+    labels = getattr(node, "labels", None) or ()
+    wanted = label.casefold()
+    return any(str(name).casefold() == wanted for name in labels)
+
+
 def _chunk_parent_uid(record: dict[str, Any]) -> str | None:
     node = record.get("node") or record.get("n")
     if node is None or not hasattr(node, "get"):
@@ -4317,6 +4329,17 @@ class GraphClient:
                 "REMOVE n.embedding, n.embed_hash, n.embed_model RETURN count(n) AS c",
                 {"project": project, "prefix": f"{project}/"},
             )
+        # Deleted, not stripped. A chunk's entire content is its vector — without one it
+        # is an unreachable node the next embed pass would have to recognise and reuse,
+        # which is more machinery than re-creating it costs.
+        if project is None:
+            await self.execute_write(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) DELETE c")
+        else:
+            await self.execute_write(
+                f"MATCH (c:{NodeLabel.EMBED_CHUNK}) "
+                "WHERE c.project_name = $project OR c.project_name STARTS WITH $prefix DELETE c",
+                {"project": project, "prefix": f"{project}/"},
+            )
         return rows[0]["c"] if rows else 0
 
     async def count_embeddings_by_project(self) -> dict[str, int]:
@@ -4446,7 +4469,17 @@ class GraphClient:
         with _tracer.start_as_current_span("graph.vector_search", attributes={"limit": limit}):
             filter_projects = projects if projects is not None else ([project] if project else None)
 
-            indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
+            chunk_index = f"vec_{NodeLabel.EMBED_CHUNK.value.lower()}"
+            # A label-scoped search still asks the chunk index. A long Callable's chunks
+            # 2..N are the parts of it that did not fit, and they are as much that
+            # Callable as chunk 1 is -- excluding them would make label="Callable" find
+            # only the head of every long function. The chunk carries no label of its
+            # own, so the scope is applied after resolution instead, on the parent.
+            indices = (
+                [f"vec_{label.lower()}", chunk_index]
+                if label
+                else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
+            )
             # Unconditional over-fetch. Even with no filter set, several rows can
             # collapse onto one node -- a long entity is in the index once per chunk plus
             # once on itself -- so a page of exactly `limit` rows can yield far fewer.
@@ -4502,11 +4535,13 @@ class GraphClient:
 
             if threshold > 0.0:
                 all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
+            # Before the label scope, the project filter and the uid collapse: a chunk
+            # carries none of its parent's properties and none of its labels, so every
+            # one of those three would read the wrong node.
             all_results = await self._resolve_embed_chunks(all_results)
+            if label:
+                all_results = [r for r in all_results if _node_has_label(r, label)]
             all_results = _best_similarity_per_uid(all_results)
-            # Before the project filter and the uid collapse: a chunk carries the
-            # project_name of its parent but none of the parent's other properties, and
-            # the caller expects nodes it can read a qualified_name off.
             if filter_projects:
                 project_set = set(filter_projects)
                 all_results = [r for r in all_results if _node_project_name(r) in project_set]
@@ -4800,8 +4835,12 @@ class GraphClient:
         params: dict[str, Any] = {"project": project, "path": path}
         pa = " AND n.file_path STARTS WITH $path" if path else ""
         counts_raw = await self.execute(
-            f"MATCH (n {{project_name: $project}}) "
-            f"WHERE NOT n:Project AND NOT n:SchemaVersion{pa} "
+            # :Entity, not a bare match: what follows is a blocklist, and an EmbedChunk
+            # passes every clause of it. The marker sits on exactly the nodes that are
+            # things in the codebase, which is the question both this and the leaf query
+            # below are asking. SchemaVersion drops out of it too.
+            f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $project}}) "
+            f"WHERE NOT n:Project{pa} "
             f"RETURN {primary_label_expr('n')} AS label, n.kind AS kind, count(n) AS cnt "
             "ORDER BY cnt DESC",
             params,
@@ -4859,8 +4898,8 @@ class GraphClient:
         )
         pa_leaf = " AND n.file_path STARTS WITH $path" if path else ""
         leaf_raw = await self.execute(
-            "MATCH (n {project_name: $project}) "
-            "WHERE NOT n:Project AND NOT n:SchemaVersion AND NOT n:Package "
+            f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $project}}) "
+            "WHERE NOT n:Project AND NOT n:Package "
             f"AND NOT n:ExternalPackage AND NOT n:ExternalSymbol{pa_leaf} "
             # EnvVar/ResourceFile can never receive IMPORTS/INHERITS/CALLS, so
             # a label-only filter would report every one of them as a leaf.

@@ -6075,3 +6075,48 @@ async def test_deleting_a_project_takes_its_chunks(graph_client: GraphClient):
 
     rows = await graph_client.execute(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) RETURN count(c) AS c")
     assert rows[0]["c"] == 0
+
+
+async def test_analysis_queries_never_see_an_embed_chunk(graph_client: GraphClient):
+    """The leaf query's filter is a blocklist, and a chunk passes every clause of it.
+
+    It has no incoming IMPORTS/INHERITS/CALLS by construction — that is the point of
+    keeping it off the :Entity marker — so every one would have been reported as a
+    dead-end node in analyze_repo(analysis="centrality").
+    """
+    await _seed_chunked_callable(graph_client)
+
+    structure = await graph_client.get_structure_overview("test", "", 50)
+    centrality = await graph_client.get_centrality_data("test", "", 50)
+
+    assert NodeLabel.EMBED_CHUNK.value not in {r["label"] for r in structure["counts"]}
+    assert NodeLabel.EMBED_CHUNK.value not in {r["label"] for r in centrality["leaves"]}
+    assert not any(str(r["qn"] or "").endswith("#chunk2") for r in centrality["leaves"])
+
+
+async def test_clearing_embeddings_deletes_chunks_rather_than_emptying_them(graph_client: GraphClient):
+    """A chunk's entire content is its vector; stripped of one it is unreachable."""
+    await _seed_chunked_callable(graph_client)
+
+    await graph_client.clear_embeddings("test")
+
+    rows = await graph_client.execute(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) RETURN count(c) AS c")
+    assert rows[0]["c"] == 0
+
+
+async def test_a_label_scoped_search_still_finds_a_chunk(graph_client: GraphClient):
+    """Chunks 2..N are as much the Callable as chunk 1 is; excluding them would make
+    label="Callable" find only the head of every long function."""
+    on_chunk = await _seed_chunked_callable(graph_client)
+
+    results = await graph_client.vector_search(on_chunk, label="Callable", limit=10)
+
+    assert [r["node"]["uid"] for r in results] == ["test:big.fn"]
+    assert results[0]["similarity"] > 0.9
+
+
+async def test_a_label_scope_still_excludes_other_labels(graph_client: GraphClient):
+    """Guards the guard: resolving chunks must not smuggle the parent past the scope."""
+    on_chunk = await _seed_chunked_callable(graph_client)
+
+    assert await graph_client.vector_search(on_chunk, label="Note", limit=10) == []

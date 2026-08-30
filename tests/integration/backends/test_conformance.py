@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
+from code_atlas.graph.client import EmbedChunkWrite
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
 from code_atlas.schema import NodeLabel, RelType
 
@@ -96,6 +97,12 @@ _NOT_COMPARED: dict[str, str] = {
     "write_embeddings_and_hashes": "write path; read back by read_embed_hashes",
     "write_embed_hashes": "write path; read back by read_embed_hashes",
     "clear_embeddings": "write path",
+    "write_embed_chunks": "write path; read back by the vector search that resolves a chunk to its parent",
+    "delete_embed_chunks": "write path",
+    # Not in _COMPARED because that set is read as "output-compared for equal answers on
+    # the seeded corpus"; this one seeds its own orphan first. The comparison is real —
+    # see TestOutputEquivalence.test_gc_orphaned_embed_chunks.
+    "gc_orphaned_embed_chunks": "write path; the count both return is compared in its own test",
     "set_embedding_config": "write path; read back by get_embedding_config",
     "set_project_embedding_model": "write path",
     "set_batch_file_hashes": "write path; read back by get_batch_file_hashes",
@@ -435,6 +442,26 @@ class TestSharedSurfaceAgrees:
         # And the model filter agrees too — a vector from another space is not copied.
         assert await mg.find_embeddings_by_hash(["shared-hash"], "model-y") == {}
         assert await lite.find_embeddings_by_hash(["shared-hash"], "model-y") == {}
+
+    async def test_gc_orphaned_embed_chunks(self, both):
+        """A chunk has no edge to its parent, so nothing takes it along when the parent
+        goes. Both backends must agree on which ones are then dead."""
+        mg, lite = both
+        dim = mg._dimension
+        live = f"{PROJECT}:mod.caller"
+        for client in (mg, lite):
+            await client.write_embed_chunks(
+                [
+                    EmbedChunkWrite(f"{live}#chunk2", live, PROJECT, 2, [0.5] * dim, "h-live"),
+                    EmbedChunkWrite(
+                        f"{PROJECT}:mod.gone#chunk2", f"{PROJECT}:mod.gone", PROJECT, 2, [0.5] * dim, "h-dead"
+                    ),
+                ],
+                model="model-x",
+            )
+        assert await mg.gc_orphaned_embed_chunks() == await lite.gc_orphaned_embed_chunks() == 1
+        # And the live parent's chunk survives, in both.
+        assert await mg.gc_orphaned_embed_chunks() == await lite.gc_orphaned_embed_chunks() == 0
 
 
 class TestTheDefectsThatMotivatedThis:
