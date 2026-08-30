@@ -5,11 +5,19 @@
   "source_repo": "pallets/click",
   "source_commit": "00e592cea702e0b2caa0dee42489fdb1c22cd845",
   "license": "BSD-3-Clause",
-  "files": ["decorators.py", "globals.py", "formatting.py", "_compat.py"],
+  "files": [
+    "decorators.py",
+    "globals.py",
+    "formatting.py",
+    "_compat.py"
+  ],
   "measured": {
     "named_funcs": 1.0,
-    "calls": 0.966
+    "calls": 0.966,
+    "retrievability": 1.357
   },
   "rationale": "Python is the reference implementation the other languages are measured against, so its named-function floor is exact 1.0 rather than a margin below measurement: every `def` is an entity, including nested ones (ATL-096, commit a23d528). Lambdas are anonymous and get no entity by design; their calls attribute to the enclosing function, which is why `calls` is high despite 8 uncaptured lambda nodes. The 3.4% call shortfall is entirely module-scope: 0 call nodes sit inside a function that produced no entity, and 11 of the 14 module-scope calls are unemitted. Eleven uids collide and all eleven are correct merges, not debt: `command` and `group` each carry four `@t.overload` declarations ahead of the real implementation, `get_current_context` two, and `_get_argv_encoding` is defined once per branch of an `if WIN:` platform conditional. An overload is a signature for the same function, not a second function, so one node is the right answer.",
-  "max_duplicate_uids": 11
+  "max_duplicate_uids": 11,
+  "retrievability": 1.34,
+  "retrievability_rationale": "Searchable content bytes (docstring + source + signature, at the production max_source_chars of 2000) over file bytes. Deliberately NOT embed text: that carries a breadcrumb header which grows with entity count, so a walker emitting more nodes would raise the ratio without making one more byte findable. Measured 2026-08-30. Highest, and the reference implementation. Above 1.0 for the same nesting reason as Java. Module docstrings and PEP-258 attribute docstrings were both unattached until 2026-08-30 and are worth 75,626 and 13,955 characters respectively on this repo."
 }

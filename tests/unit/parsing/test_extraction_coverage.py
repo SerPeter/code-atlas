@@ -50,6 +50,17 @@ def test_extraction_coverage_holds_its_floor(fixture: Path) -> None:
         f"{cov.calls_in_missed} call(s) sit inside a function that produced no entity."
     )
 
+    # Retrievability is the ratio the other two cannot see. They measure the graph --
+    # forms found, calls kept -- and a file can score 1.000 on both while being
+    # unsearchable, which is exactly what a 907-line TypeScript test file did before
+    # ATL-139. Absent means the language has not recorded one yet.
+    if "retrievability" in floor:
+        assert cov.retrievability >= floor["retrievability"], (
+            f"{fixture.name}: retrievability regressed to {cov.retrievability:.3f}, floor is "
+            f"{floor['retrievability']:.3f}. Less of the file's text now reaches the search "
+            f"index -- entities may still be found while their content is not."
+        )
+
     # A uid is the graph's identity. Two definitions emitting the same one merge
     # into a single node with an arbitrary winner's source and the union of both
     # edge sets — a confident wrong answer, which is worse than the silence of a
@@ -70,6 +81,10 @@ def test_floor_records_its_provenance(fixture: Path) -> None:
         assert key in floor, f"{fixture.name}: floor.json is missing {key!r}"
     assert 0.0 <= floor["named_funcs"] <= 1.0
     assert 0.0 <= floor["calls"] <= 1.0
+    # Not capped at 1.0: a container's source contains its members', so Python and Java
+    # measure above it. A floor against regression, not a fraction.
+    if "retrievability" in floor:
+        assert floor["retrievability"] >= 0.0
 
 
 def test_the_corpus_is_not_empty() -> None:

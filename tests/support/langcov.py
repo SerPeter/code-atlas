@@ -18,6 +18,15 @@ Two ratios are reported, because two different things go wrong:
     one is form-agnostic and catches the anonymous case: a callback whose
     body is skipped drops every call inside it.
 
+``retrievability``
+    Of the file's bytes, how many reach the search index as some entity's
+    searchable content? The other two measure the *graph*: whether the walker
+    found the forms it should and whether calls survived. Neither notices a file
+    that is perfectly parsed and completely unsearchable. Measured: a 907-line
+    TypeScript test file scored named_funcs 1.000 and calls 0.996 while 0.2% of
+    it was reachable, because every callback was declined by design and nothing
+    carried their text (ATL-139).
+
 Run it against a real checkout to see *where* the misses sit::
 
     uv run --no-sync python -m tests.support.langcov <dir> <lang>
@@ -41,6 +50,11 @@ from code_atlas.schema import NodeLabel, RelType
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+_PRODUCTION_SOURCE_CHARS = 2000
+"""Mirrors ``IndexSettings.max_source_chars``'s default, so the measurement sees the
+same text the index does."""
 
 
 @dataclass(frozen=True)
@@ -242,6 +256,8 @@ class Coverage:
     calls_in_captured: int = 0
     calls_in_missed: int = 0
     calls_at_module: int = 0
+    file_bytes: int = 0
+    content_bytes: int = 0
     sites: list[FuncSite] = field(default_factory=list)
     uids: Counter[str] = field(default_factory=Counter)
 
@@ -276,6 +292,22 @@ class Coverage:
     @property
     def calls(self) -> float:
         return self.calls_emitted / self.ast_calls if self.ast_calls else 1.0
+
+    @property
+    def retrievability(self) -> float:
+        """Searchable content bytes over file bytes.
+
+        The numerator is each entity's own content -- docstring, source, signature --
+        and deliberately NOT its embed text. Embed text carries a breadcrumb header
+        (``Module: x`` / ``Class: Y``) that grows with the number of entities, so a
+        walker emitting more nodes would raise the ratio without making one more byte
+        of the file findable. Content is what an agent searches for.
+
+        Not a fraction, so not capped at 1.0: a container's ``source`` contains its
+        members', and Python and Java measure above 1.0 for that reason. It is a floor
+        against regression, not a target to reach.
+        """
+        return self.content_bytes / self.file_bytes if self.file_bytes else 1.0
 
 
 def _walk(node: Node):
@@ -348,7 +380,11 @@ def measure(root: Path, lang: str) -> Coverage:
             continue
 
         config = get_language_for_file(str(path))
-        parsed = parse_file(str(path), src, "cov", max_source_chars=0)
+        # The production cap, not 0: `retrievability` asks what reaches the real index,
+        # and source is most of it. Neither of the other two ratios is affected --
+        # max_source_chars only truncates a field in the post-parse pass, after
+        # content_hash is computed, and changes no entity or relationship.
+        parsed = parse_file(str(path), src, "cov", max_source_chars=_PRODUCTION_SOURCE_CHARS)
         if config is None or parsed is None:
             cov.failed += 1
             continue
@@ -356,6 +392,11 @@ def measure(root: Path, lang: str) -> Coverage:
             parsers[config.name] = Parser(config.language)
         tree = parsers[config.name].parse(src)
         cov.files += 1
+
+        cov.file_bytes += len(src)
+        cov.content_bytes += sum(
+            len(e.docstring or "") + len(e.source or "") + len(e.signature or "") for e in parsed.entities
+        )
 
         callables = [e for e in parsed.entities if e.label == NodeLabel.CALLABLE]
         spans = [(e.line_start, e.line_end) for e in callables]
@@ -401,7 +442,10 @@ def _pct(a: int, b: int) -> str:
 def _report(cov: Coverage) -> None:
     spec = LANGS[cov.lang]
     print(f"files: {cov.files} parsed, {cov.failed} failed   Callables emitted: {cov.callables}")
-    print(f"named_funcs: {cov.named_funcs:.3f}    calls: {cov.calls:.3f}    duplicate_uids: {cov.duplicate_uids}")
+    print(
+        f"named_funcs: {cov.named_funcs:.3f}    calls: {cov.calls:.3f}    "
+        f"retrievability: {cov.retrievability:.3f}    duplicate_uids: {cov.duplicate_uids}"
+    )
     if cov.worst_collisions:
         print("\ncolliding uids (two definitions merging into one graph node):")
         for uid, n in cov.worst_collisions:
