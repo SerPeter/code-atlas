@@ -261,7 +261,7 @@ class TestMonorepoScopeDispatch:
             async def ping(self) -> None:
                 return None
 
-            async def ensure_schema(self) -> None:
+            async def ensure_schema(self, *, force_drop_embeddings: bool = False) -> None:
                 return None
 
             async def close(self) -> None:
@@ -393,7 +393,7 @@ class TestIndexWithGitSignals:
             async def ping(self) -> None:
                 return None
 
-            async def ensure_schema(self) -> None:
+            async def ensure_schema(self, *, force_drop_embeddings: bool = False) -> None:
                 return None
 
             async def close(self) -> None:
