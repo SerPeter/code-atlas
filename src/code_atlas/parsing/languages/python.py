@@ -160,8 +160,16 @@ _CONTAINER_LITERALS = {"list": "list", "dictionary": "dict", "set": "set", "tupl
 
 
 def _extract_docstring(node: Node, source: bytes) -> str | None:
-    """Extract docstring from the first statement of a function/class body."""
-    body = node.child_by_field_name("body")
+    """Extract the docstring from the first statement of a function, class or module.
+
+    A ``module`` node has no ``body`` field -- its statements are its direct children --
+    so the early return here silently declined every module, and the Module entity never
+    asked for one anyway. The result was that ``_build_code_entity_text``'s
+    ``if docstring`` branch for Module was unreachable and a module's docstring was
+    indexed nowhere: 149 files and 75,626 characters of it in this repository alone,
+    which is where a module says what it is for.
+    """
+    body = node.child_by_field_name("body") or (node if node.type == "module" else None)
     if body is None:
         return None
     for child in body.children:
@@ -621,6 +629,7 @@ def _parse_python(
             line_start=1,
             line_end=root.end_point[0] + 1,
             file_path=path,
+            docstring=_extract_docstring(root, source),
         )
     )
 

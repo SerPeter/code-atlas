@@ -2404,3 +2404,62 @@ def test_a_module_constant_keeps_its_node_and_gains_the_content():
 def test_string_prefixes_and_quotes_are_stripped():
     parsed = _parse(f"def run():\n    t = r'''{_LONG}'''\n    return t\n")
     assert _text_blocks(parsed)[0].docstring == _LONG
+
+
+# ---------------------------------------------------------------------------
+# Module docstrings
+# ---------------------------------------------------------------------------
+
+
+def test_module_docstring_lands_on_the_module_node():
+    """It was indexed nowhere: _extract_docstring reads a `body` field, and a `module`
+    node has none, so it declined every module silently."""
+    parsed = _parse('"""What this module is for."""\n\nX = 1\n')
+    module = next(e for e in parsed.entities if e.label == NodeLabel.MODULE)
+    assert module.docstring == "What this module is for."
+
+
+def test_module_docstring_reaches_the_embed_text():
+    """The `if docstring` branch in _build_code_entity_text's Module arm was
+    unreachable until the parser started populating it."""
+    from code_atlas.search.embeddings import build_embed_text
+
+    parsed = _parse('"""Why this exists."""\n')
+    module = next(e for e in parsed.entities if e.label == NodeLabel.MODULE)
+    text = build_embed_text(
+        {
+            "_label": "Module",
+            "qualified_name": "example",
+            "kind": "module",
+            "signature": "",
+            "docstring": module.docstring or "",
+            "source": "",
+        }
+    )
+    assert "Why this exists." in text
+
+
+def test_a_package_docstring_lands_too():
+    parsed = _parse('"""Package rationale."""\n', path="src/pkg/__init__.py")
+    package = next(e for e in parsed.entities if e.label == NodeLabel.PACKAGE)
+    assert package.docstring == "Package rationale."
+
+
+def test_a_module_without_a_docstring_gets_none():
+    parsed = _parse("import os\n\nX = 1\n")
+    module = next(e for e in parsed.entities if e.label == NodeLabel.MODULE)
+    assert module.docstring is None
+
+
+def test_a_leading_string_that_is_not_first_is_not_a_docstring():
+    parsed = _parse('import os\n\n"""Not a docstring."""\n')
+    module = next(e for e in parsed.entities if e.label == NodeLabel.MODULE)
+    assert module.docstring is None
+
+
+def test_the_module_docstring_is_not_also_a_text_block():
+    """It is carried on the module; a second node would embed the same prose twice."""
+    long_doc = "word " * 200
+    parsed = _parse(f'"""{long_doc}"""\n')
+    blocks = [e for e in parsed.entities if e.kind == ValueKind.TEXT_BLOCK]
+    assert blocks == []
