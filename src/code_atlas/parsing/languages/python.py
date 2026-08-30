@@ -650,6 +650,120 @@ def _extract_text_blocks(
         )
 
 
+# ---------------------------------------------------------------------------
+# Source de-duplication
+# ---------------------------------------------------------------------------
+
+_ELISION = "# ... {name} -> {qn}"
+"""Stands in for a span that is indexed under its own node.
+
+A reference rather than a deletion: an agent reading a function's source still learns
+that a nested definition is there and what it is called, and can fetch it by that uid.
+"""
+
+_DOC_QUOTES = (chr(34) * 3, chr(39) * 3)
+"""The two triple-quote forms, spelled with chr() so this file stays greppable."""
+
+
+def _leading_docstring_span(lines: list[str], docstring: str) -> tuple[int, int] | None:
+    """Line range of the docstring at the head of an entity's own source, 0-based.
+
+    Located rather than recorded: ``source`` is assembled at emission and the docstring
+    node is not carried alongside it.
+
+    Found by the first triple quote and CHECKED against the docstring's own text, rather
+    than by working out where the signature ends. A first attempt did the latter -- scan
+    until a line that is not a decorator or a ``def`` -- and silently failed on every
+    multi-line signature, which is most of the long functions in this codebase and
+    exactly the ones worth de-duplicating.
+    """
+    first_line = next((line.strip() for line in docstring.splitlines() if line.strip()), "")
+    for index, line in enumerate(lines):
+        for mark in _DOC_QUOTES:
+            if mark not in line:
+                continue
+            end = index if line.count(mark) >= 2 else None
+            if end is None:
+                for candidate in range(index + 1, len(lines)):
+                    if mark in lines[candidate]:
+                        end = candidate
+                        break
+            if end is None:
+                return None
+            # The block must actually be this entity's docstring. A triple-quoted
+            # default value in the signature would otherwise elide the wrong span.
+            block = chr(10).join(lines[index : end + 1])
+            return (index, end) if not first_line or first_line in block else None
+    return None
+
+
+def _child_spans(entity: ParsedEntity, entities: list[ParsedEntity]) -> list[ParsedEntity]:
+    """Entities nested inside *entity* that carry their own indexed text.
+
+    Containment is by qualified_name AND line range: the name alone would catch a
+    sibling sharing a prefix, and the range alone would catch an unrelated entity in a
+    file where two spans overlap.
+    """
+    prefix = entity.qualified_name + "."
+    return [
+        child
+        for child in entities
+        if child is not entity
+        and child.qualified_name.startswith(prefix)
+        and entity.line_start <= child.line_start
+        and child.line_end <= entity.line_end
+        and (child.docstring or child.source)
+    ]
+
+
+def _deduplicate_sources(entities: list[ParsedEntity]) -> None:
+    """Remove from each entity's ``source`` what another node already carries.
+
+    Two overlaps, together 30% of Python's indexed bytes when measured:
+
+    * a docstring sits INSIDE the function it documents, so it reached the index once as
+      ``docstring`` and again within ``source``; and
+    * a nested definition -- an inner function, or a long string literal lifted out as a
+      ``text_block`` Value -- is its own entity with its own text, and was also carried
+      whole inside its parent's.
+
+    Each is replaced by one reference line naming the node that does hold the text, so
+    the structure an agent reads stays intact while the bytes are indexed once. It also
+    makes ``index.max_source_chars`` go further: the 2000 characters a large function
+    keeps are now 2000 characters of its own code.
+    """
+    position = {id(e): i for i, e in enumerate(entities)}
+    for entity in list(entities):
+        if not entity.source:
+            continue
+        lines = entity.source.splitlines()
+        if not lines:
+            continue
+
+        spans: list[tuple[int, int, str]] = []
+        for child in _child_spans(entity, entities):
+            start = child.line_start - entity.line_start
+            end = child.line_end - entity.line_start
+            if 0 <= start <= end < len(lines):
+                indent = " " * (len(lines[start]) - len(lines[start].lstrip()))
+                qn = child.qualified_name.split(":", 1)[-1]
+                spans.append((start, end, indent + _ELISION.format(name=child.name, qn=qn)))
+
+        if entity.docstring:
+            found = _leading_docstring_span(lines, entity.docstring)
+            if found is not None:
+                start, end = found
+                indent = " " * (len(lines[start]) - len(lines[start].lstrip()))
+                spans.append((start, end, indent + _DOC_QUOTES[0] + "..." + _DOC_QUOTES[0]))
+
+        if not spans:
+            continue
+        # Highest line first: an earlier replacement would otherwise shift a later index.
+        for start, end, replacement in sorted(spans, reverse=True):
+            lines[start : end + 1] = [replacement]
+        entities[position[id(entity)]] = replace(entity, source=chr(10).join(lines))
+
+
 def _parse_python(
     path: str,
     source: bytes,
@@ -719,6 +833,10 @@ def _parse_python(
     # names it defers to, and after _filter_value_references so a text block is never
     # mistaken for a callable argument.
     _extract_text_blocks(root, path, project_name, module_qn, entities, relationships)
+
+    # Last, because it needs every entity that will exist: it removes from each source
+    # the spans that some other node now carries.
+    _deduplicate_sources(entities)
 
     # Post-processing: tag conditional (duplicate) definitions
     _tag_conditional_definitions(entities)

@@ -2514,3 +2514,77 @@ def test_a_long_string_assigned_to_a_name_is_still_a_text_block_not_a_docstring(
     parsed = _parse(f'def f():\n    q = """{long_doc}"""\n    return q\n')
     blocks = [e for e in parsed.entities if e.kind == ValueKind.TEXT_BLOCK]
     assert [b.name for b in blocks] == ["q"]
+
+
+# ---------------------------------------------------------------------------
+# Source de-duplication
+# ---------------------------------------------------------------------------
+
+
+def _src(parsed, name: str) -> str:
+    return next(e.source or "" for e in parsed.entities if e.name == name)
+
+
+def test_a_docstring_is_not_repeated_inside_its_own_source():
+    """It reaches the index as the docstring field; carrying it again in source indexed
+    the same bytes under one entity twice."""
+    parsed = _parse('def f():\n    """Why f exists."""\n    return 1\n')
+
+    entity = next(e for e in parsed.entities if e.name == "f")
+    assert entity.docstring == "Why f exists."
+    assert "Why f exists." not in (entity.source or "")
+    assert '"""..."""' in (entity.source or "")
+
+
+def test_a_multi_line_signature_does_not_defeat_the_docstring_elision():
+    """The first attempt scanned until a line that was not a decorator or a def, which
+    silently failed on every multi-line signature -- most of the long functions here."""
+    parsed = _parse('def f(\n    a: int,\n    b: int,\n) -> int:\n    """Why f exists."""\n    return a + b\n')
+    assert "Why f exists." not in _src(parsed, "f")
+
+
+def test_a_nested_function_is_replaced_by_a_reference():
+    """It is its own entity with its own source; the parent carried it whole as well."""
+    parsed = _parse("def outer():\n    def inner():\n        return 1\n    return inner\n")
+
+    source = _src(parsed, "outer")
+    assert "return 1" not in source
+    assert "outer.inner" in source
+
+
+def test_an_extracted_text_block_is_replaced_by_a_reference():
+    long_text = "word " * 200
+    parsed = _parse('def f():\n    q = """' + long_text + '"""\n    return q\n')
+
+    source = _src(parsed, "f")
+    assert "word word" not in source
+    assert "-> " in source
+
+
+def test_the_reference_names_the_node_that_holds_the_text():
+    """A deletion would lose the fact that something is there; a reference does not."""
+    parsed = _parse("def outer():\n    def inner():\n        return 1\n    return inner\n")
+
+    source = _src(parsed, "outer")
+    assert "inner" in source
+    assert "#" in source
+
+
+def test_a_function_with_nothing_to_elide_is_untouched():
+    original = "def f(a):\n    return a + 1\n"
+    parsed = _parse(original)
+    assert _src(parsed, "f") == original.rstrip(chr(10))
+
+
+def test_elision_does_not_lose_code_after_the_nested_definition():
+    """Replacing a span by index is order-sensitive; a later span must still line up."""
+    parsed = _parse("def outer():\n    def inner():\n        return 1\n    marker_after = 2\n    return marker_after\n")
+    source = _src(parsed, "outer")
+    assert "marker_after" in source
+    assert "return 1" not in source
+
+
+def test_the_docstring_field_itself_is_untouched():
+    """De-duplication must remove the copy, never the original."""
+    parsed = _parse('def f():\n    """Why f exists."""\n    return 1\n')
+    assert next(e for e in parsed.entities if e.name == "f").docstring == "Why f exists."
