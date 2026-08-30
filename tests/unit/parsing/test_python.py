@@ -2326,3 +2326,81 @@ def join(parts):
         if r.rel_type == RelType.REFERENCES and r.properties.get("via") == "const" and r.to_name == "SEP"
     ]
     assert len(refs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Long string literals as their own nodes
+# ---------------------------------------------------------------------------
+
+_LONG = "word " * 150  # 750 chars, comfortably over _MIN_TEXT_BLOCK_CHARS
+
+
+def _text_blocks(parsed: ParsedFile) -> list:
+    return [e for e in parsed.entities if e.kind == ValueKind.TEXT_BLOCK]
+
+
+def test_a_long_literal_in_a_function_body_becomes_a_node():
+    """Only module- and class-level assignments produce a Value, so this reached the
+    graph as nothing but a slice of its function's capped source."""
+    parsed = _parse(f'def run():\n    query = """{_LONG}"""\n    return query\n')
+
+    blocks = _text_blocks(parsed)
+    assert [b.qualified_name for b in blocks] == [f"{PROJECT}:example.run.query"]
+    assert blocks[0].docstring == _LONG
+
+
+def test_an_unassigned_literal_is_named_for_its_line():
+    parsed = _parse(f'def run(conn):\n    conn.execute("""{_LONG}""")\n')
+
+    blocks = _text_blocks(parsed)
+    assert [b.name for b in blocks] == ["text_L2"]
+    assert blocks[0].line_start == 2
+
+
+def test_a_short_literal_is_left_alone():
+    parsed = _parse('def run():\n    return "tiny"\n')
+    assert _text_blocks(parsed) == []
+
+
+def test_a_docstring_is_not_a_text_block():
+    """It is already carried on the entity it documents; twice under two uids is worse."""
+    parsed = _parse(f'def run():\n    """{_LONG}"""\n    return 1\n')
+    assert _text_blocks(parsed) == []
+
+
+def test_a_module_docstring_is_not_a_text_block():
+    parsed = _parse(f'"""{_LONG}"""\n\nX = 1\n')
+    assert _text_blocks(parsed) == []
+
+
+def test_a_method_literal_is_owned_by_the_method():
+    parsed = _parse(f'class C:\n    def m(self):\n        t = """{_LONG}"""\n        return t\n')
+    assert [b.qualified_name for b in _text_blocks(parsed)] == [f"{PROJECT}:example.C.m.t"]
+
+
+def test_a_nested_def_claims_its_own_literal_once():
+    source = f'def outer():\n    def inner():\n        t = """{_LONG}"""\n        return t\n    return inner\n'
+    blocks = _text_blocks(_parse(source))
+    assert [b.qualified_name for b in blocks] == [f"{PROJECT}:example.outer.inner.t"]
+
+
+def test_the_owner_defines_the_block():
+    parsed = _parse(f'def run():\n    query = """{_LONG}"""\n    return query\n')
+    defines = {(r.from_qualified_name, r.to_name) for r in parsed.relationships if r.rel_type == RelType.DEFINES}
+    assert (f"{PROJECT}:example.run", f"{PROJECT}:example.run.query") in defines
+
+
+def test_a_module_constant_keeps_its_node_and_gains_the_content():
+    """Its source is capped at index.max_source_chars, which this is exactly the thing
+    to exceed — so give the existing node the text rather than making a rival."""
+    parsed = _parse(f'SQL = """{_LONG}"""\n')
+
+    values = [e for e in parsed.entities if e.label == NodeLabel.VALUE]
+    assert [v.qualified_name for v in values] == [f"{PROJECT}:example.SQL"]
+    assert values[0].kind == ValueKind.CONSTANT
+    assert values[0].docstring == _LONG
+
+
+def test_string_prefixes_and_quotes_are_stripped():
+    parsed = _parse(f"def run():\n    t = r'''{_LONG}'''\n    return t\n")
+    assert _text_blocks(parsed)[0].docstring == _LONG

@@ -151,6 +151,10 @@ class ValueKind(StrEnum):
     CONSTANT = "constant"
     FIELD = "field"
     ENUM_MEMBER = "enum_member"
+    # A long string literal lifted out of the code around it: a prompt template, an
+    # embedded query, a help screen. Content someone searches for by what it says,
+    # which inside a function body reaches the graph no other way.
+    TEXT_BLOCK = "text_block"
 
 
 class NoteKind(StrEnum):

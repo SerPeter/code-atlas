@@ -443,6 +443,149 @@ def _tag_conditional_definitions(entities: list[ParsedEntity]) -> None:
 # ---------------------------------------------------------------------------
 
 
+_MIN_TEXT_BLOCK_CHARS: int = 500
+"""Length past which a string literal becomes a node of its own.
+
+Module-level rather than an ``atlas.toml`` field, for the reason ``config.py`` gives
+about ``_MAX_CONFIG_DEPTH``: wiring it in means editing ``settings.py``, which this
+module does not own. Override it by assigning to this name.
+
+Deliberately high. An embedded SQL query, a prompt template, a help screen or a
+fixture blob is a thing someone searches for by its content, and at this size it is
+also large enough to crowd out the code around it in the enclosing entity's embed
+text. A short literal is neither.
+"""
+
+
+def _string_body(raw: str) -> str:
+    """The text inside a Python string literal — prefix and quotes removed."""
+    prefix = _STRING_PREFIX_RE.match(raw)
+    if prefix:
+        raw = raw[prefix.end() :]
+    for quote in ('"""', "'''", '"', "'"):
+        if raw.startswith(quote) and raw.endswith(quote) and len(raw) >= 2 * len(quote):
+            return raw[len(quote) : -len(quote)]
+    return raw
+
+
+def _docstring_nodes(root: Node) -> set[int]:
+    """Byte offsets of every string that is a docstring rather than data.
+
+    A docstring is already carried on the entity it documents, so re-emitting it as a
+    text block would embed the same prose twice under two uids.
+    """
+    offsets: set[int] = set()
+    for node in _walk_all_nodes(root):
+        if node.type not in ("module", "class_definition", "function_definition"):
+            continue
+        body = node if node.type == "module" else node.child_by_field_name("body")
+        if body is None:
+            continue
+        for child in body.children:
+            if child.type == "expression_statement":
+                offsets.update(inner.start_byte for inner in child.children if inner.type == "string")
+            if child.type not in ("comment", "pass_statement"):
+                break
+    return offsets
+
+
+def _enclosing_definition_qn(node: Node, module_qn: str) -> str:
+    """Dotted name of the innermost def/class containing *node*, module qn outwards."""
+    parts: list[str] = []
+    current = node.parent
+    while current is not None:
+        if current.type in ("function_definition", "class_definition"):
+            name = current.child_by_field_name("name")
+            if name is not None:
+                parts.append(node_text(name))
+        current = current.parent
+    return ".".join([module_qn, *reversed(parts)])
+
+
+def _assigned_name(node: Node) -> str | None:
+    """The identifier a string is assigned to, when it is assigned to one directly.
+
+    Byte range rather than identity: ``child_by_field_name`` hands back a fresh wrapper
+    each call, so ``right is node`` is False even when they are the same node, and every
+    assigned literal silently fell back to its line number.
+    """
+    parent = node.parent
+    if parent is None or parent.type != "assignment":
+        return None
+    right = parent.child_by_field_name("right")
+    if right is None or (right.start_byte, right.end_byte) != (node.start_byte, node.end_byte):
+        return None
+    left = parent.child_by_field_name("left")
+    return node_text(left) if left is not None and left.type == "identifier" else None
+
+
+def _extract_text_blocks(
+    root: Node,
+    path: str,
+    project_name: str,
+    module_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Long string literals become Value nodes of their own.
+
+    A prompt template, an embedded SQL query or a help screen is content someone
+    searches for by what it says, and inside a function body it is currently invisible:
+    only module- and class-level assignments produce a Value, so a literal in a body
+    reaches the graph as nothing but a slice of its function's capped ``source``.
+
+    Runs over the whole tree in one pass rather than per function, so a literal inside
+    a nested def is claimed once, by the def that actually contains it. A name already
+    claimed by the assignment walk is skipped — that node has the same content under
+    the same uid, and this one would only fight it.
+    """
+    docstrings = _docstring_nodes(root)
+    existing = {e.qualified_name: e for e in entities}
+    for node in _walk_all_nodes(root):
+        if node.type != "string" or node.start_byte in docstrings:
+            continue
+        raw = node_text(node)
+        if len(raw) < _MIN_TEXT_BLOCK_CHARS:
+            continue
+        line_start = node.start_point[0] + 1
+        name = _assigned_name(node) or f"text_L{line_start}"
+        owner_qn = _enclosing_definition_qn(node, module_qn)
+        qualified_name = f"{project_name}:{owner_qn}.{name}"
+        claimed = existing.get(qualified_name)
+        if claimed is not None:
+            # The assignment walk already made a node for this name — a module- or
+            # class-level constant. Rather than fight it with a duplicate, give it the
+            # content: its `source` is capped at index.max_source_chars, which a literal
+            # this long is exactly the thing to exceed, and it carries no docstring of
+            # its own to lose.
+            if claimed.label is NodeLabel.VALUE and not claimed.docstring:
+                entities[entities.index(claimed)] = replace(claimed, docstring=_string_body(raw))
+            continue
+        block = ParsedEntity(
+            name=name,
+            qualified_name=qualified_name,
+            label=NodeLabel.VALUE,
+            kind=ValueKind.TEXT_BLOCK,
+            line_start=line_start,
+            line_end=node.end_point[0] + 1,
+            file_path=path,
+            # docstring, not source: this is the searchable content, and source is
+            # capped at index.max_source_chars — which a 500+ char literal is
+            # precisely the thing to exceed.
+            docstring=_string_body(raw),
+            visibility=_visibility_from_name(name),
+        )
+        entities.append(block)
+        existing[qualified_name] = block
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{owner_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=qualified_name,
+            )
+        )
+
+
 def _parse_python(
     path: str,
     source: bytes,
@@ -506,6 +649,11 @@ def _parse_python(
     # here rather than at the call site: only now is the entity list complete enough to
     # say which names are actually callables. Same reason _extract_config_refs runs late.
     _filter_value_references(entities, relationships)
+
+    # Long string literals as nodes of their own. After the assignment walk, whose
+    # names it defers to, and after _filter_value_references so a text block is never
+    # mistaken for a callable argument.
+    _extract_text_blocks(root, path, project_name, module_qn, entities, relationships)
 
     # Post-processing: tag conditional (duplicate) definitions
     _tag_conditional_definitions(entities)
