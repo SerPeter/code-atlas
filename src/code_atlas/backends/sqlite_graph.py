@@ -10,9 +10,10 @@ Unlike Memgraph's per-label node storage, all entities live in one unified
 all relationships in one ``edges`` table — the small, fixed set of properties
 every entity shares (``uid``, ``labels``, ``project_name``, ``qualified_name``,
 ``file_path``, ``name``, ``kind``, ``content_hash``) are real columns; every
-other property (``line_start``, ``docstring``, ``signature``, frontmatter
-passthrough, etc.) lives in a ``props_json`` JSON1 column, merged via
-``json_patch`` on update to mirror Cypher's ``SET n += ...`` semantics.
+other property (``line_start``, ``docstring``, ``signature``, the ``frontmatter``
+map, etc.) lives in a ``props_json`` JSON1 column, merged via ``json_patch`` on
+update to mirror Cypher's ``SET n += ...`` semantics -- except ``frontmatter``,
+which is replaced rather than merged (see ``_batch_update_entities``).
 
 Pure-Python matching logic with no Memgraph coupling
 (``_resolve_one_call``, ``_resolve_one_path_anchor``, ``_classify_file``,
@@ -757,7 +758,14 @@ class SqliteGraphClient:
             return
         for e in entities:
             await conn.execute(
-                "UPDATE nodes SET name = ?, kind = ?, content_hash = ?, props_json = json_patch(props_json, ?) "
+                # ``frontmatter`` is dropped before the patch rather than merged into. RFC 7396
+                # recurses into a nested object, so patching {"frontmatter": {"a": 1}} over a
+                # stored {"a": 1, "b": 2} keeps ``b`` -- a key deleted from the file would survive
+                # here while Cypher's ``SET n +=`` replaces the map wholesale. Removing it first
+                # makes the patch authoritative and matches the other backend. ``json_remove`` on
+                # an absent path is a no-op, and a null in the patch still clears the property.
+                "UPDATE nodes SET name = ?, kind = ?, content_hash = ?, "
+                "props_json = json_patch(json_remove(props_json, '$.frontmatter'), ?) "
                 "WHERE uid = ?",
                 (e.name, e.kind, e.content_hash, json.dumps(_entity_props(e)), e.qualified_name),
             )

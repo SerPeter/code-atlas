@@ -1398,3 +1398,45 @@ class TestDeadCodeExclusions:
         await self._seed(client, [_entity("orphan", "mod.orphan")])
 
         assert "orphan" in await self._dead(client)
+
+
+class TestFrontmatterIsReplacedNotMerged:
+    """`json_patch` recurses into nested objects; Cypher's `SET n +=` does not."""
+
+    @staticmethod
+    def _note(frontmatter: dict[str, Any] | None, *, content_hash: str) -> ParsedEntity:
+        return ParsedEntity(
+            name="A note",
+            qualified_name="proj:note:n",
+            label=NodeLabel.NOTE,
+            kind="note",
+            line_start=1,
+            line_end=3,
+            file_path="wiki/n.md",
+            content_hash=content_hash,
+            extra_properties={"frontmatter": frontmatter},
+        )
+
+    async def test_a_deleted_frontmatter_key_disappears(self, client: SqliteGraphClient) -> None:
+        await client.upsert_file_entities("proj", "wiki/n.md", [self._note({"a": 1, "b": 2}, content_hash="h1")], [])
+        await client.upsert_file_entities("proj", "wiki/n.md", [self._note({"a": 1}, content_hash="h2")], [])
+
+        props = json.loads((await _node_row(client, "proj:note:n"))[4])
+        assert props["frontmatter"] == {"a": 1}, "RFC 7396 merged the old map instead of replacing it"
+
+    async def test_removing_the_block_entirely_clears_the_property(self, client: SqliteGraphClient) -> None:
+        await client.upsert_file_entities("proj", "wiki/n.md", [self._note({"a": 1}, content_hash="h1")], [])
+        await client.upsert_file_entities("proj", "wiki/n.md", [self._note(None, content_hash="h2")], [])
+
+        props = json.loads((await _node_row(client, "proj:note:n"))[4])
+        assert "frontmatter" not in props
+
+    async def test_other_properties_survive_the_replacement(self, client: SqliteGraphClient) -> None:
+        """json_remove targets one path — the rest of props_json must be untouched."""
+        await client.upsert_file_entities("proj", "wiki/n.md", [self._note({"a": 1}, content_hash="h1")], [])
+        await client.upsert_file_entities("proj", "wiki/n.md", [self._note({"b": 2}, content_hash="h2")], [])
+
+        props = json.loads((await _node_row(client, "proj:note:n"))[4])
+        assert props["frontmatter"] == {"b": 2}
+        assert props["line_start"] == 1
+        assert props["visibility"] == "public"

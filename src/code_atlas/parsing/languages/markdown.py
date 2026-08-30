@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 from dataclasses import dataclass
@@ -329,7 +330,45 @@ def _extract_anchors(fm: dict[str, Any], from_qn: str) -> list[ParsedRelationshi
     return rels
 
 
-_HARNESS_DIALECT_EXTRA_KEYS = frozenset({"id", "kind", "tags", "derived_from", "supersedes", "contradicts", "anchors"})
+# Keys note mode *consumes* into first-class fields or edges: ``id``/``kind`` become the
+# uid and node kind, ``tags`` its tag list, and the rest become SUPERSEDES/CONTRADICTS/
+# DERIVED_FROM/DOCUMENTS edges. Storing them in the frontmatter map as well would only
+# duplicate what is already queryable, so note mode drops them. Doc mode consumes nothing,
+# and therefore excludes nothing -- a DocFile's map is its frontmatter verbatim.
+_NOTE_CONSUMED_KEYS = frozenset({"id", "kind", "tags", "derived_from", "supersedes", "contradicts", "anchors"})
+
+# Bolt carries strings, numbers, booleans, temporals, lists and maps. yaml.safe_load can
+# also produce a set (``!!set``) or a tuple, which would fail the write and take the whole
+# file's indexing down with it -- so a set or tuple becomes a list and anything else outside
+# the supported set becomes its string form, rather than an exception on arbitrary user YAML.
+_BOLT_SCALARS = (str, int, float, bool)
+
+
+def _coerce_property_value(value: Any) -> Any:
+    """Recursively coerce a YAML value into something Bolt can carry."""
+    if value is None or isinstance(value, _BOLT_SCALARS):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _coerce_property_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_coerce_property_value(v) for v in value]
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value
+    return str(value)
+
+
+def _queryable_frontmatter(fm: dict[str, Any], *, exclude: frozenset[str] = frozenset()) -> dict[str, Any] | None:
+    """Return frontmatter as one namespaced map property, or ``None`` when nothing is left.
+
+    Nesting rather than flattening onto the node is deliberate. ``SET n += extra_properties``
+    runs *after* the schema fields are written, so a flattened frontmatter key that happened to
+    share a name with one of them silently overwrote it -- every Claude Code memory note's
+    ``name`` was being replaced by its slug. A single map cannot collide with anything, is
+    replaced wholesale (so a deleted key actually disappears, which ``+=`` never did), and
+    Memgraph indexes and matches nested keys directly: ``WHERE n.frontmatter.metadata.type = ...``.
+    """
+    cleaned = {str(k): _coerce_property_value(v) for k, v in fm.items() if k not in exclude}
+    return cleaned or None
 
 
 def _parse_markdown_note(
@@ -355,7 +394,9 @@ def _parse_markdown_note(
     frontmatter_tags = [t.strip() for t in (fm.get("tags") or []) if isinstance(t, str) and t.strip()]
     tags = sorted(set(frontmatter_tags) | set(_collect_inline_tags(body)))
 
-    extra_properties = {k: v for k, v in fm.items() if k not in _HARNESS_DIALECT_EXTRA_KEYS}
+    # Always emitted, null when empty: a null in the ``+=`` map *removes* the property,
+    # which is what lets frontmatter deleted from the file disappear from the node.
+    extra_properties: dict[str, Any] = {"frontmatter": _queryable_frontmatter(fm, exclude=_NOTE_CONSUMED_KEYS)}
     if subtype:
         extra_properties["subtype"] = subtype
 
@@ -413,6 +454,11 @@ def _parse_markdown(
                 path, source, project_name, frontmatter.raw, frontmatter.body_start, note_kind, subtype
             )
 
+    # Doc mode consumes no frontmatter key, so the map is the block verbatim. Before this
+    # it was parsed for note detection and then thrown away, which made a frontmattered
+    # doc unqueryable on anything it declared about itself.
+    doc_frontmatter = _queryable_frontmatter(frontmatter.raw) if frontmatter is not None else None
+
     posix_path = path.replace("\\", "/")
     filename = PurePosixPath(posix_path).name
     file_qn = f"{project_name}:{posix_path}"
@@ -432,6 +478,10 @@ def _parse_markdown(
         line_start=1,
         line_end=max(total_lines, 1),
         file_path=path,
+        # Unconditional (null when the file has no block) so that deleting a frontmatter
+        # block clears the stored map. A DocFile is not embeddable, so paying a hash change
+        # on every markdown file here costs a re-parse and no re-embedding.
+        extra_properties={"frontmatter": doc_frontmatter},
     )
     entities.append(doc_file)
 
@@ -445,6 +495,16 @@ def _parse_markdown(
             _process_md_section(
                 child, path, source, project_name, file_qn, heading_stack, entities, relationships, seen_qns
             )
+
+    if doc_frontmatter is not None:
+        # Propagated to sections because a section is what search actually returns for a
+        # doc, so a frontmatter-keyed importance rule would otherwise never fire on one.
+        # Conditional, unlike the DocFile above: DocSections *are* embeddable, and stamping
+        # a null on every section of every unfrontmattered markdown file in the repo would
+        # change their content_hash and re-embed the lot to record an absence.
+        for entity in entities:
+            if entity.label is NodeLabel.DOC_SECTION:
+                entity.extra_properties["frontmatter"] = doc_frontmatter
 
     return ParsedFile(
         file_path=path,

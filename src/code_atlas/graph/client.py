@@ -6002,6 +6002,7 @@ class GraphClient:
             (12, self._migrate_v12_clear_for_uid_discriminators),
             (13, self._migrate_v13_add_entity_label),
             (14, self._migrate_v14_trim_marker_indices),
+            (16, self._migrate_v16_clear_for_nested_frontmatter),
         )
         for threshold, migrate in migrations:
             if stored < threshold:
@@ -6140,6 +6141,37 @@ class GraphClient:
         logger.info(
             "Schema v14: dropped the :Entity indices and constraints nothing queries, "
             "leaving the two the marker exists for"
+        )
+
+    async def _migrate_v16_clear_for_nested_frontmatter(self) -> None:
+        """v16: markdown frontmatter moved from flattened node properties into one
+        ``frontmatter`` map, and ordinary (non-Note) docs started keeping theirs at all.
+
+        Same reason as v7 and v11: the map exists only in the file's bytes, and the
+        file-hash gate skips unchanged files forever, so no existing note or doc would
+        ever grow one. Clearing the hashes forces the re-parse that builds it.
+
+        The re-parse also *repairs* a corruption. Flattened keys were applied with
+        ``SET n += extra_properties`` after the schema fields were written, so a
+        frontmatter key sharing a name with one of them overwrote it -- every Claude Code
+        memory note had its ``name`` replaced by its own slug. With the keys nested, the
+        ``ON MATCH SET n.name = e.name`` above the ``+=`` wins and the title comes back.
+
+        What this does NOT do is delete the pre-v16 flattened keys. Removing "every
+        property that is not a schema property" is one incomplete whitelist away from
+        deleting ``embedding`` and taking semantic search down silently -- the exact
+        failure this codebase has already had once. The leftovers are inert: nothing reads
+        an unknown property, and ``atlas project rm`` followed by a re-index clears them
+        for anyone who wants them gone.
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v16: cleared stored file/git hashes — run 'atlas index' so markdown "
+            "frontmatter is stored as a queryable n.frontmatter map"
         )
 
     async def _set_schema_version(self, version: int) -> None:

@@ -328,6 +328,8 @@ def test_anchors_excluded_from_extra_properties():
     parsed = _parse(source, path="docs/notes/a.md")
     note = _note(parsed)
     assert "anchors" not in note.extra_properties
+    # Consumed into DOCUMENTS edges, so it must not reappear inside the frontmatter map either.
+    assert "anchors" not in (note.extra_properties.get("frontmatter") or {})
 
 
 def test_no_anchors_frontmatter_emits_no_anchor_rels():
@@ -373,3 +375,89 @@ def test_anchor_bare_symbol_fragment_skipped():
     source = '---\nid: a\nkind: note\nanchors: ["#OrphanSymbol"]\n---\n\nBody.\n'
     parsed = _parse(source, path="docs/notes/a.md")
     assert _anchor_rels(parsed) == []
+
+
+# ---------------------------------------------------------------------------
+# 8. Frontmatter storage — one queryable `frontmatter` map, not flattened keys
+# ---------------------------------------------------------------------------
+
+
+def test_note_frontmatter_is_nested_not_flattened():
+    source = (
+        "---\nname: my-note\ndescription: A summary.\nmetadata:\n  type: feedback\n  tier: critical\n---\n\nBody.\n"
+    )
+    note = _note(_parse(source, path="memory/my-note.md"))
+    assert note.extra_properties["frontmatter"] == {
+        "name": "my-note",
+        "description": "A summary.",
+        "metadata": {"type": "feedback", "tier": "critical"},
+    }
+
+
+def test_frontmatter_never_overwrites_a_schema_field():
+    """`SET n += extra_properties` runs after the schema fields, so a flattened `name:`
+    key replaced the node's own name — every memory note lost its title to its slug."""
+    source = "---\nname: my-note\ndescription: The real title.\nmetadata:\n  type: feedback\n---\n\nBody.\n"
+    note = _note(_parse(source, path="memory/my-note.md"))
+    assert note.name == "The real title."
+    for reserved in ("name", "description", "uid", "file_path", "source", "docstring"):
+        assert reserved not in note.extra_properties
+
+
+def test_note_consumed_keys_stay_out_of_the_map():
+    source = "---\nid: n\nkind: decision\ntags: [a]\nowner: sre\n---\n\n# T\n\nBody.\n"
+    note = _note(_parse(source, path="docs/notes/n.md"))
+    assert note.extra_properties["frontmatter"] == {"owner": "sre"}
+    assert note.kind == "decision"
+    assert note.tags == ["a"]
+
+
+def test_note_frontmatter_is_null_when_nothing_is_left():
+    """Emitted as None rather than omitted: a null in the `+=` map removes the property,
+    which is the only way a deleted frontmatter key ever disappears from the node."""
+    source = "---\nid: n\nkind: note\ntags: [a]\n---\n\n# T\n\nBody.\n"
+    note = _note(_parse(source, path="docs/notes/n.md"))
+    assert note.extra_properties["frontmatter"] is None
+
+
+def test_doc_mode_frontmatter_is_kept_verbatim():
+    """Non-note markdown used to parse its frontmatter for dialect detection and discard it."""
+    source = "---\ntitle: Runbook\naudience: [oncall, sre]\nmetadata:\n  tier: critical\n---\n\n# R\n\nBody.\n"
+    parsed = _parse(source, path="docs/runbook.md")
+    expected = {"title": "Runbook", "audience": ["oncall", "sre"], "metadata": {"tier": "critical"}}
+
+    doc_file = next(e for e in parsed.entities if e.label == NodeLabel.DOC_FILE)
+    assert doc_file.extra_properties["frontmatter"] == expected
+
+
+def test_doc_mode_frontmatter_propagates_to_sections():
+    """A search hit on a doc is a DocSection, so a frontmatter rule must reach one."""
+    source = "---\ntier: critical\n---\n\n# One\n\na\n\n## Two\n\nb\n"
+    parsed = _parse(source, path="docs/runbook.md")
+    sections = [e for e in parsed.entities if e.label == NodeLabel.DOC_SECTION]
+    assert sections
+    assert all(e.extra_properties["frontmatter"] == {"tier": "critical"} for e in sections)
+
+
+def test_doc_file_without_frontmatter_carries_an_explicit_null():
+    parsed = _parse("# Title\n\ncontent\n", path="docs/readme.md")
+    doc_file = next(e for e in parsed.entities if e.label == NodeLabel.DOC_FILE)
+    assert doc_file.extra_properties == {"frontmatter": None}
+
+
+def test_sections_without_frontmatter_stay_untouched():
+    """DocSections are embeddable — stamping a null on every section of every plain
+    markdown file would change its content_hash and re-embed the repo to record an absence."""
+    parsed = _parse("# Title\n\ncontent\n", path="docs/readme.md")
+    sections = [e for e in parsed.entities if e.label == NodeLabel.DOC_SECTION]
+    assert sections
+    assert all(e.extra_properties == {} for e in sections)
+
+
+def test_unsupported_yaml_types_are_coerced_not_fatal():
+    """A YAML set cannot cross Bolt; it must not take the file's indexing down."""
+    source = "---\nid: n\nkind: note\nweird: !!set\n  ? a\n  ? b\n---\n\n# T\n\nBody.\n"
+    note = _note(_parse(source, path="docs/notes/n.md"))
+    weird = note.extra_properties["frontmatter"]["weird"]
+    assert isinstance(weird, list)
+    assert sorted(weird) == ["a", "b"]

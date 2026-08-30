@@ -72,6 +72,46 @@ memory dir, or any other indexed project).
 Neither is ever written automatically. There is no contradiction _detection_ — the edge exists so a human, or dream-mode
 consolidation landing on "contradiction, can't auto-resolve", has somewhere durable to record the verdict.
 
+## How frontmatter is stored
+
+Frontmatter lands on the node as a single `frontmatter` **map** property, not as individual top-level properties:
+
+```cypher
+MATCH (n:Note) WHERE n.frontmatter.metadata.type = 'feedback' RETURN n.name
+MATCH (n:DocSection) WHERE 'sre' IN n.frontmatter.audience RETURN n.uid
+CREATE INDEX ON :Note(frontmatter.metadata.type);   -- nested keys are indexable
+```
+
+Nesting rather than flattening, for three reasons:
+
+- **Flattened keys collided.** `SET n += extra_properties` runs _after_ the schema fields are written, so a frontmatter
+  key that happened to share a name with one of them overwrote it. Every Claude Code memory note had its `name` replaced
+  by its own slug. `uid`, `file_path`, `source` and `docstring` were equally reachable.
+- **A deleted key never disappeared.** `+=` only ever adds. The map is replaced wholesale, so removing a key from the
+  file removes it from the graph.
+- **Nothing is lost for querying.** Memgraph matches and indexes nested keys directly.
+
+Which keys appear depends on the mode:
+
+| Mode                   | Stored                                                                                                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Note**               | Everything except the keys note mode _consumes_: `id`, `kind`, `tags`, `derived_from`, `supersedes`, `contradicts`, `anchors` — already queryable as `n.kind`, `n.tags`, or as edges. |
+| **DocFile/DocSection** | The block verbatim; doc mode consumes nothing. Propagated from the file to its sections, because a section is what search actually returns for a doc.                                 |
+
+A file with no frontmatter gets `frontmatter = null` on its `DocFile` and nothing at all on its `DocSection`s — sections
+are embeddable, and stamping a null on every section of every plain markdown file would change its `content_hash` and
+re-embed the repo to record an absence.
+
+YAML values Bolt cannot carry (a `!!set`, a tuple) are coerced to lists or strings rather than failing the write, so
+arbitrary frontmatter cannot take a file's indexing down. Strings, numbers, booleans, dates, lists and nested maps all
+pass through unchanged.
+
+### Ranking on frontmatter
+
+`[search.importance]` in `atlas.toml` turns a frontmatter key or a path glob into a multiplicative ranking factor — see
+the commented block in `atlas.toml`. Keys note mode promotes out of the map stay addressable by their frontmatter name,
+so `key = "kind"` and `key = "tags"` work on notes despite not being in `n.frontmatter`.
+
 ## Identity
 
 **Filename (sans `.md`) must equal the frontmatter `id` (or `name` for the memory dialect).** This makes Obsidian's
