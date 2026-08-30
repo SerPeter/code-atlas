@@ -434,6 +434,34 @@ class QueryTimeoutError(Exception):
         super().__init__(f"Query timed out after {timeout_s}s: {query_prefix}")
 
 
+class EmbeddingsPresentError(RuntimeError):
+    """Raised when a schema migration would drop vector indices a graph still needs.
+
+    ``_migrate_indices`` drops every vector index unconditionally and recreates them
+    only when this process has embeddings enabled. So a single command run with
+    ``embeddings.enabled = false`` -- including the *automatic* disable in
+    ``cli.py`` when the embedding endpoint is merely unreachable -- silently takes
+    semantic search down on a graph holding tens of thousands of vectors, and nothing
+    puts it back: ``_reconcile_search_indices`` expects no vector indices when
+    embeddings are off, so every later startup agrees the graph is fine.
+
+    The vectors themselves survive; only the indices go. Re-running with embeddings
+    enabled rebuilds them from the stored vectors, which is why this is a refusal
+    rather than a warning: the recovery is cheap, and the failure is invisible.
+    """
+
+    def __init__(self, embedded: int) -> None:
+        self.embedded = embedded
+        super().__init__(
+            f"Refusing to migrate the schema: this process has embeddings disabled, but the graph "
+            f"holds {embedded:,} embedded node(s). Migrating would drop every vector index and not "
+            f"recreate it, disabling semantic search with no error anywhere. "
+            f"Re-run with embeddings enabled (check that the embedding endpoint is reachable -- an "
+            f"unreachable one disables them automatically), or pass --force-drop-embeddings to "
+            f"proceed anyway."
+        )
+
+
 class EntityHashData(NamedTuple):
     """Stored entity data used for delta comparison during upsert."""
 
@@ -1631,13 +1659,17 @@ class GraphClient:
             return None
         return records[0]["version"]
 
-    async def ensure_schema(self) -> None:
+    async def ensure_schema(self, *, force_drop_embeddings: bool = False) -> None:
         """Apply or migrate the graph schema.
 
         - Fresh DB (no version): apply all DDL, create version node.
         - Same version: no-op.
         - Older version: drop & recreate vector/text indices, bump version.
         - Newer version: raise RuntimeError (downgrade not supported).
+
+        *force_drop_embeddings* waives the :class:`EmbeddingsPresentError` guard on the
+        migration branch. It is the only way past a graph that still holds vectors while
+        this process has embeddings disabled -- see :meth:`_guard_embedding_drop`.
         """
         stored = await self.get_schema_version()
 
@@ -1656,6 +1688,7 @@ class GraphClient:
 
         elif stored < SCHEMA_VERSION:
             logger.info("Migrating schema v{} → v{}", stored, SCHEMA_VERSION)
+            await self._guard_embedding_drop(force=force_drop_embeddings)
             await self._migrate_indices()
             await self._run_data_migrations(stored)
             await self._reconcile_marker_labels()
@@ -5875,6 +5908,43 @@ class GraphClient:
         if missing_text:
             for stmt in generate_text_index_ddl():
                 await self._exec_ddl(stmt)
+
+    async def count_embedded_nodes(self) -> int:
+        """Number of nodes that currently carry a vector.
+
+        Seeded by the ``:Entity(embed_hash)`` marker index -- the one index that spans
+        every embeddable label -- then filtered on ``embedding`` itself, because a hash
+        can outlive its vector (a write that failed between the two).
+        """
+        rows = await self.execute(
+            f"MATCH (n:{NodeLabel.ENTITY}) WHERE n.embed_hash IS NOT NULL AND n.embedding IS NOT NULL "
+            "RETURN count(n) AS c"
+        )
+        return int(rows[0]["c"]) if rows and rows[0].get("c") is not None else 0
+
+    async def _guard_embedding_drop(self, *, force: bool) -> None:
+        """Refuse a migration that would drop vector indices this graph still needs.
+
+        See :class:`EmbeddingsPresentError`. A failure to *count* is not a failure to
+        migrate -- an unreadable catalogue should not wedge the schema -- so the guard
+        degrades to a warning rather than blocking on its own error.
+        """
+        if self._embeddings_enabled:
+            return
+        try:
+            embedded = await self.count_embedded_nodes()
+        except Exception as exc:
+            logger.warning("Could not count stored embeddings before dropping vector indices: {}", exc)
+            return
+        if not embedded:
+            return
+        if not force:
+            raise EmbeddingsPresentError(embedded)
+        logger.warning(
+            "--force-drop-embeddings: dropping vector indices for {:,} embedded node(s). "
+            "The vectors survive; re-run with embeddings enabled to rebuild the indices.",
+            embedded,
+        )
 
     async def _migrate_indices(self) -> None:
         """Drop and recreate vector/text indices (dimension may have changed).

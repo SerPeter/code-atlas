@@ -237,6 +237,13 @@ def index(
         "For a lease left behind by a process that is gone; if that process is in fact alive, "
         "two indexers will write the same nodes.",
     ),
+    force_drop_embeddings: bool = typer.Option(
+        False,
+        "--force-drop-embeddings",
+        help="Allow a schema migration to drop the vector indices even though embeddings are "
+        "disabled here and the graph holds vectors. Semantic search stays down until a run "
+        "with embeddings enabled rebuilds the indices.",
+    ),
 ) -> None:
     """Index a codebase into the graph."""
     asyncio.run(
@@ -251,6 +258,7 @@ def index(
             co_change_threshold=co_change_threshold,
             watch=watch,
             force=force,
+            force_drop_embeddings=force_drop_embeddings,
         )
     )
 
@@ -543,9 +551,11 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     co_change_threshold: int = 3,
     watch: bool = False,
     force: bool = False,
+    force_drop_embeddings: bool = False,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
     from code_atlas.backends import create_event_bus, create_graph_client, graph_backend_label, queue_backend_label
+    from code_atlas.graph.client import EmbeddingsPresentError
     from code_atlas.indexing.orchestrator import detect_sub_projects
     from code_atlas.settings import AtlasSettings, derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -619,7 +629,11 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             raise typer.Exit(code=1) from exc
         logger.info("Connected to {}", graph_backend_label(graph, settings))
 
-        await graph.ensure_schema()
+        try:
+            await graph.ensure_schema(force_drop_embeddings=force_drop_embeddings)
+        except EmbeddingsPresentError as exc:
+            logger.error(str(exc))
+            raise typer.Exit(code=1) from exc
 
         # Wait rather than index alongside another process. Two indexers writing the same
         # nodes is how one run got split across two code versions, and how Memgraph's MVCC
@@ -1312,6 +1326,7 @@ def _print_report(report: object, *, detailed: bool) -> None:
 async def _run_watch(path: str, *, debounce: float | None, max_wait: float | None, no_git_check: bool = False) -> None:
     """Async implementation of the ``atlas watch`` command."""
     from code_atlas.backends import graph_backend_label, use_backends
+    from code_atlas.graph.client import EmbeddingsPresentError
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings, derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -1344,7 +1359,11 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
                 logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
                 raise typer.Exit(code=1) from exc
             logger.info("Connected to {}", graph_backend_label(graph, settings))
-            await graph.ensure_schema()
+            try:
+                await graph.ensure_schema()
+            except EmbeddingsPresentError as exc:
+                logger.error(str(exc))
+                raise typer.Exit(code=1) from exc
 
             daemon = DaemonManager()
             started = await daemon.start(settings, graph, bus)  # ty: ignore[invalid-argument-type]
@@ -1369,6 +1388,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
 async def _run_daemon(*, no_embed: bool = False) -> None:
     """Start the EventBus, file watcher, and all tier consumers, run until interrupted."""
     from code_atlas.backends import graph_backend_label, use_backends
+    from code_atlas.graph.client import EmbeddingsPresentError
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -1397,7 +1417,11 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
                 logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
                 raise typer.Exit(code=1) from exc
             logger.info("Connected to {}", graph_backend_label(graph, settings))
-            await graph.ensure_schema()
+            try:
+                await graph.ensure_schema()
+            except EmbeddingsPresentError as exc:
+                logger.error(str(exc))
+                raise typer.Exit(code=1) from exc
 
             daemon = DaemonManager()
             started = await daemon.start(settings, graph, bus, include_watcher=True)  # ty: ignore[invalid-argument-type]

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from code_atlas.graph.client import _HASHED_ENTITY_LABELS, QueryTimeoutError
+from code_atlas.graph.client import _HASHED_ENTITY_LABELS, EmbeddingsPresentError, QueryTimeoutError
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
 from code_atlas.schema import _ENTITY_LABELS, GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
 from code_atlas.server.analysis import _analyze_communities
@@ -147,6 +147,81 @@ async def test_get_embedding_config_reads_canonical_node_across_duplicates(graph
     )
 
     assert await graph_client.get_embedding_config() == ("current", 1024)
+
+
+# ---------------------------------------------------------------------------
+# Vector-index drop guard (embeddings disabled)
+# ---------------------------------------------------------------------------
+
+
+async def _vector_labels(client: GraphClient) -> set[str]:
+    rows = await client.execute("SHOW INDEX INFO")
+    return {str(r["label"]).removeprefix(":") for r in rows if "vector" in str(r.get("index type", "")).lower()}
+
+
+async def _stage_embedded_graph_at_previous_version(client: GraphClient, settings) -> None:
+    """Leave the graph one schema version behind, holding exactly one embedded node."""
+    await client.ensure_schema()
+    await client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'p:guard', project_name: 'p', "
+        "name: 'guard', qualified_name: 'guard', embed_hash: 'h', embedding: $vec})",
+        {"vec": [0.1] * client._dimension},
+    )
+    await client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = $v", {"v": SCHEMA_VERSION - 1})
+
+
+def _lightweight_client(settings):
+    """A second client on the same endpoints, with embeddings disabled."""
+    from code_atlas.graph import client as graph_client_module
+
+    no_embed = settings.model_copy(update={"embeddings": settings.embeddings.model_copy(update={"enabled": False})})
+    return graph_client_module.GraphClient(no_embed)
+
+
+async def test_migration_refuses_to_drop_vector_indices_of_an_embedded_graph(graph_client: GraphClient, settings):
+    """A run with embeddings disabled must not silently disable semantic search.
+
+    ``_migrate_indices`` drops every vector index unconditionally and recreates them
+    only when embeddings are enabled, so this exact sequence took the production graph's
+    semantic search down and left ``_reconcile_search_indices`` agreeing nothing was
+    wrong. The vectors survive the drop, which is why refusing is cheap.
+    """
+    await _stage_embedded_graph_at_previous_version(graph_client, settings)
+    assert "Callable" in await _vector_labels(graph_client)
+
+    async with _lightweight_client(settings) as lightweight:
+        with pytest.raises(EmbeddingsPresentError) as excinfo:
+            await lightweight.ensure_schema()
+
+    assert excinfo.value.embedded == 1
+    assert "--force-drop-embeddings" in str(excinfo.value)
+    # Refused means refused: neither the indices nor the version moved.
+    assert "Callable" in await _vector_labels(graph_client)
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION - 1
+
+
+async def test_force_drop_embeddings_waives_the_refusal(graph_client: GraphClient, settings):
+    """The override exists for a graph whose vectors are known to be disposable."""
+    await _stage_embedded_graph_at_previous_version(graph_client, settings)
+
+    async with _lightweight_client(settings) as lightweight:
+        await lightweight.ensure_schema(force_drop_embeddings=True)
+
+    assert "Callable" not in await _vector_labels(graph_client)
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
+
+
+async def test_migration_with_embeddings_disabled_proceeds_on_an_unembedded_graph(graph_client: GraphClient, settings):
+    """Nothing to lose, nothing to refuse — lightweight mode stays usable."""
+    await graph_client.ensure_schema()
+    await graph_client.execute_write(
+        f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = $v", {"v": SCHEMA_VERSION - 1}
+    )
+
+    async with _lightweight_client(settings) as lightweight:
+        await lightweight.ensure_schema()
+
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
 
 
 async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from code_atlas.graph.client import GraphClient, QueryTimeoutError, UpsertResult
+from code_atlas.graph.client import EmbeddingsPresentError, GraphClient, QueryTimeoutError, UpsertResult
 
 __all__ = [
+    "EmbeddingsPresentError",
     "GraphClient",
     "QueryTimeoutError",
     "UpsertResult",

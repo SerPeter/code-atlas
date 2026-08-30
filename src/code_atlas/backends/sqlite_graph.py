@@ -540,8 +540,14 @@ class SqliteGraphClient:
             await conn.execute(stmt)
         await conn.commit()
 
-    async def ensure_schema(self) -> None:
+    async def ensure_schema(self, *, force_drop_embeddings: bool = False) -> None:  # noqa: ARG002  # parity with GraphClient.ensure_schema; see docstring
         """Apply or migrate the graph schema.
+
+        *force_drop_embeddings* is accepted for signature parity with
+        ``GraphClient.ensure_schema`` and ignored: this backend's DDL is
+        ``CREATE ... IF NOT EXISTS`` throughout and never drops a vec0 table, so
+        running with embeddings disabled leaves an existing one intact rather than
+        destroying it. There is nothing here to force past.
 
         Mirrors ``GraphClient.ensure_schema``'s fresh/current/older/newer
         branches conceptually, using a ``schema_version`` row in ``meta``
