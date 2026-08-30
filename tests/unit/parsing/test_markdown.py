@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 pytest.importorskip("tree_sitter_markdown", reason="tree-sitter-markdown not installed")
@@ -461,3 +463,96 @@ def test_unsupported_yaml_types_are_coerced_not_fatal():
     weird = note.extra_properties["frontmatter"]["weird"]
     assert isinstance(weird, list)
     assert sorted(weird) == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# Oversized section splitting
+# ---------------------------------------------------------------------------
+
+
+def _long_body(paragraphs: int = 12, words: int = 200) -> str:
+    return "\n\n".join(f"Paragraph {i}. " + "word " * words for i in range(paragraphs))
+
+
+def _sections(parsed: ParsedFile) -> list:
+    return [e for e in parsed.entities if e.label == NodeLabel.DOC_SECTION]
+
+
+def test_headerless_document_is_split_into_parts():
+    """A transcript with no headings otherwise becomes one node holding everything."""
+    parsed = _parse("# Transcript\n\n" + _long_body())
+    sections = _sections(parsed)
+
+    assert len(sections) > 1
+    assert sections[0].qualified_name == f"{PROJECT}:docs/example.md > Transcript"
+    assert [s.qualified_name for s in sections[1:]] == [
+        f"{PROJECT}:docs/example.md > Transcript#part{n}" for n in range(2, len(sections) + 1)
+    ]
+    assert [s.name for s in sections[1:]] == [f"Transcript (part {n})" for n in range(2, len(sections) + 1)]
+
+
+def test_every_part_is_within_the_budget():
+    parsed = _parse("# Transcript\n\n" + _long_body(paragraphs=40))
+    sections = _sections(parsed)
+    assert len(sections) > 1
+    assert all(len(s.docstring) <= 6000 for s in sections)
+
+
+def test_split_preserves_the_whole_body():
+    """A budget must not be a place where content quietly disappears."""
+    body = _long_body()
+    parsed = _parse("# Transcript\n\n" + body)
+    sections = _sections(parsed)
+    assert len(sections) > 1
+    rejoined = "\n\n".join(s.docstring for s in sections)
+    assert rejoined == body.strip()
+
+
+def test_parts_get_distinct_content_hashes():
+    parsed = _parse("# Transcript\n\n" + _long_body())
+    hashes = [s.content_hash for s in _sections(parsed)]
+    assert len(hashes) > 1
+    assert len(set(hashes)) == len(hashes)
+    assert all(hashes)
+
+
+def test_doc_file_contains_every_part():
+    parsed = _parse("# Transcript\n\n" + _long_body())
+    sections = _sections(parsed)
+    assert len(sections) > 1
+    contained = {r.to_name for r in parsed.relationships if r.rel_type == RelType.CONTAINS}
+    assert contained == {s.qualified_name for s in sections}
+
+
+def test_part_line_ranges_advance_and_do_not_overlap():
+    parsed = _parse("# Transcript\n\n" + _long_body())
+    sections = _sections(parsed)
+    assert len(sections) > 1
+    for earlier, later in itertools.pairwise(sections):
+        assert earlier.line_end < later.line_start
+        assert later.line_start <= later.line_end
+
+
+def test_short_section_is_untouched():
+    parsed = _parse("# Small\n\nJust a sentence.\n")
+    sections = _sections(parsed)
+    assert len(sections) == 1
+    assert sections[0].qualified_name == f"{PROJECT}:docs/example.md > Small"
+
+
+def test_splitting_can_be_disabled():
+    body = _long_body()
+    result = parse_file("docs/example.md", ("# Transcript\n\n" + body).encode(), PROJECT, max_doc_section_chars=0)
+    assert result is not None
+    sections = [e for e in result.entities if e.label == NodeLabel.DOC_SECTION]
+    assert len(sections) == 1
+    assert sections[0].docstring == body.strip()
+
+
+def test_note_is_never_split():
+    """A note's uid is an address LINKS_TO edges point at; splitting orphans them."""
+    source = "---\nid: big\nkind: note\n---\n\n" + _long_body()
+    parsed = _parse(source, path="wiki/inbox/big.md")
+    notes = [e for e in parsed.entities if e.label == NodeLabel.NOTE]
+    assert len(notes) == 1
+    assert len(notes[0].docstring or "") > 6000

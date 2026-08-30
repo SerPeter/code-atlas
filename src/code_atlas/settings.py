@@ -557,6 +557,16 @@ class IndexSettings(StrictSection):
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
     )
     max_source_chars: int = Field(default=2000, description="Max characters for entity source text (0 to disable).")
+    max_doc_section_chars: int = Field(
+        default=6000,
+        ge=0,
+        description=(
+            "Body size past which a doc section is split into consecutive nodes (0 to disable). "
+            "Headings are markdown's natural borders; a file without them yields one node holding "
+            "the whole document, which is both over the embedding input cap and too coarse to "
+            "return usefully."
+        ),
+    )
     max_parse_bytes: int = Field(
         default=1_048_576,
         description="Skip files larger than this many bytes instead of parsing them (0 disables the ceiling). "

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from tree_sitter import Language, Parser, Query
 
+from code_atlas.chunking import split_embed_text
 from code_atlas.schema import NodeLabel, RelType, Visibility
 from code_atlas.telemetry import get_metrics
 
@@ -808,6 +809,127 @@ def _parse_hazard(source: bytes, max_parse_bytes: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Oversized doc-section splitting
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_DOC_SECTION_CHARS: int = 6000
+"""Body size past which a DocSection becomes several nodes.
+
+Headings are a markdown file's natural borders, and a file without them -- a
+transcript, an export, a changelog dump -- produces one node holding the entire
+document. Measured on one corpus: 51.5% of the DocSections from a YouTube-archive
+directory exceeded the embedding model's input cap, against 0.8% of ordinary docs.
+
+Splitting rather than multi-chunk embedding (which is what code entities get) is
+deliberate, and it is the retrieval argument rather than the provider one: a
+Callable's boundary is meaningful and worth keeping whole, while half a
+header-less transcript is not a unit anyone wants returned. ``Note`` nodes are
+excluded for the same reason read the other way -- a note's uid is an address that
+``LINKS_TO`` edges point at, so splitting one would orphan the wikilink graph.
+
+~6000 characters is roughly 1500-2000 tokens, under every current model's cap.
+Set to 0 to disable splitting entirely.
+"""
+
+_MAX_DOC_PARTS: int = 200
+"""Parts one section may become. Content past it is not indexed.
+
+Only a pathology reaches this: at the default budget it takes a 1.2 MB section.
+"""
+
+_DOC_PART_SUFFIX: str = "#part"
+"""Distinct from ``_dedupe_section_qn``'s ``#N``, which disambiguates duplicate
+sibling headings — that one emits digits only, so the two can never collide."""
+
+
+def split_oversized_doc_sections(
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+    *,
+    max_chars: int,
+) -> tuple[list[ParsedEntity], list[ParsedRelationship]]:
+    """Split DocSections whose body exceeds *max_chars* into consecutive parts.
+
+    Part 1 keeps the original ``qualified_name``, so an unsplit section and the
+    head of a split one address the same node as before and every relationship
+    already pointing at it stays valid. Parts 2..N take a ``#partN`` suffix and get
+    a copy of the CONTAINS edge that held part 1, so the DocFile still contains all
+    of them.
+
+    ``DOCUMENTS`` edges are left on part 1 rather than re-derived per part. They
+    were extracted from the whole body, and re-running that extraction here would
+    make the parser's reference detection depend on where an unrelated size budget
+    happened to cut.
+
+    Line numbers for parts 2..N are counted from the body's own newlines, so they
+    inherit the offset between the heading line and where the body starts -- one or
+    two lines low, not enough to matter for a citation and not worth re-deriving
+    byte offsets through a strip() to fix.
+    """
+    if max_chars <= 0:
+        return entities, relationships
+
+    oversized = {
+        id(e) for e in entities if e.label is NodeLabel.DOC_SECTION and e.docstring and len(e.docstring) > max_chars
+    }
+    if not oversized:
+        return entities, relationships
+
+    contains_by_target: dict[str, list[ParsedRelationship]] = {}
+    for rel in relationships:
+        if rel.rel_type is RelType.CONTAINS:
+            contains_by_target.setdefault(rel.to_name, []).append(rel)
+
+    out_entities: list[ParsedEntity] = []
+    extra_rels: list[ParsedRelationship] = []
+    for entity in entities:
+        if id(entity) not in oversized:
+            out_entities.append(entity)
+            continue
+
+        body = entity.docstring or ""
+        parts, _hard = split_embed_text(body, limit=max_chars, measure=len, max_chunks=_MAX_DOC_PARTS)
+        if len(parts) <= 1:
+            out_entities.append(entity)
+            continue
+
+        offset = 0
+        for number, part in enumerate(parts, start=1):
+            found = body.find(part, offset)
+            start_off = found if found >= 0 else offset
+            offset = start_off + len(part)
+            line_start = entity.line_start + body.count("\n", 0, start_off)
+            line_end = max(line_start, min(line_start + part.count("\n"), entity.line_end))
+            if number == 1:
+                name, qualified_name = entity.name, entity.qualified_name
+            else:
+                name = f"{entity.name} (part {number})"
+                qualified_name = f"{entity.qualified_name}{_DOC_PART_SUFFIX}{number}"
+                extra_rels.extend(
+                    replace(rel, to_name=qualified_name) for rel in contains_by_target.get(entity.qualified_name, ())
+                )
+            out_entities.append(
+                replace(
+                    entity,
+                    name=name,
+                    qualified_name=qualified_name,
+                    docstring=part,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+            )
+
+        logger.debug(
+            "Split oversized doc section {} ({} chars) into {} parts",
+            entity.qualified_name,
+            len(body),
+            len(parts),
+        )
+
+    return out_entities, [*relationships, *extra_rels]
+
+
 def parse_file(
     path: str,
     source: bytes,
@@ -815,6 +937,7 @@ def parse_file(
     *,
     max_source_chars: int = 2000,
     max_parse_bytes: int = DEFAULT_MAX_PARSE_BYTES,
+    max_doc_section_chars: int = DEFAULT_MAX_DOC_SECTION_CHARS,
     rationale: RationaleSettings | None = None,
 ) -> ParsedFile | None:
     """Parse a source file and extract entities + relationships.
@@ -829,6 +952,10 @@ def parse_file(
 
     ``max_parse_bytes`` caps the file size handed to tree-sitter; 0 disables the
     ceiling. Wired from ``IndexSettings.max_parse_bytes``.
+
+    ``max_doc_section_chars`` splits a doc section whose body exceeds it into
+    consecutive nodes; 0 disables splitting. See
+    :func:`split_oversized_doc_sections`.
 
     ``rationale`` configures intent-comment extraction; ``None`` uses the
     shipped defaults (NOTE/WHY/HACK plus ADR/RFC citations, no TODO/FIXME).
@@ -898,6 +1025,11 @@ def parse_file(
                 citation_schemes=citation_schemes,
             )
 
+    # Before hashing: a part is a node in its own right, so each needs its own
+    # content_hash, and the CONTAINS edges the split adds must reach the returned list.
+    relationships = result.relationships
+    entities, relationships = split_oversized_doc_sections(entities, relationships, max_chars=max_doc_section_chars)
+
     # Post-parse pass: compute content hashes and truncate source
     def _finalize(e: ParsedEntity) -> ParsedEntity:
         updates: dict[str, Any] = {"content_hash": _compute_content_hash(e)}
@@ -915,5 +1047,5 @@ def parse_file(
         file_path=result.file_path,
         language=result.language,
         entities=[_finalize(e) for e in entities],
-        relationships=result.relationships,
+        relationships=relationships,
     )
