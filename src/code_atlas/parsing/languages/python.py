@@ -476,6 +476,47 @@ def _string_body(raw: str) -> str:
     return raw
 
 
+def _string_only_statement(node: Node | None) -> Node | None:
+    """The string inside ``node`` when it is a statement holding nothing but one."""
+    if node is None or node.type != "expression_statement":
+        return None
+    named = node.named_children
+    return named[0] if len(named) == 1 and named[0].type == "string" else None
+
+
+def _next_named_sibling(node: Node) -> Node | None:
+    """The statement after *node* in its parent, by byte range.
+
+    Byte range rather than ``is``: tree-sitter hands back a fresh wrapper per access,
+    so identity comparison silently never matches (the same trap ``_assigned_name``
+    documents).
+    """
+    parent = node.parent
+    if parent is None:
+        return None
+    span = (node.start_byte, node.end_byte)
+    children = parent.named_children
+    for i, child in enumerate(children):
+        if (child.start_byte, child.end_byte) == span:
+            return children[i + 1] if i + 1 < len(children) else None
+    return None
+
+
+def _attribute_docstring(statement: Node) -> str | None:
+    """The PEP 258 docstring after an assignment — a bare string on the next line.
+
+    ``X = 3`` followed by ``\"\"\"Why X is three.\"\"\"``. This codebase leans on them for
+    exactly the prose worth finding, and none of it reached the graph: the string is
+    not an entity of its own, and the Value node it documents had no docstring field
+    set. 55 constants and 13,955 characters of it in ``src/code_atlas`` alone.
+    """
+    string_node = _string_only_statement(_next_named_sibling(statement))
+    if string_node is None:
+        return None
+    body = _string_body(node_text(string_node)).strip()
+    return body or None
+
+
 def _docstring_nodes(root: Node) -> set[int]:
     """Byte offsets of every string that is a docstring rather than data.
 
@@ -494,6 +535,17 @@ def _docstring_nodes(root: Node) -> set[int]:
                 offsets.update(inner.start_byte for inner in child.children if inner.type == "string")
             if child.type not in ("comment", "pass_statement"):
                 break
+        # Attribute docstrings anywhere in the body, not just the leading one. They are
+        # carried on the Value they document, so a text block for the same string would
+        # embed that prose twice under two uids.
+        for child in body.children:
+            if child.type != "expression_statement" or _string_only_statement(child) is not None:
+                continue
+            if not any(c.type == "assignment" for c in child.named_children):
+                continue
+            attr = _string_only_statement(_next_named_sibling(child))
+            if attr is not None:
+                offsets.add(attr.start_byte)
     return offsets
 
 
@@ -1279,6 +1331,7 @@ def _process_assignment(
                 line_end=child.end_point[0] + 1,
                 file_path=path,
                 source=node_text(child),
+                docstring=_attribute_docstring(node),
                 visibility=_visibility_from_name(name),
             )
         )

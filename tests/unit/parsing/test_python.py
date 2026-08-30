@@ -2463,3 +2463,54 @@ def test_the_module_docstring_is_not_also_a_text_block():
     parsed = _parse(f'"""{long_doc}"""\n')
     blocks = [e for e in parsed.entities if e.kind == ValueKind.TEXT_BLOCK]
     assert blocks == []
+
+
+# ---------------------------------------------------------------------------
+# Attribute docstrings (PEP 258)
+# ---------------------------------------------------------------------------
+
+
+def _value(parsed: ParsedFile, name: str):
+    return next(e for e in parsed.entities if e.label == NodeLabel.VALUE and e.name == name)
+
+
+def test_a_constants_docstring_lands_on_its_value_node():
+    """The string is not an entity of its own, so this prose reached the graph nowhere."""
+    parsed = _parse('X = 3\n"""Why X is three."""\n')
+    assert _value(parsed, "X").docstring == "Why X is three."
+
+
+def test_an_annotated_constant_gets_it_too():
+    parsed = _parse('X: int = 3\n"""Annotated, still documented."""\n')
+    assert _value(parsed, "X").docstring == "Annotated, still documented."
+
+
+def test_a_class_attribute_docstring_lands_on_the_field():
+    parsed = _parse('class C:\n    x = 1\n    """The field rationale."""\n')
+    assert _value(parsed, "x").docstring == "The field rationale."
+
+
+def test_a_constant_with_no_following_string_has_no_docstring():
+    parsed = _parse("X = 3\nY = 4\n")
+    assert _value(parsed, "X").docstring is None
+
+
+def test_a_string_two_statements_later_is_not_the_docstring():
+    parsed = _parse('X = 3\nY = 4\n"""Belongs to Y, if anyone."""\n')
+    assert _value(parsed, "X").docstring is None
+
+
+def test_a_long_attribute_docstring_is_not_also_a_text_block():
+    """It is carried on the Value it documents; a second node would embed it twice."""
+    long_doc = "word " * 200
+    parsed = _parse(f'X = 3\n"""{long_doc}"""\n')
+    assert _value(parsed, "X").docstring == long_doc.strip()
+    assert [e for e in parsed.entities if e.kind == ValueKind.TEXT_BLOCK] == []
+
+
+def test_a_long_string_assigned_to_a_name_is_still_a_text_block_not_a_docstring():
+    """Guards the guard: the exclusion must not swallow assigned literals."""
+    long_doc = "word " * 200
+    parsed = _parse(f'def f():\n    q = """{long_doc}"""\n    return q\n')
+    blocks = [e for e in parsed.entities if e.kind == ValueKind.TEXT_BLOCK]
+    assert [b.name for b in blocks] == ["q"]
