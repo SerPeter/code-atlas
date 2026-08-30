@@ -2588,3 +2588,43 @@ def test_the_docstring_field_itself_is_untouched():
     """De-duplication must remove the copy, never the original."""
     parsed = _parse('def f():\n    """Why f exists."""\n    return 1\n')
     assert next(e for e in parsed.entities if e.name == "f").docstring == "Why f exists."
+
+
+def test_a_grandchild_span_does_not_eat_the_parents_own_code():
+    """Shipped broken and caught in review. _child_spans matched descendants at ANY
+    depth, and replacements are applied highest-line-first so an earlier one cannot
+    shift a later index -- an argument that holds only for spans that do not overlap.
+    A grandchild replaced first shrank the line list, and the child's now-stale slice
+    ate the parent's own code below the nested definition. Ten functions in this repo's
+    src/ were silently losing their tails."""
+    parsed = _parse(
+        "def outer():\n"
+        "    def inner():\n"
+        "        def deep():\n"
+        "            return 1\n"
+        "        return deep\n"
+        "    tail_one = 10\n"
+        "    tail_two = 20\n"
+        "    return inner(tail_two)\n"
+    )
+    source = _src(parsed, "outer")
+    assert "tail_one = 10" in source
+    assert "tail_two = 20" in source
+    assert "return 1" not in source
+
+
+def test_only_the_outermost_child_is_elided():
+    """Eliding a grandchild is unnecessary as well as unsafe: its text goes when its own
+    parent's span is replaced."""
+    parsed = _parse(
+        "def outer():\n"
+        "    def inner():\n"
+        "        def deep():\n"
+        "            return 1\n"
+        "        return deep\n"
+        "    return inner\n"
+    )
+    source = _src(parsed, "outer")
+    assert source.count("# ...") == 1
+    assert "outer.inner" in source
+    assert "deep" not in source

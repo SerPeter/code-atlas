@@ -705,7 +705,7 @@ def _child_spans(entity: ParsedEntity, entities: list[ParsedEntity]) -> list[Par
     file where two spans overlap.
     """
     prefix = entity.qualified_name + "."
-    return [
+    nested = [
         child
         for child in entities
         if child is not entity
@@ -713,6 +713,22 @@ def _child_spans(entity: ParsedEntity, entities: list[ParsedEntity]) -> list[Par
         and entity.line_start <= child.line_start
         and child.line_end <= entity.line_end
         and (child.docstring or child.source)
+    ]
+    # Outermost only. `startswith` matches a grandchild too, and eliding one is both
+    # unnecessary -- its text goes when its own parent's span is replaced -- and WRONG:
+    # replacements are applied highest-line-first so that an earlier one cannot shift a
+    # later index, and that argument holds only for spans that do not overlap. A
+    # grandchild replaced first shrinks the line list, and the child's now-stale slice
+    # eats the parent's own code below the nested definition. Shipped and caught in
+    # review: `tail_one = 10` vanished from a three-level fixture, and 10 functions in
+    # this repo's own src/ were silently losing their tails.
+    return [
+        child
+        for child in nested
+        if not any(
+            other is not child and other.line_start <= child.line_start and child.line_end <= other.line_end
+            for other in nested
+        )
     ]
 
 
