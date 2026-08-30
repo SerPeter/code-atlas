@@ -171,6 +171,13 @@ if TYPE_CHECKING:
         # VALUES" invariant.
         async def resolve_config_refs(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None: ...
 
+        # resolve_doc_links creates the heuristic DOCUMENTS edges (symbol_mention /
+        # file_ref) a DocSection or Note emits. Deferred to the resolution flush
+        # rather than written per file: the file_ref branch matches on a path
+        # SUFFIX, which no index can serve, so it scans the project once per call.
+        # An ambiguous match — more than one candidate node — stays unresolved.
+        async def resolve_doc_links(self, project_name: str, doc_rels: list[ParsedRelationship]) -> None: ...
+
         # gc_orphaned_reference_nodes deletes EnvVar/ResourceFile nodes with
         # zero incoming edges. Those labels get no structural edges, so
         # incoming-edge count is their reference count. Run it AFTER the

@@ -121,6 +121,7 @@ _NOT_COMPARED: dict[str, str] = {
     "resolve_member_defines": "resolution pass",
     "resolve_config_refs": "resolution pass",
     "resolve_anchors": "resolution pass",
+    "resolve_doc_links": "resolution pass",
     "resolve_citations": "resolution pass",
     "resolve_cross_project_imports": "resolution pass",
     "resolve_protocol_conformance": "returns 0 unconditionally on SQLite — a known, recorded gap",

@@ -138,17 +138,12 @@ _UID_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
     }
 )
 
-# Routed by _create_relationships via name/path matching (INHERITS/IMPLEMENTS
-# by type name, DOCUMENTS by symbol or file-path suffix via _create_doc_links).
-# IMPLEMENTS also has a uid-shaped path (detector-emitted target uids), but it
-# always falls back to this name-matched route for parser-emitted bare names.
-# DOCUMENTS has two further post-batch routes that carry no ParsedRelationship
-# of their own: resolve_anchors (link_type='anchor') and resolve_citations
-# (link_type='citation', driven by the entity's `citations` property).
+# Routed by _create_relationships via name matching (INHERITS/IMPLEMENTS by type
+# name). IMPLEMENTS also has a uid-shaped path (detector-emitted target uids), but
+# it always falls back to this name-matched route for parser-emitted bare names.
 _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
     {
         RelType.IMPLEMENTS,
-        RelType.DOCUMENTS,
     }
 )
 
@@ -216,6 +211,17 @@ _POST_BATCH_REL_TYPES: frozenset[RelType] = frozenset(
         # _create_relationships. Written at create time the MATCH simply found nothing,
         # so 43 of 45 classes with a base carried no inheritance edge at all.
         RelType.INHERITS,
+        # Every DOCUMENTS route is post-batch. The heuristic ones (symbol_mention,
+        # file_ref) used to resolve inline in _create_relationships, which made a
+        # whole-graph scan part of writing each doc file: measured 57ms per file
+        # against a 78k-node graph, and trading-bot is 2,651 doc files. Pooling them
+        # into the flush also fixes a correctness hole the inline route could not —
+        # a doc referencing a file indexed LATER in the same run saw a target that
+        # did not exist yet, and the reference was silently dropped rather than
+        # retried. Two DOCUMENTS lanes were already post-batch — anchors via
+        # resolve_anchors, and citations via resolve_citations, the latter driven by
+        # the entity's `citations` property — and resolve_doc_links now joins them.
+        RelType.DOCUMENTS,
     }
 )
 
@@ -746,7 +752,7 @@ def _resolve_anchor_path(project: str, path: str, lookup: _AnchorLookup) -> tupl
     """Resolve a path anchor to ``(file_uid, file_content_hash)`` within *project*.
 
     Exact ``file_path`` match first; falls back to a unique-suffix match
-    (mirrors the suffix convention ``_create_doc_links`` uses for file
+    (mirrors the suffix convention ``resolve_doc_links`` uses for file
     refs). An ambiguous exact or suffix match resolves to nothing rather
     than guessing.
     """
@@ -1005,7 +1011,7 @@ def _pick_citation_target(key: tuple[str, int], lookup: _CitationLookup) -> tupl
     ambiguity, it is one document described twice. A genuine tie *within* the
     winning rank (two ``0014-*.md`` files in two ``adr/`` directories) resolves
     to nothing rather than guessing, matching the never-multi-link discipline
-    ``resolve_anchors``/``_create_doc_links`` already use.
+    ``resolve_anchors``/``resolve_doc_links`` already use.
 
     The winning rank also fixes the confidence written onto the edge
     (``_CITATION_RANK_CONFIDENCE``): a weaker form of evidence still links,
@@ -3027,7 +3033,7 @@ class GraphClient:
         — doc → code, like every other DOCUMENTS edge (see the DIRECTION note
         in this module's citation section). ``link_type`` distinguishes these
         from ``'anchor'`` edges and from the heuristic ``'explicit'``/
-        ``'symbol_mention'``/``'file_ref'`` links ``_create_doc_links`` emits,
+        ``'symbol_mention'``/``'file_ref'`` links ``resolve_doc_links`` emits,
         and ``confidence`` reflects how the document was identified — 1.0 only
         for a numbered file in a scheme-named directory.
 
@@ -5985,9 +5991,9 @@ class GraphClient:
                 {"rels": rel_params},
             )
 
-        # Name-matched rels. INHERITS is deliberately absent — see _POST_BATCH_REL_TYPES.
+        # Name-matched rels. INHERITS and DOCUMENTS are deliberately absent — see
+        # _POST_BATCH_REL_TYPES.
         implements_rels = [r for r in other_rels if r.rel_type == RelType.IMPLEMENTS]
-        doc_rels = [r for r in other_rels if r.rel_type == RelType.DOCUMENTS]
 
         for name_rel_type, name_rels in ((RelType.IMPLEMENTS, implements_rels),):
             if not name_rels:
@@ -6003,11 +6009,12 @@ class GraphClient:
                 {"rels": params},
             )
 
-        if doc_rels:
-            await self._create_doc_links(project_name, doc_rels)
-
-    async def _create_doc_links(self, project_name: str, doc_rels: list[ParsedRelationship]) -> None:
+    async def resolve_doc_links(self, project_name: str, doc_rels: list[ParsedRelationship]) -> None:
         """Create DOCUMENTS edges via batched name/path matching.
+
+        Runs in the deferred resolution flush, not per file — see
+        ``_POST_BATCH_REL_TYPES``. Pooling matters most for the file-path
+        branch, whose match cannot use an index at all (below).
 
         Two batched queries: one for symbol-based links (exact name match),
         one for file-path-based links (suffix match on file_path). The
@@ -6057,19 +6064,7 @@ class GraphClient:
             created += records[0]["cnt"] if records else 0
 
         if file_params:
-            records = await self.execute(
-                f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}) "
-                f"WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
-                f"MATCH (b {{project_name: $project}}) WHERE b.file_path ENDS WITH r.to_name "
-                f"AND NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
-                f"WITH r, a, collect(b) AS candidates WHERE size(candidates) = 1 "
-                f"WITH r, a, candidates[0] AS b "
-                f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
-                f"RETURN count(e) AS cnt",
-                {"rels": file_params, "project": project_name},
-            )
-            created += records[0]["cnt"] if records else 0
+            created += await self._create_file_ref_links(project_name, file_params)
 
         attempted = len(doc_rels)
         if created < attempted:
@@ -6079,6 +6074,69 @@ class GraphClient:
                 attempted,
                 project_name,
             )
+
+    async def _create_file_ref_links(self, project_name: str, file_params: list[dict[str, Any]]) -> int:
+        """Resolve file-path DOCUMENTS refs against ONE grouped scan of the project.
+
+        ``ENDS WITH`` cannot use an index, and the original inline form matched an
+        unlabelled ``(b {project_name: ...})``, which cannot use one either — so it
+        scanned every node in the graph, not just the project's. Measured at ~57ms
+        against 78k nodes, once per doc file written; trading-bot has 2,651 of them.
+        The scan itself is unavoidable while the predicate is a suffix test. Doing it
+        once per flush rather than once per file is the whole optimisation.
+
+        One row per distinct ``file_path`` (thousands) instead of one per node (tens
+        of thousands). The ambiguity rule counts NODES, not paths, so each path
+        carries its node count and the counts are summed across every path a ref
+        matches — two entities in one file and one entity in each of two files are
+        both ambiguous, and both stay unresolved, exactly as ``size(candidates) = 1``
+        decided before.
+
+        Suffix matching moves to Python, where ``str.endswith`` reproduces Cypher's
+        ``ENDS WITH`` exactly — including matches that do not land on a path
+        separator (``a/xbar.py`` ENDS WITH ``bar.py``), which the graph-side form
+        also accepted. Narrowing that to segment-aligned matches would be a
+        behaviour change, not a translation, so it is deliberately not done here.
+        """
+        rows = await self.execute(
+            f"MATCH (b:{NodeLabel.ENTITY} {{project_name: $project}}) "
+            f"WHERE b.file_path IS NOT NULL "
+            f"AND NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
+            f"RETURN b.file_path AS fp, count(b) AS n, collect(b.uid)[0] AS uid",
+            {"project": project_name},
+        )
+        if not rows:
+            return 0
+        paths = [(r["fp"], r["n"], r["uid"]) for r in rows]
+
+        pairs: list[dict[str, Any]] = []
+        for entry in file_params:
+            to_name = entry["to_name"]
+            matched = [(n, uid) for fp, n, uid in paths if fp.endswith(to_name)]
+            if sum(n for n, _ in matched) != 1:
+                continue
+            pairs.append(
+                {
+                    "from_uid": entry["from_uid"],
+                    "to_uid": matched[0][1],
+                    "link_type": entry["link_type"],
+                    "confidence": entry["confidence"],
+                }
+            )
+        if not pairs:
+            return 0
+
+        # Both endpoints are now uid seeks, so the write no longer scans at all.
+        records = await self.execute(
+            f"UNWIND $rels AS r "
+            f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}) "
+            f"WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
+            f"MATCH (b:{NodeLabel.ENTITY} {{uid: r.to_uid}}) "
+            f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
+            f"RETURN count(e) AS cnt",
+            {"rels": pairs},
+        )
+        return records[0]["cnt"] if records else 0
 
     async def _apply_full_schema(self) -> None:
         """Apply all constraints, indices, vector indices, and text indices.

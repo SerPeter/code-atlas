@@ -25,7 +25,7 @@ the *caller* (``docker build <ctx>``, compose ``build.context``) and never
 stated in the Dockerfile, so these paths are only repo-relative under the usual
 root-context convention. And nothing in GraphClient routes a relationship by
 file path from a non-doc node — the one path-suffix resolver
-(``_create_doc_links``) requires a DocSection/Note source. Keeping them as
+(``resolve_doc_links``) requires a DocSection/Note source. Keeping them as
 normalized paths leaves the join available (``MATCH (m:Module) WHERE
 m.file_path IN stage.copy_sources``) without minting a bogus ExternalSymbol for
 every path that happens not to match.

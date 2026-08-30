@@ -934,7 +934,13 @@ async def test_upsert_with_documents_rels(graph_client: GraphClient):
         ),
     ]
 
-    await graph_client.upsert_file_entities(project, doc_fp, entities, relationships)
+    # DOCUMENTS is post-batch now (see _POST_BATCH_REL_TYPES): the upsert writes the
+    # structural rels, the resolution flush creates the doc links. Mirrors consumers.py.
+    doc_rels = [r for r in relationships if r.rel_type == RelType.DOCUMENTS]
+    await graph_client.upsert_file_entities(
+        project, doc_fp, entities, [r for r in relationships if r.rel_type != RelType.DOCUMENTS]
+    )
+    await graph_client.resolve_doc_links(project, doc_rels)
 
     # Verify DOCUMENTS edge was created with correct properties
     records = await graph_client.execute(
@@ -1028,7 +1034,7 @@ def _split_anchor_rels(
 ) -> tuple[list[ParsedRelationship], list[ParsedRelationship]]:
     """Mirror consumers.py's ``_is_anchor`` split — anchor-type DOCUMENTS rels are
     resolved separately via ``resolve_anchors``, not through the immediate
-    ``_create_relationships``/``_create_doc_links`` path (see indexing/consumers.py)."""
+    ``_create_relationships``/``resolve_doc_links`` path (see indexing/consumers.py)."""
     anchor_rels = [
         r for r in relationships if r.rel_type == RelType.DOCUMENTS and r.properties.get("link_type") == "anchor"
     ]
@@ -1502,7 +1508,7 @@ async def test_delete_anchored_entity_marks_note_broken(graph_client: GraphClien
     assert gone[0]["cnt"] == 0
 
 
-async def test_create_doc_links_ambiguous_match_creates_no_edge(graph_client: GraphClient):
+async def test_resolve_doc_links_ambiguous_match_creates_no_edge(graph_client: GraphClient):
     """Two same-named callables in a project: a heuristic doc ref is left unresolved,
     not fanned out into one edge per candidate (the multi-link bug this fix closes)."""
     await graph_client.ensure_schema()
@@ -1542,7 +1548,10 @@ async def test_create_doc_links_ambiguous_match_creates_no_edge(graph_client: Gr
             properties={"link_type": "symbol_mention", "confidence": 0.8},
         ),
     ]
-    await graph_client.upsert_file_entities(project, doc_fp, doc_entities, doc_rels)
+    # Post-batch: the upsert carries no DOCUMENTS, resolve_doc_links decides. Passing
+    # doc_rels to the upsert instead would make this assertion pass vacuously.
+    await graph_client.upsert_file_entities(project, doc_fp, doc_entities, [])
+    await graph_client.resolve_doc_links(project, doc_rels)
 
     records = await graph_client.execute(
         f"MATCH (:{NodeLabel.DOC_SECTION} {{project_name: $p}})-[:{RelType.DOCUMENTS}]->() RETURN count(*) AS cnt",
@@ -1551,7 +1560,7 @@ async def test_create_doc_links_ambiguous_match_creates_no_edge(graph_client: Gr
     assert records[0]["cnt"] == 0
 
 
-async def test_create_doc_links_excludes_note_and_docsection_targets(graph_client: GraphClient):
+async def test_resolve_doc_links_excludes_note_and_docsection_targets(graph_client: GraphClient):
     """A heuristic doc ref never lands on another Note, even on an exact name match."""
     await graph_client.ensure_schema()
     project = "doclink_excl"
@@ -1596,13 +1605,120 @@ async def test_create_doc_links_excludes_note_and_docsection_targets(graph_clien
             properties={"link_type": "symbol_mention", "confidence": 0.8},
         ),
     ]
-    await graph_client.upsert_file_entities(project, doc_fp, doc_entities, doc_rels)
+    # Post-batch: see the ambiguous-match test above for why doc_rels must not go
+    # through the upsert here.
+    await graph_client.upsert_file_entities(project, doc_fp, doc_entities, [])
+    await graph_client.resolve_doc_links(project, doc_rels)
 
     records = await graph_client.execute(
         f"MATCH (:{NodeLabel.DOC_SECTION} {{project_name: $p}})-[:{RelType.DOCUMENTS}]->() RETURN count(*) AS cnt",
         {"p": project},
     )
     assert records[0]["cnt"] == 0
+
+
+def _doc_section_with_file_ref(project: str, doc_fp: str, to_name: str) -> tuple[list, list]:
+    """A DocFile + DocSection pair emitting one ``is_file_ref`` DOCUMENTS ref."""
+    section_qn = f"{project}:{doc_fp} > Overview"
+    entities = [
+        ParsedEntity(
+            name=doc_fp.rsplit("/", 1)[-1],
+            qualified_name=f"{project}:{doc_fp}",
+            label=NodeLabel.DOC_FILE,
+            kind="doc_file",
+            line_start=1,
+            line_end=5,
+            file_path=doc_fp,
+        ),
+        ParsedEntity(
+            name="Overview",
+            qualified_name=section_qn,
+            label=NodeLabel.DOC_SECTION,
+            kind="section",
+            line_start=1,
+            line_end=5,
+            file_path=doc_fp,
+        ),
+    ]
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=section_qn,
+            rel_type=RelType.DOCUMENTS,
+            to_name=to_name,
+            properties={"link_type": "file_ref", "confidence": 0.85, "is_file_ref": True},
+        )
+    ]
+    return entities, rels
+
+
+async def _doc_link_targets(graph_client: GraphClient, project: str) -> list[str]:
+    records = await graph_client.execute(
+        f"MATCH (:{NodeLabel.DOC_SECTION} {{project_name: $p}})-[:{RelType.DOCUMENTS}]->(b) "
+        "RETURN b.file_path AS fp ORDER BY fp",
+        {"p": project},
+    )
+    return [r["fp"] for r in records]
+
+
+async def test_resolve_doc_links_file_ref_resolves_to_a_single_entity_file(graph_client: GraphClient):
+    """The happy path for the file_ref branch: one path, one entity, one edge."""
+    await graph_client.ensure_schema()
+    project = "docfile_solo"
+    await graph_client.upsert_file_entities(
+        project, "src/solo.py", [_make_entity(project, "helper", "src/solo.py", content_hash="s1")], []
+    )
+
+    doc_fp = "docs/architecture.md"
+    entities, rels = _doc_section_with_file_ref(project, doc_fp, "src/solo.py")
+    await graph_client.upsert_file_entities(project, doc_fp, entities, [])
+    await graph_client.resolve_doc_links(project, rels)
+
+    assert await _doc_link_targets(graph_client, project) == ["src/solo.py"]
+
+
+async def test_resolve_doc_links_file_ref_is_ambiguous_within_one_file(graph_client: GraphClient):
+    """Two entities in the referenced file: ambiguity is counted in NODES, not paths,
+    so a single matching path with two entities still resolves to nothing."""
+    await graph_client.ensure_schema()
+    project = "docfile_twoents"
+    fp = "src/pair.py"
+    await graph_client.upsert_file_entities(
+        project,
+        fp,
+        [
+            _make_entity(project, "alpha", fp, content_hash="a1"),
+            _make_entity(project, "beta", fp, content_hash="b1"),
+        ],
+        [],
+    )
+
+    doc_fp = "docs/architecture.md"
+    entities, rels = _doc_section_with_file_ref(project, doc_fp, fp)
+    await graph_client.upsert_file_entities(project, doc_fp, entities, [])
+    await graph_client.resolve_doc_links(project, rels)
+
+    assert await _doc_link_targets(graph_client, project) == []
+
+
+async def test_resolve_doc_links_file_ref_is_ambiguous_across_two_paths(graph_client: GraphClient):
+    """A bare ``util.py`` suffix matches two different files with one entity each.
+
+    Per path the count is 1, so a per-path uniqueness check would happily create two
+    edges — or arbitrarily pick one. The rule is one candidate node in TOTAL across
+    every matching path, which is what the graph-side ``size(candidates) = 1``
+    decided when the suffix match still ran in Cypher.
+    """
+    await graph_client.ensure_schema()
+    project = "docfile_twopaths"
+    for fp, name in (("pkg/a/util.py", "reada"), ("pkg/b/util.py", "readb")):
+        await graph_client.upsert_file_entities(project, fp, [_make_entity(project, name, fp, content_hash=name)], [])
+
+    doc_fp = "docs/architecture.md"
+    entities, rels = _doc_section_with_file_ref(project, doc_fp, "util.py")
+    await graph_client.upsert_file_entities(project, doc_fp, entities, [])
+    await graph_client.resolve_doc_links(project, rels)
+
+    assert await _doc_link_targets(graph_client, project) == []
 
 
 # ---------------------------------------------------------------------------
@@ -6177,7 +6293,15 @@ class TestDbtModelDescription:
     async def _upsert(graph_client, project: str, path: str, source: bytes) -> None:
         parsed = parse_file(path, source, project)
         assert parsed is not None
-        await graph_client.upsert_file_entities(project, path, parsed.entities, parsed.relationships)
+        # DOCUMENTS is post-batch (see _POST_BATCH_REL_TYPES), so the upsert no longer
+        # creates it — the consumer buffers it for the resolution flush. Mirrored here
+        # because this drives the graph client directly, without the consumer.
+        doc_rels = [r for r in parsed.relationships if r.rel_type == RelType.DOCUMENTS]
+        await graph_client.upsert_file_entities(
+            project, path, parsed.entities, [r for r in parsed.relationships if r.rel_type != RelType.DOCUMENTS]
+        )
+        if doc_rels:
+            await graph_client.resolve_doc_links(project, doc_rels)
 
     @staticmethod
     async def _state(graph_client, project: str) -> tuple[list[str], str | None]:

@@ -967,7 +967,6 @@ class SqliteGraphClient:
 
         direct_rels: list[ParsedRelationship] = []
         implements_rels: list[ParsedRelationship] = []
-        doc_rels: list[ParsedRelationship] = []
 
         for r in relationships:
             # Post-batch types (CALLS/IMPORTS/USES_TYPE/READS_ENV/REFERENCES_FILE)
@@ -979,8 +978,6 @@ class SqliteGraphClient:
                 continue
             if r.rel_type.value == "IMPLEMENTS" and ":" not in r.to_name:
                 implements_rels.append(r)
-            elif r.rel_type.value == "DOCUMENTS":
-                doc_rels.append(r)
             else:
                 direct_rels.append(r)
 
@@ -1010,16 +1007,19 @@ class SqliteGraphClient:
                         (r.from_qualified_name, target[0], name_rel_type),
                     )
 
-        if doc_rels:
-            await self._create_doc_links(conn, project_name, doc_rels)
+    async def resolve_doc_links(self, project_name: str, doc_rels: list[ParsedRelationship]) -> None:
+        """Simplified port of ``GraphClient.resolve_doc_links`` — per-relationship
+        matching instead of batched queries; same never-multi-link discipline (an
+        ambiguous match is left unresolved).
 
-    async def _create_doc_links(
-        self, conn: aiosqlite.Connection, project_name: str, doc_rels: list[ParsedRelationship]
-    ) -> None:
-        """Simplified port of ``GraphClient._create_doc_links`` — per-relationship
-        matching instead of two batched UNWIND queries; same never-multi-link
-        discipline (an ambiguous match is left unresolved).
+        Deferred to the resolution flush like its Memgraph counterpart: DOCUMENTS is
+        in ``_POST_BATCH_REL_VALUES`` now, so the create phase above skips it. The
+        ``file_path LIKE '%suffix'`` scan is unindexable here too, so the win is the
+        same — it runs once per flush instead of once per doc file.
         """
+        if not doc_rels:
+            return
+        conn = await self._get_conn()
         for r in doc_rels:
             props = r.properties
             entry_props = json.dumps(
@@ -1044,6 +1044,7 @@ class SqliteGraphClient:
                     "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'DOCUMENTS', ?)",
                     (r.from_qualified_name, candidates[0][0], entry_props),
                 )
+        await conn.commit()
 
     async def _recreate_file_relationships(
         self,

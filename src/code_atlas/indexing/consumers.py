@@ -689,6 +689,11 @@ class _ParsedFileData:
     ref_rels: list[ParsedRelationship]
     member_rels: list[ParsedRelationship]
     anchor_rels: list[ParsedRelationship]
+    # Heuristic DOCUMENTS (symbol_mention / file_ref / explicit). Deferred for
+    # cost rather than for visibility: resolving one inline meant a whole-graph
+    # scan per doc file, and pooling them into the flush also lets a reference to
+    # a file indexed later in the same run resolve instead of being dropped.
+    doc_rels: list[ParsedRelationship]
     # READS_ENV / REFERENCES_FILE. Deferred like imports because the target
     # EnvVar/ResourceFile node does not exist until resolution MERGEs it.
     config_rels: list[ParsedRelationship]
@@ -711,6 +716,7 @@ _SENTINEL_DELETED = _ParsedFileData(
     ref_rels=[],
     member_rels=[],
     anchor_rels=[],
+    doc_rels=[],
     config_rels=[],
     citations={},
 )
@@ -775,6 +781,12 @@ class ASTConsumer(TierConsumer):
         self._pending_ref_rels: list[ParsedRelationship] = []
         self._pending_member_rels: list[ParsedRelationship] = []
         self._pending_anchor_rels: list[ParsedRelationship] = []
+        # project_name -> {file_path: rels}. Keyed by FILE, not a flat list: each
+        # parse deletes the file's outbound edges and then re-buffers its rels, so
+        # a file parsed twice before one flush would otherwise contribute its rels
+        # twice and CREATE every DOCUMENTS edge twice over. Keying by path makes the
+        # second parse overwrite the first, which is what the delete already assumed.
+        self._pending_doc_rels: dict[str, dict[str, list[ParsedRelationship]]] = {}
         # Notes re-parsed this flush. Drives the supersession stamp pass, which is
         # scoped to these rather than sweeping the project: a project-wide pass
         # inside the batch loop is erased by the next batch (ADR-0026).
@@ -855,6 +867,7 @@ class ASTConsumer(TierConsumer):
             + len(self._pending_anchor_rels)
             + len(self._pending_note_uids)
             + len(self._pending_config_rels)
+            + sum(len(rels) for by_file in self._pending_doc_rels.values() for rels in by_file.values())
         )
 
     async def _flush_deferred_resolution(self, *, final: bool = False) -> None:  # noqa: PLR0912, PLR0915
@@ -935,6 +948,20 @@ class ASTConsumer(TierConsumer):
                 r for r in self._pending_member_rels if r.from_qualified_name.startswith(project_name + ":")
             ]
             proj_config = [r for r in self._pending_config_rels if r.from_qualified_name.startswith(project_name + ":")]
+
+            # Strictly BEFORE resolve_imports, which MERGEs ExternalSymbol/
+            # ExternalPackage stubs. Those carry a `name`, so the symbol branch would
+            # match them — and docs name libraries constantly. Resolving inline, this
+            # ran during the file's own upsert and never saw the same flush's stubs;
+            # running it here keeps that candidate set rather than quietly widening it
+            # under cover of a performance change. Already keyed by project, so no
+            # from_qualified_name filter. Pooling every buffered file into one call is
+            # the point: the file-ref branch scans the project once per call, and it
+            # used to run once per doc file.
+            proj_doc_rels = [r for rels in self._pending_doc_rels.get(project_name, {}).values() for r in rels]
+            if proj_doc_rels:
+                await self.graph.resolve_doc_links(project_name, proj_doc_rels)
+                self.note_progress()
 
             retry = self._retry_rels.setdefault(project_name, {})
             all_stale = self._stale_candidate_rels
@@ -1076,6 +1103,7 @@ class ASTConsumer(TierConsumer):
         self._pending_ref_rels.clear()
         self._pending_member_rels.clear()
         self._pending_anchor_rels.clear()
+        self._pending_doc_rels.clear()
         self._pending_note_uids.clear()
         self._pending_config_rels.clear()
         self._pending_citations.clear()
@@ -1150,6 +1178,9 @@ class ASTConsumer(TierConsumer):
             RelType.INHERITS,
             RelType.REFERENCES,
             RelType.REGISTERED_BY,
+            # Both DOCUMENTS lanes are post-batch: anchors via resolve_anchors,
+            # heuristic symbol/file refs via resolve_doc_links.
+            RelType.DOCUMENTS,
         } | _CONFIG_REF_REL_TYPES
 
         def _is_member(r: ParsedRelationship) -> bool:
@@ -1158,9 +1189,11 @@ class ASTConsumer(TierConsumer):
             return r.rel_type == RelType.DEFINES and "parent_type_name" in r.properties
 
         def _is_anchor(r: ParsedRelationship) -> bool:
-            # Explicit anchors: frontmatter DOCUMENTS edges — resolved post-batch
-            # via GraphClient.resolve_anchors (path/uid/symbol resolution needs
-            # a cross-project lookup, unlike the immediate heuristic doc-links).
+            # Explicit anchors: frontmatter DOCUMENTS edges — resolved by
+            # GraphClient.resolve_anchors, whose path/uid/symbol lookup is
+            # cross-project. The heuristic refs go to resolve_doc_links, which is
+            # per-project. DOCUMENTS as a whole is deferred (see _deferred above),
+            # so this only picks which of the two lanes a rel belongs to.
             return r.rel_type == RelType.DOCUMENTS and r.properties.get("link_type") == "anchor"
 
         def _keep_config_ref(r: ParsedRelationship) -> bool:
@@ -1182,11 +1215,7 @@ class ASTConsumer(TierConsumer):
             file_path=file_path,
             parsed_file=parsed,
             entities=parsed.entities,
-            non_import_rels=[
-                r
-                for r in parsed.relationships
-                if r.rel_type not in _deferred and not _is_member(r) and not _is_anchor(r)
-            ],
+            non_import_rels=[r for r in parsed.relationships if r.rel_type not in _deferred and not _is_member(r)],
             import_rels=[r for r in parsed.relationships if r.rel_type == RelType.IMPORTS],
             call_rels=[r for r in parsed.relationships if r.rel_type == RelType.CALLS],
             # Signature-derived USES_TYPE resolves through the Callable lookup; one whose
@@ -1203,6 +1232,7 @@ class ASTConsumer(TierConsumer):
                 or (r.rel_type == RelType.USES_TYPE and r.properties.get("on") == "value")
             ],
             anchor_rels=[r for r in parsed.relationships if _is_anchor(r)],
+            doc_rels=[r for r in parsed.relationships if r.rel_type == RelType.DOCUMENTS and not _is_anchor(r)],
             member_rels=[r for r in parsed.relationships if _is_member(r)],
             config_rels=[r for r in parsed.relationships if _keep_config_ref(r)],
             citations={e.qualified_name: list(e.citations) for e in parsed.entities if e.citations},
@@ -1505,6 +1535,12 @@ class ASTConsumer(TierConsumer):
                 self._pending_ref_rels.extend(group_ref_rels)
                 self._pending_member_rels.extend(group_member_rels)
                 self._pending_anchor_rels.extend(group_anchor_rels)
+                # Every re-parsed file is recorded, doc rels or not: an empty list
+                # overwrites a previous parse's entries, which is what makes a file
+                # whose last reference was just deleted stop re-creating the edge.
+                self._pending_doc_rels.setdefault(project_name, {}).update(
+                    {fp: pfd.doc_rels for fp, pfd in parsed_files.items()}
+                )
                 self._pending_note_uids.update(
                     f"{project_name}:{e.qualified_name}"
                     for pfd in parsed_files.values()
