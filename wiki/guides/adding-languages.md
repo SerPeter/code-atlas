@@ -191,7 +191,7 @@ Every parsed file **must** emit at least one `Module` entity representing the fi
 
 ```python
 ParsedEntity(
-    name="filename",                           # Short name
+    name="filename",  # Short name
     qualified_name=f"{project_name}:{module_qn}",  # Unique identifier
     label=NodeLabel.MODULE,
     kind="module",

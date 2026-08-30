@@ -34,7 +34,10 @@ place: those objects were downstream of genuinely leaked clients.
 4. **A `finally` is not a substitute.** The guard is the block, and the block starts at the constructor. Anything
    between construction and the guard is unguarded, which is where every leak in this codebase was.
 5. **`ResourceWarning` is fatal.** This is the enforcement mechanism, not a preference. It is the only thing that
-   distinguishes a client that is closed from one that merely looks closed.
+   distinguishes a client that is closed from one that merely looks closed. Exemptions are allowed but must be scoped to
+   the class that needs them, never global: the only one is `TestUiInstances`, whose subject is a socket deliberately
+   kept bound and handed to uvicorn. A global ignore cannot tell that from a real leak, which is exactly how the
+   previous leaks survived.
 
 Ownership is deliberately _not_ uniform where lifetimes differ: the CLI's embedding-dimension probe takes a block
 because it is used once; the daemon closes the `EmbedClient` it constructed but never the bus it was handed; the MCP

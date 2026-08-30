@@ -243,6 +243,11 @@ filterwarnings = [
     # scoped suite and read the *objects* reported, never the test names. Re-adding
     # "ignore::ResourceWarning" here silences the messenger and is how the last one
     # stayed hidden.
+    #
+    # There is exactly one exemption, and it is class-scoped rather than global:
+    # TestUiInstances in tests/unit/server/test_web.py, whose subject is a socket
+    # deliberately kept bound and handed to uvicorn. Keep exemptions at that scope --
+    # a global one cannot tell that case from a real leak, which is the whole problem.
 ]
 
 # --------------------------------------------------------------------------- #

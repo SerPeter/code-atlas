@@ -14,6 +14,7 @@ semantic recall and is often all an agent sees (truncated to 200 chars in result
 def parse_file(path: Path) -> ParsedFile | None:
     """Parse a single source file into an AST and extract entities."""
 
+
 # Don't
 def parse_file(path: Path) -> ParsedFile | None:
     """This function takes a path and does parsing."""
@@ -72,6 +73,7 @@ class EventBus:
     async def publish(self): ...
     async def subscribe(self): ...
 
+
 # Don't
 class EB:
     async def pub(self): ...
@@ -88,7 +90,9 @@ detectors that recognize `@app.route()`, `@app.command()`, `test_*` prefixes, et
 @router.get("/api/users")
 async def list_users(): ...
 
+
 def test_parse_file(): ...
+
 
 # Don't — invisible to detectors
 for name, func in commands.items():
@@ -104,6 +108,7 @@ invisible to AST parsing.
 ```python
 # Do
 class ASTConsumer(TierConsumer): ...
+
 
 # Don't
 Consumer = make_consumer(TierConsumer, features=["ast"])
