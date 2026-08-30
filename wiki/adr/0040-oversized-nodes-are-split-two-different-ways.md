@@ -77,8 +77,18 @@ neither is evidence of a defect.
 alone, and reaching a chunk that way would put it into relationship linking, package containment, the marker sweep and
 the embed-dedup lookup, none of which have any business seeing one. The price is that a chunk has no edge to its parent
 either — the link is a `parent_uid` property — so a deleted parent strands its chunks, and they need their own orphan
-sweep next to the reference-node one. Chunk vectors are also invisible to embed dedup, which reads through
-`:Entity(embed_hash)`; that costs a little re-embedding and keeps the marker's meaning intact.
+sweep next to the reference-node one.
+
+**Amended the same day.** This originally read that chunk vectors are invisible to embed dedup, which reads through
+`:Entity(embed_hash)`, and called that "a little re-embedding" worth paying to keep the marker's meaning intact. That
+was wrong about the cost. The splitter descends a ladder starting at blank lines and re-anchors there, so it is already
+sticky: measured over 40 random edit positions, a one-line insert into a 298-chunk file changes one chunk and a 200-line
+insert changes two. Every other chunk stays byte-identical — and every one of them was being re-embedded anyway, because
+the re-embed unit is the parent entity. So `find_embeddings_by_hash` now consults `:EmbedChunk` (`embed_hash`-indexed)
+as a second statement. A chunk is in fact the better dedup source of the two: its `embed_hash` is the hash of its own
+text, where a split parent's is the hash of the whole text, which no single vector corresponds to. The marker keeps its
+meaning — this is a hash lookup, not a uid one, and nothing that asks about _code_ reaches a chunk through it. The
+SQLite backend had been doing this all along, matching `nodes` without a label filter.
 
 Splitting a DocSection changes node identity for content that was previously one node. Part 1 keeps the qualified_name,
 so the re-parse updates it in place and the AST diff adds the rest; schema v17 clears the freshness markers so an
