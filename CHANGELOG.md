@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.10.3 (2026-08-30)
+
+### Bug Fixes
+
+- **indexing**: Raise max_source_chars so oversized code can actually chunk
+  ([`73f8b3e`](https://github.com/SerPeter/code-atlas/commit/73f8b3eefa9306448868db8ccf2ca184fca8d02b))
+
+
 ## v0.10.2 (2026-08-30)
 
 ### Bug Fixes
