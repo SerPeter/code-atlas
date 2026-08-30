@@ -100,6 +100,13 @@ src/code_atlas/
 embed stage asks whether any node — any project, any label — already has a vector for the same `embed_hash`
 under the same model, and copies it. Valkey carries streams, consumer groups and the indexer lease only.
 
+**Oversized nodes (ADR-0040):** set `[embeddings] max_input_tokens` for any routed model name — litellm's
+registry has no entry for one, and an unknown cap means no chunking and no truncation, so a single
+over-length node fails the whole 128-text provider call it was batched into. Past the cap, a _document_
+section splits into several nodes (`#partN`) while _code_ keeps one node and gains `EmbedChunk` overflow
+vectors, scored at the node's best chunk. A code entity that needs chunking logs a warning; that is usually
+a function too large to be one unit. Notes are never split — their uid is an address `LINKS_TO` points at.
+
 ## Code Style
 
 - Python 3.14+, line length 120

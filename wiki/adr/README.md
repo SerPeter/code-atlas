@@ -50,6 +50,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0037](./0037-telemetry-is-a-product-surface-not-a-debug-aid.md)      | Telemetry Is A Product Surface, Not A Debug Aid                | Accepted                      | 2026-08-29 |
 | [0038](./0038-backends-are-owned-by-a-composition-root.md)            | Backends Are Owned By A Composition Root                       | Accepted                      | 2026-08-30 |
 | [0039](./0039-frontmatter-is-a-map-and-importance-is-a-multiplier.md) | Frontmatter Is A Map And Importance Is A Multiplier            | Accepted                      | 2026-08-30 |
+| [0040](./0040-oversized-nodes-are-split-two-different-ways.md)        | Oversized Nodes Are Split Two Different Ways                   | Accepted                      | 2026-08-30 |
 
 ## Creating a New ADR
 
