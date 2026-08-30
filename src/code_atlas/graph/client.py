@@ -4303,7 +4303,31 @@ class GraphClient:
             "RETURN h AS h, vec AS vec",
             {"hashes": list(dict.fromkeys(hashes)), "model": model},
         )
-        return {r["h"]: r["vec"] for r in rows if r["vec"]}
+        found = {r["h"]: r["vec"] for r in rows if r["vec"]}
+
+        # Overflow chunks too. They are not :Entity -- deliberately, so nothing that
+        # asks about code can reach one -- which put them outside this lookup and made
+        # every chunk of a re-embedded node a fresh provider call, even the ones whose
+        # text had not changed. The splitter cuts at blank lines and re-anchors there,
+        # so a one-line edit to a 298-chunk file leaves all but one chunk byte-identical
+        # (measured); without this those 297 were re-billed anyway.
+        #
+        # Second statement rather than one pattern: the label is inline for the same
+        # Memgraph ordering reason as above, and the two labels share no index to seek
+        # through. Entity wins on a collision, though it cannot differ -- equal hash
+        # means equal text means equal vector under one model.
+        missing = [h for h in dict.fromkeys(hashes) if h not in found]
+        if missing:
+            chunk_rows = await self.execute(
+                f"UNWIND $hashes AS h "
+                f"MATCH (c:{NodeLabel.EMBED_CHUNK} {{embed_hash: h}}) "
+                "WHERE c.embedding IS NOT NULL AND c.embed_model = $model "
+                "WITH h AS h, collect(c.embedding)[0] AS vec "
+                "RETURN h AS h, vec AS vec",
+                {"hashes": missing, "model": model},
+            )
+            found.update({r["h"]: r["vec"] for r in chunk_rows if r["vec"]})
+        return found
 
     async def clear_embeddings(self, project: str | None = None) -> int:
         """Remove vectors and embed hashes, for one project or the whole database.

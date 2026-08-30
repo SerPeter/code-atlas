@@ -420,7 +420,11 @@ _MARKER_INDEX_PROPERTIES: tuple[str, ...] = ("uid", "embed_hash")
 
 # ``parent_uid`` is the one that earns its keep: every read of a chunk is "which node
 # does this vector belong to", and every write of one is "drop this node's old chunks".
-_EMBED_CHUNK_INDEX_PROPERTIES: tuple[str, ...] = ("uid", "parent_uid", "project_name")
+# ``embed_hash`` earns its place the same way it does on the marker: it is the key the
+# dedup lookup seeks on. A chunk is an unusually good dedup source, because its
+# embed_hash is the hash of its OWN text -- where a split parent's is the hash of the
+# whole text, which no single vector corresponds to.
+_EMBED_CHUNK_INDEX_PROPERTIES: tuple[str, ...] = ("uid", "parent_uid", "project_name", "embed_hash")
 
 LABEL_PROPERTY_INDICES: tuple[IndexSpec, ...] = (
     *(

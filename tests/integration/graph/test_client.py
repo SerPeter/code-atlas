@@ -6120,3 +6120,50 @@ async def test_a_label_scope_still_excludes_other_labels(graph_client: GraphClie
     on_chunk = await _seed_chunked_callable(graph_client)
 
     assert await graph_client.vector_search(on_chunk, label="Note", limit=10) == []
+
+
+async def test_a_chunk_vector_can_be_copied_by_dedup(graph_client: GraphClient):
+    """The splitter re-anchors at blank lines, so a one-line edit leaves all but one
+    chunk of a long node byte-identical. Those were re-billed anyway, because the
+    lookup reads :Entity(embed_hash) and a chunk deliberately carries no marker."""
+    await graph_client.ensure_schema()
+    vec = [0.25] * graph_client._dimension
+    await graph_client.write_embed_chunks(
+        [EmbedChunkWrite("p:fn#chunk2", "p:fn", "p", 2, vec, "unchanged-chunk")],
+        model="model-x",
+    )
+
+    found = await graph_client.find_embeddings_by_hash(["unchanged-chunk", "absent"], "model-x")
+
+    assert set(found) == {"unchanged-chunk"}
+    assert found["unchanged-chunk"] == vec
+
+
+async def test_chunk_dedup_respects_the_model(graph_client: GraphClient):
+    """Guards the guard: two models coexist at one dimension, and no dimension check
+    can tell their spaces apart (ADR-0035)."""
+    await graph_client.ensure_schema()
+    await graph_client.write_embed_chunks(
+        [EmbedChunkWrite("p:fn#chunk2", "p:fn", "p", 2, [0.25] * graph_client._dimension, "h")],
+        model="model-x",
+    )
+
+    assert await graph_client.find_embeddings_by_hash(["h"], "model-y") == {}
+
+
+async def test_an_entity_still_wins_over_a_chunk(graph_client: GraphClient):
+    """Equal hash means equal text means equal vector, so this cannot differ — but the
+    entity path must not stop being consulted."""
+    await graph_client.ensure_schema()
+    dim = graph_client._dimension
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'p:e', project_name: 'p', name: 'e', "
+        "qualified_name: 'e', embed_hash: 'shared', embed_model: 'model-x', embedding: $v})",
+        {"v": [1.0] + [0.0] * (dim - 1)},
+    )
+    await graph_client.write_embed_chunks(
+        [EmbedChunkWrite("p:fn#chunk2", "p:fn", "p", 2, [0.0] * dim, "shared")], model="model-x"
+    )
+
+    found = await graph_client.find_embeddings_by_hash(["shared"], "model-x")
+    assert found["shared"][0] == 1.0
