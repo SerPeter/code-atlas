@@ -392,6 +392,59 @@ class MemgraphSettings(StrictSection):
     )
 
 
+class ImportancePathRule(StrictSection):
+    """A multiplicative ranking factor applied to results whose file path matches *glob*."""
+
+    glob: str = Field(
+        description="gitignore-style pattern matched against the repo-relative, forward-slashed "
+        "file path (same dialect as [scope] and .atlasignore): 'src/**', 'wiki/decisions/', '*.md'."
+    )
+    factor: float = Field(
+        gt=0.0, description="Multiplied into the result's rank score. >1 promotes, <1 demotes, 1.0 is a no-op."
+    )
+
+
+class ImportanceFrontmatterRule(StrictSection):
+    """A multiplicative ranking factor applied to results whose frontmatter matches *key*/*value*."""
+
+    key: str = Field(
+        description="Frontmatter key, dot-separated for nesting ('metadata.type'). Resolved against the "
+        "node's `frontmatter` map, falling back to a top-level node property — so keys promoted out of "
+        "the map ('kind', 'tags') stay addressable by their frontmatter name."
+    )
+    value: str | None = Field(
+        default=None,
+        description="Value to match. A list-valued key matches on membership, a scalar on equality; "
+        "string comparison is case-insensitive. Omit to match whenever the key is present and truthy.",
+    )
+    factor: float = Field(
+        gt=0.0, description="Multiplied into the result's rank score. >1 promotes, <1 demotes, 1.0 is a no-op."
+    )
+
+
+# A product of user-supplied factors is unbounded, and the failure is silent: one
+# mistyped `factor = 100` outranks every genuine signal in the fusion, and the result
+# reads as a broken ranker rather than as bad config. Clamping keeps a typo survivable.
+IMPORTANCE_FACTOR_MIN: float = 0.01
+IMPORTANCE_FACTOR_MAX: float = 100.0
+
+
+class ImportanceSettings(StrictSection):
+    """Optional per-result ranking adjustments, applied as multipliers after RRF fusion.
+
+    Every rule that matches contributes its factor, and the factors multiply -- two
+    1.5x rules on one result give 2.25x, not 1.5x. Empty (the default) is a no-op:
+    no rule lists means no matching work and byte-identical ranking.
+    """
+
+    paths: list[ImportancePathRule] = Field(default_factory=list)
+    frontmatter: list[ImportanceFrontmatterRule] = Field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        """True when no rules are configured -- lets the ranker skip matching entirely."""
+        return not self.paths and not self.frontmatter
+
+
 class SearchSettings(StrictSection):
     """Search and retrieval settings."""
 
@@ -416,6 +469,10 @@ class SearchSettings(StrictSection):
     default_weights: dict[str, float] = Field(
         default_factory=lambda: {"graph": 1.0, "vector": 1.0, "bm25": 1.0},
         description="Default per-channel weights for hybrid search RRF fusion.",
+    )
+    importance: ImportanceSettings = Field(
+        default_factory=ImportanceSettings,
+        description="Optional path- and frontmatter-based ranking multipliers.",
     )
 
 

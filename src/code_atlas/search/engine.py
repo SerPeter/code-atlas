@@ -13,16 +13,18 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+import pathspec
 import tiktoken
 from loguru import logger
 
 from code_atlas.schema import NodeLabel
+from code_atlas.settings import IMPORTANCE_FACTOR_MAX, IMPORTANCE_FACTOR_MIN
 from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 
 if TYPE_CHECKING:
     from typing import Protocol
 
-    from code_atlas.settings import SearchSettings
+    from code_atlas.settings import ImportanceSettings, SearchSettings
 
     class GraphExecutor(Protocol):
         """Structural subset of GraphClient needed by expand_context (neighborhood navigation)."""
@@ -112,6 +114,11 @@ class SearchResult:
     # Symmetric and NOT demoted: in an unresolved contradiction neither side is known
     # wrong, so demoting one would be the system picking a winner nobody picked.
     contradicts_with: tuple[str, ...] = ()
+    # The node's frontmatter map, for [search.importance] frontmatter rules. Already in
+    # the channel records (every query returns whole nodes), so carrying it costs no
+    # extra round trip. Empty for code entities, which have no frontmatter.
+    frontmatter: dict[str, Any] = field(default_factory=dict)
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -763,14 +770,97 @@ def _is_doc_result(result: SearchResult) -> bool:
 _SUPERSEDED_PENALTY = 0.5
 
 
+# Distinguishes "key absent from the map" (fall back to a promoted node field) from
+# "key present with value None", which must not fall back.
+_MISSING = object()
+
+
+@lru_cache(maxsize=256)
+def _compile_glob(glob: str) -> pathspec.PathSpec:
+    """Compile one gitignore-style importance pattern.
+
+    Cached because the rule set is fixed per process but ``_boost_results`` runs per query
+    over every fused hit -- recompiling would put pattern parsing on the hot path.
+    """
+    return pathspec.PathSpec.from_lines("gitignore", [glob])
+
+
+def _frontmatter_lookup(result: SearchResult, key: str) -> Any:
+    """Resolve a dotted frontmatter *key* against a result.
+
+    Falls back to the handful of fields note mode promotes *out* of the frontmatter map
+    (``kind``, ``tags``) so a rule can address them by the name they have in the file --
+    otherwise ``key = "kind"`` would silently never match on exactly the notes that
+    declare one.
+    """
+    head, _, rest = key.partition(".")
+    current: Any = result.frontmatter.get(head, _MISSING) if result.frontmatter else _MISSING
+    if current is _MISSING:
+        if rest:
+            return None
+        promoted = {"kind": result.kind, "tags": list(result.tags)}
+        return promoted.get(head)
+    for part in rest.split(".") if rest else []:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _value_matches(actual: Any, expected: str | None) -> bool:
+    """Does *actual* satisfy a frontmatter rule's *expected* value?
+
+    ``None`` means "present and truthy". A list matches on membership ("if a specific
+    value is in there"), a scalar on equality. Strings compare case-insensitively --
+    frontmatter is hand-written, and ``type: Decision`` failing a rule written as
+    ``decision`` is a config trap with no upside.
+    """
+    if expected is None:
+        return bool(actual)
+    if isinstance(actual, list):
+        return any(_value_matches(item, expected) for item in actual)
+    if isinstance(actual, str):
+        return actual.casefold() == expected.casefold()
+    if isinstance(actual, bool):
+        return str(actual).casefold() == expected.casefold()
+    return actual is not None and str(actual) == expected
+
+
+def importance_factor(result: SearchResult, importance: ImportanceSettings) -> float:
+    """Product of every configured importance rule matching *result*, clamped.
+
+    Rules compose multiplicatively rather than first-match-wins: "in src/ AND tagged
+    critical" should compound, and a first-match rule set would make the answer depend on
+    config order. The clamp bounds a typo -- see IMPORTANCE_FACTOR_MIN/MAX.
+    """
+    factor = 1.0
+    if importance.paths:
+        # pathspec matches POSIX-separated relative paths; file_path is stored that way
+        # already. Case-sensitive, like [scope] and .atlasignore -- so _normalize_path,
+        # which lowercases for fnmatch, is deliberately not used here.
+        path = result.file_path.replace("\\", "/")
+        if path:
+            for rule in importance.paths:
+                if _compile_glob(rule.glob).match_file(path):
+                    factor *= rule.factor
+    for rule in importance.frontmatter:
+        if _value_matches(_frontmatter_lookup(result, rule.key), rule.value):
+            factor *= rule.factor
+    return min(max(factor, IMPORTANCE_FACTOR_MIN), IMPORTANCE_FACTOR_MAX)
+
+
 def _boost_results(
     results: list[SearchResult],
     *,
     label_boost: dict[str, float] | None = None,
     secondary_projects: frozenset[str] | None = None,
+    importance: ImportanceSettings | None = None,
 ) -> list[SearchResult]:
-    """Re-rank by RRF score * visibility * label * project-scope * supersession."""
+    """Re-rank by RRF score * visibility * label * project-scope * supersession * importance."""
     boost_table = label_boost if label_boost is not None else _LABEL_BOOST_BLENDED
+    # None and "configured but empty" are the same no-op; skipping keeps the default
+    # configuration's ranking byte-identical to what it was before importance existed.
+    use_importance = importance is not None and not importance.is_empty()
 
     def _project_boost(result: SearchResult) -> float:
         if not secondary_projects:
@@ -785,6 +875,7 @@ def _boost_results(
             * max((boost_table.get(lbl, 1.0) for lbl in result.labels), default=1.0)
             * _project_boost(result)
             * (_SUPERSEDED_PENALTY if result.superseded_by else 1.0)
+            * (importance_factor(result, importance) if use_importance and importance else 1.0)
         )
 
     # Recorded on each result rather than discarded with the sort key, so a consumer can
@@ -947,6 +1038,8 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
                 source=props_by_uid.get(uid, {}).get("source", "") or "",
                 superseded_by=props_by_uid.get(uid, {}).get("superseded_by", "") or "",
                 contradicts_with=tuple(props_by_uid.get(uid, {}).get("contradicts_with") or ()),
+                frontmatter=props_by_uid.get(uid, {}).get("frontmatter") or {},
+                tags=tuple(props_by_uid.get(uid, {}).get("tags") or ()),
             )
             for uid, rrf_score in fused_scores.items()
         ]
@@ -966,7 +1059,12 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
                 include_patterns=include_patterns,
                 exclude_patterns=exclude_patterns,
             )
-            results = _boost_results(filtered, label_boost=label_boost, secondary_projects=secondary_projects)[:limit]
+            results = _boost_results(
+                filtered,
+                label_boost=label_boost,
+                secondary_projects=secondary_projects,
+                importance=settings.importance,
+            )[:limit]
 
         span.set_attribute("results_count", len(results))
         m = get_metrics()

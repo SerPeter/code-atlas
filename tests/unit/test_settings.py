@@ -363,3 +363,60 @@ class TestEverySectionRejectsUnknownKeys:
         from code_atlas.settings import ScopeSettings
 
         assert ScopeSettings(paths=["services/a"]).paths == ["services/a"]
+
+
+class TestImportanceSettings:
+    """[search.importance] — the atlas.toml surface for ranking adjustments."""
+
+    def test_absent_by_default(self, clean_env):
+        settings = AtlasSettings(project_root=clean_env)
+        assert settings.search.importance.paths == []
+        assert settings.search.importance.frontmatter == []
+        assert settings.search.importance.is_empty()
+
+    def test_array_of_tables_loads_both_rule_kinds(self, clean_env):
+        (clean_env / "atlas.toml").write_text(
+            "[[search.importance.paths]]\n"
+            'glob = "src/code_atlas/search/**"\n'
+            "factor = 1.5\n"
+            "\n"
+            "[[search.importance.paths]]\n"
+            'glob = "wiki/inbox/"\n'
+            "factor = 0.5\n"
+            "\n"
+            "[[search.importance.frontmatter]]\n"
+            'key = "metadata.type"\n'
+            'value = "decision"\n'
+            "factor = 2.0\n"
+            "\n"
+            "[[search.importance.frontmatter]]\n"
+            'key = "deprecated"\n'
+            "factor = 0.25\n",
+            encoding="utf-8",
+        )
+        importance = AtlasSettings(project_root=clean_env).search.importance
+
+        assert [(r.glob, r.factor) for r in importance.paths] == [
+            ("src/code_atlas/search/**", 1.5),
+            ("wiki/inbox/", 0.5),
+        ]
+        assert [(r.key, r.value, r.factor) for r in importance.frontmatter] == [
+            ("metadata.type", "decision", 2.0),
+            ("deprecated", None, 0.25),
+        ]
+        assert not importance.is_empty()
+
+    def test_typo_in_a_rule_is_an_error_not_a_silent_no_op(self, clean_env):
+        """StrictSection all the way down — a misspelled key must not vanish."""
+        (clean_env / "atlas.toml").write_text(
+            '[[search.importance.paths]]\nglob = "src/**"\nfactr = 1.5\n', encoding="utf-8"
+        )
+        with pytest.raises(ValidationError):
+            AtlasSettings(project_root=clean_env)
+
+    def test_non_positive_factor_is_rejected(self, clean_env):
+        (clean_env / "atlas.toml").write_text(
+            '[[search.importance.paths]]\nglob = "src/**"\nfactor = 0.0\n', encoding="utf-8"
+        )
+        with pytest.raises(ValidationError):
+            AtlasSettings(project_root=clean_env)

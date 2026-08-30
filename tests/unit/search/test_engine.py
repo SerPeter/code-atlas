@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from code_atlas.search.engine import (
     CompactNode,
@@ -26,9 +28,10 @@ from code_atlas.search.engine import (
     expand_context,
     expand_scope,
     hybrid_search,
+    importance_factor,
     rrf_fuse,
 )
-from code_atlas.settings import SearchSettings
+from code_atlas.settings import IMPORTANCE_FACTOR_MAX, IMPORTANCE_FACTOR_MIN, ImportanceSettings, SearchSettings
 
 # ---------------------------------------------------------------------------
 # RRF fusion
@@ -1090,3 +1093,123 @@ class TestSupersessionRanking:
 
         assert before == after
         assert all(r.superseded_by == "" and r.contradicts_with == () for r in _boost_results([a, b]))
+
+
+class TestImportanceFactor:
+    """[search.importance] — multiplicative path/frontmatter ranking adjustments."""
+
+    @staticmethod
+    def _result(
+        *,
+        file_path: str = "src/mod.py",
+        frontmatter: dict[str, Any] | None = None,
+        tags: tuple[str, ...] = (),
+        kind: str = "function",
+        rrf_score: float = 0.01,
+    ) -> SearchResult:
+        return SearchResult(
+            uid="p:x",
+            name="x",
+            qualified_name="mod.x",
+            kind=kind,
+            file_path=file_path,
+            line_start=1,
+            line_end=2,
+            signature="",
+            docstring="",
+            labels=["Callable"],
+            rrf_score=rrf_score,
+            frontmatter=frontmatter or {},
+            tags=tags,
+        )
+
+    @staticmethod
+    def _settings(**kwargs: Any) -> ImportanceSettings:
+        return ImportanceSettings.model_validate(kwargs)
+
+    def test_no_rules_is_identity(self):
+        assert importance_factor(self._result(), ImportanceSettings()) == 1.0
+
+    def test_path_glob_matches_gitignore_style(self):
+        cfg = self._settings(paths=[{"glob": "src/code_atlas/search/**", "factor": 1.5}])
+        assert importance_factor(self._result(file_path="src/code_atlas/search/engine.py"), cfg) == 1.5
+        assert importance_factor(self._result(file_path="src/code_atlas/graph/client.py"), cfg) == 1.0
+
+    def test_directory_pattern_matches_everything_beneath_it(self):
+        cfg = self._settings(paths=[{"glob": "wiki/inbox/", "factor": 0.5}])
+        assert importance_factor(self._result(file_path="wiki/inbox/a/b.md"), cfg) == 0.5
+
+    def test_windows_separators_still_match(self):
+        """file_path is stored POSIX-style, but a caller-built result may not be."""
+        cfg = self._settings(paths=[{"glob": "src/**", "factor": 2.0}])
+        assert importance_factor(self._result(file_path=r"src\code_atlas\x.py"), cfg) == 2.0
+
+    def test_nested_frontmatter_key_via_dotted_path(self):
+        cfg = self._settings(frontmatter=[{"key": "metadata.type", "value": "decision", "factor": 2.0}])
+        assert importance_factor(self._result(frontmatter={"metadata": {"type": "decision"}}), cfg) == 2.0
+        assert importance_factor(self._result(frontmatter={"metadata": {"type": "note"}}), cfg) == 1.0
+
+    def test_frontmatter_value_match_is_case_insensitive(self):
+        cfg = self._settings(frontmatter=[{"key": "status", "value": "accepted", "factor": 3.0}])
+        assert importance_factor(self._result(frontmatter={"status": "Accepted"}), cfg) == 3.0
+
+    def test_list_valued_key_matches_on_membership(self):
+        cfg = self._settings(frontmatter=[{"key": "audience", "value": "sre", "factor": 2.0}])
+        assert importance_factor(self._result(frontmatter={"audience": ["oncall", "sre"]}), cfg) == 2.0
+        assert importance_factor(self._result(frontmatter={"audience": ["oncall"]}), cfg) == 1.0
+
+    def test_omitted_value_means_present_and_truthy(self):
+        cfg = self._settings(frontmatter=[{"key": "deprecated", "factor": 0.25}])
+        assert importance_factor(self._result(frontmatter={"deprecated": True}), cfg) == 0.25
+        assert importance_factor(self._result(frontmatter={"deprecated": False}), cfg) == 1.0
+        assert importance_factor(self._result(), cfg) == 1.0
+
+    def test_promoted_keys_stay_addressable_by_frontmatter_name(self):
+        """Note mode moves kind/tags out of the map; a rule must still reach them."""
+        tag_cfg = self._settings(frontmatter=[{"key": "tags", "value": "critical", "factor": 3.0}])
+        assert importance_factor(self._result(tags=("critical", "x")), tag_cfg) == 3.0
+        kind_cfg = self._settings(frontmatter=[{"key": "kind", "value": "decision", "factor": 4.0}])
+        assert importance_factor(self._result(kind="decision"), kind_cfg) == 4.0
+
+    def test_map_wins_over_promoted_fallback(self):
+        """An explicit frontmatter value is the answer even when a node field shares the name."""
+        cfg = self._settings(frontmatter=[{"key": "kind", "value": "decision", "factor": 4.0}])
+        assert importance_factor(self._result(kind="decision", frontmatter={"kind": "draft"}), cfg) == 1.0
+
+    def test_matching_rules_compose_multiplicatively(self):
+        cfg = self._settings(
+            paths=[{"glob": "src/**", "factor": 1.5}, {"glob": "*.py", "factor": 2.0}],
+            frontmatter=[{"key": "tier", "value": "critical", "factor": 3.0}],
+        )
+        assert importance_factor(self._result(frontmatter={"tier": "critical"}), cfg) == pytest.approx(9.0)
+
+    def test_product_is_clamped_at_both_ends(self):
+        high = self._settings(paths=[{"glob": "src/**", "factor": 50.0}, {"glob": "*.py", "factor": 50.0}])
+        low = self._settings(paths=[{"glob": "src/**", "factor": 0.05}, {"glob": "*.py", "factor": 0.05}])
+        assert importance_factor(self._result(), high) == IMPORTANCE_FACTOR_MAX
+        assert importance_factor(self._result(), low) == IMPORTANCE_FACTOR_MIN
+
+    def test_factor_must_be_positive(self):
+        """A zero or negative factor would erase or invert the score rather than weight it."""
+        with pytest.raises(ValidationError):
+            self._settings(paths=[{"glob": "src/**", "factor": 0.0}])
+        with pytest.raises(ValidationError):
+            self._settings(paths=[{"glob": "src/**", "factor": -1.0}])
+
+    def test_unknown_rule_key_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._settings(paths=[{"glob": "src/**", "factr": 1.0}])
+
+    def test_boost_results_applies_importance_and_reorders(self):
+        low = self._result(file_path="src/important/a.py", rrf_score=0.01)
+        high = replace(self._result(file_path="src/other/b.py", rrf_score=0.02), uid="p:y")
+        cfg = self._settings(paths=[{"glob": "src/important/**", "factor": 3.0}])
+
+        assert [r.uid for r in _boost_results([low, high])] == ["p:y", "p:x"]
+        assert [r.uid for r in _boost_results([low, high], importance=cfg)] == ["p:x", "p:y"]
+
+    def test_boost_results_without_importance_is_unchanged(self):
+        """An absent or empty rule set must leave ranking byte-identical."""
+        results = [self._result(rrf_score=0.02), replace(self._result(rrf_score=0.01), uid="p:y")]
+        baseline = [r.ranked_score for r in _boost_results(results)]
+        assert [r.ranked_score for r in _boost_results(results, importance=ImportanceSettings())] == baseline

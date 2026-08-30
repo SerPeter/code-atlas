@@ -51,6 +51,31 @@ generated_patterns = ["*_pb2.py", "*_pb2_grpc.py", "*.generated.*"]
 # Max hop depth for caller/callee expansion
 max_caller_depth = 1
 
+# Optional ranking adjustments. Every rule that matches a result multiplies into its
+# score, so two 1.5 rules give 2.25. Omit the section entirely for unchanged ranking.
+#
+# By path — gitignore-style patterns against the repo-relative path, same dialect as
+# [scope] and .atlasignore:
+# [[search.importance.paths]]
+# glob = "src/code_atlas/search/**"
+# factor = 1.5
+#
+# [[search.importance.paths]]
+# glob = "wiki/inbox/"          # drafts rank below consolidated notes
+# factor = 0.5
+#
+# By markdown frontmatter — `key` is dot-separated for nesting, and matches a list on
+# membership or a scalar on equality (case-insensitive):
+# [[search.importance.frontmatter]]
+# key = "metadata.type"
+# value = "decision"
+# factor = 2.0
+#
+# Omit `value` to match whenever the key is present and truthy:
+# [[search.importance.frontmatter]]
+# key = "deprecated"
+# factor = 0.25
+
 [detectors]
 # Enabled pattern detectors
 enabled = [
