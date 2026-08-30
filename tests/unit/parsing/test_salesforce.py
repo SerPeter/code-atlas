@@ -223,7 +223,10 @@ def test_object_file_mints_a_module_and_an_sobject():
     assert module.line_start == 1
 
     sobject = _one(parsed, "sobject")
-    assert sobject.docstring == "A house for sale"
+    # Every human-readable string the component declares, not one of them. label and
+    # pluralLabel are in extra_properties too, which BM25 sees but build_embed_text
+    # does not -- so before this they were invisible to semantic search.
+    assert sobject.docstring == "Property\nProperties\nA house for sale"
     assert sobject.extra_properties == {
         "sobject_type": "custom",
         "sobject_label": "Property",
@@ -776,3 +779,41 @@ def test_every_entity_is_hashed_and_positioned():
             assert 1 <= entity.line_start <= entity.line_end
         qualified_names = [entity.qualified_name for entity in parsed.entities]
         assert len(set(qualified_names)) == len(qualified_names), qualified_names
+
+
+def test_a_field_indexes_every_string_a_person_wrote():
+    """docstring was `description or label` -- either/or -- and inlineHelpText was read
+    nowhere. That last one is written for the end user who does not understand the
+    field, which makes it the most searchable string in a metadata tree."""
+    parsed = _parse(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <fullName>Commission_Rate__c</fullName>\n"
+        "    <label>Commission Rate</label>\n"
+        "    <description>Percentage of sale price paid on completion.</description>\n"
+        "    <inlineHelpText>Enter a whole number. 3 means 3%.</inlineHelpText>\n"
+        "    <type>Percent</type>\n"
+        "</CustomField>\n",
+        f"{OBJECTS}/Broker__c/fields/Commission_Rate__c.field-meta.xml",
+    )
+    field = _one(parsed, "sobject_field")
+    doc = field.docstring or ""
+    assert "Commission Rate" in doc
+    assert "Percentage of sale price paid on completion." in doc
+    assert "Enter a whole number. 3 means 3%." in doc
+
+
+def test_repeated_prose_is_not_indexed_twice():
+    """label and masterLabel routinely repeat each other, and a docstring saying the
+    same phrase twice wastes the embedding it costs."""
+    parsed = _parse(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <fullName>Stage__c</fullName>\n"
+        "    <label>Stage</label>\n"
+        "    <description>Stage</description>\n"
+        "    <type>Picklist</type>\n"
+        "</CustomField>\n",
+        f"{OBJECTS}/Broker__c/fields/Stage__c.field-meta.xml",
+    )
+    assert (_one(parsed, "sobject_field").docstring or "") == "Stage"
