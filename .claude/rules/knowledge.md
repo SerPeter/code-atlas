@@ -15,6 +15,9 @@ need it instead of reading it here.
 - `get_context(uid)` on a code entity returns its linked notes/docs via `DOCUMENTS` edges.
 - Cypher: `Note` nodes have `uid = "{project}:note:{slug}"`, `kind` in `draft|note|decision`, `tags`, `docstring` (full
   body). `LINKS_TO` is the wikilink graph; `DERIVED_FROM`/`SUPERSEDES` are dream-mode provenance.
+- Any other frontmatter key is one `frontmatter` map property (not flattened), so it is queryable directly:
+  `MATCH (n:Note) WHERE n.frontmatter.metadata.type = 'feedback'`. Ordinary docs carry theirs too, on both `DocFile` and
+  `DocSection`. `[search.importance]` in `atlas.toml` turns a path glob or a frontmatter key into a ranking multiplier.
 
 ## Writing things
 
