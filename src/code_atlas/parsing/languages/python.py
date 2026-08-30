@@ -540,7 +540,10 @@ def _extract_text_blocks(
     the same uid, and this one would only fight it.
     """
     docstrings = _docstring_nodes(root)
-    existing = {e.qualified_name: e for e in entities}
+    # Index, not the entity: ParsedEntity is a frozen dataclass, so `entities.index(e)`
+    # compares every field of every candidate -- including the long strings this
+    # function exists to handle.
+    existing = {e.qualified_name: i for i, e in enumerate(entities)}
     for node in _walk_all_nodes(root):
         if node.type != "string" or node.start_byte in docstrings:
             continue
@@ -551,15 +554,16 @@ def _extract_text_blocks(
         name = _assigned_name(node) or f"text_L{line_start}"
         owner_qn = _enclosing_definition_qn(node, module_qn)
         qualified_name = f"{project_name}:{owner_qn}.{name}"
-        claimed = existing.get(qualified_name)
-        if claimed is not None:
+        claimed_at = existing.get(qualified_name)
+        if claimed_at is not None:
+            claimed = entities[claimed_at]
             # The assignment walk already made a node for this name — a module- or
             # class-level constant. Rather than fight it with a duplicate, give it the
             # content: its `source` is capped at index.max_source_chars, which a literal
             # this long is exactly the thing to exceed, and it carries no docstring of
             # its own to lose.
             if claimed.label is NodeLabel.VALUE and not claimed.docstring:
-                entities[entities.index(claimed)] = replace(claimed, docstring=_string_body(raw))
+                entities[claimed_at] = replace(claimed, docstring=_string_body(raw))
             continue
         block = ParsedEntity(
             name=name,
@@ -575,8 +579,8 @@ def _extract_text_blocks(
             docstring=_string_body(raw),
             visibility=_visibility_from_name(name),
         )
+        existing[qualified_name] = len(entities)
         entities.append(block)
-        existing[qualified_name] = block
         relationships.append(
             ParsedRelationship(
                 from_qualified_name=f"{project_name}:{owner_qn}",
