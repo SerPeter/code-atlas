@@ -230,8 +230,13 @@ _CONFIG_REF_REL_TYPES: frozenset[RelType] = frozenset(
 )
 
 # Created by dedicated, out-of-band methods rather than per-file parsing:
-# DEPENDS_ON is project-to-project (monorepo dependency graph); SIMILAR_TO
-# is materialized by the (future) dream-mode consolidation pass, not parsing;
+# DEPENDS_ON has two producers with different endpoint shapes — project-to-project
+# (the monorepo dependency graph, create_depends_on_edges) and Project ->
+# ExternalPackage carrying the manifest-declared version
+# (update_external_package_versions, since v18). Neither is parser-driven, which
+# is the only thing this set asserts; do NOT read it as "project-to-project", and
+# label BOTH endpoints in any query over it or the two producers' edges mix.
+# SIMILAR_TO is materialized by the (future) dream-mode consolidation pass, not parsing;
 # CO_CHANGES_WITH is written by indexing/git_signals.py's write_git_signals,
 # triggered by the one-shot `atlas mine-git-history` CLI command, not by the
 # parsing/indexing pipeline.
@@ -3655,15 +3660,55 @@ class GraphClient:
         project_name: str,
         versions: dict[str, str],
     ) -> None:
-        """Set version properties on ExternalPackage nodes from dependency metadata."""
+        """Restate this project's manifest as ``Project -[DEPENDS_ON {version}]-> ExternalPackage``.
+
+        The version lives on the edge, not on the node (v18): it is one project's
+        statement about a package, not a fact about the package. As a node property two
+        projects pinning different versions of the same distribution overwrote each other
+        last-writer-wins — survivable only while the node stays ``{project}:ext/{name}``,
+        and the single thing blocking globalizing it (ATL-088).
+
+        Both endpoints are labelled deliberately. An unlabelled ``{uid: ...}`` match can
+        use no label-property index and Memgraph then scans every node once per row —
+        measured at 2.809s against 0.048s for 200 lookups on a 26k-node graph (see
+        _write_call_edges). The Project node's uid *is* the bare project name
+        (merge_project_node), so no extra lookup is needed to reach it.
+
+        The ExternalPackage is MATCHed and never MERGEd: a manifest key that matches no
+        node is a deliberate no-op, not a miss. go.mod, pom.xml, build.gradle and
+        composer.json emit distribution coordinates that cannot be mapped to an import
+        root from the manifest alone (see indexing/orchestrator.py's manifest-parsing
+        header), so MERGE here would mint an ExternalPackage — and now a dependency edge —
+        for every declared-but-unimported coordinate in every Go/Java/PHP project.
+
+        The pre-delete makes this a replace rather than an accumulate. A stale node
+        property was inert; a stale *edge* is an assertion that the project still depends
+        on a package its manifest no longer names, and it is visible to traversal. Scoping
+        the delete to ``:ExternalPackage`` targets is load-bearing: a bare
+        ``(p)-[r:DEPENDS_ON]->()`` would also erase the project-to-project edges
+        create_depends_on_edges writes, and nothing but that label keeps the two producers
+        disjoint.
+
+        An empty *versions* still returns early, so a project whose manifest lost every
+        dependency — or whose manifest failed to parse — keeps its edges rather than
+        having them wiped by what may be a read failure. Only a full reindex
+        (delete_project_data) clears those.
+        """
         if not versions:
             return
+        await self.execute_write(
+            f"MATCH (p:{NodeLabel.PROJECT} {{uid: $project}})-[r:{RelType.DEPENDS_ON}]->"
+            f"(:{NodeLabel.EXTERNAL_PACKAGE}) DELETE r",
+            {"project": project_name},
+        )
         params = [{"uid": f"{project_name}:ext/{pkg}", "version": ver} for pkg, ver in versions.items()]
         await self.execute_write(
             f"UNWIND $items AS item "
-            f"MATCH (n:{NodeLabel.EXTERNAL_PACKAGE} {{uid: item.uid}}) "
-            "SET n.version = item.version",
-            {"items": params},
+            f"MATCH (p:{NodeLabel.PROJECT} {{uid: $project}}), "
+            f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: item.uid}}) "
+            f"MERGE (p)-[d:{RelType.DEPENDS_ON}]->(ep) "
+            "SET d.version = item.version",
+            {"project": project_name, "items": params},
         )
 
     # -- Cross-project import resolution helpers --------------------------------
@@ -3839,7 +3884,10 @@ class GraphClient:
         if len(project_names) < 2:
             return 0
 
-        # Delete existing DEPENDS_ON edges between these projects
+        # Delete existing DEPENDS_ON edges between these projects. Both endpoints are
+        # label-constrained, which is what keeps this disjoint from the Project ->
+        # ExternalPackage version edges that share the type (v18): relax either label
+        # and every monorepo index silently wipes the manifest versions.
         await self.execute_write(
             f"MATCH (a:{NodeLabel.PROJECT})-[r:{RelType.DEPENDS_ON}]->(b:{NodeLabel.PROJECT}) "
             "WHERE a.name IN $projects AND b.name IN $projects "
@@ -4930,7 +4978,14 @@ class GraphClient:
             "MATCH (ep:ExternalPackage {project_name: $project}) "
             "OPTIONAL MATCH (ep)<-[:IMPORTS]-(src) "
             f"{ext_w} "
-            "RETURN ep.name AS package, ep.version AS version, count(src) AS imported_by "
+            # The version moved onto the dependency edge in v18. OPTIONAL, and appended
+            # after the importer filter rather than replacing it: most ExternalPackages
+            # have no manifest entry at all (every Go/Java/PHP coordinate, plus anything
+            # imported but undeclared), and a plain MATCH would silently shrink the
+            # report to only the packages someone pinned. A missing edge yields a null
+            # version, which is exactly what a missing ep.version yielded before.
+            "OPTIONAL MATCH (:Project {uid: $project})-[dep:DEPENDS_ON]->(ep) "
+            "RETURN ep.name AS package, dep.version AS version, count(src) AS imported_by "
             f"ORDER BY imported_by DESC LIMIT {limit}",
             params,
         )
@@ -5494,7 +5549,12 @@ class GraphClient:
         return {r["label"]: r["count"] for r in records}
 
     async def get_project_dependency_edges(self) -> list[dict[str, Any]]:
-        """Project-to-project DEPENDS_ON edges — ``atlas status`` and ``list_projects``."""
+        """Project-to-project DEPENDS_ON edges — ``atlas status`` and ``list_projects``.
+
+        The ``:Project`` label on BOTH endpoints is the filter, not decoration: since v18
+        DEPENDS_ON also runs Project -> ExternalPackage with a manifest version, and
+        dropping the target label would list every external package as a sibling project.
+        """
         return await self.execute(
             f"MATCH (a:{NodeLabel.PROJECT})-[:{RelType.DEPENDS_ON}]->(b:{NodeLabel.PROJECT}) "
             "RETURN a.name AS from_proj, b.name AS to_proj"
@@ -6338,6 +6398,7 @@ class GraphClient:
             (14, self._migrate_v14_trim_marker_indices),
             (16, self._migrate_v16_clear_for_nested_frontmatter),
             (17, self._migrate_v17_clear_for_doc_section_splitting),
+            (18, self._migrate_v18_versions_moved_to_dependency_edge),
         )
         for threshold, migrate in migrations:
             if stored < threshold:
@@ -6422,6 +6483,50 @@ class GraphClient:
         logger.info(
             "Schema v17: cleared stored file/git hashes — run 'atlas index' so oversized doc "
             "sections split into parts and oversized entities get their overflow vectors"
+        )
+
+    async def _migrate_v18_versions_moved_to_dependency_edge(self) -> None:
+        """v18: an ExternalPackage's ``version`` moved onto ``Project -[DEPENDS_ON]->``.
+
+        This is a MOVE, not the clear-the-hashes-and-re-parse shape v7/v11/v16/v17 use,
+        and deliberately so. Those migrations re-derive from source text, which the file
+        gate makes cheap and certain. A version does not come from source text: it comes
+        from a manifest read by ``_parse_dependency_versions``, which only runs during an
+        actual ``atlas index``. Nothing guarantees an index happens before someone calls
+        ``analyze_repo(analysis="structure")``, so dropping the property and waiting for a
+        re-index would report every dependency as unversioned for an unbounded window —
+        with no error to explain it. The precedent to follow is
+        _migrate_v10_stub_flag_moved_to_methods: write the new home, then REMOVE the old
+        property so nothing reads it again.
+
+        The two statements must stay in this order and stay two, because the REMOVE is
+        gated on the value having actually landed. An ExternalPackage whose Project node
+        is gone (an orphan left by a deleted project) gets no edge, and an unconditional
+        REMOVE would turn "moved" into "dropped" for exactly the rows nobody would think
+        to check. Those keep their node property; the reader returns null for them either
+        way, and a re-index of that project would recreate the Project node and the edge.
+
+        ``ep.project_name = p.uid`` is the join: merge_project_node writes the Project
+        node's uid as the bare project name. The predicate lives in a WHERE rather than in
+        a property map so it is plain, unambiguous Cypher — a migration that throws breaks
+        startup for everyone, and Projects number in the single digits, so the label scan
+        costs nothing.
+        """
+        await self.execute_write(
+            f"MATCH (p:{NodeLabel.PROJECT}) "
+            f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE}) "
+            "WHERE ep.version IS NOT NULL AND ep.project_name = p.uid "
+            f"MERGE (p)-[d:{RelType.DEPENDS_ON}]->(ep) "
+            "SET d.version = ep.version"
+        )
+        await self.execute_write(
+            f"MATCH (:{NodeLabel.PROJECT})-[d:{RelType.DEPENDS_ON}]->(ep:{NodeLabel.EXTERNAL_PACKAGE}) "
+            "WHERE ep.version IS NOT NULL AND d.version IS NOT NULL "
+            "REMOVE ep.version"
+        )
+        logger.info(
+            "Schema v18: moved ExternalPackage versions onto Project -[DEPENDS_ON]-> edges "
+            "so two projects can pin different versions of the same package"
         )
 
     async def _reconcile_marker_labels(self) -> int:

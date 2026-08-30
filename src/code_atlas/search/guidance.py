@@ -45,7 +45,11 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.OVERRIDES: "Method -> parent method it overrides",
     RelType.READS_ENV: "Entity -> EnvVar it reads (EnvVar is GLOBAL: uid 'env/NAME', project_name '_global')",
     RelType.REFERENCES_FILE: "Entity -> ResourceFile it reads/writes (project-scoped, uid '{project}:res/{path}')",
-    RelType.DEPENDS_ON: "Project -> project dependency (monorepo)",
+    RelType.DEPENDS_ON: (
+        "Project -> project dependency (monorepo), OR Project -> ExternalPackage carrying the "
+        "manifest-declared version (edge property 'version'; absent when the manifest does not "
+        "name that package). Match the target label — the two shapes share the type."
+    ),
     RelType.DOCUMENTS: "Doc section/Note -> code entity it documents (or Note anchor)",
     RelType.SIMILAR_TO: "Entity -> semantically similar entity (embedding cosine)",
     RelType.HANDLES_ROUTE: (

@@ -1218,8 +1218,11 @@ async def _check_model_lock(
 # Manifests declare *distribution* names; source code imports *module* names.
 # ``update_external_package_versions`` joins on ``{project}:ext/{key}``, where
 # ``key`` is what ``GraphClient.resolve_imports`` derives from an import
-# statement (``to_name.split(".")[0]``). Every parser below therefore returns
-# keys in *import* space, using the deterministic rule for its ecosystem:
+# statement (``to_name.split(".")[0]``). The join now decides whether a
+# ``Project -[DEPENDS_ON {version}]-> ExternalPackage`` edge is created at all,
+# not merely whether a property is set on an existing node. Every parser below
+# therefore returns keys in *import* space, using the deterministic rule for its
+# ecosystem:
 #
 #   pyproject.toml    distribution name lowered, ``-`` → ``_`` (pre-existing)
 #   package.json      verbatim — an npm name *is* the specifier root, scope
@@ -1233,11 +1236,11 @@ async def _check_model_lock(
 # CANNOT be reconciled from the manifest alone: the import root is a hosting
 # domain (``github``), a TLD segment (``com``/``org``) or a PSR-4 namespace
 # that only the dependency's own metadata declares. Collapsing a coordinate
-# onto such a token would stamp a version onto an aggregate node shared by
+# onto such a token would claim a version for an aggregate node shared by
 # unrelated packages, so those parsers emit the declared coordinate verbatim
 # (``github.com/spf13/cobra``, ``org.slf4j:slf4j-api``, ``monolog/monolog``).
-# Those keys match no ExternalPackage under today's uid scheme — the version
-# write is a deliberate no-op rather than a wrong mapping.
+# Those keys match no ExternalPackage under today's uid scheme — no dependency
+# edge is written for them, a deliberate no-op rather than a wrong mapping.
 
 _PEP508_RE = re.compile(r"^([A-Za-z0-9][\w.-]*)\s*(.*)")
 _GRADLE_COORD_RE = re.compile(
@@ -2086,7 +2089,7 @@ async def _index_project_inner(
         )
         ast_stats = ast_consumer.stats
 
-    # 7. Set dependency versions on ExternalPackage nodes
+    # 7. Restate the manifest as Project -[DEPENDS_ON {version}]-> ExternalPackage edges
     dep_versions = _parse_dependency_versions(project_root)
     if dep_versions:
         await graph.update_external_package_versions(project_name, dep_versions)
@@ -2437,7 +2440,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     # --- Update metadata + build results per project ---
     results: list[IndexResult] = []
     for pr in publish_results:
-        # Set dependency versions
+        # Restate the manifest as dependency edges (see step 7 of the single-project path)
         dep_versions = _parse_dependency_versions(pr.project_root)
         if dep_versions:
             await graph.update_external_package_versions(pr.project_name, dep_versions)

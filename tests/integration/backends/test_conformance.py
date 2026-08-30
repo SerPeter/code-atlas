@@ -139,7 +139,12 @@ _NOT_COMPARED: dict[str, str] = {
     "find_unembedded_entities": "ordering is engine-defined; membership covered by read_embed_hashes",
     # -- reads not yet compared. The honest residue: each is a real gap, not a
     #    justification. Comparing them is follow-up work, not a decision. ------
-    "get_structure_overview": "not yet compared",
+    # Partly compared, so it stays here rather than moving to _COMPARED — that set means
+    # "every field of the answer agrees on the seeded corpus", and only external_deps
+    # does. See TestSharedSurfaceAgrees.test_external_dependency_versions: the v18 version
+    # join is an OPTIONAL MATCH on one backend and a third LEFT JOIN on the other, which
+    # is the part with no structural reason to stay in step.
+    "get_structure_overview": "counts/packages/largest_modules not yet compared; external_deps is, in its own test",
     "get_module_summary": "not yet compared",
     "get_package_docstring": "not yet compared",
     "get_sibling_entities": "not yet compared",
@@ -462,6 +467,44 @@ class TestSharedSurfaceAgrees:
         assert await mg.gc_orphaned_embed_chunks() == await lite.gc_orphaned_embed_chunks() == 1
         # And the live parent's chunk survives, in both.
         assert await mg.gc_orphaned_embed_chunks() == await lite.gc_orphaned_embed_chunks() == 0
+
+    async def test_external_dependency_versions(self, both):
+        """The manifest version comes off ``Project -[DEPENDS_ON]-> ExternalPackage`` (v18),
+        and the two backends express that join in completely different shapes.
+
+        Memgraph appends an ``OPTIONAL MATCH`` after the importer filter; SQLite adds a
+        third ``LEFT JOIN`` to a query that is already grouping over two others. Nothing
+        but this comparison holds them together, and the failure mode is quiet: a join
+        that returns ``NULL`` for every version still returns every row, so it looks like
+        a graph with no pinned dependencies rather than a broken read.
+
+        Seeds its own corpus — the shared one has no Project node and no imports, so
+        there is no dependency to report on.
+        """
+        mg, lite = both
+        for client in (mg, lite):
+            await client.merge_project_node(PROJECT)
+            await client.resolve_imports(
+                PROJECT,
+                [
+                    ParsedRelationship(from_qualified_name=f"{PROJECT}:mod", rel_type=RelType.IMPORTS, to_name=name)
+                    for name in ("requests", "loguru")
+                ],
+            )
+            # Only one of the two is declared: an imported-but-unpinned package must
+            # still be reported, unversioned, by both.
+            await client.update_external_package_versions(PROJECT, {"requests": "2.31.0"})
+
+        a = {
+            r["package"]: (r["version"], r["imported_by"])
+            for r in (await mg.get_structure_overview(PROJECT, "", 20))["external_deps"]
+        }
+        b = {
+            r["package"]: (r["version"], r["imported_by"])
+            for r in (await lite.get_structure_overview(PROJECT, "", 20))["external_deps"]
+        }
+        assert a == {"requests": ("2.31.0", 1), "loguru": (None, 1)}
+        assert a == b, f"only in memgraph: {a.items() - b.items()}; only in sqlite: {b.items() - a.items()}"
 
 
 class TestTheDefectsThatMotivatedThis:

@@ -1440,3 +1440,278 @@ class TestFrontmatterIsReplacedNotMerged:
         assert props["frontmatter"] == {"b": 2}
         assert props["line_start"] == 1
         assert props["visibility"] == "public"
+
+
+# ---------------------------------------------------------------------------
+# ATL-146 — a manifest version is one project's statement about a package
+# ---------------------------------------------------------------------------
+
+
+async def _dependency_versions(client: SqliteGraphClient, project: str) -> dict[str, str | None]:
+    """What ``Project -[DEPENDS_ON]-> ExternalPackage`` records for *project*.
+
+    Reads the edge rows straight out of SQL rather than through
+    ``get_structure_overview``, so a reader-side bug cannot mask a writer-side one — the
+    whole point of moving the version was that the writer stops colliding, and a report
+    that happens to return the right string proves nothing about where it lives.
+    """
+    conn = await client._get_conn()
+    cur = await conn.execute(
+        "SELECT ep.name, json_extract(d.props_json, '$.version') FROM edges d "
+        "JOIN nodes ep ON ep.uid = d.to_uid "
+        "WHERE d.rel_type = 'DEPENDS_ON' AND d.from_uid = ? AND ep.labels = 'ExternalPackage'",
+        (project,),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return {str(name): version for name, version in rows}
+
+
+async def _seed_importer(client: SqliteGraphClient, project: str, *packages: str) -> None:
+    """A module in *project* importing *packages* — what actually mints ExternalPackages.
+
+    ``update_external_package_versions`` MATCHes and never MERGEs, so seeding the import
+    is not decoration: without it there is no node for the edge to land on. The Project
+    node matters for the same reason on the other endpoint.
+    """
+    module = _entity("app", "app", project=project, label=NodeLabel.MODULE, kind="module", file_path="app.py")
+    await client.upsert_file_entities(project, "app.py", [module], [])
+    await client.merge_project_node(project)
+    await client.resolve_imports(
+        project,
+        [
+            ParsedRelationship(from_qualified_name=f"{project}:app", rel_type=RelType.IMPORTS, to_name=pkg)
+            for pkg in packages
+        ],
+    )
+
+
+class TestExternalPackageVersionsLiveOnTheDependencyEdge:
+    """ATL-146: the version belongs to the dependency, not to the package."""
+
+    async def test_two_projects_keep_their_own_versions_of_one_package(self, client: SqliteGraphClient) -> None:
+        """The bug this story exists to fix, and the only reason the edge was worth adding.
+
+        As a node property the version was stored on ``{project}:ext/{name}``, so it was
+        survivable only while that uid stayed project-scoped. The moment two projects
+        share one ExternalPackage node — which is what ATL-088 does — the second index
+        overwrites the first last-writer-wins, silently and with no error. Asserting both
+        values here is what makes globalization safe to attempt.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "requests")
+        await _seed_importer(client, "lib", "requests")
+
+        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+        await client.update_external_package_versions("lib", {"requests": "2.28.0"})
+
+        assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
+        assert await _dependency_versions(client, "lib") == {"requests": "2.28.0"}
+
+    async def test_the_version_is_not_left_on_the_package_node(self, client: SqliteGraphClient) -> None:
+        """A leftover ``ep.version`` is worse than no version: it is the stale one.
+
+        Two homes for one value means whichever reader was not updated keeps serving the
+        first project to index, forever, and nothing in the graph marks it as stale.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "requests")
+
+        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+
+        props = json.loads((await _node_row(client, "app:ext/requests"))[4])
+        assert "version" not in props
+
+    async def test_a_package_dropped_from_the_manifest_loses_its_edge(self, client: SqliteGraphClient) -> None:
+        """A stale node property was inert; a stale edge is a false assertion.
+
+        ``requests`` no longer being in the manifest means the project no longer depends
+        on it, and unlike a leftover property the edge is visible to every traversal and
+        to the SBOM-shaped reads this edge exists to support.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "requests", "loguru")
+
+        await client.update_external_package_versions("app", {"requests": "2.31.0", "loguru": "0.7.2"})
+        await client.update_external_package_versions("app", {"loguru": "0.7.2"})
+
+        assert await _dependency_versions(client, "app") == {"loguru": "0.7.2"}
+
+    async def test_a_version_write_leaves_project_to_project_edges_intact(self, client: SqliteGraphClient) -> None:
+        """Two producers now share DEPENDS_ON, and only the target label keeps them apart.
+
+        ``create_depends_on_edges`` writes Project -> Project; this writes
+        Project -> ExternalPackage. The replace-not-accumulate delete here is scoped by a
+        subselect on ``labels = 'ExternalPackage'``; drop that and every monorepo index
+        erases the cross-project dependency graph on its way to writing a version.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "requests")
+        await client.merge_project_node("lib")
+        await _insert_edge(client, "app", "lib", "DEPENDS_ON")
+
+        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+
+        assert await client.get_project_dependency_edges() == [{"from_proj": "app", "to_proj": "lib"}]
+
+    async def test_a_manifest_coordinate_nothing_imports_writes_no_edge(self, client: SqliteGraphClient) -> None:
+        """The ``INSERT ... SELECT`` is the MATCH guard, and it has to be load-bearing.
+
+        go.mod, pom.xml, build.gradle and composer.json name distribution coordinates
+        that map to no import root, so most manifest keys match no node at all. The edges
+        table has no foreign keys, so a plain ``INSERT ... VALUES`` would write one
+        dangling Project -> nonexistent-uid row per declared coordinate in every
+        Go/Java/PHP project — invisible until something joined through it.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "requests")
+
+        await client.update_external_package_versions("app", {"requests": "2.31.0", "never-imported": "9.9.9"})
+
+        assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
+        assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE rel_type = 'DEPENDS_ON'") == 1
+
+    async def test_the_dependency_report_reads_the_version_off_the_edge(self, client: SqliteGraphClient) -> None:
+        """``analyze_repo(analysis="structure")`` must be unchanged in output shape.
+
+        Its ``external_dependencies`` rows are built straight from these keys, so a read
+        that quietly returns ``None`` for every version would pass every existing
+        assertion about the report — none of them look at the value.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "requests", "loguru")
+        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+
+        rows = (await client.get_structure_overview("app", "", 20))["external_deps"]
+
+        by_name = {r["package"]: r for r in rows}
+        assert by_name["requests"] == {"package": "requests", "version": "2.31.0", "imported_by": 1}
+        # An imported-but-undeclared package still appears, unversioned — a plain join
+        # would shrink the report to only the packages someone happened to pin, which is
+        # most of them on any Go/Java/PHP project.
+        assert by_name["loguru"] == {"package": "loguru", "version": None, "imported_by": 1}
+
+    async def test_another_projects_pin_does_not_leak_into_this_ones_report(self, client: SqliteGraphClient) -> None:
+        """The report's join must be pinned to the reading project's own edge.
+
+        Two DEPENDS_ON edges into one ExternalPackage is the shape ATL-088 creates and
+        the reason the ``from_uid`` predicate exists, so the second edge is seeded by
+        hand: while the node is still ``{project}:ext/{name}`` the two projects address
+        different nodes and no join can collide, which makes the natural version of this
+        test pass against a query missing the predicate. Written that way first, and it
+        did.
+
+        Both halves of the damage are asserted. Without the predicate the LEFT JOIN stops
+        being 1:1 per package, so the sibling's pin is reported as this project's *and*
+        the duplicate row inflates the ``imported_by`` count that ranks the whole list.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "requests")
+        await client.merge_project_node("lib")
+        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+        await _insert_edge(client, "lib", "app:ext/requests", "DEPENDS_ON", {"version": "2.28.0"})
+
+        rows = (await client.get_structure_overview("app", "", 20))["external_deps"]
+
+        assert rows == [{"package": "requests", "version": "2.31.0", "imported_by": 1}]
+
+    async def test_a_rewired_cross_project_stub_leaves_no_dangling_version_edge(
+        self, client: SqliteGraphClient
+    ) -> None:
+        """The inbound DEPENDS_ON must not keep a dead stub alive, nor outlive it.
+
+        ``resolve_cross_project_imports`` deletes an ExternalPackage stub once nothing
+        points at it. Before v18 nothing ever did, so a bare ``COUNT(*)`` over inbound
+        edges was correct and dropping the node row alone left nothing behind. The
+        version edge breaks both halves at once: it makes the count nonzero — so the stub
+        would survive here while Memgraph's DETACH DELETE removed it, a silent backend
+        divergence — and it outlives the node as a dangling row no sweep looks for.
+        """
+        await client.ensure_schema()
+        await _seed_importer(client, "app", "shared")
+        # The sibling project's real Package is what makes the stub resolvable — the
+        # cross-project pass matches ExternalPackage.name against Package nodes.
+        await client.merge_package_node("lib", "shared", "shared", "shared/")
+        await client.update_external_package_versions("app", {"shared": "1.0.0"})
+
+        assert await client.resolve_cross_project_imports(["app", "lib"]) == 1
+
+        assert await _node_row(client, "app:ext/shared") is None, "the rewired stub survived its own version edge"
+        assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE to_uid = ?", ("app:ext/shared",)) == 0
+
+
+class TestV18VersionsMigrateOntoTheDependencyEdge:
+    """A graph indexed before v18 keeps every version it had."""
+
+    @staticmethod
+    async def _seed_v17(client: SqliteGraphClient, project: str, package: str, version: str) -> None:
+        """The pre-v18 shape: the version as a property of the ExternalPackage node."""
+        await _seed_importer(client, project, package)
+        conn = await client._get_conn()
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
+            (json.dumps({"version": version}), f"{project}:ext/{package}"),
+        )
+        await client._set_schema_version(conn, 17)
+        await conn.commit()
+
+    async def test_the_migration_moves_the_version_rather_than_dropping_it(self, client: SqliteGraphClient) -> None:
+        """A version cannot be re-derived from source text, so clear-and-reparse loses it.
+
+        Every earlier migration on this backend hands the work back to the parser, which
+        the file-hash gate makes cheap and certain. A version comes from a manifest read
+        only during ``atlas index``, and nothing guarantees an index happens before
+        someone calls ``analyze_repo(analysis="structure")`` — so dropping the property
+        would report every dependency as unversioned for an unbounded window, with no
+        error to explain it.
+        """
+        await client.ensure_schema()
+        await self._seed_v17(client, "app", "requests", "2.31.0")
+
+        await client.ensure_schema()
+
+        assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
+        assert "version" not in json.loads((await _node_row(client, "app:ext/requests"))[4]), (
+            "the stale node property is the one a not-yet-updated reader would pick"
+        )
+        assert await client.get_schema_version() == SCHEMA_VERSION
+
+    async def test_a_package_whose_project_node_is_gone_keeps_its_version(self, client: SqliteGraphClient) -> None:
+        """An orphan gets no edge, so removing its property turns "moved" into "dropped".
+
+        The edge's ``from_uid`` is the Project node's uid; a package left behind by a
+        deleted project has nowhere to move to. Gating the REMOVE on the value having
+        actually landed is what keeps that value recoverable — and these are exactly the
+        rows nobody would think to check, since the reader returns null for them either
+        way.
+        """
+        await client.ensure_schema()
+        await self._seed_v17(client, "app", "requests", "2.31.0")
+        conn = await client._get_conn()
+        await conn.execute("DELETE FROM nodes WHERE uid = ? AND labels = 'Project'", ("app",))
+        await conn.commit()
+
+        await client.ensure_schema()
+
+        assert await _dependency_versions(client, "app") == {}
+        props = json.loads((await _node_row(client, "app:ext/requests"))[4])
+        assert props["version"] == "2.31.0"
+
+    async def test_a_half_applied_migration_converges_on_the_second_pass(self, client: SqliteGraphClient) -> None:
+        """``ensure_schema`` runs on every startup, so the move must survive being resumed.
+
+        The state seeded here is the one with no reader: an edge already exists (a prior
+        pass got as far as the INSERT) while the node still carries the property (the
+        UPDATE did not land). The node property is the pre-v18 source of truth, so the
+        second pass has to overwrite the edge rather than leave whatever is there —
+        ``INSERT OR IGNORE`` would converge on the stale value and look identical in the
+        row count. Seeding a *different* stale version is what tells the two apart.
+        """
+        await client.ensure_schema()
+        await self._seed_v17(client, "app", "requests", "2.31.0")
+        await _insert_edge(client, "app", "app:ext/requests", "DEPENDS_ON", {"version": "0.0.1-interrupted"})
+
+        await client.ensure_schema()
+
+        assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
+        assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE rel_type = 'DEPENDS_ON'") == 1

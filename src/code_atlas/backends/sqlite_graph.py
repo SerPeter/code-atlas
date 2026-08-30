@@ -556,6 +556,42 @@ class SqliteGraphClient:
             "environment-variable and referenced-file nodes"
         )
 
+    async def _migrate_v18_versions_moved_to_dependency_edge(self, conn: aiosqlite.Connection) -> None:
+        """Mirror of ``GraphClient._migrate_v18_versions_moved_to_dependency_edge``.
+
+        The first migration on this backend that moves data rather than clearing it —
+        v6/v7/v8/v9 are all ``json_remove``/``DELETE``, because they hand the work back to
+        the parser. That is not available here: a version comes from a manifest read only
+        during ``atlas index``, so dropping the property and waiting would report every
+        dependency as unversioned until someone happens to re-index.
+
+        Both statements land in one commit and both are idempotent, because
+        ``ensure_schema`` re-applies on every startup and a half-applied move is the one
+        state with no reader — the INSERT alone leaves the stale property that
+        get_structure_overview no longer reads, the UPDATE alone loses the version.
+        """
+        # Only for packages whose Project node still exists: the edge's from_uid is that
+        # node's uid, and an orphan left by a deleted project would otherwise get a
+        # dangling row. Those keep their node property rather than losing the value —
+        # see the Cypher's docstring on why the REMOVE is gated instead of unconditional.
+        await conn.execute(
+            "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) "
+            "SELECT n.project_name, n.uid, 'DEPENDS_ON', "
+            "json_object('version', json_extract(n.props_json, '$.version')) FROM nodes n "
+            "WHERE n.labels = 'ExternalPackage' AND json_extract(n.props_json, '$.version') IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM nodes p WHERE p.labels = 'Project' AND p.uid = n.project_name) "
+            "ON CONFLICT(from_uid, to_uid, rel_type) DO UPDATE SET "
+            "props_json = json_patch(edges.props_json, excluded.props_json)"
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.version') "
+            "WHERE labels = 'ExternalPackage' AND json_extract(props_json, '$.version') IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM edges d WHERE d.to_uid = nodes.uid AND d.rel_type = 'DEPENDS_ON' "
+            "AND json_extract(d.props_json, '$.version') IS NOT NULL)"
+        )
+        await conn.commit()
+        logger.info("SQLite graph schema v18: moved ExternalPackage versions onto Project -[DEPENDS_ON]-> edges")
+
     async def _apply_full_schema(self, conn: aiosqlite.Connection) -> None:
         for stmt in _node_index_ddl():
             await conn.execute(stmt)
@@ -608,6 +644,12 @@ class SqliteGraphClient:
                 await self._migrate_v8_drop_unverified_calls(conn)
             if stored < 9:
                 await self._migrate_v9_clear_for_abstract_bases(conn)
+            # The gap from 10 to 17 is real, not an oversight: those are all Memgraph
+            # freshness-marker and index-shape migrations with no embedded analogue. v18
+            # moves data this backend actually stores, so it needs its own branch or a
+            # SQLite graph keeps the version on the node while reading it off the edge.
+            if stored < 18:
+                await self._migrate_v18_versions_moved_to_dependency_edge(conn)
             await self._set_schema_version(conn, SCHEMA_VERSION)
         else:
             msg = (
@@ -2016,14 +2058,46 @@ class SqliteGraphClient:
         logger.debug("Resolved {} member DEFINES edges ({} fell back to module)", len(type_edges), len(module_edges))
 
     async def update_external_package_versions(self, project_name: str, versions: dict[str, str]) -> None:
+        """Mirror of ``GraphClient.update_external_package_versions`` — the version lives
+        on ``Project -[DEPENDS_ON]-> ExternalPackage`` (v18), not on the package node.
+
+        ``INSERT ... SELECT`` rather than ``INSERT ... VALUES``, and that is the whole
+        difference from the Cypher. Memgraph gets the "unmatched manifest key is a
+        deliberate no-op" guarantee for free from ``MATCH``; here nothing enforces it —
+        the edges table has no foreign keys and no ``PRAGMA foreign_keys`` — so a plain
+        INSERT would write one Project -> nonexistent-uid row per declared coordinate in
+        every Go/Java/PHP project, where the manifest names distributions that map to no
+        import root (see indexing/orchestrator.py's manifest-parsing header). Selecting
+        the target uid out of ``nodes`` reproduces the MATCH.
+
+        SQLite requires the SELECT of an upsert to carry a WHERE clause to disambiguate
+        the ``ON CONFLICT`` from the SELECT's own parse; ours does anyway.
+
+        ``json_patch``, not ``= excluded.props_json``: the merge form (see
+        _create_relationships) so a property added to this edge later is not silently
+        destroyed by a version write.
+        """
         if not versions:
             return
         conn = await self._get_conn()
-        for pkg, ver in versions.items():
-            await conn.execute(
-                "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ? AND labels = 'ExternalPackage'",
-                (json.dumps({"version": ver}), f"{project_name}:ext/{pkg}"),
-            )
+        # Replace, not accumulate — see the Cypher's docstring. The subselect confines
+        # the delete to ExternalPackage targets so it cannot eat create_depends_on_edges'
+        # project-to-project rows, which share the rel_type and the from_uid.
+        await conn.execute(
+            "DELETE FROM edges WHERE rel_type = 'DEPENDS_ON' AND from_uid = ? "
+            "AND to_uid IN (SELECT uid FROM nodes WHERE labels = 'ExternalPackage')",
+            (project_name,),
+        )
+        await conn.executemany(
+            "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) "
+            "SELECT ?, uid, 'DEPENDS_ON', ? FROM nodes WHERE uid = ? AND labels = 'ExternalPackage' "
+            "ON CONFLICT(from_uid, to_uid, rel_type) DO UPDATE SET "
+            "props_json = json_patch(edges.props_json, excluded.props_json)",
+            [
+                (project_name, json.dumps({"version": ver}), f"{project_name}:ext/{pkg}")
+                for pkg, ver in versions.items()
+            ],
+        )
         await conn.commit()
 
     async def resolve_cross_project_imports(self, project_names: list[str]) -> int:  # noqa: PLR0915
@@ -2123,11 +2197,23 @@ class SqliteGraphClient:
                     )
                     rewired += 1
 
-            cur = await conn.execute("SELECT COUNT(*) FROM edges WHERE to_uid = ?", (ep_uid,))
+            # DEPENDS_ON is excluded from the "is anything still pointing at this stub"
+            # count: since v18 the stub's own project points at it with the manifest
+            # version, and counting that would keep every rewired stub alive here while
+            # Memgraph (which only asks about IMPORTS and CONTAINS) deletes it. The
+            # version edge dies with the stub, exactly as the node property used to.
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE to_uid = ? AND rel_type <> 'DEPENDS_ON'", (ep_uid,)
+            )
             count_row = await cur.fetchone()
             await cur.close()
             if (count_row[0] if count_row else 0) == 0:
                 await conn.execute("DELETE FROM nodes WHERE uid = ?", (ep_uid,))
+                # The DETACH half of Memgraph's DETACH DELETE. Until v18 nothing pointed
+                # at a rewired stub, so dropping the node row alone left nothing behind;
+                # the version edge does, and a dangling edge row outlives the node
+                # forever because no sweep looks for one.
+                await conn.execute("DELETE FROM edges WHERE from_uid = ? OR to_uid = ?", (ep_uid, ep_uid))
 
         await conn.commit()
         logger.debug(
@@ -2140,6 +2226,9 @@ class SqliteGraphClient:
             return 0
         conn = await self._get_conn()
         placeholders = ",".join("?" * len(project_names))
+        # Both endpoints are pinned to labels = 'Project' — that is what keeps this
+        # delete disjoint from the Project -> ExternalPackage version edges sharing the
+        # rel_type since v18, not an accident of which rows happen to exist.
         await conn.execute(
             f"DELETE FROM edges WHERE rel_type = 'DEPENDS_ON' AND "
             f"from_uid IN (SELECT uid FROM nodes WHERE labels = 'Project' AND project_name IN ({placeholders})) AND "
@@ -3172,13 +3261,19 @@ class SqliteGraphClient:
         else:
             ext_where = ""
             ext_extra = []
+        # The version comes off the DEPENDS_ON edge since v18. LEFT, and pinned to this
+        # project's from_uid: the join must stay 1:1 per ep or COUNT(src.uid) silently
+        # multiplies. The edges primary key (from_uid, to_uid, rel_type) is what makes
+        # that true, so dropping the from_uid predicate — the obvious "simplification"
+        # once the node is globalized — would inflate every imported_by count.
         cur = await conn.execute(
-            "SELECT ep.name, json_extract(ep.props_json, '$.version'), COUNT(src.uid) AS imported_by FROM nodes ep "
+            "SELECT ep.name, json_extract(dep.props_json, '$.version'), COUNT(src.uid) AS imported_by FROM nodes ep "
             "LEFT JOIN edges e ON e.to_uid = ep.uid AND e.rel_type = 'IMPORTS' "
             "LEFT JOIN nodes src ON src.uid = e.from_uid "
+            "LEFT JOIN edges dep ON dep.to_uid = ep.uid AND dep.rel_type = 'DEPENDS_ON' AND dep.from_uid = ? "
             f"WHERE ep.labels = 'ExternalPackage' AND ep.project_name = ? {ext_where} "
             "GROUP BY ep.name ORDER BY imported_by DESC LIMIT ?",
-            [project, *ext_extra, limit],
+            [project, project, *ext_extra, limit],
         )
         ext_raw = [{"package": r[0], "version": r[1], "imported_by": r[2]} for r in await cur.fetchall()]
         await cur.close()

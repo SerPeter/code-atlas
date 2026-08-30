@@ -333,7 +333,8 @@ def test_compose_services_are_entities() -> None:
 def test_compose_depends_on_both_forms() -> None:
     parsed = _parse(COMPOSE, "docker-compose.yml")
 
-    # DEPENDS_ON is out-of-band (project-to-project) in GraphClient, so service
+    # DEPENDS_ON is written only by the indexer -- between Project nodes, or from a
+    # Project to an ExternalPackage it declares a version for -- so service
     # dependencies ride USES_TYPE, which resolves same-file names first.
     assert _targets(parsed, ":docker-compose_yml.api", RelType.USES_TYPE) == {"db"}
     assert _targets(parsed, ":docker-compose_yml.worker", RelType.USES_TYPE) == {"api", "db"}

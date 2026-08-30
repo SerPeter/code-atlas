@@ -239,7 +239,9 @@ nodes.
 
 **Call/Data (4):** CALLS, IMPORTS, USES_TYPE, OVERRIDES — runtime and compile-time dependencies.
 
-**Dependencies (1):** DEPENDS_ON — package-level dependency edges.
+**Dependencies (1):** DEPENDS_ON — two shapes sharing one type: `Project -> Project` (the monorepo dependency graph) and
+`Project -> ExternalPackage` carrying the manifest-declared `version` on the edge. Match the target label; a query that
+does not will mix them.
 
 **Documentation (2):** DOCUMENTS, MOTIVATED_BY — links between docs/ADRs and code entities.
 

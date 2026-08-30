@@ -2130,35 +2130,298 @@ async def test_resolve_imports_bare_package(graph_client: GraphClient):
     assert len(syms) == 0
 
 
-async def test_external_package_versions(graph_client: GraphClient):
-    """Version property is set on ExternalPackage nodes."""
-    await graph_client.ensure_schema()
+# ---------------------------------------------------------------------------
+# ATL-146 — a manifest version is one project's statement about a package
+# ---------------------------------------------------------------------------
 
-    project = "imp_ver"
-    fp = "src/app.py"
-    entities, mod_uid = _setup_module_node(project, fp)
-    await graph_client.upsert_file_entities(project, fp, entities, [])
 
-    import_rels = [
-        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="loguru.logger"),
-        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="pydantic.BaseModel"),
-    ]
-    await graph_client.resolve_imports(project, import_rels)
+async def _seed_importer(graph_client: GraphClient, project: str, *packages: str) -> None:
+    """A module in *project* importing *packages*, plus the Project node they hang off.
 
-    # Set versions
-    versions = {"loguru": "~=0.7", "pydantic": ">=2.0,<3.0"}
-    await graph_client.update_external_package_versions(project, versions)
+    Both endpoints matter. ``update_external_package_versions`` MATCHes and never MERGEs
+    the ExternalPackage, so without the import there is no node for the edge to land on;
+    and the Project node is the edge's other end, which the pre-v18 node-property write
+    never needed — a test carried over unchanged would silently write nothing.
+    """
+    entities, mod_uid = _setup_module_node(project, "src/app.py")
+    await graph_client.upsert_file_entities(project, "src/app.py", entities, [])
+    await graph_client.merge_project_node(project)
+    await graph_client.resolve_imports(
+        project,
+        [ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name=pkg) for pkg in packages],
+    )
 
-    # Verify
+
+async def _dependency_versions(graph_client: GraphClient, project: str) -> dict[str, str | None]:
+    """What ``Project -[DEPENDS_ON]-> ExternalPackage`` records for *project*.
+
+    Reads the edge itself rather than going through ``get_structure_overview``, so a
+    reader-side bug cannot mask a writer-side one: the point of the move is that the
+    *writer* stops colliding, and a report returning the right string proves nothing
+    about where that string lives.
+    """
     records = await graph_client.execute(
-        f"MATCH (n:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) "
-        "RETURN n.name AS name, n.version AS version ORDER BY n.name",
+        f"MATCH (:{NodeLabel.PROJECT} {{uid: $p}})-[d:{RelType.DEPENDS_ON}]->(ep:{NodeLabel.EXTERNAL_PACKAGE}) "
+        "RETURN ep.name AS name, d.version AS version",
         {"p": project},
     )
-    assert len(records) == 2
-    version_map = {r["name"]: r["version"] for r in records}
-    assert version_map["loguru"] == "~=0.7"
-    assert version_map["pydantic"] == ">=2.0,<3.0"
+    return {r["name"]: r["version"] for r in records}
+
+
+async def test_a_manifest_version_lands_on_the_dependency_edge(graph_client: GraphClient):
+    """The version is a property of the dependency, not a fact about the package (v18).
+
+    This test previously asserted ``n.version`` on the ExternalPackage node, which is
+    the shape ATL-146 removed — a package does not have a version, a project's use of it
+    does.
+    """
+    await graph_client.ensure_schema()
+
+    project = "test_imp_ver"
+    await _seed_importer(graph_client, project, "loguru", "pydantic")
+
+    await graph_client.update_external_package_versions(project, {"loguru": "~=0.7", "pydantic": ">=2.0,<3.0"})
+
+    assert await _dependency_versions(graph_client, project) == {"loguru": "~=0.7", "pydantic": ">=2.0,<3.0"}
+
+
+async def test_two_projects_keep_their_own_versions_of_one_package(graph_client: GraphClient):
+    """The bug this story exists to fix, and the only reason the edge was worth adding.
+
+    As a node property the version lived on ``{project}:ext/{name}``, survivable only
+    while that uid stayed project-scoped. The moment two projects share one
+    ExternalPackage node — which is exactly what ATL-088 does — the second index
+    overwrites the first last-writer-wins, silently and with no error. Asserting both
+    values is what makes globalization safe to attempt.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+    await _seed_importer(graph_client, "test_lib", "requests")
+
+    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+    await graph_client.update_external_package_versions("test_lib", {"requests": "2.28.0"})
+
+    assert await _dependency_versions(graph_client, "test_app") == {"requests": "2.31.0"}
+    assert await _dependency_versions(graph_client, "test_lib") == {"requests": "2.28.0"}
+
+
+async def test_the_version_is_not_left_on_the_package_node(graph_client: GraphClient):
+    """A leftover ``ep.version`` is worse than no version: it is the stale one.
+
+    Two homes for one value means whichever reader was not updated keeps serving the
+    first project to index, forever, and nothing in the graph marks it as stale.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+
+    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+
+    records = await graph_client.execute(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) RETURN ep.version AS version",
+        {"p": "test_app"},
+    )
+    assert [r["version"] for r in records] == [None]
+
+
+async def test_a_package_dropped_from_the_manifest_loses_its_edge(graph_client: GraphClient):
+    """A stale node property was inert; a stale edge is a false assertion.
+
+    ``requests`` leaving the manifest means the project no longer depends on it, and
+    unlike a leftover property the edge is visible to every traversal and to the
+    SBOM-shaped reads this edge exists to support.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests", "loguru")
+
+    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0", "loguru": "0.7.2"})
+    await graph_client.update_external_package_versions("test_app", {"loguru": "0.7.2"})
+
+    assert await _dependency_versions(graph_client, "test_app") == {"loguru": "0.7.2"}
+
+
+async def test_a_version_write_leaves_project_to_project_edges_intact(graph_client: GraphClient):
+    """Two producers now share DEPENDS_ON, and only the endpoint labels keep them apart.
+
+    ``create_depends_on_edges`` writes Project -> Project; this writes
+    Project -> ExternalPackage. The replace-not-accumulate pre-delete here is scoped to
+    ``:ExternalPackage`` targets; relax that label and every monorepo index erases the
+    cross-project dependency graph on its way to writing a manifest version.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+    await graph_client.merge_project_node("test_lib")
+    await graph_client.execute_write(
+        f"MATCH (a:{NodeLabel.PROJECT} {{uid: 'test_app'}}), (b:{NodeLabel.PROJECT} {{uid: 'test_lib'}}) "
+        f"CREATE (a)-[:{RelType.DEPENDS_ON}]->(b)"
+    )
+
+    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+
+    assert await graph_client.get_project_dependency_edges() == [{"from_proj": "test_app", "to_proj": "test_lib"}]
+
+
+async def test_a_manifest_coordinate_nothing_imports_writes_no_edge(graph_client: GraphClient):
+    """MATCH, never MERGE — an unmatched manifest key is a deliberate no-op.
+
+    go.mod, pom.xml, build.gradle and composer.json name distribution coordinates that
+    cannot be mapped to an import root from the manifest alone, so most of their keys
+    match no node. MERGE here would mint an ExternalPackage *and* a dependency edge for
+    every declared-but-unimported coordinate in every Go/Java/PHP project.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+
+    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0", "never-imported": "9.9.9"})
+
+    assert await _dependency_versions(graph_client, "test_app") == {"requests": "2.31.0"}
+    counts = await graph_client.execute(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE}) RETURN count(ep) AS cnt",
+    )
+    assert counts[0]["cnt"] == 1
+
+
+async def test_the_dependency_report_reads_the_version_off_the_edge(graph_client: GraphClient):
+    """``analyze_repo(analysis="structure")`` must be unchanged in output shape.
+
+    Its ``external_dependencies`` rows are built straight from these keys, so a read
+    that quietly returned ``None`` for every version would pass every pre-existing
+    assertion about the report — not one of them looks at the value.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests", "loguru")
+    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+
+    rows = (await graph_client.get_structure_overview("test_app", "", 20))["external_deps"]
+
+    by_name = {r["package"]: dict(r) for r in rows}
+    assert by_name["requests"] == {"package": "requests", "version": "2.31.0", "imported_by": 1}
+    # An imported-but-undeclared package still appears, unversioned. A plain MATCH would
+    # shrink the report to only the packages someone pinned, which is the minority on
+    # any Go/Java/PHP project.
+    assert by_name["loguru"] == {"package": "loguru", "version": None, "imported_by": 1}
+
+
+async def test_another_projects_pin_does_not_leak_into_this_ones_report(graph_client: GraphClient):
+    """The report's OPTIONAL MATCH must be pinned to the reading project's own edge.
+
+    Two DEPENDS_ON edges into one ExternalPackage is the shape ATL-088 creates and the
+    reason ``(:Project {uid: $project})`` is written out rather than left bare, so the
+    second edge is seeded by hand: while the node is still ``{project}:ext/{name}`` the
+    two projects address different nodes and nothing can collide, which makes the
+    natural version of this test pass against a query missing the constraint.
+
+    Both halves of the damage are asserted — an unpinned match reports the sibling's pin
+    as this project's, and its extra row multiplies the ``imported_by`` count that ranks
+    the whole list.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+    await graph_client.merge_project_node("test_lib")
+    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+    await graph_client.execute_write(
+        f"MATCH (p:{NodeLabel.PROJECT} {{uid: 'test_lib'}}), "
+        f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) "
+        f"CREATE (p)-[:{RelType.DEPENDS_ON} {{version: '2.28.0'}}]->(ep)"
+    )
+
+    rows = (await graph_client.get_structure_overview("test_app", "", 20))["external_deps"]
+
+    assert [dict(r) for r in rows] == [{"package": "requests", "version": "2.31.0", "imported_by": 1}]
+
+
+async def test_v18_migration_moves_node_versions_onto_the_dependency_edge(graph_client: GraphClient):
+    """A version cannot be re-derived from source text, so clear-and-reparse loses it.
+
+    Every other migration of this shape hands the work back to the parser, which the
+    file-hash gate makes cheap and certain. A version comes from a manifest read only
+    during ``atlas index``, and nothing guarantees an index happens before someone calls
+    ``analyze_repo(analysis="structure")`` — so dropping the property and waiting would
+    report every dependency as unversioned for an unbounded window, with no error to
+    explain it.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+    # The pre-v18 shape, written the way v17 wrote it.
+    await graph_client.execute_write(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) SET ep.version = '2.31.0'"
+    )
+    await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 17")
+
+    await graph_client.ensure_schema()
+
+    assert await _dependency_versions(graph_client, "test_app") == {"requests": "2.31.0"}
+    left = await graph_client.execute(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) RETURN ep.version AS version"
+    )
+    assert left[0]["version"] is None, "the stale node property is the one a not-yet-updated reader would pick"
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
+
+
+async def test_v18_migration_keeps_the_version_of_an_orphaned_package(graph_client: GraphClient):
+    """An orphan gets no edge, so an unconditional REMOVE turns "moved" into "dropped".
+
+    The edge's other end is the Project node; a package left behind by a deleted project
+    has nowhere to move to. Gating the REMOVE on the value having actually landed keeps
+    it recoverable, and these are exactly the rows nobody would think to check — the
+    reader returns null for them either way, so the loss is invisible.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+    await graph_client.execute_write(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) SET ep.version = '2.31.0'"
+    )
+    await graph_client.execute_write(f"MATCH (p:{NodeLabel.PROJECT} {{uid: 'test_app'}}) DETACH DELETE p")
+    await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 17")
+
+    await graph_client.ensure_schema()
+
+    assert await _dependency_versions(graph_client, "test_app") == {}
+    kept = await graph_client.execute(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) RETURN ep.version AS version"
+    )
+    assert kept[0]["version"] == "2.31.0"
+
+
+async def test_a_rewired_cross_project_stub_takes_its_version_edge_with_it(graph_client: GraphClient):
+    """A stub that gets rewired to a real Package must not leave the version edge behind.
+
+    This is the behaviour SQLite was written to match, and it was pinned only there.
+    Memgraph gets it free from ``DETACH DELETE`` while SQLite needs two explicit deletes
+    plus a ``rel_type <> 'DEPENDS_ON'`` exclusion in its liveness count -- so the side
+    that gets it free is the side with nothing proving it still does, and a future
+    rewrite of that delete has no test standing in its way.
+
+    Worth stating plainly because it is not obvious from the code: in a monorepo, a
+    project declaring a *sibling* package in its manifest has this edge written at index
+    step 7 and destroyed by cross-project resolution moments later. Pre-v18 the node
+    property died the same way, so it is not a regression -- but nothing surfaces it.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "shared")
+    # The sibling's real Package is what makes the stub resolvable -- the cross-project
+    # pass matches ExternalPackage.name against Package nodes.
+    await graph_client.merge_package_node("test_lib", "shared", "shared", "shared/__init__.py")
+    await graph_client.update_external_package_versions("test_app", {"shared": "1.0.0"})
+    assert await _dependency_versions(graph_client, "test_app") == {"shared": "1.0.0"}
+
+    # Asserting the rewire structurally, not by the return value: Memgraph's
+    # ExternalPackage rewire loop does not increment `rewired` while its ExternalSymbol
+    # loop does, so a package-only rewire reports 0 here and 1 on SQLite. Pre-existing
+    # and orthogonal to v18 -- the count is a debug-log figure, not a contract -- but it
+    # is a real divergence the conformance suite does not cover.
+    await graph_client.resolve_cross_project_imports(["test_app", "test_lib"])
+
+    rewired = await graph_client.execute(
+        f"MATCH (:{NodeLabel.MODULE} {{project_name: 'test_app'}})-[:{RelType.IMPORTS}]->"
+        f"(pkg:{NodeLabel.PACKAGE} {{project_name: 'test_lib'}}) RETURN pkg.name AS name"
+    )
+    assert [r["name"] for r in rewired] == ["shared"], "the stub was never rewired, so the delete proves nothing"
+
+    survivors = await graph_client.execute(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/shared'}}) RETURN ep"
+    )
+    assert survivors == [], "the rewired stub survived its own version edge"
+    assert await _dependency_versions(graph_client, "test_app") == {}
 
 
 async def test_resolve_imports_prefix_fallback_reexport(graph_client: GraphClient):

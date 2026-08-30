@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 17
+SCHEMA_VERSION: int = 18
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -213,13 +213,18 @@ _EXTERNAL_LABELS: frozenset[NodeLabel] = frozenset(
 # Reference-counted labels: a node exists exactly as long as something points
 # at it, so "zero incoming edges" means "unreferenced" and the node can be
 # swept (see GraphBackend.gc_orphaned_reference_nodes).  ExternalPackage and
-# ExternalSymbol are deliberately NOT here — ExternalPackage carries a
-# per-project ``version`` and receives a structural CONTAINS edge from its
-# package, so incoming-edge count is not a reference count for them.
+# ExternalSymbol are deliberately NOT here — an ExternalPackage receives a
+# structural CONTAINS edge from its package and, since v18, a structural
+# incoming ``Project -[DEPENDS_ON]->`` carrying the manifest-declared version,
+# so incoming-edge count is not a reference count for them.  (Before v18 the
+# version was a node property, which was the other half of the same argument;
+# moving it onto an edge did not weaken the exclusion, it added a second
+# structural edge to it.)
 #
 # INVARIANT: never give these labels a structural incoming edge (a Project or
 # Package CONTAINS, say).  It would make every node permanently referenced and
-# silently disable the sweep.
+# silently disable the sweep.  DEPENDS_ON on ExternalPackage is exactly that
+# kind of edge, which is why the label must stay out of this set.
 _REFERENCE_COUNTED_LABELS: frozenset[NodeLabel] = frozenset(
     {
         NodeLabel.ENV_VAR,

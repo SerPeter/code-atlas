@@ -93,8 +93,10 @@ Edge mapping is constrained by ``GraphClient``'s routing registries:
     (``resolve_imports``). Used for in-repo file references (compose
     ``build.dockerfile``, Ansible task includes) and for external references
     (container images, ``uses:`` actions).
-  - ``DEPENDS_ON`` is out-of-band (project-to-project) and must never be emitted
-    from a parser, which is why compose ``depends_on`` becomes ``USES_TYPE``.
+  - ``DEPENDS_ON`` is out-of-band — written only by the indexer, either between
+    Project nodes or from a Project to an ExternalPackage it declares a version
+    for — and must never be emitted from a parser, which is why compose
+    ``depends_on`` becomes ``USES_TYPE``.
 
 Known limitation: entity uids are derived from the file path, so a reference
 whose target lives in another file resolves only through ``USES_TYPE``/``CALLS``

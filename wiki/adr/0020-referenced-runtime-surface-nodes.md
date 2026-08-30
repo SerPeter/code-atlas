@@ -36,8 +36,9 @@ Applying it gives a deliberate asymmetry between the two new kinds:
 | `ResourceFile` | **project-scoped** | `{project}:res/{path}` | a path is only meaningful relative to a project root — `data/fixtures.json` in two repos is two different files |
 
 The global node makes "every callsite of `DATABASE_URL` across every repo" a single node rather than a name-join. The
-same rule keeps `ExternalPackage` project-scoped, because it carries a per-project `version` (see the deferred spec
-ATL-088).
+same rule kept `ExternalPackage` project-scoped, because it carried a per-project `version`. That reason is gone as of
+schema v18 (ATL-146): the version moved onto a `Project -[DEPENDS_ON]-> ExternalPackage` edge, which is per-project even
+when the node is not. Globalizing the node is now unblocked — see ATL-088 — but not done here.
 
 ### A sentinel, because null is impossible
 
@@ -54,9 +55,9 @@ them on reparse, so when the last `os.getenv("X")` leaves the source, the last i
 `gc_orphaned_reference_nodes` then sweeps nodes with zero incoming edges.
 
 `_REFERENCE_COUNTED_LABELS` is deliberately narrower than `_EXTERNAL_LABELS`: `ExternalPackage` receives a structural
-`CONTAINS` edge from its package and carries a `version`, so its incoming-edge count is not a reference count.
-**Invariant, stated in the code:** never give a reference-counted label a structural incoming edge — it would make every
-node permanently referenced and silently disable the sweep.
+`CONTAINS` edge from its package and, since v18, a structural incoming `DEPENDS_ON` from its project, so its
+incoming-edge count is not a reference count. **Invariant, stated in the code:** never give a reference-counted label a
+structural incoming edge — it would make every node permanently referenced and silently disable the sweep.
 
 ### Names only, never values
 
@@ -117,8 +118,8 @@ files across repos. The two kinds look similar and are not.
 
 ### Reference-count `ExternalPackage` too
 
-Rejected: it has a structural `CONTAINS` edge and a per-project `version`, so zero-incoming-edges is not a reference
-count for it. Sweeping it would delete live nodes.
+Rejected: it has a structural `CONTAINS` edge and, since v18, a structural incoming `DEPENDS_ON` carrying the manifest
+version, so zero-incoming-edges is not a reference count for it. Sweeping it would delete live nodes.
 
 ## References
 
@@ -126,4 +127,5 @@ count for it. Sweeping it would delete live nodes.
 - `src/code_atlas/graph/client.py` — `resolve_config_refs`, `gc_orphaned_reference_nodes`,
   `_migrate_v7_clear_freshness_markers`
 - [ADR-0018: Non-code file parsing](./0018-non-code-file-parsing.md) — the secret deny-list this reinforces
-- ATL-088 (backlog) — globalizing `ExternalPackage`, blocked on moving `version` onto the edge
+- ATL-146 — moved `version` onto `Project -[DEPENDS_ON]-> ExternalPackage` (schema v18)
+- ATL-088 (backlog) — globalizing `ExternalPackage`; was blocked on ATL-146, no longer is

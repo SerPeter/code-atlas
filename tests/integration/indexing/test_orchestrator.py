@@ -579,8 +579,18 @@ class TestManifestVersionsIntegration:
     """End-to-end proof of which manifest → ExternalPackage joins actually land."""
 
     async def _external_versions(self, graph_client, project_root: Path) -> dict[str, str | None]:
+        """Every ExternalPackage the index created, with the version its project pinned.
+
+        The OPTIONAL MATCH is what makes ``None`` mean "no manifest entry joined" rather
+        than "no such package": since v18 the version is a property of the
+        ``Project -[DEPENDS_ON]->`` edge, so a package with no manifest entry has no edge
+        at all, and an inner match would drop it from this map entirely — which is the
+        answer the go.mod case below is specifically asserting the shape of.
+        """
         rows = await graph_client.execute(
-            f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $pn}}) RETURN p.name AS name, p.version AS version",
+            f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $pn}}) "
+            f"OPTIONAL MATCH (:{NodeLabel.PROJECT} {{uid: $pn}})-[d:{RelType.DEPENDS_ON}]->(p) "
+            "RETURN p.name AS name, d.version AS version",
             {"pn": derive_project_name(project_root)},
         )
         return {r["name"]: r["version"] for r in rows}
@@ -618,6 +628,10 @@ class TestManifestVersionsIntegration:
         that aggregates every GitHub-hosted module. Stamping one module's version
         onto it would be a wrong mapping, so the parser emits the module path
         verbatim and the write is a no-op.
+
+        Since v18 the no-op is stronger than it was: nothing joined means no
+        ``DEPENDS_ON`` edge exists at all, rather than a node whose ``version``
+        property was never set.
         """
         _write(tmp_path, "go.mod", "module example.com/demo\n\ngo 1.22\n\nrequire github.com/spf13/cobra v1.8.0\n")
         _write(
