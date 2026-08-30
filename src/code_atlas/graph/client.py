@@ -30,6 +30,7 @@ from code_atlas.schema import (
     _ENTITY_LABELS,
     _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
+    FILE_HASH_LABELS,
     GLOBAL_PROJECT,
     RESOURCE_FILE_PREFIX,
     SCHEMA_VERSION,
@@ -39,6 +40,7 @@ from code_atlas.schema import (
     RelType,
     TypeDefKind,
     env_var_uid,
+    generate_clear_file_hashes_ddl,
     generate_composite_index_ddl,
     generate_drop_redundant_marker_ddl,
     generate_drop_text_index_ddl,
@@ -2095,7 +2097,7 @@ class GraphClient:
         project_name: str,
         file_paths: list[str],
     ) -> dict[str, str | None]:
-        """Return ``{file_path: file_hash}`` for Module/Package nodes in one RTT.
+        """Return ``{file_path: file_hash}`` for the FILE_HASH_LABELS nodes in one RTT.
 
         Returns ``None`` for files that have no stored hash.
         """
@@ -2108,7 +2110,7 @@ class GraphClient:
         # nothing and re-parse everything. One statement per label because the inline
         # form takes a single label.
         result: dict[str, str | None] = dict.fromkeys(file_paths)
-        for label in (NodeLabel.MODULE, NodeLabel.PACKAGE):
+        for label in FILE_HASH_LABELS:
             records = await self.execute(
                 f"UNWIND $fps AS fp "
                 f"MATCH (n:{label} {{project_name: $p, file_path: fp}}) "
@@ -2116,7 +2118,12 @@ class GraphClient:
                 {"p": project_name, "fps": file_paths},
             )
             for r in records:
-                result[r["fp"]] = r["fh"]
+                # A path should have exactly one file-level node, so these do not
+                # normally collide. Guarding anyway: a later label returning a null
+                # hash must not erase an earlier one's real value, because the gate
+                # reads a null as "never indexed" and re-parses.
+                if r["fh"] is not None or result[r["fp"]] is None:
+                    result[r["fp"]] = r["fh"]
         return result
 
     async def set_batch_file_hashes(
@@ -2124,7 +2131,7 @@ class GraphClient:
         project_name: str,
         file_hashes: dict[str, str],
     ) -> None:
-        """Write ``file_hash`` on Module/Package nodes for each file path."""
+        """Write ``file_hash`` on the FILE_HASH_LABELS nodes for each file path."""
         if not file_hashes:
             return
         params = [{"fp": fp, "fh": fh} for fp, fh in file_hashes.items()]
@@ -2133,7 +2140,7 @@ class GraphClient:
         # file's hash per call (measured: 1 of 3, with every file's node present), so
         # the incremental hash gate recorded almost nothing and re-parsed the repo on
         # every run.
-        for label in (NodeLabel.MODULE, NodeLabel.PACKAGE):
+        for label in FILE_HASH_LABELS:
             await self.execute_write(
                 f"UNWIND $items AS item "
                 f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
@@ -6178,10 +6185,7 @@ class GraphClient:
         are unaffected by the change, so purging them would cost a rebuild for nothing.
         """
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.strategy = 'project_unique' DELETE r")
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v8: dropped project_unique CALLS edges and cleared file/git hashes — "
@@ -6202,10 +6206,7 @@ class GraphClient:
         rather than rebuilt for nothing.
         """
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.confidence = 'ambiguous' DELETE r")
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v9: cleared ambiguous CALLS edges and file/git hashes — run 'atlas index' "
@@ -6223,10 +6224,7 @@ class GraphClient:
         """
         await self.execute_write(f"MATCH (t:{NodeLabel.TYPE_DEF}) WHERE t.is_abstract IS NOT NULL REMOVE t.is_abstract")
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() DELETE r")
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info("Schema v10: cleared CALLS edges and the class-level is_abstract flag — run 'atlas index'")
 
@@ -6350,10 +6348,7 @@ class GraphClient:
         next index run re-parses every file and heals entities whose body-only
         edits were invisible under the v2 hash formula.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v3: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v3"
@@ -6366,10 +6361,7 @@ class GraphClient:
         run re-parses every file — cheap, since AST diffing then finds no real content changes for
         anything but the new Note entities.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v4: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v4"
@@ -6381,10 +6373,7 @@ class GraphClient:
         with an ``anchors:`` key even though the file's bytes are unchanged. Clear file/git
         hashes so the next index run re-parses every file and resolves those anchors.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v5: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v5"
@@ -6398,10 +6387,7 @@ class GraphClient:
         full re-parse, and drop the pre-v6 CALLS edges so they are rebuilt with weights rather
         than surviving unweighted (a missing weight silently reads as 1.0 in MAGE's Leiden).
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.weight IS NULL DELETE r")
         logger.info(
@@ -6424,10 +6410,7 @@ class GraphClient:
         Nothing is deleted, unlike v6's unweighted-CALLS purge: there are no
         pre-v7 EnvVar/ResourceFile nodes to be stale.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v7: cleared stored file/git hashes — run 'atlas index' to extract "
@@ -6476,10 +6459,7 @@ class GraphClient:
         nothing). Re-parsing fills it in; deleting first would lose real edges for a
         cosmetic gain.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v11: cleared stored file/git hashes — run 'atlas index' so CALLS edges "
@@ -6509,10 +6489,7 @@ class GraphClient:
         clear is repo-wide because it is cheap and a per-language clear would need to
         know which files a project holds before reading them.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v12: cleared stored file/git hashes — run 'atlas index' so overloaded "
@@ -6533,10 +6510,7 @@ class GraphClient:
         and a node still holding a truncated vector is not wrong, only incomplete, which
         re-embedding fixes.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v17: cleared stored file/git hashes — run 'atlas index' so oversized doc "
@@ -6686,10 +6660,7 @@ class GraphClient:
         an unknown property, and ``atlas project rm`` followed by a re-index clears them
         for anyone who wants them gone.
         """
-        await self.execute_write(
-            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
-            "REMOVE n.file_hash"
-        )
+        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
             "Schema v16: cleared stored file/git hashes — run 'atlas index' so markdown "

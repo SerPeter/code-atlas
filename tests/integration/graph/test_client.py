@@ -5412,6 +5412,69 @@ async def test_batch_file_hashes_round_trip_every_file(graph_client: GraphClient
     assert {fp: got[fp] for fp in files} == {fp: f"hash-{fp}" for fp in files}
 
 
+def _doc_file_entity(project: str, fp: str) -> ParsedEntity:
+    return ParsedEntity(
+        name=fp.rsplit("/", 1)[-1],
+        qualified_name=f"{project}:{fp}",
+        label=NodeLabel.DOC_FILE,
+        kind="doc_file",
+        line_start=1,
+        line_end=5,
+        file_path=fp,
+    )
+
+
+async def test_file_hash_round_trips_on_a_doc_file(graph_client: GraphClient):
+    """Markdown produces a DocFile and no Module.
+
+    Before DocFile joined FILE_HASH_LABELS the gate could never store a hash for a
+    document and read back None forever, so every ``.md`` file re-parsed on every
+    event. Measured on one repo: 2,651 of its 3,254 files were permanently ungated.
+    """
+    await graph_client.ensure_schema()
+    project = "hash_docfile"
+    fp = "docs/architecture.md"
+    await graph_client.upsert_file_entities(project, fp, [_doc_file_entity(project, fp)], [])
+
+    await graph_client.set_batch_file_hashes(project, {fp: "md-hash-1"})
+
+    assert await graph_client.get_batch_file_hashes(project, [fp]) == {fp: "md-hash-1"}
+
+
+async def test_a_null_hash_on_one_label_does_not_erase_a_real_one_on_another(graph_client: GraphClient):
+    """The reader walks FILE_HASH_LABELS in order and must not let a later label's
+    null clobber an earlier label's stored hash — the gate reads null as "never
+    indexed" and would re-parse a file that is genuinely current."""
+    await graph_client.ensure_schema()
+    project = "hash_collide"
+    fp = "src/hybrid.py"
+
+    # Same path carrying both a Module (hashed) and a DocFile (never hashed).
+    await graph_client.upsert_file_entities(
+        project,
+        fp,
+        [
+            ParsedEntity(
+                name="hybrid",
+                qualified_name=f"{project}:src.hybrid",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=1,
+                file_path=fp,
+            ),
+            _doc_file_entity(project, fp),
+        ],
+        [],
+    )
+    await graph_client.execute_write(
+        f"MATCH (n:{NodeLabel.MODULE} {{project_name: $p, file_path: $f}}) SET n.file_hash = 'real'",
+        {"p": project, "f": fp},
+    )
+
+    assert await graph_client.get_batch_file_hashes(project, [fp]) == {fp: "real"}
+
+
 async def test_resolve_calls_will_not_resolve_a_call_on_an_unknown_receiver(graph_client: GraphClient):
     """Uniqueness within the project is evidence of identity only if the name was looked
     up in the project's namespace.

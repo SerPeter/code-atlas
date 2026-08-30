@@ -91,6 +91,7 @@ from code_atlas.schema import (
     _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     COMPOSITE_INDICES,
+    FILE_HASH_LABELS,
     GLOBAL_PROJECT,
     LABEL_PROPERTY_INDICES,
     TEXT_INDICES,
@@ -110,6 +111,9 @@ if TYPE_CHECKING:
 _VEC_LABEL_VALUES: frozenset[str] = frozenset(lbl.value for lbl in _EMBEDDABLE_LABELS)
 _TEXT_LABEL_VALUES: frozenset[str] = frozenset(lbl.value for lbl in _TEXT_SEARCHABLE_LABELS)
 _POST_BATCH_REL_VALUES: frozenset[str] = frozenset(r.value for r in _POST_BATCH_REL_TYPES)
+# Rendered once, from the same tuple the Memgraph gate iterates, so the two backends
+# cannot disagree about which nodes carry a file_hash.
+_FILE_HASH_LABELS_SQL = ", ".join(f"'{lbl.value}'" for lbl in FILE_HASH_LABELS)
 
 _NODE_COLUMNS = "uid, labels, project_name, qualified_name, file_path, name, kind, content_hash, props_json"
 
@@ -1188,7 +1192,7 @@ class SqliteGraphClient:
             placeholders = ",".join("?" * len(chunk))
             cur = await conn.execute(
                 f"SELECT file_path, props_json FROM nodes WHERE project_name = ? AND file_path IN ({placeholders}) "
-                f"AND labels IN ('Module', 'Package')",
+                f"AND labels IN ({_FILE_HASH_LABELS_SQL})",
                 (project_name, *chunk),
             )
             rows = await cur.fetchall()
@@ -1205,7 +1209,7 @@ class SqliteGraphClient:
         for fp, fh in file_hashes.items():
             await conn.execute(
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) "
-                "WHERE project_name = ? AND file_path = ? AND labels IN ('Module', 'Package')",
+                f"WHERE project_name = ? AND file_path = ? AND labels IN ({_FILE_HASH_LABELS_SQL})",
                 (json.dumps({"file_hash": fh}), project_name, fp),
             )
         await conn.commit()

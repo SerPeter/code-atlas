@@ -284,6 +284,22 @@ _MARKER_LABELS: frozenset[NodeLabel] = frozenset({NodeLabel.ENTITY})
 # All non-meta labels (must have uid + project_name)
 _ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS
 
+# The labels that carry ``file_hash`` — the per-file gate that lets an unchanged file
+# skip parsing entirely. A label qualifies by having exactly one node per file, written
+# on every parse of it, which is what makes the stored hash mean "the content this file
+# was last indexed at".
+#
+# DocFile is here because markdown produces no Module node, so without it every ``.md``
+# file re-parsed on every event forever — the gate read back None and could never
+# record one. Measured on a 3,254-file repo whose 2,651 markdown files were all
+# ungated: coverage was 18%, and adding DocFile takes it to 99.7%.
+#
+# A migration that clears hashes to force a re-parse must clear ALL of these, which is
+# what generate_clear_file_hashes_ddl is for — the two that predate it named Module and
+# Package literally, and a third written from that template would silently leave every
+# document gated.
+FILE_HASH_LABELS: tuple[NodeLabel, ...] = (NodeLabel.MODULE, NodeLabel.PACKAGE, NodeLabel.DOC_FILE)
+
 
 # ---------------------------------------------------------------------------
 # uid construction for reference-counted nodes
@@ -573,6 +589,18 @@ def generate_drop_vector_index_ddl() -> list[str]:
 def generate_drop_text_index_ddl() -> list[str]:
     """Generate DROP statements for all text indices (Memgraph 3.7+ DDL)."""
     return [f"DROP TEXT INDEX {spec.name};" for spec in TEXT_INDICES]
+
+
+def generate_clear_file_hashes_ddl() -> str:
+    """Cypher that clears every stored ``file_hash``, opening the gate for a re-parse.
+
+    For migrations whose new data can only come from re-reading the source. Derived
+    from FILE_HASH_LABELS so a label added to the gate is cleared by every future
+    migration automatically, rather than being forgotten by whichever one is written
+    next from an older one's template.
+    """
+    predicate = " OR ".join(f"n:{label.value}" for label in FILE_HASH_LABELS)
+    return f"MATCH (n) WHERE ({predicate}) AND n.file_hash IS NOT NULL REMOVE n.file_hash"
 
 
 def generate_drop_redundant_marker_ddl() -> list[str]:
