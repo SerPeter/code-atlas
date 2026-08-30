@@ -556,7 +556,21 @@ class IndexSettings(StrictSection):
         default="warn",
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
     )
-    max_source_chars: int = Field(default=2000, description="Max characters for entity source text (0 to disable).")
+    max_source_chars: int = Field(
+        default=48_000,
+        description=(
+            "Max characters for entity source text (0 to disable). Truncation happens in the "
+            "post-parse pass, before the entity is stored, so this is also the ceiling on what "
+            "an embedding can ever see: at the old 2000 it was ~500 tokens against a 2048-token "
+            "model, no code entity could exceed the cap, and the EmbedChunk overflow path "
+            "(ADR-0040) was unreachable. Measured across 33,654 embedded entities, 48,000 chars "
+            "captures every one of them whole (~12,000 tokens, inside the 8-chunk budget even "
+            "for a 2048-token model) and costs only 22% more than a 8,000 cap that would leave "
+            "7% of them truncated. Raising this makes an unresolved [embeddings] max_input_tokens "
+            "much more dangerous -- see that field. Mirrors parsing.ast.DEFAULT_MAX_SOURCE_CHARS "
+            "(asserted by a unit test)."
+        ),
+    )
     max_doc_section_chars: int = Field(
         default=6000,
         ge=0,

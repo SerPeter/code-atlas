@@ -178,12 +178,27 @@ class EmbedClient:
                 logger.debug("Embedding model max input tokens: {} (effective: {})", limit, effective)
                 return effective
         except Exception:
-            logger.opt(exception=True).debug(
-                "Could not determine max input tokens for '{}'; truncation disabled", self._model
-            )
+            self._warn_unknown_cap()
             return None
-        logger.debug("Could not determine max input tokens for '{}'; truncation disabled", self._model)
+        self._warn_unknown_cap()
         return None
+
+    def _warn_unknown_cap(self) -> None:
+        """Say out loud that neither chunking nor truncation will happen.
+
+        At warning level, not debug, because the consequence grew: entity source is
+        capped at index.max_source_chars, which is 48,000 characters — roughly 12,000
+        tokens. With no cap resolved, a text that size is sent whole, and one
+        over-length text fails the entire provider call it was batched into, taking
+        127 unrelated texts down with it. This used to be a debug line back when the
+        source cap made every code entity ~500 tokens and nothing could exceed a limit.
+        """
+        logger.warning(
+            "No input-token cap for embedding model '{}' — litellm's registry does not know it, "
+            "so neither chunking nor truncation will run. Set [embeddings] max_input_tokens "
+            "(gemini-embedding-001 is 2048, text-embedding-3-small is 8191).",
+            self._model,
+        )
 
     def count_tokens(self, text: str) -> int:
         """Token count for *text* under this model's tokenizer.

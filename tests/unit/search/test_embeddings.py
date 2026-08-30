@@ -19,6 +19,7 @@ from code_atlas.indexing.consumers import (
     _partition_written_vectors,
     _plan_embed_chunks,
 )
+from code_atlas.parsing.ast import parse_file
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
 from code_atlas.settings import EmbeddingSettings
 
@@ -893,3 +894,65 @@ class TestChunkFacts:
     def test_no_line_start_on_the_entity_means_no_span(self):
         plan = self._plan("aaaa\nbbbb", {"source": "aaaa\nbbbb"}, ["aaaa", "bbbb"])
         assert plan.chunk_facts["p:mod.fn#chunk2"].line_start is None
+
+
+class TestOversizedCodeEntityReachesTheChunker:
+    """The regression that made EmbedChunk unreachable in practice.
+
+    ``max_source_chars`` truncates ``source`` in the post-parse pass, *before* the
+    entity is stored, and ``build_embed_text`` reads that stored value. At the old
+    default of 2000 a code entity's embed text could not exceed ~500 tokens, so
+    ``_plan_embed_chunks`` always took its ``len(chunks) <= 1`` early return and no
+    EmbedChunk was ever written. Measured on a real 78k-node graph: zero EmbedChunk
+    nodes anywhere, and a 1,144-line function carrying a single embedding built from
+    2,004 characters -- about 4% of its body.
+
+    Every existing chunking test hands the splitter synthetic text, so none of them
+    could see it. These two go parser -> embed text, which is the path that was broken.
+    """
+
+    @staticmethod
+    def _huge_function_source(lines: int = 1200) -> bytes:
+        body = "\n".join(f"    value_{i} = compute_value({i}) + offset_{i}" for i in range(lines))
+        return f'def huge_function():\n    """A function far too large to be one unit."""\n{body}\n'.encode()
+
+    def _embed_text_for_huge_function(self) -> str:
+        parsed = parse_file("src/huge.py", self._huge_function_source(), "proj")
+        assert parsed is not None
+        entity = next(e for e in parsed.entities if e.name == "huge_function")
+        return build_embed_text(
+            {
+                "_label": "Callable",
+                "qualified_name": entity.qualified_name,
+                "kind": entity.kind,
+                "signature": entity.signature or "",
+                "docstring": entity.docstring or "",
+                "source": entity.source or "",
+            }
+        )
+
+    def test_source_survives_the_cap_past_a_2048_token_model(self):
+        text = self._embed_text_for_huge_function()
+        # 2048 tokens is gemini-embedding-001's cap, the smallest this project targets.
+        assert len(text) > 2048 * CHARS_PER_TOKEN_FALLBACK, (
+            f"embed text is only {len(text)} chars — the source cap is truncating below "
+            "the smallest model's input limit again, which makes chunking unreachable"
+        )
+
+    def test_it_actually_splits_into_several_chunks(self):
+        text = self._embed_text_for_huge_function()
+        chunks, _hard, _dropped = split_embed_text(
+            text, limit=2048, measure=lambda t: len(t) // CHARS_PER_TOKEN_FALLBACK + 1, max_chunks=8
+        )
+        assert len(chunks) > 1, "a 1200-line function must produce overflow chunks, not one vector"
+
+
+def test_source_cap_default_matches_the_parser_constant():
+    """IndexSettings mirrors parsing.ast rather than importing it (settings must not pull
+    in tree-sitter). Two literals that must agree need a test that says so — the parser's
+    own default sat at 2000 while the setting moved, which is what made the first version
+    of the chunking test above fail."""
+    from code_atlas.parsing.ast import DEFAULT_MAX_SOURCE_CHARS
+    from code_atlas.settings import IndexSettings
+
+    assert IndexSettings().max_source_chars == DEFAULT_MAX_SOURCE_CHARS

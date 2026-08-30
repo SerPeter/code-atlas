@@ -47,14 +47,16 @@ from tree_sitter import Node, Parser
 from code_atlas.parsing.ast import get_language_for_file, parse_file
 from code_atlas.parsing.languages import discover_plugins
 from code_atlas.schema import NodeLabel, RelType
+from code_atlas.settings import IndexSettings
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
-_PRODUCTION_SOURCE_CHARS = 2000
-"""Mirrors ``IndexSettings.max_source_chars``'s default, so the measurement sees the
-same text the index does."""
+_PRODUCTION_SOURCE_CHARS = IndexSettings().max_source_chars
+"""Read from ``IndexSettings`` rather than mirrored as a literal, so the measurement
+sees the same text the index does and cannot drift from the default it claims to
+track -- it was a hardcoded 2000 while the default moved to 48,000."""
 
 
 @dataclass(frozen=True)

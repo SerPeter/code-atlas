@@ -708,6 +708,13 @@ Deliberately not configurable — raising it re-arms a process kill.
 """
 
 DEFAULT_MAX_PARSE_BYTES = 1_048_576
+
+# Cap on the ``source`` field, applied in the post-parse pass. This is also the ceiling
+# on what an embedding can ever see, because build_embed_text reads the stored (already
+# truncated) value -- at the old 2000 a code entity could not exceed ~500 tokens, so the
+# EmbedChunk overflow path (ADR-0040) was unreachable and no chunk existed in any graph.
+# Mirrored by IndexSettings.max_source_chars, asserted equal by a unit test.
+DEFAULT_MAX_SOURCE_CHARS = 48_000
 """Default ceiling on file size handed to tree-sitter. Mirrored by
 ``IndexSettings.max_parse_bytes`` — see that field for the timing curve."""
 
@@ -1013,7 +1020,7 @@ def parse_file(
     source: bytes,
     project_name: str,
     *,
-    max_source_chars: int = 2000,
+    max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
     max_parse_bytes: int = DEFAULT_MAX_PARSE_BYTES,
     max_doc_section_chars: int = DEFAULT_MAX_DOC_SECTION_CHARS,
     rationale: RationaleSettings | None = None,

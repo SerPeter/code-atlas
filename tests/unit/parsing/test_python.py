@@ -6,7 +6,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, get_language_for_file, parse_file
+from code_atlas.parsing.ast import (
+    DEFAULT_MAX_SOURCE_CHARS,
+    ParsedEntity,
+    ParsedFile,
+    ParsedRelationship,
+    get_language_for_file,
+    parse_file,
+)
 from code_atlas.parsing.languages.python import (
     ClassOverridesDetector,
     ModuleExportsDetector,
@@ -978,13 +985,20 @@ def test_module_source_is_none():
 
 
 def test_source_truncated():
-    """Source longer than 2000 chars is truncated by default."""
-    body = "    x = 1\n" * 300  # ~3000 chars
+    """Source longer than the default cap is truncated to it.
+
+    Sized off DEFAULT_MAX_SOURCE_CHARS rather than a literal: this asserted 2000 while
+    the default moved to 48,000, and a stale literal here is how the cap could shrink
+    back under a model's input limit — making EmbedChunk unreachable again — without
+    anything failing.
+    """
+    line = "    x = 1\n"
+    body = line * (DEFAULT_MAX_SOURCE_CHARS // len(line) + 100)
     source_code = f"def big():\n{body}"
     parsed = _parse(source_code)
     func = _entity_by_name(parsed, "big")
     assert func.source is not None
-    assert len(func.source) == 2000
+    assert len(func.source) == DEFAULT_MAX_SOURCE_CHARS
 
 
 def test_source_truncated_custom():
@@ -1008,7 +1022,8 @@ def test_content_hash_changes_on_body():
 
 def test_content_hash_covers_source_beyond_truncation():
     """Edits past the max_source_chars cap still change the hash (hash runs pre-truncation)."""
-    filler = "    x = 1\n" * 300  # ~3000 chars, past the 2000 default cap
+    line = "    x = 1\n"
+    filler = line * (DEFAULT_MAX_SOURCE_CHARS // len(line) + 100)  # past the default cap
     p1 = _parse(f"def big():\n{filler}    return 1\n")
     p2 = _parse(f"def big():\n{filler}    return 2\n")
     f1, f2 = _entity_by_name(p1, "big"), _entity_by_name(p2, "big")
