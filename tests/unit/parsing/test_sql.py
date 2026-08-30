@@ -50,6 +50,11 @@ def _kinds(parsed: ParsedFile, kind: str) -> list[str]:
     return [e.name for e in parsed.entities if e.kind == kind]
 
 
+def _cte_qns(parsed: ParsedFile) -> list[str]:
+    """CTE nodes by qualified_name — the scoping is the point, so names alone hide it."""
+    return [e.qualified_name for e in parsed.entities if e.kind == "sql_cte"]
+
+
 def _rels_from(parsed: ParsedFile, from_qn_suffix: str, rel_type: RelType):
     return [
         r for r in parsed.relationships if r.from_qualified_name.endswith(from_qn_suffix) and r.rel_type == rel_type
@@ -662,3 +667,85 @@ class TestJinjaNeutralization:
         identifier characters would invent a token where there was none."""
         shimmed = _neutralize_jinja(b"{% if x %}")
         assert shimmed == b"          "
+
+
+# ---------------------------------------------------------------------------
+# CTEs as nodes
+# ---------------------------------------------------------------------------
+
+_VIEW_WITH_CTES = """
+CREATE VIEW revenue AS
+WITH daily AS (SELECT * FROM orders),
+     weekly AS (SELECT * FROM daily)
+SELECT * FROM weekly;
+"""
+
+
+def test_each_cte_is_its_own_node():
+    """A 400-line model built from named steps was one opaque node until now."""
+    parsed = _parse(_VIEW_WITH_CTES)
+    assert _cte_qns(parsed) == [
+        f"{PROJECT}:sql.view.revenue.cte.daily",
+        f"{PROJECT}:sql.view.revenue.cte.weekly",
+    ]
+
+
+def test_a_cte_uid_is_scoped_to_its_statement():
+    """Two views may each have a `daily` and they are not the same relation — the one
+    place SQL's schema-wide identity does not apply."""
+    parsed = _parse(
+        "CREATE VIEW a AS WITH daily AS (SELECT * FROM t) SELECT * FROM daily;\n"
+        "CREATE VIEW b AS WITH daily AS (SELECT * FROM u) SELECT * FROM daily;\n"
+    )
+    assert _cte_qns(parsed) == [
+        f"{PROJECT}:sql.view.a.cte.daily",
+        f"{PROJECT}:sql.view.b.cte.daily",
+    ]
+
+
+def test_the_statement_defines_its_ctes():
+    parsed = _parse(_VIEW_WITH_CTES)
+    defined = {r.to_name for r in _rels_from(parsed, "sql.view.revenue", RelType.DEFINES)}
+    assert defined == {
+        f"{PROJECT}:sql.view.revenue.cte.daily",
+        f"{PROJECT}:sql.view.revenue.cte.weekly",
+    }
+
+
+def test_a_cte_records_the_tables_it_reads():
+    parsed = _parse(_VIEW_WITH_CTES)
+    assert _uses_targets(parsed, "sql.view.revenue.cte.daily") == {"orders"}
+
+
+def test_a_sibling_reference_lands_on_the_sibling_not_a_bare_name():
+    """Bare `daily` would resolve schema-wide, onto whatever table shares the name."""
+    parsed = _parse(_VIEW_WITH_CTES)
+    assert _uses_targets(parsed, "sql.view.revenue.cte.weekly") == {f"{PROJECT}:sql.view.revenue.cte.daily"}
+
+
+def test_a_statement_without_ctes_gains_no_nodes():
+    parsed = _parse("CREATE VIEW plain AS SELECT * FROM orders;")
+    assert _cte_qns(parsed) == []
+
+
+def test_dbt_model_ctes_belong_to_the_model():
+    parsed = _parse(
+        "WITH src AS (SELECT * FROM {{ ref('orders') }}),\n"
+        "     agg AS (SELECT customer_id FROM src)\n"
+        "SELECT * FROM agg\n",
+        path="models/rev.sql",
+    )
+    assert _cte_qns(parsed) == [
+        f"{PROJECT}:dbt.model.rev.cte.src",
+        f"{PROJECT}:dbt.model.rev.cte.agg",
+    ]
+
+
+def test_a_blanked_jinja_ref_is_not_read_as_a_table():
+    """_neutralize_jinja pads `{{ ref(...) }}` with underscores so FROM still parses;
+    the grammar then offers that padding as a relation name."""
+    parsed = _parse(
+        "WITH src AS (SELECT * FROM {{ ref('orders') }})\nSELECT * FROM src\n",
+        path="models/rev.sql",
+    )
+    assert _uses_targets(parsed, "dbt.model.rev.cte.src") == set()

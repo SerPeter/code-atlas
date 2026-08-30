@@ -483,6 +483,91 @@ def _extract_view(node: Node, ctx: _Ctx) -> None:
     for name in _relation_names(query):
         if name != own_name:
             ctx.uses(view_uid, name)
+    _extract_ctes(query, view_uid, ctx)
+
+
+_KIND_CTE = "sql_cte"
+
+
+def _extract_ctes(scope: Node, owner_uid: str, ctx: _Ctx) -> None:
+    """Each ``WITH name AS (...)`` in *scope* becomes a node of its own.
+
+    A CTE is an inline view, so it gets the same label and shape a ``CREATE VIEW``
+    does. Until now the only thing this parser did with one was subtract its name from
+    the enclosing statement's table list, which meant a 400-line model built from six
+    named steps reached the graph as a single opaque node -- both too large to embed
+    and too coarse to answer "which step computes revenue".
+
+    The uid is scoped to the owner, not the schema, because a CTE's name is: two
+    models may each have a ``daily`` and they are not the same relation. That is the
+    one place SQL's schema-wide identity does not apply.
+
+    Only CTEs directly under *scope* are claimed. A nested ``WITH`` inside another
+    CTE's body belongs to that CTE, and the walk reaches it through this same function
+    when the outer one is processed -- so recursing here would claim it twice.
+    """
+    claimed: dict[str, str] = {}
+    nodes = _cte_nodes(scope)
+    for node in nodes:
+        identifier = _child(node, "identifier")
+        if identifier is None:
+            continue
+        name = _clean_name(node_text(identifier))
+        if not name or name in claimed:
+            continue
+        cte_uid = ctx.claim(f"{owner_uid}.cte.{name}")
+        claimed[name] = cte_uid
+        ctx.entities.append(
+            ParsedEntity(
+                name=name,
+                qualified_name=cte_uid,
+                label=NodeLabel.TYPE_DEF,
+                kind=_KIND_CTE,
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                file_path=ctx.path,
+                source=node_text(node),
+            )
+        )
+        ctx.defines(owner_uid, cte_uid)
+
+    # Edges second, so a CTE that reads a sibling defined below it still lands on the
+    # sibling's uid. A sibling reference must NOT go out as a bare name: names are
+    # local to the statement, and post-batch resolution is schema-wide, so `daily`
+    # would attach to whatever unrelated table in the project happens to be called
+    # that.
+    for node in nodes:
+        identifier = _child(node, "identifier")
+        if identifier is None:
+            continue
+        name = _clean_name(node_text(identifier))
+        cte_uid = claimed.get(name)
+        if cte_uid is None:
+            continue
+        for relation in _relation_names(node):
+            # A `{{ ref(...) }}` was blanked to underscore padding by _shim_jinja so the
+            # FROM clause would still parse; the grammar then reads that padding as a
+            # table name. The model's own ref()/source() scan already recorded the real
+            # dependency, so dropping it here loses nothing.
+            if relation == name or not relation.strip("_"):
+                continue
+            ctx.uses(cte_uid, claimed.get(relation, relation))
+
+
+def _cte_nodes(scope: Node) -> list[Node]:
+    """``cte`` nodes belonging to *scope* itself, not to a CTE body inside it."""
+    found: list[Node] = []
+    for node in _walk(scope):
+        if node.type != "cte":
+            continue
+        if any(_contains(other, node) for other in found):
+            continue
+        found.append(node)
+    return found
+
+
+def _contains(outer: Node, inner: Node) -> bool:
+    return outer.start_byte <= inner.start_byte and inner.end_byte <= outer.end_byte and outer.id != inner.id
 
 
 def _extract_index(node: Node, ctx: _Ctx) -> None:
@@ -747,6 +832,10 @@ def _extract_dbt_model(source: bytes, ctx: _Ctx, norm_path: str, root: Node) -> 
         )
     )
     ctx.defines(ctx.module_uid, uid)
+    # A dbt model is one file and the CTEs are its named steps, which is the whole
+    # reason a 400-line model is readable at all. Deliberately not done for a bare
+    # top-level WITH in a migration script: that is a one-off query, not a definition.
+    _extract_ctes(root, uid, ctx)
     return uid
 
 
