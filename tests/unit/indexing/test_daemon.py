@@ -729,10 +729,19 @@ class TestDaemonCliWiring:
             async def ping(self) -> bool:
                 return True
 
-            async def ensure_schema(self) -> None:
+            async def ensure_schema(self, *, force_drop_embeddings: bool = False) -> None:
                 return None
 
             async def close(self) -> None:
+                return None
+
+            # use_backends puts the graph on an AsyncExitStack. Without these the stack
+            # raises before the daemon is ever started, and the test's own assertion
+            # never runs.
+            async def __aenter__(self) -> FakeGraph:
+                return self
+
+            async def __aexit__(self, *exc: object) -> None:
                 return None
 
         class FakeDaemon:
@@ -740,9 +749,19 @@ class TestDaemonCliWiring:
                 captured.update(kwargs)
                 return False  # short-circuit _run_daemon after capturing
 
-        monkeypatch.setattr("code_atlas.graph.client.GraphClient", lambda settings: FakeGraph())
+        # code_atlas.backends, not code_atlas.graph.client: create_graph_client resolves
+        # GraphClient through its own module-level binding, so patching the definition
+        # site leaves the real client in place — and this test's settings come from the
+        # repo's .env, which points at the *production* Memgraph on 7687. The unit
+        # conftest allowlists loopback (asyncio needs a socketpair on Windows), so
+        # nothing stopped it connecting there and running a schema migration.
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda settings: FakeGraph())
         monkeypatch.setattr("code_atlas.indexing.daemon.DaemonManager", FakeDaemon)
-        monkeypatch.setattr(cli, "_load_settings", lambda: _make_settings(tmp_path))
+        settings = _make_settings(tmp_path)
+        # "memgraph", not the "auto" default: auto probes and falls back to a real
+        # SqliteGraphClient, which graph_backend_label then isinstance-checks.
+        settings.backend.graph = "memgraph"
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
 
         with pytest.raises(typer.Exit):
             await cli._run_daemon(no_embed=True)
