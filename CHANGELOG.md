@@ -2,6 +2,267 @@
 
 <!-- version list -->
 
+## v0.10.0 (2026-08-30)
+
+### Bug Fixes
+
+- **chunking**: Stop losing the tail past max_chunks, and keep fences balanced
+  ([`1c4651c`](https://github.com/SerPeter/code-atlas/commit/1c4651c77e954263586db0a3f31cd6360f649f46))
+
+- **cli**: Pair telemetry shutdown with init on every exit path
+  ([`21af285`](https://github.com/SerPeter/code-atlas/commit/21af285a2f1458037bda7852a3795328a1c745d2))
+
+- **embeddings**: Give EmbedClient a lifecycle and every site an owner
+  ([`152c13a`](https://github.com/SerPeter/code-atlas/commit/152c13addd1afe917589adf27c83131035372a93))
+
+- **graph**: Keep embed chunks out of the queries that ask about code
+  ([`c584a7f`](https://github.com/SerPeter/code-atlas/commit/c584a7f9560ed2f54f554aaa4b9001d772fde273))
+
+- **graph**: Recheck pooled Bolt connections before reuse
+  ([`02a859b`](https://github.com/SerPeter/code-atlas/commit/02a859bf68d1834d62e5abf2db64e713483cb754))
+
+- **graph**: Refuse to drop vector indices of an embedded graph
+  ([`deab48c`](https://github.com/SerPeter/code-atlas/commit/deab48c1c2f11c1fcd7992d15a5bde38f9f89c35))
+
+- **indexing**: Bound the daemon's catch-up lease wait, not the CLI's
+  ([`e5c9df3`](https://github.com/SerPeter/code-atlas/commit/e5c9df37a93d108453e60b9b9e488dc766332e17))
+
+- **mcp**: Let --index/--no-index override the configured value in both directions
+  ([`8fc9825`](https://github.com/SerPeter/code-atlas/commit/8fc98258a4cb979c08b125b3ab4b958cb10c3878))
+
+- **parsing**: A constant's docstring lands on its Value node
+  ([`29cfe85`](https://github.com/SerPeter/code-atlas/commit/29cfe859daf45956fe7bddd5dba972acbf3d4844))
+
+- **parsing**: A grandchild span was eating its parent's own code
+  ([`f45366b`](https://github.com/SerPeter/code-atlas/commit/f45366bda58342819b47320c8fa8840cbcd9dc4f))
+
+- **parsing**: Dbt is Jinja-templated SQL, so run the whole SQL path on it
+  ([`3c32f6d`](https://github.com/SerPeter/code-atlas/commit/3c32f6dc85f753de6668fd1fa2470b8f4133109f))
+
+- **parsing**: Index every string a Salesforce component declares, not one
+  ([`2066693`](https://github.com/SerPeter/code-atlas/commit/2066693146f7e65b1d813af73727f00a6e2860bc))
+
+- **parsing**: Module docstrings land on the module node
+  ([`8ab463e`](https://github.com/SerPeter/code-atlas/commit/8ab463eaf44afc72833d0fec24fd210c598e7669))
+
+- **parsing**: Recognise .each suites, and stop suites duplicating their cases
+  ([`1fd906e`](https://github.com/SerPeter/code-atlas/commit/1fd906ebe7e9fb693dba5fa3fad195a93139d988))
+
+- **parsing**: Store markdown frontmatter as one queryable map
+  ([`ed64600`](https://github.com/SerPeter/code-atlas/commit/ed6460036bfc1c148a6bdbfef56d2d749a057b42))
+
+- **telemetry**: Resolve tracers lazily so spans survive import-before-init
+  ([`5ec1abd`](https://github.com/SerPeter/code-atlas/commit/5ec1abdd0e85154dd0b18065bd3083ede56c9480))
+
+- **test**: Assert the port contract, not two consecutive numbers
+  ([`30309bc`](https://github.com/SerPeter/code-atlas/commit/30309bc65a45939d94edeb9fae88daad0fd5b90a))
+
+- **test**: Close infra clients before skipping, and stop erroring on ResourceWarning
+  ([`0b4a81c`](https://github.com/SerPeter/code-atlas/commit/0b4a81cbc94627e12eebfa4c90099b47355adf6c))
+
+- **test**: Scope the ResourceWarning exemption the port tests need
+  ([`1ba3b34`](https://github.com/SerPeter/code-atlas/commit/1ba3b34c9d734e5119898a4565c5ec0cc1ccb151))
+
+- **web**: Drop SO_REUSEADDR, which let two UIs claim one port on Linux
+  ([`86b7ea1`](https://github.com/SerPeter/code-atlas/commit/86b7ea1a6abc12e2770d9612369c4fccc9cd29db))
+
+### Build System
+
+- **compose**: Add optional victoria telemetry profile
+  ([`c4a95e6`](https://github.com/SerPeter/code-atlas/commit/c4a95e6135d783e093358124483781e1c95da63e))
+
+- **deps**: Upgrade the toolchain and adopt ty's own suppression prefix
+  ([`4160860`](https://github.com/SerPeter/code-atlas/commit/41608605b761b62f95a40d16169ab48cfb019ea7))
+
+### Chores
+
+- Shorten the ty pin comment
+  ([`19eb4cf`](https://github.com/SerPeter/code-atlas/commit/19eb4cf7cc8fd1ae61306a762946895394eae5ea))
+
+### Continuous Integration
+
+- Assert the lockfile instead of silently rewriting it
+  ([`ca6f9e6`](https://github.com/SerPeter/code-atlas/commit/ca6f9e6b3b0db526666d926416b47cb8311d2afb))
+
+### Documentation
+
+- Document `atlas index --watch` as the way to keep indexing out of sessions
+  ([`fdfae81`](https://github.com/SerPeter/code-atlas/commit/fdfae81542f6a9ef04dba74c7ddf1ccbdb89bedc))
+
+- Extend ADR-0037 with the multi-process story and the web UI
+  ([`c32a598`](https://github.com/SerPeter/code-atlas/commit/c32a598b94040e5d90db7ad614243c2cd7f9d180))
+
+- Record ADR-0037 and document the new telemetry and indexing options
+  ([`3676388`](https://github.com/SerPeter/code-atlas/commit/3676388d6a21b5ef0fbe6b5fd21b2bc0a8a0ae67))
+
+- Record the new test guardrails and the one still missing
+  ([`752ce4c`](https://github.com/SerPeter/code-atlas/commit/752ce4c2a37dd8bdcf74ee62fe32637617396f7d))
+
+- **adr**: Amend ADR-0040 — chunks are dedup sources after all
+  ([`704fe0f`](https://github.com/SerPeter/code-atlas/commit/704fe0ffe51520bf22875ab9c57817fbe146b0a2))
+
+- **adr**: Record ADR-0039 on frontmatter storage and importance
+  ([`7b32b64`](https://github.com/SerPeter/code-atlas/commit/7b32b64bf24f3d42df6388cdc99eebffa662e882))
+
+- **adr**: Record ADR-0040 on splitting oversized nodes
+  ([`1db261e`](https://github.com/SerPeter/code-atlas/commit/1db261e563ce24720699599537ad65dcdbe1da17))
+
+- **adr**: Record backend ownership and why ResourceWarning is fatal
+  ([`b61c772`](https://github.com/SerPeter/code-atlas/commit/b61c7727a6d49134421aedbbe9aed06dc631c912))
+
+- **wiki**: Close out the driver leaks, record the EmbedClient one
+  ([`a06f426`](https://github.com/SerPeter/code-atlas/commit/a06f426c37fc46756a77673ee2ff4d346d9cab7b))
+
+- **wiki**: Close out the leak note -- all of it was one class of bug
+  ([`b86d1db`](https://github.com/SerPeter/code-atlas/commit/b86d1dbbea648d2e0883484b70ad77c381385875))
+
+- **wiki**: Correct the driver claim, record the EmbedClient result
+  ([`3ff4932`](https://github.com/SerPeter/code-atlas/commit/3ff49320601a1cafbdca610d905cbe006a8efa96))
+
+- **wiki**: Record the aiosqlite thread-warning flake and its root cause
+  ([`a6ad6c8`](https://github.com/SerPeter/code-atlas/commit/a6ad6c81886fd259f1705bd7e9dcd1b51fc6e7b8))
+
+- **wiki**: Record what the ResourceWarning hunt actually found
+  ([`9352041`](https://github.com/SerPeter/code-atlas/commit/935204183f016abe70b6599a0effc60b20593db1))
+
+### Features
+
+- **backends**: Let every client be used as an async context manager
+  ([`cd5b8e9`](https://github.com/SerPeter/code-atlas/commit/cd5b8e95155cb71d619ce4ae916d9b0f09164232))
+
+- **backends**: One owner for connections, and health-check the idle ones
+  ([`80d57b2`](https://github.com/SerPeter/code-atlas/commit/80d57b222f9b80524069465dafe01276c8b2cb00))
+
+- **cli**: Add `atlas index --watch` so a checkout can have a persistent indexer
+  ([`302fa8f`](https://github.com/SerPeter/code-atlas/commit/302fa8f9fa7fc88f9b9f57d884d7157947ecb600))
+
+- **embeddings**: Border-aware chunker and an explicit input-token cap
+  ([`279a6b6`](https://github.com/SerPeter/code-atlas/commit/279a6b690b150e671849ad99c2752a18c3e2c519))
+
+- **embeddings**: Several vectors per node, scored at its best chunk
+  ([`89dd4f4`](https://github.com/SerPeter/code-atlas/commit/89dd4f49a54317b1103623b8e1fead44d38d2615))
+
+- **events**: Wait for the indexer lease with jittered polling
+  ([`3d69b4d`](https://github.com/SerPeter/code-atlas/commit/3d69b4d37459f39ee76d198d657236078833013f))
+
+- **graph**: A version belongs to the dependency, not the package
+  ([`a94fdca`](https://github.com/SerPeter/code-atlas/commit/a94fdca826ed6deb5a4c43924dc0eb78c24205e7))
+
+- **mcp**: Add --no-index for extra sessions sharing a worktree
+  ([`cbe42a7`](https://github.com/SerPeter/code-atlas/commit/cbe42a7b1ff124afd150b1db93aa697d9014c703))
+
+- **parsing**: A test's title is the name that makes it findable
+  ([`e6a4743`](https://github.com/SerPeter/code-atlas/commit/e6a4743f8028f55371690d64e11681365b063a23))
+
+- **parsing**: Long Python string literals become nodes of their own
+  ([`cec6adb`](https://github.com/SerPeter/code-atlas/commit/cec6adb64a57e8ade181bb1857983058593ef7c6))
+
+- **parsing**: Recover macro-hidden C/C++ scopes by keeping the better parse
+  ([`98839f7`](https://github.com/SerPeter/code-atlas/commit/98839f7f7a3e89e7495dbbe37cbdd79179c3caff))
+
+- **parsing**: Split oversized doc sections into consecutive nodes
+  ([`6fa2488`](https://github.com/SerPeter/code-atlas/commit/6fa248859b0ef50f1e8121c5c02adb3f3f903853))
+
+- **parsing**: SQL CTEs become nodes of their own
+  ([`1eb856c`](https://github.com/SerPeter/code-atlas/commit/1eb856c330590eb39cad37ee4d4d956389f7baab))
+
+- **ratelimit**: Give RateLimiter the context-manager protocol
+  ([`8b3f0de`](https://github.com/SerPeter/code-atlas/commit/8b3f0ded9e946d9c0ed8adde6ff2beaff74b3d33))
+
+- **search**: A chunk hit says which part matched, and where
+  ([`db881c8`](https://github.com/SerPeter/code-atlas/commit/db881c8e2b3fd39d8275e3ca387e2db65fa6998c))
+
+- **search**: Path and frontmatter importance multipliers
+  ([`e8eb231`](https://github.com/SerPeter/code-atlas/commit/e8eb23106b2e3ccf9ac938139b7f07294e27681f))
+
+- **telemetry**: Instrument MCP tools, log export, and the indexing pipeline
+  ([`651f4b2`](https://github.com/SerPeter/code-atlas/commit/651f4b2d002a92ce7cbcbb6e5de231a25398b4b8))
+
+- **telemetry**: Tell overlapping atlas processes apart, and instrument the web UI
+  ([`5b1a257`](https://github.com/SerPeter/code-atlas/commit/5b1a25720b54a96d32b61d09c31f302cb80e84da))
+
+- **telemetry**: Time every stage, every parse and every graph round-trip
+  ([`aee3515`](https://github.com/SerPeter/code-atlas/commit/aee351521a886f4034f12bc996c1887725753085))
+
+- **web**: Stop concurrent atlas ui invocations competing for one port
+  ([`27eee1f`](https://github.com/SerPeter/code-atlas/commit/27eee1fee731f09b585287cc654e498b01a7ebaa))
+
+### Performance Improvements
+
+- **embeddings**: Let overflow chunks be dedup sources
+  ([`3d5c0fd`](https://github.com/SerPeter/code-atlas/commit/3d5c0fdfee4ab62c4f55f14828af71a12f085514))
+
+- **parsing**: Look up a claimed text-block name by index
+  ([`51b1574`](https://github.com/SerPeter/code-atlas/commit/51b1574ef225f0e7b20762a9ae992f40a5ed1ca5))
+
+- **parsing**: Stop indexing the same Python bytes under two entities
+  ([`b4b638d`](https://github.com/SerPeter/code-atlas/commit/b4b638d1bf962375802bc3b699c7e963f86d511a))
+
+### Refactoring
+
+- **chunking**: Move the splitter where parsing can reach it
+  ([`3336770`](https://github.com/SerPeter/code-atlas/commit/33367708c8e42b38b3644017335bdd6b5726e2cc))
+
+- **cli**: Give index an explicit AsyncExitStack, finishing the conversion
+  ([`0ee7a57`](https://github.com/SerPeter/code-atlas/commit/0ee7a57fed8685876165338e37aba4bf03fd8098))
+
+- **cli**: Move search onto connected()
+  ([`c502f03`](https://github.com/SerPeter/code-atlas/commit/c502f0381af6f67aa3e6f423f391370146847fa3))
+
+- **cli**: Move status, project rm, mine-git-history and dream onto connected()
+  ([`90d1f55`](https://github.com/SerPeter/code-atlas/commit/90d1f557b9d03fbb3429f0d26cd813fe116f7d3b))
+
+- **cli**: Open backends through a scope instead of per-command plumbing
+  ([`4233b21`](https://github.com/SerPeter/code-atlas/commit/4233b21ab6ccc03f6e0f8032bcec3ece1634506a))
+
+- **health**: Require the connections instead of creating them
+  ([`4cfacde`](https://github.com/SerPeter/code-atlas/commit/4cfacde95af8d0680392c81229f49b38d7bd374a))
+
+- **indexing**: Inject the bus into DaemonManager instead of building one
+  ([`93b9c7f`](https://github.com/SerPeter/code-atlas/commit/93b9c7fecd3855bacf29e379b200c9fe906779b6))
+
+### Testing
+
+- Add pytest-timeout and pytest-testmon
+  ([`9a964fc`](https://github.com/SerPeter/code-atlas/commit/9a964fc48f6e9ca97b8acfa6afcc3756b352a10a))
+
+- Adopt the pytest baseline, and fix the three deprecations it caught
+  ([`d611212`](https://github.com/SerPeter/code-atlas/commit/d61121295836408679efe5ee385ac02f0dfb215a))
+
+- Block off-box network access in unit tests
+  ([`b1aa283`](https://github.com/SerPeter/code-atlas/commit/b1aa283ca5fbb507db4f155c1ed1e676b504ea4c))
+
+- Let fixtures and blocks own the clients, not trailing close() lines
+  ([`af218f7`](https://github.com/SerPeter/code-atlas/commit/af218f715be1786f3d1f891505e4a9c3e7ff9347))
+
+- Put hypothesis, time-machine and codspeed to work
+  ([`3ff1b5e`](https://github.com/SerPeter/code-atlas/commit/3ff1b5ef8dcdb975a166da9c99d9a75e31c07dd6))
+
+- Stop ignoring ResourceWarning, now that nothing leaks
+  ([`fdbc22a`](https://github.com/SerPeter/code-atlas/commit/fdbc22a9d31fab02ebeeb525ad0407c884ce6be6))
+
+- Stop the suite waiting out production timeouts
+  ([`f9cfd53`](https://github.com/SerPeter/code-atlas/commit/f9cfd53fb3a0debbe11caeaa3ef09c92805c7533))
+
+- **cli**: Teach the graph doubles the new ensure_schema kwarg
+  ([`625b865`](https://github.com/SerPeter/code-atlas/commit/625b8651561dcf5921f65dcb3cd43bbb553ae4d8))
+
+- **daemon**: Stop the CLI wiring test reaching the production graph
+  ([`944762f`](https://github.com/SerPeter/code-atlas/commit/944762ffcf35e7f4eae49bdfbabdbcfaf4a41475))
+
+- **git-signals**: Let the CLI own its client instead of a patch that missed
+  ([`8753e43`](https://github.com/SerPeter/code-atlas/commit/8753e43f9826563ea92cd50f7db785de729cb65a))
+
+- **integration**: Scope the three clients whose setup ran outside the finally
+  ([`17349c9`](https://github.com/SerPeter/code-atlas/commit/17349c96b98e38187dbe47280f880685a483b401))
+
+- **langcov**: A third floor, for whether a file is findable at all
+  ([`66e0f7e`](https://github.com/SerPeter/code-atlas/commit/66e0f7ede04016370561329c53607c4b6f021f42))
+
+- **mcp**: Close the client the stubbed backend scope hands over
+  ([`d592eaf`](https://github.com/SerPeter/code-atlas/commit/d592eafa8a9cb3a57cf63f58ce23b289fe824530))
+
+
 ## v0.9.0 (2026-08-28)
 
 ### Bug Fixes
