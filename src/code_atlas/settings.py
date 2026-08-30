@@ -336,6 +336,26 @@ class EmbeddingSettings(StrictSection):
     truncate_ratio: float = Field(
         default=0.9, gt=0, le=1, description="Fraction of max input tokens to use as truncation limit."
     )
+    max_input_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Hard input-token cap for the model. None asks litellm's model registry. "
+            "Set it when the registry does not know the model — an OpenRouter- or TEI-prefixed "
+            "name is not in the registry, so the cap resolves to 'unknown', no chunking or "
+            "truncation happens, and one over-length node fails the whole provider call it "
+            "travelled in. gemini-embedding-001 is 2048; text-embedding-3-small is 8191."
+        ),
+    )
+    max_chunks: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Max embedding chunks per node when its text exceeds the input cap. Bounds what a "
+            "single pathological node costs in provider calls and vector-index entries; content "
+            "past the last chunk is not embedded."
+        ),
+    )
     query_cache_size: int = Field(default=128, description="Max cached query embeddings (LRU eviction).")
 
     @model_validator(mode="after")

@@ -12,7 +12,14 @@ import pytest
 
 from code_atlas.events import EmbedDirty, EntityRef
 from code_atlas.indexing.consumers import EmbedConsumer
-from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
+from code_atlas.search.embeddings import (
+    CHARS_PER_TOKEN_FALLBACK,
+    EmbedClient,
+    EmbeddingError,
+    build_embed_text,
+    hash_text,
+    split_embed_text,
+)
 from code_atlas.settings import EmbeddingSettings
 
 # ---------------------------------------------------------------------------
@@ -563,3 +570,111 @@ class TestEmbedDedupLookup:
         written = graph.write_embeddings_and_hashes.call_args[0][0]
         assert len(written) == 2
         assert all(w[1] == shared for w in written)
+
+
+# ---------------------------------------------------------------------------
+# split_embed_text tests
+# ---------------------------------------------------------------------------
+
+
+def _chars(text: str) -> int:
+    """Measure in characters — one token per character makes the limits readable."""
+    return len(text)
+
+
+class TestSplitEmbedText:
+    def test_short_text_is_one_chunk(self):
+        chunks, hard = split_embed_text("hello", limit=100, measure=_chars)
+        assert chunks == ["hello"]
+        assert hard is False
+
+    def test_empty_text_yields_no_chunks(self):
+        assert split_embed_text("", limit=100, measure=_chars) == ([], False)
+
+    def test_unknown_limit_returns_text_whole(self):
+        """limit<=0 means the registry had no answer; guessing one is worse than not."""
+        text = "x" * 5000
+        assert split_embed_text(text, limit=0, measure=_chars) == ([text], False)
+
+    def test_splits_on_paragraph_border_before_line_border(self):
+        text = "a\nb\n\nc\nd"
+        chunks, hard = split_embed_text(text, limit=4, measure=_chars)
+        assert chunks == ["a\nb", "c\nd"]
+        assert hard is False
+
+    def test_packs_greedily_rather_than_one_chunk_per_line(self):
+        """The ladder cuts at a border, not at every border."""
+        text = "\n".join("line" for _ in range(6))  # 6 * 4 + 5 = 29 chars
+        chunks, _ = split_embed_text(text, limit=14, measure=_chars)
+        assert chunks == ["line\nline\nline", "line\nline\nline"]
+
+    def test_every_chunk_is_within_the_limit(self):
+        text = "\n\n".join("para " * 20 for _ in range(10))
+        chunks, _ = split_embed_text(text, limit=200, measure=_chars, max_chunks=99)
+        assert chunks
+        assert all(_chars(c) <= 200 for c in chunks)
+
+    def test_hard_split_when_no_border_exists(self):
+        """A base64 blob or minified bundle has no border to cut at."""
+        chunks, hard = split_embed_text("x" * 250, limit=100, measure=_chars, max_chunks=99)
+        assert hard is True
+        assert [len(c) for c in chunks] == [100, 100, 50]
+        assert "".join(chunks) == "x" * 250
+
+    def test_hard_split_is_not_reported_for_a_clean_border_split(self):
+        chunks, hard = split_embed_text("aaaa\n\nbbbb", limit=5, measure=_chars)
+        assert chunks == ["aaaa", "bbbb"]
+        assert hard is False
+
+    def test_max_chunks_caps_the_tail(self):
+        chunks, _ = split_embed_text("x" * 1000, limit=10, measure=_chars, max_chunks=3)
+        assert len(chunks) == 3
+
+    def test_dense_tokenizer_still_terminates(self):
+        """A measure that reports far more units than characters must converge."""
+        chunks, hard = split_embed_text("y" * 300, limit=10, measure=lambda t: len(t) * 7, max_chunks=400)
+        assert hard is True
+        assert all(len(c) * 7 <= 10 for c in chunks)
+        assert "".join(chunks) == "y" * 300
+
+
+class TestEmbedClientSplitText:
+    def test_unmapped_model_has_no_limit_without_an_override(self):
+        """This is the production failure: no cap, no chunking, no truncation."""
+        client = EmbedClient(_make_settings(model="nomic-ai/nomic-embed-code"))
+        assert client._max_input_tokens is None
+        chunks, hard = client.split_text("word " * 20_000)
+        assert len(chunks) == 1
+        assert hard is False
+
+    def test_explicit_max_input_tokens_restores_the_cap(self):
+        client = EmbedClient(_make_settings(max_input_tokens=2048, truncate_ratio=1.0))
+        assert client._max_input_tokens == 2048
+        chunks, _ = client.split_text("word " * 20_000)
+        assert len(chunks) > 1
+        assert all(client.count_tokens(c) <= 2048 for c in chunks)
+
+    def test_override_beats_the_registry(self):
+        """A registry answer of 8191 must not override a deliberate 512."""
+        client = EmbedClient(
+            _make_settings(provider="litellm", base_url="", model="text-embedding-3-small", max_input_tokens=512)
+        )
+        assert client._max_input_tokens == int(512 * 0.9)
+
+    def test_truncate_ratio_applies_to_the_override(self):
+        client = EmbedClient(_make_settings(max_input_tokens=1000, truncate_ratio=0.9))
+        assert client._max_input_tokens == 900
+
+    def test_max_chunks_setting_bounds_the_split(self):
+        client = EmbedClient(_make_settings(max_input_tokens=64, truncate_ratio=1.0, max_chunks=2))
+        chunks, _ = client.split_text("word " * 5_000)
+        assert len(chunks) == 2
+
+    def test_count_tokens_falls_back_when_no_tokenizer_is_reachable(self):
+        client = EmbedClient(_make_settings())
+        with patch("code_atlas.search.embeddings.litellm.encode", side_effect=Exception("not mapped")):
+            first = client.count_tokens("x" * 300)
+            assert first == 300 // CHARS_PER_TOKEN_FALLBACK + 1
+            assert client._encode_ok is False
+            # Remembered: the splitter measures a text many times on the way down.
+            client.count_tokens("x" * 300)
