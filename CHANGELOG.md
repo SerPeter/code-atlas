@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.10.1 (2026-08-30)
+
+### Performance Improvements
+
+- **indexing**: Resolve DOCUMENTS in the flush, not per file
+  ([`5ab225e`](https://github.com/SerPeter/code-atlas/commit/5ab225e418ceea6c5a1d3758284e73aed6b3de80))
+
+
 ## v0.10.0 (2026-08-30)
 
 ### Bug Fixes
