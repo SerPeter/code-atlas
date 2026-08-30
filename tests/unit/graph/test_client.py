@@ -1173,7 +1173,13 @@ class TestMarkerLabelStamping:
 
     # SchemaVersion is meta, not an entity: a singleton with no uid, never an edge
     # endpoint, and deliberately outside _ENTITY_LABELS.
-    _EXEMPT = ("NodeLabel.SCHEMA_VERSION",)
+    #
+    # EmbedChunk is exempt for the opposite reason: it is a second vector for a node,
+    # not a node in the codebase. The marker is what makes a node reachable by uid
+    # alone, and reaching a chunk that way is precisely what must not happen -- it
+    # would put chunks in relationship linking, package containment and the
+    # embed-dedup lookup, none of which have any business seeing one.
+    _EXEMPT = ("NodeLabel.SCHEMA_VERSION", "NodeLabel.EMBED_CHUNK")
 
     def _node_writes(self):
         src = inspect.getsource(sys.modules[GraphClient.__module__])

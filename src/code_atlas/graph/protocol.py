@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
     from code_atlas.graph.client import (
         CallStats,
+        EmbedChunkWrite,
         ReplayableRels,
         UpsertResult,
         _AnchorLookup,
@@ -268,6 +269,12 @@ if TYPE_CHECKING:
             labels: list[str] | None = None,
             model: str = "",
         ) -> None: ...
+
+        async def write_embed_chunks(self, items: list[EmbedChunkWrite], *, model: str = "") -> None: ...
+
+        async def delete_embed_chunks(self, parent_uids: list[str]) -> None: ...
+
+        async def gc_orphaned_embed_chunks(self, project_name: str = "") -> int: ...
 
         async def find_embeddings_by_hash(self, hashes: list[str], model: str) -> dict[str, list[float]]: ...
 

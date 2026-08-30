@@ -16,6 +16,7 @@ from code_atlas.graph.client import GraphClient, QueryTimeoutError
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
+    _EMBED_CHUNK_LABELS,
     _EMBEDDABLE_LABELS,
     _EXTERNAL_LABELS,
     _TEXT_SEARCHABLE_LABELS,
@@ -241,6 +242,7 @@ class TestSchemaInfo:
             | set(result["node_labels"]["documentation"])
             | set(result["node_labels"]["external"])
             | set(result["node_labels"]["marker"])
+            | set(result["node_labels"]["internal"])
             | set(result["node_labels"]["meta"])
         )
         assert all_labels == {lbl.value for lbl in NodeLabel}
@@ -256,7 +258,11 @@ class TestSchemaInfo:
 
         # Text/vector searchable labels
         assert set(result["text_searchable_labels"]) == {lbl.value for lbl in _TEXT_SEARCHABLE_LABELS}
-        assert set(result["vector_searchable_labels"]) == {lbl.value for lbl in _EMBEDDABLE_LABELS}
+        # EmbedChunk is embeddable but not a result: it holds a vector for a node whose
+        # text did not fit, and naming it here would invite a query that asks for it.
+        assert set(result["vector_searchable_labels"]) == {
+            lbl.value for lbl in _EMBEDDABLE_LABELS - _EMBED_CHUNK_LABELS
+        }
 
     async def test_schema_info_label_groups_correct(self, settings):
         result = await _invoke_tool(None, "schema_info")  # ty: ignore[invalid-argument-type]

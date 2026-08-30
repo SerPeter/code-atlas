@@ -34,6 +34,7 @@ from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
+    _EMBED_CHUNK_LABELS,
     _EMBEDDABLE_LABELS,
     _EXTERNAL_LABELS,
     _MARKER_LABELS,
@@ -1846,6 +1847,10 @@ def _register_info_tools(mcp: FastMCP) -> None:
                 "documentation": sorted(lbl.value for lbl in _DOC_LABELS),
                 "external": sorted(lbl.value for lbl in _EXTERNAL_LABELS),
                 "marker": sorted(lbl.value for lbl in _MARKER_LABELS),
+                # Named so the listing stays complete, grouped apart so an agent reads
+                # it as plumbing: an EmbedChunk holds a vector for a node whose text did
+                # not fit the model's input cap, and never appears in a result.
+                "internal": sorted(lbl.value for lbl in _EMBED_CHUNK_LABELS),
                 "meta": [NodeLabel.SCHEMA_VERSION.value],
             },
             "relationship_types": sorted(r.value for r in RelType),
@@ -1871,7 +1876,12 @@ def _register_info_tools(mcp: FastMCP) -> None:
                 "project_name",
             ],
             "text_searchable_labels": sorted(lbl.value for lbl in _TEXT_SEARCHABLE_LABELS),
-            "vector_searchable_labels": sorted(lbl.value for lbl in _EMBEDDABLE_LABELS),
+            # EmbedChunk is excluded on purpose: it is an implementation detail of long
+            # nodes, never returned as a result, and naming it here would invite a query
+            # that asks for it directly.
+            "vector_searchable_labels": sorted(
+                lbl.value for lbl in _EMBEDDABLE_LABELS if lbl is not NodeLabel.EMBED_CHUNK
+            ),
             "cypher_examples": list(CYPHER_EXAMPLES),
             "uid_format": "{project_name}:{qualified_name}",
             "schema_version": SCHEMA_VERSION,

@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from code_atlas.graph.client import _HASHED_ENTITY_LABELS, EmbeddingsPresentError, QueryTimeoutError
+from code_atlas.graph.client import (
+    _HASHED_ENTITY_LABELS,
+    EmbedChunkWrite,
+    EmbeddingsPresentError,
+    QueryTimeoutError,
+)
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
 from code_atlas.schema import _ENTITY_LABELS, GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
 from code_atlas.server.analysis import _analyze_communities
@@ -5956,3 +5961,117 @@ class TestDbtModelDescription:
             {"doc": f"{project}:dbt.model.orders.description"},
         )
         assert [r["uid"] for r in rows] == [f"{project}:dbt.model.orders"]
+
+
+# ---------------------------------------------------------------------------
+# Overflow embedding chunks
+# ---------------------------------------------------------------------------
+
+
+async def _seed_chunked_callable(client: GraphClient, *, uid: str = "test:big.fn") -> list[float]:
+    """One embedded Callable plus two overflow chunks. Returns the chunk-2 vector."""
+    await client.ensure_schema()
+    on_node = [0.0] * client._dimension
+    on_node[0] = 1.0
+    on_chunk = [0.0] * client._dimension
+    on_chunk[1] = 1.0
+
+    await client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: $uid, project_name: 'test', "
+        "name: 'fn', qualified_name: 'big.fn', kind: 'function', embed_hash: 'full', embedding: $vec})",
+        {"uid": uid, "vec": on_node},
+    )
+    await client.write_embed_chunks(
+        [
+            EmbedChunkWrite(
+                uid=f"{uid}#chunk2",
+                parent_uid=uid,
+                project_name="test",
+                chunk_index=2,
+                vector=on_chunk,
+                embed_hash="h2",
+            ),
+            EmbedChunkWrite(
+                uid=f"{uid}#chunk3",
+                parent_uid=uid,
+                project_name="test",
+                chunk_index=3,
+                vector=[0.0] * client._dimension,
+                embed_hash="h3",
+            ),
+        ],
+        model="test-model",
+    )
+    return on_chunk
+
+
+async def test_a_chunk_hit_is_returned_as_its_parent(graph_client: GraphClient):
+    """A chunk is a second vector for a node, not a result of its own."""
+    on_chunk = await _seed_chunked_callable(graph_client)
+
+    results = await graph_client.vector_search(on_chunk, limit=10)
+
+    uids = [r["node"]["uid"] for r in results]
+    assert "test:big.fn" in uids
+    assert not any(uid.startswith("test:big.fn#chunk") for uid in uids)
+
+
+async def test_a_node_matched_twice_is_returned_once_at_its_best_score(graph_client: GraphClient):
+    """Summing or averaging would make rank depend on how the splitter happened to cut."""
+    on_chunk = await _seed_chunked_callable(graph_client)
+
+    results = await graph_client.vector_search(on_chunk, limit=10)
+
+    matched = [r for r in results if r["node"]["uid"] == "test:big.fn"]
+    assert len(matched) == 1
+    # The chunk is the exact query vector; the node's own vector is orthogonal to it.
+    assert matched[0]["similarity"] > 0.9
+
+
+async def test_re_embedding_drops_the_previous_chunks(graph_client: GraphClient):
+    """A node whose text shrank must not keep answering for content it no longer has."""
+    await _seed_chunked_callable(graph_client)
+    await graph_client.delete_embed_chunks(["test:big.fn"])
+
+    rows = await graph_client.execute(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) RETURN count(c) AS c")
+    assert rows[0]["c"] == 0
+
+
+async def test_orphaned_chunks_are_swept(graph_client: GraphClient):
+    """A chunk has no edge to its parent, so DETACH DELETE cannot take it along."""
+    await _seed_chunked_callable(graph_client)
+    await graph_client.execute_write(f"MATCH (n:{NodeLabel.CALLABLE} {{uid: 'test:big.fn'}}) DETACH DELETE n")
+
+    assert await graph_client.gc_orphaned_embed_chunks() == 2
+
+    rows = await graph_client.execute(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) RETURN count(c) AS c")
+    assert rows[0]["c"] == 0
+
+
+async def test_a_live_parent_keeps_its_chunks(graph_client: GraphClient):
+    """Guards the sweep: one that deletes everything would pass the test above."""
+    await _seed_chunked_callable(graph_client)
+
+    assert await graph_client.gc_orphaned_embed_chunks() == 0
+
+    rows = await graph_client.execute(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) RETURN count(c) AS c")
+    assert rows[0]["c"] == 2
+
+
+async def test_chunks_are_not_marked_as_entities(graph_client: GraphClient):
+    """The marker is what makes a node reachable by uid alone — a chunk must not be."""
+    await _seed_chunked_callable(graph_client)
+
+    rows = await graph_client.execute(
+        f"MATCH (c:{NodeLabel.EMBED_CHUNK}) WHERE c:{NodeLabel.ENTITY} RETURN count(c) AS c"
+    )
+    assert rows[0]["c"] == 0
+
+
+async def test_deleting_a_project_takes_its_chunks(graph_client: GraphClient):
+    """They carry project_name for exactly this — 'atlas project rm' matches on it."""
+    await _seed_chunked_callable(graph_client)
+    await graph_client.delete_project_data("test")
+
+    rows = await graph_client.execute(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) RETURN count(c) AS c")
+    assert rows[0]["c"] == 0

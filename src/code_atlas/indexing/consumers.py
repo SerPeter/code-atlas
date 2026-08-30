@@ -33,15 +33,17 @@ from code_atlas.events import (
     Topic,
     decode_event,
 )
-from code_atlas.graph.client import _CONFIG_REF_REL_TYPES
+from code_atlas.graph.client import _CONFIG_REF_REL_TYPES, EmbedChunkWrite
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, parse_file
 from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, run_detectors
 from code_atlas.schema import NodeLabel, RelType
-from code_atlas.search.embeddings import build_embed_text, hash_text
+from code_atlas.search.embeddings import _CODE_ENTITY_LABELS, build_embed_text, hash_text
 from code_atlas.settings import derive_project_name
 from code_atlas.telemetry import get_metrics, get_tracer, timed_phase
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from code_atlas.graph.client import GraphClient
     from code_atlas.search.embeddings import EmbedClient
     from code_atlas.settings import AtlasSettings
@@ -1058,6 +1060,13 @@ class ASTConsumer(TierConsumer):
 
         if self._pending_project_names:
             await self.graph.gc_orphaned_reference_nodes()
+            # An overflow chunk has no edge to its parent (the link is a property, which
+            # is what makes finding one cheap), so a DETACH DELETE of the parent cannot
+            # take it with it. Left behind it stays in the vector index, answering
+            # searches with text no node in the graph still contains.
+            orphaned = await self.graph.gc_orphaned_embed_chunks()
+            if orphaned:
+                logger.debug("Swept {} orphaned embed chunk(s)", orphaned)
 
         self._pending_import_rels.clear()
         self._pending_call_rels.clear()
@@ -1591,6 +1600,123 @@ class ASTConsumer(TierConsumer):
 # ---------------------------------------------------------------------------
 
 
+EMBED_CHUNK_UID_SEPARATOR = "#chunk"
+"""Joins a node's uid to a chunk index to make the chunk's own uid.
+
+Not a character a qualified_name produces, so a chunk uid can never collide with an
+entity's, and the parent is recoverable from the chunk uid by inspection alone.
+"""
+
+
+@dataclass(frozen=True)
+class _ChunkPlan:
+    """How one embed batch's texts map onto the vectors that get written.
+
+    A node whose embed text fits the model's input cap -- all but a fraction of a
+    percent of them -- contributes exactly one unit and no chunk entry, so the plan is
+    a pass-through for the normal batch.
+    """
+
+    units: list[tuple[str, str, str]]
+    """``(target_uid, text, hash of that text)`` — what actually gets embedded."""
+
+    store_hash: dict[str, str]
+    """``target_uid -> the hash to persist on it``.
+
+    Differs from the unit's own hash for exactly one case: the parent of a split node
+    stores the hash of its *whole* text, not of chunk 1, because that is the value
+    ``process_batch``'s freshness check compares against. Storing chunk 1's hash there
+    would make every subsequent batch believe the node had changed and re-embed it
+    forever.
+    """
+
+    chunk_of: dict[str, tuple[str, int]]
+    """``chunk uid -> (parent uid, 1-based chunk index)`` for the overflow chunks."""
+
+
+def _plan_embed_chunks(
+    to_process: list[tuple[str, str, str]],
+    uid_to_label: dict[str, str],
+    split: Callable[[str], tuple[list[str], bool]],
+) -> _ChunkPlan:
+    """Expand any text over the model's input cap into one unit per chunk.
+
+    Chunk 1 is written to the node itself, so a node that fits creates no extra graph
+    state at all and a node that does not keeps answering searches at its own uid.
+
+    The warning is the point of the label check, not the split: a Callable or TypeDef
+    that needs several chunks is usually one that is too large to be a single unit of
+    anything, which is worth saying out loud. Documents are not -- an oversized
+    DocSection has already been split into separate nodes by the parser, and a Note is
+    deliberately never split, so neither is evidence of a defect.
+    """
+    units: list[tuple[str, str, str]] = []
+    store_hash: dict[str, str] = {}
+    chunk_of: dict[str, tuple[str, int]] = {}
+
+    for uid, text, full_hash in to_process:
+        chunks, hard_split = split(text)
+        if len(chunks) <= 1:
+            units.append((uid, text, full_hash))
+            store_hash[uid] = full_hash
+            continue
+
+        label = uid_to_label.get(uid, "")
+        log = logger.warning if label in _CODE_ENTITY_LABELS else logger.debug
+        log(
+            "Embed text for {} ({}) needs {} chunks to fit the model's input cap{}",
+            uid,
+            label or "unknown label",
+            len(chunks),
+            " — no natural border to cut at" if hard_split else "",
+        )
+
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_hash = hash_text(chunk)
+            if index == 1:
+                units.append((uid, chunk, chunk_hash))
+                store_hash[uid] = full_hash
+            else:
+                chunk_uid = f"{uid}{EMBED_CHUNK_UID_SEPARATOR}{index}"
+                units.append((chunk_uid, chunk, chunk_hash))
+                store_hash[chunk_uid] = chunk_hash
+                chunk_of[chunk_uid] = (uid, index)
+
+    return _ChunkPlan(units=units, store_hash=store_hash, chunk_of=chunk_of)
+
+
+def _partition_written_vectors(
+    resolved: list[tuple[str, list[float], str]],
+    plan: _ChunkPlan,
+) -> tuple[list[tuple[str, list[float], str]], list[EmbedChunkWrite]]:
+    """Sort embedded units into the two things they are written as.
+
+    A unit's uid says which: anything the plan recorded as a chunk becomes an
+    EmbedChunk node, everything else is a vector on the node itself. The hash written
+    is the plan's, not the unit's — see ``_ChunkPlan.store_hash``.
+    """
+    parent_items: list[tuple[str, list[float], str]] = []
+    chunk_items: list[EmbedChunkWrite] = []
+    for target_uid, vector, _unit_hash in resolved:
+        stored = plan.store_hash[target_uid]
+        parent = plan.chunk_of.get(target_uid)
+        if parent is None:
+            parent_items.append((target_uid, vector, stored))
+            continue
+        parent_uid, chunk_index = parent
+        chunk_items.append(
+            EmbedChunkWrite(
+                uid=target_uid,
+                parent_uid=parent_uid,
+                project_name=parent_uid.split(":", 1)[0],
+                chunk_index=chunk_index,
+                vector=vector,
+                embed_hash=stored,
+            )
+        )
+    return parent_items, chunk_items
+
+
 class EmbedConsumer(TierConsumer):
     """Embed stage: Re-embed entities via TEI. Deduplicates by qualified name.
 
@@ -1826,9 +1952,12 @@ class EmbedConsumer(TierConsumer):
                     )
                     return deferred or None
 
+                # 2b. Expand anything over the model's input cap into one unit per chunk.
+                plan = _plan_embed_chunks(to_process, uid_to_label, self.embed.split_text)
+
                 # 3. Graph dedup check → 4. API call for what is genuinely new
-                with timed_phase("embed", "dedup", candidates=len(to_process)):
-                    dedup_resolved, need_embed, dedup_hits = await self._resolve_from_graph(to_process)
+                with timed_phase("embed", "dedup", candidates=len(plan.units)):
+                    dedup_resolved, need_embed, dedup_hits = await self._resolve_from_graph(plan.units)
                 # The expensive one, and the only phase whose cost is someone else's
                 # network: split out so a slow provider cannot be mistaken for a slow graph.
                 with timed_phase("embed", "provider", entities=len(need_embed)):
@@ -1838,19 +1967,29 @@ class EmbedConsumer(TierConsumer):
                 #    Bounded to _EMBED_WRITE_CONCURRENCY rather than fully serialised --
                 #    see the _write_gate comment in __init__ for the measurements.
                 all_resolved = dedup_resolved + api_vectors
+                parent_items, chunk_items = _partition_written_vectors(all_resolved, plan)
+
                 if all_resolved:
                     with timed_phase("embed", "write_lock_wait"):
                         await self._write_gate.acquire()
                     try:
                         with timed_phase("embed", "write", vectors=len(all_resolved)):
-                            write_labels = [uid_to_label[uid] for uid, _, _ in all_resolved] if uid_to_label else None
+                            # Every node here is being re-embedded, so its old overflow
+                            # chunks describe text it no longer contains. Dropping them
+                            # unconditionally costs one indexed statement that matches
+                            # nothing in the normal case, and is the only thing standing
+                            # between a node that shrank and vectors of deleted content
+                            # still answering searches.
+                            await self.graph.delete_embed_chunks([uid for uid, _t, _h in to_process])
+                            write_labels = [uid_to_label[uid] for uid, _, _ in parent_items] if uid_to_label else None
                             # Stamp the model: a vector only means anything inside the space
                             # its model defines, and one database holds several (ATL-135).
                             await self.graph.write_embeddings_and_hashes(
-                                all_resolved,
+                                parent_items,
                                 labels=write_labels,
                                 model=self._embed_model,
                             )
+                            await self.graph.write_embed_chunks(chunk_items, model=self._embed_model)
                     finally:
                         self._write_gate.release()
 

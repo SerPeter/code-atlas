@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 16
+SCHEMA_VERSION: int = 17
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -56,6 +56,10 @@ class NodeLabel(StrEnum):
     # of the 12 entity labels it's after can use one shared index instead of
     # an unindexed ScanAll over the whole graph.
     ENTITY = "Entity"
+    # Overflow vectors: chunks 2..N of a node whose embed text exceeds the model's
+    # input cap. Chunk 1 stays on the node itself, so the common case -- a node that
+    # fits -- creates none of these. See _EMBED_CHUNK_LABELS.
+    EMBED_CHUNK = "EmbedChunk"
     # Meta
     SCHEMA_VERSION = "SchemaVersion"
 
@@ -219,7 +223,15 @@ _REFERENCE_COUNTED_LABELS: frozenset[NodeLabel] = frozenset(
     }
 )
 
-_EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
+# Deliberately outside _ENTITY_LABELS: an EmbedChunk is not a thing in the codebase,
+# it is a second vector for one. It carries no :Entity marker (so no uid-only lookup,
+# relationship linking or marker sweep ever reaches one), no content_hash, no
+# file_path, and no text index -- only enough to be found by vector search and
+# resolved back to its parent. It is in _EMBEDDABLE_LABELS purely to get a vector
+# index and be queried alongside the rest.
+_EMBED_CHUNK_LABELS: frozenset[NodeLabel] = frozenset({NodeLabel.EMBED_CHUNK})
+
+_EMBEDDABLE_LABELS: frozenset[NodeLabel] = _EMBED_CHUNK_LABELS | frozenset(
     {
         NodeLabel.TYPE_DEF,
         NodeLabel.CALLABLE,
@@ -350,6 +362,7 @@ class TextIndexSpec:
 # uid uniqueness on all entity labels; version on SchemaVersion
 UNIQUE_CONSTRAINTS: tuple[UniqueConstraintSpec, ...] = (
     *[UniqueConstraintSpec(label=lbl, property="uid") for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)],
+    *[UniqueConstraintSpec(label=lbl, property="uid") for lbl in sorted(_EMBED_CHUNK_LABELS, key=str)],
     UniqueConstraintSpec(label=NodeLabel.SCHEMA_VERSION, property="version"),
 )
 
@@ -358,6 +371,14 @@ EXISTENCE_CONSTRAINTS: tuple[ExistenceConstraintSpec, ...] = (
     *[
         spec
         for lbl in sorted(_ENTITY_LABELS, key=lambda lbl: lbl.value)
+        for spec in (
+            ExistenceConstraintSpec(label=lbl, property="uid"),
+            ExistenceConstraintSpec(label=lbl, property="project_name"),
+        )
+    ],
+    *[
+        spec
+        for lbl in sorted(_EMBED_CHUNK_LABELS, key=str)
         for spec in (
             ExistenceConstraintSpec(label=lbl, property="uid"),
             ExistenceConstraintSpec(label=lbl, property="project_name"),
@@ -393,6 +414,10 @@ _INDEX_PROPERTIES: tuple[str, ...] = (
 # emit a DROP for it, since that subtracts this tuple from that one.
 _MARKER_INDEX_PROPERTIES: tuple[str, ...] = ("uid", "embed_hash")
 
+# ``parent_uid`` is the one that earns its keep: every read of a chunk is "which node
+# does this vector belong to", and every write of one is "drop this node's old chunks".
+_EMBED_CHUNK_INDEX_PROPERTIES: tuple[str, ...] = ("uid", "parent_uid", "project_name")
+
 LABEL_PROPERTY_INDICES: tuple[IndexSpec, ...] = (
     *(
         IndexSpec(label=lbl, property=prop)
@@ -403,6 +428,11 @@ LABEL_PROPERTY_INDICES: tuple[IndexSpec, ...] = (
         IndexSpec(label=lbl, property=prop)
         for lbl in sorted(_MARKER_LABELS, key=lambda lbl: lbl.value)
         for prop in _MARKER_INDEX_PROPERTIES
+    ),
+    *(
+        IndexSpec(label=lbl, property=prop)
+        for lbl in sorted(_EMBED_CHUNK_LABELS, key=lambda lbl: lbl.value)
+        for prop in _EMBED_CHUNK_INDEX_PROPERTIES
     ),
 )
 
@@ -603,7 +633,14 @@ def _validate_schema_completeness() -> None:
         raise RuntimeError(f"Entity labels missing from LABEL_PROPERTY_INDICES: {missing_index}")
 
     # Label groupings must cover all non-meta labels
-    grouped = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | _MARKER_LABELS | {NodeLabel.SCHEMA_VERSION}
+    grouped = (
+        _CODE_LABELS
+        | _DOC_LABELS
+        | _EXTERNAL_LABELS
+        | _MARKER_LABELS
+        | _EMBED_CHUNK_LABELS
+        | {NodeLabel.SCHEMA_VERSION}
+    )
     missing_group = all_labels - grouped
     if missing_group:
         raise RuntimeError(f"NodeLabels not in any label group: {missing_group}")

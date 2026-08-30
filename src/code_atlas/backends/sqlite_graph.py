@@ -62,6 +62,7 @@ from code_atlas.graph.client import (
     _UNVERIFIED_STRATEGIES,
     SCHEMA_VERSION,
     CallStats,
+    EmbedChunkWrite,
     EntityHashData,
     ReplayableRels,
     UpsertResult,
@@ -359,6 +360,31 @@ def _row_to_node(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
         **props,
         "_labels": [labels],
     }
+
+
+def _is_chunk_record(record: dict[str, Any]) -> bool:
+    """True when a search row is an overflow chunk rather than a node proper."""
+    node = record.get("node")
+    return isinstance(node, dict) and NodeLabel.EMBED_CHUNK.value in (node.get("_labels") or ())
+
+
+def _best_similarity_per_uid(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse rows onto one per uid, keeping the highest similarity.
+
+    Mirror of the same function in ``graph/client.py`` — see it for why max and not
+    sum. Duplicated rather than shared because the two backends' "node" is a different
+    shape and the uid read differs with it.
+    """
+    best: dict[str, dict[str, Any]] = {}
+    for record in records:
+        node = record.get("node") or {}
+        uid = node.get("uid") if isinstance(node, dict) else None
+        if uid is None:
+            continue
+        current = best.get(uid)
+        if current is None or record.get("similarity", 0) > current.get("similarity", 0):
+            best[uid] = record
+    return list(best.values())
 
 
 class SqliteGraphClient:
@@ -2594,8 +2620,9 @@ class SqliteGraphClient:
         specs = [
             s for s in build_vector_index_specs(self._dimension) if not label or s.label.value.lower() == label.lower()
         ]
-        filtering = bool(filter_projects) or threshold > 0.0
-        fetch_limit = limit * 3 if filtering else limit
+        # Unconditional over-fetch, matching the Memgraph backend: several rows can
+        # collapse onto one node once EmbedChunk hits resolve to their parents.
+        fetch_limit = limit * 3
         blob = sqlite_vec.serialize_float32(vector)
 
         async def _one(spec: Any) -> list[dict[str, Any]]:
@@ -2631,12 +2658,138 @@ class SqliteGraphClient:
 
         if threshold > 0.0:
             all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
+        # Before the project filter and the uid collapse, for the reason the Memgraph
+        # backend gives: a chunk answers with its parent's identity, not its own.
+        all_results = await self._resolve_embed_chunks(conn, all_results)
+        all_results = _best_similarity_per_uid(all_results)
         if filter_projects:
             project_set = set(filter_projects)
             all_results = [r for r in all_results if r["node"].get("project_name") in project_set]
 
         all_results.sort(key=lambda r: r.get("similarity", 0), reverse=True)
         return all_results[:limit]
+
+    async def write_embed_chunks(self, items: list[EmbedChunkWrite], *, model: str = "") -> None:
+        """Mirror of ``GraphClient.write_embed_chunks`` — see that docstring.
+
+        A chunk is an ordinary ``nodes`` row labelled EmbedChunk, so every side table
+        this backend keeps (``vec_embedchunk`` via ``_write_embedding_row``, the delete
+        sweep via ``_cleanup_search_side_tables``) reaches it without a special case:
+        both are driven by ``schema.py``'s registries, which the label is now in.
+        """
+        if not items:
+            return
+        conn = await self._get_conn()
+        async with self._write_lock:
+            for item in items:
+                props: dict[str, Any] = {
+                    "parent_uid": item.parent_uid,
+                    "chunk_index": item.chunk_index,
+                    "embed_hash": item.embed_hash,
+                }
+                if model:
+                    props["embed_model"] = model
+                blob = sqlite_vec.serialize_float32(item.vector)
+                await conn.execute(
+                    "INSERT INTO nodes (uid, labels, project_name, name, props_json, embedding) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(uid) DO UPDATE SET props_json = excluded.props_json, embedding = excluded.embedding",
+                    (
+                        item.uid,
+                        NodeLabel.EMBED_CHUNK.value,
+                        item.project_name,
+                        item.uid,
+                        json.dumps(props),
+                        blob,
+                    ),
+                )
+                await self._write_embedding_row(conn, item.uid, blob)
+            await conn.commit()
+
+    async def delete_embed_chunks(self, parent_uids: list[str]) -> None:
+        """Mirror of ``GraphClient.delete_embed_chunks`` — see that docstring."""
+        if not parent_uids:
+            return
+        conn = await self._get_conn()
+        async with self._write_lock:
+            await self._delete_chunk_uids(conn, await self._chunk_uids_of(conn, parent_uids))
+            await conn.commit()
+
+    async def gc_orphaned_embed_chunks(self, project_name: str = "") -> int:
+        """Mirror of ``GraphClient.gc_orphaned_embed_chunks`` — see that docstring."""
+        conn = await self._get_conn()
+        scope = " AND c.project_name = ?" if project_name else ""
+        params: tuple[Any, ...] = (NodeLabel.EMBED_CHUNK.value, *((project_name,) if project_name else ()))
+        cur = await conn.execute(
+            "SELECT c.uid FROM nodes c "
+            "LEFT JOIN nodes p ON p.uid = json_extract(c.props_json, '$.parent_uid') "
+            f"WHERE c.labels = ?{scope} AND p.uid IS NULL",
+            params,
+        )
+        dead = [r[0] for r in await cur.fetchall()]
+        await cur.close()
+        if not dead:
+            return 0
+        async with self._write_lock:
+            await self._delete_chunk_uids(conn, dead)
+            await conn.commit()
+        return len(dead)
+
+    async def _chunk_uids_of(self, conn: aiosqlite.Connection, parent_uids: list[str]) -> list[str]:
+        out: list[str] = []
+        for chunk in _chunks(list(dict.fromkeys(parent_uids))):
+            if not chunk:
+                continue
+            placeholders = ",".join("?" * len(chunk))
+            cur = await conn.execute(
+                "SELECT uid FROM nodes WHERE labels = ? "
+                f"AND json_extract(props_json, '$.parent_uid') IN ({placeholders})",
+                (NodeLabel.EMBED_CHUNK.value, *chunk),
+            )
+            out.extend(r[0] for r in await cur.fetchall())
+            await cur.close()
+        return out
+
+    async def _delete_chunk_uids(self, conn: aiosqlite.Connection, uids: list[str]) -> None:
+        if not uids:
+            return
+        await self._cleanup_search_side_tables(conn, uids)
+        for chunk in _chunks(uids):
+            if not chunk:
+                continue
+            placeholders = ",".join("?" * len(chunk))
+            await conn.execute(f"DELETE FROM nodes WHERE uid IN ({placeholders})", chunk)
+
+    async def _resolve_embed_chunks(
+        self, conn: aiosqlite.Connection, records: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Swap every EmbedChunk hit for the node it is a chunk of.
+
+        Mirror of ``GraphClient._resolve_embed_chunks``; the difference is only that a
+        node here is a dict carrying ``_labels`` rather than a driver Node object.
+        """
+        parent_uids = {p for r in records if _is_chunk_record(r) and (p := (r.get("node") or {}).get("parent_uid"))}
+        if not parent_uids:
+            return records
+        placeholders = ",".join("?" * len(parent_uids))
+        cur = await conn.execute(
+            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE uid IN ({placeholders})", sorted(parent_uids)
+        )
+        parents = {}
+        for row in await cur.fetchall():
+            node = _row_to_node(row)
+            parents[node["uid"]] = node
+        await cur.close()
+
+        out: list[dict[str, Any]] = []
+        for record in records:
+            if not _is_chunk_record(record):
+                out.append(record)
+                continue
+            parent = parents.get((record.get("node") or {}).get("parent_uid", ""))
+            if parent is not None:
+                out.append({**record, "node": parent})
+        return out
 
     async def get_vector_index_info(self) -> list[dict[str, Any]]:
         conn = await self._get_conn()

@@ -8,6 +8,7 @@ from __future__ import annotations
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
+    _EMBED_CHUNK_LABELS,
     _EMBEDDABLE_LABELS,
     _ENTITY_LABELS,
     _EXTERNAL_LABELS,
@@ -48,7 +49,14 @@ class TestLabelCompleteness:
         assert existence_labels == set(NodeLabel) - _MARKER_LABELS
 
     def test_label_sets_cover_all(self):
-        grouped = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LABELS | _MARKER_LABELS | {NodeLabel.SCHEMA_VERSION}
+        grouped = (
+            _CODE_LABELS
+            | _DOC_LABELS
+            | _EXTERNAL_LABELS
+            | _MARKER_LABELS
+            | _EMBED_CHUNK_LABELS
+            | {NodeLabel.SCHEMA_VERSION}
+        )
         assert grouped == set(NodeLabel)
 
     def test_entity_labels_exclude_meta(self):
@@ -67,7 +75,17 @@ class TestLabelCompleteness:
 
     def test_index_registry_covers_entity_and_marker_labels(self):
         index_labels = {spec.label for spec in LABEL_PROPERTY_INDICES}
-        assert index_labels == _ENTITY_LABELS | _MARKER_LABELS
+        assert index_labels == _ENTITY_LABELS | _MARKER_LABELS | _EMBED_CHUNK_LABELS
+
+    def test_embed_chunk_is_embeddable_without_being_an_entity(self):
+        """It is a second vector for a node, not a thing in the codebase.
+
+        In _ENTITY_LABELS it would acquire the :Entity marker, and with it every
+        uid-only lookup, relationship link and marker sweep in the graph.
+        """
+        assert NodeLabel.EMBED_CHUNK in _EMBEDDABLE_LABELS
+        assert NodeLabel.EMBED_CHUNK not in _ENTITY_LABELS
+        assert NodeLabel.EMBED_CHUNK not in _TEXT_SEARCHABLE_LABELS
 
     def test_marker_label_indexed_only_on_what_is_queried(self):
         """The marker carries exactly the indices whose lookups are genuinely its own.

@@ -462,6 +462,17 @@ class EmbeddingsPresentError(RuntimeError):
         )
 
 
+class EmbedChunkWrite(NamedTuple):
+    """One overflow vector, ready to write. See :meth:`GraphClient.write_embed_chunks`."""
+
+    uid: str
+    parent_uid: str
+    project_name: str
+    chunk_index: int
+    vector: list[float]
+    embed_hash: str
+
+
 class EntityHashData(NamedTuple):
     """Stored entity data used for delta comparison during upsert."""
 
@@ -586,6 +597,41 @@ def _record_uid(record: dict[str, Any]) -> str | None:
     if node is None or not hasattr(node, "get"):
         return None
     return node.get("uid")
+
+
+def _is_embed_chunk(record: dict[str, Any]) -> bool:
+    """True when this vector-search row is an overflow chunk, not a node proper."""
+    node = record.get("node") or record.get("n")
+    labels = getattr(node, "labels", None)
+    return bool(labels) and NodeLabel.EMBED_CHUNK.value in labels
+
+
+def _chunk_parent_uid(record: dict[str, Any]) -> str | None:
+    node = record.get("node") or record.get("n")
+    if node is None or not hasattr(node, "get"):
+        return None
+    return node.get("parent_uid")
+
+
+def _best_similarity_per_uid(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse rows onto one per uid, keeping the highest similarity.
+
+    A long node is present in the index several times -- once on the node and once per
+    overflow chunk -- and the question a search asks is whether *any* part of it
+    matches, so the best-scoring part is the node's score. Summing or averaging would
+    make a long node's rank depend on how the splitter happened to cut it.
+    """
+    best: dict[str, dict[str, Any]] = {}
+    unkeyed: list[dict[str, Any]] = []
+    for record in records:
+        uid = _record_uid(record)
+        if uid is None:
+            unkeyed.append(record)
+            continue
+        current = best.get(uid)
+        if current is None or record.get("similarity", 0) > current.get("similarity", 0):
+            best[uid] = record
+    return [*best.values(), *unkeyed]
 
 
 _BM25_RRF_K = 60
@@ -4124,6 +4170,84 @@ class GraphClient:
                 {"items": params},
             )
 
+    async def write_embed_chunks(self, items: list[EmbedChunkWrite], *, model: str = "") -> None:
+        """Create or update the overflow vectors of nodes whose text did not fit.
+
+        Chunk 1 lives on the node itself, so a node that fits its model's input cap
+        writes none of these -- which is all but a fraction of a percent of them.
+
+        MERGE on uid rather than CREATE: a re-embed of the same node writes the same
+        chunk uids, and the delete in :meth:`delete_embed_chunks` only runs for nodes
+        whose text actually changed.
+        """
+        if not items:
+            return
+        stamp = ", c.embed_model = $model" if model else ""
+        await self.execute_write(
+            f"UNWIND $items AS item "
+            f"MERGE (c:{NodeLabel.EMBED_CHUNK} {{uid: item.uid}}) "
+            "SET c.parent_uid = item.parent_uid, c.project_name = item.project_name, "
+            f"c.chunk_index = item.chunk_index, c.embedding = item.vector, c.embed_hash = item.hash{stamp}",
+            {
+                "items": [
+                    {
+                        "uid": it.uid,
+                        "parent_uid": it.parent_uid,
+                        "project_name": it.project_name,
+                        "chunk_index": it.chunk_index,
+                        "vector": it.vector,
+                        "hash": it.embed_hash,
+                    }
+                    for it in items
+                ],
+                "model": model,
+            },
+        )
+
+    async def delete_embed_chunks(self, parent_uids: list[str]) -> None:
+        """Drop every overflow vector belonging to *parent_uids*.
+
+        Called before re-embedding, so a node whose text shrank back under the cap --
+        or simply produced fewer chunks -- does not leave vectors of text it no longer
+        contains sitting in the index, answering searches for content that is gone.
+
+        A plain DELETE, not DETACH: a chunk has no edges by design (the link to its
+        parent is the ``parent_uid`` property, which is what makes an orphan cheap to
+        find and a parent's DETACH DELETE unable to take its chunks with it).
+        """
+        if not parent_uids:
+            return
+        await self.execute_write(
+            f"UNWIND $uids AS u MATCH (c:{NodeLabel.EMBED_CHUNK} {{parent_uid: u}}) DELETE c",
+            {"uids": list(dict.fromkeys(parent_uids))},
+        )
+
+    async def gc_orphaned_embed_chunks(self, project_name: str = "") -> int:
+        """Delete chunks whose parent no longer exists. Returns the number removed.
+
+        A chunk is not reachable from its parent by an edge, so deleting the parent --
+        a file removed, an entity renamed -- leaves its chunks behind, still indexed
+        and still answering vector searches with text nothing in the graph contains.
+        """
+        scope = "WHERE c.project_name = $p " if project_name else ""
+        # Read first, delete second. `... DELETE d RETURN count(d)` returns 0 -- the
+        # rows are gone by the time the aggregate runs -- which reads as "nothing was
+        # orphaned" rather than "everything was", and there is no error either way.
+        rows = await self.execute(
+            f"MATCH (c:{NodeLabel.EMBED_CHUNK}) {scope}"
+            f"OPTIONAL MATCH (parent:{NodeLabel.ENTITY} {{uid: c.parent_uid}}) "
+            "WITH c, parent WHERE parent IS NULL "
+            "RETURN c.uid AS uid",
+            {"p": project_name} if project_name else None,
+        )
+        dead = [r["uid"] for r in rows if r.get("uid")]
+        if not dead:
+            return 0
+        await self.execute_write(
+            f"UNWIND $uids AS u MATCH (c:{NodeLabel.EMBED_CHUNK} {{uid: u}}) DELETE c", {"uids": dead}
+        )
+        return len(dead)
+
     async def run_in_write_transaction(self, fn: Callable[[], Awaitable[_T]]) -> _T:
         """Run *fn* inside a managed write transaction (single session, auto-retry)."""
 
@@ -4323,8 +4447,10 @@ class GraphClient:
             filter_projects = projects if projects is not None else ([project] if project else None)
 
             indices = [f"vec_{label.lower()}"] if label else [f"vec_{lbl.value.lower()}" for lbl in _EMBEDDABLE_LABELS]
-            filtering = bool(filter_projects) or threshold > 0.0
-            fetch_limit = limit * 3 if filtering else limit
+            # Unconditional over-fetch. Even with no filter set, several rows can
+            # collapse onto one node -- a long entity is in the index once per chunk plus
+            # once on itself -- so a page of exactly `limit` rows can yield far fewer.
+            fetch_limit = limit * 3
 
             async def _vs_page(idx: str, page: int) -> tuple[list[dict[str, Any]], int]:
                 # Memgraph 3.12's vector index is not purged synchronously on delete, so a
@@ -4376,12 +4502,47 @@ class GraphClient:
 
             if threshold > 0.0:
                 all_results = [r for r in all_results if r.get("similarity", 0) >= threshold]
+            all_results = await self._resolve_embed_chunks(all_results)
+            all_results = _best_similarity_per_uid(all_results)
+            # Before the project filter and the uid collapse: a chunk carries the
+            # project_name of its parent but none of the parent's other properties, and
+            # the caller expects nodes it can read a qualified_name off.
             if filter_projects:
                 project_set = set(filter_projects)
                 all_results = [r for r in all_results if _node_project_name(r) in project_set]
 
             all_results.sort(key=lambda rec: rec.get("similarity", 0), reverse=True)
             return all_results[:limit]
+
+    async def _resolve_embed_chunks(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Swap every EmbedChunk hit for the node it is a chunk of.
+
+        A chunk is a second vector for a node, not a result in its own right, so it
+        stands in for its parent at the similarity the chunk itself scored. Chunks
+        whose parent is gone are dropped rather than returned as holes -- the vector
+        index outlives a delete (see the guard in ``_vs_page``), and so does a chunk
+        whose parent was removed before ``gc_orphaned_embed_chunks`` next ran.
+        """
+        chunk_rows = [r for r in records if _is_embed_chunk(r)]
+        if not chunk_rows:
+            return records
+
+        parent_uids = {uid for r in chunk_rows if (uid := _chunk_parent_uid(r))}
+        rows = await self.execute(
+            f"UNWIND $uids AS u MATCH (n:{NodeLabel.ENTITY} {{uid: u}}) RETURN n AS node",
+            {"uids": sorted(parent_uids)},
+        )
+        parents = {uid: r["node"] for r in rows if (uid := _record_uid(r))}
+
+        out: list[dict[str, Any]] = []
+        for record in records:
+            if not _is_embed_chunk(record):
+                out.append(record)
+                continue
+            parent = parents.get(_chunk_parent_uid(record) or "")
+            if parent is not None:
+                out.append({**record, "node": parent})
+        return out
 
     # -- Graph (name-based) search helpers ------------------------------------
 
@@ -6073,6 +6234,7 @@ class GraphClient:
             (13, self._migrate_v13_add_entity_label),
             (14, self._migrate_v14_trim_marker_indices),
             (16, self._migrate_v16_clear_for_nested_frontmatter),
+            (17, self._migrate_v17_clear_for_doc_section_splitting),
         )
         for threshold, migrate in migrations:
             if stored < threshold:
@@ -6133,6 +6295,30 @@ class GraphClient:
         logger.info(
             "Schema v12: cleared stored file/git hashes — run 'atlas index' so overloaded "
             "C++ functions and Ruby singleton methods stop sharing one node"
+        )
+
+    async def _migrate_v17_clear_for_doc_section_splitting(self) -> None:
+        """v17: oversized doc sections became several nodes, and oversized code entities
+        gained overflow embedding chunks.
+
+        Same reason as v7, v11 and v16: both depend on re-reading the file. The parts of
+        a split section exist only in the source bytes, and the file-hash gate skips an
+        unchanged file forever, so a header-less document already in the graph would stay
+        one oversized node no matter how many times ``atlas index`` ran.
+
+        Nothing is deleted here. The old single node keeps the qualified_name that part 1
+        will claim, so the re-parse updates it in place and the AST diff adds the rest;
+        and a node still holding a truncated vector is not wrong, only incomplete, which
+        re-embedding fixes.
+        """
+        await self.execute_write(
+            f"MATCH (n) WHERE (n:{NodeLabel.MODULE} OR n:{NodeLabel.PACKAGE}) AND n.file_hash IS NOT NULL "
+            "REMOVE n.file_hash"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v17: cleared stored file/git hashes — run 'atlas index' so oversized doc "
+            "sections split into parts and oversized entities get their overflow vectors"
         )
 
     async def _reconcile_marker_labels(self) -> int:

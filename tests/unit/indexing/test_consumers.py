@@ -57,6 +57,7 @@ class StubGraph:
         self.citation_calls: list[tuple[str, dict[str, list[str]], set[str] | None, bool]] = []
         self.hash_writes: list[tuple[str, dict[str, str]]] = []
         self.gc_calls: int = 0
+        self.embed_chunk_gc_calls: int = 0
 
     async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
         self.deleted.append((project_name, file_path))
@@ -86,6 +87,10 @@ class StubGraph:
 
     async def gc_orphaned_reference_nodes(self) -> int:
         self.gc_calls += 1
+        return 0
+
+    async def gc_orphaned_embed_chunks(self, project_name: str = "") -> int:
+        self.embed_chunk_gc_calls += 1
         return 0
 
     async def resolve_citations(

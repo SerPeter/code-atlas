@@ -9,10 +9,11 @@ from unittest.mock import AsyncMock, patch
 
 import litellm
 import pytest
+from loguru import logger
 
 from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, split_embed_text
 from code_atlas.events import EmbedDirty, EntityRef
-from code_atlas.indexing.consumers import EmbedConsumer
+from code_atlas.indexing.consumers import EmbedConsumer, _partition_written_vectors, _plan_embed_chunks
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
 from code_atlas.settings import EmbeddingSettings
 
@@ -446,6 +447,10 @@ class TestEmbedDedupLookup:
         # Not a MagicMock: the consumer stamps this onto every vector it writes, and a
         # MagicMock reaches the Bolt driver as an unserialisable parameter.
         mock.configured_model = "test-model"
+        # split_text is synchronous; left as an AsyncMock it hands the consumer a
+        # coroutine where a (chunks, hard_split) tuple belongs. "Everything fits" is the
+        # right default here -- these tests are about the dedup ladder, not chunking.
+        mock.split_text = lambda text: ([text], False)
         return mock
 
     @staticmethod
@@ -672,3 +677,100 @@ class TestEmbedClientSplitText:
             assert client._encode_ok is False
             # Remembered: the splitter measures a text many times on the way down.
             client.count_tokens("x" * 300)
+
+
+# ---------------------------------------------------------------------------
+# Multi-chunk embedding
+# ---------------------------------------------------------------------------
+
+
+class TestPlanEmbedChunks:
+    """One node, several vectors — see _ChunkPlan."""
+
+    @staticmethod
+    def _split_into(count: int, *, hard: bool = False):
+        return lambda text: ([text[i::count] for i in range(count)] if count > 1 else [text], hard)
+
+    def test_text_that_fits_is_one_unit_and_no_chunk(self):
+        plan = _plan_embed_chunks([("p:a", "body", "H")], {"p:a": "Callable"}, self._split_into(1))
+        assert plan.units == [("p:a", "body", "H")]
+        assert plan.store_hash == {"p:a": "H"}
+        assert plan.chunk_of == {}
+
+    def test_split_keeps_chunk_one_on_the_node_itself(self):
+        plan = _plan_embed_chunks([("p:a", "abcdef", "H")], {"p:a": "Callable"}, self._split_into(3))
+        assert plan.units[0][0] == "p:a"
+        assert [u for u, _t, _h in plan.units[1:]] == ["p:a#chunk2", "p:a#chunk3"]
+
+    def test_parent_stores_the_hash_of_the_whole_text(self):
+        """Storing chunk 1's hash would make the freshness check re-embed it forever."""
+        plan = _plan_embed_chunks([("p:a", "abcdef", "FULL")], {"p:a": "Callable"}, self._split_into(3))
+        assert plan.store_hash["p:a"] == "FULL"
+
+    def test_each_chunk_stores_its_own_hash(self):
+        plan = _plan_embed_chunks([("p:a", "abcdef", "FULL")], {"p:a": "Callable"}, self._split_into(3))
+        for chunk_uid, text, _h in plan.units[1:]:
+            assert plan.store_hash[chunk_uid] == hash_text(text)
+
+    def test_chunk_of_records_parent_and_one_based_index(self):
+        plan = _plan_embed_chunks([("p:a", "abcdef", "H")], {"p:a": "Callable"}, self._split_into(3))
+        assert plan.chunk_of == {"p:a#chunk2": ("p:a", 2), "p:a#chunk3": ("p:a", 3)}
+
+    @staticmethod
+    def _warnings_from(label: str, *, hard: bool = False) -> list[str]:
+        """Plan a 3-way split of one node and return the WARNINGs it emitted.
+
+        A loguru sink, not caplog: loguru does not route through the stdlib logging
+        handlers caplog installs, so caplog.text is empty whatever was logged — which
+        makes a "did not warn" assertion pass for the wrong reason.
+        """
+        messages: list[str] = []
+        sink = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+        try:
+            _plan_embed_chunks(
+                [("p:a", "abcdef", "H")],
+                {"p:a": label},
+                lambda text: ([text[i::3] for i in range(3)], hard),
+            )
+        finally:
+            logger.remove(sink)
+        return messages
+
+    def test_splitting_a_code_entity_warns(self):
+        """A Callable needing several chunks is usually one too large to be a unit."""
+        assert any("p:a" in m for m in self._warnings_from("Callable"))
+
+    def test_splitting_a_document_does_not_warn(self):
+        """An oversized section is already split by the parser; a Note never is."""
+        assert self._warnings_from("Note") == []
+
+    def test_a_hard_split_says_so(self):
+        assert any("no natural border" in m for m in self._warnings_from("Callable", hard=True))
+
+
+class TestPartitionWrittenVectors:
+    def test_parents_and_chunks_go_to_different_writers(self):
+        plan = _plan_embed_chunks(
+            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: ([t[:3], t[3:]], False)
+        )
+        resolved = [(uid, [0.5], h) for uid, _t, h in plan.units]
+        parents, chunks = _partition_written_vectors(resolved, plan)
+
+        assert [uid for uid, _v, _h in parents] == ["proj:a"]
+        assert [(c.uid, c.parent_uid, c.chunk_index) for c in chunks] == [("proj:a#chunk2", "proj:a", 2)]
+
+    def test_chunk_carries_its_parents_project(self):
+        plan = _plan_embed_chunks(
+            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: ([t[:3], t[3:]], False)
+        )
+        resolved = [(uid, [0.5], h) for uid, _t, h in plan.units]
+        _parents, chunks = _partition_written_vectors(resolved, plan)
+        assert chunks[0].project_name == "proj"
+
+    def test_the_parent_row_carries_the_whole_text_hash(self):
+        plan = _plan_embed_chunks(
+            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: ([t[:3], t[3:]], False)
+        )
+        resolved = [(uid, [0.5], h) for uid, _t, h in plan.units]
+        parents, _chunks = _partition_written_vectors(resolved, plan)
+        assert parents[0][2] == "FULL"
