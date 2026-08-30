@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v0.10.2 (2026-08-30)
+
+### Bug Fixes
+
+- **indexing**: Extend the file-hash gate to documents
+  ([`31e7e3b`](https://github.com/SerPeter/code-atlas/commit/31e7e3bdd5cd38df9c605a20248f4f7fb4fc4476))
+
+- **watcher**: Stop a directory's modified event re-publishing its whole subtree
+  ([`2ce20f3`](https://github.com/SerPeter/code-atlas/commit/2ce20f322f59842c9cfd246bf525cccebed10ec8))
+
+
 ## v0.10.1 (2026-08-30)
 
 ### Performance Improvements
