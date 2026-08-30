@@ -749,3 +749,52 @@ def test_a_blanked_jinja_ref_is_not_read_as_a_table():
         path="models/rev.sql",
     )
     assert _uses_targets(parsed, "dbt.model.rev.cte.src") == set()
+
+
+# ---------------------------------------------------------------------------
+# dbt is Jinja-templated SQL (ATL: the whole SQL path, not a carve-out)
+# ---------------------------------------------------------------------------
+
+
+def test_a_dbt_model_carries_its_own_sql():
+    """The model node held a name and nothing else, so the SELECT that defines what it
+    produces reached the index nowhere and a model with no CTEs was unsearchable."""
+    parsed = _parse(
+        "with src as (select * from {{ ref('raw') }})\nselect customer_id, sum(total) as revenue from src group by 1\n",
+        path="models/rev.sql",
+    )
+    model = next(e for e in parsed.entities if e.kind == "dbt_model")
+    assert "sum(total) as revenue" in (model.source or "")
+
+
+def test_a_dbt_models_leading_comment_becomes_its_docstring():
+    """dbt has no docstring syntax; a leading -- block is the convention."""
+    parsed = _parse(
+        "-- Revenue per customer, restated nightly.\nselect 1 from {{ ref('x') }}\n",
+        path="models/rev.sql",
+    )
+    model = next(e for e in parsed.entities if e.kind == "dbt_model")
+    assert model.docstring == "Revenue per customer, restated nightly."
+
+
+def test_a_view_in_a_jinja_file_is_still_extracted():
+    """The dbt path walked for create_table alone, so a view in any file containing
+    Jinja reached the graph nowhere."""
+    parsed = _parse(
+        "{{ config(materialized='view') }}\nCREATE VIEW active_users AS SELECT * FROM users WHERE active;\n",
+        path="models/v.sql",
+    )
+    assert any(e.kind == "sql_view" and e.name == "active_users" for e in parsed.entities)
+
+
+def test_a_model_does_not_carry_its_ctes_text():
+    """A CTE is its own entity; the model's source is the whole file."""
+    parsed = _parse(
+        "with daily as (select marker_inside_cte from {{ ref('raw') }})\nselect * from daily\n",
+        path="models/d.sql",
+    )
+    model = next(e for e in parsed.entities if e.kind == "dbt_model")
+    cte = next(e for e in parsed.entities if e.kind == "sql_cte")
+    assert "marker_inside_cte" in (cte.source or "")
+    assert "marker_inside_cte" not in (model.source or "")
+    assert "daily" in (model.source or "")

@@ -72,6 +72,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    elide_nested_entity_spans,
     node_text,
     register_language,
 )
@@ -767,16 +768,48 @@ def _parse_dbt(path: str, source: bytes, project_name: str) -> ParsedFile:
         )
     )
 
-    # Any real DDL in the file still counts -- a dbt project can hold plain SQL too.
-    for node in _walk(shimmed_root):
-        if node.type == "create_table":
-            _extract_table(node, ctx)
+    # The whole SQL path, not a carve-out for CREATE TABLE. dbt IS Jinja-templated SQL:
+    # once the Jinja is neutralised, everything ordinary SQL extraction knows how to do
+    # applies. Walking for create_table alone meant a dbt project's views, indexes and
+    # functions reached the graph only from files that happened to contain no Jinja.
+    _walk_statements(shimmed_root, ctx)
+    _recover_routines(shimmed_root, ctx)
 
     macros = _extract_dbt_macros(source, ctx, norm_path)
     owner_uid = _extract_dbt_model(source, ctx, norm_path, shimmed_root) if not macros else None
     _extract_dbt_edges(source, ctx, owner_uid or module_uid, defined_macros=macros)
 
+    # The CTEs and any DDL above are entities in their own right, and the model's source
+    # is the whole file, so it carried their text as well. Same duplication Python and
+    # TypeScript have, same shared fix.
+    elide_nested_entity_spans(
+        ctx.entities,
+        lambda child: f"-- ... {child.name} -> {child.qualified_name.split(':', 1)[-1]}",
+    )
+
     return ParsedFile(file_path=norm_path, language="sql", entities=ctx.entities, relationships=ctx.relationships)
+
+
+def _leading_comment(source: bytes) -> str | None:
+    """The comment block at the head of a dbt model -- what the model is for.
+
+    dbt has no docstring syntax; the convention is a ``--`` block at the top, above or
+    below the ``{{ config() }}`` call. Attaching it is the same fix Go and Rust already
+    get for their comment-above-declaration convention, and without it a model's one
+    sentence of prose reached the index nowhere.
+    """
+    lines: list[str] = []
+    for raw in source.decode("utf-8", errors="replace").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("{{", "{%")):
+            if lines:
+                break
+            continue
+        if stripped.startswith("--"):
+            lines.append(stripped.lstrip("-").strip())
+            continue
+        break
+    return "\n".join(lines) or None
 
 
 def _extract_dbt_macros(source: bytes, ctx: _Ctx, norm_path: str) -> set[bytes]:
@@ -829,6 +862,11 @@ def _extract_dbt_model(source: bytes, ctx: _Ctx, norm_path: str, root: Node) -> 
             line_end=root.end_point[0] + 1,
             file_path=norm_path,
             tags=tags,
+            # The model's SQL is the model. Without this the node carried a name and
+            # nothing else, so the SELECT that defines what the model produces reached
+            # the index nowhere and a model with no CTEs was unsearchable.
+            source=source.decode("utf-8", errors="replace"),
+            docstring=_leading_comment(source),
         )
     )
     ctx.defines(ctx.module_uid, uid)
@@ -903,6 +941,20 @@ def _parse_sql(path: str, source: bytes, root: Node, project_name: str) -> Parse
         )
     )
 
+    _walk_statements(root, ctx)
+    _recover_routines(root, ctx)
+    return ParsedFile(file_path=norm_path, language=language, entities=ctx.entities, relationships=ctx.relationships)
+
+
+def _walk_statements(root: Node, ctx: _Ctx) -> None:
+    """Dispatch every DDL statement under *root* to its extractor.
+
+    Shared with the dbt path, which is the point: a dbt model is Jinja-templated SQL, so
+    once the Jinja is neutralised the ordinary SQL extraction is exactly what should run
+    on it. It previously walked for ``create_table`` alone, which meant a dbt project's
+    views, indexes and functions reached the graph only if they happened to live in a
+    file containing no Jinja at all.
+    """
     for node in _walk(root):
         node_type = node.type
         if node_type == "create_table":
@@ -915,9 +967,6 @@ def _parse_sql(path: str, source: bytes, root: Node, project_name: str) -> Parse
             _extract_function(node, ctx)
         elif node_type == "alter_table":
             _extract_alter_table(node, ctx)
-
-    _recover_routines(root, ctx)
-    return ParsedFile(file_path=norm_path, language=language, entities=ctx.entities, relationships=ctx.relationships)
 
 
 # ---------------------------------------------------------------------------
