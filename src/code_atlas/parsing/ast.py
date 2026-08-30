@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from tree_sitter import Language, Parser, Query
 
-from code_atlas.chunking import split_embed_text
+from code_atlas.chunking import repair_fences, split_embed_text
 from code_atlas.schema import NodeLabel, RelType, Visibility
 from code_atlas.telemetry import get_metrics
 
@@ -889,7 +889,18 @@ def split_oversized_doc_sections(
             continue
 
         body = entity.docstring or ""
-        parts, _hard = split_embed_text(body, limit=max_chars, measure=len, max_chunks=_MAX_DOC_PARTS)
+        split = split_embed_text(body, limit=max_chars, measure=len, max_chunks=_MAX_DOC_PARTS)
+        # Fences second: the ladder cuts on blank lines, which occur inside a fenced
+        # block, so a long example otherwise yields parts of unlabelled bare code.
+        parts = repair_fences(split.chunks)
+        if split.dropped:
+            logger.warning(
+                "Doc section {} is too large to index whole: {} of {} characters past part {} were dropped",
+                entity.qualified_name,
+                split.dropped,
+                len(body),
+                _MAX_DOC_PARTS,
+            )
         if len(parts) <= 1:
             out_entities.append(entity)
             continue

@@ -44,6 +44,7 @@ from code_atlas.telemetry import get_metrics, get_tracer, timed_phase
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from code_atlas.chunking import SplitResult
     from code_atlas.graph.client import GraphClient
     from code_atlas.search.embeddings import EmbedClient
     from code_atlas.settings import AtlasSettings
@@ -1637,7 +1638,7 @@ class _ChunkPlan:
 def _plan_embed_chunks(
     to_process: list[tuple[str, str, str]],
     uid_to_label: dict[str, str],
-    split: Callable[[str], tuple[list[str], bool]],
+    split: Callable[[str], SplitResult],
 ) -> _ChunkPlan:
     """Expand any text over the model's input cap into one unit per chunk.
 
@@ -1655,7 +1656,18 @@ def _plan_embed_chunks(
     chunk_of: dict[str, tuple[str, int]] = {}
 
     for uid, text, full_hash in to_process:
-        chunks, hard_split = split(text)
+        split_result = split(text)
+        chunks, hard_split = split_result.chunks, split_result.hard_split
+        if split_result.dropped:
+            # The cap is a cost ceiling, not a licence to lose text silently. Saying so
+            # is the difference between "this node is long" and "this node is longer
+            # than we are willing to index, and here is what that cost".
+            logger.warning(
+                "Embed text for {} exceeds {} chunks; ~{} tokens past the cap are not indexed",
+                uid,
+                len(chunks),
+                split_result.dropped,
+            )
         if len(chunks) <= 1:
             units.append((uid, text, full_hash))
             store_hash[uid] = full_hash

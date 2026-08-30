@@ -11,7 +11,7 @@ choice, passed in as *measure*.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -84,31 +84,53 @@ def _hard_split(text: str, limit: int, measure: Callable[[str], int]) -> list[st
     return out
 
 
+class SplitResult(NamedTuple):
+    """What :func:`split_embed_text` did, including what it could not keep."""
+
+    chunks: list[str]
+    """The pieces, each measuring at most the requested limit."""
+
+    hard_split: bool
+    """True when a cut landed mid-border because the ladder ran out."""
+
+    dropped: int
+    """Measured units discarded past ``max_chunks``, 0 when nothing was lost.
+
+    A count rather than a flag, and returned rather than logged here, because this
+    module is pure: only the caller knows which node lost the text and can say so.
+    Before this existed the tail vanished and ``len(chunks)`` was the only signal --
+    indistinguishable from a text that genuinely needed exactly that many.
+    """
+
+
 def split_embed_text(
     text: str,
     *,
     limit: int,
     measure: Callable[[str], int],
     max_chunks: int = 8,
-) -> tuple[list[str], bool]:
+) -> SplitResult:
     """Split *text* into chunks that each measure at most *limit*.
 
-    Returns ``(chunks, hard_split)``. *hard_split* is True when at least one cut
-    landed mid-border because :data:`_BORDER_LADDER` ran out -- the caller uses it
-    to say *why* a node was split, not whether.
+    A *limit* of 0 or less means "no known limit" and returns the text unsplit: that
+    is the state a model absent from litellm's registry is in, and guessing a limit
+    for it would be worse than the provider's own error.
 
-    A *limit* of 0 or less means "no known limit" and returns the text unsplit:
-    that is the state a model absent from litellm's registry is in, and guessing a
-    limit for it would be worse than the provider's own error.
+    At most *max_chunks* are returned. The cap bounds what one pathological node can
+    cost in provider calls and index entries, and :attr:`SplitResult.dropped` says
+    what that cost the text.
 
-    At most *max_chunks* are returned. The cap bounds what one pathological node
-    can cost, in provider calls and in index entries; the tail past it is dropped
-    and the caller is told by the length it gets back.
+    Chunks do **not** concatenate back to the input: the separator a cut lands on is
+    consumed, so a boundary loses one blank line, newline or space. That is a
+    whitespace character at a place the text was already being divided, and is left
+    alone -- but it means ``"".join(chunks) == text`` is not an invariant to test
+    against, and ``dropped`` is measured over the discarded chunks rather than as a
+    difference from the input's own length.
     """
     if not text:
-        return [], False
+        return SplitResult([], False, 0)
     if limit <= 0 or measure(text) <= limit:
-        return [text], False
+        return SplitResult([text], False, 0)
 
     chunks = [text]
     for sep in _BORDER_LADDER:
@@ -131,4 +153,48 @@ def split_embed_text(
             hard_split = True
             final.extend(_hard_split(chunk, limit, measure))
 
-    return final[:max_chunks], hard_split
+    dropped = sum(measure(c) for c in final[max_chunks:])
+    return SplitResult(final[:max_chunks], hard_split, dropped)
+
+
+_FENCE_MARKERS = ("```", "~~~")
+
+
+def _fence_marker(line: str) -> str | None:
+    """The fence marker opening or closing on *line*, if any."""
+    stripped = line.lstrip()
+    return next((m for m in _FENCE_MARKERS if stripped.startswith(m)), None)
+
+
+def repair_fences(parts: list[str]) -> list[str]:
+    """Re-open and close code fences so each part stands alone as valid markdown.
+
+    The border ladder cuts on blank lines, and blank lines occur *inside* fenced
+    blocks -- so a long example splits into a part that opens a fence and never closes
+    it, followed by parts of bare code with no fence and no language tag. Measured on
+    one section: part 2 came back with zero fence markers, starting mid-code.
+
+    A post-pass rather than a rung on the ladder, because the ladder is shared with
+    code embed text, where a fence means nothing. The caller that knows its text is
+    markdown asks for this.
+
+    Re-opening repeats the original opening line, so the language tag survives into
+    every continuation part. That adds a few characters to a part, which can push it
+    marginally over the limit; that is preferred to handing a retrieval index an
+    unlabelled code fragment.
+    """
+    out: list[str] = []
+    carry: str | None = None
+    for part in parts:
+        opener = carry
+        for line in part.splitlines():
+            marker = _fence_marker(line)
+            if marker is None:
+                continue
+            opener = line.rstrip() if opener is None else None
+        body = (carry + "\n" if carry else "") + part
+        if opener is not None:
+            body += "\n" + (_fence_marker(opener) or "```")
+        out.append(body)
+        carry = opener
+    return out

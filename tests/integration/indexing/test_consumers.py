@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from code_atlas.chunking import SplitResult
 from code_atlas.events import (
     EmbedDirty,
     EntityRef,
@@ -1376,11 +1377,11 @@ class _StallingEmbedClient:
     def release(self) -> None:
         self._release.set()
 
-    def split_text(self, text: str) -> tuple[list[str], bool]:
+    def split_text(self, text: str) -> SplitResult:
         """Part of the EmbedClient contract since ATL-140. Everything fits here — this
         test is about concurrent writes to one uid, not about chunking, and a fake
         without it stalls the consumer in a retry loop that reads as a hang."""
-        return [text], False
+        return SplitResult([text], False, 0)
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         self.calls += 1

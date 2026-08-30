@@ -11,7 +11,7 @@ import litellm
 import pytest
 from loguru import logger
 
-from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, split_embed_text
+from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, SplitResult, repair_fences, split_embed_text
 from code_atlas.events import EmbedDirty, EntityRef
 from code_atlas.indexing.consumers import EmbedConsumer, _partition_written_vectors, _plan_embed_chunks
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
@@ -450,7 +450,7 @@ class TestEmbedDedupLookup:
         # split_text is synchronous; left as an AsyncMock it hands the consumer a
         # coroutine where a (chunks, hard_split) tuple belongs. "Everything fits" is the
         # right default here -- these tests are about the dedup ladder, not chunking.
-        mock.split_text = lambda text: ([text], False)
+        mock.split_text = lambda text: SplitResult([text], False, 0)
         return mock
 
     @staticmethod
@@ -583,55 +583,55 @@ def _chars(text: str) -> int:
 
 class TestSplitEmbedText:
     def test_short_text_is_one_chunk(self):
-        chunks, hard = split_embed_text("hello", limit=100, measure=_chars)
+        chunks, hard, _dropped = split_embed_text("hello", limit=100, measure=_chars)
         assert chunks == ["hello"]
         assert hard is False
 
     def test_empty_text_yields_no_chunks(self):
-        assert split_embed_text("", limit=100, measure=_chars) == ([], False)
+        assert split_embed_text("", limit=100, measure=_chars) == ([], False, 0)
 
     def test_unknown_limit_returns_text_whole(self):
         """limit<=0 means the registry had no answer; guessing one is worse than not."""
         text = "x" * 5000
-        assert split_embed_text(text, limit=0, measure=_chars) == ([text], False)
+        assert split_embed_text(text, limit=0, measure=_chars) == ([text], False, 0)
 
     def test_splits_on_paragraph_border_before_line_border(self):
         text = "a\nb\n\nc\nd"
-        chunks, hard = split_embed_text(text, limit=4, measure=_chars)
+        chunks, hard, _dropped = split_embed_text(text, limit=4, measure=_chars)
         assert chunks == ["a\nb", "c\nd"]
         assert hard is False
 
     def test_packs_greedily_rather_than_one_chunk_per_line(self):
         """The ladder cuts at a border, not at every border."""
         text = "\n".join("line" for _ in range(6))  # 6 * 4 + 5 = 29 chars
-        chunks, _ = split_embed_text(text, limit=14, measure=_chars)
+        chunks, _, _dropped = split_embed_text(text, limit=14, measure=_chars)
         assert chunks == ["line\nline\nline", "line\nline\nline"]
 
     def test_every_chunk_is_within_the_limit(self):
         text = "\n\n".join("para " * 20 for _ in range(10))
-        chunks, _ = split_embed_text(text, limit=200, measure=_chars, max_chunks=99)
+        chunks, _, _dropped = split_embed_text(text, limit=200, measure=_chars, max_chunks=99)
         assert chunks
         assert all(_chars(c) <= 200 for c in chunks)
 
     def test_hard_split_when_no_border_exists(self):
         """A base64 blob or minified bundle has no border to cut at."""
-        chunks, hard = split_embed_text("x" * 250, limit=100, measure=_chars, max_chunks=99)
+        chunks, hard, _dropped = split_embed_text("x" * 250, limit=100, measure=_chars, max_chunks=99)
         assert hard is True
         assert [len(c) for c in chunks] == [100, 100, 50]
         assert "".join(chunks) == "x" * 250
 
     def test_hard_split_is_not_reported_for_a_clean_border_split(self):
-        chunks, hard = split_embed_text("aaaa\n\nbbbb", limit=5, measure=_chars)
+        chunks, hard, _dropped = split_embed_text("aaaa\n\nbbbb", limit=5, measure=_chars)
         assert chunks == ["aaaa", "bbbb"]
         assert hard is False
 
     def test_max_chunks_caps_the_tail(self):
-        chunks, _ = split_embed_text("x" * 1000, limit=10, measure=_chars, max_chunks=3)
+        chunks, _, _dropped = split_embed_text("x" * 1000, limit=10, measure=_chars, max_chunks=3)
         assert len(chunks) == 3
 
     def test_dense_tokenizer_still_terminates(self):
         """A measure that reports far more units than characters must converge."""
-        chunks, hard = split_embed_text("y" * 300, limit=10, measure=lambda t: len(t) * 7, max_chunks=400)
+        chunks, hard, _dropped = split_embed_text("y" * 300, limit=10, measure=lambda t: len(t) * 7, max_chunks=400)
         assert hard is True
         assert all(len(c) * 7 <= 10 for c in chunks)
         assert "".join(chunks) == "y" * 300
@@ -642,14 +642,14 @@ class TestEmbedClientSplitText:
         """This is the production failure: no cap, no chunking, no truncation."""
         client = EmbedClient(_make_settings(model="nomic-ai/nomic-embed-code"))
         assert client._max_input_tokens is None
-        chunks, hard = client.split_text("word " * 20_000)
+        chunks, hard, _dropped = client.split_text("word " * 20_000)
         assert len(chunks) == 1
         assert hard is False
 
     def test_explicit_max_input_tokens_restores_the_cap(self):
         client = EmbedClient(_make_settings(max_input_tokens=2048, truncate_ratio=1.0))
         assert client._max_input_tokens == 2048
-        chunks, _ = client.split_text("word " * 20_000)
+        chunks, _, _dropped = client.split_text("word " * 20_000)
         assert len(chunks) > 1
         assert all(client.count_tokens(c) <= 2048 for c in chunks)
 
@@ -666,7 +666,7 @@ class TestEmbedClientSplitText:
 
     def test_max_chunks_setting_bounds_the_split(self):
         client = EmbedClient(_make_settings(max_input_tokens=64, truncate_ratio=1.0, max_chunks=2))
-        chunks, _ = client.split_text("word " * 5_000)
+        chunks, _, _dropped = client.split_text("word " * 5_000)
         assert len(chunks) == 2
 
     def test_count_tokens_falls_back_when_no_tokenizer_is_reachable(self):
@@ -689,7 +689,7 @@ class TestPlanEmbedChunks:
 
     @staticmethod
     def _split_into(count: int, *, hard: bool = False):
-        return lambda text: ([text[i::count] for i in range(count)] if count > 1 else [text], hard)
+        return lambda text: SplitResult([text[i::count] for i in range(count)] if count > 1 else [text], hard, 0)
 
     def test_text_that_fits_is_one_unit_and_no_chunk(self):
         plan = _plan_embed_chunks([("p:a", "body", "H")], {"p:a": "Callable"}, self._split_into(1))
@@ -730,7 +730,7 @@ class TestPlanEmbedChunks:
             _plan_embed_chunks(
                 [("p:a", "abcdef", "H")],
                 {"p:a": label},
-                lambda text: ([text[i::3] for i in range(3)], hard),
+                lambda text: SplitResult([text[i::3] for i in range(3)], hard, 0),
             )
         finally:
             logger.remove(sink)
@@ -751,7 +751,7 @@ class TestPlanEmbedChunks:
 class TestPartitionWrittenVectors:
     def test_parents_and_chunks_go_to_different_writers(self):
         plan = _plan_embed_chunks(
-            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: ([t[:3], t[3:]], False)
+            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: SplitResult([t[:3], t[3:]], False, 0)
         )
         resolved = [(uid, [0.5], h) for uid, _t, h in plan.units]
         parents, chunks = _partition_written_vectors(resolved, plan)
@@ -761,7 +761,7 @@ class TestPartitionWrittenVectors:
 
     def test_chunk_carries_its_parents_project(self):
         plan = _plan_embed_chunks(
-            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: ([t[:3], t[3:]], False)
+            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: SplitResult([t[:3], t[3:]], False, 0)
         )
         resolved = [(uid, [0.5], h) for uid, _t, h in plan.units]
         _parents, chunks = _partition_written_vectors(resolved, plan)
@@ -769,8 +769,73 @@ class TestPartitionWrittenVectors:
 
     def test_the_parent_row_carries_the_whole_text_hash(self):
         plan = _plan_embed_chunks(
-            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: ([t[:3], t[3:]], False)
+            [("proj:a", "abcdef", "FULL")], {"proj:a": "Callable"}, lambda t: SplitResult([t[:3], t[3:]], False, 0)
         )
         resolved = [(uid, [0.5], h) for uid, _t, h in plan.units]
         parents, _chunks = _partition_written_vectors(resolved, plan)
         assert parents[0][2] == "FULL"
+
+
+TICK = chr(96) * 3
+"""A markdown code fence, spelled without literal backticks so this file stays greppable."""
+
+
+class TestSplitReportsWhatItDropped:
+    """The cap is a cost ceiling, not a licence to lose text silently."""
+
+    def test_a_capped_split_reports_the_loss(self):
+        """Compared against the same split uncapped, which is the only exact baseline:
+        the ladder consumes the separator it cuts on, so chunks do not concatenate back
+        to the input byte for byte."""
+        text = "word " * 4000
+        whole = split_embed_text(text, limit=100, measure=_chars, max_chunks=9999)
+        capped = split_embed_text(text, limit=100, measure=_chars, max_chunks=3)
+
+        assert len(capped.chunks) == 3
+        assert capped.dropped == sum(_chars(c) for c in whole.chunks[3:])
+        assert capped.dropped > 19_000
+
+    def test_an_uncapped_split_reports_no_loss(self):
+        """Otherwise 'dropped' would be noise on every long node rather than a signal."""
+        result = split_embed_text("word " * 4000, limit=100, measure=_chars, max_chunks=9999)
+        assert result.dropped == 0
+        # Everything but the consumed separators, one per boundary.
+        assert sum(_chars(c) for c in result.chunks) == 20_000 - (len(result.chunks) - 1)
+
+    def test_a_text_that_fits_reports_no_loss(self):
+        assert split_embed_text("short", limit=100, measure=_chars).dropped == 0
+
+    def test_the_count_is_in_measured_units_not_characters(self):
+        """It is reported to a caller that thinks in tokens, so it must measure in them."""
+        result = split_embed_text("x" * 900, limit=10, measure=lambda t: len(t) // 3, max_chunks=2)
+        assert result.dropped == (900 - sum(len(c) for c in result.chunks)) // 3
+
+
+class TestFenceRepair:
+    """The ladder cuts on blank lines, and blank lines occur inside fenced blocks."""
+
+    @staticmethod
+    def _fenced(paragraphs: int = 40) -> str:
+        body = "\n\n".join(f"line_{i} = compute({i})" for i in range(paragraphs))
+        return "Intro paragraph.\n\n" + TICK + "python\n" + body + "\n" + TICK + "\n\nOutro."
+
+    def test_every_part_has_balanced_fences(self):
+        parts = repair_fences(split_embed_text(self._fenced(), limit=400, measure=_chars, max_chunks=99).chunks)
+        assert len(parts) > 1
+        for part in parts:
+            assert part.count(TICK) % 2 == 0, part[:80]
+
+    def test_a_continuation_part_keeps_the_language_tag(self):
+        """An unlabelled code fragment is the thing this exists to prevent."""
+        parts = repair_fences(split_embed_text(self._fenced(), limit=400, measure=_chars, max_chunks=99).chunks)
+        middle = [p for p in parts if "line_" in p and "Intro" not in p]
+        assert middle
+        assert all(p.lstrip().startswith(TICK + "python") for p in middle)
+
+    def test_text_without_fences_is_untouched(self):
+        parts = ["plain one", "plain two"]
+        assert repair_fences(parts) == parts
+
+    def test_a_fence_wholly_inside_one_part_is_untouched(self):
+        parts = [TICK + "py\nx = 1\n" + TICK]
+        assert repair_fences(parts) == parts

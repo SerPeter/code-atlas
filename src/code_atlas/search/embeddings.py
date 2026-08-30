@@ -15,7 +15,7 @@ import litellm
 from loguru import logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, split_embed_text
+from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, SplitResult, split_embed_text
 from code_atlas.search.ratelimit import ConcurrencyGate, RateLimiter
 from code_atlas.settings import _PROVIDER_DEFAULTS
 from code_atlas.telemetry import get_tracer
@@ -203,13 +203,12 @@ class EmbedClient:
                 return count
         return len(text) // CHARS_PER_TOKEN_FALLBACK + 1
 
-    def split_text(self, text: str) -> tuple[list[str], bool]:
+    def split_text(self, text: str) -> SplitResult:
         """Split *text* into chunks this model will accept.
 
-        Returns ``(chunks, hard_split)``; a text already under the cap comes back as
-        a single chunk with ``hard_split`` False, which is the case for all but a
-        fraction of a percent of nodes. When the cap is unknown the text is returned
-        whole -- see ``EmbeddingSettings.max_input_tokens``.
+        A text already under the cap comes back as a single chunk, which is the case
+        for all but a fraction of a percent of nodes. When the cap is unknown the text
+        is returned whole -- see ``EmbeddingSettings.max_input_tokens``.
         """
         return split_embed_text(
             text,

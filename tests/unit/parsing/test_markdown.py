@@ -556,3 +556,38 @@ def test_note_is_never_split():
     notes = [e for e in parsed.entities if e.label == NodeLabel.NOTE]
     assert len(notes) == 1
     assert len(notes[0].docstring or "") > 6000
+
+
+_TICK = chr(96) * 3
+"""A markdown code fence, spelled without literal backticks so this file stays greppable."""
+
+
+def _fenced_doc(paragraphs: int = 400) -> str:
+    """A section whose code block spans blank lines -- what the ladder cuts on.
+
+    Sized past index.max_doc_section_chars (6000) on purpose: below it the section
+    does not split at all and the test passes for the wrong reason.
+    """
+    code = "\n\n".join(f"line_{i} = compute({i})" for i in range(paragraphs))
+    return "# Guide\n\nIntro paragraph.\n\n" + _TICK + "python\n" + code + "\n" + _TICK + "\n\nOutro.\n"
+
+
+def test_a_split_section_leaves_every_part_valid_markdown():
+    """The ladder cuts on blank lines, and blank lines occur inside fenced blocks, so
+    a long example otherwise yields parts of unlabelled bare code."""
+    parsed = _parse(_fenced_doc())
+    sections = [e for e in parsed.entities if e.label == NodeLabel.DOC_SECTION]
+
+    assert len(sections) > 1, "the fixture must actually split for this to test anything"
+    for section in sections:
+        assert (section.docstring or "").count(_TICK) % 2 == 0, section.qualified_name
+
+
+def test_a_continuation_part_keeps_its_language_tag():
+    parsed = _parse(_fenced_doc())
+    sections = [e for e in parsed.entities if e.label == NodeLabel.DOC_SECTION]
+    continuations = [s for s in sections[1:] if "line_" in (s.docstring or "")]
+
+    assert continuations
+    for section in continuations:
+        assert (section.docstring or "").lstrip().startswith(_TICK + "python")
