@@ -10,16 +10,10 @@ from unittest.mock import AsyncMock, patch
 import litellm
 import pytest
 
+from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, split_embed_text
 from code_atlas.events import EmbedDirty, EntityRef
 from code_atlas.indexing.consumers import EmbedConsumer
-from code_atlas.search.embeddings import (
-    CHARS_PER_TOKEN_FALLBACK,
-    EmbedClient,
-    EmbeddingError,
-    build_embed_text,
-    hash_text,
-    split_embed_text,
-)
+from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
 from code_atlas.settings import EmbeddingSettings
 
 # ---------------------------------------------------------------------------
