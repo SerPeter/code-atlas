@@ -1258,7 +1258,9 @@ test('retries', async t => {
   });
 });
 """)
-    assert _callable_names(parsed) == set()
+    # The wrapper itself is now an entity (ATL-139: a test's title names it).
+    # What this test pins is the form INSIDE it, which still gets none.
+    assert _callable_names(parsed) == {"retries"}
     assert _calls_from(parsed, "src.example") == {"test", "ky", "stub"}
 
 
@@ -1361,7 +1363,9 @@ test('decodes', async t => {
   await use(customFetch);
 });
 """)
-    assert _callable_names(parsed) == set()
+    # The wrapper itself is now an entity (ATL-139: a test's title names it).
+    # What this test pins is the form INSIDE it, which still gets none.
+    assert _callable_names(parsed) == {"decodes"}
     # The body is still walked; its calls attribute to the nearest named scope.
     assert _calls_from(parsed, "src.example") == {"test", "build", "use"}
 
@@ -1406,7 +1410,9 @@ test('validates', async t => {
   await use(schema);
 });
 """)
-    assert _callable_names(parsed) == set()
+    # The wrapper itself is now an entity (ATL-139: a test's title names it).
+    # What this test pins is the form INSIDE it, which still gets none.
+    assert _callable_names(parsed) == {"validates"}
     assert "check" in _calls_from(parsed, "src.example")
 
 
@@ -1477,7 +1483,9 @@ describe('legacy', function () {
 """,
         path="src/example.js",
     )
-    assert _callable_names(parsed) == set()
+    # The wrapper itself is now an entity (ATL-139: a test's title names it).
+    # What this test pins is the form INSIDE it, which still gets none.
+    assert _callable_names(parsed) == {"legacy"}
     assert "work" in _calls_from(parsed, "src.example")
 
 
@@ -1667,3 +1675,93 @@ export function Panel() {
         path="src/Panel.tsx",
     )
     assert "track" in _calls_from(parsed, "src.Panel.Panel")
+
+
+# ---------------------------------------------------------------------------
+# Title-named callbacks (ATL-139)
+# ---------------------------------------------------------------------------
+
+
+def _test_cases(parsed) -> dict:
+    return {e.name: e.qualified_name for e in parsed.entities if e.kind == "test_case"}
+
+
+def test_a_test_is_named_by_its_title():
+    """ADR-0031's rule is a name a developer could use. A title is how the test is run
+    (ava --match, pytest -k), how CI reports it, and how a human asks about it."""
+    parsed = _parse("test('POST JSON with upload progress', async t => { t.pass(); });\n")
+
+    cases = _test_cases(parsed)
+    assert list(cases) == ["POST JSON with upload progress"]
+    assert cases["POST JSON with upload progress"].endswith(".post_json_with_upload_progress")
+
+
+def test_a_nested_case_is_named_under_its_suite():
+    parsed = _parse("describe('outer', () => { it('inner', () => { go(); }); });\n")
+
+    cases = _test_cases(parsed)
+    assert set(cases) == {"outer", "inner"}
+    assert cases["inner"].endswith(".outer.inner")
+
+
+def test_member_call_forms_are_recognised():
+    """test.serial, it.each, t.test -- either end of the chain may carry the name."""
+    parsed = _parse("test.serial('serial one', async t => { go(); });\nt.test('node style', async () => { go(); });\n")
+    assert set(_test_cases(parsed)) == {"serial one", "node style"}
+
+
+def test_a_call_with_an_already_named_handler_mints_nothing():
+    """The handler has a name; a second entity for it would be a duplicate."""
+    parsed = _parse("test('uses a handler', handleIt);\n")
+    assert _test_cases(parsed) == {}
+
+
+def test_a_call_without_a_string_first_argument_is_not_a_naming_call():
+    parsed = _parse("describe(someVariable, () => { go(); });\n")
+    assert _test_cases(parsed) == {}
+
+
+def test_an_unrecognised_call_name_mints_nothing():
+    """Guards the guard: the rule keys on the call name, not on the argument shape."""
+    parsed = _parse("register('a label', () => { go(); });\n")
+    assert _test_cases(parsed) == {}
+
+
+def test_two_tests_sharing_a_title_both_decline():
+    """A uid must identify exactly one definition (ADR-0032). One silently overwriting
+    the other is a confident wrong answer, worse than the silence of a missing entity."""
+    parsed = _parse("test('same name', async t => { one(); });\ntest('same name', async t => { two(); });\n")
+    assert _test_cases(parsed) == {}
+
+
+def test_titles_that_slug_alike_both_decline():
+    """'a-b' and 'a b' are one uid segment; neither may claim it."""
+    parsed = _parse("test('a-b', async t => { one(); });\ntest('a b', async t => { two(); });\n")
+    assert _test_cases(parsed) == {}
+
+
+def test_the_suite_defines_its_cases():
+    parsed = _parse("describe('outer', () => { it('inner', () => { go(); }); });\n")
+
+    defines = {(r.from_qualified_name, r.to_name) for r in parsed.relationships if r.rel_type == RelType.DEFINES}
+    outer = _test_cases(parsed)["outer"]
+    inner = _test_cases(parsed)["inner"]
+    assert (outer, inner) in defines
+
+
+def test_a_test_case_kind_is_outside_the_dead_code_predicate():
+    """Nothing in a codebase calls a test by name, so every one would be reported dead.
+    find_dead_code restricts itself to _CODE_ENTITY_KINDS, built from the enums."""
+    from code_atlas.graph.client import _CODE_ENTITY_KINDS
+
+    parsed = _parse("test('never called', async t => { go(); });\n")
+    kinds = {e.kind for e in parsed.entities if e.kind == "test_case"}
+    assert kinds == {"test_case"}
+    assert not (kinds & _CODE_ENTITY_KINDS)
+
+
+def test_the_body_travels_with_the_entity():
+    """The point is retrievability: a title with no body is only half findable."""
+    parsed = _parse("test('checks the widget cache', async t => { await widgetCache.warm(); });\n")
+    entity = next(e for e in parsed.entities if e.kind == "test_case")
+    assert "widgetCache.warm" in (entity.source or "")

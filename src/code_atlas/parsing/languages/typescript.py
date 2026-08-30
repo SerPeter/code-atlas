@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -1514,6 +1516,159 @@ def _process_node(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Title-named callbacks (ATL-139)
+# ---------------------------------------------------------------------------
+
+_KIND_TEST_CASE = "test_case"
+"""Outside CallableKind on purpose -- see _extract_title_named_callbacks."""
+
+_NAMING_CALLS: frozenset[str] = frozenset({"test", "it", "describe", "suite", "context", "specify", "bench"})
+"""Calls whose first string argument names the callback that follows it.
+
+Module-level rather than an ``atlas.toml`` field, for the reason ``config.py`` gives
+about its own tables: wiring it in means editing ``settings.py``, which this module does
+not own. Override it by assigning to this name.
+
+Deliberately not the route registrations (``app.get('/users/:id', handler)``) that this
+story's title also named. A route's handler is usually a named identifier already, and
+the shape that would have to match an inline one -- string first argument, function
+somewhere in the arguments -- also matches ``emitter.on``, ``arr.reduce`` and every
+other higher-order call with a string first argument. Tests earn the rule because the
+call name itself carries the intent; routes need a fixture to measure against before a
+heuristic is defensible.
+"""
+
+_MAX_TITLE_SLUG = 60
+"""Characters of a slugified title that reach the uid.
+
+A uid segment is read by humans in search output and in ``get_context``. Long enough to
+stay distinguishable, short enough that a uid does not become a paragraph.
+"""
+
+
+def _naming_call_title(node: Node) -> str | None:
+    """The title a naming call gives its callback, or None if this is not one.
+
+    Requires both halves of the shape: a recognised call name, a string literal first
+    argument, AND an inline function among the arguments. A ``test`` that receives an
+    already-named handler needs no entity minted for it -- the handler has one.
+    """
+    if node.type != "call_expression":
+        return None
+    function = node.child_by_field_name("function")
+    arguments = node.child_by_field_name("arguments")
+    if function is None or arguments is None:
+        return None
+
+    # `test`, and also `test.serial` / `it.each` / `t.test`: either end of a member
+    # chain may carry the name.
+    names = {node_text(n) for n in function.children if n.type in ("identifier", "property_identifier")}
+    if function.type == "identifier":
+        names.add(node_text(function))
+    if not (names & _NAMING_CALLS):
+        return None
+
+    args = list(arguments.named_children)
+    if not args or args[0].type not in ("string", "template_string"):
+        return None
+    if not any(a.type in ("arrow_function", "function_expression", "function") for a in args):
+        return None
+
+    title = node_text(args[0])
+    for quote in ("'", '"', "`"):
+        if title.startswith(quote) and title.endswith(quote) and len(title) >= 2:
+            title = title[1:-1]
+            break
+    return title.strip() or None
+
+
+def _title_slug(title: str) -> str:
+    """A uid segment from a human title: lowercase, alphanumeric, underscore-joined."""
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", title).strip("_").lower()
+    return slug[:_MAX_TITLE_SLUG] or "unnamed"
+
+
+def _collect_title_named(
+    node: Node,
+    owner_qn: str,
+    found: list[tuple[str, str, Node]],
+) -> None:
+    """Gather ``(qualified_name, title, call node)`` for every title-named callback.
+
+    Recurses through the callback with the new owner, so a ``it`` inside a ``describe``
+    is named under it: ``module.outer_suite.inner_case``.
+    """
+    title = _naming_call_title(node)
+    child_owner = owner_qn
+    if title is not None:
+        child_owner = f"{owner_qn}.{_title_slug(title)}"
+        found.append((child_owner, title, node))
+    for child in node.children:
+        _collect_title_named(child, child_owner, found)
+
+
+def _extract_title_named_callbacks(
+    root: Node,
+    path: str,
+    project_name: str,
+    module_qn: str,
+    entities: list[ParsedEntity],
+    relationships: list[ParsedRelationship],
+) -> None:
+    """Emit an entity per ``test('title', () => {...})``.
+
+    ADR-0031 declines a callback in argument position because nothing can refer to it.
+    A test's title is exactly what refers to it: it is how the test is run
+    (``ava --match``, ``pytest -k``), how CI reports it, and how a human asks about it.
+    So the rule's own test -- "a name that a developer could use to refer to it" -- is
+    met; the walker simply did not know the name lived in an argument.
+
+    Measured before this: ``tests/fixtures/langcov/typescript/stream.ts`` is 907 lines
+    of ``test(...)`` and produced ONE entity, the Module, whose whole embed text was the
+    48-character string ``Module: stream``.
+
+    ``kind`` is outside ``CallableKind`` on purpose. ``find_dead_code`` restricts itself
+    to ``_CODE_ENTITY_KINDS``, built from the enums, so a test is excluded from it
+    without a special case -- which matters, because nothing in the codebase calls a
+    test by name and every one of these would otherwise be reported dead.
+    """
+    found: list[tuple[str, str, Node]] = []
+    _collect_title_named(root, module_qn, found)
+    if not found:
+        return
+
+    # A uid must identify exactly one definition (ADR-0032). Two sibling calls sharing a
+    # title -- or two titles slugging the same -- claim one uid, so both decline rather
+    # than one silently overwriting the other. Their calls still attribute upward.
+    counts = Counter(qn for qn, _title, _node in found)
+
+    for qualified_name, title, node in found:
+        if counts[qualified_name] > 1:
+            continue
+        owner_qn = qualified_name.rsplit(".", 1)[0]
+        entities.append(
+            ParsedEntity(
+                name=title,
+                qualified_name=f"{project_name}:{qualified_name}",
+                label=NodeLabel.CALLABLE,
+                kind=_KIND_TEST_CASE,
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                file_path=path,
+                signature=title,
+                source=node_text(node),
+            )
+        )
+        relationships.append(
+            ParsedRelationship(
+                from_qualified_name=f"{project_name}:{owner_qn}",
+                rel_type=RelType.DEFINES,
+                to_name=f"{project_name}:{qualified_name}",
+            )
+        )
+
+
 def _parse_typescript(
     path: str,
     source: bytes,
@@ -1550,6 +1705,10 @@ def _parse_typescript(
     # encloses — import-time work, test-file setup, an IIFE's insides — which on
     # a real codebase is 9% of all call sites (ADR-0031).
     _walk_scope(root, path, source, project_name, module_qn, entities, relationships, seen)
+
+    # After the walk: these are callbacks the walk deliberately declined, and naming them
+    # needs the finished entity list to be settled first.
+    _extract_title_named_callbacks(root, path, project_name, module_qn, entities, relationships)
 
     return ParsedFile(
         file_path=path,
