@@ -1260,13 +1260,13 @@ class TestCallAttribution:
         parsed = _parse("struct S {\n  int n = build();\n};\n", path="src/s.cpp")
         assert [r.to_name for r in _rels_from(parsed, "src.s", RelType.CALLS)] == ["build"]
 
-    def test_calls_stranded_by_a_macro_misparse_still_reach_the_module(self):
-        """The shape ADR-0031's module fallback exists for.
+    def test_a_macro_hidden_scope_is_recovered_and_owns_its_calls(self):
+        """Superseded ATL-096's module-fallback expectation for this shape.
 
-        ``FMT_BEGIN_NAMESPACE`` is not expandable, so tree-sitter mis-parses the
-        specialisation that follows and leaves its body as a bare block at file
-        scope. The enclosing scope is unrecoverable — no entity can honestly be
-        emitted for ``format`` — but the call inside it is still real.
+        ``FMT_BEGIN_NAMESPACE`` is not expandable, so tree-sitter used to mis-parse the
+        specialisation that follows and leave its body as a bare block at file scope --
+        and the honest answer then was to attribute the call to the module. ATL-143's
+        shim recovers the scope, so the honest answer is now the method itself.
         """
         parsed = _parse(
             "FMT_BEGIN_NAMESPACE\n"
@@ -1276,7 +1276,14 @@ class TestCallAttribution:
             "FMT_END_NAMESPACE\n",
             path="src/dbg.cpp",
         )
-        assert [r.to_name for r in _rels_from(parsed, "src.dbg", RelType.CALLS)] == ["copy"]
+        assert [r.to_name for r in _rels_from(parsed, "src.dbg.formatter<my_type>.format", RelType.CALLS)] == ["copy"]
+        assert _rels_from(parsed, "src.dbg", RelType.CALLS) == []
+
+    def test_a_call_with_no_enclosing_callable_still_reaches_the_module(self):
+        """The module fallback is not gone, only less often needed for macro debris.
+        A file-scope initialiser has no enclosing callable at all, macros or not."""
+        parsed = _parse("int x = compute();\n", path="src/low.cpp")
+        assert [r.to_name for r in _rels_from(parsed, "src.low", RelType.CALLS)] == ["compute"]
 
     def test_a_call_is_emitted_exactly_once(self):
         """The structural walk and the call walk must not both claim a subtree."""
@@ -1780,3 +1787,71 @@ auto test_value() -> T { return T(); }
         reads = [e for e in parsed.entities if e.qualified_name.rsplit(".", 1)[-1].startswith("read(")]
         assert len(reads) == 2
         assert {e.name for e in reads} == {"read"}
+
+
+class TestMacroShim:
+    """ATL-143. tree-sitter has no preprocessor, so a bare macro standing where a
+    keyword belongs collapses a file into one ERROR node."""
+
+    def test_a_macro_hidden_namespace_yields_its_contents(self):
+        parsed = _parse(
+            "FMT_BEGIN_NAMESPACE\n"
+            "struct color_type {\n"
+            "  auto value() const -> int { return v_; }\n"
+            "};\n"
+            "FMT_END_NAMESPACE\n",
+            path="src/c.cpp",
+        )
+        names = {e.name for e in parsed.entities}
+        assert {"color_type", "value"} <= names
+
+    def test_a_clean_file_is_not_shimmed(self):
+        """A file the grammar handles must be byte-identical to before: the shim is a
+        recovery path, not a preprocessing step."""
+        source = "namespace ns {\nstruct S {\n  int m() { return f(); }\n};\n}\n"
+        parsed = _parse(source, path="src/clean.cpp")
+        assert {e.qualified_name for e in parsed.entities} == {
+            "test_project:src.clean",
+            "test_project:src.clean.ns.S",
+            "test_project:src.clean.ns.S.m",
+        }
+
+    def test_a_macro_inside_a_comment_is_left_alone(self):
+        """Blanking prose to help the parser trades a parse problem for a retrieval one."""
+        parsed = _parse(
+            "FMT_BEGIN_NAMESPACE\n"
+            "/// Uses FMT_API for export.\n"
+            "struct S { int m() { return 1; } };\n"
+            "FMT_END_NAMESPACE\n",
+            path="src/doc.cpp",
+        )
+        docs = " ".join(e.docstring or "" for e in parsed.entities)
+        assert "FMT_API" in docs
+
+    def test_a_string_literal_is_left_alone(self):
+        parsed = _parse(
+            'FMT_BEGIN_NAMESPACE\nstruct S { const char* m() { return "ERROR_CODE"; } };\nFMT_END_NAMESPACE\n',
+            path="src/str.cpp",
+        )
+        sources = " ".join(e.source or "" for e in parsed.entities)
+        assert "ERROR_CODE" in sources
+
+    def test_recovered_source_is_the_original_not_the_blanked_text(self):
+        """The shimmed tree is used for STRUCTURE only. An agent reading a recovered
+        entity's source must not see gaps where the code says FMT_CONSTEXPR."""
+        parsed = _parse(
+            "FMT_BEGIN_NAMESPACE\nstruct S {\n  FMT_CONSTEXPR int m() { return 1; }\n};\nFMT_END_NAMESPACE\n",
+            path="src/src.cpp",
+        )
+        method = next(e for e in parsed.entities if e.name == "m")
+        assert "FMT_CONSTEXPR" in (method.source or "")
+
+    def test_line_numbers_survive_the_shim(self):
+        """Length-preserving is the whole trick: an entity found in the shimmed tree has
+        to point at the real file."""
+        parsed = _parse(
+            "FMT_BEGIN_NAMESPACE\n\nstruct S {\n  int m() { return 1; }\n};\nFMT_END_NAMESPACE\n",
+            path="src/lines.cpp",
+        )
+        struct = next(e for e in parsed.entities if e.name == "S")
+        assert struct.line_start == 3

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
+from dataclasses import replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -36,7 +37,7 @@ _CPP_AVAILABLE = False
 
 try:
     import tree_sitter_c as ts_c
-    from tree_sitter import Language, Query
+    from tree_sitter import Language, Parser, Query
 
     _C_LANGUAGE = Language(ts_c.language())
     _C_QUERY = Query(_C_LANGUAGE, "(translation_unit) @root")
@@ -46,7 +47,7 @@ except ImportError:
 
 try:
     import tree_sitter_cpp as ts_cpp
-    from tree_sitter import Language, Query
+    from tree_sitter import Language, Parser, Query
 
     _CPP_LANGUAGE = Language(ts_cpp.language())
     _CPP_QUERY = Query(_CPP_LANGUAGE, "(translation_unit) @root")
@@ -494,17 +495,18 @@ def _method_callable_kind(name: str, class_name: str, tags: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _parse_cpp(
+def _extract_cpp(
     path: str,
     source: bytes,
     root: Node,
     project_name: str,
+    is_cpp: bool,
 ) -> ParsedFile:
-    """Extract entities and relationships from a C or C++ parse tree."""
-    # Sniffed here as well as in the router, so the walker's C++ branches and
-    # the recorded language agree however this handler was reached. The sniff
-    # short-circuits on a pure C header, so the repeat is nearly free.
-    is_cpp = _is_cpp_file(path, source)
+    """Extract entities and relationships from one C or C++ parse tree.
+
+    Split out of :func:`_parse_cpp` so the shim can run it against a second tree and the
+    two results be compared. Takes *is_cpp* rather than sniffing, so both runs agree.
+    """
     module_qn = _module_qualified_name(path)
     lang = "cpp" if is_cpp else "c"
 
@@ -545,6 +547,221 @@ def _parse_cpp(
         entities=entities,
         relationships=relationships,
     )
+
+
+# ---------------------------------------------------------------------------
+# Preprocessor shim (ATL-143)
+# ---------------------------------------------------------------------------
+
+_MACRO_TOKEN = re.compile(rb"\b[A-Z][A-Z0-9_]{3,}\b")
+"""An ALL-CAPS identifier of at least four characters.
+
+Four, not two: `IN`, `OUT` and `MAX` are ordinary identifiers in real code, and the
+shim's job is the declaration decorators and namespace openers that macro-heavy headers
+put where the grammar expects a keyword.
+"""
+
+_PROTECTED_NODES = frozenset({"comment", "string_literal", "raw_string_literal", "char_literal", "system_lib_string"})
+"""Never blanked. A doxygen comment naming FMT_API is documentation, and a string
+literal reading "ERROR" is data -- both reach the index as text, and mangling them to
+help the parser would trade a parse problem for a retrieval one."""
+
+
+def _protected_ranges(root: Node) -> list[tuple[int, int]]:
+    """Byte ranges of comments and literals, from the ORIGINAL parse.
+
+    Taken from the failed parse on purpose: tree-sitter still tokenises comments and
+    strings inside an ERROR region, so even a file the grammar could not assemble tells
+    us where its prose is.
+    """
+    ranges: list[tuple[int, int]] = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in _PROTECTED_NODES:
+            ranges.append((node.start_byte, node.end_byte))
+            continue
+        stack.extend(node.children)
+    return sorted(ranges)
+
+
+def _shim_macros(source: bytes, root: Node) -> bytes:
+    """Blank macro-shaped tokens, preserving every byte offset and newline.
+
+    Length-preserving is the whole trick, and the same one ``apex.py`` uses on the Java
+    grammar and ``sql.py`` on Jinja: byte offsets, and therefore line numbers, stay true,
+    so an entity found in the shimmed tree points at the real file.
+
+    A token followed by ``(`` is left alone. ``FMT_ASSERT(x)`` is an expression the
+    grammar parses fine; a bare ``FMT_BEGIN_NAMESPACE`` is a namespace opener standing
+    where a keyword belongs, and that is what collapses a file into one ERROR node.
+    """
+    protected = _protected_ranges(root)
+    out = bytearray(source)
+    for match in _MACRO_TOKEN.finditer(source):
+        start, end = match.span()
+        if source[end : end + 1] == b"(":
+            continue
+        if any(lo <= start < hi for lo, hi in protected):
+            continue
+        for i in range(start, end):
+            out[i] = ord(" ")
+    return bytes(out)
+
+
+def _error_line_count(root: Node) -> int:
+    """Lines the grammar could not assemble. The shim's acceptance test measures this."""
+    lines: set[int] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR" or node.is_missing:
+            lines.update(range(node.start_point[0], node.end_point[0] + 1))
+        stack.extend(node.children)
+    return len(lines)
+
+
+def _reslice_sources(entities: list[ParsedEntity], source: bytes) -> None:
+    """Replace each entity's ``source`` with the original text for its lines.
+
+    The shimmed tree is used for STRUCTURE only. Its text has macro names blanked, and
+    an agent reading that source would see gaps where the code says FMT_API. Because the
+    shim preserves length, an entity's line span means the same thing in both, so the
+    real text is one slice away.
+
+    ``signature`` is not re-sliced -- it is assembled from several nodes rather than one
+    span -- so a recovered entity's signature can still be missing a macro token. Small,
+    and only on files that produced nothing at all before.
+    """
+    lines = source.decode("utf-8", errors="replace").splitlines()
+    for index, entity in enumerate(entities):
+        if not entity.source:
+            continue
+        start = max(entity.line_start - 1, 0)
+        end = min(entity.line_end, len(lines))
+        if start < end:
+            entities[index] = replace(entity, source="\n".join(lines[start:end]))
+
+
+def _shimmed_parse(path: str, source: bytes, root: Node, project_name: str, is_cpp: bool) -> ParsedFile | None:
+    """Re-parse with macros blanked, and return it only if it is strictly better.
+
+    THE GUARD IS THE DESIGN, not an optimisation on it. Measured on fmtlib, shimming
+    unconditionally is a large net win that nonetheless DESTROYS entities in particular
+    files -- test/base-test.cc falls from 140 entities to 49, and include/fmt/os.h goes
+    from 25 ERROR lines to 98. Blanking cannot invent tokens, but it changes parse
+    structure, and the effect on entities is not one-directional.
+
+    Parsing twice and keeping the shimmed result only when it has strictly fewer ERROR
+    lines AND no fewer entities makes the heuristic's quality a performance question
+    rather than a correctness one. On the 16-file fixture it is better than the
+    unconditional shim on both axes -- 300 ERROR lines against 446, 772 entities against
+    677 -- because it never accepts a regression, and it leaves 10 of those 16 files
+    untouched.
+    """
+    # Flags, not a None check: the Language names only exist when their grammar wheel
+    # is installed, so referencing one unguarded is a NameError, not a None.
+    if is_cpp and not _CPP_AVAILABLE:
+        return None
+    if not is_cpp and not _C_AVAILABLE:
+        return None
+    language = _CPP_LANGUAGE if is_cpp else _C_LANGUAGE
+    shimmed_source = _shim_macros(source, root)
+    if shimmed_source == source:
+        return None
+
+    shimmed_root = Parser(language).parse(shimmed_source).root_node
+    if _error_line_count(shimmed_root) >= _error_line_count(root):
+        return None
+
+    candidate = _drop_colliding(_extract_cpp(path, shimmed_source, shimmed_root, project_name, is_cpp))
+    _reslice_sources(candidate.entities, source)
+    return candidate
+
+
+def _calls_in(parsed: ParsedFile) -> int:
+    return sum(1 for r in parsed.relationships if r.rel_type is RelType.CALLS)
+
+
+def _uid_collisions(parsed: ParsedFile) -> int:
+    """Entities claiming a qualified_name another already claimed."""
+    counts = Counter(e.qualified_name for e in parsed.entities)
+    return sum(n - 1 for n in counts.values() if n > 1)
+
+
+def _drop_colliding(parsed: ParsedFile) -> ParsedFile:
+    """Remove every entity whose qualified_name identifies more than one definition.
+
+    Recovering a scope can also recover an AMBIGUITY: a macro-hidden overload set
+    arrives as several definitions of one name, and two nodes merging into one is a
+    confident wrong answer, worse than the silence of a missing entity (ADR-0032).
+
+    Dropping the colliding few rather than the whole recovery is what makes that rule
+    affordable here. On ``color.h`` the choice is between 3 ambiguous entities and 236
+    good ones, or nothing at all -- and ADR-0032's own remedy for an unqualifiable
+    definition is to emit no entity for it, not to abandon its neighbours.
+
+    Relationships *from* a dropped entity go with it. Edges *to* one are left: they are
+    resolved by name post-batch and simply find nothing, which is the same outcome as
+    never having been written.
+    """
+    counts = Counter(e.qualified_name for e in parsed.entities)
+    colliding = {qn for qn, n in counts.items() if n > 1}
+    if not colliding:
+        return parsed
+    return ParsedFile(
+        file_path=parsed.file_path,
+        language=parsed.language,
+        entities=[e for e in parsed.entities if e.qualified_name not in colliding],
+        relationships=[r for r in parsed.relationships if r.from_qualified_name not in colliding],
+    )
+
+
+def _parse_cpp(
+    path: str,
+    source: bytes,
+    root: Node,
+    project_name: str,
+) -> ParsedFile:
+    """Extract entities and relationships from a C or C++ file.
+
+    Parses once. If the grammar hit no ERROR the result stands unchanged -- a clean file
+    never pays for the shim, and never risks it. Otherwise the preprocessor is very
+    likely the reason (tree-sitter has none), and :func:`_shimmed_parse` gets a second
+    opinion.
+    """
+    # Sniffed here as well as in the router, so the walker's C++ branches and
+    # the recorded language agree however this handler was reached. The sniff
+    # short-circuits on a pure C header, so the repeat is nearly free.
+    is_cpp = _is_cpp_file(path, source)
+    parsed = _extract_cpp(path, source, root, project_name, is_cpp)
+    if not root.has_error:
+        return parsed
+
+    recovered = _shimmed_parse(path, source, root, project_name, is_cpp)
+    # A net gain in graph facts, not a gain on every axis independently.
+    #
+    # Entities alone is too weak: blanking a token can cost a call edge the grammar had
+    # managed, and entities-only acceptance measured calls 0.924 -> 0.905 on fmtlib.
+    # But "no fewer calls" is far too strong -- it rejects color.h, where 5 lost call
+    # edges buy 235 entities including every type and method in the file. Requiring an
+    # improvement on all four axes at once left retrievability at 0.610, below where it
+    # started.
+    #
+    # An entity and a call edge are both one fact, so compare them as such: accept when
+    # more facts arrive than leave. Collisions are handled by dropping the colliding
+    # entities (see _drop_colliding), not by refusing the file.
+    if recovered is not None and (
+        len(recovered.entities) - len(parsed.entities) > _calls_in(parsed) - _calls_in(recovered)
+    ):
+        _log.debug(
+            "cpp: macro shim recovered %d -> %d entities in %s",
+            len(parsed.entities),
+            len(recovered.entities),
+            path,
+        )
+        return recovered
+    return parsed
 
 
 def _build_qn(module_qn: str, namespace_parts: list[str], class_stack: list[str], name: str) -> str:
