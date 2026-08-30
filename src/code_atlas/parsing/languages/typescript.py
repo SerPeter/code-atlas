@@ -13,6 +13,7 @@ from code_atlas.parsing.ast import (
     ParsedFile,
     ParsedRelationship,
     call_receiver_props,
+    elide_nested_entity_spans,
     node_text,
     register_language,
 )
@@ -1561,11 +1562,21 @@ def _naming_call_title(node: Node) -> str | None:
     if function is None or arguments is None:
         return None
 
-    # `test`, and also `test.serial` / `it.each` / `t.test`: either end of a member
-    # chain may carry the name.
-    names = {node_text(n) for n in function.children if n.type in ("identifier", "property_identifier")}
-    if function.type == "identifier":
-        names.add(node_text(function))
+    # `test`, and also `test.serial` / `it.only` / `t.test`: either end of a member chain
+    # may carry the name.
+    #
+    # And `test.each(table)('adds %i', fn)`, where the callee is ITSELF a call -- jest's
+    # dominant parameterised form. Its `function` field is a call_expression with no
+    # identifier among its own children, so a first version missed every one of them and
+    # the TypeScript measurement (taken on ava-style ky, which has none) did not show it.
+    callee = function
+    if callee.type == "call_expression":
+        inner = callee.child_by_field_name("function")
+        if inner is not None:
+            callee = inner
+    names = {node_text(n) for n in callee.children if n.type in ("identifier", "property_identifier")}
+    if callee.type == "identifier":
+        names.add(node_text(callee))
     if not (names & _NAMING_CALLS):
         return None
 
@@ -1667,6 +1678,16 @@ def _extract_title_named_callbacks(
                 to_name=f"{project_name}:{qualified_name}",
             )
         )
+
+    # A suite's source is the whole call, nested cases included -- and each of those is
+    # its own entity with the same text. Left alone, `describe` with ten `it`s indexes
+    # every case twice, and nesting multiplies it. This is the duplication Python's
+    # _deduplicate_sources removes, reintroduced here the moment suites became entities;
+    # the shared helper is why there is one implementation of the index arithmetic.
+    elide_nested_entity_spans(
+        entities,
+        lambda child: f"// ... {child.name} -> {child.qualified_name.split(':', 1)[-1]}",
+    )
 
 
 def _parse_typescript(

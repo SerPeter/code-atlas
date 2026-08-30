@@ -1765,3 +1765,27 @@ def test_the_body_travels_with_the_entity():
     parsed = _parse("test('checks the widget cache', async t => { await widgetCache.warm(); });\n")
     entity = next(e for e in parsed.entities if e.kind == "test_case")
     assert "widgetCache.warm" in (entity.source or "")
+
+
+def test_each_forms_are_recognised():
+    """jest's dominant parameterised form. The callee is ITSELF a call_expression, with
+    no identifier among its own children, so a first version missed every one -- and the
+    TypeScript measurement was taken on ava-style ky, which has none."""
+    parsed = _parse(
+        "test.each([[1],[2]])('adds %i', (n) => { go(n); });\ndescribe.each(cases)('suite %s', (c) => { go(c); });\n"
+    )
+    assert set(_test_cases(parsed)) == {"adds %i", "suite %s"}
+
+
+def test_a_suite_does_not_carry_its_cases_text():
+    """A suite's source is the whole call, nested cases included -- and each case is its
+    own entity with the same text. This is the duplication Python's de-duplication
+    removes, reintroduced the moment suites became entities."""
+    parsed = _parse(
+        "describe('outer suite', () => {\n  it('inner one', async t => { await widgetCache.warm(); });\n});\n"
+    )
+    outer = next(e for e in parsed.entities if e.name == "outer suite")
+    inner = next(e for e in parsed.entities if e.name == "inner one")
+    assert "widgetCache.warm" in (inner.source or "")
+    assert "widgetCache.warm" not in (outer.source or "")
+    assert "inner one" in (outer.source or "")

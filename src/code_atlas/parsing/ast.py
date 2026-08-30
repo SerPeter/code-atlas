@@ -809,6 +809,73 @@ def _parse_hazard(source: bytes, max_parse_bytes: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def elide_nested_entity_spans(entities: list[ParsedEntity], reference: Callable[[ParsedEntity], str]) -> None:
+    """Replace, in each entity's ``source``, the span of any entity nested inside it.
+
+    A nested definition is its own node with its own indexed text; carrying it whole in
+    its parent's source indexes the same bytes twice. *reference* renders the line that
+    stands in for it, so the structure an agent reads survives the removal.
+
+    ONE implementation on purpose. The index arithmetic here is subtle enough to have
+    shipped broken once: replacements are applied highest-line-first so an earlier one
+    cannot shift a later index, and that argument holds **only for spans that do not
+    overlap**. Eliding a grandchild as well as its parent breaks it -- the grandchild
+    goes first, the line list shrinks, and the parent's now-stale slice eats the code
+    below the nested definition. Hence ``_outermost``: a grandchild's text leaves anyway
+    when its own parent's span is replaced.
+    """
+    position = {id(e): i for i, e in enumerate(entities)}
+    for entity in list(entities):
+        if not entity.source:
+            continue
+        lines = entity.source.splitlines()
+        if not lines:
+            continue
+        spans = []
+        for child in _outermost(_nested_within(entity, entities)):
+            start = child.line_start - entity.line_start
+            end = child.line_end - entity.line_start
+            if 0 <= start <= end < len(lines):
+                indent = " " * (len(lines[start]) - len(lines[start].lstrip()))
+                spans.append((start, end, indent + reference(child)))
+        if not spans:
+            continue
+        for start, end, replacement in sorted(spans, reverse=True):
+            lines[start : end + 1] = [replacement]
+        entities[position[id(entity)]] = replace(entity, source="\n".join(lines))
+
+
+def _nested_within(entity: ParsedEntity, entities: list[ParsedEntity]) -> list[ParsedEntity]:
+    """Entities inside *entity* that carry indexed text of their own.
+
+    Containment is by qualified_name AND line range: the name alone would catch a
+    sibling sharing a prefix, and the range alone would catch an unrelated entity in a
+    file where two spans overlap.
+    """
+    prefix = entity.qualified_name + "."
+    return [
+        child
+        for child in entities
+        if child is not entity
+        and child.qualified_name.startswith(prefix)
+        and entity.line_start <= child.line_start
+        and child.line_end <= entity.line_end
+        and (child.docstring or child.source)
+    ]
+
+
+def _outermost(spans: list[ParsedEntity]) -> list[ParsedEntity]:
+    """Drop any span contained in another. See elide_nested_entity_spans for why."""
+    return [
+        span
+        for span in spans
+        if not any(
+            other is not span and other.line_start <= span.line_start and span.line_end <= other.line_end
+            for other in spans
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Oversized doc-section splitting
 # ---------------------------------------------------------------------------

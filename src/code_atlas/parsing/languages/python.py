@@ -15,6 +15,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    elide_nested_entity_spans,
     looks_like_resource_path,
     node_text,
     register_language,
@@ -697,87 +698,40 @@ def _leading_docstring_span(lines: list[str], docstring: str) -> tuple[int, int]
     return None
 
 
-def _child_spans(entity: ParsedEntity, entities: list[ParsedEntity]) -> list[ParsedEntity]:
-    """Entities nested inside *entity* that carry their own indexed text.
-
-    Containment is by qualified_name AND line range: the name alone would catch a
-    sibling sharing a prefix, and the range alone would catch an unrelated entity in a
-    file where two spans overlap.
-    """
-    prefix = entity.qualified_name + "."
-    nested = [
-        child
-        for child in entities
-        if child is not entity
-        and child.qualified_name.startswith(prefix)
-        and entity.line_start <= child.line_start
-        and child.line_end <= entity.line_end
-        and (child.docstring or child.source)
-    ]
-    # Outermost only. `startswith` matches a grandchild too, and eliding one is both
-    # unnecessary -- its text goes when its own parent's span is replaced -- and WRONG:
-    # replacements are applied highest-line-first so that an earlier one cannot shift a
-    # later index, and that argument holds only for spans that do not overlap. A
-    # grandchild replaced first shrinks the line list, and the child's now-stale slice
-    # eats the parent's own code below the nested definition. Shipped and caught in
-    # review: `tail_one = 10` vanished from a three-level fixture, and 10 functions in
-    # this repo's own src/ were silently losing their tails.
-    return [
-        child
-        for child in nested
-        if not any(
-            other is not child and other.line_start <= child.line_start and child.line_end <= other.line_end
-            for other in nested
-        )
-    ]
-
-
 def _deduplicate_sources(entities: list[ParsedEntity]) -> None:
     """Remove from each entity's ``source`` what another node already carries.
 
     Two overlaps, together 30% of Python's indexed bytes when measured:
 
     * a docstring sits INSIDE the function it documents, so it reached the index once as
-      ``docstring`` and again within ``source``; and
+      the ``docstring`` field and again within ``source``; and
     * a nested definition -- an inner function, or a long string literal lifted out as a
       ``text_block`` Value -- is its own entity with its own text, and was also carried
       whole inside its parent's.
 
-    Each is replaced by one reference line naming the node that does hold the text, so
-    the structure an agent reads stays intact while the bytes are indexed once. It also
-    makes ``index.max_source_chars`` go further: the 2000 characters a large function
-    keeps are now 2000 characters of its own code.
+    The nested half is :func:`elide_nested_entity_spans`, shared with TypeScript. The
+    docstring half is Python's alone: it is the only language here that puts its
+    documentation inside the body rather than in a comment above the declaration, which
+    is also why Python was the only language measuring above 1.0 retrievability.
+
+    The docstring pass runs second and re-reads the source, so it sees the line numbers
+    the first pass left rather than the ones it was given.
     """
-    position = {id(e): i for i, e in enumerate(entities)}
-    for entity in list(entities):
-        if not entity.source:
+    elide_nested_entity_spans(
+        entities, lambda child: _ELISION.format(name=child.name, qn=child.qualified_name.split(":", 1)[-1])
+    )
+
+    for index, entity in enumerate(entities):
+        if not entity.source or not entity.docstring:
             continue
         lines = entity.source.splitlines()
-        if not lines:
+        found = _leading_docstring_span(lines, entity.docstring)
+        if found is None:
             continue
-
-        spans: list[tuple[int, int, str]] = []
-        for child in _child_spans(entity, entities):
-            start = child.line_start - entity.line_start
-            end = child.line_end - entity.line_start
-            if 0 <= start <= end < len(lines):
-                indent = " " * (len(lines[start]) - len(lines[start].lstrip()))
-                qn = child.qualified_name.split(":", 1)[-1]
-                spans.append((start, end, indent + _ELISION.format(name=child.name, qn=qn)))
-
-        if entity.docstring:
-            found = _leading_docstring_span(lines, entity.docstring)
-            if found is not None:
-                start, end = found
-                indent = " " * (len(lines[start]) - len(lines[start].lstrip()))
-                spans.append((start, end, indent + _DOC_QUOTES[0] + "..." + _DOC_QUOTES[0]))
-
-        if not spans:
-            continue
-        # Highest line first: an earlier replacement would otherwise shift a later index.
-        for start, end, replacement in sorted(spans, reverse=True):
-            lines[start : end + 1] = [replacement]
-        entities[position[id(entity)]] = replace(entity, source=chr(10).join(lines))
+        start, end = found
+        indent = " " * (len(lines[start]) - len(lines[start].lstrip()))
+        lines[start : end + 1] = [indent + _DOC_QUOTES[0] + "..." + _DOC_QUOTES[0]]
+        entities[index] = replace(entity, source=chr(10).join(lines))
 
 
 def _parse_python(
