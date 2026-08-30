@@ -167,16 +167,28 @@ class FileWatcher:
         self._reset_debounce()
 
     async def _accept_uncovered_path(self, change: Change, abs_path: str, rel_path: str) -> int:
-        """Expand a directory rename/delete that the include spec rejected outright.
+        """Expand a directory that appeared or went away and the include spec rejected.
+
+        Only ``added`` and ``deleted`` expand. A directory also reports ``modified``
+        every time an entry is created or removed inside it, and expanding THAT walks
+        the whole subtree and re-publishes every file under it as modified. On the repo
+        root that is the entire project, on a loop, for as long as anything keeps
+        touching a top-level path: measured at 4,412 events every 60-110s and
+        20,331,409 in total, which outran the AST stage five to one and pushed the
+        stream past its MAXLEN so unprocessed events were trimmed away.
+
+        Nothing is lost by skipping it. inotify already reports the individual files
+        that changed inside a directory; the expansion exists only for the case where
+        the directory itself is the whole event, so the files under it never get one.
 
         Returns the number of individual file changes queued.
         """
         if change == Change.deleted:
             affected = self._expand_directory_delete(rel_path)
             change_type = "deleted"
-        elif Path(abs_path).is_dir():
+        elif change == Change.added and Path(abs_path).is_dir():
             affected = await self._expand_directory_add(Path(abs_path))
-            change_type = _CHANGE_TYPE_MAP.get(change, "created")
+            change_type = "created"
         else:
             logger.trace("SKIP {}: excluded by scope", rel_path)
             return 0

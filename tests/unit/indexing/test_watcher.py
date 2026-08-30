@@ -453,6 +453,27 @@ class TestDirectoryRenameExpansion:
         await watcher._on_change({(Change.deleted, str(tmp_path / "empty_dir"))})
         assert watcher._pending == {}
 
+    async def test_directory_modified_does_not_expand_to_contained_files(self, tmp_path: Path) -> None:
+        """A directory reports `modified` whenever an entry is created or removed inside
+        it. Expanding that walks the whole subtree and republishes every file under it,
+        which on the repo root is the entire project — the runaway that produced
+        20,331,409 events, outran the AST stage 5:1 and trimmed unprocessed work off the
+        capped stream. inotify already reports the files that actually changed.
+        """
+        bus = RecordingBus()
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "mod_a.py").write_text("a = 1\n")
+        (pkg / "mod_b.py").write_text("b = 1\n")
+
+        settings = WatcherSettings(debounce_s=0.05, max_wait_s=5.0)
+        watcher = FileWatcher(tmp_path, bus, ExtensionStubScope(), settings)  # ty: ignore[invalid-argument-type]
+
+        await watcher._on_change({(Change.modified, str(pkg))})
+
+        assert watcher._pending == {}
+        assert bus.published == []
+
     async def test_directory_add_expands_to_contained_files(self, tmp_path: Path) -> None:
         bus = RecordingBus()
         new_dir = tmp_path / "pkg"
