@@ -2686,6 +2686,9 @@ class SqliteGraphClient:
                     "parent_uid": item.parent_uid,
                     "chunk_index": item.chunk_index,
                     "embed_hash": item.embed_hash,
+                    "snippet": item.snippet,
+                    "line_start": item.line_start,
+                    "line_end": item.line_end,
                 }
                 if model:
                     props["embed_model"] = model
@@ -2783,7 +2786,21 @@ class SqliteGraphClient:
                 continue
             parent = parents.get((record.get("node") or {}).get("parent_uid", ""))
             if parent is not None:
-                out.append({**record, "node": parent})
+                chunk = record.get("node") or {}
+                out.append(
+                    {
+                        **record,
+                        "node": parent,
+                        # Mirrors GraphClient._chunk_facts: the parent stands in for the
+                        # chunk, but what the chunk knew travels with it.
+                        "matched_chunk": {
+                            "chunk_index": chunk.get("chunk_index"),
+                            "snippet": chunk.get("snippet") or "",
+                            "line_start": chunk.get("line_start"),
+                            "line_end": chunk.get("line_end"),
+                        },
+                    }
+                )
         return out
 
     async def get_vector_index_info(self) -> list[dict[str, Any]]:

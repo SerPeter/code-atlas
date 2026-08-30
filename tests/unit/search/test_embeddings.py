@@ -13,7 +13,12 @@ from loguru import logger
 
 from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, SplitResult, repair_fences, split_embed_text
 from code_atlas.events import EmbedDirty, EntityRef
-from code_atlas.indexing.consumers import EmbedConsumer, _partition_written_vectors, _plan_embed_chunks
+from code_atlas.indexing.consumers import (
+    SNIPPET_CHARS,
+    EmbedConsumer,
+    _partition_written_vectors,
+    _plan_embed_chunks,
+)
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
 from code_atlas.settings import EmbeddingSettings
 
@@ -839,3 +844,52 @@ class TestFenceRepair:
     def test_a_fence_wholly_inside_one_part_is_untouched(self):
         parts = [TICK + "py\nx = 1\n" + TICK]
         assert repair_fences(parts) == parts
+
+
+class TestChunkFacts:
+    """A chunk keeps a vector and a hash, never its text -- so what a hit can say about
+    itself has to be derived and stored when the chunk is planned."""
+
+    @staticmethod
+    def _plan(text: str, props: dict, chunks: list[str]):
+        return _plan_embed_chunks(
+            [("p:mod.fn", text, "FULL")],
+            {"p:mod.fn": "Callable"},
+            lambda _t: SplitResult(chunks, False, 0),
+            {"p:mod.fn": props},
+        )
+
+    def test_a_chunk_carries_a_snippet(self):
+        plan = self._plan("aaaa\nbbbb", {}, ["aaaa", "bbbb"])
+        assert plan.chunk_facts["p:mod.fn#chunk2"].snippet == "bbbb"
+
+    def test_the_snippet_is_bounded(self):
+        long_tail = "y" * (SNIPPET_CHARS * 3)
+        plan = self._plan("head\n" + long_tail, {}, ["head", long_tail])
+        assert len(plan.chunk_facts["p:mod.fn#chunk2"].snippet) == SNIPPET_CHARS
+
+    def test_a_chunk_inside_the_source_gets_a_line_span(self):
+        source = "line one\nline two\nline three\nline four"
+        text = "Function: fn\n\n" + source
+        plan = self._plan(text, {"source": source, "line_start": 10}, ["Function: fn", source])
+        facts = plan.chunk_facts["p:mod.fn#chunk2"]
+        assert facts.line_start == 10
+        assert facts.line_end == 13
+
+    def test_a_later_chunk_starts_further_down(self):
+        source = "\n".join(f"line {i}" for i in range(20))
+        head, tail = source[:40], source[40:]
+        text = "Function: fn\n\n" + source
+        plan = self._plan(text, {"source": source, "line_start": 100}, ["Function: fn", head, tail])
+        assert plan.chunk_facts["p:mod.fn#chunk2"].line_start == 100
+        assert plan.chunk_facts["p:mod.fn#chunk3"].line_start > 100
+
+    def test_a_chunk_outside_the_source_gets_no_span(self):
+        """A guessed line sends an agent to the wrong place; None sends it to the node."""
+        text = 'Function: fn\n"""a very long docstring"""\n\nbody'
+        plan = self._plan(text, {"source": "body", "line_start": 5}, [text[:20], text[20:34]])
+        assert plan.chunk_facts["p:mod.fn#chunk2"].line_start is None
+
+    def test_no_line_start_on_the_entity_means_no_span(self):
+        plan = self._plan("aaaa\nbbbb", {"source": "aaaa\nbbbb"}, ["aaaa", "bbbb"])
+        assert plan.chunk_facts["p:mod.fn#chunk2"].line_start is None

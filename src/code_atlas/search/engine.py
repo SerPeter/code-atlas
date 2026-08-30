@@ -117,6 +117,16 @@ class SearchResult:
     # The node's frontmatter map, for [search.importance] frontmatter rules. Already in
     # the channel records (every query returns whole nodes), so carrying it costs no
     # extra round trip. Empty for code entities, which have no frontmatter.
+    matched_chunk: dict[str, Any] = field(default_factory=dict)
+    """Which overflow chunk matched, when the hit came from one.
+
+    ``{chunk_index, snippet, line_start, line_end}``, empty when the node itself
+    matched. A chunk is never a result -- it resolves to its parent -- so without this
+    a search that matched part 7 of a long node returns the node and says nothing about
+    why, and the agent pays a fetch and a scan to recover what the index already knew.
+    ``line_start`` is None where it is not derivable; see ``EmbedChunkWrite``.
+    """
+
     frontmatter: dict[str, Any] = field(default_factory=dict)
     tags: tuple[str, ...] = ()
 
@@ -1014,6 +1024,15 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
             for st in requested_types:
                 channel_status.setdefault(st.value, "ok")
 
+        # Best chunk per uid: the vector channel already collapsed to one row per node
+        # at its best-scoring chunk, so the facts on that row are the winning chunk's.
+        chunk_by_uid: dict[str, dict[str, Any]] = {}
+        for record in channel_results.get("vector", []):
+            facts = record.get("matched_chunk")
+            uid = (record.get("node") or {}).get("uid") if hasattr(record.get("node"), "get") else None
+            if facts and uid:
+                chunk_by_uid[uid] = facts
+
         with _tracer.start_as_current_span("rrf_fuse"):
             ranked_lists, props_by_uid = _build_ranked_lists(channel_results)
             fused_scores = rrf_fuse(ranked_lists, k=settings.rrf_k, weights=effective_weights)
@@ -1038,6 +1057,7 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
                 source=props_by_uid.get(uid, {}).get("source", "") or "",
                 superseded_by=props_by_uid.get(uid, {}).get("superseded_by", "") or "",
                 contradicts_with=tuple(props_by_uid.get(uid, {}).get("contradicts_with") or ()),
+                matched_chunk=chunk_by_uid.get(uid, {}),
                 frontmatter=props_by_uid.get(uid, {}).get("frontmatter") or {},
                 tags=tuple(props_by_uid.get(uid, {}).get("tags") or ()),
             )

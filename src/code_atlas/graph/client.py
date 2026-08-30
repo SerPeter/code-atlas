@@ -472,6 +472,24 @@ class EmbedChunkWrite(NamedTuple):
     vector: list[float]
     embed_hash: str
 
+    snippet: str = ""
+    """A bounded prefix of the chunk's text, so a hit can say what it matched.
+
+    Stored because nothing else holds it: a chunk keeps a vector and a hash, never the
+    text they were made from. Without it a search that matched chunk 7 of a long node
+    returns the node and the agent must fetch and scan it to find out why -- paying for
+    information the index had and discarded.
+    """
+
+    line_start: int | None = None
+    """First line of the file this chunk covers, when that is derivable."""
+
+    line_end: int | None = None
+    """Last line, likewise. Both are None when the chunk falls in a node's header or
+    docstring rather than its source, because only the source has a known offset from
+    the entity's own ``line_start``. Null is the honest answer there; a guessed line
+    sends an agent to the wrong place, which is worse than sending it to the node."""
+
 
 class EntityHashData(NamedTuple):
     """Stored entity data used for delta comparison during upsert."""
@@ -616,6 +634,18 @@ def _node_has_label(record: dict[str, Any], label: str) -> bool:
     labels = getattr(node, "labels", None) or ()
     wanted = label.casefold()
     return any(str(name).casefold() == wanted for name in labels)
+
+
+def _chunk_facts(record: dict[str, Any]) -> dict[str, Any]:
+    """What the matching chunk knew, for a result that now names its parent."""
+    node = record.get("node") or record.get("n")
+    get = node.get if hasattr(node, "get") else (lambda _k, _d=None: None)
+    return {
+        "chunk_index": get("chunk_index"),
+        "snippet": get("snippet") or "",
+        "line_start": get("line_start"),
+        "line_end": get("line_end"),
+    }
 
 
 def _chunk_parent_uid(record: dict[str, Any]) -> str | None:
@@ -3980,14 +4010,17 @@ class GraphClient:
 
         Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``source``, ``tags``, ``kind``, ``_label``,
-        ``embed_hash``, ``has_embedding``.
+        ``embed_hash``, ``has_embedding``, ``line_start``.
         """
         ret = (
             "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
             "n.signature AS signature, n.docstring AS docstring, "
             "n.source AS source, n.tags AS tags, "
             f"n.kind AS kind, {primary_label_expr('n')} AS _label, "
-            "n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding"
+            "n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding, "
+            # For the chunk line span (ATL-138): one more projected property on a query
+            # that already runs, rather than a second read.
+            "n.line_start AS line_start"
         )
 
         if labels is None or len(labels) != len(uids):
@@ -4199,7 +4232,8 @@ class GraphClient:
             f"UNWIND $items AS item "
             f"MERGE (c:{NodeLabel.EMBED_CHUNK} {{uid: item.uid}}) "
             "SET c.parent_uid = item.parent_uid, c.project_name = item.project_name, "
-            f"c.chunk_index = item.chunk_index, c.embedding = item.vector, c.embed_hash = item.hash{stamp}",
+            "c.chunk_index = item.chunk_index, c.embedding = item.vector, c.embed_hash = item.hash, "
+            f"c.snippet = item.snippet, c.line_start = item.line_start, c.line_end = item.line_end{stamp}",
             {
                 "items": [
                     {
@@ -4209,6 +4243,9 @@ class GraphClient:
                         "chunk_index": it.chunk_index,
                         "vector": it.vector,
                         "hash": it.embed_hash,
+                        "snippet": it.snippet,
+                        "line_start": it.line_start,
+                        "line_end": it.line_end,
                     }
                     for it in items
                 ],
@@ -4600,7 +4637,10 @@ class GraphClient:
                 continue
             parent = parents.get(_chunk_parent_uid(record) or "")
             if parent is not None:
-                out.append({**record, "node": parent})
+                # The parent replaces the chunk as the result, but the chunk's own facts
+                # travel with it: which part matched, what it said, and where it was.
+                # Dropping them here is what made a Module hit a 200 that is really a 404.
+                out.append({**record, "node": parent, "matched_chunk": _chunk_facts(record)})
         return out
 
     # -- Graph (name-based) search helpers ------------------------------------

@@ -19,7 +19,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from loguru import logger
 
@@ -1609,6 +1609,48 @@ entity's, and the parent is recoverable from the chunk uid by inspection alone.
 """
 
 
+SNIPPET_CHARS = 240
+"""How much of a chunk's text travels with a hit that matched it.
+
+Enough to recognise what matched -- a test title, a function signature, the head of a
+config block -- without storing the text twice. A chunk otherwise keeps only a vector
+and a hash, so if this is not stored the information does not exist anywhere.
+"""
+
+
+class _ChunkFacts(NamedTuple):
+    """What a chunk can tell a result about itself once its parent stands in for it."""
+
+    snippet: str
+    line_start: int | None
+    line_end: int | None
+
+
+def _chunk_line_span(
+    chunk: str,
+    offset: int,
+    source: str,
+    source_offset: int,
+    entity_line_start: int | None,
+) -> tuple[int | None, int | None]:
+    """File lines this chunk covers, or ``(None, None)`` when that is not derivable.
+
+    Only the ``source`` portion of an embed text has a known offset from the entity's
+    own ``line_start``; the breadcrumb header and the docstring do not, because
+    ``build_embed_text`` reorders and re-wraps them. A chunk landing there gets nulls.
+
+    Null rather than a guess on purpose: a wrong line sends an agent to the wrong place,
+    which is worse than sending it to the node and letting it look.
+    """
+    if entity_line_start is None or not source or source_offset < 0 or offset < source_offset:
+        return None, None
+    relative = offset - source_offset
+    if relative > len(source):
+        return None, None
+    start = entity_line_start + source[:relative].count("\n")
+    return start, start + chunk.count("\n")
+
+
 @dataclass(frozen=True)
 class _ChunkPlan:
     """How one embed batch's texts map onto the vectors that get written.
@@ -1634,11 +1676,15 @@ class _ChunkPlan:
     chunk_of: dict[str, tuple[str, int]]
     """``chunk uid -> (parent uid, 1-based chunk index)`` for the overflow chunks."""
 
+    chunk_facts: dict[str, _ChunkFacts]
+    """``chunk uid -> what that chunk can tell a search result about itself``."""
+
 
 def _plan_embed_chunks(
     to_process: list[tuple[str, str, str]],
     uid_to_label: dict[str, str],
     split: Callable[[str], SplitResult],
+    props_by_uid: dict[str, dict[str, Any]] | None = None,
 ) -> _ChunkPlan:
     """Expand any text over the model's input cap into one unit per chunk.
 
@@ -1654,6 +1700,8 @@ def _plan_embed_chunks(
     units: list[tuple[str, str, str]] = []
     store_hash: dict[str, str] = {}
     chunk_of: dict[str, tuple[str, int]] = {}
+    chunk_facts: dict[str, _ChunkFacts] = {}
+    props_by_uid = props_by_uid or {}
 
     for uid, text, full_hash in to_process:
         split_result = split(text)
@@ -1683,8 +1731,19 @@ def _plan_embed_chunks(
             " — no natural border to cut at" if hard_split else "",
         )
 
+        props = props_by_uid.get(uid, {})
+        source = props.get("source") or ""
+        # rfind, not find: build_embed_text appends the source last, and a short source
+        # can also appear inside the docstring above it.
+        source_offset = text.rfind(source) if source else -1
+        entity_line_start = props.get("line_start")
+
+        cursor = 0
         for index, chunk in enumerate(chunks, start=1):
             chunk_hash = hash_text(chunk)
+            found = text.find(chunk, cursor)
+            offset = found if found >= 0 else cursor
+            cursor = offset + len(chunk)
             if index == 1:
                 units.append((uid, chunk, chunk_hash))
                 store_hash[uid] = full_hash
@@ -1693,8 +1752,12 @@ def _plan_embed_chunks(
                 units.append((chunk_uid, chunk, chunk_hash))
                 store_hash[chunk_uid] = chunk_hash
                 chunk_of[chunk_uid] = (uid, index)
+                line_start, line_end = _chunk_line_span(chunk, offset, source, source_offset, entity_line_start)
+                chunk_facts[chunk_uid] = _ChunkFacts(
+                    snippet=chunk[:SNIPPET_CHARS], line_start=line_start, line_end=line_end
+                )
 
-    return _ChunkPlan(units=units, store_hash=store_hash, chunk_of=chunk_of)
+    return _ChunkPlan(units=units, store_hash=store_hash, chunk_of=chunk_of, chunk_facts=chunk_facts)
 
 
 def _partition_written_vectors(
@@ -1716,6 +1779,7 @@ def _partition_written_vectors(
             parent_items.append((target_uid, vector, stored))
             continue
         parent_uid, chunk_index = parent
+        facts = plan.chunk_facts.get(target_uid)
         chunk_items.append(
             EmbedChunkWrite(
                 uid=target_uid,
@@ -1724,6 +1788,9 @@ def _partition_written_vectors(
                 chunk_index=chunk_index,
                 vector=vector,
                 embed_hash=stored,
+                snippet=facts.snippet if facts else "",
+                line_start=facts.line_start if facts else None,
+                line_end=facts.line_end if facts else None,
             )
         )
     return parent_items, chunk_items
@@ -1965,7 +2032,12 @@ class EmbedConsumer(TierConsumer):
                     return deferred or None
 
                 # 2b. Expand anything over the model's input cap into one unit per chunk.
-                plan = _plan_embed_chunks(to_process, uid_to_label, self.embed.split_text)
+                plan = _plan_embed_chunks(
+                    to_process,
+                    uid_to_label,
+                    self.embed.split_text,
+                    {p["uid"]: p for p in entity_props if p.get("uid")},
+                )
 
                 # 3. Graph dedup check → 4. API call for what is genuinely new
                 with timed_phase("embed", "dedup", candidates=len(plan.units)):

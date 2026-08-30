@@ -6167,3 +6167,55 @@ async def test_an_entity_still_wins_over_a_chunk(graph_client: GraphClient):
 
     found = await graph_client.find_embeddings_by_hash(["shared"], "model-x")
     assert found["shared"][0] == 1.0
+
+
+async def test_a_chunk_hit_reports_which_part_matched(graph_client: GraphClient):
+    """The parent stands in for the chunk as the result, but a hit that says only
+    'this file' makes the agent fetch and scan for what the index already knew."""
+    await graph_client.ensure_schema()
+    on_chunk = [0.0] * graph_client._dimension
+    on_chunk[1] = 1.0
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'test:big.fn', project_name: 'test', "
+        "name: 'fn', qualified_name: 'big.fn', kind: 'function'})"
+    )
+    await graph_client.write_embed_chunks(
+        [
+            EmbedChunkWrite(
+                uid="test:big.fn#chunk2",
+                parent_uid="test:big.fn",
+                project_name="test",
+                chunk_index=2,
+                vector=on_chunk,
+                embed_hash="h2",
+                snippet="test('POST JSON with upload progress', async t => {",
+                line_start=412,
+                line_end=437,
+            )
+        ],
+        model="test-model",
+    )
+
+    results = await graph_client.vector_search(on_chunk, limit=5)
+
+    hit = next(r for r in results if r["node"]["uid"] == "test:big.fn")
+    assert hit["matched_chunk"]["chunk_index"] == 2
+    assert "upload progress" in hit["matched_chunk"]["snippet"]
+    assert (hit["matched_chunk"]["line_start"], hit["matched_chunk"]["line_end"]) == (412, 437)
+
+
+async def test_a_node_that_matched_itself_reports_no_chunk(graph_client: GraphClient):
+    """Guards the guard: matched_chunk must mean 'a chunk matched', not 'always set'."""
+    await graph_client.ensure_schema()
+    vec = [0.0] * graph_client._dimension
+    vec[0] = 1.0
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'test:plain', project_name: 'test', "
+        "name: 'plain', qualified_name: 'plain', embed_hash: 'h', embedding: $v})",
+        {"v": vec},
+    )
+
+    results = await graph_client.vector_search(vec, limit=5)
+
+    hit = next(r for r in results if r["node"]["uid"] == "test:plain")
+    assert not hit.get("matched_chunk")
