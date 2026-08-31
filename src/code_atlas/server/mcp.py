@@ -30,7 +30,7 @@ from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.dream import VaultRoot, build_dream_report, report_to_dict
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
 from code_atlas.indexing.daemon import DaemonManager
-from code_atlas.indexing.orchestrator import StalenessChecker
+from code_atlas.indexing.orchestrator import StalenessChecker, assert_embedding_dimension_matches
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
@@ -779,6 +779,11 @@ def create_mcp_server(  # noqa: PLR0915
         # sets the version as part of applying a fresh schema, so checking after
         # would always see a version and needs_first_index would never be True.
         needs_first_index = await graph.get_schema_version() is None
+        # ATL-150 — ensure_schema rebuilds every vector index at the CONFIGURED dimension,
+        # so an MCP server started from a checkout whose config disagrees with the graph
+        # would orphan every stored vector just by connecting. Refuse instead: this process
+        # only reads, and it has no business rewriting indices it cannot repair.
+        await assert_embedding_dimension_matches(graph, settings)
         await graph.ensure_schema()
         first_index_ready = asyncio.Event()
         if not needs_first_index:
@@ -813,7 +818,7 @@ def create_mcp_server(  # noqa: PLR0915
                         msg = (
                             f"Embedding model mismatch: stored='{stored_model}', "
                             f"configured='{settings.embeddings.model}'. "
-                            "Refusing to start in strict mode. Run 'atlas index --full' to re-embed."
+                            "Refusing to start in strict mode. Run 'atlas index --reset-embeddings' to re-embed."
                         )
                         raise RuntimeError(msg)
                     logger.warning(
@@ -1449,7 +1454,7 @@ def _register_search_tools(mcp: FastMCP) -> None:
                     code="EMBEDDINGS_DISABLED",
                 )
             return _error(
-                "Vector search disabled: embedding model mismatch. Run 'atlas index --full' to re-embed.",
+                "Vector search disabled: embedding model mismatch. Run 'atlas index --reset-embeddings' to re-embed.",
                 code="MODEL_MISMATCH",
             )
         clamped = _clamp_limit(limit)

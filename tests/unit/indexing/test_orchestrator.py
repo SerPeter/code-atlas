@@ -15,6 +15,7 @@ from code_atlas.indexing import orchestrator as orchestrator_module
 from code_atlas.indexing.orchestrator import (
     _DEFAULT_EXCLUDE,
     _DEFAULT_INCLUDE,
+    EmbeddingDimensionMismatchError,
     FileScope,
     StalenessChecker,
     _check_model_lock,
@@ -22,8 +23,10 @@ from code_atlas.indexing.orchestrator import (
     _git_changed_files,
     _parse_dependency_versions,
     _read_git_head,
+    _reconcile_until_embedded,
     _stop_consumer_tasks,
     _wait_for_drain,
+    assert_embedding_dimension_matches,
     gc_vanished_worktree_projects,
     register_manifest_parser,
     scan_files,
@@ -1199,6 +1202,131 @@ class TestCheckModelLock:
         await _check_model_lock(graph, "model-b", 768, project="beta", reindex=False)  # ty: ignore[invalid-argument-type]
 
         assert graph.calls == []
+
+
+# ---------------------------------------------------------------------------
+# ATL-150: the dimension guard, and ATL-148: re-embedding to completion
+# ---------------------------------------------------------------------------
+
+
+class TestAssertEmbeddingDimensionMatches:
+    """`ensure_schema` rebuilds every vector index at the *configured* dimension, so a
+    mismatch has to be caught by the caller before it runs — not by `_check_model_lock`,
+    which is ~1400 lines of call stack too late and left 59,864 vectors orphaned."""
+
+    def _settings(self, *, dimension: int | None, enabled: bool = True) -> AtlasSettings:
+        settings = AtlasSettings(project_root=".")
+        settings.embeddings.enabled = enabled
+        settings.embeddings.dimension = dimension
+        return settings
+
+    async def test_mismatch_raises_before_any_ddl(self) -> None:
+        graph = FakeLockGraph(("m", 1536), counts={"trading-bot": 59864})
+        with pytest.raises(EmbeddingDimensionMismatchError) as exc:
+            await assert_embedding_dimension_matches(graph, self._settings(dimension=768))  # ty: ignore[invalid-argument-type]
+        # The remedy has to name the flag that actually opts in. Naming --full, as every
+        # message did before ADR-0042, now sends the user to a flag that refuses.
+        assert "--reset-embeddings" in str(exc.value)
+        assert "trading-bot (59,864 vectors)" in str(exc.value)
+        # Nothing was read destructively and nothing was rebuilt: a guard that fires
+        # after touching an index is the bug, not the fix.
+        assert graph.calls == []
+
+    async def test_matching_dimension_is_silent(self) -> None:
+        graph = FakeLockGraph(("m", 768))
+        await assert_embedding_dimension_matches(graph, self._settings(dimension=768))  # ty: ignore[invalid-argument-type]
+
+    async def test_a_fresh_database_is_not_blocked(self) -> None:
+        """No stored config means nothing to orphan, so the guard must not fire."""
+        await assert_embedding_dimension_matches(FakeLockGraph(None), self._settings(dimension=768))  # ty: ignore[invalid-argument-type]
+
+    async def test_embeddings_disabled_is_not_blocked(self) -> None:
+        graph = FakeLockGraph(("m", 1536))
+        await assert_embedding_dimension_matches(graph, self._settings(dimension=768, enabled=False))  # ty: ignore[invalid-argument-type]
+
+    async def test_an_unresolved_dimension_is_not_blocked(self) -> None:
+        """`--no-embed`, or a probe that could not reach the service, leaves it None.
+        Guessing 768 there would refuse every run against a 1536 graph."""
+        graph = FakeLockGraph(("m", 1536))
+        await assert_embedding_dimension_matches(graph, self._settings(dimension=None))  # ty: ignore[invalid-argument-type]
+
+
+class FakeReconcileGraph:
+    """Hands out unembedded uids in capped pages, like find_unembedded_entities."""
+
+    def __init__(self, pending: list[str], *, limit: int = 2, stuck: set[str] | None = None) -> None:
+        self.pending = list(pending)
+        self.limit = limit
+        self.stuck = set(stuck or ())
+        self.pages: list[list[str]] = []
+
+    async def find_unembedded_entities(self, project_name: str):
+        page = self.pending[: self.limit]
+        self.pages.append(list(page))
+        return [(uid, "Callable", "f.py") for uid in page]
+
+    def embed(self, uids: set[str]) -> None:
+        """Whatever the drain would have embedded stops being pending."""
+        self.pending = [u for u in self.pending if u in self.stuck or u not in uids]
+
+
+class FakeReconcileBus:
+    def __init__(self) -> None:
+        self.published: list[str] = []
+
+    async def publish_many(self, topic, events):
+        self.published.extend(e.entity.qualified_name for e in events)
+
+
+class TestReconcileUntilEmbedded:
+    """`find_unembedded_entities` is capped per project. That is invisible while the only
+    caller heals a handful of lost events, and fatal for `--reset-embeddings`, which
+    empties the whole project: one pass would restore 5,000 of 35,104 and exit 0."""
+
+    async def test_it_loops_until_every_entity_is_embedded(self) -> None:
+        graph = FakeReconcileGraph([f"u{i}" for i in range(5)], limit=2)
+        bus = FakeReconcileBus()
+
+        async def drain() -> bool:
+            graph.embed(set(bus.published))
+            return True
+
+        assert await _reconcile_until_embedded(graph, bus, ["p"], drain) is True  # ty: ignore[invalid-argument-type]
+        assert graph.pending == []
+        assert [len(p) for p in graph.pages] == [2, 2, 1, 0]
+
+    async def test_it_stops_rather_than_re_billing_work_that_cannot_finish(self) -> None:
+        """An entity the provider keeps refusing would otherwise loop forever, paying
+        for the same batch each lap."""
+        graph = FakeReconcileGraph(["stuck"], limit=2, stuck={"stuck"})
+        bus = FakeReconcileBus()
+
+        async def drain() -> bool:
+            graph.embed(set(bus.published))
+            return True
+
+        assert await _reconcile_until_embedded(graph, bus, ["p"], drain) is True  # ty: ignore[invalid-argument-type]
+        assert len(graph.pages) == 2, "one pass, then one that proved no progress, then stop"
+
+    async def test_a_failed_drain_reports_not_drained(self) -> None:
+        graph = FakeReconcileGraph(["u0", "u1"], limit=2)
+
+        async def drain() -> bool:
+            return False
+
+        assert await _reconcile_until_embedded(graph, FakeReconcileBus(), ["p"], drain) is False  # ty: ignore[invalid-argument-type]
+
+    async def test_nothing_pending_drains_nothing(self) -> None:
+        graph = FakeReconcileGraph([])
+        drained_calls = 0
+
+        async def drain() -> bool:
+            nonlocal drained_calls
+            drained_calls += 1
+            return True
+
+        assert await _reconcile_until_embedded(graph, FakeReconcileBus(), ["p"], drain) is True  # ty: ignore[invalid-argument-type]
+        assert drained_calls == 0
 
 
 # ---------------------------------------------------------------------------

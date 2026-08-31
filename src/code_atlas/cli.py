@@ -15,6 +15,8 @@ from loguru import logger
 from rich.console import Console
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from code_atlas.graph.protocol import GraphBackend
     from code_atlas.indexing.orchestrator import IndexResult
     from code_atlas.settings import AtlasSettings
@@ -90,6 +92,21 @@ def _echo(msg: str) -> None:
     """Print a message to stderr (visible in default mode, suppressed by --json/--quiet)."""
     if not _output.json and not _output.quiet:
         typer.echo(msg, err=True)
+
+
+def _is_interactive() -> bool:
+    """Whether a human is actually present to answer a confirmation prompt.
+
+    Its own function for two reasons. Click's CliRunner gives the command a stdin that
+    is not a TTY while still feeding it input, so every confirmation test has to say
+    otherwise. And `typer.confirm` on a real non-TTY aborts with "Aborted!", never the
+    "--yes is required" message ADR-0042 decision 2 requires a non-interactive
+    destructive run to print.
+    """
+    try:
+        return sys.stdin.isatty()
+    except AttributeError, ValueError:
+        return False  # detached or closed stdin — nobody is there
 
 
 def _warn_partial_index(result: IndexResult) -> None:
@@ -212,7 +229,37 @@ def index(
     project: list[str] | None = typer.Option(
         None, "--project", "-p", help="Index specific sub-projects (repeatable, globs)."
     ),
-    full_reindex: bool = typer.Option(False, "--full", help="Force full re-index, ignoring delta cache."),
+    full_reindex: bool = typer.Option(
+        False,
+        "--full",
+        help="Re-check every file: enumerate all of them and re-parse each one even if "
+        "its bytes are unchanged. DESTROYS NOTHING — content and embedding hashes still "
+        "decide what is rewritten and what is billed. Use this after a parser or config "
+        "change.",
+    ),
+    reset: bool = typer.Option(
+        False,
+        "--reset",
+        help="DESTRUCTIVE. Delete the project's graph data (nodes, relationships and "
+        "embeddings) and rebuild it from scratch. On a monorepo this deletes every "
+        "sub-project the run visits. Every vector removed has to be re-embedded, and "
+        "therefore re-billed. Requires confirmation, or --yes.",
+    ),
+    reset_embeddings: bool = typer.Option(
+        False,
+        "--reset-embeddings",
+        help="DESTRUCTIVE. Drop this project's vectors, embed hashes and EmbedChunk "
+        "nodes, keeping the graph, so the next pass re-embeds without re-parsing. For a "
+        "model or dimension switch; a dimension change clears every project in the "
+        "database, because the vector indices are shared. Requires confirmation, or --yes.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt for a destructive run. Required for --reset "
+        "or --reset-embeddings without a TTY. Implies nothing on its own.",
+    ),
     no_embed: bool = typer.Option(False, "--no-embed", help="Disable embeddings (lightweight mode)."),
     no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow indexing outside a git repository."),
     with_git_signals: bool = typer.Option(
@@ -246,11 +293,23 @@ def index(
     ),
 ) -> None:
     """Index a codebase into the graph."""
+    # Mutually exclusive rather than a precedence rule: the three flags set three
+    # different axes, and guessing which one a user meant is how "re-check everything"
+    # became "destroy everything" in the first place (ADR-0042).
+    chosen = [
+        n for n, on in (("--full", full_reindex), ("--reset", reset), ("--reset-embeddings", reset_embeddings)) if on
+    ]
+    if len(chosen) > 1:
+        raise typer.BadParameter(f"{' and '.join(chosen)} cannot be combined — they mean different things.")
+
     asyncio.run(
         _run_index(
             path,
             scope,
             full_reindex,
+            reset=reset,
+            reset_embeddings=reset_embeddings,
+            skip_confirm=yes,
             projects=project,
             no_embed=no_embed,
             no_git_check=no_git_check,
@@ -539,6 +598,68 @@ def mcp(
 # ---------------------------------------------------------------------------
 
 
+async def _confirm_destructive(
+    graph: GraphBackend,
+    project_names: Sequence[str],
+    *,
+    action: str,
+    reaches_children: bool,
+    skip_confirm: bool,
+) -> None:
+    """State what a destructive operation will remove, then require an explicit yes.
+
+    ADR-0042 decision 2. The counts are their own read-only pass taken before anything
+    is removed — `DETACH DELETE n RETURN count(n)` returns 0, so a count the deletion
+    takes for itself cannot exist — and a run that cannot describe its own blast radius
+    aborts rather than proceeding on an estimate. The failure this guards is
+    unrecoverable and metered.
+
+    *reaches_children* says whether each name also carries its ``{name}/`` children.
+    ``clear_embeddings`` matches name-or-prefix in a single call, while
+    ``delete_project_data`` is exact-match and a monorepo reaches its sub-projects only
+    by being called once per sub-project the run visits. Printing the prefix set for
+    both would name projects a single-project ``--reset`` never touches, which is as
+    wrong as naming too few.
+
+    Read without the indexer lease, which is taken further down. Deliberate: these
+    counts are a statement of magnitude for a human to judge, not a transaction, and
+    holding the lease across human latency blocks every other indexer on the database.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    try:
+        for name in project_names:
+            for row in await graph.count_project_data(name):
+                if reaches_children or row["name"] == name:
+                    rows[row["name"]] = row
+    except Exception as exc:
+        logger.error("Cannot count what would be removed — refusing to proceed. {}", exc)
+        raise typer.Exit(code=1) from exc
+
+    _echo(f"{action}.")
+    # Per row, never summed: `relationships` counts every edge with at least one
+    # endpoint in that project — which is what DETACH DELETE removes — so an edge
+    # between two listed projects is in both rows.
+    for name in sorted(rows):
+        row = rows[name]
+        _echo(
+            f"  {name}: {row['nodes']:,} nodes | {row['relationships']:,} relationships"
+            f" | {row['embedded_nodes']:,} embedded nodes | {row['embed_chunks']:,} embed chunks"
+        )
+    vectors = sum(row["embedded_nodes"] + row["embed_chunks"] for row in rows.values())
+    _echo(f"  Recovery cost: {vectors:,} vector(s) to re-embed, and therefore to re-bill.")
+
+    if skip_confirm:
+        return
+    # No prompt that default-accepts and no timeout that proceeds: without a human
+    # there is nobody to say yes, so the run refuses instead of assuming one.
+    if _output.json or not _is_interactive():
+        logger.error("{} — refusing without confirmation; pass --yes.", action)
+        raise typer.Exit(code=1)
+    if not typer.confirm(f"{action}?"):
+        _echo("Aborted.")
+        raise typer.Exit(code=1)
+
+
 async def _run_index(  # noqa: PLR0912, PLR0915
     path: str,
     scope: list[str] | None,
@@ -552,11 +673,19 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     watch: bool = False,
     force: bool = False,
     force_drop_embeddings: bool = False,
+    reset: bool = False,
+    reset_embeddings: bool = False,
+    skip_confirm: bool = False,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
     from code_atlas.backends import create_event_bus, create_graph_client, graph_backend_label, queue_backend_label
     from code_atlas.graph.client import EmbeddingsPresentError
-    from code_atlas.indexing.orchestrator import detect_sub_projects
+    from code_atlas.indexing.orchestrator import (
+        EmbeddingDimensionMismatchError,
+        assert_embedding_dimension_matches,
+        detect_sub_projects,
+        select_sub_projects,
+    )
     from code_atlas.settings import AtlasSettings, derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -629,6 +758,103 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             raise typer.Exit(code=1) from exc
         logger.info("Connected to {}", graph_backend_label(graph, settings))
 
+        # Monorepo detection is resolved here, above ensure_schema, because the
+        # destructive preflight below has to name the sub-projects a --reset will
+        # actually visit. Pure — filesystem only, no graph, no lease.
+        sub_projects = detect_sub_projects(project_root, settings.monorepo)
+        is_monorepo = bool(sub_projects) or bool(projects)
+
+        # A --scope path (explicit or auto-derived from a subdirectory target) must
+        # not be silently discarded when monorepo mode kicks in — translate it into
+        # the sub-project(s) it touches. If it touches none, it's entirely within
+        # root-only territory, so fall back to a plain scoped single-project index
+        # instead of indexing the whole monorepo.
+        if is_monorepo and scope:
+            normalized_scope = [s.replace("\\", "/").rstrip("/") for s in scope]
+            matched = {
+                sp.name
+                for sp in sub_projects
+                for s in normalized_scope
+                if s == sp.path or s.startswith(sp.path + "/") or sp.path.startswith(s + "/")
+            }
+            if matched:
+                projects = sorted(set(projects or []) | matched)
+            else:
+                is_monorepo = False
+
+        # ATL-150 — the guard has to run before ensure_schema, not after. See
+        # `assert_embedding_dimension_matches` for why, and note that changing the
+        # dimension is exactly what --reset-embeddings is for, so it opts out.
+        stored_dim: int | None = None
+        if settings.embeddings.enabled and settings.embeddings.dimension is not None:
+            stored_config = await graph.get_embedding_config()
+            if stored_config is not None:
+                stored_dim = stored_config[1]
+        dimension_mismatch = stored_dim is not None and stored_dim != settings.embeddings.dimension
+        if not (reset or reset_embeddings):
+            try:
+                await assert_embedding_dimension_matches(graph, settings)
+            except EmbeddingDimensionMismatchError as exc:
+                logger.error(str(exc))
+                raise typer.Exit(code=1) from exc
+
+        if reset or reset_embeddings:
+            # A model change makes `_check_model_lock` clear embeddings name-or-prefix for
+            # the whole tree, on top of whatever the flag itself removes. So --reset's
+            # radius is wider than its own per-project deletes whenever the model moved,
+            # and a preflight naming only the visited projects would understate it —
+            # the one failure ADR-0042 decision 2 exists to prevent.
+            model_mismatch = False
+            if settings.embeddings.enabled:
+                recorded = await graph.get_project_embedding_model(project_name)
+                model_mismatch = recorded is not None and recorded != settings.embeddings.model
+            if reset:
+                # The monorepo path deletes once per sub-project it visits, so ask
+                # `select_sub_projects` the same question the run will ask rather than
+                # deriving the list from a prefix match over the graph.
+                if is_monorepo:
+                    names = [
+                        f"{project_name}/{sp.name}" for sp in select_sub_projects(sub_projects, settings, projects)
+                    ]
+                    names.append(project_name)  # the root project's own files
+                else:
+                    names = [project_name]
+                reaches_children = model_mismatch
+                action = f"Delete all graph data for '{project_name}'"
+                if model_mismatch:
+                    action += ", and every sub-project's vectors for the model change"
+            else:
+                names = [project_name]
+                reaches_children = True  # clear_embeddings matches name-or-prefix
+                action = f"Clear all embeddings for '{project_name}'"
+            if dimension_mismatch:
+                # A dimension is global because the vector indices are, so this reaches
+                # every project in the database. Said up front rather than logged after
+                # the fact, which is how ATL-135 destroyed other projects' vectors.
+                names = sorted(set(names) | set(await graph.count_embeddings_by_project()))
+                action += (
+                    f", and every project's vectors for the {stored_dim} → "
+                    f"{settings.embeddings.dimension} dimension change"
+                )
+            await _confirm_destructive(
+                graph, names, action=action, reaches_children=reaches_children, skip_confirm=skip_confirm
+            )
+
+            # ADR-0042 decision 3: check the lock, then clear, then ensure_schema. For an
+            # opted-in dimension change the clear has to happen here — ensure_schema
+            # would otherwise create indices at the new dimension over vectors still in
+            # the old space, and a CREATE that fails on a dimension error registers the
+            # index name anyway and poisons the label. `_check_model_lock` then finds
+            # nothing left to clear and rebuilds the indices at the new dimension.
+            if dimension_mismatch:
+                cleared = await graph.clear_embeddings(None)
+                logger.info(
+                    "Dimension {} → {}: cleared {:,} vector(s) database-wide before rebuilding the shared indices.",
+                    stored_dim,
+                    settings.embeddings.dimension,
+                    cleared,
+                )
+
         try:
             await graph.ensure_schema(force_drop_embeddings=force_drop_embeddings)
         except EmbeddingsPresentError as exc:
@@ -656,31 +882,15 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         # human and to any CI step gating on the exit code.
         incomplete = False
 
-        # Auto-detect monorepo: if sub-projects detected or --project specified → monorepo mode
-        sub_projects = detect_sub_projects(project_root, settings.monorepo)
-        is_monorepo = bool(sub_projects) or bool(projects)
-
-        # A --scope path (explicit or auto-derived from a subdirectory target) must
-        # not be silently discarded when monorepo mode kicks in — translate it into
-        # the sub-project(s) it touches. If it touches none, it's entirely within
-        # root-only territory, so fall back to a plain scoped single-project index
-        # instead of indexing the whole monorepo.
-        if is_monorepo and scope:
-            normalized_scope = [s.replace("\\", "/").rstrip("/") for s in scope]
-            matched = {
-                sp.name
-                for sp in sub_projects
-                for s in normalized_scope
-                if s == sp.path or s.startswith(sp.path + "/") or sp.path.startswith(s + "/")
-            }
-            if matched:
-                projects = sorted(set(projects or []) | matched)
-            else:
-                is_monorepo = False
-
         if is_monorepo:
             results = await _index_monorepo_with_progress(
-                settings, graph, bus, projects=projects, full_reindex=full_reindex
+                settings,
+                graph,
+                bus,
+                projects=projects,
+                full_reindex=full_reindex,
+                reset=reset,
+                reset_embeddings=reset_embeddings,
             )
             total_files = sum(r.files_scanned for r in results)
             total_entities = sum(r.entities_total for r in results)
@@ -714,7 +924,15 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                 if git_signals_stats is not None:
                     _echo(_git_signals_summary_line(git_signals_stats, co_change_threshold))
         else:
-            result = await _index_single_with_spinner(settings, graph, bus, scope=scope, full_reindex=full_reindex)
+            result = await _index_single_with_spinner(
+                settings,
+                graph,
+                bus,
+                scope=scope,
+                full_reindex=full_reindex,
+                reset=reset,
+                reset_embeddings=reset_embeddings,
+            )
             incomplete = not result.drained
 
             git_signals_stats = (
@@ -766,6 +984,8 @@ async def _index_monorepo_with_progress(
     *,
     projects: list[str] | None,
     full_reindex: bool,
+    reset: bool = False,
+    reset_embeddings: bool = False,
 ) -> list[Any]:
     """Run monorepo indexing with a Rich progress bar (unless --json or --quiet)."""
     from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -814,6 +1034,8 @@ async def _index_monorepo_with_progress(
             bus,
             scope_projects=projects,
             full_reindex=full_reindex,
+            reset=reset,
+            reset_embeddings=reset_embeddings,
             drain_timeout_s=settings.index.drain_timeout_s,
             on_progress=on_progress,
             on_drain_progress=on_drain,
@@ -829,6 +1051,8 @@ async def _index_single_with_spinner(
     *,
     scope: list[str] | None,
     full_reindex: bool,
+    reset: bool = False,
+    reset_embeddings: bool = False,
 ) -> Any:
     """Run single-project indexing with a Rich spinner (unless --json or --quiet)."""
     from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -859,6 +1083,8 @@ async def _index_single_with_spinner(
             bus,
             scope_paths=scope or None,
             full_reindex=full_reindex,
+            reset=reset,
+            reset_embeddings=reset_embeddings,
             drain_timeout_s=settings.index.drain_timeout_s,
             on_drain_progress=on_drain,
         )
@@ -875,7 +1101,8 @@ async def _watch_after_index(settings: Any, graph: Any, bus: Any, lease_owner: s
     watcher over the same files.
 
     ``catchup=False`` because the pass that just ran *was* the catch-up, and it honoured
-    --full/--scope/--project, which the daemon's own generic pass would not.
+    --full/--reset/--reset-embeddings/--scope/--project, which the daemon's own generic
+    pass would not.
 
     ``lease_owner`` is what makes this work at all: the daemon's consumers stand down
     for a foreign lease, and ours is not foreign.
@@ -965,7 +1192,7 @@ async def _run_search(
                 if search_types and SearchType.VECTOR in search_types:
                     logger.error(
                         "Cannot use vector search: model mismatch "
-                        "(stored='{}', current='{}'). Run 'atlas index --full'.",
+                        "(stored='{}', current='{}'). Run 'atlas index --reset-embeddings'.",
                         stored_model,
                         settings.embeddings.model,
                     )
@@ -1111,15 +1338,16 @@ async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
             logger.error("No project named '{}' found in the graph.", name)
             raise typer.Exit(code=1)
 
-        if not skip_confirm:
-            if _output.json:
-                logger.error(
-                    "Refusing to delete '{}' without confirmation in --json mode — pass --yes to confirm.", name
-                )
-                raise typer.Exit(code=1)
-            if not typer.confirm(f"Delete all graph data for '{name}'?"):
-                _echo("Aborted.")
-                raise typer.Exit(code=1)
+        # Exact-match, exactly like `delete_project_data` itself: `atlas project rm
+        # trading-bot` does not reach `trading-bot/core`, and a preflight that said it
+        # did would be the over-report ADR-0042 forbids as firmly as an under-report.
+        await _confirm_destructive(
+            graph,
+            [name],
+            action=f"Delete all graph data for '{name}'",
+            reaches_children=False,
+            skip_confirm=skip_confirm,
+        )
 
         await graph.delete_project_data(name)
         _echo(f"Removed project '{name}'.")
@@ -1328,6 +1556,10 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
     from code_atlas.backends import graph_backend_label, use_backends
     from code_atlas.graph.client import EmbeddingsPresentError
     from code_atlas.indexing.daemon import DaemonManager
+    from code_atlas.indexing.orchestrator import (
+        EmbeddingDimensionMismatchError,
+        assert_embedding_dimension_matches,
+    )
     from code_atlas.settings import AtlasSettings, derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -1359,9 +1591,13 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
                 logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
                 raise typer.Exit(code=1) from exc
             logger.info("Connected to {}", graph_backend_label(graph, settings))
+            # ATL-150 — before ensure_schema, not after. This path has no --reset-embeddings
+            # to opt in with, and the daemon swallows the later _check_model_lock error and
+            # keeps running, so without this it corrupts the indices and logs one traceback.
             try:
+                await assert_embedding_dimension_matches(graph, settings)
                 await graph.ensure_schema()
-            except EmbeddingsPresentError as exc:
+            except (EmbeddingDimensionMismatchError, EmbeddingsPresentError) as exc:
                 logger.error(str(exc))
                 raise typer.Exit(code=1) from exc
 
@@ -1390,6 +1626,10 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
     from code_atlas.backends import graph_backend_label, use_backends
     from code_atlas.graph.client import EmbeddingsPresentError
     from code_atlas.indexing.daemon import DaemonManager
+    from code_atlas.indexing.orchestrator import (
+        EmbeddingDimensionMismatchError,
+        assert_embedding_dimension_matches,
+    )
     from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
 
@@ -1417,9 +1657,13 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
                 logger.error("Cannot reach {} — {}", graph_backend_label(graph, settings), exc)
                 raise typer.Exit(code=1) from exc
             logger.info("Connected to {}", graph_backend_label(graph, settings))
+            # ATL-150 — before ensure_schema, not after. This path has no --reset-embeddings
+            # to opt in with, and the daemon swallows the later _check_model_lock error and
+            # keeps running, so without this it corrupts the indices and logs one traceback.
             try:
+                await assert_embedding_dimension_matches(graph, settings)
                 await graph.ensure_schema()
-            except EmbeddingsPresentError as exc:
+            except (EmbeddingDimensionMismatchError, EmbeddingsPresentError) as exc:
                 logger.error(str(exc))
                 raise typer.Exit(code=1) from exc
 

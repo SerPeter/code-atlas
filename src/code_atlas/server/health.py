@@ -328,7 +328,7 @@ async def check_embedding_model(
         CheckStatus.WARN,
         f"Mismatch: this project indexed under '{project_model}', configured='{embed_settings.model}'",
         detail=f"Stored dimension: {stored_dim}. Vector search disabled until re-indexed.",
-        suggestion="Run 'atlas index --full' to re-embed this project with the new model.",
+        suggestion="Run 'atlas index --reset-embeddings' to re-embed this project with the new model.",
     )
 
 

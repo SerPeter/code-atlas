@@ -267,12 +267,16 @@ class TestMonorepoScopeDispatch:
             async def close(self) -> None:
                 return None
 
-        async def fake_monorepo_with_progress(settings, graph, bus, *, projects, full_reindex):
+        # ``**_reset_flags`` absorbs reset/reset_embeddings: these doubles are about
+        # which dispatch a scope picks, and TestDestructiveIndexFlags below is where the
+        # destructive axis is asserted. Named rather than ``**_kw`` so it is obvious
+        # which flags are being ignored on purpose.
+        async def fake_monorepo_with_progress(settings, graph, bus, *, projects, full_reindex, **_reset_flags):
             captured["dispatch"] = "monorepo"
             captured["projects"] = projects
             return []
 
-        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex):
+        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex, **_reset_flags):
             from code_atlas.indexing.orchestrator import IndexResult
 
             captured["dispatch"] = "single"
@@ -399,7 +403,7 @@ class TestIndexWithGitSignals:
             async def close(self) -> None:
                 return None
 
-        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex):
+        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex, **_reset_flags):
             captured["order"].append("index")
             return IndexResult(files_scanned=1, files_published=1, entities_total=2, duration_s=0.1)
 
@@ -466,6 +470,291 @@ class TestIndexWithGitSignals:
         assert captured["order"] == ["index", "write"]
 
 
+def _forbid_prompt(monkeypatch, why: str) -> None:
+    """Fail loudly if a confirmation appears where none belongs.
+
+    An exit code cannot tell a run that never asked from one that asked and got a yes
+    out of a stray stdin, and ADR-0042 forbids the second on every path here.
+    """
+    from code_atlas import cli
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError(f"typer.confirm should not be called: {why}")
+
+    monkeypatch.setattr(cli.typer, "confirm", _unexpected)
+
+
+class TestDestructiveIndexFlags:
+    """`atlas index` separates scope from destruction, and destruction is gated (ATL-148/149).
+
+    ``--full`` used to delete the project's graph data before rebuilding it, which is
+    not what anyone reads "full index" as meaning. Running it on the production graph to
+    re-derive an extraction fix would have destroyed 35,104 embeddings and re-billed
+    every one through a paid provider — nearly done by hand while investigating ADR-0040.
+    Scope now lives on ``--full``, destruction on ``--reset`` / ``--reset-embeddings``,
+    and the destructive pair has to state its blast radius and be told yes.
+
+    Every refusal below asserts that the destructive graph calls did not happen, not
+    merely that the exit code was non-zero -- an exit code says nothing about whether
+    the data survived. The CLI can destroy by two routes: its own database-wide
+    ``clear_embeddings`` for a dimension change, and the orchestrator behind
+    ``reset``/``reset_embeddings``. A refusal has to close both, so both are asserted:
+    the spies for the first, ``dispatch`` staying ``None`` for the second.
+    """
+
+    @staticmethod
+    def _patch_common(monkeypatch, *, sub_projects=None, interactive: bool = True) -> dict:
+        from code_atlas import cli
+
+        captured: dict = {"counted": [], "deleted": [], "cleared": [], "dispatch": None}
+
+        class FakeBus:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                await self.close()
+
+            async def ping(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+            # atlas index takes an exclusive lease so it cannot run alongside a daemon.
+            async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+                return True
+
+            async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+                return True
+
+            async def release_indexer_lease(self, owner: str) -> bool:
+                return True
+
+            async def read_indexer_lease(self) -> str | None:
+                return None
+
+        class FakeGraph:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                await self.close()
+
+            async def ping(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+            async def ensure_schema(self, *, force_drop_embeddings: bool = False) -> None:
+                # Recorded because this is DDL: a schema migration drops every vector
+                # index, so a refused run that got this far already destroyed something.
+                captured["ensure_schema"] = True
+
+            async def count_project_data(self, project_name: str) -> list[dict]:
+                captured["counted"].append(project_name)
+                # Every project also answers with a `{name}/child` row, so a test can tell
+                # whether the preflight printed the prefix set (what clear_embeddings
+                # reaches) or only the exact name (what delete_project_data reaches).
+                return [
+                    {"name": project_name, "nodes": 12, "relationships": 30, "embedded_nodes": 9, "embed_chunks": 2},
+                    {
+                        "name": f"{project_name}/child",
+                        "nodes": 4,
+                        "relationships": 6,
+                        "embedded_nodes": 3,
+                        "embed_chunks": 1,
+                    },
+                ]
+
+            async def delete_project_data(self, project_name: str) -> None:
+                captured["deleted"].append(project_name)
+
+            async def clear_embeddings(self, project_name: str | None) -> int:
+                captured["cleared"].append(project_name)
+                return 0
+
+        async def fake_single_with_spinner(
+            settings, graph, bus, *, scope, full_reindex, reset=False, reset_embeddings=False
+        ):
+            from code_atlas.indexing.orchestrator import IndexResult
+
+            captured["dispatch"] = "single"
+            captured["flags"] = (full_reindex, reset, reset_embeddings)
+            return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=0.0)
+
+        async def fake_monorepo_with_progress(
+            settings, graph, bus, *, projects, full_reindex, reset=False, reset_embeddings=False
+        ):
+            captured["dispatch"] = "monorepo"
+            captured["flags"] = (full_reindex, reset, reset_embeddings)
+            captured["projects"] = projects
+            return []
+
+        monkeypatch.setattr("code_atlas.backends.EventBus", FakeBus)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", FakeGraph)
+        monkeypatch.setattr(
+            "code_atlas.indexing.orchestrator.detect_sub_projects", lambda root, mono: sub_projects or []
+        )
+        monkeypatch.setattr(cli, "_index_single_with_spinner", fake_single_with_spinner)
+        monkeypatch.setattr(cli, "_index_monorepo_with_progress", fake_monorepo_with_progress)
+        # Stated per test rather than inherited: CliRunner gives the command a stdin that
+        # is not a TTY, so the non-TTY refusal would otherwise be the branch every test
+        # here took by accident, including the ones named after the prompt.
+        monkeypatch.setattr(cli, "_is_interactive", lambda: interactive)
+        _reset_output()
+        return captured
+
+    def test_two_destructive_flags_together_is_a_usage_error(self, tmp_path, monkeypatch) -> None:
+        captured = self._patch_common(monkeypatch)
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--reset", "--reset-embeddings", "--no-git-check"])
+
+        assert result.exit_code == 2, result.output
+        assert captured["counted"] == []
+        assert captured["dispatch"] is None
+
+    def test_full_combined_with_reset_is_a_usage_error(self, tmp_path, monkeypatch) -> None:
+        """Not a precedence rule. Guessing which axis was meant is the original defect."""
+        captured = self._patch_common(monkeypatch)
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--full", "--reset", "--no-git-check"])
+
+        assert result.exit_code == 2, result.output
+        assert captured["dispatch"] is None
+
+    def test_a_plain_index_never_prompts_and_destroys_nothing(self, tmp_path, monkeypatch) -> None:
+        captured = self._patch_common(monkeypatch)
+        _forbid_prompt(monkeypatch, "a non-destructive index has nothing to confirm")
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--no-embed", "--no-git-check"])
+
+        assert result.exit_code == 0, result.output
+        assert captured["flags"] == (False, False, False)
+        assert captured["counted"] == [], "a run that removes nothing has no blast radius to describe"
+        assert captured["deleted"] == []
+        assert captured["cleared"] == []
+
+    def test_full_re_checks_every_file_and_destroys_nothing(self, tmp_path, monkeypatch) -> None:
+        """The whole of ATL-148: --full is a scope decision now, not a destruction one."""
+        captured = self._patch_common(monkeypatch)
+        _forbid_prompt(monkeypatch, "--full is not destructive")
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--full", "--no-embed", "--no-git-check"])
+
+        assert result.exit_code == 0, result.output
+        assert captured["flags"] == (True, False, False)
+        assert captured["counted"] == []
+        assert captured["deleted"] == []
+        assert captured["cleared"] == []
+
+    def test_reset_without_a_tty_and_without_yes_removes_nothing(self, tmp_path, monkeypatch) -> None:
+        """No prompt that default-accepts and no timeout that proceeds -- it refuses."""
+        captured = self._patch_common(monkeypatch, interactive=False)
+        _forbid_prompt(monkeypatch, "there is nobody present to answer")
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--reset", "--no-embed", "--no-git-check"])
+
+        assert result.exit_code == 1, result.output
+        assert captured["deleted"] == []
+        assert captured["cleared"] == []
+        assert captured["dispatch"] is None
+        assert "ensure_schema" not in captured, "refused above the schema migration, not merely before the index"
+
+    def test_reset_refused_at_the_prompt_removes_nothing(self, tmp_path, monkeypatch) -> None:
+        captured = self._patch_common(monkeypatch)
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--reset", "--no-embed", "--no-git-check"], input="n\n")
+
+        assert result.exit_code == 1, result.output
+        # "Aborted." is echoed only by the prompt path, so this separates a genuine no
+        # from the "nobody is there" refusal, which would also exit 1 with nothing removed.
+        assert "Aborted." in result.output
+        assert captured["deleted"] == []
+        assert captured["cleared"] == []
+        assert captured["dispatch"] is None
+        assert "ensure_schema" not in captured
+
+    def test_reset_with_yes_proceeds_and_names_only_what_the_delete_reaches(self, tmp_path, monkeypatch) -> None:
+        captured = self._patch_common(monkeypatch)
+        _forbid_prompt(monkeypatch, "--yes is the confirmation")
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--reset", "--yes", "--no-embed", "--no-git-check"])
+
+        assert result.exit_code == 0, result.output
+        # The delete itself belongs to index_project, which this double stands in for;
+        # what the CLI owes is the authorisation arriving there and nowhere else.
+        assert captured["flags"] == (False, True, False)
+        assert captured["counted"] == [tmp_path.name]
+        # delete_project_data is exact-match, so naming the prefix child would be the
+        # over-report ADR-0042 forbids as firmly as an under-report.
+        assert f"{tmp_path.name}/child" not in result.output
+        assert "11 vector(s) to re-embed" in result.output
+
+    def test_reset_embeddings_names_the_children_its_prefix_match_reaches(self, tmp_path, monkeypatch) -> None:
+        """clear_embeddings matches name-or-prefix, so the sub-projects have to be named."""
+        captured = self._patch_common(monkeypatch)
+        _forbid_prompt(monkeypatch, "--yes is the confirmation")
+
+        result = runner.invoke(
+            app, ["index", str(tmp_path), "--reset-embeddings", "--yes", "--no-embed", "--no-git-check"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert captured["flags"] == (False, False, True)
+        assert f"{tmp_path.name}/child" in result.output
+        assert "15 vector(s) to re-embed" in result.output
+
+    def test_a_monorepo_reset_names_every_sub_project_the_run_will_visit(self, tmp_path, monkeypatch) -> None:
+        from code_atlas.indexing.orchestrator import DetectedProject
+
+        sub_projects = [
+            DetectedProject(name="foo", path="packages/foo", root=tmp_path / "packages" / "foo", marker="x"),
+            DetectedProject(name="bar", path="packages/bar", root=tmp_path / "packages" / "bar", marker="x"),
+        ]
+        captured = self._patch_common(monkeypatch, sub_projects=sub_projects)
+        _forbid_prompt(monkeypatch, "--yes is the confirmation")
+
+        result = runner.invoke(
+            app, ["index", str(tmp_path), "--reset", "--yes", "-p", "foo", "--no-embed", "--no-git-check"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert captured["dispatch"] == "monorepo"
+        # One delete per sub-project the run visits, plus the root's own files -- and
+        # not the sibling --project excluded, which this run never touches.
+        assert sorted(captured["counted"]) == [tmp_path.name, f"{tmp_path.name}/foo"]
+        assert f"{tmp_path.name}/bar" not in result.output
+
+    def test_a_preflight_count_that_fails_aborts_with_nothing_removed(self, tmp_path, monkeypatch) -> None:
+        """A destructive run that cannot describe its own blast radius aborts (ADR-0042).
+
+        Proceeding on an estimate is not on offer: what is being estimated is
+        unrecoverable and metered.
+        """
+        captured = self._patch_common(monkeypatch)
+
+        async def boom(self, project_name: str) -> list[dict]:
+            raise RuntimeError("count query timed out")
+
+        monkeypatch.setattr("code_atlas.backends.GraphClient.count_project_data", boom)
+
+        result = runner.invoke(app, ["index", str(tmp_path), "--reset", "--yes", "--no-embed", "--no-git-check"])
+
+        assert result.exit_code == 1, result.output
+        assert captured["deleted"] == []
+        assert captured["cleared"] == []
+        assert captured["dispatch"] is None
+        assert "ensure_schema" not in captured
+
+
 class TestNoColor:
     def test_no_color_sets_flag(self) -> None:
         _reset_output()
@@ -530,6 +819,13 @@ class TestProjectRm:
         mock_graph = AsyncMock()
         mock_graph.ping = AsyncMock()
         mock_graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "myproject"}}] if found else [])
+        # The confirmation gate reads the blast radius first (ATL-149), so a double
+        # without this aborts the command before it reaches the question under test.
+        mock_graph.count_project_data = AsyncMock(
+            return_value=[
+                {"name": "myproject", "nodes": 10, "relationships": 4, "embedded_nodes": 3, "embed_chunks": 1}
+            ]
+        )
         mock_graph.delete_project_data = AsyncMock()
         mock_graph.close = AsyncMock()
         return mock_graph
@@ -581,6 +877,10 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        # CliRunner feeds stdin without making it a TTY, so without this the command
+        # would take the "nobody is there to answer" branch and this test would pass
+        # having never reached the prompt it is named after.
+        monkeypatch.setattr(cli, "_is_interactive", lambda: True)
 
         result = runner.invoke(app, ["project", "rm", "myproject"], input="n\n")
 
@@ -597,6 +897,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr(cli, "_is_interactive", lambda: True)
 
         result = runner.invoke(app, ["project", "rm", "myproject"], input="y\n")
 
@@ -651,6 +952,53 @@ class TestProjectRm:
         # Closed by the use_backends scope, so the assertion is on the exit it drives
         # rather than on close() -- which the command no longer calls by hand.
         mock_graph.__aexit__.assert_awaited_once()
+
+    def test_it_prints_what_it_will_remove_before_removing_it(self, tmp_path, monkeypatch) -> None:
+        """The defect ATL-149 names: this command confirmed without saying what was at stake.
+
+        Asserted with --yes so the counts are isolated from the prompt -- the preflight
+        owes its numbers on every destructive path, not only the interactive one.
+        """
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+
+        result = runner.invoke(app, ["project", "rm", "myproject", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert "10 nodes" in result.output
+        assert "4 relationships" in result.output
+        assert "3 embedded nodes" in result.output
+        assert "1 embed chunks" in result.output
+        # Stated in the terms actually paid: those vectors have to be re-embedded, and
+        # therefore re-billed.
+        assert "4 vector(s) to re-embed" in result.output
+        mock_graph.delete_project_data.assert_awaited_once_with("myproject")
+
+    def test_without_a_tty_it_refuses_instead_of_prompting(self, tmp_path, monkeypatch) -> None:
+        """A prompt nobody can answer is not a gate, so --yes is the only way through."""
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        monkeypatch.setattr(cli, "_is_interactive", lambda: False)
+        _forbid_prompt(monkeypatch, "there is nobody present to answer")
+
+        result = runner.invoke(app, ["project", "rm", "myproject"], input="y\n")
+
+        assert result.exit_code == 1, result.output
+        mock_graph.delete_project_data.assert_not_awaited()
 
 
 class TestIndexExitCode:

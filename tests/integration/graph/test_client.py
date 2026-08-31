@@ -5,6 +5,7 @@ Requires a running Memgraph instance (docker compose up -d memgraph).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -19,9 +20,15 @@ from code_atlas.graph.client import (
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
 from code_atlas.schema import _ENTITY_LABELS, GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
 from code_atlas.server.analysis import _analyze_communities
+from code_atlas.settings import derive_project_name
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
+    from typer.testing import Result
+
     from code_atlas.graph.client import GraphClient
+    from code_atlas.settings import AtlasSettings
 
 
 pytestmark = [pytest.mark.integration]
@@ -254,6 +261,275 @@ async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):
     proj = await graph_client.execute("MATCH (p {uid: 'mig3'}) RETURN p.git_hash AS gh")
     assert proj[0]["gh"] is None
     assert await graph_client.get_schema_version() == SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Dimension-mismatch guard (ATL-150)
+# ---------------------------------------------------------------------------
+#
+# Driven through the real ``atlas index`` because what ATL-150 fixes is an *order*,
+# and the order belongs to the caller that knows the run's intent -- ``ensure_schema``
+# is reached from four paths and stays deliberately dimension-blind. Asserting the
+# guard anywhere below the CLI would only assert the order the test itself chose.
+# The subject is still this file's, and sits next to the drop guard above: which
+# vector indices survive a schema-applying run, and under what conditions it refuses.
+
+_ATL150_MODEL = "atl150/embed"
+"""Absent from litellm's registry on purpose: an unknown model resolves to no input
+cap, so nothing chunks and no tokenizer is fetched (ADR-0040). The provider call
+itself is stubbed."""
+
+
+async def _vector_index_dimensions(client: GraphClient) -> dict[str, int]:
+    """``{index_name: dimension}`` — what a drop-and-recreate at the wrong dimension
+    silently changes, and therefore what "untouched" has to mean."""
+    return {row["index_name"]: row["dimension"] for row in await client.get_vector_index_info()}
+
+
+def _index_env(settings: AtlasSettings, *, dimension: int) -> dict[str, str]:
+    """Pin every setting ``atlas index`` would otherwise resolve for itself.
+
+    ``_run_index`` builds its own ``AtlasSettings`` from the target path rather than
+    taking a fixture's, and importing ``code_atlas.cli`` runs ``load_dotenv`` — so this
+    repo's own ``.env`` is in ``os.environ`` by the time it does. ``_export_atlas_env``
+    already overwrites the Memgraph and Valkey halves of that (7687/6379 → the test
+    containers); they are repeated here so the safety does not depend on which fixture
+    ran first. Nothing overwrites the ``[embeddings]`` half, and that one is not merely
+    untidy: unpinned it resolves to a real paid provider and a dimension of its own,
+    which is both a billed call and the wrong number for the thing under test.
+    """
+    return {
+        "ATLAS_BACKEND__GRAPH": "memgraph",
+        "ATLAS_BACKEND__QUEUE": "valkey",
+        "ATLAS_MEMGRAPH__HOST": settings.memgraph.host,
+        "ATLAS_MEMGRAPH__PORT": str(settings.memgraph.port),
+        "ATLAS_MEMGRAPH__USERNAME": "",
+        "ATLAS_MEMGRAPH__PASSWORD": "",
+        "ATLAS_REDIS__HOST": settings.redis.host,
+        "ATLAS_REDIS__PORT": str(settings.redis.port),
+        "ATLAS_REDIS__DB": "0",
+        "ATLAS_REDIS__PASSWORD": "",
+        "ATLAS_REDIS__STREAM_PREFIX": settings.redis.stream_prefix,
+        "ATLAS_MONOREPO__AUTO_DETECT": "false",
+        "ATLAS_EMBEDDINGS__ENABLED": "true",
+        "ATLAS_EMBEDDINGS__PROVIDER": "tei",
+        "ATLAS_EMBEDDINGS__MODEL": _ATL150_MODEL,
+        "ATLAS_EMBEDDINGS__DIMENSION": str(dimension),
+    }
+
+
+async def _atlas_index(root: Path, env: dict[str, str], *args: str) -> Result:
+    """Invoke the real ``atlas index`` and return click's result.
+
+    In a worker thread because the command owns an ``asyncio.run`` of its own, which
+    cannot be re-entered from inside pytest-asyncio's loop. ``--json`` is always on: it
+    is the one output mode whose loguru sink is bound to ``sys.stderr`` at call time,
+    so it is the one whose error message CliRunner can capture at all (the default
+    sink is a Rich console built at import, pointing at the real stderr).
+
+    The ``code_atlas.cli`` import is local rather than module-level so a run that
+    deselects these tests never pays for it — but note that it permanently adds this
+    repo's ``.env`` keys to ``os.environ`` for the rest of the session. Nothing else in
+    this file reads settings it does not pin, and a full ``tests/integration`` run
+    already imports the CLI at collection; a test added below that builds a bare
+    ``AtlasSettings`` would be the first thing to notice.
+    """
+    from typer.testing import CliRunner
+
+    from code_atlas.cli import app
+
+    return await asyncio.to_thread(
+        CliRunner().invoke,
+        app,
+        ["--json", "index", str(root), "--no-git-check", *args],
+        env=env,
+    )
+
+
+@pytest.fixture
+def _stub_embed_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer the provider locally, at whatever dimension the run is configured for.
+
+    Every index probes the service for the dimension it really emits (ATL-111) and then
+    embeds for real. Neither is what ATL-150 is about, and an unreachable TEI turns a
+    DDL-ordering test into four tenacity backoffs per run.
+    """
+    from code_atlas.search.embeddings import EmbedClient
+
+    async def _embed_batch(self: EmbedClient, texts: list[str]) -> list[list[float]]:
+        return [[0.1] * (self._settings.dimension or 768) for _ in texts]
+
+    monkeypatch.setattr(EmbedClient, "embed_batch", _embed_batch)
+
+
+@pytest.fixture
+def clear_vs_schema_order(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the order in which a run clears vectors and applies the schema.
+
+    Needed because on the *opted-in* path the two orders are indistinguishable by
+    their end state: Memgraph 3.12 accepts a ``CREATE VECTOR INDEX`` at the new
+    dimension over nodes still holding old-space vectors instead of failing, and the
+    model lock rebuilds the indices afterwards either way. ADR-0042 fixes the order
+    regardless, because a create that *does* fail on dimensions registers the index
+    name anyway and poisons the label. Without this the test would pass against the
+    bug it exists to pin.
+    """
+    from code_atlas.graph.client import GraphClient
+
+    order: list[str] = []
+
+    def _record(name: str) -> None:
+        original = getattr(GraphClient, name)
+
+        async def _recorded(self, *args, _name=name, _original=original, **kwargs):
+            order.append(_name)
+            return await _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(GraphClient, name, _recorded)
+
+    _record("clear_embeddings")
+    _record("ensure_schema")
+    return order
+
+
+async def test_dimension_mismatch_aborts_before_any_vector_index_is_touched(
+    graph_client: GraphClient, settings: AtlasSettings, tmp_path: Path
+):
+    """The recorded incident, in miniature.
+
+    ``_migrate_indices`` drops every vector index unconditionally and recreates them at
+    the *configured* dimension, while the pipeline's only dimension comparison lived
+    ~1400 lines later in ``_check_model_lock``. So a 768-configured run against the
+    1536 production graph dropped the right indices, rebuilt them wrong and *then*
+    printed an accurate error — 59,864 vectors orphaned by a message that arrived too
+    late to matter. Staged one schema version behind, because the migration branch is
+    the one that issues that DDL; on a current graph nothing would be dropped and the
+    test would pass without the fix.
+
+    Deliberately not given the embed stub: a run that aborts here never reaches the
+    provider, and needing one would mean it did.
+    """
+    await graph_client.ensure_schema()
+    await graph_client.set_embedding_config(_ATL150_MODEL, graph_client._dimension)
+    await graph_client.execute_write(
+        f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = $v", {"v": SCHEMA_VERSION - 1}
+    )
+    before = await _vector_index_dimensions(graph_client)
+    assert before, "no vector indices exist, so 'untouched' would prove nothing"
+
+    result = await _atlas_index(tmp_path, _index_env(settings, dimension=graph_client._dimension + 256))
+
+    assert result.exit_code == 1, result.output
+    assert await _vector_index_dimensions(graph_client) == before
+    # Zero DDL, not merely the right dimension afterwards: a migration that ran and
+    # happened to land on the same numbers would still have moved this.
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION - 1
+    assert await graph_client.get_embedding_config() == (_ATL150_MODEL, graph_client._dimension)
+    assert "--reset-embeddings" in result.stderr, result.stderr
+
+
+@pytest.mark.usefixtures("_stub_embed_provider")
+async def test_a_matching_dimension_still_applies_the_schema_and_indexes(
+    graph_client: GraphClient, settings: AtlasSettings, tmp_path: Path
+):
+    """The guard is about mismatch, not about rebuilding (ATL-150's third constraint).
+
+    A migration that legitimately rebuilds the indices on a graph whose dimension
+    agrees must still run, and the run behind it must still index and embed — a guard
+    that refused this would cost more than the bug it fixes.
+    """
+    await graph_client.ensure_schema()
+    await graph_client.set_embedding_config(_ATL150_MODEL, graph_client._dimension)
+    await graph_client.execute_write(
+        f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = $v", {"v": SCHEMA_VERSION - 1}
+    )
+    (tmp_path / "mod.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+
+    result = await _atlas_index(tmp_path, _index_env(settings, dimension=graph_client._dimension))
+
+    assert result.exit_code == 0, result.output
+    assert set((await _vector_index_dimensions(graph_client)).values()) == {graph_client._dimension}
+    assert await graph_client.get_schema_version() == SCHEMA_VERSION
+    embedded = await graph_client.execute(
+        "MATCH (n {project_name: $p}) WHERE n.embedding IS NOT NULL RETURN count(n) AS c",
+        {"p": derive_project_name(tmp_path)},
+    )
+    assert embedded[0]["c"] > 0, "nothing was indexed or embedded — the happy path is not exercised"
+
+
+@pytest.mark.usefixtures("_stub_embed_provider")
+async def test_a_graph_with_no_stored_dimension_is_not_blocked(
+    graph_client: GraphClient, settings: AtlasSettings, tmp_path: Path
+):
+    """The guard compares against a *stored* dimension, and a first index has none.
+
+    Whatever such a run configures is definitionally the right answer for an empty
+    store: there is nothing to disagree with, and nothing to protect.
+    """
+    assert await graph_client.get_embedding_config() is None
+
+    result = await _atlas_index(tmp_path, _index_env(settings, dimension=1024))
+
+    assert result.exit_code == 0, result.output
+    assert set((await _vector_index_dimensions(graph_client)).values()) == {1024}
+    assert await graph_client.get_embedding_config() == (_ATL150_MODEL, 1024)
+
+
+@pytest.mark.usefixtures("_stub_embed_provider")
+async def test_reset_embeddings_leaves_no_vector_at_the_old_dimension(
+    graph_client: GraphClient, settings: AtlasSettings, tmp_path: Path, clear_vs_schema_order: list[str]
+):
+    """ATL-150's second scenario — and the reason the order has to be fixed at all.
+
+    ``--reset-embeddings`` exists to change the model or the dimension, so it drives
+    into this landmine on every intended use: a ``CREATE VECTOR INDEX`` at the new
+    dimension issued while the old-space vectors are still on the nodes, and a create
+    that fails on dimensions registers the index name anyway and poisons the label.
+
+    The seeded vectors belong to a project this run never names, which is the point: a
+    dimension is global because the vector indices are, so its clear has to be global
+    too. (Doing that for a *model* change instead is ATL-135.)
+    """
+    await graph_client.ensure_schema()
+    await graph_client.set_embedding_config(_ATL150_MODEL, graph_client._dimension)
+    old_vector = [0.1] * graph_client._dimension
+    await graph_client.execute_write(
+        f"CREATE (n:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'testatl150other:fn', "
+        "project_name: 'testatl150other', name: 'fn', qualified_name: 'fn', embed_hash: 'h', "
+        "embedding: $vec})",
+        {"vec": old_vector},
+    )
+    await graph_client.write_embed_chunks(
+        [EmbedChunkWrite("testatl150other:fn#chunk2", "testatl150other:fn", "testatl150other", 2, old_vector, "h2")],
+        model=_ATL150_MODEL,
+    )
+    await graph_client.execute_write(
+        f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = $v", {"v": SCHEMA_VERSION - 1}
+    )
+
+    clear_vs_schema_order.clear()  # drop this test's own setup calls
+
+    result = await _atlas_index(tmp_path, _index_env(settings, dimension=1024), "--reset-embeddings", "--yes")
+
+    assert result.exit_code == 0, result.output
+    # ADR-0042 decision 3: clear, then rebuild. The trailing clear is the model lock's
+    # own, finding nothing left to do — which is what "reuse the lock's scoping" means.
+    assert clear_vs_schema_order == ["clear_embeddings", "ensure_schema", "clear_embeddings"]
+    assert set((await _vector_index_dimensions(graph_client)).values()) == {1024}
+    lengths = [
+        r["len"]
+        for r in await graph_client.execute(
+            "MATCH (n) WHERE n.embedding IS NOT NULL RETURN DISTINCT size(n.embedding) AS len"
+        )
+    ]
+    assert graph_client._dimension not in lengths, "a vector survived at the old dimension"
+    seeded = await graph_client.execute(
+        "MATCH (n {uid: 'testatl150other:fn'}) RETURN n.embedding IS NULL AS cleared, n.embed_hash AS hash"
+    )
+    assert (seeded[0]["cleared"], seeded[0]["hash"]) == (True, None)
+    chunks = await graph_client.execute(f"MATCH (c:{NodeLabel.EMBED_CHUNK}) RETURN count(c) AS c")
+    assert chunks[0]["c"] == 0
+    assert await graph_client.get_embedding_config() == (_ATL150_MODEL, 1024)
 
 
 # ---------------------------------------------------------------------------

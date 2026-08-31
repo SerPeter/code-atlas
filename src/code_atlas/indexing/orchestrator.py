@@ -29,7 +29,7 @@ from code_atlas.settings import derive_project_name, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
     from typing import Protocol
 
     from code_atlas.graph.protocol import GraphBackend
@@ -749,6 +749,30 @@ def _sub_project_scope_paths(global_paths: list[str], sub_path: str) -> list[str
     return translated
 
 
+def select_sub_projects(
+    sub_projects: list[DetectedProject],
+    settings: AtlasSettings,
+    scope_projects: list[str] | None,
+) -> list[DetectedProject]:
+    """The sub-projects a monorepo run will actually visit, after --project and scope.paths.
+
+    Pure, and shared with the CLI's destructive preflight rather than reimplemented
+    there: a ``--reset`` has to name the projects it is about to delete, and a monorepo
+    reaches them by calling ``delete_project_data`` once per *detected* sub-project --
+    not by a prefix match. Deriving the list from the graph's ``{root}/`` prefix instead
+    names siblings the run never visits, which is the over-report ADR-0042 decision 2
+    forbids just as firmly as an under-report.
+    """
+    selected = sub_projects
+    if scope_projects:
+        selected = [
+            sp for sp in selected if any(sp.name == pat or fnmatch.fnmatch(sp.name, pat) for pat in scope_projects)
+        ]
+    if settings.scope.paths:
+        selected = [sp for sp in selected if _sub_project_in_scope(settings.scope.paths, sp.path)]
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # Package detection
 # ---------------------------------------------------------------------------
@@ -1099,6 +1123,44 @@ async def _resolve_dimension(embed: EmbedClient, configured: int | None) -> int:
     return configured
 
 
+class EmbeddingDimensionMismatchError(RuntimeError):
+    """The graph's stored vector dimension is not the configured one (ATL-150)."""
+
+
+async def assert_embedding_dimension_matches(graph: GraphBackend, settings: AtlasSettings) -> None:
+    """Refuse to apply the schema while the graph's vector dimension is not the configured one.
+
+    ``ensure_schema`` drops every vector index and recreates it at the *configured*
+    dimension, unconditionally; the pipeline's own comparison lives in
+    :func:`_check_model_lock`, ~1400 lines of call stack later. So a 768-configured run
+    against the 1536 production graph rebuilt every index at the wrong width, orphaning
+    59,864 vectors, and *then* raised an accurate error that arrived too late to matter.
+    Nothing recovers from that automatically: ``_reconcile_search_indices`` compares label
+    sets, so an index that is present but the wrong width never reads as missing.
+
+    The comparison belongs to the caller — ensure_schema is reached with four different
+    intents and its job is to apply the schema, not to second-guess it — but all four
+    callers want the same answer, so it lives here rather than in any one of them.
+    Callers that mean to change the dimension (``--reset-embeddings``) skip it.
+    """
+    if not settings.embeddings.enabled or settings.embeddings.dimension is None:
+        return
+    stored = await graph.get_embedding_config()
+    if stored is None or stored[1] == settings.embeddings.dimension:
+        return
+    counts = await graph.count_embeddings_by_project()
+    affected = ", ".join(f"{p} ({c:,} vectors)" for p, c in sorted(counts.items()))
+    msg = (
+        f"Embedding dimension changed from {stored[1]} to {settings.embeddings.dimension}. The vector "
+        "indices are shared by every project in this database, so applying the schema would rebuild all "
+        "of them and orphan every stored vector. This run made no schema change."
+        + (f" Affected: {affected}." if affected else "")
+        + f" Re-run 'atlas index --reset-embeddings' to clear the vectors and rebuild at "
+        f"{settings.embeddings.dimension}."
+    )
+    raise EmbeddingDimensionMismatchError(msg)
+
+
 def _describe_other_projects(models: dict[str, str], project: str) -> str:
     """Render the other projects' models for a lock error message."""
     others = sorted((p, m) for p, m in models.items() if p != project)
@@ -1115,8 +1177,14 @@ async def _check_model_lock(
     *,
     project: str,
     reindex: bool,
-) -> None:
+) -> bool:
     """Enforce the embedding locks: dimension database-wide, model per project.
+
+    *reindex* is the caller's opt-in to destroying vectors — ``--reset`` or
+    ``--reset-embeddings``, never ``--full`` (ADR-0042). Returns whether this call
+    cleared any embeddings, so a ``--reset-embeddings`` whose config did *not* move
+    knows it still has its own clearing to do, without re-deriving the scoping rule
+    below at the call site.
 
     The split is not a preference, it is what the storage is. Vector indices are one
     per label for the whole database and carry a single dimension, so **dimension has
@@ -1137,7 +1205,7 @@ async def _check_model_lock(
     if stored is None:
         await graph.set_embedding_config(model, dimension)
         await graph.set_project_embedding_model(project, model)
-        return
+        return False
 
     _stored_model, stored_dim = stored
 
@@ -1149,7 +1217,7 @@ async def _check_model_lock(
             msg = (
                 f"Embedding dimension changed from {stored_dim} to {dimension}. "
                 "Vector indices are shared by every project in this database, so this "
-                "rebuilds all of them. Run 'atlas index --full' to proceed."
+                "rebuilds all of them. Run 'atlas index --reset-embeddings' to proceed."
                 + (f" This will re-embed: {affected}." if affected else "")
             )
             raise RuntimeError(msg)
@@ -1166,12 +1234,12 @@ async def _check_model_lock(
         await graph.set_embedding_config(model, dimension)
         await graph.set_project_embedding_model(project, model)
         logger.info("Cleared {:,} vectors for the dimension change", cleared)
-        return
+        return True
 
     # -- Model: per project -------------------------------------------------- #
     project_model = await graph.get_project_embedding_model(project)
     if project_model == model:
-        return
+        return False
 
     if project_model is None:
         # A project indexed before the per-project lock existed. Its vectors were
@@ -1184,18 +1252,18 @@ async def _check_model_lock(
             logger.warning(
                 "Project '{}' has {:,} vectors but no recorded embedding model; adopting the "
                 "configured '{}'. If you changed the model while indexing was failing, those "
-                "vectors are from the old one — run 'atlas index --full' to re-embed.",
+                "vectors are from the old one — run 'atlas index --reset-embeddings' to re-embed.",
                 project,
                 existing,
                 model,
             )
-        return
+        return False
 
     if not reindex:
         models = await graph.get_embedding_models_by_project()
         msg = (
             f"Embedding model for project '{project}' changed from '{project_model}' to "
-            f"'{model}'. Run 'atlas index --full' to re-embed this project — other projects "
+            f"'{model}'. Run 'atlas index --reset-embeddings' to re-embed this project — other projects "
             "in this database are unaffected." + _describe_other_projects(models, project)
         )
         raise RuntimeError(msg)
@@ -1209,6 +1277,7 @@ async def _check_model_lock(
         project,
         cleared,
     )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1606,15 +1675,27 @@ async def _run_pipeline(
     *,
     project_root: Path | None = None,
     project_filter: set[str] | None = None,
+    reconcile_projects: set[str] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
     reindex_mode: bool = False,
+    force_reparse: bool = False,
 ) -> tuple[ASTConsumer, bool]:
     """Start inline consumers and wait for the pipeline to drain.
 
     Returns the AST consumer (so callers can read accumulated stats) and
     whether the pipeline fully drained before the timeout.
     When *reindex_mode* is True, reindex-tuned policies are used for
-    faster polling.
+    faster polling. *force_reparse* is a different question and deliberately a
+    different flag: reindex_mode is throughput tuning and is also true for a
+    naturally escalated delta, while force_reparse tells the AST stage to distrust
+    the ``file_hash`` gate (ADR-0042 axis B).
+
+    *reconcile_projects* defaults to *project_filter* and widens only the
+    unembedded-entity sweep. ``clear_embeddings`` matches name-or-prefix, so a
+    ``--reset-embeddings`` can strip vectors from sub-projects this run never
+    publishes; reconciling only the published set would walk away from vectors the
+    same command destroyed. ``EmbedDirty`` is exempt from the consumer's project
+    filter, so widening the sweep needs no matching change there.
     """
     await bus.ensure_group(Topic.FILE_CHANGED, "ast")
 
@@ -1627,7 +1708,13 @@ async def _run_pipeline(
     )
 
     ast_consumer = ASTConsumer(
-        bus, graph, settings, project_root=project_root, project_filter=project_filter, policy=ast_policy
+        bus,
+        graph,
+        settings,
+        project_root=project_root,
+        project_filter=project_filter,
+        policy=ast_policy,
+        force_reparse=force_reparse,
     )
     ast_task = asyncio.create_task(ast_consumer.run())
 
@@ -1654,18 +1741,19 @@ async def _run_pipeline(
         )
         # Only worth reconciling once the run's own work has settled, and only while
         # these consumers are still alive to act on what it finds.
-        if (
-            drained
-            and embed is not None
-            and project_filter
-            and await _reconcile_missing_embeddings(graph, bus, project_filter)
-        ):
-            drained = await _wait_for_drain(
+        sweep = reconcile_projects or project_filter
+        if drained and embed is not None and sweep:
+            drained = await _reconcile_until_embedded(
+                graph,
                 bus,
-                drain_timeout_s,
-                embed_enabled=True,
-                on_drain_progress=on_drain_progress,
-                settle_s=_DRAIN_SETTLE_S,
+                sweep,
+                lambda: _wait_for_drain(
+                    bus,
+                    drain_timeout_s,
+                    embed_enabled=True,
+                    on_drain_progress=on_drain_progress,
+                    settle_s=_DRAIN_SETTLE_S,
+                ),
             )
     finally:
         ast_consumer.stop()
@@ -1938,10 +2026,51 @@ async def _publish_events(
         FileChanged(path=file_path, change_type="created", project_name=project_name, project_root=project_root)
         for file_path in files
     ]
+    # A file deleted since the last index is not in *files*, so nothing else would ever
+    # tell the AST stage about it — see _reconcile_full_deletions for why that used to be
+    # covered and no longer is.
+    full_events.extend(
+        FileChanged(path=fp, change_type="deleted", project_name=project_name, project_root=project_root)
+        for fp in decision.files_deleted
+    )
     if full_events:
         await bus.publish_many(Topic.FILE_CHANGED, full_events)
     logger.debug("Published {} FileChanged events (full)", len(full_events))
     return len(full_events)
+
+
+async def _reconcile_full_deletions(
+    graph: GraphClient,
+    project_name: str,
+    files: Iterable[str],
+    decision: _DeltaDecision,
+    *,
+    enabled: bool,
+) -> _DeltaDecision:
+    """Give an explicit ``--full`` the deleted-file set its delta sibling already computes.
+
+    ``_publish_events``' full branch emits one ``created`` per file that exists on disk, so
+    nothing tells the AST stage about a file deleted since the last index. Until ADR-0042
+    split the flags, ``--full`` covered that by deleting the whole project first; now that it
+    destroys nothing, a deleted or renamed file would keep its entities, edges and vectors
+    forever, because the hash gate guarantees no later run revisits them.
+
+    Keyed on the *flag*, never on ``decision.mode == "full"``. ``_decide_delta_mode`` returns
+    a full decision with an empty ``files_deleted`` in several places where that emptiness is
+    the point — most sharply ``_decide_empty_scan_deletion``, where a zero-file scan git does
+    not corroborate (an unmounted path, an `rm -rf` mid-checkout) must leave the graph alone
+    rather than read as "every file was deleted". Reconciling those would turn a transient
+    misconfiguration into a wipe, which is the opposite of this epic.
+
+    After ``--reset`` there is nothing left to reconcile against, so the caller passes False.
+    """
+    if not enabled or decision.mode != "full":
+        return decision
+    stale = await graph.get_project_file_paths(project_name) - set(files)
+    if not stale:
+        return decision
+    logger.debug("Full index of '{}': reconciling {} file(s) deleted since the last run", project_name, len(stale))
+    return _DeltaDecision("full", decision.files_added, decision.files_modified, stale)
 
 
 def _record_index_metrics(span: Any, mode: str, files: int, entities: int, duration: float) -> None:
@@ -1963,6 +2092,8 @@ async def index_project(
     *,
     scope_paths: list[str] | None = None,
     full_reindex: bool = False,
+    reset: bool = False,
+    reset_embeddings: bool = False,
     drain_timeout_s: float = 600.0,
     project_name: str | None = None,
     project_root: Path | None = None,
@@ -1970,8 +2101,12 @@ async def index_project(
 ) -> IndexResult:
     """Run a full or delta index of the project through the event pipeline.
 
+    Three independent axes, one flag each (ADR-0042): *full_reindex* enumerates every
+    file and distrusts the ``file_hash`` gate and destroys nothing; *reset* deletes the
+    project's data first; *reset_embeddings* drops its vectors and keeps the graph.
+
     1. Scan files
-    2. Optionally wipe old data (full reindex)
+    2. Optionally wipe old data (reset)
     3. Decide full vs. delta mode (git diff, threshold check)
     4. Create Project + Package hierarchy in the graph
     5. Publish FileChanged events to Valkey (all or delta-only)
@@ -1997,6 +2132,8 @@ async def index_project(
                 bus,
                 scope_paths=scope_paths,
                 full_reindex=full_reindex,
+                reset=reset,
+                reset_embeddings=reset_embeddings,
                 drain_timeout_s=drain_timeout_s,
                 project_name=project_name,
                 project_root=project_root,
@@ -2006,13 +2143,15 @@ async def index_project(
             )
 
 
-async def _index_project_inner(
+async def _index_project_inner(  # noqa: PLR0915
     settings: AtlasSettings,
     graph: GraphClient,
     bus: EventBus,
     *,
     scope_paths: list[str] | None = None,
     full_reindex: bool = False,
+    reset: bool = False,
+    reset_embeddings: bool = False,
     drain_timeout_s: float = 600.0,
     project_name: str,
     project_root: Path | None = None,
@@ -2038,26 +2177,41 @@ async def _index_project_inner(
     if settings.embeddings.enabled:
         embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
 
-    if full_reindex:
-        logger.debug("Full reindex: deleting existing data for '{}'", project_name)
+    if reset:
+        # The flush is here and not under --full because the streams are shared: an
+        # XTRIM discards a concurrent daemon's queued work for every project, not just
+        # this one (ADR-0009). A --full deletes nothing, so it has nothing to flush.
+        logger.debug("Reset: deleting existing data for '{}'", project_name)
         await bus.flush()
         await graph.delete_project_data(project_name)
 
+    cleared_by_lock = False
     if settings.embeddings.enabled and embed is not None:
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
-        await _check_model_lock(
+        # The opt-in is destruction, never enumeration. --full authorising a
+        # database-wide clear_embeddings is the coupling ADR-0042 exists to break.
+        cleared_by_lock = await _check_model_lock(
             graph,
             settings.embeddings.model,
             dimension,
             project=project_name,
-            reindex=full_reindex,
+            reindex=reset or reset_embeddings,
         )
+    if reset_embeddings and not cleared_by_lock:
+        # The lock clears only when the model or dimension actually moved, so an
+        # unchanged config -- or --no-embed, which skips the lock entirely -- would make
+        # --reset-embeddings a confirmed no-op. Scoped to this project (name-or-prefix)
+        # because nothing global changed: clearing every project for one project's
+        # request is ATL-135.
+        cleared = await graph.clear_embeddings(project_name)
+        logger.info("Cleared {:,} vector(s) for project '{}'", cleared, project_name)
 
     # 3. Decide full vs. delta mode
-    if full_reindex:
+    if full_reindex or reset:
         decision = _DeltaDecision("full", set(), set(), set())
     else:
         decision = await _decide_delta_mode(settings, graph, project_name, project_root, set(files))
+    decision = await _reconcile_full_deletions(graph, project_name, files, decision, enabled=full_reindex and not reset)
 
     # 4. Create Project + Package hierarchy
     pkg_count = await _create_package_hierarchy(graph, project_name, project_root)
@@ -2072,10 +2226,14 @@ async def _index_project_inner(
     )
 
     # 7. Start inline consumers and wait for drain
-    reindex_mode = full_reindex or decision.mode == "full"
+    reindex_mode = full_reindex or reset or decision.mode == "full"
     ast_stats = None
     drained = True
-    if published > 0:
+    # --reset-embeddings publishes nothing on an unchanged tree, and the only pass that
+    # re-queues vector-less entities (_reconcile_missing_embeddings) lives inside
+    # _run_pipeline -- so without the second clause the flag clears every vector and
+    # re-embeds none. The AST stage still receives no events, so nothing is re-parsed.
+    if published > 0 or (reset_embeddings and embed is not None):
         ast_consumer, drained = await _run_pipeline(
             bus,
             graph,
@@ -2084,8 +2242,12 @@ async def _index_project_inner(
             drain_timeout_s,
             project_root=project_root,
             project_filter={project_name},
+            reconcile_projects=await _cleared_embedding_scope(
+                graph, project_name, cleared=reset_embeddings or cleared_by_lock
+            ),
             on_drain_progress=on_drain_progress,
             reindex_mode=reindex_mode,
+            force_reparse=full_reindex or reset,
         )
         ast_stats = ast_consumer.stats
 
@@ -2150,6 +2312,8 @@ async def index_monorepo(
     *,
     scope_projects: list[str] | None = None,
     full_reindex: bool = False,
+    reset: bool = False,
+    reset_embeddings: bool = False,
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
@@ -2175,6 +2339,8 @@ async def index_monorepo(
                 bus,
                 scope_projects=scope_projects,
                 full_reindex=full_reindex,
+                reset=reset,
+                reset_embeddings=reset_embeddings,
                 drain_timeout_s=drain_timeout_s,
                 on_progress=on_progress,
                 on_drain_progress=on_drain_progress,
@@ -2203,6 +2369,7 @@ async def publish_project_changes(
     files: list[str],
     *,
     full_reindex: bool = False,
+    reset: bool = False,
     exclude_package_dirs: list[str] | None = None,
 ) -> _ProjectPublishResult:
     """Scan, decide delta/full, create packages, and publish events for one project.
@@ -2213,15 +2380,20 @@ async def publish_project_changes(
 
     Does NOT create consumers or wait for drain — callers manage the shared pipeline.
     """
-    if full_reindex:
-        logger.debug("Full reindex: deleting existing data for '{}'", project_name)
+    if reset:
+        # The monorepo's per-sub-project delete. delete_project_data is exact-match, so
+        # this loop -- once per detected sub-project, with its own prefixed name -- is
+        # how one --reset reaches N projects. The CLI preflight enumerates that same
+        # list rather than a prefix match over the graph.
+        logger.debug("Reset: deleting existing data for '{}'", project_name)
         await graph.delete_project_data(project_name)
 
     # Decide full vs. delta mode
-    if full_reindex:
+    if full_reindex or reset:
         decision = _DeltaDecision("full", set(), set(), set())
     else:
         decision = await _decide_delta_mode(settings, graph, project_name, project_root, set(files))
+    decision = await _reconcile_full_deletions(graph, project_name, files, decision, enabled=full_reindex and not reset)
 
     # Create Project + Package hierarchy
     pkg_count = await _create_package_hierarchy(graph, project_name, project_root, exclude_dirs=exclude_package_dirs)
@@ -2257,6 +2429,8 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     *,
     scope_projects: list[str] | None = None,
     full_reindex: bool = False,
+    reset: bool = False,
+    reset_embeddings: bool = False,
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
@@ -2273,7 +2447,15 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
     if not sub_projects:
         logger.info("No sub-projects detected — falling back to single-project index")
-        result = await index_project(settings, graph, bus, full_reindex=full_reindex, drain_timeout_s=drain_timeout_s)
+        result = await index_project(
+            settings,
+            graph,
+            bus,
+            full_reindex=full_reindex,
+            reset=reset,
+            reset_embeddings=reset_embeddings,
+            drain_timeout_s=drain_timeout_s,
+        )
         return [result]
 
     logger.info("Detected {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
@@ -2284,27 +2466,17 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     # project's package hierarchy.
     all_sub_paths = [sp.path for sp in sub_projects]
 
-    # Filter by scope_projects if specified (matches on bare DetectedProject.name)
-    if scope_projects:
-        filtered: list[DetectedProject] = []
-        for sp in sub_projects:
-            for pattern in scope_projects:
-                if sp.name == pattern or fnmatch.fnmatch(sp.name, pattern):
-                    filtered.append(sp)
-                    break
-        sub_projects = filtered
-        logger.info("Scoped to {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
-
-    # Filter by settings.scope.paths (repo-root-relative) if configured -- a
-    # sub-project with zero overlap is outside the configured scope and must not
-    # be indexed at all. One that does overlap is scanned with a translated,
-    # sub-relative prefix list (see _sub_project_scope_paths at its call site below).
-    if settings.scope.paths:
-        in_scope = [sp for sp in sub_projects if _sub_project_in_scope(settings.scope.paths, sp.path)]
-        if len(in_scope) != len(sub_projects):
-            dropped = sorted({sp.name for sp in sub_projects} - {sp.name for sp in in_scope})
-            logger.info("Outside scope.paths, skipping sub-project(s): {}", ", ".join(dropped))
-        sub_projects = in_scope
+    # Filter by --project globs and by settings.scope.paths. Shared with the CLI's
+    # destructive preflight, which has to name exactly the projects a --reset will
+    # delete -- a sub-project with zero scope overlap is outside the configured scope
+    # and must not be indexed at all. One that does overlap is scanned with a
+    # translated, sub-relative prefix list (see _sub_project_scope_paths below).
+    selected = select_sub_projects(sub_projects, settings, scope_projects)
+    if len(selected) != len(sub_projects):
+        dropped = sorted({sp.name for sp in sub_projects} - {sp.name for sp in selected})
+        logger.info("Skipping sub-project(s) outside --project / scope.paths: {}", ", ".join(dropped))
+    sub_projects = selected
+    logger.info("Indexing {} sub-project(s): {}", len(sub_projects), ", ".join(sp.name for sp in sub_projects))
 
     # Topological sort: process dependency packages before dependents
     dep_graph = _build_project_dep_graph(sub_projects)
@@ -2322,22 +2494,28 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
 
     # --- Shared embedding resources (created once) ---
     embed: EmbedClient | None = None
+    cleared_by_lock = False
     if settings.embeddings.enabled:
         embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
-        await _check_model_lock(
+        # Destruction is the opt-in, not enumeration -- see _index_project_inner.
+        cleared_by_lock = await _check_model_lock(
             graph,
             settings.embeddings.model,
             dimension,
             project=root_name,
-            reindex=full_reindex,
+            reindex=reset or reset_embeddings,
         )
+    if reset_embeddings and not cleared_by_lock:
+        # Name-or-prefix, so one call reaches the root and every "{root}/" child.
+        cleared = await graph.clear_embeddings(root_name)
+        logger.info("Cleared {:,} vector(s) for '{}' and its sub-projects", cleared, root_name)
 
-    if full_reindex:
+    if reset:
         await bus.flush()
 
     # --- Start shared consumers (once for entire monorepo) ---
-    reindex_mode = full_reindex
+    reindex_mode = full_reindex or reset
 
     await bus.ensure_group(Topic.FILE_CHANGED, "ast")
 
@@ -2348,7 +2526,9 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         else None
     )
 
-    ast_consumer = ASTConsumer(bus, graph, settings, project_root=project_root, policy=ast_policy)
+    ast_consumer = ASTConsumer(
+        bus, graph, settings, project_root=project_root, policy=ast_policy, force_reparse=full_reindex or reset
+    )
 
     consumer_tasks: list[asyncio.Task[None]] = []
     consumer_tasks.append(asyncio.create_task(ast_consumer.run()))
@@ -2381,6 +2561,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 sub.root,
                 sub_files,
                 full_reindex=full_reindex,
+                reset=reset,
             )
             publish_results.append(pr)
 
@@ -2404,6 +2585,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                 project_root,
                 root_only_files,
                 full_reindex=full_reindex,
+                reset=reset,
                 exclude_package_dirs=all_sub_paths,
             )
             publish_results.append(root_pr)
@@ -2420,15 +2602,25 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             settle_s=_DRAIN_SETTLE_S,
         )
         if drained and embed is not None:
-            names = [pr.project_name for pr in publish_results]
-            if await _reconcile_missing_embeddings(graph, bus, names):
-                drained = await _wait_for_drain(
+            names = {pr.project_name for pr in publish_results}
+            # The clear reaches every "{root}/" child, including sub-projects a --project
+            # scope kept this run from publishing. Sweeping only the published set is how
+            # one flag destroys a sibling's vectors and then walks away from them.
+            names |= (
+                await _cleared_embedding_scope(graph, root_name, cleared=reset_embeddings or cleared_by_lock) or set()
+            )
+            drained = await _reconcile_until_embedded(
+                graph,
+                bus,
+                names,
+                lambda: _wait_for_drain(
                     bus,
                     drain_timeout_s,
                     embed_enabled=True,
                     on_drain_progress=on_drain_progress,
                     settle_s=_DRAIN_SETTLE_S,
-                )
+                ),
+            )
 
     finally:
         # --- Tear down consumers (once) ---
@@ -2509,8 +2701,8 @@ def _build_delta_stats(decision: _DeltaDecision, ast_stats: Any) -> DeltaStats:
     )
 
 
-async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, project_names: Iterable[str]) -> int:
-    """Republish embed work for entities that hold no vector, and return how many.
+async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, project_names: Iterable[str]) -> set[str]:
+    """Republish embed work for entities that hold no vector, and return their uids.
 
     The AST stage already refuses to re-embed an entity that has one
     (``has_embedding``, consumers.py) — but that check is downstream of two
@@ -2526,6 +2718,7 @@ async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, proje
     and it catches every cause rather than the one that happened to be found.
     """
     refs: list[Event] = []
+    queued: set[str] = set()
     for project_name in project_names:
         for uid, label, file_path in await graph.find_unembedded_entities(project_name):
             # EntityRef.qualified_name carries the *uid* — the embed consumer feeds it
@@ -2537,6 +2730,7 @@ async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, proje
                     significance=Significance.HIGH,
                 )
             )
+            queued.add(uid)
     if refs:
         logger.warning(
             "Re-queued {} entity(ies) that had no embedding — earlier embed work was lost, "
@@ -2544,7 +2738,62 @@ async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, proje
             len(refs),
         )
         await bus.publish_many(Topic.EMBED_DIRTY, refs)
-    return len(refs)
+    return queued
+
+
+async def _cleared_embedding_scope(graph: GraphClient, project_name: str, *, cleared: bool) -> set[str] | None:
+    """Every project a ``clear_embeddings(project_name)`` reached, or None if none did.
+
+    ``clear_embeddings`` matches name-or-prefix in one call, so it strips ``{root}/{sub}``
+    even when the run was scoped to one sub-project or to the root alone. The sweep that
+    re-embeds afterwards is driven by what this run *published*, which is the narrower set
+    — so without this, a ``--reset-embeddings --project auth`` destroys ``myrepo/shared``'s
+    vectors and never puts them back, and only a separate index of that sub-project would
+    notice.
+    """
+    if not cleared:
+        return None
+    return {project_name, *(row["name"] for row in await graph.count_project_data(project_name))}
+
+
+async def _reconcile_until_embedded(
+    graph: GraphClient,
+    bus: EventBus,
+    project_names: Iterable[str],
+    drain: Callable[[], Awaitable[bool]],
+) -> bool:
+    """Re-queue vector-less entities and drain, repeatedly, until none are left.
+
+    ``find_unembedded_entities`` is capped at 5,000 per project, so one pass restores at
+    most that many. That cap is invisible while the only caller is a delta run healing a
+    handful of lost ``EmbedDirty`` events, and fatal for ``--reset-embeddings``, which
+    deliberately empties the whole project: on the 35,104-entity project ADR-0042 cites,
+    a single pass would re-embed 5,000, exit 0, and leave 30,104 entities unsearchable.
+    A later ``atlas index`` cannot recover them either — on an unchanged tree it publishes
+    nothing and never starts a pipeline for the reconcile to run in.
+
+    Stops when a pass re-queues exactly what the one before it did. That means the embed
+    stage is not making progress on those entities (an over-length node, a provider
+    rejecting them), and another lap would only re-bill work that already failed.
+    """
+    names = list(project_names)
+    drained = True
+    previous: set[str] | None = None
+    while True:
+        queued = await _reconcile_missing_embeddings(graph, bus, names)
+        if not queued:
+            return drained
+        if queued == previous:
+            logger.warning(
+                "{} entity(ies) still hold no embedding after a pass that re-queued the same work — "
+                "stopping rather than paying for it again; check the embed stage logs",
+                len(queued),
+            )
+            return drained
+        previous = queued
+        drained = await drain()
+        if not drained:
+            return False
 
 
 async def _wait_for_drain(

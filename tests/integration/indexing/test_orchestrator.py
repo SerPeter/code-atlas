@@ -4,13 +4,27 @@ from __future__ import annotations
 
 import subprocess
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
+from code_atlas.chunking import SplitResult
 from code_atlas.events import Topic
 from code_atlas.indexing.orchestrator import StalenessChecker, index_monorepo, index_project
-from code_atlas.schema import NodeLabel, RelType
-from code_atlas.settings import AtlasSettings, IndexSettings, derive_project_name
+from code_atlas.schema import (
+    _EMBEDDABLE_LABELS,
+    FILE_HASH_LABELS,
+    NodeLabel,
+    RelType,
+    generate_clear_file_hashes_ddl,
+)
+from code_atlas.settings import (
+    AtlasSettings,
+    EmbeddingSettings,
+    IndexSettings,
+    RationaleSettings,
+    derive_project_name,
+)
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
 if TYPE_CHECKING:
@@ -412,12 +426,18 @@ class TestPipelineDurabilityIntegration:
         assert r2.entities_total > 0
         assert await graph_client.get_project_git_hash(project_name) == _get_head(tmp_path)
 
-    async def test_full_reindex_preserves_foreign_consumer_group(self, tmp_path, graph_client, event_bus):
-        """S7(e): a full reindex must not destroy consumer groups a live daemon depends on.
+    async def test_reset_preserves_foreign_consumer_group(self, tmp_path, graph_client, event_bus):
+        """S7(e): a destructive reindex must not destroy consumer groups a live daemon depends on.
 
         Before the fix ``bus.flush()`` destroyed every consumer group on the
         pipeline streams, permanently killing a concurrently running daemon's
         consumers.
+
+        ``reset``, not ``full_reindex``: since ADR-0042 the flush is the one thing
+        ``--reset`` does and ``--full`` does not, because the streams are shared and a
+        run that deletes nothing has nothing to discard. Left on ``full_reindex=True``
+        this test went green by never flushing at all -- passing for the absence of the
+        very call it exists to guard.
         """
         _write(tmp_path, "app.py", "x = 1\n")
         settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
@@ -428,9 +448,7 @@ class TestPipelineDurabilityIntegration:
         key = event_bus._stream_key(Topic.FILE_CHANGED)
 
         try:
-            await index_project(
-                settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
-            )
+            await index_project(settings, graph_client, event_bus, reset=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
 
             groups = await event_bus._redis.xinfo_groups(key)
             names = set()
@@ -699,12 +717,15 @@ class TestEmbeddingReconciliation:
         await graph_client.ensure_schema()
         await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
 
-        before = len(await graph_client.find_unembedded_entities(project))
-        assert before
+        unembedded = {uid for uid, _, _ in await graph_client.find_unembedded_entities(project)}
+        assert unembedded
 
         await event_bus.ensure_group(Topic.EMBED_DIRTY, "reconcile-test")
+        # Returns the uids it re-queued, not a count: the caller loops until a pass
+        # re-queues the same set twice, which is how it tells "still working" from
+        # "these will never embed" without paying for the second one.
         queued = await _reconcile_missing_embeddings(graph_client, event_bus, [project])
-        assert queued == before
+        assert queued == unembedded
 
         published = await event_bus.read_batch(Topic.EMBED_DIRTY, "reconcile-test", "c1", count=1, block_ms=500)
         assert published
@@ -713,3 +734,522 @@ class TestEmbeddingReconciliation:
         # The republished ref must round-trip through the same lookup the consumer uses.
         props = await graph_client.read_entity_texts([event.entity.qualified_name])
         assert props, "republished ref did not resolve — the consumer would no-op on it"
+
+
+# ---------------------------------------------------------------------------
+# Reindex scope vs. destruction — ADR-0042 / ATL-148 (require Memgraph + Valkey)
+# ---------------------------------------------------------------------------
+
+
+_FAKE_MODEL = "atlas-test/fake-embed"
+"""Recorded as the project's embedding model, so the per-project model lock sees the
+same value across the several index runs each test below performs and never decides
+it has vectors to clear on its own."""
+
+
+class _CountingEmbedClient:
+    """A stand-in provider that records what it was asked to embed.
+
+    Spend is asserted on this counter and never on elapsed time. The claim ADR-0042
+    makes is that a ``--full`` re-check is free *in provider calls*; a timing assertion
+    would go green on a fast machine that billed for every entity in the project.
+
+    Implements only the surface the index path actually touches: the async-context
+    protocol (``index_project`` enters the client on an exit stack), ``detect_dimension``
+    for the dimension probe, the three attributes ``EmbedConsumer`` reads in its
+    constructor, and ``split_text`` — part of the client contract since ATL-140, and a
+    fake without it stalls the consumer in a retry loop that reads as a hang.
+    """
+
+    def __init__(self, model: str, dimension: int) -> None:
+        self.max_concurrency = 1
+        self.batch_size = 32
+        self.configured_model = model
+        self._dimension = dimension
+        self.calls = 0
+        self.texts: list[str] = []
+
+    async def __aenter__(self) -> _CountingEmbedClient:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+    async def detect_dimension(self) -> int:
+        return self._dimension
+
+    def split_text(self, text: str) -> SplitResult:
+        return SplitResult([text], False, 0)
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        self.texts.extend(texts)
+        return [[0.1] * self._dimension for _ in texts]
+
+
+def _embedding_settings(dimension: int) -> EmbeddingSettings:
+    """Embeddings on, pinned to the vector indices' dimension and to the fake model."""
+    return EmbeddingSettings(model=_FAKE_MODEL, dimension=dimension)
+
+
+async def _blast_radius(graph_client, project: str) -> dict[str, int]:
+    """The row ``count_project_data`` reports for *project* itself.
+
+    Deliberately the same read the destructive preflight prints, so a test asserting
+    "nothing was removed" asserts on the number a user would have been shown.
+    """
+    rows = await graph_client.count_project_data(project)
+    row = next((r for r in rows if r["name"] == project), None)
+    # Not a convenience default: ADR-0042 makes "nothing there" and "the count failed"
+    # mean opposite things, so a missing row is a failure and must say so rather than
+    # surfacing as `RuntimeError: coroutine raised StopIteration`.
+    assert row is not None, f"count_project_data reported no row for {project!r}"
+    return row
+
+
+async def _file_hashes(graph_client, project: str) -> dict[str, str | None]:
+    """``file_path -> file_hash`` across every label the gate stores one on.
+
+    ``None`` for a node carrying no hash — the state a schema migration's
+    ``generate_clear_file_hashes_ddl`` leaves behind, and the state a gate-distrusting
+    run that stopped *writing* hashes when it stopped *reading* them would leave behind
+    for every file it parsed.
+    """
+    out: dict[str, str | None] = {}
+    for label in FILE_HASH_LABELS:
+        records = await graph_client.execute(
+            f"MATCH (n:{label} {{project_name: $p}}) RETURN n.file_path AS fp, n.file_hash AS fh",
+            {"p": project},
+        )
+        out.update({r["fp"]: r["fh"] for r in records})
+    return out
+
+
+async def _entities_for_file(graph_client, project: str, file_path: str) -> set[str]:
+    """Every entity uid the graph still holds for *file_path*, node label included."""
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $p, file_path: $fp}}) RETURN n.uid AS uid",
+        {"p": project, "fp": file_path},
+    )
+    return {r["uid"] for r in records}
+
+
+async def _mark_module(graph_client, project: str, file_path: str) -> None:
+    """Stamp a property no writer sets onto the Module node for *file_path*."""
+    await graph_client.execute_write(
+        f"MATCH (n:{NodeLabel.MODULE} {{project_name: $p, file_path: $fp}}) SET n.atl148_marker = 'survived'",
+        {"p": project, "fp": file_path},
+    )
+
+
+async def _module_mark(graph_client, project: str, file_path: str) -> str | None:
+    """The mark, or ``None`` once the node it sat on has been destroyed and rebuilt.
+
+    Counts alone cannot separate a re-check from a delete-and-rebuild: both end with
+    the same numbers, which is exactly why the old ``--full`` could be swapped for the
+    new one and every count-based test would still pass.
+    """
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.MODULE} {{project_name: $p, file_path: $fp}}) RETURN n.atl148_marker AS m",
+        {"p": project, "fp": file_path},
+    )
+    return records[0]["m"] if records else None
+
+
+async def _entity_source(graph_client, project: str, name: str) -> str:
+    """The stored ``source`` of the single Callable called *name*."""
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.CALLABLE} {{project_name: $p, name: $n}}) RETURN n.source AS source",
+        {"p": project, "n": name},
+    )
+    assert len(records) == 1, f"expected exactly one callable named {name}, got {len(records)}"
+    return records[0]["source"] or ""
+
+
+async def _searchable_vectors(graph_client, project: str) -> int:
+    """How many of *project*'s vectors a vector index actually serves.
+
+    Deliberately narrower than ``count_project_data``'s ``embedded_nodes``, which counts
+    every vector a destructive run would remove. Package and DocFile nodes are given a
+    vector by the AST stage but have no vector index, so ``find_unembedded_entities``
+    excludes them on purpose and a clear is one-way for exactly those two labels. This
+    is the number that has to come back.
+    """
+    labels = "|".join(sorted(lbl.value for lbl in _EMBEDDABLE_LABELS))
+    records = await graph_client.execute(
+        f"MATCH (n:{labels}) WHERE n.project_name = $p AND n.embedding IS NOT NULL RETURN count(n) AS c",
+        {"p": project},
+    )
+    return records[0]["c"]
+
+
+async def _content_hashes(graph_client, project: str) -> dict[str, str]:
+    """``name -> content_hash`` for the project's callables — ADR-0042's layer 2."""
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.CALLABLE} {{project_name: $p}}) RETURN n.name AS name, n.content_hash AS h",
+        {"p": project},
+    )
+    return {r["name"]: r["h"] for r in records}
+
+
+class TestReindexScopeIsNotDestruction:
+    """ADR-0042's three axes, one flag each: ``--full`` re-checks, ``--reset`` destroys.
+
+    Every project here is deliberately **not** a git repo, so ``_decide_delta_mode``
+    returns ``full`` on every run and enumeration is never the variable under test. What
+    separates ``atlas index`` from ``atlas index --full`` in these tests is then exactly
+    one thing — whether the ``file_hash`` gate is trusted — which is axis B, the axis
+    that had no flag at all before this epic.
+    """
+
+    @pytest.fixture
+    def project_dir(self, tmp_path):
+        """A minimal Python project: three files, one of them a package marker."""
+        _write(tmp_path, "src/__init__.py", "")
+        _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
+        _write(tmp_path, "src/utils.py", "MAGIC = 42\n\ndef add(a, b):\n    return a + b\n")
+        return tmp_path
+
+    @pytest.fixture
+    def provider(self, graph_client):
+        """Patch the embedding provider into both orchestrator entry points."""
+        embed = _CountingEmbedClient(_FAKE_MODEL, graph_client._dimension)
+        with patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=embed):
+            yield embed
+
+    @pytest.fixture
+    def parse_calls(self, monkeypatch):
+        """Every path the AST stage genuinely handed to tree-sitter, in order.
+
+        A run that skipped every file and a run that re-parsed every file and found
+        nothing changed return the identical ``IndexResult``, so this is the only
+        signal that separates "distrusted the gate" from "trusted it".
+        """
+        from code_atlas.indexing import consumers
+
+        real = consumers.parse_file
+        seen: list[str] = []
+
+        def _counting(path, source, project_name, **kwargs):
+            seen.append(path)
+            return real(path, source, project_name, **kwargs)
+
+        monkeypatch.setattr(consumers, "parse_file", _counting)
+        return seen
+
+    # -- axis C: --full destroys nothing ------------------------------------ #
+
+    async def test_full_on_an_unchanged_project_costs_no_provider_call(
+        self, project_dir, graph_client, event_bus, provider, parse_calls
+    ):
+        """The headline claim: re-checking everything is free when nothing changed.
+
+        Cost ladders down four layers and money only enters at the bottom. ``--full``
+        skips layer 1 (``file_hash``) by design; layers 2-4 (``content_hash``,
+        ``embed_hash``, the ``(embed_hash, embed_model)`` dedup) are untouched and stop
+        the run before it reaches the provider.
+        """
+        settings = AtlasSettings(project_root=project_dir, embeddings=_embedding_settings(graph_client._dimension))
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        embedded = (await graph_client.count_embeddings_by_project()).get(project, 0)
+        assert embedded > 0, "the first index has to buy vectors, or a free re-check proves nothing"
+
+        provider.calls = 0
+        parse_calls.clear()
+        result = await index_project(
+            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+        )
+
+        assert result.mode == "full"
+        # Non-vacuous: a run that skipped every file would also report zero calls, for
+        # entirely the wrong reason.
+        assert parse_calls, "--full must distrust the gate and re-parse, or the zero below means nothing"
+        assert provider.calls == 0
+        assert (await graph_client.count_embeddings_by_project()).get(project, 0) == embedded
+
+    async def test_full_deletes_nothing(self, project_dir, graph_client, event_bus, parse_calls):
+        """``--full`` re-reads and re-parses every file and removes no node or edge."""
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await _mark_module(graph_client, project, "src/app.py")
+        before = await _blast_radius(graph_client, project)
+        assert before["nodes"] > 0
+        assert before["relationships"] > 0
+
+        parse_calls.clear()
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        after = await _blast_radius(graph_client, project)
+        assert parse_calls
+        assert (after["nodes"], after["relationships"]) == (before["nodes"], before["relationships"])
+        # The counts above survive a delete-and-rebuild too. This does not.
+        assert await _module_mark(graph_client, project, "src/app.py") == "survived"
+
+    async def test_full_still_reconciles_a_file_deleted_from_disk(
+        self, project_dir, graph_client, event_bus, parse_calls
+    ):
+        """Destroying nothing must not mean reconciling nothing.
+
+        ``_publish_events``' full branch emits one ``created`` per file that exists, so
+        nothing tells the AST stage about a file deleted since the last index. Deleting
+        the whole project first used to cover that; once ``--full`` stopped doing so, a
+        deleted or renamed file would keep its entities, edges and vectors forever —
+        and the hash gate guarantees no later run revisits them. Running ``--full``
+        again would not help, which is what makes it permanent rather than merely late.
+        """
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert await _entities_for_file(graph_client, project, "src/utils.py")
+
+        (project_dir / "src" / "utils.py").unlink()
+        parse_calls.clear()
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert not await _entities_for_file(graph_client, project, "src/utils.py")
+        # The surviving files are untouched — this reconciles the deletion, it does not
+        # fall back to rebuilding the project.
+        assert await _entities_for_file(graph_client, project, "src/app.py")
+
+    async def test_reset_deletes_and_rebuilds(self, project_dir, graph_client, event_bus, parse_calls):
+        """``--reset`` is the old ``--full``: the project's data goes, then comes back."""
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await _mark_module(graph_client, project, "src/app.py")
+        before = await _blast_radius(graph_client, project)
+
+        parse_calls.clear()
+        result = await index_project(
+            settings, graph_client, event_bus, reset=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+        )
+
+        after = await _blast_radius(graph_client, project)
+        assert result.mode == "full"
+        assert parse_calls
+        assert (after["nodes"], after["relationships"]) == (before["nodes"], before["relationships"])
+        # Same numbers, different nodes — which is the whole difference between the two
+        # flags, and the reason this pair of tests is written as a pair.
+        assert await _module_mark(graph_client, project, "src/app.py") is None
+
+    # -- axis B: distrusting the gate, without breaking it ------------------ #
+
+    async def test_full_repopulates_file_hash_for_every_file_it_parsed(
+        self, project_dir, graph_client, event_bus, parse_calls
+    ):
+        """Distrusting the gate must not stop the run writing to it.
+
+        ADR-0042 states it as a consequence worth naming: the first ``--full`` after an
+        upgrade is also what populates ``file_hash`` for files and labels that never had
+        one. The obvious implementation of axis B — compute the new hashes only on the
+        branch that also compares them — leaves a ``--full`` writing no hash at all, so
+        every following delta run re-parses the same files forever.
+
+        Clearing the hashes first is what makes this specific to ``--full``: it is the
+        state twelve schema migrations deliberately create with
+        ``generate_clear_file_hashes_ddl`` to force exactly this run.
+        """
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        baseline = await _file_hashes(graph_client, project)
+        assert baseline, "the ordinary path has to store hashes first"
+        assert all(baseline.values())
+
+        await graph_client.execute_write(generate_clear_file_hashes_ddl())
+        assert not any((await _file_hashes(graph_client, project)).values())
+
+        parse_calls.clear()
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert parse_calls
+        assert await _file_hashes(graph_client, project) == baseline
+
+    async def test_full_rewrites_exactly_what_a_config_change_moved(
+        self, tmp_path, graph_client, event_bus, provider, parse_calls
+    ):
+        """The case the epic exists for: bytes unchanged, extraction changed.
+
+        Widening ``[rationale] markers`` makes the parser attach a ``# WHY:`` comment to
+        the callable below it. No file's bytes moved, so the gate would skip everything;
+        ``--full`` distrusts it, re-parses, and layer 2 (``content_hash``) then decides
+        that exactly one entity is different.
+
+        The provider is still never asked about the entity that did not move — which is
+        the ladder working, not an accident of this fixture.
+        """
+        _write(
+            tmp_path,
+            "src/mod.py",
+            "# WHY: the retry cascade needs a wider window.\n"
+            "def widened():\n"
+            "    return 1\n"
+            "\n"
+            "def untouched():\n"
+            "    return 2\n",
+        )
+        narrow = AtlasSettings(
+            project_root=tmp_path,
+            rationale=RationaleSettings(markers=["NOTE"]),
+            embeddings=_embedding_settings(graph_client._dimension),
+        )
+        wide = AtlasSettings(
+            project_root=tmp_path,
+            rationale=RationaleSettings(markers=["NOTE", "WHY"]),
+            embeddings=_embedding_settings(graph_client._dimension),
+        )
+        await graph_client.ensure_schema()
+        project = derive_project_name(tmp_path)
+
+        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        before = await _content_hashes(graph_client, project)
+        assert set(before) == {"widened", "untouched"}
+
+        provider.texts.clear()
+        parse_calls.clear()
+        await index_project(wide, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert "src/mod.py" in parse_calls
+        after = await _content_hashes(graph_client, project)
+        assert after["widened"] != before["widened"], "the entity the config change reached must be rewritten"
+        assert after["untouched"] == before["untouched"], "and nothing else may be"
+        assert not [t for t in provider.texts if "untouched" in t], "an unmoved entity must not be re-embedded"
+
+    async def test_full_does_not_repair_a_source_truncated_under_a_narrower_cap(
+        self, tmp_path, graph_client, event_bus, parse_calls
+    ):
+        """Raising ``index.max_source_chars`` and running ``--full`` leaves ``source`` short.
+
+        Pinned, not endorsed. ``content_hash`` is computed *before* truncation
+        (``parsing/ast.py`` ``_finalize``) so that moving the cap is not a content change,
+        and the consequence is that layer 2 never fires for a cap change: the file is
+        genuinely re-read and re-parsed, every entity classifies as ``unchanged``, only
+        line positions are written, and the stored ``source`` stays cut at the old cap.
+
+        Axis B is doing its job here — ``parse_calls`` proves the re-parse happened — so
+        the gap is not in this epic's flag split. ATL-152's extraction epoch would not
+        close it either: that invalidates ``file_hash``, which is layer 1. Repairing this
+        means folding the cap into ``content_hash``.
+        """
+        body = "\n".join(f"    value_{i} = {i}" for i in range(60))
+        _write(tmp_path, "src/big.py", f"def big():\n{body}\n    return 1\n")
+        narrow = AtlasSettings(project_root=tmp_path, index=IndexSettings(max_source_chars=80), embeddings=NO_EMBED)
+        wide = AtlasSettings(project_root=tmp_path, index=IndexSettings(max_source_chars=50_000), embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(tmp_path)
+
+        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert len(await _entity_source(graph_client, project, "big")) == 80
+
+        parse_calls.clear()
+        await index_project(wide, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert "src/big.py" in parse_calls, "the file has to be re-parsed, or this pins the wrong thing"
+        assert len(await _entity_source(graph_client, project, "big")) == 80
+
+    # -- axis C: --reset-embeddings drops vectors and nothing else ---------- #
+
+    async def test_reset_embeddings_keeps_the_graph_and_re_embeds_without_reparsing(
+        self, project_dir, graph_client, event_bus, provider, parse_calls
+    ):
+        """Vectors go, the graph stays, and the next run pays the provider and nothing else.
+
+        Recovery is measured on the *searchable* vectors, not on the raw count, because
+        the two genuinely differ: Package and DocFile nodes are handed a vector by the
+        AST stage but no vector index serves them, so ``find_unembedded_entities``
+        excludes them and only a re-parse would ever write one again -- which the gate
+        correctly refuses. The clear is therefore one-way for those two labels. Nothing
+        searchable is lost, so it is a wart rather than a hole, but a test asserting the
+        raw count returns to its old value fails on it.
+        """
+        embedding = AtlasSettings(project_root=project_dir, embeddings=_embedding_settings(graph_client._dimension))
+        lightweight = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        before = await _blast_radius(graph_client, project)
+        before_searchable = await _searchable_vectors(graph_client, project)
+        hashes = await _file_hashes(graph_client, project)
+        assert before["embedded_nodes"] > 0
+
+        # --no-embed so the cleared state is observable at all: with the embed stage
+        # running, the same run's reconcile pass re-fills what it just dropped and the
+        # zero never exists anywhere a test can see it.
+        parse_calls.clear()
+        await index_project(
+            lightweight, graph_client, event_bus, reset_embeddings=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+        )
+
+        cleared = await _blast_radius(graph_client, project)
+        assert (cleared["embedded_nodes"], cleared["embed_chunks"]) == (0, 0)
+        assert (cleared["nodes"], cleared["relationships"]) == (before["nodes"], before["relationships"])
+        assert await _file_hashes(graph_client, project) == hashes
+        assert parse_calls == [], "dropping vectors is not a reason to re-parse anything"
+
+        # The next ordinary index re-embeds off the surviving graph. The gate still holds,
+        # so nothing is re-parsed and only the provider is paid.
+        provider.calls = 0
+        await index_project(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert parse_calls == []
+        assert provider.calls > 0
+        assert await _searchable_vectors(graph_client, project) == before_searchable
+        assert await graph_client.find_unembedded_entities(project) == []
+        assert await _file_hashes(graph_client, project) == hashes
+
+    async def test_reset_embeddings_on_a_sub_project_leaves_its_siblings_alone(
+        self, tmp_path, graph_client, event_bus, provider
+    ):
+        """ATL-135, at monorepo granularity: one project's clear reaches one project.
+
+        ``clear_embeddings`` matches name-or-prefix, so a clear scoped to
+        ``{root}/auth`` must reach ``{root}/auth`` and its own children and stop there —
+        not the sibling ``{root}/shared``, and not the bare root. Clearing every project
+        for one project's model change is how ATL-135 destroyed 6,691 vectors belonging
+        to a project nobody had asked about.
+        """
+        _write(tmp_path, "services/auth/pyproject.toml", '[project]\nname = "auth"\n')
+        _write(tmp_path, "services/auth/auth/service.py", "def authenticate():\n    return True\n")
+        _write(tmp_path, "libs/shared/pyproject.toml", '[project]\nname = "shared"\n')
+        _write(tmp_path, "libs/shared/shared/utils.py", "def validate():\n    return True\n")
+        _write(tmp_path, "tools/run.py", "def main():\n    return None\n")
+
+        embedding = AtlasSettings(project_root=tmp_path, embeddings=_embedding_settings(graph_client._dimension))
+        lightweight = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        root = derive_project_name(tmp_path)
+
+        await index_monorepo(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        before = await graph_client.count_embeddings_by_project()
+        assert before.get(f"{root}/auth", 0) > 0
+        assert before.get(f"{root}/shared", 0) > 0
+
+        # The sub-project entry point: index_project with the prefixed name and the
+        # sub-project's own root, which is how every monorepo member is addressed.
+        await index_project(
+            lightweight,
+            graph_client,
+            event_bus,
+            reset_embeddings=True,
+            project_name=f"{root}/auth",
+            project_root=tmp_path / "services" / "auth",
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+        )
+
+        after = await graph_client.count_embeddings_by_project()
+        assert after.get(f"{root}/auth", 0) == 0
+        assert after.get(f"{root}/shared") == before.get(f"{root}/shared")
+        assert after.get(root) == before.get(root)

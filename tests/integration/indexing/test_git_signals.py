@@ -121,7 +121,7 @@ class TestIndexCommandWithGitSignals:
 
         calls: list[str] = []
 
-        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex):
+        async def fake_single_with_spinner(settings, graph, bus, *, scope, full_reindex, **_reset_flags):
             calls.append("index")
             return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=0.0)
 

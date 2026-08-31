@@ -738,6 +738,7 @@ class ASTConsumer(TierConsumer):
         defer_to_lease: bool = False,
         lease_owner: str | None = None,
         abandoned_min_idle_ms: int = _ABANDONED_MIN_IDLE_MS,
+        force_reparse: bool = False,
     ) -> None:
         super().__init__(
             bus=bus,
@@ -755,6 +756,10 @@ class ASTConsumer(TierConsumer):
         self._project_root = project_root or Path(settings.project_root)
         self.stats = ASTStats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
+        # `atlas index --full` distrusts the file_hash gate without destroying
+        # anything (ADR-0042): re-parse every file, delete nothing. Never set in
+        # daemon mode — the watch loop's whole economy is the gate.
+        self._force_reparse = force_reparse
 
         # Per-file cooldown state (daemon mode). Cooldown-deferred events stay
         # un-ACKed in the PEL and are redelivered by the reclaim loop.
@@ -1291,7 +1296,7 @@ class ASTConsumer(TierConsumer):
                 root = effective_root if effective_root is not None else self._project_root
 
                 # 0. File hash gate — read files, compute hashes, skip unchanged
-                use_hash_gate = self.settings.index.file_hash_gate
+                use_hash_gate = self.settings.index.file_hash_gate and not self._force_reparse
                 strip_ws = self.settings.index.strip_whitespace
                 file_sources: dict[str, bytes] = {}  # file_path → source bytes (pre-read)
                 deleted_files: list[str] = []
@@ -1319,11 +1324,20 @@ class ASTConsumer(TierConsumer):
                         deferred_keys.add(f"{event_project_name}:{fp}")
                     self.stats.files_deferred += len(unreadable_paths)
 
-                # Apply hash gate to live files
+                # Hash every live file, gate or no gate. Deliberately OUTSIDE the
+                # branch below: the run that distrusts the gate is also the run that
+                # populates file_hash for files and labels that never carried one —
+                # a newly added FILE_HASH_LABELS entry, or a project indexed while
+                # `[index] file_hash_gate = false`. Computing hashes only on the gated
+                # path meant those files were re-parsed and then left with no stored
+                # hash at all, so the next delta run re-parsed them again, and so did
+                # every run after it, forever (ADR-0042).
+                new_hashes = {fp: _compute_file_hash(file_sources[fp], strip_whitespace=strip_ws) for fp in live_paths}
+
+                # Only the SKIP DECISION is conditional. With the gate off there is
+                # nothing to compare against, so get_batch_file_hashes is a round trip
+                # that serves nobody — it exists solely to answer "may I skip this".
                 if use_hash_gate and live_paths:
-                    new_hashes = {
-                        fp: _compute_file_hash(file_sources[fp], strip_whitespace=strip_ws) for fp in live_paths
-                    }
                     stored_hashes = await self.graph.get_batch_file_hashes(project_name, live_paths)
 
                     gate_passed: list[str] = []
@@ -1343,8 +1357,6 @@ class ASTConsumer(TierConsumer):
                             len(live_paths),
                         )
                     live_paths = gate_passed
-                else:
-                    new_hashes = {}
 
                 # 1. Parse loop (async, per-file) — no graph writes
                 parsed_files: dict[str, _ParsedFileData] = {}
