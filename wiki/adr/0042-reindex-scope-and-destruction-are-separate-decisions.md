@@ -2,7 +2,21 @@
 
 ## Status
 
-Proposed — 2026-08-31.
+Accepted — 2026-08-31.
+
+Decisions 1, 2 and 3 are implemented (ATL-148, ATL-149, ATL-150). Decisions 4 and 5 are not, and are tracked as ATL-151
+(`rels_hash`) and ATL-152 (extraction epoch); both are optimisations of a re-check that is already correct and
+non-destructive, so neither gates the split.
+
+Two things the implementation had to add that the reasoning below does not anticipate:
+
+- A non-destructive `--full` stops reconciling files **deleted from disk**. `_publish_events`' full branch emits one
+  `created` per file that exists, so `delete_project_data` was the only thing on that path removing entities for a file
+  since deleted. `_reconcile_full_deletions` restores that, and closes the same hole in the ratio-triggered escalation
+  to full, which never deleted either.
+- `--reset-embeddings` needs the unembedded sweep to **loop**. `find_unembedded_entities` is capped at 5,000 per
+  project, which is invisible while the only caller heals a handful of lost events and fatal for a flag that empties the
+  whole project: one pass would restore 5,000 of 35,104 and exit 0.
 
 ## Context
 

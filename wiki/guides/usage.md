@@ -12,9 +12,26 @@ atlas index /path/to/project
 # Index specific paths (monorepo)
 atlas index . --scope services/auth --scope libs/shared
 
-# Full re-index (re-embeds all entities)
+# Re-check every file: enumerate all of them and re-parse each one even if its
+# bytes are unchanged. Deletes nothing, and content/embedding hashes still decide
+# what is rewritten — so a re-check where nothing changed costs zero provider calls.
+# This is the one to reach for after a parser or configuration change.
 atlas index --full
+
+# DESTRUCTIVE — delete the project's graph data and rebuild it from scratch. On a
+# monorepo this deletes every sub-project the run visits. Prints what it is about to
+# remove and waits for a yes; --yes is required when there is no TTY.
+atlas index --reset --yes
+
+# DESTRUCTIVE — drop this project's vectors, embed hashes and EmbedChunk nodes and
+# keep the graph, so the next pass re-embeds without re-parsing. For a model or
+# dimension switch. A *dimension* change clears every project in the database,
+# because the vector indices are shared.
+atlas index --reset-embeddings --yes
 ```
+
+The three flags set three independent axes and cannot be combined — see
+[ADR-0042](../adr/0042-reindex-scope-and-destruction-are-separate-decisions.md).
 
 ## Search
 
