@@ -622,6 +622,19 @@ def _node_project_name(record: dict[str, Any]) -> str:
     return ""
 
 
+def _project_data_rows(rows: list[dict[str, Any]], project_name: str) -> list[dict[str, Any]]:
+    """Finish a ``count_project_data`` answer: *project_name* always gets a row, sorted.
+
+    Shared by both backends so the preflight cannot read differently depending on which
+    one answered. A project with nothing in it still gets a zeroed row -- "0 nodes" is
+    something a human can act on, where an empty list reads as "the count failed", and
+    ADR-0042 makes those two outcomes mean opposite things.
+    """
+    if not any(row["name"] == project_name for row in rows):
+        rows = [*rows, {"name": project_name, "nodes": 0, "relationships": 0, "embedded_nodes": 0, "embed_chunks": 0}]
+    return sorted(rows, key=lambda row: row["name"])
+
+
 def _record_uid(record: dict[str, Any]) -> str | None:
     """Extract uid from a record containing a neo4j Node."""
     node = record.get("node") or record.get("n")
@@ -2289,6 +2302,78 @@ class GraphClient:
             {"project_name": project_name},
         )
         return records[0]["cnt"] if records else 0
+
+    async def count_project_data(self, project_name: str) -> list[dict[str, Any]]:
+        """What a destructive run on *project_name* would remove, counted before it starts.
+
+        ADR-0042 decision 2: an operation on the destruction axis states its own blast
+        radius first, and one that cannot describe it aborts rather than proceed on an
+        estimate -- the failure it prevents is unrecoverable and metered. It has to be
+        its own read: ``DETACH DELETE n RETURN count(n)`` answers 0, because the rows
+        are gone before the aggregate runs (the same trap noted on
+        :meth:`gc_orphaned_embed_chunks`).
+
+        One row per project in scope -- the exact name plus every ``{project_name}/``
+        child -- because the two destructive calls reach that set by different routes:
+        a monorepo reset calls :meth:`delete_project_data` once per prefixed
+        sub-project, while :meth:`clear_embeddings` matches name-or-prefix in a single
+        call. The caller knows which of those it is about to run and renders the rows
+        that apply; one merged number would over-report for the other.
+
+        ``relationships`` counts every edge with at least one endpoint in that project,
+        which is exactly what ``DETACH DELETE`` removes -- including the cross-project
+        DEPENDS_ON/IMPORTS edges that re-indexing the target alone will not rebuild. An
+        edge between two in-scope projects therefore appears in both rows: render the
+        rows, never sum that column.
+        """
+        params = {"project": project_name, "prefix": f"{project_name}/"}
+        # Label-free, matching delete_project_data's own `MATCH (n {project_name: $p})`.
+        # Enumerating labels here would UNDER-report the moment a label is added to the
+        # writer and not to this list -- the one failure this read exists to prevent.
+        # It is not the slower choice either: the prefix half is STARTS WITH, which
+        # Memgraph plans as ScanAll even with a label and a (project_name) index.
+        #
+        # `'EmbedChunk' IN labels(n)` as an expression rather than a `WHERE n:EmbedChunk`
+        # predicate: a post-hoc label filter after an inline-property match is
+        # order-sensitive on this engine and silently drops rows.
+        rows = await self.execute(
+            "MATCH (n) WHERE n.project_name = $project OR n.project_name STARTS WITH $prefix "
+            "RETURN n.project_name AS name, count(n) AS nodes, "
+            f"sum(CASE WHEN n.embedding IS NOT NULL AND NOT ('{NodeLabel.EMBED_CHUNK}' IN labels(n)) "
+            "THEN 1 ELSE 0 END) AS embedded_nodes, "
+            f"sum(CASE WHEN '{NodeLabel.EMBED_CHUNK}' IN labels(n) THEN 1 ELSE 0 END) AS embed_chunks",
+            params,
+        )
+        # A second statement rather than an OPTIONAL MATCH folded into the first:
+        # expanding edges off the node match multiplies every node row by its degree,
+        # and the node counts above would be wrong by a factor nobody would notice.
+        # UNWIND both endpoints so an edge that LEAVES the project is still reported by
+        # the project it leaves; WITH DISTINCT collapses the double entry an internal
+        # edge produces, so each edge is counted once per project it touches.
+        edge_rows = await self.execute(
+            "MATCH (a)-[r]->(b) "
+            "WHERE a.project_name = $project OR a.project_name STARTS WITH $prefix "
+            "OR b.project_name = $project OR b.project_name STARTS WITH $prefix "
+            "UNWIND [a.project_name, b.project_name] AS name "
+            "WITH DISTINCT name, r "
+            "WHERE name = $project OR name STARTS WITH $prefix "
+            "RETURN name, count(r) AS relationships",
+            params,
+        )
+        rels = {r["name"]: r["relationships"] for r in edge_rows}
+        return _project_data_rows(
+            [
+                {
+                    "name": r["name"],
+                    "nodes": r["nodes"],
+                    "relationships": rels.get(r["name"], 0),
+                    "embedded_nodes": r["embedded_nodes"],
+                    "embed_chunks": r["embed_chunks"],
+                }
+                for r in rows
+            ],
+            project_name,
+        )
 
     # -- Import resolution helpers ---------------------------------------------
 

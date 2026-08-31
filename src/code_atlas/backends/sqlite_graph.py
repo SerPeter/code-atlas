@@ -78,6 +78,7 @@ from code_atlas.graph.client import (
     _fuse_bm25_results,
     _pick_citation_target,
     _plan_config_refs,
+    _project_data_rows,
     _render_citation_key,
     _resolve_one_call,
     _resolve_one_path_anchor,
@@ -1161,6 +1162,56 @@ class SqliteGraphClient:
         row = await cur.fetchone()
         await cur.close()
         return row[0] if row else 0
+
+    async def count_project_data(self, project_name: str) -> list[dict[str, Any]]:
+        """Mirror of ``GraphClient.count_project_data`` — see that docstring.
+
+        Reads the ``project_name`` COLUMN, the way ``delete_project_data`` does — never
+        ``json_extract(props_json, '$.project_name')``, a key no writer here ever sets.
+
+        ``substr(...) = ?`` rather than ``LIKE ?`` for the prefix half: ``_`` and ``%``
+        are LIKE wildcards and both are ordinary characters in a project name, so LIKE
+        would claim a wider scope than Cypher's ``STARTS WITH`` reaches. Same reason
+        ``_prefix_clause`` exists.
+        """
+        conn = await self._get_conn()
+        scope = (project_name, len(project_name) + 1, f"{project_name}/")
+        cur = await conn.execute(
+            "SELECT project_name, COUNT(*), "
+            f"SUM(CASE WHEN embedding IS NOT NULL AND labels <> '{NodeLabel.EMBED_CHUNK.value}' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN labels = '{NodeLabel.EMBED_CHUNK.value}' THEN 1 ELSE 0 END) "
+            "FROM nodes WHERE project_name = ? OR substr(project_name, 1, ?) = ? "
+            "GROUP BY project_name",
+            scope,
+        )
+        node_rows = await cur.fetchall()
+        await cur.close()
+        # Two indexed joins UNIONed rather than one `ON p.uid = e.from_uid OR p.uid =
+        # e.to_uid`, which would use neither edge index. UNION (not UNION ALL) dedupes
+        # the (project, edge) tuple, so an edge internal to one project is counted once
+        # -- the SQL equivalent of the Cypher WITH DISTINCT.
+        cur = await conn.execute(
+            "SELECT name, COUNT(*) FROM ("
+            "SELECT DISTINCT p.project_name AS name, e.from_uid AS f, e.to_uid AS t, e.rel_type AS rt "
+            "FROM edges e JOIN nodes p ON p.uid = e.from_uid "
+            "WHERE p.project_name = ? OR substr(p.project_name, 1, ?) = ? "
+            "UNION "
+            "SELECT DISTINCT p.project_name, e.from_uid, e.to_uid, e.rel_type "
+            "FROM edges e JOIN nodes p ON p.uid = e.to_uid "
+            "WHERE p.project_name = ? OR substr(p.project_name, 1, ?) = ?"
+            ") GROUP BY name",
+            (*scope, *scope),
+        )
+        edge_rows = await cur.fetchall()
+        await cur.close()
+        rels = {r[0]: r[1] for r in edge_rows}
+        return _project_data_rows(
+            [
+                {"name": n, "nodes": c, "relationships": rels.get(n, 0), "embedded_nodes": emb, "embed_chunks": ch}
+                for n, c, emb, ch in node_rows
+            ],
+            project_name,
+        )
 
     async def delete_project_data(self, project_name: str) -> None:
         conn = await self._get_conn()
@@ -2576,15 +2627,21 @@ class SqliteGraphClient:
         vectors silently (ATL-135).
         """
         conn = await self._get_conn()
+        # project_name is a COLUMN here, never a props_json key (_NODE_COLUMNS). Reading it
+        # out of the blob matched nothing at all, so the scoped clear was a silent no-op
+        # while _check_model_lock still recorded the new model -- old-space vectors under
+        # the new model's name, and no later run able to notice. substr rather than LIKE:
+        # LIKE reads `_` and `%` in a project name as wildcards and would reach wider than
+        # Cypher's STARTS WITH, which is the radius count_project_data shows in the preflight.
+        prefix = f"{project}/"
         where = (
             "(embedding IS NOT NULL OR json_extract(props_json, '$.embed_hash') IS NOT NULL)"
             if project is None
             # "{root}/{sub}" sub-projects belong to the same model as their root.
             else "(embedding IS NOT NULL OR json_extract(props_json, '$.embed_hash') IS NOT NULL) "
-            "AND (json_extract(props_json, '$.project_name') = ? "
-            "OR json_extract(props_json, '$.project_name') LIKE ?)"
+            "AND (project_name = ? OR substr(project_name, 1, ?) = ?)"
         )
-        args: tuple[object, ...] = () if project is None else (project, f"{project}/%")
+        args: tuple[object, ...] = () if project is None else (project, len(prefix), prefix)
         cur = await conn.execute(f"SELECT count(*) FROM nodes WHERE {where}", args)
         row = await cur.fetchone()
         await cur.close()
@@ -2595,20 +2652,33 @@ class SqliteGraphClient:
             f"WHERE {where}",
             args,
         )
-        # The vec0 shadow tables carry no project column, so a scoped clear cannot
-        # prune them selectively -- rows are re-keyed on the next write and a stale
-        # one is unreachable once `nodes.embedding` is NULL.
+        # Deleted, not stripped, mirroring GraphClient.clear_embeddings: a chunk's entire
+        # content is its vector, so a stripped one is an unreachable row the next embed pass
+        # would have to recognise and reuse.
         if project is None:
+            # The vec0 shadow tables carry no project column, so only a database-wide clear
+            # can prune them wholesale -- rows are re-keyed on the next write and a stale one
+            # is unreachable once `nodes.embedding` is NULL.
             for spec in build_vector_index_specs(self._dimension):
                 await self._safe_exec(conn, f"DELETE FROM {spec.name}")
+            await conn.execute("DELETE FROM nodes WHERE labels = ?", (NodeLabel.EMBED_CHUNK.value,))
+        else:
+            cur = await conn.execute(
+                "SELECT uid FROM nodes WHERE labels = ? AND (project_name = ? OR substr(project_name, 1, ?) = ?)",
+                (NodeLabel.EMBED_CHUNK.value, project, len(prefix), prefix),
+            )
+            chunk_uids = [r[0] for r in await cur.fetchall()]
+            await cur.close()
+            await self._delete_chunk_uids(conn, chunk_uids)
         await conn.commit()
         return cleared
 
     async def count_embeddings_by_project(self) -> dict[str, int]:
         conn = await self._get_conn()
         cur = await conn.execute(
-            "SELECT json_extract(props_json, '$.project_name') AS p, count(*) "
-            "FROM nodes WHERE embedding IS NOT NULL GROUP BY p"
+            # The column, not props_json -- see clear_embeddings. Reading the blob returned
+            # {} for every store, blanking the project list in the destructive preflight.
+            "SELECT project_name AS p, count(*) FROM nodes WHERE embedding IS NOT NULL GROUP BY p"
         )
         rows = await cur.fetchall()
         await cur.close()

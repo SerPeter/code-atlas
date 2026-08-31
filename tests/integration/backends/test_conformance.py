@@ -51,6 +51,7 @@ PROJECT = "test-conformance"
 _COMPARED: frozenset[str] = frozenset(
     {
         "count_entities",
+        "count_project_data",
         "get_entity_by_uid",
         "get_existing_uids",
         "node_exists",
@@ -96,7 +97,10 @@ _NOT_COMPARED: dict[str, str] = {
     "write_embeddings": "write path; read back by find_embeddings_by_hash",
     "write_embeddings_and_hashes": "write path; read back by read_embed_hashes",
     "write_embed_hashes": "write path; read back by read_embed_hashes",
-    "clear_embeddings": "write path",
+    # Partly compared: its *scope* is, by TestTheDefectsThatMotivatedThis
+    # .test_a_scoped_embedding_clear_reaches_the_same_projects. The counts it returns are
+    # not, so it stays here rather than moving to _COMPARED.
+    "clear_embeddings": "write path; scope compared by the scoped-clear defect test",
     "write_embed_chunks": "write path; read back by the vector search that resolves a chunk to its parent",
     "delete_embed_chunks": "write path",
     # Not in _COMPARED because that set is read as "output-compared for equal answers on
@@ -168,7 +172,7 @@ _NOT_COMPARED: dict[str, str] = {
     "get_embedding_config": "not yet compared",
     "get_embedding_models_by_project": "not yet compared",
     "get_project_embedding_model": "not yet compared",
-    "count_embeddings_by_project": "not yet compared",
+    "count_embeddings_by_project": "compared by the scoped-clear defect test, which reads it on both backends",
     "read_entity_texts": "not yet compared",
     "get_notes_for_dedup": "not yet compared",
     "get_orphan_notes": "not yet compared",
@@ -369,6 +373,54 @@ class TestSharedSurfaceAgrees:
         mg, lite = both
         assert await mg.count_entities(PROJECT) == await lite.count_entities(PROJECT)
 
+    async def test_count_project_data(self, both):
+        """The read a destructive run trusts to describe what it is about to remove.
+
+        Compared field by field, not by membership: ADR-0042 makes a preflight that
+        under-reports worse than no preflight at all, and the two implementations share
+        nothing but this comparison — a Cypher UNWIND + WITH DISTINCT on one side, a
+        UNION of two indexed joins on the other.
+
+        Seeds its own corpus: the shared one has no sub-project, no vectors and no
+        chunks, so three of the five columns would compare zero against zero and pass
+        while proving nothing.
+        """
+        mg, lite = both
+        dim = mg._dimension
+        sub = f"{PROJECT}/sub"
+        caller = f"{PROJECT}:mod.caller"
+        for client in (mg, lite):
+            await client.upsert_file_entities(
+                sub, "sub.py", [_entity("subfn", f"{sub}:sub.subfn", file_path="sub.py")], []
+            )
+            await client.write_embeddings_and_hashes(
+                [(caller, [0.25] * dim, "h-caller")], labels=["Callable"], model="model-x"
+            )
+            await client.write_embed_chunks(
+                [EmbedChunkWrite(f"{caller}#chunk2", caller, PROJECT, 2, [0.5] * dim, "h-chunk")], model="model-x"
+            )
+
+        a = {r["name"]: r for r in await mg.count_project_data(PROJECT)}
+        b = {r["name"]: r for r in await lite.count_project_data(PROJECT)}
+        assert set(a) == set(b) == {PROJECT, sub}, "the prefix child is part of the blast radius"
+        assert a == b, f"memgraph {a} != sqlite {b}"
+        # Pinned as well as equal: two backends agreeing on zero would pass vacuously.
+        assert a[PROJECT] == {
+            "name": PROJECT,
+            "nodes": len(_corpus()[0]) + 1,  # the corpus, plus the EmbedChunk
+            "relationships": 1,  # DEFINES is the only edge upsert_file_entities materialises
+            "embedded_nodes": 1,
+            "embed_chunks": 1,
+        }
+        assert a[sub]["nodes"] == 1
+
+    async def test_count_project_data_names_a_project_with_nothing_in_it(self, both):
+        """An empty list would read as "the count failed", and ADR-0042 makes those two
+        outcomes mean opposite things — abort versus proceed."""
+        mg, lite = both
+        zero = {"name": "absent", "nodes": 0, "relationships": 0, "embedded_nodes": 0, "embed_chunks": 0}
+        assert await mg.count_project_data("absent") == await lite.count_project_data("absent") == [zero]
+
     async def test_get_existing_uids(self, both):
         mg, lite = both
         wanted = [f"{PROJECT}:mod.caller", f"{PROJECT}:mod.absent"]
@@ -511,6 +563,35 @@ class TestSharedSurfaceAgrees:
 class TestTheDefectsThatMotivatedThis:
     """One test per wrong-answer bug ATL-112 found by hand. A suite that compares
     outputs is what should have found them."""
+
+    async def test_a_scoped_embedding_clear_reaches_the_same_projects(self, both):
+        """SQLite read ``project_name`` out of ``props_json``, where no writer puts it —
+        it is a real column. So the scoped clear matched nothing at all while Memgraph's
+        cleared the tree, and ``count_embeddings_by_project`` returned ``{}`` for every
+        store. ``--reset-embeddings`` on that backend was a confirmed no-op that still
+        recorded the new model, leaving old-space vectors under the new model's name.
+
+        The prefix half is checked with an underscore in the project name on purpose: a
+        raw ``LIKE 'code_atlas/%'`` reads ``_`` as a wildcard and reaches wider than
+        Cypher's ``STARTS WITH``, which would make the destructive preflight understate.
+        """
+        family = {"code_atlas": 1, "code_atlas/sub": 1, "codeXatlas/sub": 1, "unrelated": 1}
+        results = []
+        for client in both:
+            for name in family:
+                uid = f"{name}:mod.embedded"
+                await client.upsert_file_entities(name, "mod.py", [_entity("embedded", uid)], [])
+                await client.write_embeddings([(uid, [0.05] * client._dimension)])
+            before = {k: v for k, v in (await client.count_embeddings_by_project()).items() if k in family}
+            cleared = await client.clear_embeddings("code_atlas")
+            after = {k: v for k, v in (await client.count_embeddings_by_project()).items() if k in family}
+            results.append((before, cleared, after))
+
+        assert results[0] == results[1], "backends disagree about a destructive clear's scope"
+        before, cleared, after = results[0]
+        assert before == family, "count_embeddings_by_project did not see every seeded project"
+        assert cleared == 2, "the clear must reach the project and its '{name}/' children, and stop there"
+        assert set(after) == {"codeXatlas/sub", "unrelated"}
 
     async def test_like_metacharacters_are_not_wildcards(self, both):
         """`_` matched any character, so searching `weird_name` also returned

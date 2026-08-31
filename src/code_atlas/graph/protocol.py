@@ -106,6 +106,17 @@ if TYPE_CHECKING:
 
         async def count_entities(self, project_name: str) -> int: ...
 
+        # count_project_data is the blast-radius read a destructive run makes BEFORE
+        # it removes anything (ADR-0042 decision 2). One row per project the operation
+        # reaches: {name, nodes, relationships, embedded_nodes, embed_chunks}, covering
+        # the exact project_name and every "{project_name}/" child — the two
+        # destructive calls reach that set by different routes, so the caller picks the
+        # rows its action touches. `relationships` counts every edge with at least one
+        # endpoint in that project, which is what DETACH DELETE removes; an edge
+        # between two in-scope projects is therefore in both rows, so render them and
+        # never sum that column.
+        async def count_project_data(self, project_name: str) -> list[dict[str, Any]]: ...
+
         # -- Cross-file resolution -------------------------------------------
 
         # These three return the rels they could not settle for good. Resolution
