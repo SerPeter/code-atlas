@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.11.1 (2026-08-31)
+
+### Documentation
+
+- **adr**: Record ADR-0042 decisions 4 and 5 as implemented, with amendments
+  ([`ad9efa8`](https://github.com/SerPeter/code-atlas/commit/ad9efa815d5470b6b17138bdeaffd841436382b1))
+
+### Performance Improvements
+
+- **indexing**: Make a no-op re-check cost only the parse
+  ([`dedbf88`](https://github.com/SerPeter/code-atlas/commit/dedbf88e764615e71e5451e4778c8549eea5088e))
+
+
 ## v0.11.0 (2026-08-31)
 
 ### Documentation
