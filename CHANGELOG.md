@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.11.0 (2026-08-31)
+
+### Documentation
+
+- **adr**: Accept ADR-0042 and document the flag split
+  ([`e80fdf5`](https://github.com/SerPeter/code-atlas/commit/e80fdf5a6220a115b06840b916a0969aaa80f925))
+
+### Features
+
+- **cli**: Separate reindex scope from destruction
+  ([`ffdb7a8`](https://github.com/SerPeter/code-atlas/commit/ffdb7a8665e14306394614f60177324649dea15e))
+
+- **graph**: Count what a destructive run would remove, before it starts
+  ([`4b7f9f8`](https://github.com/SerPeter/code-atlas/commit/4b7f9f850434b3559bd7ed2c1d051f4a74aeb733))
+
+
 ## v0.10.4 (2026-08-31)
 
 ### Documentation
