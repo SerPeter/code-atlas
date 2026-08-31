@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.10.4 (2026-08-31)
+
+### Documentation
+
+- **adr**: Separate reindex scope from destruction
+  ([`3ede0dc`](https://github.com/SerPeter/code-atlas/commit/3ede0dcad4d27d3777776245c3007b9d8d6263bd))
+
+### Performance Improvements
+
+- **graph**: Resolve import-scope references from the module, not the name
+  ([`6cbb4c0`](https://github.com/SerPeter/code-atlas/commit/6cbb4c0bb3f1974c1c4f7933c3458e4fe2536ea2))
+
+
 ## v0.10.3 (2026-08-30)
 
 ### Bug Fixes
