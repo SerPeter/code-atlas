@@ -4,9 +4,7 @@
 
 Accepted — 2026-08-31.
 
-Decisions 1, 2 and 3 are implemented (ATL-148, ATL-149, ATL-150). Decisions 4 and 5 are not, and are tracked as ATL-151
-(`rels_hash`) and ATL-152 (extraction epoch); both are optimisations of a re-check that is already correct and
-non-destructive, so neither gates the split.
+All five decisions are implemented (ATL-148, ATL-149, ATL-150, ATL-151, ATL-152).
 
 Two things the implementation had to add that the reasoning below does not anticipate:
 
@@ -108,7 +106,48 @@ resolution flush — a full `build_resolution_lookup` plus `resolve_calls` / `re
 over the whole project.
 
 A per-file `rels_hash`, stored beside `file_hash`, closes this: when every entity returns `unchanged` **and** the
-relationship fingerprint matches, skip the rewrite and skip buffering. The parse is then the only irreducible cost.
+relationship fingerprint matches, skip the rewrite. The parse is then the only irreducible cost.
+
+**Amended on implementation (ATL-151), in three places.**
+
+**Skip the write, keep the buffer.** The paragraph above also said "skip buffering", and that is wrong. The buffer is
+what [ADR-0026](./0026-resolution-is-replayed-not-batch-final.md) added to fix a measured loss — resolution reads the
+graph as it stands at its flush, so a callee upserted by a _later_ batch was never linked, and adding the replay took
+CALLS from 9,058 to 9,713 and `find_dead_code` on `src/` from 27 to 15. Skipping the buffer for an unchanged file
+reintroduces exactly that, and worse: `--full` is the run that repairs it, so the repair would be the thing broken.
+Confirmed by sabotage rather than by argument — implementing the buffer skip makes
+`test_a_skipped_file_still_buffers_its_rels_for_a_callee_that_lands_later` fail. `rels_hash` fingerprints the _parse_,
+while resolution's output is a function of the parse **and the rest of the graph**, so it is a sound gate for the
+per-file write and an unsound one for the buffer.
+
+**The fingerprint is compared pre-detector and stored post-detector.** Detector output is derived from the graph, not
+from the file's bytes, and the detectors cannot run until the entity transaction has written the entities they query. So
+what is stored covers the merged set the second `rels_only` pass actually writes, while what is compared is the
+parser-only set — a file that carried detector edges last run therefore yields a stored hash no pre-detector hash can
+equal, and never skips. That asymmetry is the point: only running the detectors could tell you whether they still fire,
+and the per-file rewrite is the only thing that revokes a detector edge that has stopped firing.
+
+**A skipped rewrite no longer retracts a stale resolved edge.** A replay MERGEs; it does not retract (ADR-0026), so the
+per-file delete was the only thing erasing an edge resolved against a partial graph in some earlier run. Measured on
+this repo, three no-op `--full` runs over a graph seeded from empty: IMPORTS 2,322 → 2,367, CALLS 14,235 → 14,236,
+DOCUMENTS 214 → 215, and every other type identical. Those 45 IMPORTS are stale edges the old `--full` retracted. This
+is deliberate — `--reset` is the operation that converges the graph, and decision 1 already makes it the one you reach
+for when you suspect the graph is wrong. What was _not_ acceptable and was fixed rather than documented:
+`resolve_doc_links` used `CREATE` where every other resolver MERGEs, silently relying on the per-file delete for
+idempotence, so the same three runs took DOCUMENTS from 213 to 432 and would have grown without bound.
+
+Measured effect of the decision itself, no-op `--full` on this repo (450 files, 9,430 entities), before → after:
+
+|                                           | before | after |
+| ----------------------------------------- | -----: | ----: |
+| files whose relationships were rewritten  |    253 |    60 |
+| relationships written                     | 11,324 | 4,115 |
+| relationship statements (delete + create) |     44 |    33 |
+| wall clock                                |  26.5s | 25.4s |
+
+The surviving 60 files are the ones carrying detector edges, which never skip by construction. The wall clock barely
+moves, and the story never claimed it would: this is database churn, and the point is that a re-check stops being
+something people avoid.
 
 ### 5. The gate key should cover what the gate is gating
 
@@ -120,6 +159,36 @@ This subsumes the twelve migrations that call `generate_clear_file_hashes_ddl`, 
 
 Recorded here rather than deferred silently, because it is the reason `--full` is load-bearing today. It is sequenced
 last: it redefines what the gate means, and the flag split delivers most of the value without it.
+
+**Amended on implementation (ATL-152): the key has to be stored in _two_ places, not one.** The paragraph above is right
+about `file_hash` and wrong about what that reaches. `file_hash` is gate _2_, and gate 2 is only ever asked about a file
+the run already published. Gate 1 is enumeration: `_decide_delta_mode` returns three empty sets when git reports no
+change, `_publish_events` then publishes nothing, and the pipeline never starts — so on a project sitting at its stored
+HEAD an epoch bump alone reaches no file at all. The twelve migrations' `REMOVE p.git_hash` is therefore _not_ subsumed
+and stays; only their `generate_clear_file_hashes_ddl` call goes.
+
+So the resolved key is also stored on the `Project` node, and `_decide_delta_mode` enumerates everything when it differs
+from the current one. That is what makes the sentence above true rather than aspirational, and an absent key reading as
+"differs" is what carries the one-time re-check every graph indexed before the key existed is owed.
+
+Two consequences worth naming:
+
+- **The key must be stable across runs and processes**, or the failure is not a slow first run: the daemon always trusts
+  the gate, so a key that moved would re-parse the whole project forever at watcher cadence and read as a performance
+  regression rather than as a key that moved. Lists are sorted, the payload is rendered canonically, and the digest is
+  `hashlib` rather than the per-process-salted `hash()`. The computed key is logged at DEBUG on consumer construction,
+  because two processes disagreeing about it (an `ATLAS_*` in a `.env` found from a different cwd outranks the target
+  project's `atlas.toml`) has no other symptom.
+- **This is deliberately not a `SCHEMA_VERSION` bump.** A version whose only real work is `REMOVE p.git_hash` would make
+  every existing graph pay `ensure_schema`'s migration branch, which drops every vector and text index unconditionally
+  and recreates the vector ones only when embeddings are enabled — the failure this codebase has already had once, and
+  an outright `EmbeddingsPresentError` on a lightweight install. Keying gate 1 on the Project node buys the same
+  one-time re-check with no index churn, and buys it again for every future epoch bump.
+
+What it does **not** do is repair the ADR-0040 truncation that motivated it. `content_hash` is computed before
+truncation, so a cap change re-reads and re-parses every file and then classifies every entity `unchanged`; the stored
+`source` stays cut at the old cap. Layer 1 is opened, layer 2 still declines. Repairing that means folding the cap into
+`content_hash`, which re-embeds every truncated entity and is a separate decision.
 
 ## Consequences
 
