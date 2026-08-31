@@ -6669,3 +6669,120 @@ async def test_a_node_that_matched_itself_reports_no_chunk(graph_client: GraphCl
 
     hit = next(r for r in results if r["node"]["uid"] == "test:plain")
     assert not hit.get("matched_chunk")
+
+
+# ---------------------------------------------------------------------------
+# _link_named_callable — import scope
+# ---------------------------------------------------------------------------
+
+
+async def _seed_import_scope(graph_client: GraphClient, project: str) -> None:
+    """src/app.py imports helper from src/utils.py. src/other.py has a same-named twin
+    it does NOT import — the decoy that proves import scope is actually enforced."""
+    for fp, mod, fn in (
+        ("src/utils.py", "src.utils", "helper"),
+        ("src/other.py", "src.other", "helper"),
+        ("src/app.py", "src.app", "caller"),
+    ):
+        await graph_client.upsert_file_entities(
+            project,
+            fp,
+            [
+                ParsedEntity(
+                    name=mod.rsplit(".", 1)[-1],
+                    qualified_name=f"{project}:{mod}",
+                    label=NodeLabel.MODULE,
+                    kind="module",
+                    line_start=1,
+                    line_end=20,
+                    file_path=fp,
+                ),
+                ParsedEntity(
+                    name=fn,
+                    qualified_name=f"{project}:{mod}.{fn}",
+                    label=NodeLabel.CALLABLE,
+                    kind="function",
+                    line_start=2,
+                    line_end=8,
+                    file_path=fp,
+                ),
+            ],
+            [],
+        )
+    await graph_client.resolve_imports(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.app",
+                rel_type=RelType.IMPORTS,
+                to_name="src.utils.helper",
+            )
+        ],
+    )
+
+
+async def test_value_reference_resolves_through_the_importing_module(graph_client: GraphClient):
+    """The import strategy links a bare name to the entity the referrer's module imports."""
+    await graph_client.ensure_schema()
+    project = "vref_import"
+    await _seed_import_scope(graph_client, project)
+
+    await graph_client.resolve_value_references(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.app.caller",
+                rel_type=RelType.REFERENCES,
+                to_name="helper",
+            )
+        ],
+    )
+
+    records = await graph_client.execute(
+        f"MATCH (a:{NodeLabel.CALLABLE} {{project_name: $p}})-[e:{RelType.REFERENCES}]->(b) "
+        "RETURN a.name AS src, b.uid AS dst, e.strategy AS strategy",
+        {"p": project},
+    )
+    assert [(r["src"], r["dst"], r["strategy"]) for r in records] == [
+        ("caller", f"{project}:src.utils.helper", "import")
+    ]
+
+
+async def test_value_reference_ignores_a_same_named_twin_it_does_not_import(graph_client: GraphClient):
+    """Precision guard for the fan-out rewrite.
+
+    The import strategy used to match every (project_name, name) twin and then ask
+    ``EXISTS { module imports this one }`` per candidate — index-backed but unselective,
+    measured at 381 candidates for one name on the production graph and 5.3s for a single
+    ref. It is now driven from the module's IMPORTS edges instead. That is only a valid
+    rewrite if it still refuses the twin nobody imported, which is what this asserts: two
+    Callables named ``helper`` exist, exactly one is reachable through an import.
+    """
+    await graph_client.ensure_schema()
+    project = "vref_twin"
+    await _seed_import_scope(graph_client, project)
+
+    twins = await graph_client.execute(
+        f"MATCH (b:{NodeLabel.CALLABLE} {{project_name: $p, name: 'helper'}}) RETURN count(b) AS n",
+        {"p": project},
+    )
+    assert twins[0]["n"] == 2, "the decoy twin is missing, so this test proves nothing"
+
+    await graph_client.resolve_value_references(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=f"{project}:src.app.caller",
+                rel_type=RelType.REFERENCES,
+                to_name="helper",
+            )
+        ],
+    )
+
+    records = await graph_client.execute(
+        f"MATCH (:{NodeLabel.CALLABLE} {{project_name: $p}})-[:{RelType.REFERENCES}]->(b) RETURN b.uid AS dst",
+        {"p": project},
+    )
+    assert [r["dst"] for r in records] == [f"{project}:src.utils.helper"], (
+        "resolved to the un-imported twin — import scope is not being enforced"
+    )

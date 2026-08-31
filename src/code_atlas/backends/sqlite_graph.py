@@ -1852,7 +1852,8 @@ class SqliteGraphClient:
         )
 
     async def resolve_value_references(self, project_name: str, ref_rels: list[ParsedRelationship]) -> None:
-        """Same-file only — the import-scope pass is a Memgraph EXISTS subquery."""
+        """Same-file only. The import-scope pass is Memgraph-side: it walks the
+        referring module's IMPORTS edges, which this schema has no cheap join for."""
         if not ref_rels:
             return
         conn = await self._get_conn()

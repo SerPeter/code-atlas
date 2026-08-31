@@ -3294,20 +3294,42 @@ class GraphClient:
         """
         for strategy in ("same_file", "import"):
             confidence, weight = _TYPE_REF_FACTS[strategy]
-            scope = (
-                "WHERE b.file_path = a.file_path AND b.uid <> a.uid "
-                if strategy == "same_file"
-                else (
-                    f"WHERE b.uid <> a.uid AND NOT (a)-[:{rel_type}]->(b) "
-                    f"AND EXISTS {{ MATCH (m:{NodeLabel.MODULE} {{file_path: a.file_path, project_name: r.project}})"
-                    f"-[:{RelType.IMPORTS}]->(b) }} "
+            if strategy == "same_file":
+                match = (
+                    f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}), "
+                    f"(b:{target} {{project_name: r.project, name: r.to_name}}) "
+                    "WHERE b.file_path = a.file_path AND b.uid <> a.uid "
                 )
-            )
+            else:
+                # Driven from the importing module's IMPORTS edges, NOT from the name.
+                #
+                # The name-first form -- match every (project_name, name) twin, then ask
+                # EXISTS { module imports this one } per candidate -- is index-backed and
+                # still quadratic in practice, because (project_name, name) is not
+                # selective. Measured on the production graph: `main` resolves to 381
+                # Callables and `OUT` to 174 Values in one project, and each candidate
+                # re-resolved the module by (file_path, project_name) and then scanned its
+                # IMPORTS. That cost 5.3s for ONE ref, 27s for five, and passed 90s at
+                # twenty -- per resolution flush, forever.
+                #
+                # A module imports tens of names, not thousands, so expanding its edges and
+                # filtering by name inverts the fan-out. Same answer, verified pair-for-pair
+                # against the old form over 60 real refs: 0.48s -> 0.08s there, ~300x on the
+                # pathological name. Same bug class as the DOCUMENTS scan fixed in v0.10.1,
+                # in a query that fix did not touch.
+                match = (
+                    f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}) "
+                    f"MATCH (m:{NodeLabel.MODULE} {{project_name: r.project, file_path: a.file_path}})"
+                    f"-[:{RelType.IMPORTS}]->(b:{target} {{name: r.to_name}}) "
+                    # Kept from the name-first form: an IMPORTS edge can land on another
+                    # project's node after cross-project resolution rewires a stub, and this
+                    # pass has always been project-local.
+                    f"WHERE b.project_name = r.project AND b.uid <> a.uid "
+                    f"AND NOT (a)-[:{rel_type}]->(b) "
+                )
             await self.execute_write(
                 f"UNWIND $rels AS r "
-                f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}), "
-                f"(b:{target} {{project_name: r.project, name: r.to_name}}) "
-                f"{scope}"
+                f"{match}"
                 f"MERGE (a)-[e:{rel_type}]->(b) "
                 f"SET e.strategy = '{strategy}', e.confidence = '{confidence}', e.weight = {weight}",
                 {"rels": params},
