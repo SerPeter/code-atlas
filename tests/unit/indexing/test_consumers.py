@@ -16,11 +16,14 @@ from code_atlas.indexing.consumers import (
     ASTConsumer,
     BatchPolicy,
     TierConsumer,
+    _compute_file_hash,
     _next_resolve_gap,
+    _rels_hash,
+    _retry_key,
 )
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship
 from code_atlas.schema import RelType
-from code_atlas.settings import AtlasSettings, EmbeddingSettings
+from code_atlas.settings import AtlasSettings, EmbeddingSettings, IndexSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,6 +59,7 @@ class StubGraph:
         self.config_calls: list[tuple[str, list[ParsedRelationship]]] = []
         self.citation_calls: list[tuple[str, dict[str, list[str]], set[str] | None, bool]] = []
         self.hash_writes: list[tuple[str, dict[str, str]]] = []
+        self.rels_hash_writes: list[tuple[str, dict[str, str]]] = []
         self.gc_calls: int = 0
         self.embed_chunk_gc_calls: int = 0
 
@@ -69,8 +73,19 @@ class StubGraph:
     async def set_batch_file_hashes(self, project_name: str, hashes: dict[str, str]) -> None:
         self.hash_writes.append((project_name, dict(hashes)))
 
+    async def get_batch_rels_hashes(self, project_name: str, file_paths: list[str]) -> dict[str, str | None]:
+        return {}
+
+    async def set_batch_rels_hashes(self, project_name: str, rels_hashes: dict[str, str]) -> None:
+        self.rels_hash_writes.append((project_name, dict(rels_hashes)))
+
     async def upsert_batch_entities(
-        self, project_name: str, file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]]
+        self,
+        project_name: str,
+        file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+        *,
+        rels_only: bool = False,
+        rels_unchanged: Any = (),
     ) -> dict[str, UpsertResult]:
         # ``added`` carries qualified_names with the project prefix stripped,
         # the way the real delta classifier reports them.
@@ -661,7 +676,12 @@ class _UnchangedGraph(StubGraph):
     """
 
     async def upsert_batch_entities(
-        self, project_name: str, file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]]
+        self,
+        project_name: str,
+        file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
+        *,
+        rels_only: bool = False,
+        rels_unchanged: Any = (),
     ) -> dict[str, UpsertResult]:
         return {
             fp: UpsertResult(unchanged=[e.qualified_name.split(":", 1)[1] for e in entities])
@@ -750,6 +770,143 @@ async def test_hash_survives_only_after_the_flush_so_a_crash_loop_cannot_strand_
     await consumer.process_batch([event], "b2")
     assert graph.hash_writes == [], "an unchanged-looking recovery run wrote the hash before its flush"
     assert "plain.py" in consumer._pending_file_hashes.get("proj", {})
+
+
+class TestTheRelationshipFingerprint:
+    """ATL-151: what a skipped relationship rewrite is allowed to trust.
+
+    ``_rels_hash`` decides whether TX2's delete-then-recreate for a file can be left
+    out entirely, so anything it cannot see is an edge that silently stops being
+    updated.
+    """
+
+    @staticmethod
+    def _rel(to_name: str, **props: object) -> ParsedRelationship:
+        return ParsedRelationship(
+            from_qualified_name="proj:mod.caller",
+            rel_type=RelType.DEFINES,
+            to_name=to_name,
+            properties=dict(props),
+        )
+
+    def test_it_is_order_independent(self) -> None:
+        """A parser that emits the same edges in a different order has not changed the
+        graph, and must not trigger a rewrite of every edge in the file."""
+        a, b, c = self._rel("x"), self._rel("y"), self._rel("z")
+
+        assert _rels_hash([a, b, c]) == _rels_hash([c, a, b])
+
+    def test_it_covers_properties_that_retry_key_ignores(self) -> None:
+        """The reason this is not ``_retry_key``. That key is for deduplicating the
+        replay buffer and reads only ``receiver``/``receiver_type``; a fingerprint
+        narrower than the write lets an edge keep a stale property forever."""
+        weight_5 = self._rel("x", weight=5)
+        weight_9 = self._rel("x", weight=9)
+
+        assert _retry_key(weight_5) == _retry_key(weight_9), "precondition: _retry_key cannot see this"
+        assert _rels_hash([weight_5]) != _rels_hash([weight_9])
+
+    def test_a_rel_type_change_alone_moves_it(self) -> None:
+        same_endpoints = ParsedRelationship(
+            from_qualified_name="proj:mod.caller",
+            rel_type=RelType.CONTAINS,
+            to_name="x",
+        )
+
+        assert _rels_hash([self._rel("x")]) != _rels_hash([same_endpoints])
+
+    def test_the_endpoints_are_separated_rather_than_concatenated(self) -> None:
+        """Guards the digest's framing: ``("ab", "c")`` and ``("a", "bc")`` describe
+        different edges and must not collide."""
+        assert _rels_hash([self._rel("x")]) != _rels_hash(
+            [
+                ParsedRelationship(
+                    from_qualified_name="proj:mod.calle",
+                    rel_type=RelType.DEFINES,
+                    to_name="rx",
+                )
+            ]
+        )
+
+
+async def test_the_rels_hash_is_withheld_until_the_flush_like_the_file_hash(tmp_path: Path) -> None:
+    """DEVIATION from a naive reading of ATL-151, and a sharper hazard than the file
+    hash's own (ATL-090).
+
+    A ``rels_hash`` written in ``process_batch`` describes a rel set whose deferred half
+    is not resolved yet. After a crash in between, the next run re-parses the file --
+    its ``file_hash`` is correctly unset -- and then declines to rewrite its
+    relationships because the fingerprint matches. That is a file which visibly
+    re-parses on every run while permanently missing edges, which is undiagnosable from
+    outside. Both hashes therefore ride the same schedule.
+    """
+    graph = _UnchangedGraph()
+    consumer = _reindex_consumer(tmp_path, graph)
+    (tmp_path / "plain.py").write_text("def g():\n    return 2\n", encoding="utf-8")
+
+    await consumer.process_batch([], "warmup")
+    await consumer.process_batch([_event("plain.py", "proj", str(tmp_path))], "b1")
+
+    assert "plain.py" in consumer._pending_rels_hashes.get("proj", {})
+    assert graph.rels_hash_writes == [], "no relationship fingerprint may be written before the deferred flush"
+
+    await consumer._flush_deferred_resolution()
+    assert [p for p, _ in graph.rels_hash_writes] == ["proj"]
+    assert "plain.py" in graph.rels_hash_writes[0][1]
+
+
+class TestTheGateKeyCoversExtraction:
+    """ATL-152: the stored file_hash keys on the extraction contract, not on bytes alone.
+
+    Hashing bytes alone made the gate's key narrower than the thing it gates. Raising
+    ``index.max_source_chars`` on 2026-08-31 left 2,169 entities holding truncated source
+    while the gate insisted every file was current, because no file's bytes had moved.
+    """
+
+    def test_a_moved_extraction_key_moves_the_file_hash(self) -> None:
+        """The sabotage anchor: stop folding the key in and this is what fails."""
+        source = b"def g():\n    return 2\n"
+
+        assert _compute_file_hash(source, extraction_key="k1") == _compute_file_hash(source, extraction_key="k1")
+        assert _compute_file_hash(source, extraction_key="k1") != _compute_file_hash(source, extraction_key="k2")
+
+    def test_an_empty_key_is_a_no_op_rather_than_a_distinct_input(self) -> None:
+        """So the function still means "the hash of these bytes" for a caller that does not
+        gate on extraction. ``extraction_key`` never returns the empty string, so this
+        cannot silently disable the gate's coverage in production.
+        """
+        source = b"def g():\n    return 2\n"
+
+        assert _compute_file_hash(source, extraction_key="") == _compute_file_hash(source)
+        assert _compute_file_hash(source, strip_whitespace=False, extraction_key="") == _compute_file_hash(
+            source, strip_whitespace=False
+        )
+
+    async def test_the_consumer_hashes_under_its_own_extraction_key(self, tmp_path: Path) -> None:
+        """The wiring, not just the signature.
+
+        Two consumers differing only in an extraction-affecting setting must record
+        different hashes for byte-identical input — otherwise the config half of the key
+        is computed and then dropped on the floor.
+        """
+        (tmp_path / "plain.py").write_text("def g():\n    return 2\n", encoding="utf-8")
+        event = _event("plain.py", "proj", str(tmp_path))
+
+        def _consumer(index: IndexSettings) -> ASTConsumer:
+            return ASTConsumer(
+                RecordingBus(),  # ty: ignore[invalid-argument-type]
+                StubGraph(),  # ty: ignore[invalid-argument-type]
+                AtlasSettings(project_root=tmp_path, index=index, embeddings=EmbeddingSettings(enabled=False)),
+                policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+            )
+
+        narrow = _consumer(IndexSettings(max_source_chars=2000))
+        wide = _consumer(IndexSettings(max_source_chars=48_000))
+        for consumer in (narrow, wide):
+            await consumer.process_batch([], "warmup")
+            await consumer.process_batch([event], "b1")
+
+        assert narrow._pending_file_hashes["proj"]["plain.py"] != wide._pending_file_hashes["proj"]["plain.py"]
 
 
 class TestAdaptiveResolveCadence:

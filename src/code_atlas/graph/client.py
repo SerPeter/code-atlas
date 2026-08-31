@@ -40,7 +40,6 @@ from code_atlas.schema import (
     RelType,
     TypeDefKind,
     env_var_uid,
-    generate_clear_file_hashes_ddl,
     generate_composite_index_ddl,
     generate_drop_redundant_marker_ddl,
     generate_drop_text_index_ddl,
@@ -610,6 +609,43 @@ class _BatchClassification:
     all_shifted: list[ParsedEntity]
     per_file_results: dict[str, UpsertResult]  # file_path → UpsertResult
     new_file_paths: set[str]  # files with no prior data (skip rel delete)
+
+
+def _rel_write_skips(
+    classification: _BatchClassification,
+    file_rels: dict[str, list[ParsedRelationship]],
+    rels_unchanged: Collection[str],
+) -> set[str]:
+    """Files whose relationship rewrite is provably a no-op, so TX2 can leave them alone.
+
+    *rels_unchanged* is the caller's half of the answer -- the stored ``rels_hash``
+    equals the fingerprint of the set being passed in (``consumers._rels_hash``). This
+    adds the half only the classification knows, and both halves are required:
+
+    - **Nothing was added, modified or deleted for the file.** TX1 creates added entities
+      as fresh nodes with no edges and DETACH DELETEs removed ones, so an identical rel
+      set still has to be written when either happened.
+    - **No target of the file's edges was deleted anywhere in this batch.** TX1 deletes
+      before it creates, so a definition that moved between two files in the same batch is
+      destroyed and re-created under the same uid; the edges into it died with the old
+      node and only a rewrite puts them back. Today's unconditional rewrite covers that by
+      accident, so the skip has to cover it on purpose.
+
+    A file with no prior data is never a candidate -- its edges have never been written.
+    """
+    candidates = {fp for fp in rels_unchanged if fp in file_rels and fp not in classification.new_file_paths}
+    if not candidates:
+        return set()
+    deleted_uids = {uid for uids in classification.all_deleted_by_label.values() for uid in uids}
+    skips: set[str] = set()
+    for fp in candidates:
+        result = classification.per_file_results.get(fp)
+        if result is None or result.added or result.modified or result.deleted:
+            continue
+        if deleted_uids and any(r.to_name in deleted_uids for r in file_rels[fp]):
+            continue
+        skips.add(fp)
+    return skips
 
 
 def _node_project_name(record: dict[str, Any]) -> str:
@@ -1996,6 +2032,7 @@ class GraphClient:
         file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
         *,
         rels_only: bool = False,
+        rels_unchanged: Collection[str] = (),
     ) -> dict[str, UpsertResult]:
         """Batched multi-file upsert using two sequential managed transactions.
 
@@ -2014,6 +2051,12 @@ class GraphClient:
         new_file_paths is empty by construction on that pass (every file now has prior
         data), which is exactly what the relationship rewrite needs: delete first, for
         every file, then recreate the merged set.
+
+        *rels_unchanged* names files whose stored relationship fingerprint already equals
+        the set being passed in; TX2 drops the ones ``_rel_write_skips`` confirms against
+        the classification, and is skipped entirely when that leaves nothing to write
+        (ADR-0042 decision 4). Never honoured on the *rels_only* pass, which has no
+        classification to confirm anything with and exists precisely to rewrite.
         """
         if not file_data:
             return {}
@@ -2050,6 +2093,12 @@ class GraphClient:
         file_rels = {fp: rels for fp, (_, rels) in file_data.items()}
         new_file_paths = set() if classification is None else classification.new_file_paths
 
+        if rels_unchanged and classification is not None:
+            skips = _rel_write_skips(classification, file_rels, rels_unchanged)
+            if skips:
+                logger.debug("Rel rewrite skipped for {}/{} unchanged file(s)", len(skips), len(file_rels))
+                file_rels = {fp: rels for fp, rels in file_rels.items() if fp not in skips}
+
         async def _rel_tx(tx: Any) -> None:
             token = _active_tx_var.set(tx)
             try:
@@ -2057,8 +2106,12 @@ class GraphClient:
             finally:
                 _active_tx_var.reset(token)
 
-        async with self._driver.session() as session:
-            await session.execute_write(_rel_tx)
+        # An empty map makes _recreate_batch_relationships write nothing, so the whole
+        # transaction is a session plus a begin/commit for no work. That is the shape a
+        # no-op re-check takes once every file in the batch is skipped.
+        if file_rels:
+            async with self._driver.session() as session:
+                await session.execute_write(_rel_tx)
 
         if classification is None:
             logger.debug("Batch relationship rewrite for {} file(s)", len(file_data))
@@ -2087,10 +2140,12 @@ class GraphClient:
             await self._batch_delete_entities(dict(uids_by_label))
         # A Package node for this path (e.g. __init__.py) is intentionally not
         # deleted — the directory hierarchy may still need it — but its stored
-        # file_hash must be cleared. Otherwise an identically re-created file
-        # is silently skipped forever by the hash gate (get_batch_file_hashes).
+        # gate properties must be cleared. Otherwise an identically re-created file is
+        # silently skipped forever by the hash gate (get_batch_file_hashes), and its
+        # relationship fingerprint would still claim the edges this delete just removed.
         await self.execute_write(
-            f"MATCH (n:{NodeLabel.PACKAGE} {{project_name: $p, file_path: $f}}) SET n.file_hash = NULL",
+            f"MATCH (n:{NodeLabel.PACKAGE} {{project_name: $p, file_path: $f}}) "
+            "SET n.file_hash = NULL, n.rels_hash = NULL",
             {"p": project_name, "f": file_path},
         )
         return [self._strip_uid(uid) for uid in old_data]
@@ -2105,6 +2160,66 @@ class GraphClient:
             props,
         )
 
+    async def _get_batch_file_prop(
+        self,
+        project_name: str,
+        file_paths: list[str],
+        prop: str,
+    ) -> dict[str, str | None]:
+        """Read one gate property off the FILE_HASH_LABELS nodes, one RTT per label.
+
+        *prop* is a literal from this module, never user input — it is interpolated
+        because a Cypher property name cannot be a parameter.
+
+        The label filter MUST be inline on the node pattern, not a post-MATCH WHERE.
+        ``UNWIND ... MATCH (n {...}) WHERE n:Label`` is order-sensitive in Memgraph and
+        silently drops rows: measured, a batch of 3 existing files with one non-matching
+        path FIRST returned 0 rows. That made the hash gate read back nothing and
+        re-parse everything. One statement per label because the inline form takes a
+        single label.
+
+        Shared by both gate properties so that shape exists once — a second copy
+        written from the same template is exactly how the second one drifts.
+        """
+        result: dict[str, str | None] = dict.fromkeys(file_paths)
+        for label in FILE_HASH_LABELS:
+            records = await self.execute(
+                f"UNWIND $fps AS fp "
+                f"MATCH (n:{label} {{project_name: $p, file_path: fp}}) "
+                f"RETURN n.file_path AS fp, n.{prop} AS v",
+                {"p": project_name, "fps": file_paths},
+            )
+            for r in records:
+                # A path should have exactly one file-level node, so these do not
+                # normally collide. Guarding anyway: a later label returning a null
+                # value must not erase an earlier one's real value, because the gate
+                # reads a null as "never indexed" and re-parses.
+                if r["v"] is not None or result[r["fp"]] is None:
+                    result[r["fp"]] = r["v"]
+        return result
+
+    async def _set_batch_file_prop(
+        self,
+        project_name: str,
+        values: dict[str, str],
+        prop: str,
+    ) -> None:
+        """Write one gate property onto the FILE_HASH_LABELS nodes, one statement per label.
+
+        Inline label, one statement per label — see ``_get_batch_file_prop``. With the
+        post-MATCH ``WHERE n:Module OR n:Package`` form this wrote only the FIRST file's
+        hash per call (measured: 1 of 3, with every file's node present), so the
+        incremental hash gate recorded almost nothing and re-parsed the repo on every run.
+        """
+        params = [{"fp": fp, "v": v} for fp, v in values.items()]
+        for label in FILE_HASH_LABELS:
+            await self.execute_write(
+                f"UNWIND $items AS item "
+                f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
+                f"SET n.{prop} = item.v",
+                {"p": project_name, "items": params},
+            )
+
     async def get_batch_file_hashes(
         self,
         project_name: str,
@@ -2116,28 +2231,7 @@ class GraphClient:
         """
         if not file_paths:
             return {}
-        # The label filter MUST be inline on the node pattern, not a post-MATCH WHERE.
-        # `UNWIND ... MATCH (n {...}) WHERE n:Label` is order-sensitive in Memgraph and
-        # silently drops rows: measured, a batch of 3 existing files with one
-        # non-matching path FIRST returned 0 rows. That made the hash gate read back
-        # nothing and re-parse everything. One statement per label because the inline
-        # form takes a single label.
-        result: dict[str, str | None] = dict.fromkeys(file_paths)
-        for label in FILE_HASH_LABELS:
-            records = await self.execute(
-                f"UNWIND $fps AS fp "
-                f"MATCH (n:{label} {{project_name: $p, file_path: fp}}) "
-                "RETURN n.file_path AS fp, n.file_hash AS fh",
-                {"p": project_name, "fps": file_paths},
-            )
-            for r in records:
-                # A path should have exactly one file-level node, so these do not
-                # normally collide. Guarding anyway: a later label returning a null
-                # hash must not erase an earlier one's real value, because the gate
-                # reads a null as "never indexed" and re-parses.
-                if r["fh"] is not None or result[r["fp"]] is None:
-                    result[r["fp"]] = r["fh"]
-        return result
+        return await self._get_batch_file_prop(project_name, file_paths, "file_hash")
 
     async def set_batch_file_hashes(
         self,
@@ -2147,19 +2241,34 @@ class GraphClient:
         """Write ``file_hash`` on the FILE_HASH_LABELS nodes for each file path."""
         if not file_hashes:
             return
-        params = [{"fp": fp, "fh": fh} for fp, fh in file_hashes.items()]
-        # Inline label, one statement per label — see get_batch_file_hashes. With the
-        # post-MATCH `WHERE n:Module OR n:Package` form this wrote only the FIRST
-        # file's hash per call (measured: 1 of 3, with every file's node present), so
-        # the incremental hash gate recorded almost nothing and re-parsed the repo on
-        # every run.
-        for label in FILE_HASH_LABELS:
-            await self.execute_write(
-                f"UNWIND $items AS item "
-                f"MATCH (n:{label} {{project_name: $p, file_path: item.fp}}) "
-                "SET n.file_hash = item.fh",
-                {"p": project_name, "items": params},
-            )
+        await self._set_batch_file_prop(project_name, file_hashes, "file_hash")
+
+    async def get_batch_rels_hashes(
+        self,
+        project_name: str,
+        file_paths: list[str],
+    ) -> dict[str, str | None]:
+        """Return ``{file_path: rels_hash}`` for the FILE_HASH_LABELS nodes in one RTT.
+
+        Its own call rather than a second value on ``get_batch_file_hashes`` because the
+        two gates are asked about different sets of files: ``file_hash`` for every live
+        path and only when the gate is trusted, ``rels_hash`` for the files that survived
+        it — which is every file under ``--full``, the run the fingerprint exists for,
+        and a handful under the gate.
+        """
+        if not file_paths:
+            return {}
+        return await self._get_batch_file_prop(project_name, file_paths, "rels_hash")
+
+    async def set_batch_rels_hashes(
+        self,
+        project_name: str,
+        rels_hashes: dict[str, str],
+    ) -> None:
+        """Write ``rels_hash`` on the FILE_HASH_LABELS nodes for each file path."""
+        if not rels_hashes:
+            return
+        await self._set_batch_file_prop(project_name, rels_hashes, "rels_hash")
 
     async def merge_package_node(self, project_name: str, qualified_name: str, name: str, file_path: str) -> None:
         """Create or update a Package node by uid."""
@@ -2265,6 +2374,23 @@ class GraphClient:
         if not records or records[0]["git_hash"] is None:
             return None
         return records[0]["git_hash"]
+
+    async def get_project_extraction_key(self, project_name: str) -> str | None:
+        """Read the stored ``extraction_key`` from the Project node.
+
+        The enumeration half of the ATL-152 gate: ``_decide_delta_mode`` compares this
+        against ``settings.extraction_key`` and enumerates everything when they differ,
+        because ``file_hash`` is only ever consulted for a file the run already published.
+        ``None`` (never indexed, or indexed before the key existed) reads as "differs",
+        which is what makes the first run after the upgrade re-check the whole project.
+        """
+        records = await self.execute(
+            f"MATCH (n:{NodeLabel.PROJECT} {{uid: $uid}}) RETURN n.extraction_key AS key",
+            {"uid": project_name},
+        )
+        if not records:
+            return None
+        return records[0]["key"]
 
     async def get_project_file_paths(self, project_name: str) -> set[str]:
         """Return all distinct file_paths indexed for a project.
@@ -3950,14 +4076,22 @@ class GraphClient:
         if not matched_eps:
             return 0
 
-        # Writes — per-stub for correctness
+        # Writes — per-stub for correctness.
+        #
+        # MERGE, not CREATE. A post-batch resolver has to be idempotent on its own: it
+        # runs on every flush, and the rewired edge points at the real entity, so the
+        # importer's own per-file rewrite is what used to sweep it. ATL-151 made that
+        # rewrite conditional, and an edge nothing deletes plus a CREATE that cannot see
+        # it is one extra parallel edge per re-index, forever. Exactly the shape measured
+        # in resolve_doc_links (DOCUMENTS 213 -> 432 over three no-op runs); the SQLite
+        # port already used INSERT OR IGNORE, so this was also a silent backend divergence.
         rewired = 0
         for es_uid, real_uid in sym_to_real.items():
             await self.execute_write(
                 f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
                 f"(es:{NodeLabel.EXTERNAL_SYMBOL} {{uid: $es_uid}}) "
                 f"MATCH (real:{NodeLabel.ENTITY} {{uid: $real_uid}}) "
-                f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
+                f"MERGE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
                 {"es_uid": es_uid, "real_uid": real_uid},
             )
@@ -3968,7 +4102,7 @@ class GraphClient:
                 f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
                 f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $ep_uid}}) "
                 f"MATCH (real {{uid: $real_uid}}) "
-                f"CREATE (src)-[:{RelType.IMPORTS}]->(real) "
+                f"MERGE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
                 {"ep_uid": ep_uid, "real_uid": real_uid},
             )
@@ -6171,7 +6305,15 @@ class GraphClient:
                 f"WHERE NOT b:{NodeLabel.NOTE} AND NOT b:{NodeLabel.DOC_SECTION} "
                 f"WITH r, a, collect(b) AS candidates WHERE size(candidates) = 1 "
                 f"WITH r, a, candidates[0] AS b "
-                f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
+                # MERGE, not CREATE. This was the only post-batch resolver that relied on
+                # TX2's per-file delete for idempotence, and ATL-151 made that delete
+                # conditional: on a no-op `--full` the file skips its rewrite, the doc
+                # rels are still buffered (the ADR-0026 replay buffer is deliberately
+                # kept), and every heuristic DOCUMENTS edge was created a second time.
+                # Measured on this repo before the fix: 213 -> 432 over three re-checks,
+                # unbounded. The SQLite port already used INSERT OR IGNORE, so this also
+                # ends a silent divergence between the two backends.
+                f"MERGE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
                 f"RETURN count(e) AS cnt",
                 {"rels": symbol_params, "project": project_name},
             )
@@ -6246,7 +6388,8 @@ class GraphClient:
             f"MATCH (a:{NodeLabel.ENTITY} {{uid: r.from_uid}}) "
             f"WHERE a:{NodeLabel.DOC_SECTION} OR a:{NodeLabel.NOTE} "
             f"MATCH (b:{NodeLabel.ENTITY} {{uid: r.to_uid}}) "
-            f"CREATE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
+            # MERGE for the same reason as the symbol branch above.
+            f"MERGE (a)-[e:{RelType.DOCUMENTS} {{link_type: r.link_type, confidence: r.confidence}}]->(b) "
             f"RETURN count(e) AS cnt",
             {"rels": pairs},
         )
@@ -6292,10 +6435,9 @@ class GraphClient:
         are unaffected by the change, so purging them would cost a rebuild for nothing.
         """
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.strategy = 'project_unique' DELETE r")
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
-            "Schema v8: dropped project_unique CALLS edges and cleared file/git hashes — "
+            "Schema v8: dropped project_unique CALLS edges and cleared the git_hash — "
             "run 'atlas index' to re-resolve them against the call's receiver"
         )
 
@@ -6304,7 +6446,7 @@ class GraphClient:
 
         Only the parser can produce the flag and nothing in the graph can be used to
         derive it, so every file has to go through the parser again — the same reasoning
-        as v7, and the file-hash gate would otherwise skip each unchanged file forever.
+        as v7, and without the git_hash clear below no run would even enumerate them.
 
         Ambiguous CALLS edges are dropped because their candidate sets were computed
         without the flag: a set that included a Protocol stub was resolved across it, and
@@ -6313,10 +6455,9 @@ class GraphClient:
         rather than rebuilt for nothing.
         """
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.confidence = 'ambiguous' DELETE r")
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
-            "Schema v9: cleared ambiguous CALLS edges and file/git hashes — run 'atlas index' "
+            "Schema v9: cleared ambiguous CALLS edges and the git_hash — run 'atlas index' "
             "to re-resolve them against Protocol/ABC declarations"
         )
 
@@ -6331,7 +6472,6 @@ class GraphClient:
         """
         await self.execute_write(f"MATCH (t:{NodeLabel.TYPE_DEF}) WHERE t.is_abstract IS NOT NULL REMOVE t.is_abstract")
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() DELETE r")
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info("Schema v10: cleared CALLS edges and the class-level is_abstract flag — run 'atlas index'")
 
@@ -6451,54 +6591,47 @@ class GraphClient:
             await self._exec_ddl(stmt)
 
     async def _migrate_v3_clear_freshness_markers(self) -> None:
-        """v3: content_hash now covers entity source. Clear file/git hashes so the
-        next index run re-parses every file and heals entities whose body-only
-        edits were invisible under the v2 hash formula.
+        """v3: content_hash now covers entity source. Clear git_hash so the next index
+        run enumerates every file and heals entities whose body-only edits were invisible
+        under the v2 hash formula.
+
+        The per-file re-parse comes from the extraction epoch rather than from a hash
+        clear — see _run_data_migrations.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
-        logger.info(
-            "Schema v3: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v3"
-        )
+        logger.info("Schema v3: cleared the stored git_hash — run 'atlas index' to refresh entities indexed before v3")
 
     async def _migrate_v4_clear_freshness_markers(self) -> None:
         """v4: content_hash now folds in extra_properties (frontmatter), changing every entity's
         hash value even though most entities' extra_properties is empty (the extra empty list
-        element still shifts the \\0-joined hash input). Clear file/git hashes so the next index
-        run re-parses every file — cheap, since AST diffing then finds no real content changes for
+        element still shifts the \\0-joined hash input). Clear git_hash so the next index run
+        enumerates every file — cheap, since AST diffing then finds no real content changes for
         anything but the new Note entities.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
-        logger.info(
-            "Schema v4: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v4"
-        )
+        logger.info("Schema v4: cleared the stored git_hash — run 'atlas index' to refresh entities indexed before v4")
 
     async def _migrate_v5_clear_freshness_markers(self) -> None:
         """v5: markdown.py now excludes ``anchors`` from Note.extra_properties and instead
         emits DOCUMENTS(link_type='anchor') relationships, changing content_hash for any note
-        with an ``anchors:`` key even though the file's bytes are unchanged. Clear file/git
-        hashes so the next index run re-parses every file and resolves those anchors.
+        with an ``anchors:`` key even though the file's bytes are unchanged. Clear git_hash
+        so the next index run enumerates every file and resolves those anchors.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
-        logger.info(
-            "Schema v5: cleared stored file/git hashes — run 'atlas index' to refresh entities indexed before v5"
-        )
+        logger.info("Schema v5: cleared the stored git_hash — run 'atlas index' to refresh entities indexed before v5")
 
     async def _migrate_v6_clear_freshness_markers(self) -> None:
         """v6: CALLS edges gained numeric ``weight``/``candidate_count``/``from_test``, and
         entities gained ``rationale``/``citations``. Both are produced during indexing, so an
         existing graph keeps neither until its files are re-parsed — and the file-hash gate
-        skips unchanged files, so nothing would ever re-run. Clear file/git hashes to force a
-        full re-parse, and drop the pre-v6 CALLS edges so they are rebuilt with weights rather
-        than surviving unweighted (a missing weight silently reads as 1.0 in MAGE's Leiden).
+        skips unchanged files, so nothing would ever re-run. Clear git_hash to enumerate every
+        file, and drop the pre-v6 CALLS edges so they are rebuilt with weights rather than
+        surviving unweighted (a missing weight silently reads as 1.0 in MAGE's Leiden).
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         await self.execute_write(f"MATCH ()-[r:{RelType.CALLS}]->() WHERE r.weight IS NULL DELETE r")
         logger.info(
-            "Schema v6: cleared stored file/git hashes and unweighted CALLS edges — "
+            "Schema v6: cleared the stored git_hash and unweighted CALLS edges — "
             "run 'atlas index' to rebuild with edge weights and rationale"
         )
 
@@ -6510,17 +6643,16 @@ class GraphClient:
         ``content_hash`` changes: the new data is a whole class of node that
         only the parser can produce, and it is produced from source text nobody
         has ever looked at before. There is nothing in the graph to derive it
-        from, so every file has to go through the parser again. The file-hash
-        gate would otherwise skip every unchanged file forever and the two new
-        labels would stay permanently empty on any pre-v7 index.
+        from, so every file has to go through the parser again — which clearing
+        git_hash and the extraction epoch arrange between them, and without which
+        the two new labels stay permanently empty on any pre-v7 index.
 
         Nothing is deleted, unlike v6's unweighted-CALLS purge: there are no
         pre-v7 EnvVar/ResourceFile nodes to be stale.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
-            "Schema v7: cleared stored file/git hashes — run 'atlas index' to extract "
+            "Schema v7: cleared the stored git_hash — run 'atlas index' to extract "
             "environment-variable and referenced-file nodes"
         )
 
@@ -6530,6 +6662,22 @@ class GraphClient:
         A table rather than a chain of ``if`` statements: the ladder only ever grows, and
         inlined it pushed ``ensure_schema`` past the branch limit for what is really one
         loop. Order is significant — each entry assumes its predecessors have run.
+
+        **How a migration forces a re-parse, since ATL-152.** Most entries below exist
+        because their new data can only come from re-reading the source, and two gates
+        stand in front of that. Twelve of them used to open the second one by hand with
+        ``generate_clear_file_hashes_ddl`` — the same admission written twelve times, and
+        one a thirteenth written from an older one's template would silently forget. That
+        half is automatic now: ``schema.EXTRACTION_EPOCH`` is folded into the gate's key,
+        so bumping it invalidates every stored ``file_hash`` by changing the key rather
+        than by deleting the values.
+
+        The ``REMOVE p.git_hash`` beside each one is **not** subsumed by that and stays.
+        The epoch invalidates gate 2 (``file_hash``, per file); gate 1 is enumeration, and
+        in delta mode ``_publish_events`` emits events only for the files git reports as
+        changed — so on a project sitting at its stored HEAD an epoch bump alone would
+        reach no file at all. Clearing ``git_hash`` is what makes the run enumerate
+        everything and lets the gate decide, per file, whether extraction actually moved.
         """
         migrations: tuple[tuple[int, Callable[[], Awaitable[None]]], ...] = (
             (3, self._migrate_v3_clear_freshness_markers),
@@ -6557,8 +6705,8 @@ class GraphClient:
 
         Same reason as v7, not an analogy with it: the line number exists only in the
         source text, so nothing already in the graph can derive it. A pre-v11 index has
-        CALLS edges whose ``line`` is permanently null, and the file-hash gate would skip
-        every unchanged file forever, so the property would never appear.
+        CALLS edges whose ``line`` is permanently null, and without the git_hash clear
+        below nothing would enumerate those files, so the property would never appear.
 
         Nothing is deleted. Unlike v8's purge, a lineless CALLS edge is not WRONG — it is
         the same edge missing one property, and consumers already treat a null ``line`` as
@@ -6566,10 +6714,9 @@ class GraphClient:
         nothing). Re-parsing fills it in; deleting first would lose real edges for a
         cosmetic gain.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
-            "Schema v11: cleared stored file/git hashes — run 'atlas index' so CALLS edges "
+            "Schema v11: cleared the stored git_hash — run 'atlas index' so CALLS edges "
             "record the line the call is written on"
         )
 
@@ -6581,25 +6728,23 @@ class GraphClient:
         `Base.settings` splits from `Base.self.settings`. Separately, a binding local
         to an anonymous callback no longer produces an entity at all.
 
-        A hash clear, not a purge — and the distinction was checked rather than
-        assumed. ``_classify_file`` compares a re-parse against the uids the graph
-        already holds for that file and emits the difference as deletions, so the old
-        node disappears the moment the file is read again. Clearing file and git
-        hashes is what forces that read; deleting here as well would only race the
-        re-parse to the same result.
+        A re-read, not a purge — and the distinction was checked rather than assumed.
+        ``_classify_file`` compares a re-parse against the uids the graph already holds
+        for that file and emits the difference as deletions, so the old node disappears
+        the moment the file is read again. Clearing git_hash is what forces that read;
+        deleting here as well would only race the re-parse to the same result.
 
-        This is why it cannot be skipped: the hash gate would otherwise treat every
-        unchanged file as done, the split would never happen, and the graph would keep
-        serving one node for two functions indefinitely.
+        This is why it cannot be skipped: nothing would enumerate an unchanged file, the
+        split would never happen, and the graph would keep serving one node for two
+        functions indefinitely.
 
         Only projects containing C++, Ruby or TypeScript are materially affected. The
-        clear is repo-wide because it is cheap and a per-language clear would need to
-        know which files a project holds before reading them.
+        clear is repo-wide because it is cheap and a per-language one would need to know
+        which files a project holds before reading them.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
-            "Schema v12: cleared stored file/git hashes — run 'atlas index' so overloaded "
+            "Schema v12: cleared the stored git_hash — run 'atlas index' so overloaded "
             "C++ functions and Ruby singleton methods stop sharing one node"
         )
 
@@ -6608,19 +6753,18 @@ class GraphClient:
         gained overflow embedding chunks.
 
         Same reason as v7, v11 and v16: both depend on re-reading the file. The parts of
-        a split section exist only in the source bytes, and the file-hash gate skips an
-        unchanged file forever, so a header-less document already in the graph would stay
-        one oversized node no matter how many times ``atlas index`` ran.
+        a split section exist only in the source bytes, and nothing would otherwise
+        enumerate an unchanged file, so a header-less document already in the graph would
+        stay one oversized node no matter how many times ``atlas index`` ran.
 
         Nothing is deleted here. The old single node keeps the qualified_name that part 1
         will claim, so the re-parse updates it in place and the AST diff adds the rest;
         and a node still holding a truncated vector is not wrong, only incomplete, which
         re-embedding fixes.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
-            "Schema v17: cleared stored file/git hashes — run 'atlas index' so oversized doc "
+            "Schema v17: cleared the stored git_hash — run 'atlas index' so oversized doc "
             "sections split into parts and oversized entities get their overflow vectors"
         )
 
@@ -6750,9 +6894,9 @@ class GraphClient:
         """v16: markdown frontmatter moved from flattened node properties into one
         ``frontmatter`` map, and ordinary (non-Note) docs started keeping theirs at all.
 
-        Same reason as v7 and v11: the map exists only in the file's bytes, and the
-        file-hash gate skips unchanged files forever, so no existing note or doc would
-        ever grow one. Clearing the hashes forces the re-parse that builds it.
+        Same reason as v7 and v11: the map exists only in the file's bytes, and nothing
+        would otherwise enumerate an unchanged file, so no existing note or doc would ever
+        grow one. Clearing git_hash forces the re-parse that builds it.
 
         The re-parse also *repairs* a corruption. Flattened keys were applied with
         ``SET n += extra_properties`` after the schema fields were written, so a
@@ -6767,10 +6911,9 @@ class GraphClient:
         an unknown property, and ``atlas project rm`` followed by a re-index clears them
         for anyone who wants them gone.
         """
-        await self.execute_write(generate_clear_file_hashes_ddl())
         await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
         logger.info(
-            "Schema v16: cleared stored file/git hashes — run 'atlas index' so markdown "
+            "Schema v16: cleared the stored git_hash — run 'atlas index' so markdown "
             "frontmatter is stored as a queryable n.frontmatter map"
         )
 

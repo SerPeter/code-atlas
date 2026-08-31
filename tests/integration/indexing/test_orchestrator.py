@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 import pytest
 
+from code_atlas import schema
 from code_atlas.chunking import SplitResult
 from code_atlas.events import Topic
+from code_atlas.indexing.consumers import ASTConsumer
 from code_atlas.indexing.orchestrator import StalenessChecker, index_monorepo, index_project
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
@@ -23,6 +25,7 @@ from code_atlas.settings import (
     EmbeddingSettings,
     IndexSettings,
     RationaleSettings,
+    SearchSettings,
     derive_project_name,
 )
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
@@ -44,6 +47,30 @@ def _write(root: Path, rel_path: str, content: str = "") -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return p
+
+
+@pytest.fixture
+def parse_calls(monkeypatch):
+    """Every path the AST stage genuinely handed to tree-sitter, in order.
+
+    A run that skipped every file and a run that re-parsed every file and found nothing
+    changed return the identical ``IndexResult``, so this is the only signal that
+    separates "distrusted the gate" from "trusted it".
+
+    Module-scoped rather than owned by one class: the flag split (axis B) and the gate
+    key (ATL-152) both turn on exactly this distinction.
+    """
+    from code_atlas.indexing import consumers
+
+    real = consumers.parse_file
+    seen: list[str] = []
+
+    def _counting(path, source, project_name, **kwargs):
+        seen.append(path)
+        return real(path, source, project_name, **kwargs)
+
+    monkeypatch.setattr(consumers, "parse_file", _counting)
+    return seen
 
 
 def _git(cwd, *args):
@@ -792,6 +819,19 @@ def _embedding_settings(dimension: int) -> EmbeddingSettings:
     return EmbeddingSettings(model=_FAKE_MODEL, dimension=dimension)
 
 
+@pytest.fixture
+def provider(graph_client):
+    """Patch the embedding provider into both orchestrator entry points.
+
+    Module-scoped for the same reason ``parse_calls`` is: ADR-0042's claim that a
+    re-check costs nothing at the provider is made by the flag split (axis B) and again
+    by the gate key (ATL-152), and the two reach the re-parse by different routes.
+    """
+    embed = _CountingEmbedClient(_FAKE_MODEL, graph_client._dimension)
+    with patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=embed):
+        yield embed
+
+
 async def _blast_radius(graph_client, project: str) -> dict[str, int]:
     """The row ``count_project_data`` reports for *project* itself.
 
@@ -909,33 +949,6 @@ class TestReindexScopeIsNotDestruction:
         _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
         _write(tmp_path, "src/utils.py", "MAGIC = 42\n\ndef add(a, b):\n    return a + b\n")
         return tmp_path
-
-    @pytest.fixture
-    def provider(self, graph_client):
-        """Patch the embedding provider into both orchestrator entry points."""
-        embed = _CountingEmbedClient(_FAKE_MODEL, graph_client._dimension)
-        with patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=embed):
-            yield embed
-
-    @pytest.fixture
-    def parse_calls(self, monkeypatch):
-        """Every path the AST stage genuinely handed to tree-sitter, in order.
-
-        A run that skipped every file and a run that re-parsed every file and found
-        nothing changed return the identical ``IndexResult``, so this is the only
-        signal that separates "distrusted the gate" from "trusted it".
-        """
-        from code_atlas.indexing import consumers
-
-        real = consumers.parse_file
-        seen: list[str] = []
-
-        def _counting(path, source, project_name, **kwargs):
-            seen.append(path)
-            return real(path, source, project_name, **kwargs)
-
-        monkeypatch.setattr(consumers, "parse_file", _counting)
-        return seen
 
     # -- axis C: --full destroys nothing ------------------------------------ #
 
@@ -1253,3 +1266,565 @@ class TestReindexScopeIsNotDestruction:
         assert after.get(f"{root}/auth", 0) == 0
         assert after.get(f"{root}/shared") == before.get(f"{root}/shared")
         assert after.get(root) == before.get(root)
+
+
+class TestTheExtractionKeyGatesEnumeration:
+    """ATL-152: an extraction change invalidates the gate by itself.
+
+    The file-hash gate keyed on file *bytes* while the extracted result also depends on
+    the parser and on configuration, so its key was narrower than the thing it gated.
+    After any extraction change the graph could be wrong for every file while the gate
+    insisted nothing needed doing — recovered on 2026-08-31 by a hand-written script
+    clearing ``file_hash`` on 845 nodes and ``git_hash`` on 9 projects.
+
+    A git-backed project on purpose. On a non-git tree ``_decide_delta_mode`` falls back
+    to full mode on its own, so nothing here would be testing the gate at all: the whole
+    question is whether an unchanged HEAD still gets enumerated.
+    """
+
+    @pytest.fixture
+    def git_project(self, tmp_path):
+        _init_git_repo(tmp_path)
+        _write(tmp_path, "src/__init__.py", "")
+        _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
+        _write(tmp_path, "src/utils.py", "MAGIC = 42\n\ndef add(a, b):\n    return a + b\n")
+        _git(tmp_path, "add", ".")
+        _git(tmp_path, "commit", "-m", "initial")
+        return tmp_path
+
+    async def test_an_unchanged_key_still_skips_every_file(self, git_project, graph_client, event_bus, parse_calls):
+        """The behaviour that must survive: the ordinary re-index stays free."""
+        settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        parse_calls.clear()
+        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert result.mode == "delta"
+        assert parse_calls == []
+
+    async def test_a_bumped_epoch_re_parses_a_project_git_calls_unchanged(
+        self, git_project, graph_client, event_bus, parse_calls, monkeypatch
+    ):
+        """The story's headline scenario, and the reason both halves of the key exist.
+
+        Bumping the epoch has to reach files git reports as unchanged, which takes BOTH
+        gates: ``Project.extraction_key`` opens enumeration, and the epoch inside each
+        ``file_hash`` is what then declines to skip. Remove either and this passes for
+        the wrong reason or not at all — with only the file-hash half, delta mode
+        publishes nothing and the gate is never even consulted.
+        """
+        settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        parse_calls.clear()
+
+        monkeypatch.setattr(schema, "EXTRACTION_EPOCH", schema.EXTRACTION_EPOCH + 1)
+        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert result.mode == "full"
+        assert {"src/app.py", "src/utils.py"} <= set(parse_calls)
+
+        # ...and exactly once. This is also the migration ATL-152 owes every graph indexed
+        # before the key existed: those hashes were computed keyless, so the first run
+        # afterwards re-reads everything and the run that re-checked also re-keyed.
+        parse_calls.clear()
+        again = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert again.mode == "delta"
+        assert parse_calls == []
+
+    async def test_a_bumped_epoch_costs_no_provider_call_when_nothing_moved(
+        self, git_project, graph_client, event_bus, provider, parse_calls, monkeypatch
+    ):
+        """The whole point of keying the gate rather than clearing it: the epoch is free.
+
+        Deliberately not a duplicate of ``test_full_on_an_unchanged_project_costs_no_provider_call``.
+        That one reaches the re-parse through the ``--full`` FLAG, which sets
+        ``force_reparse=True`` and turns the per-file gate off entirely. The epoch reaches
+        it with the gate still ON and still trusted: ``full_reindex`` is False, every file
+        is asked about, and the gate declines to skip only because the stored hashes were
+        keyed on the old epoch. Same claim about spend, opposite setting of the switch that
+        makes the claim interesting — and this is the route a version upgrade takes, where
+        nobody chose to pay anything.
+        """
+        settings = AtlasSettings(project_root=git_project, embeddings=_embedding_settings(graph_client._dimension))
+        await graph_client.ensure_schema()
+        project = derive_project_name(git_project)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        embedded = (await graph_client.count_embeddings_by_project()).get(project, 0)
+        assert embedded > 0, "the first index has to buy vectors, or a free re-check proves nothing"
+
+        provider.calls = 0
+        parse_calls.clear()
+        monkeypatch.setattr(schema, "EXTRACTION_EPOCH", schema.EXTRACTION_EPOCH + 1)
+        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert result.mode == "full"
+        # Non-vacuous: a run that skipped every file would report zero calls too, for
+        # entirely the wrong reason.
+        assert {"src/app.py", "src/utils.py"} <= set(parse_calls)
+        assert provider.calls == 0, "layer 2 (content_hash) has to stop the re-parse before the provider"
+        assert (await graph_client.count_embeddings_by_project()).get(project, 0) == embedded
+
+    async def test_an_extraction_affecting_setting_re_parses_without_manual_clearing(
+        self, git_project, graph_client, event_bus, parse_calls
+    ):
+        """The ``max_source_chars`` case the story exists for, on the enumeration side.
+
+        NOTE this proves the file is re-READ, not that its stored ``source`` is repaired:
+        ``content_hash`` is computed before truncation, so layer 2 still classifies every
+        entity as unchanged. That gap is pinned separately by
+        ``test_full_does_not_repair_a_source_truncated_under_a_narrower_cap`` and closing
+        it means folding the cap into ``content_hash``, which is not this story.
+        """
+        await graph_client.ensure_schema()
+        narrow = AtlasSettings(
+            project_root=git_project, index=IndexSettings(max_source_chars=2000), embeddings=NO_EMBED
+        )
+        wide = AtlasSettings(
+            project_root=git_project, index=IndexSettings(max_source_chars=48_000), embeddings=NO_EMBED
+        )
+
+        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        parse_calls.clear()
+        result = await index_project(wide, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert result.mode == "full"
+        assert {"src/app.py", "src/utils.py"} <= set(parse_calls)
+
+    async def test_a_setting_that_cannot_move_extraction_still_skips(
+        self, git_project, graph_client, event_bus, parse_calls
+    ):
+        """The other direction, and the one that makes the key worth having.
+
+        A key that moved on any config change would re-parse the world every time someone
+        tuned RRF weights, which is how a gate stops being trusted.
+        """
+        await graph_client.ensure_schema()
+        before = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
+        after = AtlasSettings(project_root=git_project, search=SearchSettings(rrf_k=99), embeddings=NO_EMBED)
+
+        await index_project(before, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        parse_calls.clear()
+        result = await index_project(after, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert result.mode == "delta"
+        assert parse_calls == []
+
+    async def test_a_project_with_no_stored_key_enumerates_everything(self, git_project, graph_client, event_bus):
+        """An absent key has to read as "differs" — this is what carries the upgrade.
+
+        A graph indexed before this shipped has no ``Project.extraction_key`` AND stored
+        every ``file_hash`` without one. This test pins the half an absent key is
+        responsible for: enumeration reopens, so the per-file gate is asked about every
+        file instead of about nothing. The other half — the gate then declining to skip
+        them — is what test_a_bumped_epoch_re_parses_a_project_git_calls_unchanged
+        covers, and only both together re-parse the project.
+
+        Deliberately does not assert on parse_calls: these hashes were written by the
+        current code under the current key, so the gate skipping them here is correct.
+
+        Doing it this way rather than with a ``SCHEMA_VERSION`` bump is a decision, not an
+        omission. A bump would deliver the one-time re-check once and then need repeating
+        for every future epoch move, and ``ensure_schema``'s migration branch drops and
+        rebuilds every vector and text index (``_migrate_indices``) — a cost this graph
+        has already paid once for nothing, and one a lightweight install cannot pay at all.
+        """
+        settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(git_project)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert await graph_client.get_project_extraction_key(project) is not None
+        assert (await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)).mode == (
+            "delta"
+        ), "without this the assertion below would pass for the wrong reason"
+
+        await graph_client.execute_write(
+            f"MATCH (p:{NodeLabel.PROJECT} {{uid: $uid}}) REMOVE p.extraction_key", {"uid": project}
+        )
+        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert result.mode == "full"
+        assert result.files_published == 3
+
+
+class _RelWriteSpy:
+    """Counts the relationship statements the per-file write path issues, and their payloads.
+
+    Statement count alone measures batch count rather than work: the delete is one
+    statement per *batch* over a ``$fps`` list and the create is one UNWIND per rel_type
+    over the pooled rels, so a thirty-file batch is a handful of statements whether one
+    file changed or thirty. ``deleted_file_paths`` and ``created_rels`` are the numbers
+    that move.
+
+    Matches on query shape rather than wrapping ``_recreate_batch_relationships``,
+    because the claim under test is about statements actually reaching the database.
+    Deliberately blind to the post-batch resolvers' own MERGEs (CALLS/IMPORTS/USES_TYPE/
+    DOCUMENTS), which ATL-151 does not touch — the replay buffer is kept, so those still
+    run for every file including the ones whose rewrite was skipped.
+    """
+
+    def __init__(self, graph) -> None:
+        self._graph = graph
+        self._orig = graph.execute_write
+        self.delete_statements = 0
+        self.deleted_file_paths = 0
+        self.create_statements = 0
+        self.created_rels = 0
+
+    def __enter__(self) -> _RelWriteSpy:
+        async def _spy(query: str, params: dict | None = None, **kwargs):
+            p = params or {}
+            if "n.file_path IN $fps AND NOT n:" in query and "DELETE r" in query:
+                self.delete_statements += 1
+                self.deleted_file_paths += len(p.get("fps") or [])
+            elif "SET e += r.props" in query or "CREATE (a)-[:IMPLEMENTS" in query:
+                self.create_statements += 1
+                self.created_rels += len(p.get("rels") or [])
+            return await self._orig(query, params, **kwargs)
+
+        self._graph.execute_write = _spy
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._graph.execute_write = self._orig
+
+    @property
+    def total(self) -> int:
+        return self.delete_statements + self.create_statements
+
+    def __str__(self) -> str:
+        return (
+            f"{self.delete_statements} delete(s) over {self.deleted_file_paths} file(s), "
+            f"{self.create_statements} create(s) of {self.created_rels} rel(s)"
+        )
+
+
+async def _rel_census(graph_client, project: str) -> dict[str, int]:
+    """``rel_type -> count`` for every edge leaving one of *project*'s nodes."""
+    records = await graph_client.execute(
+        "MATCH (n {project_name: $p})-[r]->() RETURN type(r) AS t, count(r) AS c ORDER BY t",
+        {"p": project},
+    )
+    return {r["t"]: r["c"] for r in records}
+
+
+async def _mark_rels(graph_client, project: str, file_path: str | None = None) -> int:
+    """Stamp a property no writer sets onto the project's edges. Returns how many.
+
+    Counting edges cannot separate "left alone" from "deleted and recreated identically"
+    — both end on the same number, which is exactly why the unconditional rewrite could
+    be swapped for the skip with every count-based test still passing.
+    """
+    pattern = (
+        f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $p, file_path: $f}})-[r]->()"
+        if file_path
+        else f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $p}})-[r]->()"
+    )
+    records = await graph_client.execute(
+        f"{pattern} SET r.atl151_marker = 'survived' RETURN count(r) AS c",
+        {"p": project, "f": file_path},
+    )
+    return records[0]["c"]
+
+
+async def _rewritten_rels(graph_client, project: str, file_path: str | None = None) -> list[str]:
+    """Every unmarked edge out of the scope, as ``"file_path:REL_TYPE"``, sorted.
+
+    A rewrite deletes and recreates, so anything it touched comes back unmarked. An edge
+    created *since* the mark was taken is unmarked too and shows up here — a post-batch
+    resolver's new CALLS edge, say — so a caller expecting one of those names the rel
+    type it cares about rather than asserting this is empty.
+    """
+    pattern = (
+        f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $p, file_path: $f}})-[r]->()"
+        if file_path
+        else f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $p}})-[r]->()"
+    )
+    records = await graph_client.execute(
+        f"{pattern} WHERE r.atl151_marker IS NULL RETURN n.file_path AS fp, type(r) AS t",
+        {"p": project, "f": file_path},
+    )
+    return sorted(f"{r['fp']}:{r['t']}" for r in records)
+
+
+async def _overrides(graph_client, project: str) -> int:
+    """How many OVERRIDES edges the detector currently has standing."""
+    records = await graph_client.execute(
+        f"MATCH (:{NodeLabel.CALLABLE} {{project_name: $p}})-[r:{RelType.OVERRIDES}]->() RETURN count(r) AS c",
+        {"p": project},
+    )
+    return records[0]["c"]
+
+
+async def _calls(graph_client, project: str) -> list[tuple[str, str]]:
+    """``(caller name, callee name)`` for every resolved CALLS edge, sorted."""
+    records = await graph_client.execute(
+        f"MATCH (a {{project_name: $p}})-[:{RelType.CALLS}]->(b) RETURN a.name AS a, b.name AS b",
+        {"p": project},
+    )
+    return sorted((r["a"], r["b"]) for r in records)
+
+
+class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
+    """ATL-151, at the altitude a user meets it: ``atlas index --full``.
+
+    ``--full`` is the run the story exists for. Entities were already diffed by
+    ``content_hash`` and skipped when unchanged; relationships had no equivalent, so a
+    re-check that found nothing changed still deleted and recreated every edge for every
+    file — 4,878 files' worth on the production graph — to arrive back where it started.
+
+    Every project here is deliberately **not** a git repo, so ``_decide_delta_mode``
+    returns ``full`` on every run and enumeration is never the variable. What separates
+    the runs is the ``--full`` flag alone: axis B, whether the ``file_hash`` gate is
+    trusted. Without it an unchanged file is never even parsed and nothing below would
+    reach the fingerprint at all.
+    """
+
+    @pytest.fixture
+    def project_dir(self, tmp_path):
+        """Two plain modules, one importing and calling the other.
+
+        No ``__init__.py``, deliberately, and this is measured rather than assumed: add a
+        non-empty one and ``test_a_full_recheck_of_an_unchanged_project_writes_no_relationships``
+        fails with "1 delete(s) over 1 file(s)". A package marker with content re-reports
+        an entity as *added* on every single re-index, so the classification refuses its
+        skip forever — a pre-existing signal with nothing to do with this story, which
+        would make the zero below unreachable for the wrong reason. (An *empty* marker is
+        harmless: it lands in ``new_file_paths`` each run but has no relationships to
+        rewrite, and the test still passes with one present.)
+        """
+        _write(tmp_path, "alpha.py", "def widen(value):\n    return value + 1\n")
+        _write(tmp_path, "beta.py", "from alpha import widen\n\n\ndef run():\n    return widen(1)\n")
+        return tmp_path
+
+    async def test_a_full_recheck_of_an_unchanged_project_writes_no_relationships(
+        self, project_dir, graph_client, event_bus, parse_calls
+    ):
+        """The headline claim: re-checking everything costs the parse and nothing else.
+
+        The spy is the direct evidence and the marker is the corroborating kind — an
+        edge that came back is a *different* edge, and no count can tell you that.
+        """
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert await _mark_rels(graph_client, project) > 0, "the first index has to write edges"
+        before = await _rel_census(graph_client, project)
+
+        parse_calls.clear()
+        with _RelWriteSpy(graph_client) as spy:
+            result = await index_project(
+                settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            )
+
+        assert result.mode == "full"
+        # Non-vacuous: a run that trusted the gate and skipped every file would report
+        # the same zero, for entirely the wrong reason.
+        assert {"alpha.py", "beta.py"} <= set(parse_calls), "--full must distrust the gate and re-parse"
+        assert spy.total == 0, f"a no-op re-check still issued {spy}"
+        assert await _rel_census(graph_client, project) == before
+        assert await _rewritten_rels(graph_client, project) == []
+
+    async def test_a_file_that_gained_an_edge_is_rewritten_and_its_neighbour_is_not(
+        self, project_dir, graph_client, event_bus, parse_calls
+    ):
+        """The selectivity, which is the part neither half proves alone.
+
+        Both files are re-parsed — ``--full`` guarantees that — and exactly one of them
+        reaches the database. Note what "gained an edge" has to mean here: a gained
+        *call* would be the wrong example, because CALLS is resolved post-batch from the
+        replay buffer and is not part of what this path writes at all. A gained
+        definition is, and it moves the file's DEFINES set.
+        """
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await _mark_rels(graph_client, project)
+
+        _write(
+            project_dir,
+            "alpha.py",
+            "def widen(value):\n    return value + 1\n\n\ndef narrow(value):\n    return value - 1\n",
+        )
+
+        parse_calls.clear()
+        with _RelWriteSpy(graph_client) as spy:
+            await index_project(
+                settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            )
+
+        assert {"alpha.py", "beta.py"} <= set(parse_calls)
+        assert spy.deleted_file_paths == 1, f"exactly one file should have been rewritten, got {spy}"
+        assert await _rewritten_rels(graph_client, project, "beta.py") == []
+        assert "alpha.py:DEFINES" in await _rewritten_rels(graph_client, project, "alpha.py")
+        names = await graph_client.execute(
+            f"MATCH (m:{NodeLabel.MODULE} {{project_name: $p, file_path: 'alpha.py'}})"
+            f"-[:{RelType.DEFINES}]->(c) RETURN c.name AS name",
+            {"p": project},
+        )
+        assert sorted(r["name"] for r in names) == ["narrow", "widen"]
+
+    async def test_a_new_module_is_linked_from_a_file_the_recheck_did_not_rewrite(
+        self, tmp_path, graph_client, event_bus
+    ):
+        """The story's real risk, and the reason the buffer was kept when the write was not.
+
+        The story also asked for a skipped file's relationships not to be buffered for the
+        resolution flush. That buffer is exactly what ADR-0026 added to fix a measured
+        loss — resolution reads the graph as it stands at the flush, so a callee upserted
+        later was never linked: CALLS 9,058 -> 9,713, cross-file 4,066 -> 4,720,
+        ``find_dead_code`` on src/ 27 -> 15. Skipping the buffer for an unchanged file
+        reintroduces precisely that, and worse, because ``--full`` is the run that repairs
+        the hole — the repair would be the thing broken.
+
+        So the write is skipped and the buffer is kept, and this test is what says so.
+        Delete the buffering for skipped files and it fails with no edge at all: the
+        caller's ``file_hash`` is stored the same run, so nothing would ever revisit it.
+        """
+        _write(tmp_path, "caller.py", "def run():\n    return compute()\n")
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(tmp_path)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert await _calls(graph_client, project) == [], "precondition: nothing defines compute yet"
+        await _mark_rels(graph_client, project, "caller.py")
+
+        _write(tmp_path, "helper_lib.py", "def compute():\n    return 1\n")
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        # The skip really did fire for the caller — otherwise the buffer is not under
+        # test. Named by rel type rather than asserted empty: the CALLS edge below is
+        # itself new and unmarked, which is the whole point.
+        assert "caller.py:DEFINES" not in await _rewritten_rels(graph_client, project, "caller.py"), (
+            "the caller's rewrite was not skipped, so this proves nothing about the buffer"
+        )
+        assert await _calls(graph_client, project) == [("run", "compute")]
+
+    async def test_a_detector_edge_that_stopped_firing_is_revoked_by_the_recheck(
+        self, tmp_path, graph_client, event_bus, parse_calls
+    ):
+        """The one shape where the fingerprint, and not the classification, is deciding.
+
+        For parser-emitted edges the entity classification is nearly sufficient on its
+        own: adding or removing an edge almost always means adding or editing the entity
+        it runs from, so a fingerprint forced to a constant changes nothing. What
+        genuinely moves a file's written rel set while every one of its own entities
+        stands still is **detector output**, which is derived from the rest of the graph.
+
+        Here ``Base.run`` disappears and ``child_mod.py`` is untouched on disk, so it
+        stops emitting OVERRIDES. Step 3's rewrite is the only thing that can revoke it —
+        step 4b touches only files whose detectors emit something in the CURRENT run — and
+        the only reason ``child_mod.py`` gets that rewrite is that its stored fingerprint
+        covers the merged parser+detector set while the compare is made pre-detector, so
+        a file that carried detector edges can never match. Force ``_rels_hash`` to a
+        constant and this is the test in this file that fails, with the stale edge
+        surviving every future re-check.
+        """
+        _write(tmp_path, "base_mod.py", "class Base:\n    def run(self):\n        return 1\n")
+        _write(
+            tmp_path,
+            "child_mod.py",
+            "from base_mod import Base\n\n\nclass Child(Base):\n    def run(self):\n        return 2\n",
+        )
+        settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(tmp_path)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert await _overrides(graph_client, project) == 1, "precondition: the detector fired"
+
+        _write(tmp_path, "base_mod.py", "class Base:\n    def other(self):\n        return 1\n")
+        parse_calls.clear()
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert "child_mod.py" in parse_calls, "the untouched file has to be re-parsed, or this pins nothing"
+        assert await _overrides(graph_client, project) == 0, "a detector edge that stopped firing survived the re-check"
+
+    async def test_repeated_full_rechecks_leave_the_relationship_census_alone(
+        self, project_dir, graph_client, event_bus
+    ):
+        """Skipping the rewrite must not let anything accumulate in its place.
+
+        The per-file delete used to be the idempotence of every edge the flush re-derives,
+        and one resolver was leaning on it: ``resolve_doc_links`` used ``CREATE`` where
+        the others MERGE, and duplicated every heuristic DOCUMENTS edge on every re-check
+        — 213 -> 432 over three runs, unbounded. Nothing in the graph looked broken; the
+        count simply grew.
+
+        Runs two and three are the comparison, not one and two. A first index resolves
+        against a partial graph and ADR-0026's replay MERGEs rather than retracts, so a
+        single legitimate settling step between them is expected and is not what this is
+        watching for.
+        """
+        _write(project_dir, "guide.md", "# Guide\n\n## Using widen\n\nCall `widen` to widen a value.\n")
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        settled = await _rel_census(graph_client, project)
+        assert settled.get(RelType.DOCUMENTS.value, 0) > 0, "precondition: a doc edge exists to duplicate"
+
+        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert await _rel_census(graph_client, project) == settled
+
+    async def test_an_interrupted_run_leaves_both_gates_open(
+        self, project_dir, graph_client, event_bus, parse_calls, monkeypatch
+    ):
+        """DESIGN J: ``rels_hash`` is withheld until the deferred flush, like ``file_hash``.
+
+        Both are written by the same block of ``_flush_deferred_resolution`` and for the
+        same reason, sharpened: a fingerprint stored before the flush describes a rel set
+        whose deferred half is not resolved yet, so a crash in between produces a file
+        that visibly re-parses on every run (its ``file_hash`` correctly unset) while
+        declining to rewrite relationships whose other half never landed. That is
+        undiagnosable from the outside — the gate you would inspect looks right.
+
+        The kill is the flush never happening, which is what a process death between the
+        upsert and the flush amounts to: the entity and relationship transactions are
+        committed, the resolution is not, and neither gate property may be on disk.
+        """
+        settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+        files = ["alpha.py", "beta.py"]
+
+        async def _never_flushes(self, *, final: bool = False) -> None:
+            return None
+
+        # Restored by hand rather than with monkeypatch.undo(): the parse_calls fixture
+        # patches through the SAME function-scoped monkeypatch instance, so undo() would
+        # silently take the parse recorder down with it and every assertion below would
+        # read an empty list as "nothing was parsed".
+        real_flush = ASTConsumer._flush_deferred_resolution
+        monkeypatch.setattr(ASTConsumer, "_flush_deferred_resolution", _never_flushes)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        monkeypatch.setattr(ASTConsumer, "_flush_deferred_resolution", real_flush)
+
+        assert set(files) <= set(parse_calls), "precondition: the interrupted run did parse and upsert"
+        assert await _calls(graph_client, project) == [], "precondition: its deferred half never resolved"
+        assert await graph_client.get_batch_file_hashes(project, files) == dict.fromkeys(files)
+        assert await graph_client.get_batch_rels_hashes(project, files) == dict.fromkeys(files)
+
+        # Recovery, on the ordinary path: both gates being open is what makes the next
+        # run re-read the files AND rewrite their relationships rather than trust either.
+        parse_calls.clear()
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert set(files) <= set(parse_calls)
+        assert await _calls(graph_client, project) == [("run", "widen")]
+        assert all((await graph_client.get_batch_file_hashes(project, files)).values())
+        assert all((await graph_client.get_batch_rels_hashes(project, files)).values())

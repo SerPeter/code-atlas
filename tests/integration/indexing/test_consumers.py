@@ -1512,3 +1512,277 @@ async def test_embed_poison_capped_not_infinite(event_bus: EventBus, graph_clien
     await asyncio.wait_for(task, timeout=10.0)
 
     assert await _pel_count(event_bus, Topic.EMBED_DIRTY, "embed") == 0
+
+
+# ---------------------------------------------------------------------------
+# ATL-151 — the relationship fingerprint
+# ---------------------------------------------------------------------------
+
+
+class RelWriteSpy:
+    """Counts the relationship statements the per-file write path issues.
+
+    Statement count alone measures batch count, not work: the delete is one statement
+    per *batch* over a ``$fps`` list and the create is one UNWIND per rel_type over the
+    pooled rels, so a thirty-file batch is a handful of statements whether one file
+    changed or thirty. The payload counts are the number that moves.
+
+    Matches on query shape rather than wrapping ``_recreate_batch_relationships``,
+    because the claim under test is about statements actually sent to the database.
+    Deliberately blind to the resolvers' own MERGEs (CALLS/IMPORTS/USES_TYPE), which
+    ATL-151 does not touch: the replay buffer is kept, so those still run.
+    """
+
+    def __init__(self, graph: GraphClient) -> None:
+        self._graph = graph
+        self._orig = graph.execute_write
+        self.delete_statements = 0
+        self.deleted_file_paths = 0
+        self.create_statements = 0
+        self.created_rels = 0
+
+    def __enter__(self) -> RelWriteSpy:
+        async def _spy(query: str, params: dict | None = None, **kwargs):
+            p = params or {}
+            if "n.file_path IN $fps AND NOT n:" in query and "DELETE r" in query:
+                self.delete_statements += 1
+                self.deleted_file_paths += len(p.get("fps") or [])
+            elif "SET e += r.props" in query or "CREATE (a)-[:IMPLEMENTS" in query:
+                self.create_statements += 1
+                self.created_rels += len(p.get("rels") or [])
+            return await self._orig(query, params, **kwargs)
+
+        self._graph.execute_write = _spy  # ty: ignore[invalid-assignment]
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._graph.execute_write = self._orig  # ty: ignore[invalid-assignment]
+
+    @property
+    def total(self) -> int:
+        return self.delete_statements + self.create_statements
+
+
+def _full_consumer(event_bus: EventBus, graph_client: GraphClient, settings: AtlasSettings) -> ASTConsumer:
+    """A consumer shaped like ``atlas index --full``: distrust the byte gate, destroy nothing.
+
+    ``force_reparse`` is what makes these tests reach the fingerprint at all -- with the
+    byte gate trusted an unchanged file never gets as far as being parsed, so nothing
+    would be proved about the relationship rewrite.
+    """
+    return ASTConsumer(
+        event_bus,
+        graph_client,
+        settings,
+        policy=BatchPolicy(time_window_s=0, max_batch_size=10, block_ms=50),
+        force_reparse=True,
+    )
+
+
+async def _index_once(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+    paths: list[str],
+    *,
+    change_type: str = "created",
+) -> None:
+    consumer = _full_consumer(event_bus, graph_client, settings)
+    await consumer.process_batch([_file_changed(settings, p, change_type) for p in paths], "seed")
+    await consumer._flush_deferred_resolution(final=True)
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_a_reparse_that_changes_nothing_writes_no_relationships(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """ADR-0042 decision 4: a no-op re-check should cost only the parse.
+
+    Before this, every ``--full`` deleted and recreated every edge of every file --
+    ~4,878 files' worth on the production graph -- to arrive back where it started. The
+    entities were already diffed by ``content_hash``; the relationships had no
+    equivalent, and that is the whole reason a no-op re-check was not nearly free.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(settings.project_root, "noop_lib.py", "def helper():\n    return 1\n")
+    _write_python_file(
+        settings.project_root,
+        "noop_app.py",
+        "from noop_lib import helper\n\n\ndef run():\n    return helper()\n",
+    )
+    await _index_once(event_bus, graph_client, settings, ["noop_lib.py", "noop_app.py"])
+
+    before = await graph_client.execute(
+        "MATCH (n {project_name: $p})-[r]->() RETURN count(r) AS n", {"p": project_name}
+    )
+
+    consumer = _full_consumer(event_bus, graph_client, settings)
+    with RelWriteSpy(graph_client) as spy:
+        await consumer.process_batch(
+            [_file_changed(settings, "noop_lib.py"), _file_changed(settings, "noop_app.py")], "recheck"
+        )
+        await consumer._flush_deferred_resolution(final=True)
+
+    assert spy.total == 0, (
+        f"a no-op re-check still issued {spy.delete_statements} delete(s) over "
+        f"{spy.deleted_file_paths} file(s) and {spy.create_statements} create(s) of "
+        f"{spy.created_rels} rel(s)"
+    )
+    after = await graph_client.execute("MATCH (n {project_name: $p})-[r]->() RETURN count(r) AS n", {"p": project_name})
+    assert after[0]["n"] == before[0]["n"], "skipping the rewrite changed the graph"
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_a_changed_relationship_set_still_rewrites_when_no_entity_moved(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """The other side of the gate, and the sabotage anchor for the whole story.
+
+    The shape had to be chosen carefully. The story's own scenario -- "unchanged
+    entities, but the file gained a call" -- cannot reach this path at all: CALLS is
+    resolved post-batch from the replay buffer and is not part of what TX2 writes. And
+    for parser-emitted edges the entity classification is nearly sufficient on its own,
+    because adding an edge almost always means adding or editing the entity it runs from.
+
+    What genuinely moves a file's written rel set while every one of its entities stands
+    still is **detector output**, which is derived from the rest of the graph. Here
+    ``Base.run`` disappears, so ``det_child.py`` -- byte-identical, every entity
+    ``unchanged`` -- stops emitting OVERRIDES. Step 3's rewrite is the only thing that
+    revokes it: step 4b touches only files whose detectors emit something in the CURRENT
+    run, so nothing else would ever sweep it.
+
+    Force ``_rels_hash`` to a constant and this is the test that fails, with the stale
+    edge surviving forever.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(settings.project_root, "rev_base.py", "class Base:\n    def run(self):\n        return 1\n")
+    _write_python_file(
+        settings.project_root,
+        "rev_child.py",
+        "from rev_base import Base\n\n\nclass Child(Base):\n    def run(self):\n        return 2\n",
+    )
+    await _index_once(event_bus, graph_client, settings, ["rev_base.py", "rev_child.py"])
+
+    overrides = "MATCH (:Callable {project_name: $p})-[r:OVERRIDES]->() RETURN count(r) AS n"
+    assert (await graph_client.execute(overrides, {"p": project_name}))[0]["n"] == 1, "precondition: detector fired"
+
+    # The base loses the method. rev_child.py is untouched on disk.
+    _write_python_file(settings.project_root, "rev_base.py", "class Base:\n    def other(self):\n        return 1\n")
+
+    consumer = _full_consumer(event_bus, graph_client, settings)
+    await consumer.process_batch(
+        [_file_changed(settings, "rev_base.py"), _file_changed(settings, "rev_child.py")], "recheck"
+    )
+    await consumer._flush_deferred_resolution(final=True)
+
+    assert (await graph_client.execute(overrides, {"p": project_name}))[0]["n"] == 0, (
+        "a detector edge that stopped firing survived the re-check"
+    )
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_a_skipped_file_still_buffers_its_rels_for_a_callee_that_lands_later(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """ATL-151 skips the WRITE and keeps the BUFFER, and this is why.
+
+    The story's scenario also said an unchanged file's relationships need not be
+    buffered for the resolution flush. That buffer is exactly what ADR-0026 added to fix
+    a measured loss -- resolution reads the graph as it stands at the flush, so a callee
+    upserted by a later batch was never linked: CALLS 9,058 -> 9,713, cross-file
+    4,066 -> 4,720, ``find_dead_code`` on src/ 27 -> 15. Skipping the buffer for an
+    unchanged file reintroduces precisely that, and worse: ``--full`` is the run that
+    repairs it, so the repair would be the thing broken.
+
+    Written as a RE-PARSE deliberately. The two existing replay regressions
+    (``test_a_callee_indexed_after_its_caller_still_gets_the_edge`` and
+    ``test_a_lone_candidate_is_revisited_when_a_second_one_appears``) index every file
+    for the first time, so every entity classifies ``added`` and this skip can never
+    fire in them -- they stay green under either version and cover nothing here.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(settings.project_root, "reparse_dispatch.py", "def fan_out(sink):\n    return sink.emit()\n")
+    _write_python_file(
+        settings.project_root, "reparse_sink_a.py", "class SinkA:\n    def emit(self):\n        return 'a'\n"
+    )
+    await _index_once(event_bus, graph_client, settings, ["reparse_dispatch.py", "reparse_sink_a.py"])
+
+    # Second run: the dispatcher is byte-identical and skips its rewrite, while a new
+    # implementation of the name it calls lands in a LATER batch.
+    _write_python_file(
+        settings.project_root, "reparse_sink_b.py", "class SinkB:\n    def emit(self):\n        return 'b'\n"
+    )
+    consumer = _full_consumer(event_bus, graph_client, settings)
+    await consumer.process_batch(
+        [_file_changed(settings, "reparse_dispatch.py"), _file_changed(settings, "reparse_sink_a.py")], "batch-0"
+    )
+    await consumer._flush_deferred_resolution()
+    await consumer.process_batch([_file_changed(settings, "reparse_sink_b.py", "created")], "batch-1")
+    await consumer._flush_deferred_resolution(final=True)
+
+    rows = await graph_client.execute(
+        "MATCH (a:Callable {project_name: $p, name: 'fan_out'})-[:CALLS]->(b:Callable {name: 'emit'}) "
+        "RETURN b.uid AS uid ORDER BY uid",
+        {"p": project_name},
+    )
+    assert len(rows) == 2, (
+        f"the skipped file's call was not replayed against the later batch, got {[r['uid'] for r in rows]}"
+    )
+
+
+@pytest.mark.usefixtures("_clean_streams")
+async def test_a_file_with_detector_rels_never_skips_and_keeps_its_detector_edge(
+    event_bus: EventBus,
+    graph_client: GraphClient,
+    settings: AtlasSettings,
+) -> None:
+    """The asymmetry that makes the fingerprint safe, and the hole it closes.
+
+    Detector output is graph-derived, not a function of the file's bytes, and the
+    detectors cannot run until step 3 has written the entities they query -- so the
+    fingerprint is *compared* pre-detector while what is *stored* covers the merged set
+    step 4b actually writes. A file that carried detector rels last run therefore yields
+    a stored hash no pre-detector hash can equal, and never skips.
+
+    The hole: step 3's rewrite is what revokes a detector edge that has stopped firing,
+    and step 4b only touches files whose detectors emit something in the current run. A
+    parser-only fingerprint would let such a file skip step 3 with nothing left to sweep
+    it, leaving the stale edge in the graph forever.
+    """
+    await graph_client.ensure_schema()
+    project_name = settings.project_root.resolve().name
+
+    _write_python_file(settings.project_root, "det_base.py", "class Base:\n    def run(self):\n        return 1\n")
+    _write_python_file(
+        settings.project_root,
+        "det_child.py",
+        "from det_base import Base\n\n\nclass Child(Base):\n    def run(self):\n        return 2\n",
+    )
+    await _index_once(event_bus, graph_client, settings, ["det_base.py", "det_child.py"])
+
+    overrides = "MATCH (:Callable {project_name: $p})-[r:OVERRIDES]->() RETURN count(r) AS n"
+    assert (await graph_client.execute(overrides, {"p": project_name}))[0]["n"] == 1, "precondition: detector fired"
+
+    consumer = _full_consumer(event_bus, graph_client, settings)
+    with RelWriteSpy(graph_client) as spy:
+        await consumer.process_batch(
+            [_file_changed(settings, "det_base.py"), _file_changed(settings, "det_child.py")], "recheck"
+        )
+        await consumer._flush_deferred_resolution(final=True)
+
+    assert spy.deleted_file_paths >= 1, "the file carrying detector rels must not have skipped its rewrite"
+    assert (await graph_client.execute(overrides, {"p": project_name}))[0]["n"] == 1, (
+        "the detector edge was lost or duplicated by the re-check"
+    )

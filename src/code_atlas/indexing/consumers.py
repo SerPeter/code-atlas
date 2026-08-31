@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import socket
@@ -38,7 +39,7 @@ from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship,
 from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, run_detectors
 from code_atlas.schema import NodeLabel, RelType
 from code_atlas.search.embeddings import _CODE_ENTITY_LABELS, build_embed_text, hash_text
-from code_atlas.settings import derive_project_name
+from code_atlas.settings import derive_project_name, extraction_key
 from code_atlas.telemetry import get_metrics, get_tracer, timed_phase
 
 if TYPE_CHECKING:
@@ -70,20 +71,72 @@ def _retry_key(rel: ParsedRelationship) -> tuple[str, str, str, str, str]:
     )
 
 
-def _compute_file_hash(source: bytes, *, strip_whitespace: bool = True) -> str:
+def _rels_hash(relationships: list[ParsedRelationship]) -> str:
+    """Fingerprint of the relationship set the per-file write path *would write*.
+
+    The second half of the no-op re-check gate (ADR-0042 decision 4): when every entity
+    for a file classifies ``unchanged`` and this matches what was stored, TX2's
+    delete-then-recreate of that file's edges is provably a no-op and is skipped.
+
+    Covers **everything** a written edge carries -- type, both endpoints, and the whole
+    property dict, rendered canonically. Deliberately not ``_retry_key``, which looks
+    similar: that is a dedup key for the replay buffer and reads only ``receiver`` and
+    ``receiver_type``, so ``line``, ``site_count``, ``weight``, ``confidence``,
+    ``strategy``, ``link_type``, ``on`` and ``alias`` would all be invisible to it. A
+    fingerprint narrower than the write is how an edge silently stops being updated.
+
+    Order-independent: the per-rel keys are sorted before digesting, because a parser
+    that emits the same edges in a different order has not changed the graph.
+
+    **The invariant, and it is narrower than it looks:** this describes the set this
+    path would write, NOT the set of edges on disk out of the file. The on-disk set is a
+    superset -- ``resolve_protocol_conformance`` MERGEs ``inferred``/``confidence``/
+    ``weight`` onto an IMPLEMENTS edge the parser also writes, ``resolve_member_defines``
+    owns cross-file DEFINES, ``resolve_citations`` owns citation DOCUMENTS. Every element
+    of that difference is re-derived idempotently by a post-batch pass that runs whether
+    or not any file was rewritten, so skipping the rewrite preserves them where today's
+    rewrite deletes them and the flush puts them back.
+    """
+    keys = sorted(
+        "\x00".join(
+            (
+                str(r.rel_type),
+                r.from_qualified_name,
+                r.to_name,
+                json.dumps(r.properties or {}, sort_keys=True, default=str),
+            )
+        )
+        for r in relationships
+    )
+    return hashlib.sha256("\x01".join(keys).encode()).hexdigest()[:16]
+
+
+def _compute_file_hash(source: bytes, *, strip_whitespace: bool = True, extraction_key: str = "") -> str:
     """Compute a short SHA-256 hash of file contents.
 
     When *strip_whitespace* is True: strip trailing whitespace per line,
     collapse consecutive blank lines, then hash.  This makes the gate
     ignore formatting-only changes (e.g. ``ruff format``) while preserving
     leading indentation for indentation-sensitive languages.
+
+    *extraction_key* (:func:`code_atlas.settings.extraction_key`) is folded in so the
+    gate's key covers the thing the gate is gating. Hashing bytes alone made the key
+    narrower than the parse it guards: after any change to how files are extracted every
+    stored hash still matched, so nothing was ever re-read and the graph stayed wrong
+    with no signal (ADR-0042 decision 5). An empty key is a deliberate no-op rather than
+    a distinct input, so this still means exactly "the hash of these bytes" for a caller
+    that does not gate on extraction; ``extraction_key`` itself always returns a
+    16-character digest and never the empty string.
     """
     if strip_whitespace:
         lines = [line.rstrip() for line in source.splitlines()]
-        normalized = b"\n".join(lines)
-        normalized = _COLLAPSE_BLANK_RE.sub(b"\n\n", normalized)
-        return hashlib.sha256(normalized).hexdigest()[:16]
-    return hashlib.sha256(source).hexdigest()[:16]
+        payload = b"\n".join(lines)
+        payload = _COLLAPSE_BLANK_RE.sub(b"\n\n", payload)
+    else:
+        payload = source
+    if extraction_key:
+        payload += b"\x00" + extraction_key.encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +809,14 @@ class ASTConsumer(TierConsumer):
         self._project_root = project_root or Path(settings.project_root)
         self.stats = ASTStats()
         self._detectors = get_enabled_detectors(settings.detectors.enabled)
+        # Pure and per-run: one settings object serves this project, every monorepo
+        # sub-project and every extra vault, so compute it once rather than per file.
+        # Logged because the only symptom of two processes disagreeing on it (a stray
+        # ATLAS_* in a .env found from a different cwd outranks the target's atlas.toml)
+        # is the gate never matching -- a permanent silent re-parse at watcher cadence,
+        # which reads as a performance regression rather than a config divergence.
+        self._extraction_key = extraction_key(settings)
+        logger.debug("AST consumer extraction key: {}", self._extraction_key)
         # `atlas index --full` distrusts the file_hash gate without destroying
         # anything (ADR-0042): re-parse every file, delete nothing. Never set in
         # daemon mode — the watch loop's whole economy is the gate.
@@ -850,6 +911,15 @@ class ASTConsumer(TierConsumer):
         # writing the hash any earlier would make a crash before that point
         # permanently unrecoverable (hash gate would skip the file forever).
         self._pending_file_hashes: dict[str, dict[str, str]] = {}  # project_name -> {file_path: hash}
+        # Relationship fingerprints (_rels_hash), withheld on EXACTLY the same schedule
+        # and for a sharper version of the same reason. A rels_hash written before the
+        # flush describes a rel set whose deferred half is not resolved yet, so after a
+        # crash the next run re-parses the file (its file_hash is unset, correctly) and
+        # then declines to rewrite its relationships because the fingerprint matches --
+        # a file that visibly re-parses every run while permanently missing edges, which
+        # is undiagnosable from the outside. Written by the same block in
+        # _flush_deferred_resolution as the file hashes.
+        self._pending_rels_hashes: dict[str, dict[str, str]] = {}  # project_name -> {file_path: rels_hash}
 
     async def run(self) -> None:
         try:
@@ -1062,8 +1132,16 @@ class ASTConsumer(TierConsumer):
             # hash gate reprocesses the file (and regenerates the rels) on
             # the next run instead of silently skipping it forever.
             pending_hashes = self._pending_file_hashes.pop(project_name, None)
+            pending_rels_hashes = self._pending_rels_hashes.pop(project_name, None)
             if pending_hashes:
                 await self.graph.set_batch_file_hashes(project_name, pending_hashes)
+            if pending_rels_hashes:
+                # Two adjacent writes rather than one: they carry different key sets
+                # (every live file vs. only the files this batch parsed), and a crash
+                # between them is benign in both directions because both describe work
+                # that is already committed by the time either runs. What is NOT benign
+                # is either of them landing before this flush -- see _pending_rels_hashes.
+                await self.graph.set_batch_rels_hashes(project_name, pending_rels_hashes)
 
         if final:
             for project_name in self._citation_projects:
@@ -1332,7 +1410,12 @@ class ASTConsumer(TierConsumer):
                 # path meant those files were re-parsed and then left with no stored
                 # hash at all, so the next delta run re-parsed them again, and so did
                 # every run after it, forever (ADR-0042).
-                new_hashes = {fp: _compute_file_hash(file_sources[fp], strip_whitespace=strip_ws) for fp in live_paths}
+                new_hashes = {
+                    fp: _compute_file_hash(
+                        file_sources[fp], strip_whitespace=strip_ws, extraction_key=self._extraction_key
+                    )
+                    for fp in live_paths
+                }
 
                 # Only the SKIP DECISION is conditional. With the gate off there is
                 # nothing to compare against, so get_batch_file_hashes is a round trip
@@ -1385,6 +1468,11 @@ class ASTConsumer(TierConsumer):
                     if deleted:
                         batch_max_sig = Significance.HIGH
 
+                # Relationship fingerprints of what step 3 (and step 4b) actually write,
+                # keyed by file. Persisted with the file hashes at step 6, on the same
+                # withhold schedule and for a sharper version of the same reason.
+                new_rels_hashes: dict[str, str] = {}
+
                 # 3. Batched upsert (2 managed transactions) — entities + parser-only
                 #    rels. Graph-querying detectors run AFTER this write (step 3.5)
                 #    so this batch's own entities are visible for same-batch
@@ -1392,8 +1480,32 @@ class ASTConsumer(TierConsumer):
                 #    otherwise silently miss subjects added in the same batch).
                 if parsed_files:
                     file_data = {fp: (pfd.entities, pfd.non_import_rels) for fp, pfd in parsed_files.items()}
+
+                    # Relationship fingerprints for the files about to be written.
+                    # Read REGARDLESS of the hash gate, unlike the file hashes above:
+                    # `--full` turns that gate off and is precisely the run this exists
+                    # for — a re-check whose parse produces an identical rel set should
+                    # not delete and recreate every edge in the project (ADR-0042
+                    # decision 4). Scoped to the files that survived the gate and
+                    # actually parsed, so under the gate this is a handful of paths.
+                    #
+                    # Compared PRE-detector against a stored fingerprint that covers the
+                    # MERGED set written in step 4b. That asymmetry is deliberate and is
+                    # what makes the skip safe: detector output is graph-derived, not a
+                    # function of the file's bytes, so a file that carried detector rels
+                    # last run yields a stored hash no pre-detector hash can equal, and
+                    # never skips. Only running the detectors could tell you whether they
+                    # still fire — and they cannot run until step 3 has written the
+                    # entities they query.
+                    stored_rels_hashes = await self.graph.get_batch_rels_hashes(project_name, list(parsed_files))
+                    fresh_rels_hashes = {fp: _rels_hash(pfd.non_import_rels) for fp, pfd in parsed_files.items()}
+                    new_rels_hashes = dict(fresh_rels_hashes)
+                    rels_unchanged = {fp for fp, h in fresh_rels_hashes.items() if stored_rels_hashes.get(fp) == h}
+
                     with timed_phase("ast", "upsert", files=len(file_data)):
-                        results = await self.graph.upsert_batch_entities(project_name, file_data)
+                        results = await self.graph.upsert_batch_entities(
+                            project_name, file_data, rels_unchanged=rels_unchanged
+                        )
 
                     # 3.5. Graph-querying detectors, now that this batch's entities exist.
                     det_results: dict[str, DetectorResult] = {}
@@ -1438,6 +1550,14 @@ class ASTConsumer(TierConsumer):
                         # set before recreating it, so dropping non_import_rels here would
                         # discard the parser rels written in step 3.
                         await self.graph.upsert_batch_entities(project_name, second_file_data, rels_only=True)
+                        # Store the fingerprint of what was actually WRITTEN. Storing the
+                        # parser-only set here would let the next run skip a file whose
+                        # detector edges have since stopped firing, leaving them in the
+                        # graph forever: step 4b only rewrites files whose detectors emit
+                        # something in the CURRENT run, so nothing else would ever revoke
+                        # them once step 3 stopped deleting.
+                        for fp, rels in det_rel_files.items():
+                            new_rels_hashes[fp] = _rels_hash(parsed_files[fp].non_import_rels + rels)
 
                     # 5. Accumulate stats + entity refs from per-file results
                     for fp, pfd in parsed_files.items():
@@ -1529,6 +1649,8 @@ class ASTConsumer(TierConsumer):
                 #    removes a second write rather than adding one.
                 if new_hashes:
                     self._pending_file_hashes.setdefault(project_name, {}).update(new_hashes)
+                if new_rels_hashes:
+                    self._pending_rels_hashes.setdefault(project_name, {}).update(new_rels_hashes)
 
                 # 7. Accumulate rels for deferred resolution
                 group_import_rels = [r for pfd in parsed_files.values() for r in pfd.import_rels]

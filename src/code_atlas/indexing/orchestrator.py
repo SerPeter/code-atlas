@@ -25,7 +25,7 @@ from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsume
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError
-from code_atlas.settings import derive_project_name, resolve_git_dir
+from code_atlas.settings import derive_project_name, extraction_key, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
@@ -1848,6 +1848,26 @@ async def _decide_delta_mode(
     if not current_file_set:
         return await _decide_empty_scan_deletion(graph, project_name, project_root)
 
+    # Enumeration has to open when the EXTRACTION contract moves, not only when git does.
+    # The epoch and the extraction-affecting settings live in the file_hash key (gate 2),
+    # but gate 2 is only ever asked about a file this run published — and in delta mode
+    # that is exactly the files git reports as changed. So on a project sitting at its
+    # stored HEAD, an epoch bump alone would reach nothing at all. Comparing the key here
+    # is what turns "extraction changed" into "enumerate everything and let the per-file
+    # gate decide, one file at a time, whether anything actually moved".
+    #
+    # A project with no stored key reads as changed, which is the one-time full re-check
+    # ATL-152 owes every graph indexed before the key existed.
+    current_key = extraction_key(settings)
+    stored_key = await graph.get_project_extraction_key(project_name)
+    if stored_key != current_key:
+        logger.info(
+            "Extraction key changed ({} → {}) — enumerating every file so the hash gate can re-check each one",
+            stored_key or "none",
+            current_key,
+        )
+        return _DeltaDecision("full", set(), set(), set())
+
     stored_hash = await graph.get_project_git_hash(project_name)
     if stored_hash is None:
         return _DeltaDecision("full", set(), set(), set())
@@ -2270,6 +2290,12 @@ async def _index_project_inner(  # noqa: PLR0915
     # leftover backlog (durability contract #5).
     if git_hash and drained:
         metadata["git_hash"] = git_hash
+    # Gated on `drained` for the same reason as git_hash: the key is a checkpoint meaning
+    # "every file in this project has been parsed under this extraction contract", and a
+    # run that timed out has not earned it. Advancing it early would leave the next delta
+    # run trusting stored file hashes the timed-out run never rewrote.
+    if drained:
+        metadata["extraction_key"] = extraction_key(settings)
     if decision.mode == "delta":
         metadata["delta_files_added"] = len(decision.files_added)
         metadata["delta_files_modified"] = len(decision.files_modified)
@@ -2650,6 +2676,11 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         # missed files and drain the leftover backlog (durability contract #5).
         if git_hash and drained:
             metadata["git_hash"] = git_hash
+        # Same gate, same reason as git_hash, and it must be written here as well as on
+        # the single-project path: every sub-project has its own Project node, and one
+        # that never stores the key reads as "extraction changed" on every single run.
+        if drained:
+            metadata["extraction_key"] = extraction_key(settings)
         if pr.mode == "delta":
             metadata["delta_files_added"] = len(pr.decision.files_added)
             metadata["delta_files_modified"] = len(pr.decision.files_modified)

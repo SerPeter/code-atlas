@@ -301,6 +301,24 @@ _ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LA
 FILE_HASH_LABELS: tuple[NodeLabel, ...] = (NodeLabel.MODULE, NodeLabel.PACKAGE, NodeLabel.DOC_FILE)
 
 
+# Bumped BY HAND when extraction output changes for a reason no setting captures: a
+# parser fix, a new language handler or grammar, a changed uid scheme, a different
+# _compute_content_hash formula, a detector implementation change.
+#
+# Part of the file-hash gate's contract, which is why it lives beside FILE_HASH_LABELS.
+# settings.extraction_key folds it in alongside the extraction-affecting configuration,
+# and consumers._compute_file_hash folds that into the stored file_hash -- so bumping it
+# invalidates every stored hash and the next run re-parses (ADR-0042 decision 5). It is
+# the *primary* half of that key: the config half can only see three caps, the detector
+# list and the rationale settings, and everything else about extraction lives in code.
+#
+# Deliberately NOT the package version -- a docs-only release would then force a global
+# re-parse of every project. Deliberately NOT SCHEMA_VERSION either: an extraction change
+# and a schema change are different events, and coupling them makes each pay the other's
+# cost, most sharply the vector-index drop and rebuild every schema migration performs.
+EXTRACTION_EPOCH: int = 1
+
+
 # ---------------------------------------------------------------------------
 # uid construction for reference-counted nodes
 #
@@ -592,15 +610,28 @@ def generate_drop_text_index_ddl() -> list[str]:
 
 
 def generate_clear_file_hashes_ddl() -> str:
-    """Cypher that clears every stored ``file_hash``, opening the gate for a re-parse.
+    """Cypher clearing every stored gate property, returning a file to "never indexed".
 
-    For migrations whose new data can only come from re-reading the source. Derived
-    from FILE_HASH_LABELS so a label added to the gate is cleared by every future
-    migration automatically, rather than being forgotten by whichever one is written
-    next from an older one's template.
+    Both of them: ``file_hash`` (does this file need re-parsing?) and ``rels_hash``
+    (does its relationship set need rewriting?). One statement rather than two, because
+    a caller that opened one gate and left the other shut would re-parse a file and then
+    decline to rewrite its edges -- the single place that has to cover both, or a future
+    migration heals one gate and not the other. The predicate matches on *either* being
+    present for the same reason: a node carrying only a ``rels_hash`` must not be missed.
+
+    No longer what migrations use. Twelve of them called this to force a re-parse until
+    ATL-152 gave the gate an ``EXTRACTION_EPOCH``: a migration whose new data can only
+    come from re-reading the source now bumps the epoch, which invalidates every stored
+    hash by changing the key rather than by deleting 845 values. What remains is the
+    manual lever -- staging the "no stored hash" state by hand, or in a test that needs
+    it -- and it is still derived from FILE_HASH_LABELS so a label added to the gate is
+    covered without anyone remembering to add it here.
     """
     predicate = " OR ".join(f"n:{label.value}" for label in FILE_HASH_LABELS)
-    return f"MATCH (n) WHERE ({predicate}) AND n.file_hash IS NOT NULL REMOVE n.file_hash"
+    return (
+        f"MATCH (n) WHERE ({predicate}) AND (n.file_hash IS NOT NULL OR n.rels_hash IS NOT NULL) "
+        "REMOVE n.file_hash, n.rels_hash"
+    )
 
 
 def generate_drop_redundant_marker_ddl() -> list[str]:

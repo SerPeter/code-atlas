@@ -18,7 +18,14 @@ from code_atlas.graph.client import (
     QueryTimeoutError,
 )
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
-from code_atlas.schema import _ENTITY_LABELS, GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType
+from code_atlas.schema import (
+    _ENTITY_LABELS,
+    GLOBAL_PROJECT,
+    SCHEMA_VERSION,
+    NodeLabel,
+    RelType,
+    generate_clear_file_hashes_ddl,
+)
 from code_atlas.server.analysis import _analyze_communities
 from code_atlas.settings import derive_project_name
 
@@ -236,8 +243,20 @@ async def test_migration_with_embeddings_disabled_proceeds_on_an_unembedded_grap
     assert await graph_client.get_schema_version() == SCHEMA_VERSION
 
 
-async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):
-    """Migrating from v2 (through v3 and v4) clears Module.file_hash and Project.git_hash for a re-parse."""
+async def test_migration_v3_opens_enumeration_without_touching_the_file_hashes(graph_client: GraphClient):
+    """Migrating from v2 clears Project.git_hash — and deliberately leaves file_hash alone.
+
+    Inverted from the assertion it replaces. Until ATL-152 this migration also ran
+    ``generate_clear_file_hashes_ddl``, which is the same admission twelve migrations
+    wrote out one at a time. The re-parse now comes from the gate's own key instead:
+    ``schema.EXTRACTION_EPOCH`` is folded into every ``file_hash``, so a stored value
+    computed under an older epoch cannot match and the file is re-read anyway.
+
+    What is NOT subsumed is enumeration. In delta mode only the files git reports as
+    changed are ever published, so gate 2 is never asked about the rest — which is why
+    ``git_hash`` must still be cleared here, and why this test asserts one and refuses
+    the other rather than dropping the pair.
+    """
     await graph_client.ensure_schema()
 
     await graph_client.execute_write(
@@ -257,7 +276,7 @@ async def test_migration_v3_clears_freshness_markers(graph_client: GraphClient):
     await graph_client.ensure_schema()
 
     mod = await graph_client.execute("MATCH (n {uid: 'mig3:mod'}) RETURN n.file_hash AS fh")
-    assert mod[0]["fh"] is None
+    assert mod[0]["fh"] == "stale", "a migration must no longer blank 845 hashes to force a re-parse"
     proj = await graph_client.execute("MATCH (p {uid: 'mig3'}) RETURN p.git_hash AS gh")
     assert proj[0]["gh"] is None
     assert await graph_client.get_schema_version() == SCHEMA_VERSION
@@ -1784,6 +1803,71 @@ async def test_delete_anchored_entity_marks_note_broken(graph_client: GraphClien
     assert gone[0]["cnt"] == 0
 
 
+async def test_resolve_doc_links_is_idempotent(graph_client: GraphClient):
+    """Running the same doc link twice must not create a second edge.
+
+    Every other post-batch resolver MERGEs; this one used ``CREATE`` and leaned on the
+    per-file relationship rewrite to revoke the previous run's edges. ATL-151 made that
+    rewrite conditional -- a file whose parse produced an identical relationship set no
+    longer deletes and recreates its edges -- while the doc rels are still buffered for
+    the flush, because the ADR-0026 replay buffer is deliberately kept. Measured on this
+    repo before the fix: 213 DOCUMENTS edges became 432 over three no-op ``--full`` runs,
+    growing without bound. The SQLite port already used ``INSERT OR IGNORE``, so this was
+    also a silent divergence between the two backends.
+    """
+    await graph_client.ensure_schema()
+    project = "docidem"
+
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{"
+        "  uid: $uid, project_name: $project, name: $name,"
+        "  qualified_name: $qn, kind: 'function', file_path: 'src/auth.py'"
+        "})",
+        {
+            "uid": f"{project}:auth.validate_token",
+            "project": project,
+            "name": "validate_token",
+            "qn": "auth.validate_token",
+        },
+    )
+    doc_fp = "docs/auth.md"
+    section_qn = f"{project}:{doc_fp} > Auth"
+    await graph_client.upsert_file_entities(
+        project,
+        doc_fp,
+        [
+            ParsedEntity(
+                name="Auth",
+                qualified_name=section_qn,
+                label=NodeLabel.DOC_SECTION,
+                kind="section",
+                line_start=1,
+                line_end=8,
+                file_path=doc_fp,
+                header_level=2,
+                header_path="Auth",
+            )
+        ],
+        [],
+    )
+    doc_rels = [
+        ParsedRelationship(
+            from_qualified_name=section_qn,
+            rel_type=RelType.DOCUMENTS,
+            to_name="validate_token",
+            properties={"link_type": "explicit", "confidence": 0.9, "is_file_ref": False},
+        )
+    ]
+
+    await graph_client.resolve_doc_links(project, doc_rels)
+    await graph_client.resolve_doc_links(project, doc_rels)
+
+    records = await graph_client.execute(
+        f"MATCH (:{NodeLabel.DOC_SECTION})-[r:{RelType.DOCUMENTS}]->() RETURN count(r) AS n"
+    )
+    assert records[0]["n"] == 1, "a second resolution pass duplicated the doc link"
+
+
 async def test_resolve_doc_links_ambiguous_match_creates_no_edge(graph_client: GraphClient):
     """Two same-named callables in a project: a heuristic doc ref is left unresolved,
     not fanned out into one edge per candidate (the multi-link bug this fix closes)."""
@@ -2772,6 +2856,41 @@ async def test_v18_migration_keeps_the_version_of_an_orphaned_package(graph_clie
         f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) RETURN ep.version AS version"
     )
     assert kept[0]["version"] == "2.31.0"
+
+
+async def test_resolve_cross_project_imports_is_idempotent(graph_client: GraphClient):
+    """Running the rewire twice must not leave two parallel IMPORTS edges.
+
+    A post-batch resolver runs on every flush, so it has to be idempotent on its own.
+    This one used `CREATE` and was idempotent only by accident: the importer's per-file
+    relationship rewrite swept its outgoing IMPORTS before every re-parse. ATL-151 makes
+    that rewrite conditional, so the rewired edge now survives and a bare CREATE adds one
+    more parallel copy per re-index, without bound — the shape measured in
+    `resolve_doc_links`, where three no-op `--full` runs took DOCUMENTS from 213 to 432.
+
+    Single-project runs never reach the write at all (`len(project_names) < 2` returns
+    early), which is why this needs two projects to prove anything.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "shared")
+    await graph_client.merge_package_node("test_lib", "shared", "shared", "shared/__init__.py")
+
+    async def _edge_count() -> int:
+        rows = await graph_client.execute(
+            f"MATCH (:{NodeLabel.MODULE} {{project_name: 'test_app'}})-[r:{RelType.IMPORTS}]->"
+            f"(:{NodeLabel.PACKAGE} {{project_name: 'test_lib'}}) RETURN count(r) AS c"
+        )
+        return rows[0]["c"] if rows else 0
+
+    await graph_client.resolve_cross_project_imports(["test_app", "test_lib"])
+    assert await _edge_count() == 1, "the stub was never rewired, so re-running proves nothing"
+
+    # The second pass has to re-create the stub the first one deleted, exactly as a real
+    # re-index does: resolve_imports re-MERGEs it before cross-project resolution runs.
+    for _ in range(2):
+        await _seed_importer(graph_client, "test_app", "shared")
+        await graph_client.resolve_cross_project_imports(["test_app", "test_lib"])
+        assert await _edge_count() == 1, "a re-run added a parallel IMPORTS edge"
 
 
 async def test_a_rewired_cross_project_stub_takes_its_version_edge_with_it(graph_client: GraphClient):
@@ -4591,6 +4710,12 @@ async def test_delete_file_entities_clears_package_file_hash(graph_client: Graph
     """Deleting a file's entities also clears its surviving Package node's
     stale file_hash (client.py:638) — otherwise an identically re-created
     __init__.py is silently skipped forever by the AST consumer's hash gate.
+
+    Since ATL-151 the same is true of ``rels_hash``, and for a sharper reason: this
+    delete has just destroyed the very edges that fingerprint describes, so a surviving
+    value is not merely stale but actively wrong. Both gate properties are asserted
+    here because production clears them in one statement — a test that checked only one
+    would go green on a change that half-reverted it.
     """
     await graph_client.ensure_schema()
     project = "pkgdel1"
@@ -4600,7 +4725,8 @@ async def test_delete_file_entities_clears_package_file_hash(graph_client: Graph
     # a stored file_hash from the last successful parse.
     await graph_client.merge_package_node(project, "src.pkg", "pkg", fp)
     await graph_client.execute_write(
-        f"MATCH (n:{NodeLabel.PACKAGE} {{project_name: $p, file_path: $f}}) SET n.file_hash = 'stale_hash'",
+        f"MATCH (n:{NodeLabel.PACKAGE} {{project_name: $p, file_path: $f}}) "
+        "SET n.file_hash = 'stale_hash', n.rels_hash = 'stale_rels'",
         {"p": project, "f": fp},
     )
 
@@ -4624,6 +4750,7 @@ async def test_delete_file_entities_clears_package_file_hash(graph_client: Graph
     # with identical content is reprocessed instead of silently skipped.
     hashes = await graph_client.get_batch_file_hashes(project, [fp])
     assert hashes[fp] is None
+    assert (await graph_client.get_batch_rels_hashes(project, [fp]))[fp] is None
 
 
 async def test_recreate_relationships_package_defines_no_duplicate(graph_client: GraphClient):
@@ -5611,10 +5738,13 @@ async def test_wipe_guard_still_trips_on_real_project_data(graph_client: GraphCl
     assert "my-production-repo" in verdict
 
 
-async def test_v7_migration_clears_freshness_markers(graph_client: GraphClient):
-    """A pre-v7 index has no EnvVar/ResourceFile nodes and nothing to derive
-    them from, so every file must be re-parsed — which only happens if the
-    stored file/git hashes are cleared.
+async def test_v7_migration_opens_enumeration_for_the_re_parse_it_needs(graph_client: GraphClient):
+    """A pre-v7 index has no EnvVar/ResourceFile nodes and nothing to derive them from,
+    so every file must be re-parsed — which needs enumeration opened, and nothing else.
+
+    ``git_hash`` is what a migration still has to clear; ``file_hash`` is left in place
+    because the extraction epoch in its key already stops it matching (ATL-152). See
+    test_migration_v3_opens_enumeration_without_touching_the_file_hashes.
     """
     await graph_client.ensure_schema()
     project = "test_v7_migration"
@@ -5639,7 +5769,7 @@ async def test_v7_migration_clears_freshness_markers(graph_client: GraphClient):
     records = await graph_client.execute(
         f"MATCH (m:{NodeLabel.MODULE} {{project_name: $p}}) RETURN m.file_hash AS fh", {"p": project}
     )
-    assert [r["fh"] for r in records] == [None]
+    assert [r["fh"] for r in records] == ["fh1"], "the epoch invalidates it; the migration must not blank it"
     assert await graph_client.get_project_git_hash(project) is None
 
 
@@ -5749,6 +5879,295 @@ async def test_a_null_hash_on_one_label_does_not_erase_a_real_one_on_another(gra
     )
 
     assert await graph_client.get_batch_file_hashes(project, [fp]) == {fp: "real"}
+
+
+# ---------------------------------------------------------------------------
+# ATL-151 — the relationship fingerprint, at the graph API
+# ---------------------------------------------------------------------------
+
+
+async def test_both_gate_properties_round_trip_across_every_label(graph_client: GraphClient):
+    """``file_hash`` and ``rels_hash`` are stored side by side and must not cross.
+
+    Both accessor pairs now delegate to one ``_get_batch_file_prop`` /
+    ``_set_batch_file_prop``, interpolating the property name into the Cypher. That
+    removed a second copy of the inline-label, one-statement-per-label shape whose
+    comments carry two measured row-loss incidents — and introduced the only way the
+    two gates could ever be confused for each other, which is what this pins. A reader
+    that returned the wrong property would answer "unchanged" from the wrong evidence,
+    and neither gate would look broken from the outside.
+
+    The missing path goes FIRST for the original reason: that ordering is what returned
+    0 of 3 rows before the label moved inline, and the shared helper has to keep
+    inheriting the fix rather than only the shape.
+    """
+    await graph_client.ensure_schema()
+    project = "gate_props"
+    module_fp, package_fp, doc_fp = "src/mod.py", "src/pkg/__init__.py", "wiki/adr/0001-x.md"
+
+    await graph_client.upsert_file_entities(
+        project,
+        module_fp,
+        [
+            ParsedEntity(
+                name="mod",
+                qualified_name=f"{project}:src.mod",
+                label=NodeLabel.MODULE,
+                kind="module",
+                line_start=1,
+                line_end=1,
+                file_path=module_fp,
+            )
+        ],
+        [],
+    )
+    await graph_client.merge_package_node(project, "src.pkg", "pkg", package_fp)
+    await graph_client.upsert_file_entities(project, doc_fp, [_doc_file_entity(project, doc_fp)], [])
+
+    files = [module_fp, package_fp, doc_fp]
+    await graph_client.set_batch_file_hashes(project, {fp: f"fh-{fp}" for fp in files})
+    await graph_client.set_batch_rels_hashes(project, {fp: f"rh-{fp}" for fp in files})
+
+    probe = ["never_indexed.py", *files]
+    got_file = await graph_client.get_batch_file_hashes(project, probe)
+    got_rels = await graph_client.get_batch_rels_hashes(project, probe)
+
+    assert got_file == {"never_indexed.py": None, **{fp: f"fh-{fp}" for fp in files}}
+    assert got_rels == {"never_indexed.py": None, **{fp: f"rh-{fp}" for fp in files}}
+
+
+async def test_clearing_the_gate_reopens_both_halves(graph_client: GraphClient):
+    """``generate_clear_file_hashes_ddl`` is the one place that has to cover both.
+
+    A caller that opened one gate and left the other shut produces the worst shape this
+    story can make: a file that visibly re-parses on every run while declining to
+    rewrite its relationships. The second node here carries a ``rels_hash`` and no
+    ``file_hash`` — not a state the pipeline writes, but the predicate matches on
+    *either* being present precisely so a node in it cannot be missed, and a predicate
+    narrowed back to ``file_hash IS NOT NULL`` would leave it behind.
+    """
+    await graph_client.ensure_schema()
+    project = "gate_clear"
+    both_fp, rels_only_fp = "src/both.py", "src/rels_only.py"
+
+    for fp, qn in ((both_fp, "src.both"), (rels_only_fp, "src.rels_only")):
+        await graph_client.upsert_file_entities(
+            project,
+            fp,
+            [
+                ParsedEntity(
+                    name=qn.rsplit(".", 1)[-1],
+                    qualified_name=f"{project}:{qn}",
+                    label=NodeLabel.MODULE,
+                    kind="module",
+                    line_start=1,
+                    line_end=1,
+                    file_path=fp,
+                )
+            ],
+            [],
+        )
+    await graph_client.set_batch_file_hashes(project, {both_fp: "fh"})
+    await graph_client.set_batch_rels_hashes(project, {both_fp: "rh", rels_only_fp: "rh"})
+
+    await graph_client.execute_write(generate_clear_file_hashes_ddl())
+
+    files = [both_fp, rels_only_fp]
+    assert await graph_client.get_batch_file_hashes(project, files) == dict.fromkeys(files)
+    assert await graph_client.get_batch_rels_hashes(project, files) == dict.fromkeys(files)
+
+
+# ---------------------------------------------------------------------------
+# ATL-151 — skipping TX2's rewrite (upsert_batch_entities(rels_unchanged=...))
+# ---------------------------------------------------------------------------
+
+
+def _gated_file(
+    project: str, fp: str, *, content_hash: str = "v1"
+) -> tuple[list[ParsedEntity], list[ParsedRelationship]]:
+    """A module, one callable in it, and the same-file DEFINES edge between them.
+
+    The smallest thing TX2 actually writes. Same-file on purpose: the delete phase
+    deliberately spares *cross-file* DEFINES, so a cross-file fixture would survive a
+    rewrite it never skipped and the marker below would prove nothing either way.
+    """
+    module_qn = fp.replace("/", ".").removesuffix(".py")
+    module = ParsedEntity(
+        name=module_qn.rsplit(".", 1)[-1],
+        qualified_name=f"{project}:{module_qn}",
+        label=NodeLabel.MODULE,
+        kind="module",
+        line_start=1,
+        line_end=9,
+        file_path=fp,
+        content_hash="mod-v1",
+    )
+    fn = _make_entity(project, "handler", fp, content_hash=content_hash)
+    return [module, fn], [
+        ParsedRelationship(
+            from_qualified_name=module.qualified_name, rel_type=RelType.DEFINES, to_name=fn.qualified_name
+        )
+    ]
+
+
+async def _mark_rels(graph_client: GraphClient, project: str, fp: str) -> None:
+    """Stamp a property no writer sets onto every edge out of *fp*'s entities.
+
+    Counting edges cannot separate "left alone" from "deleted and recreated identically"
+    — both end on the same number, which is exactly why the unconditional rewrite could
+    have been swapped for the skip and every count-based test would still have passed.
+    """
+    await graph_client.execute_write(
+        f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $p, file_path: $f}})-[r]->() SET r.atl151_marker = 'survived'",
+        {"p": project, "f": fp},
+    )
+
+
+async def _rel_marks(graph_client: GraphClient, project: str, fp: str) -> list[str | None]:
+    """The mark on each edge still leaving *fp*, in target order. Three outcomes.
+
+    ``["survived"]`` the rewrite was skipped, ``[None]`` it happened and the edge came
+    back, ``[]`` the edge is gone.
+    """
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.ENTITY} {{project_name: $p, file_path: $f}})-[r]->(m) "
+        "RETURN r.atl151_marker AS mark ORDER BY m.uid",
+        {"p": project, "f": fp},
+    )
+    return [r["mark"] for r in records]
+
+
+async def test_an_unchanged_file_named_unchanged_keeps_its_edges_untouched(graph_client: GraphClient):
+    """ADR-0042 decision 4, at the API that implements it.
+
+    Both halves are required and only the caller knows the first: the stored
+    fingerprint equals the set being handed in. ``_rel_write_skips`` adds the half only
+    the classification knows, and TX2 then leaves the file alone.
+    """
+    await graph_client.ensure_schema()
+    project = "relskip_noop"
+    fp = "src/mod.py"
+    entities, rels = _gated_file(project, fp)
+
+    await graph_client.upsert_batch_entities(project, {fp: (entities, rels)})
+    await _mark_rels(graph_client, project, fp)
+    assert await _rel_marks(graph_client, project, fp) == ["survived"], "precondition: the edge exists and is marked"
+
+    await graph_client.upsert_batch_entities(project, {fp: (entities, rels)}, rels_unchanged={fp})
+    assert await _rel_marks(graph_client, project, fp) == ["survived"]
+
+    # Non-vacuity, and the whole difference the story buys: the identical call without
+    # the fingerprint deletes and recreates the same edge to arrive back where it was.
+    await graph_client.upsert_batch_entities(project, {fp: (entities, rels)})
+    assert await _rel_marks(graph_client, project, fp) == [None]
+
+
+async def test_a_file_whose_entity_moved_is_rewritten_even_when_offered_the_skip(graph_client: GraphClient):
+    """An honest fingerprint is still not enough on its own.
+
+    The rel set handed in is identical to the stored one here — only the callable's
+    ``content_hash`` moved. TX1 creates added entities as fresh nodes with no edges and
+    DETACH DELETEs removed ones, so a file with any classification delta has to be
+    rewritten whatever its fingerprint says.
+    """
+    await graph_client.ensure_schema()
+    project = "relskip_moved_entity"
+    fp = "src/mod.py"
+    entities_v1, rels = _gated_file(project, fp)
+    entities_v2, rels_v2 = _gated_file(project, fp, content_hash="v2")
+    assert rels == rels_v2, "the fingerprint must be honest, or this passes for the wrong reason"
+
+    await graph_client.upsert_batch_entities(project, {fp: (entities_v1, rels)})
+    await _mark_rels(graph_client, project, fp)
+
+    await graph_client.upsert_batch_entities(project, {fp: (entities_v2, rels_v2)}, rels_unchanged={fp})
+    assert await _rel_marks(graph_client, project, fp) == [None]
+
+
+async def test_a_file_with_no_prior_data_is_never_skipped(graph_client: GraphClient):
+    """A file whose edges have never been written cannot have them left alone.
+
+    ``new_file_paths`` also drives the delete phase's skip, so a first-index file
+    reaching TX2 as a skip candidate would be created with no relationships at all —
+    silently, and permanently, because its ``file_hash`` is written the same run.
+    """
+    await graph_client.ensure_schema()
+    project = "relskip_first_index"
+    fp = "src/mod.py"
+    entities, rels = _gated_file(project, fp)
+
+    await graph_client.upsert_batch_entities(project, {fp: (entities, rels)}, rels_unchanged={fp})
+
+    assert await _rel_marks(graph_client, project, fp) == [None], "a first index must write its edges"
+
+
+async def test_an_edge_into_a_definition_the_batch_moved_is_rewritten(graph_client: GraphClient):
+    """The guard the classification contributes that has nothing to do with the file itself.
+
+    TX1 deletes before it creates, so a definition that moves between two files in one
+    batch is destroyed and re-created under the same uid — and the edges into it died
+    with the old node. Today's unconditional rewrite covers that by accident; the skip
+    has to cover it on purpose, by refusing any file one of whose edge targets was
+    deleted anywhere in the batch.
+
+    The caller here is untouched and its fingerprint matches, so the classification is
+    the only thing that can save the edge. The marker distinguishes the two outcomes
+    that matter: ``[None]`` is the rewrite putting it back, ``[]`` is the skip losing it.
+    """
+    await graph_client.ensure_schema()
+    project = "relskip_moved_target"
+    parent_fp, old_fp, new_fp = "src/parent.py", "src/old_home.py", "src/new_home.py"
+    member_uid = f"{project}:shared.member"
+
+    def _member(fp: str) -> ParsedEntity:
+        return replace(_make_entity(project, "member", fp, content_hash="m1"), qualified_name=member_uid)
+
+    parent = _make_entity(project, "Parent", parent_fp, label=NodeLabel.TYPE_DEF, kind="class", content_hash="p1")
+    # A DEFINES referrer deliberately does NOT preserve its target from deletion (it is
+    # normally re-derived from the member's own file), which is what lets the node
+    # actually be destroyed here rather than edge-stripped and kept.
+    defines = ParsedRelationship(
+        from_qualified_name=parent.qualified_name, rel_type=RelType.DEFINES, to_name=member_uid
+    )
+
+    await graph_client.upsert_batch_entities(
+        project, {parent_fp: ([parent], [defines]), old_fp: ([_member(old_fp)], [])}
+    )
+    await _mark_rels(graph_client, project, parent_fp)
+    assert await _rel_marks(graph_client, project, parent_fp) == ["survived"], "precondition: the edge exists"
+
+    await graph_client.upsert_batch_entities(
+        project,
+        {parent_fp: ([parent], [defines]), old_fp: ([], []), new_fp: ([_member(new_fp)], [])},
+        rels_unchanged={parent_fp, old_fp, new_fp},
+    )
+
+    homes = await graph_client.execute(
+        f"MATCH (m:{NodeLabel.ENTITY} {{uid: $uid}}) RETURN m.file_path AS fp", {"uid": member_uid}
+    )
+    assert [r["fp"] for r in homes] == [new_fp], "precondition: the definition really did move"
+    assert await _rel_marks(graph_client, project, parent_fp) == [None], (
+        "the edge into the moved definition was not restored"
+    )
+
+
+async def test_the_rels_only_pass_never_honours_the_skip(graph_client: GraphClient):
+    """The detector re-write exists precisely to rewrite, and has nothing to confirm with.
+
+    ``rels_only`` runs no entity transaction, so there is no classification to supply
+    the second half of the answer. Honouring the fingerprint there would drop the merged
+    parser+detector set the pass is for, leaving the file with whatever step 3 wrote.
+    """
+    await graph_client.ensure_schema()
+    project = "relskip_rels_only"
+    fp = "src/mod.py"
+    entities, rels = _gated_file(project, fp)
+
+    await graph_client.upsert_batch_entities(project, {fp: (entities, rels)})
+    await _mark_rels(graph_client, project, fp)
+
+    await graph_client.upsert_batch_entities(project, {fp: (entities, rels)}, rels_only=True, rels_unchanged={fp})
+    assert await _rel_marks(graph_client, project, fp) == [None]
 
 
 async def test_resolve_calls_will_not_resolve_a_call_on_an_unknown_receiver(graph_client: GraphClient):

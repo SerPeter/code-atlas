@@ -3,19 +3,35 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from code_atlas import schema
 from code_atlas.settings import (
     AtlasSettings,
     BackendSettings,
+    DetectorSettings,
+    EmbeddingSettings,
     ExtraVaultSettings,
+    IndexSettings,
     KnowledgeSettings,
+    LibrarySettings,
+    McpSettings,
     MemgraphSettings,
+    MonorepoSettings,
+    ObservabilitySettings,
+    ProjectSettings,
+    RationaleSettings,
     RedisSettings,
+    ScopeSettings,
+    SearchSettings,
+    WatcherSettings,
     derive_project_name,
+    extraction_key,
 )
 
 
@@ -27,6 +43,34 @@ def clean_env(monkeypatch, tmp_path):
         if key.startswith("ATLAS_"):
             monkeypatch.delenv(key)
     return tmp_path
+
+
+def _extraction_key_in_child(project_root: Path, hash_seed: str) -> str:
+    """``extraction_key`` for *project_root*, computed in a fresh interpreter.
+
+    ``PYTHONHASHSEED`` is fixed at interpreter start, so the only way to observe a
+    per-process salt is from another process. ATLAS_* is scrubbed for the same reason
+    ``clean_env`` scrubs it in-process.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ATLAS_")}
+    env["PYTHONHASHSEED"] = hash_seed
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from code_atlas.settings import AtlasSettings, extraction_key; "
+                "print(extraction_key(AtlasSettings(project_root=sys.argv[1])))"
+            ),
+            str(project_root),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+        check=True,
+    )
+    return result.stdout.strip()
 
 
 class TestEnvVarScoping:
@@ -420,3 +464,163 @@ class TestImportanceSettings:
         )
         with pytest.raises(ValidationError):
             AtlasSettings(project_root=clean_env)
+
+
+class TestExtractionKey:
+    """The gate's key must cover extraction and nothing else, and never move on its own.
+
+    An over-inclusive key costs one spurious re-parse. An under-inclusive one leaves the
+    graph wrong with no signal, which is the defect ATL-152 exists to remove. An UNSTABLE
+    one is worse than both: the daemon always trusts the gate, so a key that differs run to
+    run re-parses the whole project forever at watcher cadence and reads as a performance
+    regression rather than as a key that moved.
+    """
+
+    def test_identical_config_gives_an_identical_key(self, clean_env):
+        assert extraction_key(AtlasSettings(project_root=clean_env)) == extraction_key(
+            AtlasSettings(project_root=clean_env)
+        )
+
+    def test_the_key_does_not_depend_on_list_order(self, clean_env):
+        """Reordering a list in atlas.toml must not re-parse the world.
+
+        Extraction reads markers as a frozenset and merely iterates the detector list, so
+        their order is provably not output-bearing.
+        """
+        forward = AtlasSettings(
+            project_root=clean_env,
+            detectors=DetectorSettings(enabled=["test_mapping", "class_overrides"]),
+            rationale=RationaleSettings(markers=["NOTE", "WHY"]),
+        )
+        reversed_ = AtlasSettings(
+            project_root=clean_env,
+            detectors=DetectorSettings(enabled=["class_overrides", "test_mapping"]),
+            rationale=RationaleSettings(markers=["WHY", "NOTE"]),
+        )
+
+        assert extraction_key(forward) == extraction_key(reversed_)
+
+    def test_the_epoch_is_part_of_the_key(self, clean_env, monkeypatch):
+        """The sabotage check ATL-152 asks for, in the one place it can be made.
+
+        Drop EXTRACTION_EPOCH from the payload and this is the test that fails.
+        """
+        settings = AtlasSettings(project_root=clean_env)
+        before = extraction_key(settings)
+
+        monkeypatch.setattr(schema, "EXTRACTION_EPOCH", schema.EXTRACTION_EPOCH + 1)
+
+        assert extraction_key(settings) != before
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("index", IndexSettings(max_source_chars=2000)),
+            ("index", IndexSettings(max_doc_section_chars=1234)),
+            ("index", IndexSettings(max_parse_bytes=4096)),
+            ("detectors", DetectorSettings(enabled=["test_mapping"])),
+            ("rationale", RationaleSettings(enabled=False)),
+            ("rationale", RationaleSettings(markers=["NOTE"])),
+            ("rationale", RationaleSettings(tasks=True)),
+            ("rationale", RationaleSettings(task_markers=["XXX"])),
+            ("rationale", RationaleSettings(citations=False)),
+            ("rationale", RationaleSettings(citation_schemes=["ADR"])),
+        ],
+    )
+    def test_every_extraction_affecting_setting_moves_the_key(self, clean_env, field, value):
+        """One case per member of extraction_key's IN list.
+
+        ``max_source_chars`` is the 2026-08-31 incident: raising it left 2,169 entities
+        holding truncated source while every file's bytes were unchanged.
+        """
+        baseline = extraction_key(AtlasSettings(project_root=clean_env))
+
+        assert extraction_key(AtlasSettings(project_root=clean_env, **{field: value})) != baseline
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            # Changes what is HASHED, not what is parsed — _compute_file_hash already
+            # normalizes on it, so folding it in here would double-count.
+            ("index", IndexSettings(strip_whitespace=False)),
+            # Pipeline control, not extraction.
+            ("index", IndexSettings(delta_threshold=0.9)),
+            ("index", IndexSettings(file_hash_gate=False)),
+            # Downstream of extraction: gated by embed_hash and by query-time weights.
+            ("search", SearchSettings(rrf_k=99)),
+            ("memgraph", MemgraphSettings(port=7688)),
+            # Never reaches the parser: note mode is triggered by frontmatter, not by path.
+            ("knowledge", KnowledgeSettings(vault_path="notes")),
+            # The rest of the docstring's OUT list, one case per section, so "both lists
+            # are exhaustive as of this writing" is a claim something checks rather than a
+            # comment. The tempting member is embeddings: max_input_tokens drives ADR-0040
+            # chunking, which reads like extraction and is not — it splits the embed *text*
+            # of an entity the parser has already produced, and is gated by embed_hash.
+            ("embeddings", EmbeddingSettings(max_input_tokens=1000)),
+            ("backend", BackendSettings(graph="sqlite")),
+            ("redis", RedisSettings(port=6380)),
+            ("watcher", WatcherSettings(debounce_s=5.0)),
+            ("mcp", McpSettings(port=9000)),
+            ("observability", ObservabilitySettings(enabled=True)),
+            ("libraries", LibrarySettings(full_index=["requests"])),
+            ("monorepo", MonorepoSettings(auto_detect=False)),
+            # Enumeration and project identity. The gate self-heals on both: it is keyed
+            # (project_name, file_path), so a newly in-scope file has no stored hash under
+            # that key and parses, and a renamed project has none for any of its files.
+            ("scope", ScopeSettings(paths=["src"])),
+            ("project", ProjectSettings(name="renamed")),
+        ],
+    )
+    def test_a_non_extraction_setting_leaves_the_key_alone(self, clean_env, field, value):
+        baseline = extraction_key(AtlasSettings(project_root=clean_env))
+
+        assert extraction_key(AtlasSettings(project_root=clean_env, **{field: value})) == baseline
+
+    def test_the_key_is_the_same_however_the_config_arrived(self, clean_env, monkeypatch):
+        """Resolved values, not the route they arrived by.
+
+        An explicit kwarg, an ``ATLAS_*`` env var and an ``atlas.toml`` key are three ways
+        to set the same field, and the daemon, the CLI and an MCP session do not all take
+        the same one. A key that digested the route would have two processes disagree about
+        an identically-configured project — and because the gate is always trusted, the
+        symptom is not an error but a project re-parsed forever at watcher cadence.
+        """
+        baseline = extraction_key(AtlasSettings(project_root=clean_env))
+        from_kwarg = extraction_key(AtlasSettings(project_root=clean_env, index=IndexSettings(max_source_chars=1234)))
+        assert from_kwarg != baseline, "1234 has to differ from the default, or every equality below is vacuous"
+
+        monkeypatch.setenv("ATLAS_INDEX__MAX_SOURCE_CHARS", "1234")
+        from_env = extraction_key(AtlasSettings(project_root=clean_env))
+        monkeypatch.delenv("ATLAS_INDEX__MAX_SOURCE_CHARS")
+
+        (clean_env / "atlas.toml").write_text("[index]\nmax_source_chars = 1234\n", encoding="utf-8")
+        from_toml = extraction_key(AtlasSettings(project_root=clean_env))
+
+        assert from_kwarg == from_env == from_toml
+
+    def test_the_key_is_the_same_in_another_process(self, clean_env):
+        """``hashlib``, never the builtin ``hash()``.
+
+        ``hash()`` of a str is salted per interpreter, so a key built with it would differ
+        between the daemon and the CLI while every in-process assertion in this class
+        stayed green. Two children with different ``PYTHONHASHSEED`` values is the only
+        place that shows up, and it is worth two interpreter starts because the failure it
+        catches is silent: the losing process re-parses the whole project on every run.
+        """
+        keys = {_extraction_key_in_child(clean_env, seed) for seed in ("0", "12345")}
+
+        assert len(keys) == 1, f"the key moved between processes: {sorted(keys)}"
+        assert keys == {extraction_key(AtlasSettings(project_root=clean_env))}
+
+    def test_the_key_does_not_depend_on_where_the_project_lives(self, clean_env, tmp_path):
+        """project_root is per-worktree and per-machine.
+
+        Keying on it would make two checkouts of the same repo invalidate each other's
+        stored hashes, and the gate already keys on (project_name, file_path) anyway.
+        """
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+
+        assert extraction_key(AtlasSettings(project_root=clean_env)) == extraction_key(
+            AtlasSettings(project_root=other)
+        )

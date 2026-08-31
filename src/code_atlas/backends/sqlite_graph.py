@@ -79,6 +79,7 @@ from code_atlas.graph.client import (
     _pick_citation_target,
     _plan_config_refs,
     _project_data_rows,
+    _rel_write_skips,
     _render_citation_key,
     _resolve_one_call,
     _resolve_one_path_anchor,
@@ -481,13 +482,15 @@ class SqliteGraphClient:
         """Mirror of ``GraphClient._migrate_v6_clear_freshness_markers``.
 
         CALLS edges gained numeric ``weight``/``candidate_count``/``from_test`` and entities
-        gained ``rationale``/``citations``; both are produced at index time, and the file-hash
-        gate would otherwise skip every unchanged file forever.
+        gained ``rationale``/``citations``; both are produced at index time, and nothing would
+        otherwise enumerate an unchanged file.
+
+        Only ``git_hash`` is cleared here. The per-file ``file_hash`` clear these mirrors
+        went with ATL-152: ``schema.EXTRACTION_EPOCH`` is folded into the gate's key, so a
+        migration that needs a re-parse bumps the epoch and the stored hashes stop matching
+        on their own. See ``GraphClient._run_data_migrations`` for why the git_hash clear is
+        not subsumed by that and stays.
         """
-        await conn.execute(
-            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
-            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
-        )
         await conn.execute(
             "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
             "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
@@ -497,7 +500,7 @@ class SqliteGraphClient:
         )
         await conn.commit()
         logger.info(
-            "SQLite schema v6: cleared stored file/git hashes and unweighted CALLS edges — "
+            "SQLite schema v6: cleared the stored git_hash and unweighted CALLS edges — "
             "run 'atlas index' to rebuild with edge weights and rationale"
         )
         await conn.commit()
@@ -508,15 +511,11 @@ class SqliteGraphClient:
             "DELETE FROM edges WHERE rel_type = 'CALLS' AND json_extract(props_json, '$.confidence') = 'ambiguous'"
         )
         await conn.execute(
-            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
-            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
-        )
-        await conn.execute(
             "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
             "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
         )
         await conn.commit()
-        logger.info("SQLite graph schema v9: cleared ambiguous CALLS edges and freshness markers")
+        logger.info("SQLite graph schema v9: cleared ambiguous CALLS edges and the stored git_hash")
 
     async def _migrate_v8_drop_unverified_calls(self, conn: aiosqlite.Connection) -> None:
         """Mirror of ``GraphClient._migrate_v8_drop_unverified_calls``.
@@ -529,35 +528,27 @@ class SqliteGraphClient:
             "DELETE FROM edges WHERE rel_type = 'CALLS' AND json_extract(props_json, '$.strategy') = 'project_unique'"
         )
         await conn.execute(
-            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
-            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
-        )
-        await conn.execute(
             "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
             "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
         )
         await conn.commit()
-        logger.info("SQLite graph schema v8: dropped project_unique CALLS edges and cleared freshness markers")
+        logger.info("SQLite graph schema v8: dropped project_unique CALLS edges and cleared the git_hash")
 
     async def _migrate_v7_clear_freshness_markers(self, conn: aiosqlite.Connection) -> None:
         """Mirror of ``GraphClient._migrate_v7_clear_freshness_markers``.
 
         EnvVar/ResourceFile nodes exist only if a parser produced the reference,
         and nothing already in the graph can be used to derive them — so every
-        file has to be re-parsed, and the file-hash gate would otherwise skip
-        each unchanged one forever.
+        file has to be re-parsed, and without this clear nothing would enumerate
+        an unchanged one. See the v6 mirror for why only ``git_hash`` is cleared.
         """
-        await conn.execute(
-            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
-            "WHERE json_extract(props_json, '$.file_hash') IS NOT NULL"
-        )
         await conn.execute(
             "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
             "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
         )
         await conn.commit()
         logger.info(
-            "SQLite schema v7: cleared stored file/git hashes — run 'atlas index' to extract "
+            "SQLite schema v7: cleared the stored git_hash — run 'atlas index' to extract "
             "environment-variable and referenced-file nodes"
         )
 
@@ -916,6 +907,7 @@ class SqliteGraphClient:
         file_data: dict[str, tuple[list[ParsedEntity], list[ParsedRelationship]]],
         *,
         rels_only: bool = False,
+        rels_unchanged: Collection[str] = (),
     ) -> dict[str, UpsertResult]:
         if not file_data:
             return {}
@@ -942,7 +934,12 @@ class SqliteGraphClient:
                 await self._batch_update_positions(conn, classification.all_shifted)
 
             file_rels = {fp: rels for fp, (_entities, rels) in file_data.items()}
-            await self._recreate_batch_relationships(conn, project_name, file_rels, classification.new_file_paths)
+            if rels_unchanged:
+                # Same gate as GraphClient.upsert_batch_entities -- see _rel_write_skips.
+                skips = _rel_write_skips(classification, file_rels, rels_unchanged)
+                file_rels = {fp: rels for fp, rels in file_rels.items() if fp not in skips}
+            if file_rels:
+                await self._recreate_batch_relationships(conn, project_name, file_rels, classification.new_file_paths)
             await conn.commit()
             return classification.per_file_results
 
@@ -955,7 +952,7 @@ class SqliteGraphClient:
                 uids_by_label[data.label].append(uid)
             await self._batch_delete_entities(conn, dict(uids_by_label))
         await conn.execute(
-            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash') "
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.file_hash', '$.rels_hash') "
             "WHERE labels = 'Package' AND project_name = ? AND file_path = ?",
             (project_name, file_path),
         )
@@ -1137,6 +1134,16 @@ class SqliteGraphClient:
         props = json.loads(row[0]) if row[0] else {}
         return props.get("git_hash")
 
+    async def get_project_extraction_key(self, project_name: str) -> str | None:
+        conn = await self._get_conn()
+        cur = await conn.execute("SELECT props_json FROM nodes WHERE labels = 'Project' AND uid = ?", (project_name,))
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        props = json.loads(row[0]) if row[0] else {}
+        return props.get("extraction_key")
+
     async def get_project_file_paths(self, project_name: str) -> set[str]:
         conn = await self._get_conn()
         cur = await conn.execute(
@@ -1232,9 +1239,8 @@ class SqliteGraphClient:
         await conn.execute("DELETE FROM nodes WHERE project_name = ?", (project_name,))
         await conn.commit()
 
-    async def get_batch_file_hashes(self, project_name: str, file_paths: list[str]) -> dict[str, str | None]:
-        if not file_paths:
-            return {}
+    async def _get_batch_file_prop(self, project_name: str, file_paths: list[str], prop: str) -> dict[str, str | None]:
+        """Read one gate property (``file_hash`` / ``rels_hash``) off the file-level nodes."""
         conn = await self._get_conn()
         result: dict[str, str | None] = dict.fromkeys(file_paths)
         for chunk in _chunks(file_paths):
@@ -1250,20 +1256,39 @@ class SqliteGraphClient:
             await cur.close()
             for fp, props_json in rows:
                 props = json.loads(props_json) if props_json else {}
-                result[fp] = props.get("file_hash")
+                result[fp] = props.get(prop)
         return result
+
+    async def _set_batch_file_prop(self, project_name: str, values: dict[str, str], prop: str) -> None:
+        """Write one gate property onto the file-level nodes."""
+        conn = await self._get_conn()
+        for fp, v in values.items():
+            await conn.execute(
+                "UPDATE nodes SET props_json = json_patch(props_json, ?) "
+                f"WHERE project_name = ? AND file_path = ? AND labels IN ({_FILE_HASH_LABELS_SQL})",
+                (json.dumps({prop: v}), project_name, fp),
+            )
+        await conn.commit()
+
+    async def get_batch_file_hashes(self, project_name: str, file_paths: list[str]) -> dict[str, str | None]:
+        if not file_paths:
+            return {}
+        return await self._get_batch_file_prop(project_name, file_paths, "file_hash")
 
     async def set_batch_file_hashes(self, project_name: str, file_hashes: dict[str, str]) -> None:
         if not file_hashes:
             return
-        conn = await self._get_conn()
-        for fp, fh in file_hashes.items():
-            await conn.execute(
-                "UPDATE nodes SET props_json = json_patch(props_json, ?) "
-                f"WHERE project_name = ? AND file_path = ? AND labels IN ({_FILE_HASH_LABELS_SQL})",
-                (json.dumps({"file_hash": fh}), project_name, fp),
-            )
-        await conn.commit()
+        await self._set_batch_file_prop(project_name, file_hashes, "file_hash")
+
+    async def get_batch_rels_hashes(self, project_name: str, file_paths: list[str]) -> dict[str, str | None]:
+        if not file_paths:
+            return {}
+        return await self._get_batch_file_prop(project_name, file_paths, "rels_hash")
+
+    async def set_batch_rels_hashes(self, project_name: str, rels_hashes: dict[str, str]) -> None:
+        if not rels_hashes:
+            return
+        await self._set_batch_file_prop(project_name, rels_hashes, "rels_hash")
 
     async def merge_package_node(self, project_name: str, qualified_name: str, name: str, file_path: str) -> None:
         conn = await self._get_conn()

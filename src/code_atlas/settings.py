@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +17,11 @@ from pydantic_settings import (
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+
+# The module, not the name: ``extraction_key`` reads EXTRACTION_EPOCH at call time so a
+# test can move it, which is what makes "a bumped epoch re-parses" provable rather than
+# asserted. ``schema`` imports nothing project-local, so this cannot cycle.
+from code_atlas import schema
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -798,3 +805,83 @@ class AtlasSettings(BaseSettings):
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+
+
+def extraction_key(settings: AtlasSettings) -> str:
+    """Short digest of everything that decides what a parse produces for identical bytes.
+
+    Folded into the file-hash gate's key by ``indexing.consumers._compute_file_hash`` and
+    stored on the ``Project`` node so ``_decide_delta_mode`` can open enumeration when it
+    moves. That is the whole mechanism of ADR-0042 decision 5: the gate invalidates itself
+    when extraction changes, instead of a migration clearing 845 stored hashes by hand.
+
+    Membership below is a decision, not a sweep. A key that covers *some*
+    extraction-affecting configuration is worse than one that covers none, because it
+    looks complete -- so both lists are exhaustive as of this writing, and adding a
+    setting means deciding which list it joins.
+
+    **IN** -- every input ``parse_file`` reads, plus the detector pass that only runs for
+    a file the gate let through:
+
+    - ``index.max_source_chars``, ``index.max_doc_section_chars``, ``index.max_parse_bytes``
+      -- the three caps threaded into ``parse_file``. The first is the 2026-08-31 incident
+      that motivated this story; the second changes how many nodes a document becomes; the
+      third decides whether a file is parsed at all.
+    - ``detectors.enabled`` -- decides which TESTS / OVERRIDES / EXPORTS / INJECTED_INTO
+      edges a parsed file contributes. Keyed on the *configured names*, so a detector whose
+      registry entry fails to import is not covered (``get_enabled_detectors`` skips
+      unknown names silently); that is a code change, and code changes are the epoch's job.
+    - every ``rationale.*`` field -- ``_resolve_rationale_markers`` reads all six, and what
+      it returns changes each entity's ``rationale``/``citations`` and therefore its
+      ``content_hash``. The raw six rather than the resolved pair: resolving them lives in
+      ``parsing.ast``, which imports tree-sitter, and this module must not (pinned by
+      ``tests/unit/search/test_embeddings.py``). So editing ``task_markers`` while
+      ``tasks`` is false re-parses for nothing -- deliberate, because over-covering costs
+      one spurious re-parse and under-covering leaves the graph silently wrong.
+
+    **OUT**, and none of these is an oversight:
+
+    - ``index.strip_whitespace`` -- it changes what is *hashed*, not what is parsed.
+      ``_compute_file_hash`` already normalizes on it, so every stored hash moves when it
+      flips; folding it in here would double-count. ``parse_file`` receives the raw bytes
+      and never sees the flag.
+    - ``knowledge.vault_path`` -- never reaches the parser. Note mode is triggered by a
+      file's frontmatter, not by its directory, so this only names roots for dream mode
+      and the vault watcher. Including it would re-parse every project when someone renames
+      their vault directory, for zero extraction change.
+    - ``scope.*``, ``monorepo.*``, ``project.name``, ``project_root`` -- enumeration and
+      project identity. The gate is keyed ``(project_name, file_path)`` and self-heals: a
+      newly in-scope or newly renamed file has no stored hash under that key, so it parses.
+    - ``embeddings.*``, ``search.*`` -- downstream of extraction. Embedding inputs are
+      gated by ``embed_hash`` (ADR-0042's layer 3) and ranking is applied at query time.
+    - ``index.file_hash_gate``, ``delta_threshold``, ``stale_mode``, ``lease_wait_s``,
+      ``drain_timeout_s``, ``backend.*``, ``memgraph.*``, ``redis.*``, ``watcher.*``,
+      ``mcp.*``, ``observability.*``, ``libraries.*`` -- pipeline control and transport.
+
+    Everything about extraction that no setting can express -- a language handler, a new
+    grammar, the uid scheme, ``_compute_content_hash``'s formula, a detector's
+    implementation -- is covered by ``schema.EXTRACTION_EPOCH``, which is the primary half
+    of this key rather than a backstop for the config half.
+
+    The value must be **stable across runs and processes** for identical configuration, or
+    the daemon re-parses the whole project forever at watcher cadence and it reads as a
+    performance regression rather than a key that moved. So: lists are sorted (extraction
+    reads markers as a ``frozenset`` and merely iterates the detector list, so their order
+    is not output-bearing, while an ``atlas.toml`` reorder must not re-parse the world),
+    the payload is rendered with ``sort_keys=True``, and the digest is ``hashlib`` and
+    never ``hash()``, which is salted per process.
+    """
+    payload = {
+        "epoch": schema.EXTRACTION_EPOCH,
+        "detectors.enabled": sorted(settings.detectors.enabled),
+        "index.max_doc_section_chars": settings.index.max_doc_section_chars,
+        "index.max_parse_bytes": settings.index.max_parse_bytes,
+        "index.max_source_chars": settings.index.max_source_chars,
+        "rationale.citation_schemes": sorted(settings.rationale.citation_schemes),
+        "rationale.citations": settings.rationale.citations,
+        "rationale.enabled": settings.rationale.enabled,
+        "rationale.markers": sorted(settings.rationale.markers),
+        "rationale.task_markers": sorted(settings.rationale.task_markers),
+        "rationale.tasks": settings.rationale.tasks,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
