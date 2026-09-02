@@ -666,3 +666,68 @@ class TestOutOfScopeRefuses:
         _mg, lite = both
         with pytest.raises(NotImplementedError, match="not supported by the sqlite backend"):
             await lite.execute_write("CREATE (n:Foo)")
+
+
+# ---------------------------------------------------------------------------
+# Observability parity (ATL-158)
+# ---------------------------------------------------------------------------
+
+
+def _graph_query_ops(reader: Any) -> set[tuple[str, str]]:
+    """(op, kind) pairs seen on ``atlas_graph_query_seconds``."""
+    seen: set[tuple[str, str]] = set()
+    for rm in reader.get_metrics_data().resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != "atlas_graph_query_seconds":
+                    continue
+                for point in metric.data.data_points:
+                    seen.add((point.attributes.get("op"), point.attributes.get("kind")))
+    return seen
+
+
+class TestObservabilityParity:
+    """Both backends must report on the same instrument, not just return the same rows.
+
+    This is the check whose absence let the SQLite backend run for six weeks with no
+    telemetry at all. The suite above compares what the two backends *return*; nothing
+    compared what they *report*, so a backend emitting nothing was indistinguishable
+    from one emitting everything. `atlas_graph_query_seconds` is the shared instrument,
+    and its sample count per `op` is the round-trip count a benchmark reads.
+    """
+
+    async def test_both_backends_record_on_the_same_instrument(self, both, monkeypatch):
+        pytest.importorskip("opentelemetry.sdk")
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+        import code_atlas.telemetry as tel
+
+        memgraph, sqlite = both
+        results: dict[str, set[tuple[str, str]]] = {}
+
+        for label, client in (("memgraph", memgraph), ("sqlite", sqlite)):
+            reader = InMemoryMetricReader()
+            # A local provider rather than the global one: `set_meter_provider` is
+            # once-per-process and a second call is ignored, which would silently give
+            # the second backend an empty reader and read as "sqlite emits nothing".
+            meter = MeterProvider(metric_readers=[reader]).get_meter("code_atlas")
+            with monkeypatch.context() as m:
+                m.setattr(
+                    tel,
+                    "_metrics",
+                    tel._Metrics(graph_query_seconds=meter.create_histogram("atlas_graph_query_seconds", unit="s")),
+                )
+                m.setattr(tel, "_enabled", True)
+                m.setattr(tel, "_initialized", True)
+                await client.count_entities(PROJECT)
+            results[label] = _graph_query_ops(reader)
+
+        for label, seen in results.items():
+            assert seen, f"{label} recorded nothing on atlas_graph_query_seconds"
+            assert any(op == "count_entities" for op, _ in seen), (
+                f"{label} did not attribute the query to its calling method: {sorted(seen)}"
+            )
+            assert all(kind in {"read", "write", "read_tx", "write_tx"} for _, kind in seen), (
+                f"{label} used a kind outside the shared vocabulary: {sorted(seen)}"
+            )

@@ -51,6 +51,11 @@ import aiosqlite
 import sqlite_vec
 from loguru import logger
 
+from code_atlas.backends.instrumentation import TimedConnection
+from code_atlas.backends.instrumentation import in_transaction as _txn
+
+if TYPE_CHECKING:
+    from code_atlas.backends.instrumentation import SqlConnection
 from code_atlas.graph.client import (
     _CODE_ENTITY_KINDS,
     _DEFAULT_EDGE_WEIGHT,
@@ -415,6 +420,12 @@ class SqliteGraphClient:
         # Injected connections are used as-is (no PRAGMA/extension-load/schema
         # bootstrap) — the caller (real setup code or a test fake) owns that.
         self._conn: aiosqlite.Connection | None = conn
+        # Instrumentation wraps only a connection this client opened. An injected one is
+        # handed back untouched -- ADR-0038's "never what it was handed" applies to more
+        # than closing: a caller that passes a connection gets that object back from
+        # ``_get_conn``, not a decorated stand-in it never asked for.
+        self._owns_conn = conn is None
+        self._timed: TimedConnection | None = None
         self._connect_lock = asyncio.Lock()
         # Serializes the read-classify-write sequences in upsert_*: aiosqlite
         # funnels everything through one worker thread, but a multi-statement
@@ -428,7 +439,7 @@ class SqliteGraphClient:
 
     # -- Connection lifecycle / schema ---------------------------------------
 
-    async def _get_conn(self) -> aiosqlite.Connection:
+    async def _get_conn(self) -> SqlConnection:
         if self._conn is None:
             async with self._connect_lock:
                 if self._conn is None:
@@ -443,7 +454,13 @@ class SqliteGraphClient:
                     await conn.commit()
                     self._conn = conn
         assert self._conn is not None
-        return self._conn
+        if not self._owns_conn:
+            return self._conn
+        if self._timed is None:
+            # Wrapped once, here, rather than at 213 call sites -- so a statement added
+            # tomorrow is instrumented without anyone remembering to instrument it.
+            self._timed = TimedConnection(self._conn)
+        return self._timed
 
     async def ping(self) -> bool:
         """Health check — returns True if the local database is reachable."""
@@ -469,16 +486,16 @@ class SqliteGraphClient:
         await cur.close()
         return int(row[0]) if row else None
 
-    async def _upsert_meta(self, conn: aiosqlite.Connection, key: str, value: str) -> None:
+    async def _upsert_meta(self, conn: SqlConnection, key: str, value: str) -> None:
         await conn.execute(
             "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
 
-    async def _set_schema_version(self, conn: aiosqlite.Connection, version: int) -> None:
+    async def _set_schema_version(self, conn: SqlConnection, version: int) -> None:
         await self._upsert_meta(conn, "schema_version", str(version))
 
-    async def _migrate_v6_clear_freshness_markers(self, conn: aiosqlite.Connection) -> None:
+    async def _migrate_v6_clear_freshness_markers(self, conn: SqlConnection) -> None:
         """Mirror of ``GraphClient._migrate_v6_clear_freshness_markers``.
 
         CALLS edges gained numeric ``weight``/``candidate_count``/``from_test`` and entities
@@ -505,7 +522,7 @@ class SqliteGraphClient:
         )
         await conn.commit()
 
-    async def _migrate_v9_clear_for_abstract_bases(self, conn: aiosqlite.Connection) -> None:
+    async def _migrate_v9_clear_for_abstract_bases(self, conn: SqlConnection) -> None:
         """Mirror of ``GraphClient._migrate_v9_clear_for_abstract_bases``."""
         await conn.execute(
             "DELETE FROM edges WHERE rel_type = 'CALLS' AND json_extract(props_json, '$.confidence') = 'ambiguous'"
@@ -517,7 +534,7 @@ class SqliteGraphClient:
         await conn.commit()
         logger.info("SQLite graph schema v9: cleared ambiguous CALLS edges and the stored git_hash")
 
-    async def _migrate_v8_drop_unverified_calls(self, conn: aiosqlite.Connection) -> None:
+    async def _migrate_v8_drop_unverified_calls(self, conn: SqlConnection) -> None:
         """Mirror of ``GraphClient._migrate_v8_drop_unverified_calls``.
 
         project_unique edges were written confidence:"resolved" with full weight, so
@@ -534,7 +551,7 @@ class SqliteGraphClient:
         await conn.commit()
         logger.info("SQLite graph schema v8: dropped project_unique CALLS edges and cleared the git_hash")
 
-    async def _migrate_v7_clear_freshness_markers(self, conn: aiosqlite.Connection) -> None:
+    async def _migrate_v7_clear_freshness_markers(self, conn: SqlConnection) -> None:
         """Mirror of ``GraphClient._migrate_v7_clear_freshness_markers``.
 
         EnvVar/ResourceFile nodes exist only if a parser produced the reference,
@@ -552,7 +569,7 @@ class SqliteGraphClient:
             "environment-variable and referenced-file nodes"
         )
 
-    async def _migrate_v18_versions_moved_to_dependency_edge(self, conn: aiosqlite.Connection) -> None:
+    async def _migrate_v18_versions_moved_to_dependency_edge(self, conn: SqlConnection) -> None:
         """Mirror of ``GraphClient._migrate_v18_versions_moved_to_dependency_edge``.
 
         The first migration on this backend that moves data rather than clearing it —
@@ -588,7 +605,7 @@ class SqliteGraphClient:
         await conn.commit()
         logger.info("SQLite graph schema v18: moved ExternalPackage versions onto Project -[DEPENDS_ON]-> edges")
 
-    async def _apply_full_schema(self, conn: aiosqlite.Connection) -> None:
+    async def _apply_full_schema(self, conn: SqlConnection) -> None:
         for stmt in _node_index_ddl():
             await conn.execute(stmt)
         if self._embeddings_enabled:
@@ -675,7 +692,7 @@ class SqliteGraphClient:
 
     # -- Internal helpers -----------------------------------------------------
 
-    async def _safe_exec(self, conn: aiosqlite.Connection, stmt: str, params: Any = ()) -> None:
+    async def _safe_exec(self, conn: SqlConnection, stmt: str, params: Any = ()) -> None:
         """Execute a side-table (vec0/FTS5) statement, tolerating a missing virtual
         table (``ensure_schema`` not yet run) the way Memgraph tolerates writing
         node properties before its vector/text indices exist.
@@ -685,7 +702,7 @@ class SqliteGraphClient:
         except aiosqlite.OperationalError as exc:
             logger.debug("Side-table statement skipped ({}): {}", exc, stmt[:80])
 
-    async def _nodes_by_uid(self, conn: aiosqlite.Connection, uids: list[str]) -> dict[str, dict[str, Any]]:
+    async def _nodes_by_uid(self, conn: SqlConnection, uids: list[str]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
         deduped = list(dict.fromkeys(uids))
         for chunk in _chunks(deduped):
@@ -700,7 +717,7 @@ class SqliteGraphClient:
                 result[node["uid"]] = node
         return result
 
-    async def _cleanup_search_side_tables(self, conn: aiosqlite.Connection, uids: list[str]) -> None:
+    async def _cleanup_search_side_tables(self, conn: SqlConnection, uids: list[str]) -> None:
         for chunk in _chunks(uids):
             if not chunk:
                 continue
@@ -721,7 +738,7 @@ class SqliteGraphClient:
                     uid_ph = ",".join("?" * len(items))
                     await self._safe_exec(conn, f"DELETE FROM {table} WHERE uid IN ({uid_ph})", [u for u, _r in items])
 
-    async def _sync_fts_row(self, conn: aiosqlite.Connection, e: ParsedEntity) -> None:
+    async def _sync_fts_row(self, conn: SqlConnection, e: ParsedEntity) -> None:
         label = e.label.value
         if label not in _TEXT_LABEL_VALUES:
             return
@@ -737,7 +754,7 @@ class SqliteGraphClient:
         await self._safe_exec(conn, f"INSERT INTO {table}(uid, text) VALUES (?, ?)", (uid, text))
 
     async def _get_file_content_hashes(
-        self, conn: aiosqlite.Connection, project_name: str, file_path: str
+        self, conn: SqlConnection, project_name: str, file_path: str
     ) -> dict[str, EntityHashData]:
         cur = await conn.execute(
             "SELECT uid, labels, content_hash, props_json FROM nodes "
@@ -760,7 +777,7 @@ class SqliteGraphClient:
         return result
 
     async def _get_batch_file_content_hashes(
-        self, conn: aiosqlite.Connection, project_name: str, file_paths: list[str]
+        self, conn: SqlConnection, project_name: str, file_paths: list[str]
     ) -> dict[str, dict[str, EntityHashData]]:
         if not file_paths:
             return {}
@@ -791,7 +808,7 @@ class SqliteGraphClient:
     # -- Entity CRUD ------------------------------------------------------------
 
     async def _batch_create_entities(
-        self, conn: aiosqlite.Connection, project_name: str, entities: list[ParsedEntity]
+        self, conn: SqlConnection, project_name: str, entities: list[ParsedEntity]
     ) -> None:
         if not entities:
             return
@@ -823,7 +840,7 @@ class SqliteGraphClient:
         for e in entities:
             await self._sync_fts_row(conn, e)
 
-    async def _batch_update_entities(self, conn: aiosqlite.Connection, entities: list[ParsedEntity]) -> None:
+    async def _batch_update_entities(self, conn: SqlConnection, entities: list[ParsedEntity]) -> None:
         if not entities:
             return
         for e in entities:
@@ -841,14 +858,14 @@ class SqliteGraphClient:
             )
             await self._sync_fts_row(conn, e)
 
-    async def _batch_update_positions(self, conn: aiosqlite.Connection, entities: list[ParsedEntity]) -> None:
+    async def _batch_update_positions(self, conn: SqlConnection, entities: list[ParsedEntity]) -> None:
         for e in entities:
             await conn.execute(
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
                 (json.dumps({"line_start": e.line_start, "line_end": e.line_end}), e.qualified_name),
             )
 
-    async def _batch_delete_entities(self, conn: aiosqlite.Connection, uids_by_label: dict[str, list[str]]) -> None:
+    async def _batch_delete_entities(self, conn: SqlConnection, uids_by_label: dict[str, list[str]]) -> None:
         """Delete entity nodes by uid.
 
         Simplified vs. ``GraphClient._batch_delete_entities`` — always fully
@@ -876,7 +893,7 @@ class SqliteGraphClient:
         relationships: list[ParsedRelationship],
     ) -> UpsertResult:
         conn = await self._get_conn()
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             old_data = await self._get_file_content_hashes(conn, project_name, file_path)
             fc = _classify_file_delta(old_data, entities, _strip_uid)
 
@@ -912,7 +929,7 @@ class SqliteGraphClient:
         if not file_data:
             return {}
         conn = await self._get_conn()
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             if rels_only:
                 # See GraphClient.upsert_batch_entities for why this pass classifies to
                 # nothing and why new_file_paths is empty.
@@ -962,7 +979,7 @@ class SqliteGraphClient:
     # -- Relationships ------------------------------------------------------------
 
     async def _create_relationships(
-        self, conn: aiosqlite.Connection, project_name: str, relationships: list[ParsedRelationship]
+        self, conn: SqlConnection, project_name: str, relationships: list[ParsedRelationship]
     ) -> None:
         if not relationships:
             return
@@ -1050,7 +1067,7 @@ class SqliteGraphClient:
 
     async def _recreate_file_relationships(
         self,
-        conn: aiosqlite.Connection,
+        conn: SqlConnection,
         project_name: str,
         file_path: str,
         relationships: list[ParsedRelationship],
@@ -1069,7 +1086,7 @@ class SqliteGraphClient:
 
     async def _recreate_batch_relationships(
         self,
-        conn: aiosqlite.Connection,
+        conn: SqlConnection,
         project_name: str,
         file_rels: dict[str, list[ParsedRelationship]],
         new_file_paths: set[str],
@@ -2378,7 +2395,7 @@ class SqliteGraphClient:
 
     async def set_project_embedding_model(self, project: str, model: str) -> None:
         conn = await self._get_conn()
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             await conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (f"embedding_model:{project}", model),
@@ -2474,7 +2491,7 @@ class SqliteGraphClient:
         await cur.close()
         return [(uid, label, file_path or "") for uid, label, file_path in rows]
 
-    async def _write_embedding_row(self, conn: aiosqlite.Connection, uid: str, blob: bytes) -> None:
+    async def _write_embedding_row(self, conn: SqlConnection, uid: str, blob: bytes) -> None:
         cur = await conn.execute("SELECT rowid, labels FROM nodes WHERE uid = ?", (uid,))
         row = await cur.fetchone()
         await cur.close()
@@ -2533,7 +2550,7 @@ class SqliteGraphClient:
         # consumer happened to serialise its callers; that is the consumer's concurrency
         # policy, not this backend's durability guarantee, and the two must not be the
         # same knob. Every other writer here already takes this lock.
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             props = {"embed_hash": "", "embed_model": model} if model else {"embed_hash": ""}
             for uid, vector, h in items:
                 blob = sqlite_vec.serialize_float32(vector)
@@ -2607,7 +2624,7 @@ class SqliteGraphClient:
         await cur.close()
         affected.update(note_uids)
 
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             for uid in sorted(affected):
                 cur = await conn.execute(
                     "SELECT from_uid FROM edges WHERE rel_type = 'SUPERSEDES' AND to_uid = ? LIMIT 1", (uid,)
@@ -2870,7 +2887,7 @@ class SqliteGraphClient:
         if not items:
             return
         conn = await self._get_conn()
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             for item in items:
                 props: dict[str, Any] = {
                     "parent_uid": item.parent_uid,
@@ -2899,7 +2916,7 @@ class SqliteGraphClient:
         if not parent_uids:
             return
         conn = await self._get_conn()
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             await self._delete_chunk_uids(conn, await self._chunk_uids_of(conn, parent_uids))
             await conn.commit()
 
@@ -2918,12 +2935,12 @@ class SqliteGraphClient:
         await cur.close()
         if not dead:
             return 0
-        async with self._write_lock:
+        async with self._write_lock, _txn():
             await self._delete_chunk_uids(conn, dead)
             await conn.commit()
         return len(dead)
 
-    async def _chunk_uids_of(self, conn: aiosqlite.Connection, parent_uids: list[str]) -> list[str]:
+    async def _chunk_uids_of(self, conn: SqlConnection, parent_uids: list[str]) -> list[str]:
         out: list[str] = []
         for chunk in _chunks(list(dict.fromkeys(parent_uids))):
             if not chunk:
@@ -2938,7 +2955,7 @@ class SqliteGraphClient:
             await cur.close()
         return out
 
-    async def _delete_chunk_uids(self, conn: aiosqlite.Connection, uids: list[str]) -> None:
+    async def _delete_chunk_uids(self, conn: SqlConnection, uids: list[str]) -> None:
         if not uids:
             return
         await self._cleanup_search_side_tables(conn, uids)
@@ -2948,9 +2965,7 @@ class SqliteGraphClient:
             placeholders = ",".join("?" * len(chunk))
             await conn.execute(f"DELETE FROM nodes WHERE uid IN ({placeholders})", chunk)
 
-    async def _resolve_embed_chunks(
-        self, conn: aiosqlite.Connection, records: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    async def _resolve_embed_chunks(self, conn: SqlConnection, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Swap every EmbedChunk hit for the node it is a chunk of.
 
         Mirror of ``GraphClient._resolve_embed_chunks``; the difference is only that a
@@ -3085,7 +3100,7 @@ class SqliteGraphClient:
         return row is not None
 
     async def _bfs_shortest_path(
-        self, conn: aiosqlite.Connection, from_uid: str, to_uid: str, edge_types: tuple[str, ...], max_depth: int
+        self, conn: SqlConnection, from_uid: str, to_uid: str, edge_types: tuple[str, ...], max_depth: int
     ) -> list[tuple[str, str, str, dict[str, Any]]] | None:
         """BFS shortest path over ``edges``, restricted to *edge_types*.
 
@@ -3207,7 +3222,7 @@ class SqliteGraphClient:
 
     async def _bfs_reachable(
         self,
-        conn: aiosqlite.Connection,
+        conn: SqlConnection,
         uid: str,
         src_col: str,
         dst_col: str,
@@ -3449,7 +3464,7 @@ class SqliteGraphClient:
         return {"hubs": hubs_raw, "hub_modules": hub_modules_raw, "leaves": leaf_raw}
 
     async def _module_import_edges(
-        self, conn: aiosqlite.Connection, project: str, clause: str, extra: list[Any]
+        self, conn: SqlConnection, project: str, clause: str, extra: list[Any]
     ) -> dict[str, list[dict[str, Any]]]:
         """Shared direct/indirect module-import query, parametrized by a
         pre-built path-scope clause — callers apply it to different columns
@@ -3974,7 +3989,7 @@ class SqliteGraphClient:
 
     # -- Context expansion / navigation (search/engine.py's expand_context) ---
 
-    async def _label_matches(self, conn: aiosqlite.Connection, uid: str, label: str) -> bool:
+    async def _label_matches(self, conn: SqlConnection, uid: str, label: str) -> bool:
         """Whether *uid* carries *label* (mirrors Cypher's inline ``:Label`` node-pattern filter).
 
         Always ``True`` when *label* is empty (no filter requested).

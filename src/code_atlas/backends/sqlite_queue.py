@@ -26,6 +26,11 @@ from typing import TYPE_CHECKING, Self
 import aiosqlite
 
 from code_atlas.events import Event, StreamGroupInfo, Topic, encode_event
+from code_atlas.telemetry import get_tracer
+
+# Same span names the Valkey ``EventBus`` emits (``events.py``), deliberately: a trace
+# should not change shape because a deployment chose the embedded queue.
+_tracer = get_tracer(__name__)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -123,34 +128,38 @@ class SqliteEventBus:
 
     async def publish(self, topic: Topic, event: Event) -> bytes:
         """Publish an event. Returns the message ID (``b"<rowid>-0"``)."""
-        conn = await self._get_conn()
-        payload = encode_event(event)[b"data"]
-        cur = await conn.execute(
-            "INSERT INTO messages (topic, payload, created_at) VALUES (?, ?, ?)",
-            (topic.value, payload, time.time()),
-        )
-        await conn.commit()
-        rowid = cur.lastrowid
-        await cur.close()
-        return f"{rowid}-0".encode()
+        with _tracer.start_as_current_span("eventbus.publish", attributes={"topic": topic.value}):
+            conn = await self._get_conn()
+            payload = encode_event(event)[b"data"]
+            cur = await conn.execute(
+                "INSERT INTO messages (topic, payload, created_at) VALUES (?, ?, ?)",
+                (topic.value, payload, time.time()),
+            )
+            await conn.commit()
+            rowid = cur.lastrowid
+            await cur.close()
+            return f"{rowid}-0".encode()
 
     async def publish_many(self, topic: Topic, events: list[Event]) -> list[bytes]:
         """Publish multiple events in a single transaction."""
         if not events:
             return []
-        conn = await self._get_conn()
-        now = time.time()
-        ids: list[bytes] = []
-        for event in events:
-            payload = encode_event(event)[b"data"]
-            cur = await conn.execute(
-                "INSERT INTO messages (topic, payload, created_at) VALUES (?, ?, ?)",
-                (topic.value, payload, now),
-            )
-            ids.append(f"{cur.lastrowid}-0".encode())
-            await cur.close()
-        await conn.commit()
-        return ids
+        with _tracer.start_as_current_span(
+            "eventbus.publish_many", attributes={"topic": topic.value, "count": len(events)}
+        ):
+            conn = await self._get_conn()
+            now = time.time()
+            ids: list[bytes] = []
+            for event in events:
+                payload = encode_event(event)[b"data"]
+                cur = await conn.execute(
+                    "INSERT INTO messages (topic, payload, created_at) VALUES (?, ?, ?)",
+                    (topic.value, payload, now),
+                )
+                ids.append(f"{cur.lastrowid}-0".encode())
+                await cur.close()
+            await conn.commit()
+            return ids
 
     async def _claim_new_messages(
         self, topic: Topic, group: str, consumer: str, count: int
@@ -199,14 +208,21 @@ class SqliteEventBus:
         nothing arrives in time. Returns the same shape as ``EventBus.read_batch``.
         """
         deadline = time.monotonic() + block_ms / 1000
-        while True:
-            rows = await self._claim_new_messages(topic, group, consumer, count)
-            if rows:
-                return rows
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return []
-            await asyncio.sleep(min(_POLL_INTERVAL_S, remaining))
+        # Spans the poll wait as well as the claim, matching the Valkey side where the
+        # equivalent span covers a blocking XREADGROUP. Both are deliberate pacing
+        # rather than work, and a benchmark accounts for them on that line.
+        with _tracer.start_as_current_span(
+            "eventbus.read_batch",
+            attributes={"topic": topic.value, "group": group, "consumer": consumer},
+        ):
+            while True:
+                rows = await self._claim_new_messages(topic, group, consumer, count)
+                if rows:
+                    return rows
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                await asyncio.sleep(min(_POLL_INTERVAL_S, remaining))
 
     async def read_pending(
         self,
@@ -217,20 +233,23 @@ class SqliteEventBus:
         count: int = 10,
     ) -> list[tuple[bytes, dict[bytes, bytes]]]:
         """Replay this consumer's un-acked deliveries (the PEL) — survives a process restart."""
-        conn = await self._get_conn()
-        cur = await conn.execute(
-            """
-            SELECT m.id, m.payload FROM deliveries d
-            JOIN messages m ON m.id = d.message_id
-            WHERE d.topic = ? AND d.grp = ? AND d.consumer = ? AND d.acked_at IS NULL
-            ORDER BY m.id
-            LIMIT ?
-            """,
-            (topic.value, group, consumer, count),
-        )
-        rows = await cur.fetchall()
-        await cur.close()
-        return [(f"{row[0]}-0".encode(), {b"data": row[1]}) for row in rows]
+        with _tracer.start_as_current_span(
+            "eventbus.read_pending", attributes={"topic": topic.value, "group": group, "consumer": consumer}
+        ):
+            conn = await self._get_conn()
+            cur = await conn.execute(
+                """
+                SELECT m.id, m.payload FROM deliveries d
+                JOIN messages m ON m.id = d.message_id
+                WHERE d.topic = ? AND d.grp = ? AND d.consumer = ? AND d.acked_at IS NULL
+                ORDER BY m.id
+                LIMIT ?
+                """,
+                (topic.value, group, consumer, count),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            return [(f"{row[0]}-0".encode(), {b"data": row[1]}) for row in rows]
 
     async def ack(self, topic: Topic, group: str, *msg_ids: bytes) -> int:
         """Acknowledge messages after successful processing. Returns the count acked."""
@@ -259,27 +278,30 @@ class SqliteEventBus:
         count: int = 10,
     ) -> list[tuple[bytes, dict[bytes, bytes]]]:
         """Take over deliveries a dead consumer left pending. Mirrors ``EventBus``."""
-        conn = await self._get_conn()
-        cutoff = time.time() - (min_idle_ms / 1000.0)
-        cur = await conn.execute(
-            "SELECT d.message_id, m.payload FROM deliveries d JOIN messages m ON m.id = d.message_id "
-            "WHERE d.topic = ? AND d.grp = ? AND d.acked_at IS NULL AND d.consumer <> ? "
-            "AND d.delivered_at <= ? ORDER BY d.message_id LIMIT ?",
-            (topic.value, group, consumer, cutoff, count),
-        )
-        rows = await cur.fetchall()
-        await cur.close()
-        if not rows:
-            return []
-        ids = [r[0] for r in rows]
-        placeholders = ",".join("?" * len(ids))
-        await conn.execute(
-            f"UPDATE deliveries SET consumer = ?, delivered_at = ? WHERE topic = ? AND grp = ? "
-            f"AND message_id IN ({placeholders})",
-            (consumer, time.time(), topic.value, group, *ids),
-        )
-        await conn.commit()
-        return [(f"{r[0]}-0".encode(), {b"data": r[1]}) for r in rows]
+        with _tracer.start_as_current_span(
+            "eventbus.reclaim_abandoned", attributes={"topic": topic.value, "group": group, "consumer": consumer}
+        ):
+            conn = await self._get_conn()
+            cutoff = time.time() - (min_idle_ms / 1000.0)
+            cur = await conn.execute(
+                "SELECT d.message_id, m.payload FROM deliveries d JOIN messages m ON m.id = d.message_id "
+                "WHERE d.topic = ? AND d.grp = ? AND d.acked_at IS NULL AND d.consumer <> ? "
+                "AND d.delivered_at <= ? ORDER BY d.message_id LIMIT ?",
+                (topic.value, group, consumer, cutoff, count),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if not rows:
+                return []
+            ids = [r[0] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            await conn.execute(
+                f"UPDATE deliveries SET consumer = ?, delivered_at = ? WHERE topic = ? AND grp = ? "
+                f"AND message_id IN ({placeholders})",
+                (consumer, time.time(), topic.value, group, *ids),
+            )
+            await conn.commit()
+            return [(f"{r[0]}-0".encode(), {b"data": r[1]}) for r in rows]
 
     # -- Indexer lease ---------------------------------------------------------
 
