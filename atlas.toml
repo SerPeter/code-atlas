@@ -1,5 +1,21 @@
 # Code Atlas configuration
 # See: https://github.com/SerPeter/code-atlas
+#
+# This file is committed and shared: it describes the CODEBASE — scope, detectors,
+# rationale markers, monorepo layout, knowledge vault. It is the same for everyone.
+#
+# Anything that differs per machine — [redis], [memgraph], [embeddings], [backend] —
+# belongs in one of these instead, most specific first:
+#
+#   1. ATLAS_* environment variables    ATLAS_MEMGRAPH__HOST=box.local
+#                                       (nested sections use a double underscore;
+#                                        export them from .envrc if you want them
+#                                        loaded automatically — atlas never reads .env)
+#   2. atlas.local.toml                 gitignored, sits beside this file, merges per key
+#
+# Both override this file. atlas.local.toml merges rather than replaces, so setting
+# [memgraph] host there keeps this file's port. Discovery for both files starts at the
+# git root, so it does not matter which directory you run atlas from.
 
 [scope]
 # Restrict indexing to these directory paths (leave empty for everything)

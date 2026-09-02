@@ -88,6 +88,36 @@ Add to your Claude Code / Cursor / Windsurf MCP config:
 }
 ```
 
+## Configuration
+
+`atlas.toml` is committed and describes the codebase — scope, detectors, rationale markers, monorepo layout, knowledge
+vault. It is the same for everyone working on the repository.
+
+Settings that differ per machine — `[redis]`, `[memgraph]`, `[embeddings]`, `[backend]` — belong somewhere else. Two
+options, most specific first:
+
+| Layer              | Committed?      | Use it for                                            |
+| ------------------ | --------------- | ----------------------------------------------------- |
+| `ATLAS_*` env vars | no              | one-off overrides, CI, anything already in your shell |
+| `atlas.local.toml` | no (gitignored) | machine-specific values you want to persist           |
+| `atlas.toml`       | yes             | everything about the codebase itself                  |
+
+Nested sections use a double underscore: `ATLAS_MEMGRAPH__HOST=box.local`. Atlas never reads `.env` itself — export from
+`.envrc` (direnv) if you want them loaded automatically.
+
+`atlas.local.toml` merges per key rather than replacing the file, so this is enough to point one developer at a
+different Memgraph while inheriting everything else:
+
+```toml
+# atlas.local.toml
+[memgraph]
+host = "box.local"
+```
+
+Both files are discovered from the **git root**, so it does not matter which directory you run `atlas` from — a
+sub-directory of the repo resolves to the same project, the same config and the same indexer lease. A config file inside
+a sub-directory is not read.
+
 ## Agent Integration
 
 ### Guidelines for Agent Instructions
