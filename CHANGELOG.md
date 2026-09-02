@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.11.2 (2026-09-02)
+
+### Bug Fixes
+
+- **settings**: Resolve config from the project root, and read atlas.local.toml
+  ([`0b7aed9`](https://github.com/SerPeter/code-atlas/commit/0b7aed941808934b07d6872e1aef0299b050d3a8))
+
+### Documentation
+
+- Say which settings are shared and which are per-machine
+  ([`28238c1`](https://github.com/SerPeter/code-atlas/commit/28238c11511d1993e7fe0d0b728036bf7f751a36))
+
+
 ## v0.11.1 (2026-08-31)
 
 ### Documentation
