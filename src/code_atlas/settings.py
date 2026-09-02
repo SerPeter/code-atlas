@@ -188,6 +188,15 @@ def _has_tool_atlas_table(pyproject_path: Path) -> bool:
     return isinstance(tool_section, dict) and isinstance(tool_section.get("atlas"), dict)
 
 
+_LOCAL_CONFIG_NAME = "atlas.local.toml"
+"""Gitignored per-developer override, layered over the shared config (ATL-157).
+
+Named here rather than inline because ``.gitignore`` has carried this filename under
+"Local config overrides" since before anything read it — a developer could create the
+file, watch git ignore it, and reasonably conclude it worked.
+"""
+
+
 def _find_atlas_toml(start: Path | None = None) -> _ConfigFileMatch | None:
     """Walk up from *start* (default: cwd) looking for Atlas config.
 
@@ -197,6 +206,14 @@ def _find_atlas_toml(start: Path | None = None) -> _ConfigFileMatch | None:
     is transparent to the search and the walk continues past it. The first
     directory level where either resolves wins; there is no cross-directory
     merging.
+
+    ``atlas.local.toml`` is not part of that rule and does not break it: it is layered
+    over whatever this function returns, from the *same* directory level, by
+    ``AtlasSettings.settings_customise_sources`` (ATL-157). The no-merging rule is about
+    directory levels, and it still holds.
+
+    Callers pass the project root, not the cwd — see ``settings_customise_sources`` for
+    why the difference is load-bearing (ATL-156).
     """
     current = (start or Path.cwd()).resolve()
     while True:
@@ -768,14 +785,35 @@ class AtlasSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Discover atlas.toml (or a pyproject.toml [tool.atlas] fallback) relative to
-        # the target project_root (when explicitly passed, e.g. `atlas index <other-path>`),
-        # not the process cwd — otherwise indexing a project other than the cwd's own
-        # applies the wrong config.
+        # Discover atlas.toml (or a pyproject.toml [tool.atlas] fallback) relative to the
+        # target project_root when one is explicitly passed (`atlas index <other-path>`),
+        # and otherwise relative to the project root this process would resolve anyway --
+        # never the process cwd (ATL-156).
+        #
+        # cwd was the old fallback, and it split identity from configuration: project
+        # identity has always come from the git root (`_default_project_root`, and
+        # `_explicit_project_name` discovering from that root), while config came from
+        # wherever the process happened to start. So `atlas mcp` run in `apps/web` of a
+        # monorepo got the SAME project name, graph and indexer lease as one run at the
+        # root, with different settings -- two writers addressing the same nodes, and
+        # whichever ran last decided what the graph held. Worse than two separate
+        # projects, which at least show up as two rows in `atlas status`.
         init_kwargs = getattr(init_settings, "init_kwargs", {})
         target_root = init_kwargs.get("project_root")
-        config_match = _find_atlas_toml(Path(target_root) if target_root else None)
+        search_root = Path(target_root) if target_root else _default_project_root()
+        config_match = _find_atlas_toml(search_root)
         sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
+
+        # `atlas.local.toml`, ahead of the shared file so it wins per key (ATL-157).
+        # Repo-specific settings (scope, detectors, monorepo layout) belong in the
+        # committed file; infrastructure that differs per machine ([redis], [memgraph],
+        # [embeddings], [backend]) belongs here or in ATLAS_* variables, which outrank
+        # both. Beside the file discovery settled on -- never searched for on its own up
+        # the tree, which would reintroduce the ambiguity above.
+        local_path = (config_match.path.parent if config_match is not None else search_root) / _LOCAL_CONFIG_NAME
+        if local_path.is_file():
+            sources.append(TomlConfigSettingsSource(settings_cls, toml_file=local_path))
+
         if config_match is not None:
             if config_match.table_header:
                 # pyproject.toml [tool.atlas] fallback — PyprojectTomlConfigSettingsSource

@@ -179,6 +179,180 @@ class TestAtlasTomlDiscovery:
         assert settings.memgraph.port == 7687  # default, not cwd's 6666
 
 
+def _captured_warnings(project_root: Path) -> list[str]:
+    """WARNING-level loguru messages emitted by `_warn_shadowed_config`.
+
+    A loguru sink, not `caplog`: loguru does not route through stdlib logging, so
+    `caplog.text` is empty even while the message is plainly on stderr — which is exactly
+    how a log-assertion test passes vacuously.
+    """
+    from loguru import logger
+
+    from code_atlas.cli import _warn_shadowed_config
+
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+    try:
+        _warn_shadowed_config(project_root)
+    finally:
+        logger.remove(sink)
+    return messages
+
+
+def _repo(root: Path, shared: str = "", local: str = "") -> Path:
+    """A git-rooted project with an optional shared and/or local config."""
+    (root / ".git").mkdir(parents=True)  # find_git_root only tests existence
+    if shared:
+        (root / "atlas.toml").write_text(shared, encoding="utf-8")
+    if local:
+        (root / "atlas.local.toml").write_text(local, encoding="utf-8")
+    return root
+
+
+class TestConfigDiscoveryStartsAtTheProjectRoot:
+    """ATL-156. Identity has always come from the git root, config came from cwd.
+
+    That split gave `atlas mcp` started in a sub-directory the same project name, graph
+    and indexer lease as one started at the root, with different settings — two writers
+    addressing the same nodes, and no row in `atlas status` to show they disagreed.
+    """
+
+    def test_a_subdirectory_yields_the_same_settings_as_the_root(self, clean_env, monkeypatch):
+        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7777\n[index]\nmax_source_chars = 4321\n")
+        sub = repo / "apps" / "web"
+        sub.mkdir(parents=True)
+        # A competing config in the sub-directory is what makes this assertion mean
+        # anything. Without one, cwd-relative discovery walks up and finds the root's file
+        # anyway, so the test passes with or without the fix — measured, not assumed.
+        (sub / "atlas.toml").write_text("[memgraph]\nport = 7000\n[index]\nmax_source_chars = 1234\n", encoding="utf-8")
+
+        monkeypatch.chdir(repo)
+        from_root = AtlasSettings()
+        monkeypatch.chdir(sub)
+        from_sub = AtlasSettings()
+
+        # Field for field, not just the one the fixture sets: a fallback that happened to
+        # agree on `port` while diverging elsewhere is the bug, not the fix.
+        assert from_sub.model_dump() == from_root.model_dump()
+
+    def test_a_subdirectory_config_does_not_win(self, clean_env, monkeypatch):
+        """The measured case: cwd=apps/web read max_source_chars 1234 from the sub-directory."""
+        repo = _repo(clean_env / "repo", shared="[index]\nmax_source_chars = 4321\n")
+        sub = repo / "apps" / "web"
+        sub.mkdir(parents=True)
+        (sub / "atlas.toml").write_text("[index]\nmax_source_chars = 1234\n", encoding="utf-8")
+
+        monkeypatch.chdir(sub)
+
+        assert AtlasSettings().index.max_source_chars == 4321
+
+    def test_a_shadowed_subdirectory_config_is_reported(self, clean_env, monkeypatch):
+        """Not read is fine; not read and not mentioned is the same defect in a new place."""
+        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7687\n")
+        sub = repo / "apps" / "web"
+        sub.mkdir(parents=True)
+        (sub / "atlas.toml").write_text("[memgraph]\nport = 7111\n", encoding="utf-8")
+
+        monkeypatch.chdir(sub)
+        warnings = _captured_warnings(repo)
+
+        assert any("atlas.toml" in w for w in warnings)
+        assert any(str(repo) in w for w in warnings), "the warning must name the root it read instead"
+
+    def test_no_warning_when_running_at_the_root(self, clean_env, monkeypatch):
+        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7687\n")
+        monkeypatch.chdir(repo)
+
+        assert _captured_warnings(repo) == []
+
+    def test_outside_a_git_repository_discovery_still_starts_at_cwd(self, clean_env, monkeypatch):
+        """No .git anywhere, so `_default_project_root` falls back to cwd — unchanged."""
+        plain = clean_env / "plain"
+        plain.mkdir()
+        (plain / "atlas.toml").write_text("[memgraph]\nport = 7999\n", encoding="utf-8")
+
+        monkeypatch.chdir(plain)
+
+        assert AtlasSettings().memgraph.port == 7999
+
+
+class TestLocalConfigOverride:
+    """ATL-157. `atlas.local.toml` has been in .gitignore under "Local config overrides"
+    since before anything read it, so creating one looked supported and did nothing."""
+
+    def test_it_overrides_one_key_and_inherits_the_rest(self, clean_env, monkeypatch):
+        """The point of merging rather than replacing: override the host, keep the port."""
+        repo = _repo(
+            clean_env / "repo",
+            shared='[memgraph]\nhost = "shared-host"\nport = 7687\n[index]\nmax_source_chars = 4321\n',
+            local='[memgraph]\nhost = "local-host"\n',
+        )
+        monkeypatch.chdir(repo)
+
+        settings = AtlasSettings()
+
+        assert settings.memgraph.host == "local-host"
+        assert settings.memgraph.port == 7687, "the shared value in the same section was replaced, not merged"
+        assert settings.index.max_source_chars == 4321, "an untouched section was dropped"
+
+    def test_precedence_runs_from_most_specific_to_least(self, clean_env, monkeypatch):
+        """init kwarg > ATLAS_* env > atlas.local.toml > atlas.toml.
+
+        Infrastructure differs per machine, so the environment has to outrank both files;
+        repo-specific settings live in the shared one, which loses to everything.
+        """
+        repo = _repo(
+            clean_env / "repo",
+            shared='[memgraph]\nhost = "from-shared"\n',
+            local='[memgraph]\nhost = "from-local"\n',
+        )
+        monkeypatch.chdir(repo)
+
+        assert AtlasSettings().memgraph.host == "from-local"
+
+        monkeypatch.setenv("ATLAS_MEMGRAPH__HOST", "from-env")
+        assert AtlasSettings().memgraph.host == "from-env"
+
+    def test_a_local_file_applies_with_no_shared_file(self, clean_env, monkeypatch):
+        repo = _repo(clean_env / "repo", local="[memgraph]\nport = 7555\n")
+        monkeypatch.chdir(repo)
+
+        assert AtlasSettings().memgraph.port == 7555
+
+    def test_it_layers_over_a_pyproject_shared_config(self, clean_env, monkeypatch):
+        repo = clean_env / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "pyproject.toml").write_text(
+            "[tool.atlas.memgraph]\nhost = 'shared-host'\nport = 7687\n", encoding="utf-8"
+        )
+        (repo / "atlas.local.toml").write_text("[memgraph]\nhost = 'local-host'\n", encoding="utf-8")
+        monkeypatch.chdir(repo)
+
+        settings = AtlasSettings()
+
+        assert settings.memgraph.host == "local-host"
+        assert settings.memgraph.port == 7687
+
+    def test_an_unknown_key_still_raises(self, clean_env, monkeypatch):
+        """The local file is an override, not an amnesty for typos (StrictSection)."""
+        repo = _repo(clean_env / "repo", local="[memgraph]\nhsot = 'typo'\n")
+        monkeypatch.chdir(repo)
+
+        with pytest.raises(ValidationError):
+            AtlasSettings()
+
+    def test_a_local_file_in_a_subdirectory_is_not_read(self, clean_env, monkeypatch):
+        """The ATL-156 boundary holds for this file too — one directory level, never a walk."""
+        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7687\n")
+        sub = repo / "apps" / "web"
+        sub.mkdir(parents=True)
+        (sub / "atlas.local.toml").write_text("[memgraph]\nport = 7111\n", encoding="utf-8")
+
+        monkeypatch.chdir(sub)
+
+        assert AtlasSettings().memgraph.port == 7687
+
+
 class TestBackendSettings:
     def test_defaults(self):
         settings = BackendSettings()

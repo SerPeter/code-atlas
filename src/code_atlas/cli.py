@@ -211,15 +211,52 @@ def _resolve_project_root(path: str, *, no_git_check: bool = False) -> tuple[Pat
     return git_root, scope_prefix
 
 
+def _warn_shadowed_config(project_root: Path) -> None:
+    """Say so when a config file between cwd and the project root is being ignored.
+
+    ATL-156 moved discovery to the project root, which is what makes one repository mean
+    one configuration wherever you run from. The cost is that a config file in a
+    sub-directory stops being read *and* stops being findable — discovery walks up from
+    the root, so it never sees one below. Silence there is the same defect in a new
+    place: someone edits a file and nothing happens.
+
+    Walks cwd upward to the root rather than scanning the tree, so it costs a handful of
+    stats and only reports a file the caller plausibly believed was in effect.
+    """
+    from code_atlas.settings import _LOCAL_CONFIG_NAME
+
+    try:
+        cwd = Path.cwd().resolve()
+        root = project_root.resolve()
+        if cwd == root or root not in cwd.parents:
+            return
+        current = cwd
+        while current != root:
+            for name in ("atlas.toml", _LOCAL_CONFIG_NAME):
+                if (current / name).is_file():
+                    logger.warning(
+                        "Ignoring {} — config is read from the project root ({}), so one repository "
+                        "means one configuration wherever you run from. Move these settings up, or use "
+                        "ATLAS_* variables for machine-specific ones.",
+                        current / name,
+                        root,
+                    )
+            current = current.parent
+    except OSError:
+        return  # a diagnostic must never be the thing that fails the command
+
+
 def _load_settings(**overrides: object) -> AtlasSettings:
     """Load ``AtlasSettings``, converting the git-root RuntimeError into a user-friendly exit."""
     from code_atlas.settings import AtlasSettings
 
     try:
-        return AtlasSettings(**overrides)  # ty: ignore[invalid-argument-type]
+        settings = AtlasSettings(**overrides)  # ty: ignore[invalid-argument-type]
     except RuntimeError as exc:
         logger.error("{}", exc)
         raise typer.Exit(code=1) from None
+    _warn_shadowed_config(settings.project_root)
+    return settings
 
 
 @app.command()
