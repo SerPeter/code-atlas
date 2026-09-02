@@ -221,6 +221,13 @@ times. Almost all of that is avoidable.
 
 ## Configuration
 
-- `atlas.toml` - Project configuration (scope, embeddings, search settings, detectors)
-- `.atlasignore` - Gitignore-style exclusion patterns for indexing
-- Environment variables: `ATLAS_*` prefix with double-underscore nesting (e.g., `ATLAS_EMBEDDINGS__MODEL`)
+Resolved most-specific-first: init kwarg > `ATLAS_*` env > `atlas.local.toml` > `atlas.toml`. All of it is
+discovered from the **git root**, so the directory you run from never changes what is loaded — a config file
+in a sub-directory is not read, and `cli._warn_shadowed_config` says so when one exists.
+
+- `atlas.toml` — committed, describes the codebase (scope, search settings, detectors, monorepo layout, vault)
+- `atlas.local.toml` — gitignored, merges per key over the above. For `[redis]`, `[memgraph]`, `[embeddings]`,
+  `[backend]`, which differ per machine and should not be in the shared file
+- Environment variables: `ATLAS_*` prefix with double-underscore nesting (e.g. `ATLAS_EMBEDDINGS__MODEL`).
+  Atlas never reads `.env` itself — export from `.envrc` (direnv) if you want that
+- `.atlasignore` — gitignore-style exclusion patterns for indexing
