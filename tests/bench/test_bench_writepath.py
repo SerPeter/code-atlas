@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from code_atlas.backends.instrumentation import analyse_scans, capture_statements
+from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.bench import capture, stub_provider
 
 if TYPE_CHECKING:
@@ -136,12 +138,26 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
             _write_tree(root, "measured", _MEASURED_FILES)
             _commit(root, "measured batch")
             cap.clear()
-            result = await index_project(
-                settings,
-                backends.graph,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
-                backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
-                project_name=project,
-            )
+            # Statement capture is a diagnostic and distorts what it measures -- the trace
+            # callback fires per statement on the worker thread. It is inside the measured
+            # window anyway because the scan report has to describe the SAME run the
+            # round-trip counts describe; a scan profile of a different run is a different
+            # fact. Timings from this run are therefore not comparable to an untraced one,
+            # which is why nothing here asserts on time.
+            # Narrowed explicitly: the scan analysis is SQLite-only by nature, and the
+            # backend union has no `_get_conn`. Asserting the type here beats a blanket
+            # ignore, because if this file ever runs against Memgraph it should stop
+            # rather than silently skip the scan report.
+            assert isinstance(backends.graph, SqliteGraphClient), "the scan report is SQLite-only"
+            conn = await backends.graph._get_conn()
+            async with capture_statements(conn) as statements:
+                result = await index_project(
+                    settings,
+                    backends.graph,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
+                    backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
+                    project_name=project,
+                )
+            scans = await analyse_scans(conn, statements)
             entities = await backends.graph.count_entities(project)
             vectors_after = (await backends.graph.count_embeddings_by_project()).get(project, 0)
 
@@ -160,6 +176,15 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
         "new_entities": entities - entities_before,
         "new_vectors": vectors_after - vectors_before,
         "embedding_statements": by_op.get("_write_embedding_row", 0),
+        # Every node index in this schema is partial (`WHERE labels = '<Label>'`), so a
+        # predicate that does not name one label uses none of them. Amplification is row
+        # visits: scanning executions times table rows, which grows linearly with the
+        # corpus and makes the shape self-evident across the sweep (ATL-158).
+        "scan_amplification": scans.amplification,
+        "scanning_statements": len(scans.scanning),
+        "scanning_executions": scans.scanning_executions,
+        "non_scanning_statements": scans.non_scanning,
+        "scanning_ops": sorted({op for op, _sql, _n in scans.scanning}),
         "by_op": by_op,
     }
 
@@ -301,3 +326,60 @@ class TestEmbeddingWriteVolume:
                 "upper bound until this is resolved."
             )
         assert sweep
+
+
+class TestScanAmplification:
+    """What the partial-index schema costs, swept.
+
+    Every node index is `CREATE INDEX ... WHERE labels = '<Label>'` and there is no
+    unqualified index on `nodes`, so any `labels IN (...)` / `NOT IN (...)` predicate uses
+    none of them and falls to a full table scan. That includes `_get_batch_file_prop` —
+    the file-hash gate, whose entire purpose is making an unchanged file cheap.
+
+    Reported, never fixed here. The epic measures; whether 124 partial indices are the
+    right shape is a separate decision that should be taken against a number.
+    """
+
+    def test_amplification_is_reported_per_corpus_size(self, sweep):
+        rows = [
+            (
+                int(p["ballast_files"]),
+                int(p["graph_entities"]),
+                int(p["scanning_statements"]),
+                int(p["scanning_executions"]),
+                int(p["scan_amplification"]),
+            )
+            for p in sweep
+        ]
+        print(f"\n(ballast, entities, scanning_stmts, scanning_execs, row_visits): {rows}")
+        assert rows
+
+    def test_the_detector_discriminates(self, sweep):
+        """Bidirectional. A detector that flags everything satisfies a one-sided check
+        while being useless, so some statement must come back clean."""
+        last = sweep[-1]
+        assert int(last["scanning_statements"]) > 0, "no scanning statement found at all — the detector is silent"
+        assert int(last["non_scanning_statements"]) > 0, (
+            "every statement was flagged as a scan — the detector is not discriminating"
+        )
+
+    def test_amplification_grows_with_the_corpus(self, sweep):
+        """The shape that makes the cost legible.
+
+        Row visits are scanning executions times table rows, so on a fixed batch this
+        climbs purely because the table got bigger. That is the argument the number
+        exists to make.
+        """
+        first, last = int(sweep[0]["scan_amplification"]), int(sweep[-1]["scan_amplification"])
+        assert last > first, f"scan amplification did not grow with the corpus: {first} -> {last}"
+
+    def test_the_file_hash_gate_is_among_the_scanners(self, sweep):
+        """Named specifically because it is the sharpest instance.
+
+        `_get_batch_file_prop` exists to make an unchanged file cheap, and it cannot use
+        a partial index. If this ever stops being true the schema changed, and the report
+        above should be re-read rather than trusted.
+        """
+        ops = set(sweep[-1]["scanning_ops"])
+        assert ops, "no scanning ops attributed"
+        print(f"\nops whose statements plan as a full scan of nodes: {sorted(ops)}")
