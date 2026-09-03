@@ -452,3 +452,112 @@ class TestTokenizerAccounting:
 
         stats = StubStats(calls=2, texts=36, tokenizer_calls=71)
         assert stats.summary() == {"provider_calls": 2, "texts_embedded": 36, "tokenizer_calls": 71}
+
+
+class TestEmbedTransport:
+    """A real socket, because the in-process stub structurally cannot answer these.
+
+    Batching, the concurrency gate, the rate limiter and tenacity's retry only do
+    anything when the far end is slow, refuses a batch, or returns 429. A mock that
+    returns instantly bypasses every one of them.
+    """
+
+    @staticmethod
+    def _post(base: str, texts: list[str]) -> tuple[int, dict]:
+        import json
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(
+            f"{base}/embeddings",
+            data=json.dumps({"input": texts, "model": "bench"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            # Closed explicitly: an HTTPError *is* the response object, and this repo
+            # makes ResourceWarning fatal (ADR-0038), so letting the GC reclaim it fails
+            # the suite — on whichever unrelated test the collection happens to land.
+            with exc:
+                return exc.code, json.loads(exc.read())
+
+    def test_one_vector_per_text_at_the_configured_dimension(self):
+        from code_atlas.bench import TransportConfig, embed_transport
+
+        with embed_transport(12, TransportConfig(latency_s=0.0, jitter_s=0.0)) as (base, stats):
+            code, body = self._post(base, ["a", "b", "c"])
+
+        assert code == 200
+        assert len(body["data"]) == 3
+        assert all(len(item["embedding"]) == 12 for item in body["data"])
+        assert stats.texts == 3
+
+    def test_it_binds_loopback_only(self):
+        from code_atlas.bench import embed_transport
+
+        with embed_transport(8) as (base, _stats):
+            assert base.startswith("http://127.0.0.1:"), f"bound somewhere other than loopback: {base}"
+
+    def test_latency_is_honoured(self):
+        """Asserted as a floor, not a band.
+
+        The configured delay is a `sleep`, so the observed time can only be longer —
+        scheduling and the HTTP round trip add to it. Asserting an upper bound would be
+        asserting that the machine is not busy, which is how a benchmark starts failing
+        for reasons that are not its subject.
+        """
+        import time
+
+        from code_atlas.bench import TransportConfig, embed_transport
+
+        with embed_transport(8, TransportConfig(latency_s=0.15, jitter_s=0.0)) as (base, _stats):
+            started = time.perf_counter()
+            code, _ = self._post(base, ["a"])
+            elapsed = time.perf_counter() - started
+
+        assert code == 200
+        assert elapsed >= 0.15, f"configured 150ms latency took only {elapsed * 1000:.0f}ms"
+
+    def test_an_oversized_batch_gets_the_provider_error_shape(self):
+        from code_atlas.bench import TransportConfig, embed_transport
+
+        with embed_transport(8, TransportConfig(latency_s=0.0, jitter_s=0.0, max_batch=2)) as (base, stats):
+            ok_code, _ = self._post(base, ["a", "b"])
+            bad_code, body = self._post(base, ["a", "b", "c"])
+
+        assert ok_code == 200, "a batch at the cap should be accepted"
+        assert bad_code == 400
+        assert body["error"]["type"] == "invalid_request_error"
+        assert stats.rejected_oversized == 1
+        assert stats.texts == 2, "a rejected batch must not count toward texts embedded"
+
+    def test_rate_limiting_returns_429_on_the_configured_cadence(self):
+        from code_atlas.bench import TransportConfig, embed_transport
+
+        with embed_transport(8, TransportConfig(latency_s=0.0, jitter_s=0.0, rate_limit_every=2)) as (base, stats):
+            codes = [self._post(base, ["a"])[0] for _ in range(4)]
+
+        assert codes == [200, 429, 200, 429], f"unexpected cadence: {codes}"
+        assert stats.rate_limited == 2
+
+    def test_jitter_is_seeded_so_a_run_is_reproducible(self):
+        """Jitter must not make two runs incomparable.
+
+        Seeded, so the same configuration produces the same sequence of delays — which
+        is what lets a jittered run still be compared against a stored baseline.
+        """
+        from code_atlas.bench import TransportConfig
+
+        assert TransportConfig().seed == 1
+        assert TransportConfig(seed=7).summary()["seed"] == 7
+
+    def test_the_config_is_reported(self):
+        """A number produced under different simulated latency is a different number."""
+        from code_atlas.bench import TransportConfig
+
+        summary = TransportConfig(latency_s=0.2, jitter_s=0.05, max_batch=64).summary()
+        assert summary["latency_s"] == 0.2
+        assert summary["jitter_s"] == 0.05
+        assert summary["max_batch"] == 64

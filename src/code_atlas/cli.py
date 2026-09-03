@@ -459,6 +459,12 @@ def bench(
         "--require",
         help="Node label the corpus must produce, or the run fails (repeatable). Default: DocSection.",
     ),
+    embed_transport: bool = typer.Option(
+        False,
+        "--embed-transport",
+        help="Route embeddings over a local loopback endpoint with latency, jitter and a batch cap, "
+        "to measure pacing and retry. Still offline and still free.",
+    ),
 ) -> None:
     """Index a corpus and report where the time went, stage by stage.
 
@@ -470,7 +476,17 @@ def bench(
     index you actually use. ``--backend memgraph`` opts in to the configured one, under
     a ``bench-`` prefixed project name.
     """
-    asyncio.run(_run_bench(path=path, backend=backend, label=label, repo=repo, ref=ref, require=require))
+    asyncio.run(
+        _run_bench(
+            path=path,
+            backend=backend,
+            label=label,
+            repo=repo,
+            ref=ref,
+            require=require,
+            embed_transport=embed_transport,
+        )
+    )
 
 
 @app.command()
@@ -1496,6 +1512,58 @@ async def _mine_and_write_git_signals(
 # ---------------------------------------------------------------------------
 
 
+def _bench_corpus(*, path: str, repo: str, ref: str, backend: str) -> tuple[Any, Any, Any, dict[str, object]]:
+    """Resolve the corpus and build the settings overrides for one bench run.
+
+    Returns ``(corpus, root, scratch_dir, overrides)``.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from code_atlas.bench import resolve_corpus
+
+    if repo:
+        target = resolve_corpus(repo, ref=ref)
+        root = target.path
+        _echo(f"corpus {target.label()} ({'cached' if target.reused_cache else 'cloned'}) at {root}")
+    else:
+        root, _ = _resolve_project_root(path)
+        target = resolve_corpus(str(root))
+
+    scratch = Path(tempfile.mkdtemp(prefix="atlas-bench-"))
+    overrides: dict[str, object] = {"project_root": root}
+    if backend == "sqlite":
+        # Both halves pinned to a throwaway directory, and pinned *explicitly* rather
+        # than left on "auto": auto probes Memgraph first and falls back only if it is
+        # unreachable, so on a machine where it is up a benchmark would quietly write
+        # into the index someone actually queries.
+        overrides["backend"] = {"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(scratch)}
+    elif backend != "memgraph":
+        raise typer.BadParameter("--backend must be 'sqlite' or 'memgraph'")
+    return target, root, scratch, overrides
+
+
+def _bench_notes(cap: Any, provider: Any, transport: Any, transport_cfg: Any) -> tuple[str, ...]:
+    """The lines under the table that say what the numbers do and do not include."""
+    if transport is not None:
+        seam = f"embedding transport: loopback endpoint, {transport.summary()}, config {transport_cfg.summary()}"
+    else:
+        seam = (
+            f"embedding provider stubbed in-process: {provider.calls} calls, "
+            f"{provider.texts} texts, {provider.tokenizer_calls} tokenizer calls, no network"
+        )
+    return (
+        "pacing constants are at production values and are reported, not lowered",
+        "work counters reproduce exactly between runs; times do not",
+        seam,
+        f"vector provenance (ADR-0036): {cap.embedding_provenance() or 'none recorded'}",
+        (
+            "the external line is embed_batch, which also holds the concurrency gate "
+            "and the rate limiter - it is not provider latency alone"
+        ),
+    )
+
+
 def _bench_payload(report: Any, profile: Any, corpus: Any) -> dict[str, Any]:
     """Machine-readable form of a bench run.
 
@@ -1556,7 +1624,14 @@ def _emit_bench(report: Any, profile: Any, corpus: Any, require: tuple[str, ...]
 
 
 async def _run_bench(
-    *, path: str, backend: str, label: str, repo: str = "", ref: str = "", require: list[str] | None = None
+    *,
+    path: str,
+    backend: str,
+    label: str,
+    repo: str = "",
+    ref: str = "",
+    require: list[str] | None = None,
+    embed_transport: bool = False,
 ) -> None:
     """Async implementation of the ``atlas bench`` command.
 
@@ -1566,11 +1641,18 @@ async def _run_bench(
     run would report an empty table rather than an error.
     """
     import shutil
-    import tempfile
     import time
-    from pathlib import Path
+    from contextlib import ExitStack
 
-    from code_atlas.bench import capture, profile_corpus, resolve_corpus, stub_provider
+    from code_atlas.bench import (
+        StubStats,
+        TransportConfig,
+        capture,
+        count_tokenizer,
+        profile_corpus,
+        stub_provider,
+    )
+    from code_atlas.bench import embed_transport as embed_transport_ctx
 
     try:
         cap = capture()
@@ -1583,34 +1665,39 @@ async def _run_bench(
     from code_atlas.backends import connected
     from code_atlas.indexing.orchestrator import index_project
 
-    if repo:
-        target = resolve_corpus(repo, ref=ref)
-        root = target.path
-        _echo(f"corpus {target.label()} ({'cached' if target.reused_cache else 'cloned'}) at {root}")
-    else:
-        root, _ = _resolve_project_root(path)
-        target = resolve_corpus(str(root))
-    scratch = Path(tempfile.mkdtemp(prefix="atlas-bench-"))
+    target, _root, scratch, overrides = _bench_corpus(path=path, repo=repo, ref=ref, backend=backend)
     corpus = label or target.label()
 
-    overrides: dict[str, object] = {"project_root": root}
-    if backend == "sqlite":
-        # Both halves pinned to a throwaway directory, and pinned *explicitly* rather
-        # than left on "auto": auto probes Memgraph first and falls back only if it is
-        # unreachable, so on a machine where it is up a benchmark would quietly write
-        # into the index someone actually queries.
-        overrides["backend"] = {"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(scratch)}
-    elif backend != "memgraph":
-        raise typer.BadParameter("--backend must be 'sqlite' or 'memgraph'")
+    dimension = _load_settings(**overrides).embeddings.dimension or 768
 
-    settings = _load_settings(**overrides)
-    project_name = f"bench-{corpus}"
+    with ExitStack() as outer:
+        transport_stats = None
+        transport_cfg = TransportConfig()
+        if embed_transport:
+            # A real socket, not another in-process patch. The in-process stub answers
+            # "what does our own code cost"; this answers what the stub structurally
+            # cannot — whether batching, the concurrency gate, the rate limiter and
+            # tenacity's retry behave when the far end is slow or refuses a batch.
+            base_url, transport_stats = outer.enter_context(embed_transport_ctx(dimension, transport_cfg))
+            # provider="tei" is what makes litellm POST to {base_url}/embeddings with an
+            # `openai/` prefixed model, so this exercises the real client path.
+            overrides["embeddings"] = {
+                "provider": "tei",
+                "base_url": base_url,
+                "model": "bench-stub",
+                "dimension": dimension,
+            }
+            provider = outer.enter_context(count_tokenizer(StubStats()))
+        else:
+            # Nothing inside may reach a provider. Everything above
+            # `litellm.aembedding` stays real, so chunking, batching, the rate limiter
+            # and the dedup lookup are still measured.
+            provider = outer.enter_context(stub_provider(dimension))
 
-    try:
-        # The stub wraps the whole run, including schema bootstrap: nothing inside may
-        # reach a provider. Everything above `litellm.aembedding` stays real, so
-        # chunking, batching, the rate limiter and the dedup lookup are still measured.
-        with stub_provider(settings.embeddings.dimension or 768) as provider:
+        settings = _load_settings(**overrides)
+        project_name = f"bench-{corpus}"
+
+        try:
             async with connected(settings, with_bus=True, on_unreachable=_unreachable_backend) as backends:
                 bus = backends.bus
                 started = time.perf_counter()
@@ -1627,39 +1714,28 @@ async def _run_bench(
                 # faster, so it is asserted rather than assumed.
                 profile = await profile_corpus(backends.graph, project_name)
 
-        report = cap.report(
-            total_s=total_s,
-            corpus=f"{corpus} ({result.files_scanned} files, {result.entities_total} entities)",
-            backend=backend,
-            notes=(
-                "pacing constants are at production values and are reported, not lowered",
-                "work counters reproduce exactly between runs; times do not",
-                (
-                    f"embedding provider stubbed in-process: {provider.calls} calls, "
-                    f"{provider.texts} texts, {provider.tokenizer_calls} tokenizer calls, no network"
-                ),
-                f"vector provenance (ADR-0036): {cap.embedding_provenance() or 'none recorded'}",
-                (
-                    "the external line is embed_batch, which also holds the concurrency gate "
-                    "and the rate limiter - it is not provider latency alone"
-                ),
-            ),
-        )
-        # Fail closed. If embeddings were enabled and the stub saw no traffic, either the
-        # stage did not run or something reached past the seam — both make the numbers a
-        # lie, and a silent zero here is exactly the shape of a benchmark that quietly
-        # measures nothing.
-        if settings.embeddings.enabled and provider.calls == 0 and result.entities_total > 0:
-            logger.error(
-                "The embedding stub was never called on a run with {} entities — the embed stage "
-                "either did not run or bypassed the provider seam.",
-                result.entities_total,
+            report = cap.report(
+                total_s=total_s,
+                corpus=f"{corpus} ({result.files_scanned} files, {result.entities_total} entities)",
+                backend=backend,
+                notes=_bench_notes(cap, provider, transport_stats, transport_cfg),
             )
-            raise typer.Exit(code=1)
+            # Fail closed. If embeddings were enabled and the stub saw no traffic, either the
+            # stage did not run or something reached past the seam — both make the numbers a
+            # lie, and a silent zero here is exactly the shape of a benchmark that quietly
+            # measures nothing.
+            seam_calls = transport_stats.requests if transport_stats is not None else provider.calls
+            if settings.embeddings.enabled and seam_calls == 0 and result.entities_total > 0:
+                logger.error(
+                    "The embedding seam saw no traffic on a run with {} entities — the embed stage "
+                    "either did not run or bypassed it.",
+                    result.entities_total,
+                )
+                raise typer.Exit(code=1)
 
-        _emit_bench(report, profile, target, tuple(require) if require else ("DocSection",))
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+            _emit_bench(report, profile, target, tuple(require) if require else ("DocSection",))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 async def _run_dream() -> None:

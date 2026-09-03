@@ -500,6 +500,29 @@ def _deterministic_vector(text: str, dimension: int) -> list[float]:
 
 
 @contextmanager
+def count_tokenizer(stats: StubStats) -> Iterator[StubStats]:
+    """Count `litellm.encode` calls without touching the network seam.
+
+    Split out from `stub_provider` because transport mode needs the tokenizer count but
+    must NOT patch `_embed_call` -- patching it is what would stop the request ever
+    reaching the socket the transport stub exists to exercise.
+    """
+    import litellm  # noqa: PLC0415
+
+    real_encode = litellm.encode
+
+    def _counting_encode(*args: Any, **kwargs: Any) -> Any:
+        stats.tokenizer_calls += 1
+        return real_encode(*args, **kwargs)
+
+    litellm.encode = _counting_encode
+    try:
+        yield stats
+    finally:
+        litellm.encode = real_encode
+
+
+@contextmanager
 def stub_provider(dimension: int) -> Iterator[StubStats]:
     """Replace the one line that reaches the network, and nothing above it.
 
@@ -750,3 +773,160 @@ def resolve_corpus(spec: str, *, ref: str = "", cache: Any = None) -> Corpus:
     if code != 0:
         raise RuntimeError(f"git checkout failed for {spec}: {err}")
     return Corpus(path=target, name=target.parent.name, commit=_head_commit(target), source=spec)
+
+
+# ---------------------------------------------------------------------------
+# Transport stub
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TransportConfig:
+    """How the local endpoint should behave.
+
+    Every field is recorded in the report. A number produced under different simulated
+    latency is a different number, and one that does not say which is not comparable to
+    anything.
+    """
+
+    latency_s: float = 0.05
+    jitter_s: float = 0.02
+    max_batch: int = 0
+    """Reject a request carrying more than this many texts. 0 disables the cap."""
+    rate_limit_every: int = 0
+    """Return the provider's 429 shape on every Nth request. 0 disables it."""
+    seed: int = 1
+
+    def summary(self) -> dict[str, float | int]:
+        return {
+            "latency_s": self.latency_s,
+            "jitter_s": self.jitter_s,
+            "max_batch": self.max_batch,
+            "rate_limit_every": self.rate_limit_every,
+            "seed": self.seed,
+        }
+
+
+@dataclass
+class TransportStats:
+    """What actually crossed the socket."""
+
+    requests: int = 0
+    texts: int = 0
+    rejected_oversized: int = 0
+    rate_limited: int = 0
+    latencies: list[float] = field(default_factory=list)
+
+    def summary(self) -> dict[str, float | int]:
+        ordered = sorted(self.latencies)
+        return {
+            "requests": self.requests,
+            "texts": self.texts,
+            "rejected_oversized": self.rejected_oversized,
+            "rate_limited": self.rate_limited,
+            "latency_p50_ms": round(ordered[len(ordered) // 2] * 1000, 1) if ordered else 0,
+            "latency_max_ms": round(ordered[-1] * 1000, 1) if ordered else 0,
+        }
+
+
+@contextmanager
+def embed_transport(dimension: int, config: TransportConfig | None = None) -> Iterator[tuple[str, TransportStats]]:
+    """A real embedding endpoint on loopback. Yields ``(base_url, stats)``.
+
+    Deliberately a socket rather than another in-process patch. The in-process stub
+    answers "what does our own code cost"; this answers a different question the stub
+    structurally cannot — whether batching, the concurrency gate, the rate limiter and
+    tenacity's retry behave when the other end is slow, refuses an oversized batch, or
+    returns 429. A mock that returns instantly bypasses every one of them.
+
+    Still free and still offline: it binds 127.0.0.1 on an ephemeral port and nothing
+    leaves the machine.
+
+    Speaks the OpenAI embeddings shape because `provider="tei"` already prefixes the
+    model with `openai/` and posts to ``{base_url}/embeddings`` — so this exercises the
+    real litellm client rather than a bespoke path.
+    """
+    import json as _json  # noqa: PLC0415
+    import random as _random  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: PLC0415
+
+    cfg = config or TransportConfig()
+    stats = TransportStats()
+    rng = _random.Random(cfg.seed)
+    lock = threading.Lock()
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — the base class names it this
+            """Silence the default stderr access log; it would swamp the report."""
+
+        def _send(self, code: int, payload: dict[str, Any]) -> None:
+            body = _json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            request = _json.loads(self.rfile.read(length) or b"{}")
+            texts = request.get("input") or []
+            if isinstance(texts, str):
+                texts = [texts]
+
+            started = _time.perf_counter()
+            with lock:
+                stats.requests += 1
+                index = stats.requests
+                delay = max(0.0, cfg.latency_s + (rng.uniform(-cfg.jitter_s, cfg.jitter_s) if cfg.jitter_s else 0.0))
+            _time.sleep(delay)
+
+            if cfg.rate_limit_every and index % cfg.rate_limit_every == 0:
+                with lock:
+                    stats.rate_limited += 1
+                self._send(429, {"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}})
+                return
+
+            if cfg.max_batch and len(texts) > cfg.max_batch:
+                with lock:
+                    stats.rejected_oversized += 1
+                self._send(
+                    400,
+                    {
+                        "error": {
+                            "message": f"batch of {len(texts)} exceeds {cfg.max_batch}",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+                return
+
+            with lock:
+                stats.texts += len(texts)
+                stats.latencies.append(_time.perf_counter() - started)
+            self._send(
+                200,
+                {
+                    "object": "list",
+                    "model": request.get("model", "bench"),
+                    "data": [
+                        {"object": "embedding", "index": i, "embedding": _deterministic_vector(t, dimension)}
+                        for i, t in enumerate(texts)
+                    ],
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                },
+            )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", stats
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
