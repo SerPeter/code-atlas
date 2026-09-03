@@ -930,3 +930,169 @@ def embed_transport(dimension: int, config: TransportConfig | None = None) -> It
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Baselines
+# ---------------------------------------------------------------------------
+
+
+def fingerprint() -> dict[str, Any]:
+    """What is stable and knowable about this machine.
+
+    Deliberately not a speed score. A "machine speed" number measured at run time is
+    itself subject to load, which would make the fingerprint non-deterministic and defeat
+    the one job it has — deciding whether two results are comparable at all.
+    """
+    import platform  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    ram_gb = 0.0
+    cores = 0
+    try:
+        import psutil  # noqa: PLC0415
+
+        ram_gb = round(psutil.virtual_memory().total / (1024**3), 1)
+        cores = psutil.cpu_count(logical=True) or 0
+    except Exception:
+        pass
+
+    return {
+        "cpu": platform.processor() or platform.machine(),
+        "cores": cores,
+        "ram_gb": ram_gb,
+        "os": f"{platform.system()} {platform.release()}",
+        "python": sys.version.split()[0],
+    }
+
+
+def fingerprint_diff(stored: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    """Fields that differ. Empty means the two results are comparable."""
+    return sorted(k for k in set(stored) | set(current) if stored.get(k) != current.get(k))
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """The result of holding a run against a stored baseline."""
+
+    comparable: bool
+    reason: str
+    counter_deltas: dict[str, tuple[int, int]] = field(default_factory=dict)
+    """name -> (baseline, current) for counters that moved."""
+    fingerprint_fields: tuple[str, ...] = ()
+
+    @property
+    def regressed(self) -> bool:
+        """Any deterministic counter that grew.
+
+        Growth only. A counter falling is work removed, which is the outcome an
+        optimisation is trying to produce and must never fail a run.
+        """
+        return any(current > baseline for baseline, current in self.counter_deltas.values())
+
+    def render(self) -> str:
+        lines = [f"baseline: {self.reason}"]
+        if not self.comparable:
+            if self.fingerprint_fields:
+                lines.append(f"  machine differs in: {', '.join(self.fingerprint_fields)}")
+            lines.append("  no thresholds applied — a cross-machine comparison is not a regression signal")
+            return "\n".join(lines)
+        if not self.counter_deltas:
+            lines.append("  every work counter identical")
+            return "\n".join(lines)
+        for name, (was, now) in sorted(self.counter_deltas.items()):
+            arrow = "+" if now > was else "-"
+            lines.append(f"  {arrow} {name:<44}{was:>8,} -> {now:>8,}")
+        return "\n".join(lines)
+
+
+def baseline_path(root: Any, *, backend: str, corpus: str) -> Any:
+    """One file per (backend, corpus).
+
+    Separate files because Memgraph and SQLite numbers are not comparable and must never
+    end up in the same document where a reader might diff them; and one per corpus
+    because a different corpus is a different measurement, not a different reading of the
+    same one.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in corpus)[:60]
+    return Path(root) / f"{backend}-{safe}.json"
+
+
+def save_baseline(path: Any, *, report: BenchReport, corpus_commit: str, extra: dict[str, Any] | None = None) -> None:
+    """Write a baseline. Only ever called by an explicit request.
+
+    A suite that rewrites its own baseline on a passing run cannot detect slow drift:
+    every run would compare against the previous one and every step would look like no
+    change at all.
+    """
+    import json  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "backend": report.backend,
+        "corpus": report.corpus,
+        "corpus_commit": corpus_commit,
+        "fingerprint": fingerprint(),
+        "work_counters": report.work_counters(),
+        # Times are recorded but never compared automatically. They are here so a human
+        # reading the diff can see whether a counter change had a cost, not so a
+        # threshold can fire on them.
+        "timings_s": {f"{p.stage}.{p.phase}": round(p.seconds, 4) for c in report.consumers for p in c.phases},
+        "total_s": round(report.total_s, 3),
+        **(extra or {}),
+    }
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def compare_baseline(path: Any, *, report: BenchReport, corpus_commit: str) -> Comparison:
+    """Hold *report* against a stored baseline, refusing invalid comparisons.
+
+    Three things make a comparison invalid, and each is reported rather than silently
+    tolerated: a different machine, a different backend, and a different corpus commit.
+    Only the first is a "not comparable" that people will meet routinely; the other two
+    mean someone is comparing different measurements.
+
+    **Never fails on a cross-hardware difference.** A threshold that fires because
+    somebody moved machines teaches people to ignore it, which costs more than the
+    regression it was meant to catch.
+    """
+    import json  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    target = Path(path)
+    if not target.is_file():
+        return Comparison(comparable=False, reason=f"no baseline at {target}")
+
+    stored = json.loads(target.read_text(encoding="utf-8"))
+
+    if stored.get("backend") != report.backend:
+        return Comparison(
+            comparable=False,
+            reason=f"backend differs ({stored.get('backend')} vs {report.backend}) — never comparable",
+        )
+    if corpus_commit and stored.get("corpus_commit") and stored["corpus_commit"] != corpus_commit:
+        return Comparison(
+            comparable=False,
+            reason=f"corpus moved ({stored['corpus_commit'][:12]} -> {corpus_commit[:12]}) — different bytes",
+        )
+
+    differing = fingerprint_diff(stored.get("fingerprint", {}), fingerprint())
+    if differing:
+        return Comparison(
+            comparable=False,
+            reason="different machine — reported, not gated",
+            fingerprint_fields=tuple(differing),
+        )
+
+    was = stored.get("work_counters", {})
+    now = report.work_counters()
+    deltas = {
+        name: (int(was.get(name, 0)), int(now.get(name, 0)))
+        for name in sorted(set(was) | set(now))
+        if int(was.get(name, 0)) != int(now.get(name, 0))
+    }
+    return Comparison(comparable=True, reason="same machine, backend and corpus", counter_deltas=deltas)

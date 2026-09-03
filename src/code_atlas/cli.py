@@ -459,6 +459,15 @@ def bench(
         "--require",
         help="Node label the corpus must produce, or the run fails (repeatable). Default: DocSection.",
     ),
+    record_baseline: bool = typer.Option(
+        False,
+        "--record-baseline",
+        help="Overwrite the stored baseline with this run. Never automatic — a suite that "
+        "rewrites its own baseline cannot detect slow drift.",
+    ),
+    baseline_dir: str = typer.Option(
+        "tests/bench/baselines", "--baseline-dir", help="Where baselines are read and written."
+    ),
     embed_transport: bool = typer.Option(
         False,
         "--embed-transport",
@@ -485,6 +494,8 @@ def bench(
             ref=ref,
             require=require,
             embed_transport=embed_transport,
+            record_baseline=record_baseline,
+            baseline_dir=baseline_dir,
         )
     )
 
@@ -1632,6 +1643,8 @@ async def _run_bench(
     ref: str = "",
     require: list[str] | None = None,
     embed_transport: bool = False,
+    record_baseline: bool = False,
+    baseline_dir: str = "tests/bench/baselines",
 ) -> None:
     """Async implementation of the ``atlas bench`` command.
 
@@ -1647,9 +1660,12 @@ async def _run_bench(
     from code_atlas.bench import (
         StubStats,
         TransportConfig,
+        baseline_path,
         capture,
+        compare_baseline,
         count_tokenizer,
         profile_corpus,
+        save_baseline,
         stub_provider,
     )
     from code_atlas.bench import embed_transport as embed_transport_ctx
@@ -1732,6 +1748,14 @@ async def _run_bench(
                     result.entities_total,
                 )
                 raise typer.Exit(code=1)
+
+            path = baseline_path(baseline_dir, backend=backend, corpus=corpus)
+            if record_baseline:
+                save_baseline(path, report=report, corpus_commit=target.commit)
+                _echo(f"baseline written to {path}")
+            else:
+                _echo("")
+                _echo(compare_baseline(path, report=report, corpus_commit=target.commit).render())
 
             _emit_bench(report, profile, target, tuple(require) if require else ("DocSection",))
         finally:
