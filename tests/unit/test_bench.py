@@ -203,3 +203,138 @@ class TestProviderStub:
 
         assert response.data == []
         assert stats.texts == 0
+
+
+class TestCorpusResolution:
+    """A corpus that moves under a benchmark produces numbers nobody can compare."""
+
+    @staticmethod
+    def _source_repo(root):
+        import subprocess
+
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "a.py").write_text("def f(x):\n    return x\n", encoding="utf-8")
+
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=False)
+
+        git("-c", "init.defaultBranch=main", "init", "-q")
+        git("config", "user.email", "b@example.com")
+        git("config", "user.name", "Bench")
+        git("add", "-A")
+        git("commit", "-q", "-m", "corpus")
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=False
+        ).stdout.strip()
+
+    def test_a_local_path_is_used_where_it_is(self, tmp_path):
+        """A benchmark must never fetch into the tree someone is sitting in."""
+        from code_atlas.bench import resolve_corpus
+
+        sha = self._source_repo(tmp_path / "local")
+        corpus = resolve_corpus(str(tmp_path / "local"))
+
+        assert corpus.source == "local"
+        assert corpus.commit == sha
+        assert corpus.path == (tmp_path / "local").resolve()
+
+    def test_a_url_is_cloned_and_pinned(self, tmp_path):
+        from code_atlas.bench import resolve_corpus
+
+        sha = self._source_repo(tmp_path / "src")
+        corpus = resolve_corpus((tmp_path / "src").as_uri(), cache=tmp_path / "cache")
+
+        assert corpus.commit == sha, "the clone was not pinned to the source commit"
+        assert corpus.reused_cache is False
+        assert (corpus.path / "a.py").exists()
+
+    def test_a_second_resolve_reuses_the_clone(self, tmp_path):
+        """Reuse is asserted on the flag, not on timing.
+
+        Timing would make this flaky on a slow disk, and the property that matters is
+        that no fetch happened — re-fetching would silently change the corpus under a
+        comparison that assumes it is fixed.
+        """
+        from code_atlas.bench import resolve_corpus
+
+        self._source_repo(tmp_path / "src")
+        url = (tmp_path / "src").as_uri()
+        first = resolve_corpus(url, cache=tmp_path / "cache")
+        second = resolve_corpus(url, cache=tmp_path / "cache")
+
+        assert first.reused_cache is False
+        assert second.reused_cache is True
+        assert first.commit == second.commit
+
+    def test_two_urls_sharing_a_name_do_not_collide(self, tmp_path):
+        """Two forks called `backend` must not share one cache directory."""
+        from code_atlas.bench import resolve_corpus
+
+        self._source_repo(tmp_path / "one" / "repo")
+        self._source_repo(tmp_path / "two" / "repo")
+        a = resolve_corpus((tmp_path / "one" / "repo").as_uri(), cache=tmp_path / "cache")
+        b = resolve_corpus((tmp_path / "two" / "repo").as_uri(), cache=tmp_path / "cache")
+
+        assert a.path != b.path, "two distinct URLs shared one cache directory"
+        # Deliberately NOT asserting the commits differ. Two repositories with
+        # identical content, author and timestamp produce the identical sha, which
+        # made this fail under -n auto while passing serially. That would be a fact
+        # about git, not about the cache key under test here.
+
+    def test_comparability_is_gated_on_the_commit(self, tmp_path):
+        from code_atlas.bench import resolve_corpus
+
+        sha = self._source_repo(tmp_path / "local")
+        corpus = resolve_corpus(str(tmp_path / "local"))
+
+        assert corpus.comparable_with(sha)
+        assert not corpus.comparable_with("0" * 40)
+
+    def test_an_uncommitted_repo_is_not_comparable_with_anything(self, tmp_path):
+        """An unpinnable corpus must refuse comparison rather than compare loosely.
+
+        `git init` with no commit leaves HEAD unborn, so there is no sha. Reporting that
+        as comparable-to-empty-string would make every such run compare equal.
+        """
+        import subprocess
+
+        from code_atlas.bench import resolve_corpus
+
+        root = tmp_path / "unborn"
+        root.mkdir()
+        subprocess.run(
+            ["git", "-c", "init.defaultBranch=main", "init", "-q"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        corpus = resolve_corpus(str(root))
+
+        assert corpus.commit == ""
+        assert not corpus.comparable_with("")
+        assert "no-commit" in corpus.label()
+
+
+class TestCorpusProfile:
+    def test_a_missing_required_shape_is_named(self):
+        from code_atlas.bench import CorpusProfile
+
+        code_only = CorpusProfile(labels={"Callable": 4, "Module": 4}, files=4, entities=8)
+        assert code_only.missing() == ("DocSection",)
+        assert code_only.doc_sections == 0
+
+    def test_a_corpus_with_the_shape_reports_nothing_missing(self):
+        from code_atlas.bench import CorpusProfile
+
+        mixed = CorpusProfile(labels={"Callable": 4, "DocSection": 2}, files=5, entities=6)
+        assert mixed.missing() == ()
+        assert mixed.doc_sections == 2
+
+    def test_the_summary_drops_empty_labels(self):
+        from code_atlas.bench import CorpusProfile
+
+        profile = CorpusProfile(labels={"Callable": 3, "Note": 0}, files=1, entities=3)
+        summary = profile.summary()
+        assert summary["Callable"] == 3
+        assert "Note" not in summary, "a zero count reads as a shape the corpus has"

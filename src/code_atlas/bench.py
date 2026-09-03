@@ -501,3 +501,175 @@ def stub_provider(dimension: int) -> Iterator[StubStats]:
         yield stats
     finally:
         EmbedClient._embed_call = real  # noqa: SLF001 - substituting the network boundary is the point
+
+
+# ---------------------------------------------------------------------------
+# Corpus profile
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CorpusProfile:
+    """What a corpus actually contained, read back from the graph after indexing.
+
+    Asserted rather than assumed, because a corpus that quietly stopped producing a
+    shape is indistinguishable from a benchmark that got faster. Three of the four
+    regressions this suite exists to catch lived in a shape the corpus did not have:
+    no `DocSection` meant the doc-link path never ran at all, and no entity over the
+    embedding cap meant chunking was unreachable.
+    """
+
+    labels: dict[str, int]
+    files: int
+    entities: int
+
+    @property
+    def doc_sections(self) -> int:
+        return self.labels.get("DocSection", 0)
+
+    @property
+    def notes(self) -> int:
+        return self.labels.get("Note", 0)
+
+    def missing(self, *, require: tuple[str, ...] = ("DocSection",)) -> tuple[str, ...]:
+        """Required labels the corpus did not produce."""
+        return tuple(label for label in require if self.labels.get(label, 0) == 0)
+
+    def summary(self) -> dict[str, int]:
+        return {"files": self.files, "entities": self.entities, **{k: v for k, v in sorted(self.labels.items()) if v}}
+
+
+async def profile_corpus(graph: Any, project_name: str) -> CorpusProfile:
+    """Read back what the indexed corpus contained.
+
+    Uses only `GraphBackend` methods, so it reports identically on either backend --
+    a profile that worked on one and silently returned zeros on the other would be
+    worse than none, since zero reads as "the corpus lacks this shape".
+    """
+    labels = await graph.get_label_counts()
+    files = len(await graph.get_project_file_paths(project_name))
+    entities = await graph.count_entities(project_name)
+    return CorpusProfile(labels=dict(labels), files=files, entities=entities)
+
+
+# ---------------------------------------------------------------------------
+# Corpus resolution
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Corpus:
+    """A corpus to measure, pinned to a commit so results stay comparable."""
+
+    path: Any
+    name: str
+    commit: str
+    source: str
+    reused_cache: bool = False
+
+    def label(self) -> str:
+        short = self.commit[:12] if self.commit else "no-commit"
+        return f"{self.name}@{short}"
+
+    def comparable_with(self, other_commit: str) -> bool:
+        """Two results may only be compared when they measured the same bytes.
+
+        An unpinned corpus moving under a benchmark is the quiet way a suite starts
+        reporting improvements nobody made.
+        """
+        return bool(self.commit) and self.commit == other_commit
+
+
+def cache_root() -> Any:
+    """Where cloned corpora live.
+
+    Outside the project tree deliberately: a clone under `.atlas/` would be swept by
+    the very indexing the benchmark is measuring, and would make the corpus part of the
+    repository it is meant to be independent of.
+
+    The project has no cache convention to follow -- everything else it writes lands in
+    `.atlas/` relative to the project root -- so this introduces one, honouring
+    `ATLAS_BENCH_CACHE` first so a machine with a small home volume can move it.
+    """
+    import os  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    override = os.environ.get("ATLAS_BENCH_CACHE")
+    if override:
+        return Path(override)
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "code-atlas" / "bench-corpora"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "code-atlas" / "bench-corpora"
+
+
+def _git(args: list[str], cwd: Any, timeout: int = 300) -> tuple[int, str, str]:
+    """Run git the way the rest of this codebase does: list args, never a shell."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", str(exc)
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def _head_commit(path: Any) -> str:
+    code, out, _ = _git(["rev-parse", "HEAD"], cwd=path, timeout=10)
+    return out if code == 0 else ""
+
+
+def _slug(url: str) -> str:
+    """A filesystem-safe directory name for a clone, stable across runs."""
+    import hashlib  # noqa: PLC0415
+    import re  # noqa: PLC0415
+
+    tail = re.sub(r"[^A-Za-z0-9._-]+", "-", url.rstrip("/").removesuffix(".git").split("/")[-1] or "repo")
+    # The hash disambiguates two forks that share a repository name; the readable half
+    # is kept so the cache directory can be understood without consulting anything.
+    return f"{tail}-{hashlib.sha256(url.encode()).hexdigest()[:8]}"
+
+
+def resolve_corpus(spec: str, *, ref: str = "", cache: Any = None) -> Corpus:
+    """A local path or a git URL, resolved to a pinned directory on disk.
+
+    A local path is used where it is and never fetched -- a benchmark must not mutate
+    the working tree someone is sitting in.
+
+    A URL is cloned shallow into the cache. A second call for the same (url, ref) with
+    the clone already present **does not fetch**: the commit already on disk is what was
+    measured last time, and re-fetching would silently change the corpus under a
+    comparison.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    if "://" not in spec and not spec.startswith("git@"):
+        path = Path(spec).resolve()
+        return Corpus(path=path, name=path.name, commit=_head_commit(path), source="local")
+
+    root = Path(cache) if cache is not None else cache_root()
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / _slug(spec) / (ref or "HEAD")
+
+    if (target / ".git").exists():
+        commit = _head_commit(target)
+        if commit:
+            return Corpus(path=target, name=target.parent.name, commit=commit, source=spec, reused_cache=True)
+
+    target.mkdir(parents=True, exist_ok=True)
+    code, _, err = _git(["init", "-q"], cwd=target, timeout=30)
+    if code != 0:
+        raise RuntimeError(f"git init failed for {target}: {err}")
+    _git(["remote", "add", "origin", spec], cwd=target, timeout=30)
+    # Fetch the single commit rather than a branch: `--branch` cannot take a raw sha,
+    # and a benchmark corpus is pinned to a sha far more often than to a branch tip.
+    code, _, err = _git(["fetch", "--depth", "1", "origin", ref or "HEAD"], cwd=target)
+    if code != 0:
+        raise RuntimeError(f"git fetch failed for {spec} at {ref or 'HEAD'}: {err}")
+    code, _, err = _git(["checkout", "-q", "FETCH_HEAD"], cwd=target, timeout=120)
+    if code != 0:
+        raise RuntimeError(f"git checkout failed for {spec}: {err}")
+    return Corpus(path=target, name=target.parent.name, commit=_head_commit(target), source=spec)

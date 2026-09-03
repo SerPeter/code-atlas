@@ -452,6 +452,8 @@ def bench(
         "sqlite", "--backend", help="sqlite (a throwaway database) or memgraph (the configured one)."
     ),
     label: str = typer.Option("", "--label", help="Name this run in the report and in a stored baseline."),
+    repo: str = typer.Option("", "--repo", help="Git URL to clone, pin and cache instead of a local path."),
+    ref: str = typer.Option("", "--ref", help="Commit, tag or branch to pin --repo to. Defaults to HEAD."),
 ) -> None:
     """Index a corpus and report where the time went, stage by stage.
 
@@ -463,7 +465,7 @@ def bench(
     index you actually use. ``--backend memgraph`` opts in to the configured one, under
     a ``bench-`` prefixed project name.
     """
-    asyncio.run(_run_bench(path=path, backend=backend, label=label))
+    asyncio.run(_run_bench(path=path, backend=backend, label=label, repo=repo, ref=ref))
 
 
 @app.command()
@@ -1489,7 +1491,66 @@ async def _mine_and_write_git_signals(
 # ---------------------------------------------------------------------------
 
 
-async def _run_bench(*, path: str, backend: str, label: str) -> None:
+def _bench_payload(report: Any, profile: Any, corpus: Any) -> dict[str, Any]:
+    """Machine-readable form of a bench run.
+
+    Carries the corpus commit alongside the numbers because results measured against
+    different bytes must never be compared, and a payload that omits the commit invites
+    exactly that.
+    """
+    return {
+        "corpus": report.corpus,
+        "corpus_commit": corpus.commit,
+        "corpus_source": corpus.source,
+        "backend": report.backend,
+        "total_s": round(report.total_s, 3),
+        "accounted_s": round(report.accounted_s, 3),
+        "unaccounted_s": round(report.unaccounted_s, 3),
+        "phases": [
+            {
+                "stage": p.stage,
+                "phase": p.phase,
+                "class": p.kind,
+                "seconds": round(p.seconds, 4),
+                "calls": p.calls,
+                "units": p.units,
+                "unit": p.unit_name,
+            }
+            for c in report.consumers
+            for p in c.phases
+        ],
+        "round_trips": {f"{op}:{kind}": n for (op, kind), n in report.round_trips.items()},
+        "work_counters": report.work_counters(),
+        "corpus_profile": profile.summary(),
+    }
+
+
+def _emit_bench(report: Any, profile: Any, corpus: Any) -> None:
+    """Print a bench run, then fail if the corpus was missing a shape it needed.
+
+    The failure is not a warning. A corpus with no DocSection leaves the whole doc-link
+    path unexercised, and a run that skipped it is indistinguishable from a fast one --
+    which is exactly how a whole-graph scan per doc file reached production.
+    """
+    from code_atlas.bench import render
+
+    if _output.json:
+        _json_output(_bench_payload(report, profile, corpus))
+    else:
+        print(render(report))
+        _echo("")
+        _echo(f"corpus profile: {profile.summary()}")
+
+    missing = profile.missing()
+    if missing:
+        logger.error(
+            "Corpus produced no {} — the paths that depend on them never ran, so these numbers understate the work.",
+            ", ".join(missing),
+        )
+        raise typer.Exit(code=1)
+
+
+async def _run_bench(*, path: str, backend: str, label: str, repo: str = "", ref: str = "") -> None:
     """Async implementation of the ``atlas bench`` command.
 
     Order matters in one place: the capture is installed *before* any client is built.
@@ -1502,7 +1563,7 @@ async def _run_bench(*, path: str, backend: str, label: str) -> None:
     import time
     from pathlib import Path
 
-    from code_atlas.bench import capture, render, stub_provider
+    from code_atlas.bench import capture, profile_corpus, resolve_corpus, stub_provider
 
     try:
         cap = capture()
@@ -1514,11 +1575,16 @@ async def _run_bench(*, path: str, backend: str, label: str) -> None:
 
     from code_atlas.backends import connected
     from code_atlas.indexing.orchestrator import index_project
-    from code_atlas.settings import derive_project_name
 
-    root, _ = _resolve_project_root(path)
+    if repo:
+        target = resolve_corpus(repo, ref=ref)
+        root = target.path
+        _echo(f"corpus {target.label()} ({'cached' if target.reused_cache else 'cloned'}) at {root}")
+    else:
+        root, _ = _resolve_project_root(path)
+        target = resolve_corpus(str(root))
     scratch = Path(tempfile.mkdtemp(prefix="atlas-bench-"))
-    corpus = label or derive_project_name(root)
+    corpus = label or target.label()
 
     overrides: dict[str, object] = {"project_root": root}
     if backend == "sqlite":
@@ -1549,6 +1615,10 @@ async def _run_bench(*, path: str, backend: str, label: str) -> None:
                     project_name=project_name,
                 )
                 total_s = time.perf_counter() - started
+                # Profiled inside the scope, while the graph is still open. A corpus
+                # that stopped producing a shape reads exactly like a benchmark that got
+                # faster, so it is asserted rather than assumed.
+                profile = await profile_corpus(backends.graph, project_name)
 
         report = cap.report(
             total_s=total_s,
@@ -1564,33 +1634,7 @@ async def _run_bench(*, path: str, backend: str, label: str) -> None:
                 ),
             ),
         )
-        if _output.json:
-            _json_output(
-                {
-                    "corpus": report.corpus,
-                    "backend": report.backend,
-                    "total_s": round(report.total_s, 3),
-                    "accounted_s": round(report.accounted_s, 3),
-                    "unaccounted_s": round(report.unaccounted_s, 3),
-                    "phases": [
-                        {
-                            "stage": p.stage,
-                            "phase": p.phase,
-                            "class": p.kind,
-                            "seconds": round(p.seconds, 4),
-                            "calls": p.calls,
-                            "units": p.units,
-                            "unit": p.unit_name,
-                        }
-                        for c in report.consumers
-                        for p in c.phases
-                    ],
-                    "round_trips": {f"{op}:{kind}": n for (op, kind), n in report.round_trips.items()},
-                    "work_counters": report.work_counters(),
-                }
-            )
-        else:
-            print(render(report))
+        _emit_bench(report, profile, target)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
