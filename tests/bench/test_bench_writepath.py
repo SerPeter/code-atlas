@@ -128,6 +128,9 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
                 project_name=project,
             )
 
+            entities_before = await backends.graph.count_entities(project)
+            vectors_before = (await backends.graph.count_embeddings_by_project()).get(project, 0)
+
             # Now add the measured batch and re-index as a delta. Everything captured
             # from here belongs to N files written against a graph of size M.
             _write_tree(root, "measured", _MEASURED_FILES)
@@ -140,6 +143,7 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
                 project_name=project,
             )
             entities = await backends.graph.count_entities(project)
+            vectors_after = (await backends.graph.count_embeddings_by_project()).get(project, 0)
 
     report = cap.report(total_s=0.0, corpus=f"ballast={ballast}", backend="sqlite")
     by_op = report.round_trips_by_op()
@@ -148,11 +152,14 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
         "graph_entities": entities,
         "measured_files": result.files_published,
         "round_trips": report.total_round_trips,
-        # Vectors written during the measured window. If this tracks graph size rather
-        # than batch size, the run is finishing the ballast's embedding work and the
-        # round-trip growth is leakage, not graph-size scaling. Surfaced rather than
-        # assumed either way -- see TestEmbeddingLeakage.
-        "embedding_rows": by_op.get("_write_embedding_row", 0),
+        # Vectors that actually appeared, and the SQL it took to write them. These are
+        # different numbers and conflating them is easy: `_write_embedding_row` issues
+        # several statements per vector (a rowid lookup, the node update, the vec0 sync),
+        # so its round-trip count is NOT a vector count. An earlier version of this file
+        # labelled it as one and read a fivefold "leak" that was mostly statements per row.
+        "new_entities": entities - entities_before,
+        "new_vectors": vectors_after - vectors_before,
+        "embedding_statements": by_op.get("_write_embedding_row", 0),
         "by_op": by_op,
     }
 
@@ -232,30 +239,65 @@ class TestWhatScalesWithGraphSize:
         assert entity_ops != rel_ops, "entity and relationship writes are not separable"
 
 
-class TestEmbeddingLeakage:
-    """Is the round-trip growth graph-size scaling, or ballast work finishing late?
+class TestEmbeddingWriteVolume:
+    """How many vector writes a fixed batch costs, and how that moves with graph size.
 
-    `_write_embedding_row` climbing with the ballast would mean the measured window is
-    completing embedding the *previous* run left undone — `_reconcile_until_embedded`
-    sweeps the whole project for entities without vectors, so an incomplete ballast run
-    lands its remainder on the next run's bill.
+    Reported, not diagnosed. This number has been misread twice while writing this file
+    and the record is worth keeping, because both misreadings are easy:
 
-    This does not assert which it is. It puts the number where a reader can see it,
-    because a benchmark that silently attributes ballast work to the measured batch is
-    worse than one that says it cannot tell.
+    1. `_write_embedding_row` round-trips (52 -> 200 across the sweep) were first read as
+       a vector count. They are a CALL count -- the helper's own statement is one
+       `SELECT rowid`, while its `DELETE`/`INSERT` attribute to `_safe_exec`.
+    2. The correction then used `new_vectors`, the change in nodes holding a vector, and
+       concluded there was no rewriting. That is also wrong: a node that already has a
+       vector and gets a new one does not change that count, so the metric is blind to
+       exactly the thing it was introduced to detect.
+
+    What is established: a fixed 5-file batch triggers 52 embedding-row writes into a
+    50-entity graph and 200 into a 146-entity one, while only 17 entities are new at both
+    sizes. What is NOT established is why -- rewrites of existing vectors, `EmbedChunk`
+    rows, and the reconcile sweep are all live candidates and none has been ruled out.
+
+    So this asserts the shape and prints the numbers. Naming a cause here without
+    checking it is how the first two readings happened.
     """
 
-    def test_embedding_writes_are_reported_against_batch_size(self, sweep):
-        rows = [(int(p["ballast_files"]), int(p["embedding_rows"]), int(p["measured_files"])) for p in sweep]
-        print(f"\nembedding rows per (ballast, rows, measured_files): {rows}")
-
-        first, last = sweep[0], sweep[-1]
-        leaked = int(last["embedding_rows"]) > int(first["embedding_rows"]) * 1.5
-        if leaked:
-            print(
-                "  NOTE: embedding writes scale with the ballast, not the batch. Part of the "
-                "round-trip growth above is the previous run's embedding work finishing here, "
-                "not graph-size scaling. Treat the curve as an upper bound until the embed "
-                "reconcile is excluded from the measured window."
+    def test_the_write_volume_is_reported_against_the_batch(self, sweep):
+        rows = [
+            (
+                int(p["ballast_files"]),
+                int(p["graph_entities"]),
+                int(p["new_entities"]),
+                int(p["new_vectors"]),
+                int(p["embedding_statements"]),
             )
-        assert rows
+            for p in sweep
+        ]
+        print(f"\n(ballast, graph_entities, new_entities, new_vectors, embedding_row_writes): {rows}")
+
+        for ballast, _graph, new_entities, new_vectors, _writes in rows:
+            assert new_vectors > 0, f"ballast={ballast}: no vectors appeared, so the row is vacuous"
+            assert new_vectors <= new_entities, (
+                f"ballast={ballast}: {new_vectors} new vectors for {new_entities} new entities"
+            )
+
+    def test_write_volume_exceeding_new_entities_is_visible(self, sweep):
+        """The open question, kept in front of a reader rather than buried.
+
+        If embedding-row writes greatly exceed the entities that gained a vector, the
+        measured window is doing work for something other than its batch. That is either
+        a real inefficiency or a benchmark artefact; this says which numbers to look at.
+        """
+        excess = [
+            (int(p["ballast_files"]), int(p["embedding_statements"]), int(p["new_vectors"]))
+            for p in sweep
+            if int(p["embedding_statements"]) > int(p["new_vectors"]) * 2
+        ]
+        if excess:
+            print(
+                f"\nOPEN: embedding-row writes far exceed newly-vectored entities {excess}. "
+                "Cause not established — candidates are rewrites of existing vectors, EmbedChunk "
+                "rows, and the unembedded-entity reconcile. The write-path curve above is an "
+                "upper bound until this is resolved."
+            )
+        assert sweep
