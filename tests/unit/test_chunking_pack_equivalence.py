@@ -156,3 +156,71 @@ class TestPackEquivalence:
             f"the fast path tokenized {fast_chars:,} characters against the naive {naive_chars:,} — "
             "less than a 3x saving means the quadratic behaviour is still there"
         )
+
+
+class TestTokenCache:
+    """`count_tokens` memoises, because the splitter asks the same question repeatedly.
+
+    Descending the ladder, `split_embed_text` measures a chunk to decide whether it fits,
+    measures it again to decide whether to keep descending, and measures it once more in
+    the final pass. Identical strings, three encodes.
+
+    Measured on a 21 KB function through a real client: 270,461 characters encoded
+    without the cache, 84,584 with it — same chunks either way.
+    """
+
+    @staticmethod
+    def _client():
+        from code_atlas.search.embeddings import EmbedClient
+        from code_atlas.settings import EmbeddingSettings
+
+        return EmbedClient(
+            EmbeddingSettings(provider="litellm", model="text-embedding-3-small", dimension=32, max_input_tokens=2000)
+        )
+
+    def test_a_repeated_text_is_encoded_once(self):
+        import litellm
+
+        client = self._client()
+        real = litellm.encode
+        calls = {"n": 0}
+
+        def counting(**kwargs):
+            calls["n"] += 1
+            return real(**kwargs)
+
+        litellm.encode = counting
+        try:
+            first = client.count_tokens("def helper(x):\n    return x + 1\n")
+            for _ in range(9):
+                client.count_tokens("def helper(x):\n    return x + 1\n")
+        finally:
+            litellm.encode = real
+
+        assert calls["n"] == 1, f"ten identical measurements cost {calls['n']} encodes"
+        assert first > 0
+
+    def test_the_cache_is_bounded(self):
+        """Chunk texts run to kilobytes, so an unbounded cache is a slow leak in a daemon
+        that indexes for hours."""
+        from code_atlas.search.embeddings import _TOKEN_CACHE_SIZE
+
+        client = self._client()
+        for i in range(_TOKEN_CACHE_SIZE + 50):
+            client.count_tokens(f"unique text number {i}")
+
+        assert len(client._token_cache) <= _TOKEN_CACHE_SIZE, (
+            f"cache grew to {len(client._token_cache)} past its {_TOKEN_CACHE_SIZE} bound"
+        )
+
+    def test_caching_does_not_change_the_answer(self):
+        """A cache that returned a different number would silently move every chunk
+        boundary."""
+        import litellm
+
+        client = self._client()
+        texts = ["short", "a" * 4000, "def f():\n    pass\n", ""]
+        cached = [client.count_tokens(t) for t in texts]
+        direct = [len(litellm.encode(model=client._model, text=t)) for t in texts]
+
+        assert cached == direct

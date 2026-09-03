@@ -37,6 +37,16 @@ _RETRYABLE_ERRORS = (
 )
 
 
+_TOKEN_CACHE_SIZE = 512
+"""Texts whose token count is remembered.
+
+Sized for one node's descent down the border ladder plus the batch around it, not for a
+whole corpus: the reuse this exploits is within a single `split_text` call, where the same
+chunk is measured to decide whether it fits, again to decide whether to keep descending,
+and again in the final pass.
+"""
+
+
 class EmbeddingError(Exception):
     """Raised when an embedding operation fails."""
 
@@ -64,6 +74,10 @@ class EmbedClient:
         self._batch_size: int = settings.batch_size
         self._max_concurrency: int = settings.max_concurrency
         self._timeout = settings.timeout_s
+        # Token counts for texts the splitter has already measured. Bounded: chunk
+        # texts run to kilobytes, so an unbounded cache is a slow leak in a daemon that
+        # indexes for hours.
+        self._token_cache: OrderedDict[str, int] = OrderedDict()
         self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._query_cache_size = settings.query_cache_size
 
@@ -201,13 +215,28 @@ class EmbedClient:
         )
 
     def count_tokens(self, text: str) -> int:
-        """Token count for *text* under this model's tokenizer.
+        """Token count for *text* under this model's tokenizer, memoised.
 
         Falls back to :data:`CHARS_PER_TOKEN_FALLBACK` when the model has no
         tokenizer litellm can reach. The first failure is remembered -- ``encode``
         raises per call for an unmapped model, and the splitter measures a text many
         times on its way down the border ladder.
+
+        **Memoised because the splitter asks the same question repeatedly.** Descending
+        the ladder, `split_embed_text` measures every chunk to decide whether it fits,
+        measures them all again to decide whether to stop descending, and measures them
+        once more in the final pass. Identical strings, three encodes. The cache turns
+        the repeats into dictionary hits, and it is bounded because chunk texts are large
+        enough that an unbounded one would be a slow leak in a long-lived daemon.
+
+        Keyed on the text alone: the model is fixed for the life of the client, and a
+        client for another model has its own cache.
         """
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            self._token_cache.move_to_end(text)
+            return cached
+
         if self._encode_ok is not False:
             try:
                 count = len(litellm.encode(model=self._model, text=text))
@@ -215,8 +244,16 @@ class EmbedClient:
                 self._encode_ok = False
             else:
                 self._encode_ok = True
+                self._remember_tokens(text, count)
                 return count
-        return len(text) // CHARS_PER_TOKEN_FALLBACK + 1
+        fallback = len(text) // CHARS_PER_TOKEN_FALLBACK + 1
+        self._remember_tokens(text, fallback)
+        return fallback
+
+    def _remember_tokens(self, text: str, count: int) -> None:
+        self._token_cache[text] = count
+        if len(self._token_cache) > _TOKEN_CACHE_SIZE:
+            self._token_cache.popitem(last=False)
 
     def split_text(self, text: str) -> SplitResult:
         """Split *text* into chunks this model will accept.
