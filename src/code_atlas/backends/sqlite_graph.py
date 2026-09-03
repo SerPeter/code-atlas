@@ -42,6 +42,7 @@ embedded-backend plan's explicit "best-effort resolution" allowance):
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import struct
 from collections import defaultdict
@@ -331,6 +332,37 @@ def _classify_batch(
         per_file_results=per_file_results,
         new_file_paths=new_file_paths,
     )
+
+
+def _json_default(value: Any) -> str:
+    """Serialise the property types Bolt carries natively but JSON does not.
+
+    `_coerce_property_value` in the markdown parser deliberately preserves temporals,
+    because Bolt has a Date type and Memgraph stores an unquoted YAML `2026-08-30` as
+    one. This backend has `json.dumps`, which does not, and the failure was not a lost
+    property: `TypeError: Object of type date is not JSON serializable` propagates out of
+    the whole **batch**, so every unrelated file travelling with the dated one was retried
+    five times and then parked as poison. One dated ADR dropped a batch of this repo's own
+    docs, silently, and only the benchmark's own output showed it.
+
+    So the coercion belongs here rather than in the parser: the parser's value is correct
+    for the backend it was written against, and narrowing it would cost Memgraph a real
+    temporal to work around a JSON limitation. The two backends therefore return different
+    types for a dated frontmatter key -- Date on Memgraph, ISO string here -- which is the
+    honest consequence of one of them having temporals and the other not.
+    """
+    if isinstance(value, datetime.datetime | datetime.date | datetime.time):
+        return value.isoformat()
+    return str(value)
+
+
+def _dumps(obj: Any) -> str:
+    """`json.dumps` for anything stored in `props_json`.
+
+    Every props_json write goes through this rather than `json.dumps` directly, because
+    the crash above came from a value nobody thought of and the next one will too.
+    """
+    return json.dumps(obj, default=_json_default)
 
 
 def _entity_props(e: ParsedEntity) -> dict[str, Any]:
@@ -826,7 +858,7 @@ class SqliteGraphClient:
                     e.name,
                     e.kind,
                     e.content_hash,
-                    json.dumps(_entity_props(e)),
+                    _dumps(_entity_props(e)),
                 )
             )
         await conn.executemany(
@@ -854,7 +886,7 @@ class SqliteGraphClient:
                 "UPDATE nodes SET name = ?, kind = ?, content_hash = ?, "
                 "props_json = json_patch(json_remove(props_json, '$.frontmatter'), ?) "
                 "WHERE uid = ?",
-                (e.name, e.kind, e.content_hash, json.dumps(_entity_props(e)), e.qualified_name),
+                (e.name, e.kind, e.content_hash, _dumps(_entity_props(e)), e.qualified_name),
             )
             await self._sync_fts_row(conn, e)
 
@@ -862,7 +894,7 @@ class SqliteGraphClient:
         for e in entities:
             await conn.execute(
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
-                (json.dumps({"line_start": e.line_start, "line_end": e.line_end}), e.qualified_name),
+                (_dumps({"line_start": e.line_start, "line_end": e.line_end}), e.qualified_name),
             )
 
     async def _batch_delete_entities(self, conn: SqlConnection, uids_by_label: dict[str, list[str]]) -> None:
@@ -1002,8 +1034,7 @@ class SqliteGraphClient:
 
         if direct_rels:
             rows = [
-                (r.from_qualified_name, r.to_name, r.rel_type.value, json.dumps(r.properties or {}))
-                for r in direct_rels
+                (r.from_qualified_name, r.to_name, r.rel_type.value, _dumps(r.properties or {})) for r in direct_rels
             ]
             await conn.executemany(
                 "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, ?) "
@@ -1041,9 +1072,7 @@ class SqliteGraphClient:
         conn = await self._get_conn()
         for r in doc_rels:
             props = r.properties
-            entry_props = json.dumps(
-                {"link_type": props.get("link_type", ""), "confidence": props.get("confidence", 0.0)}
-            )
+            entry_props = _dumps({"link_type": props.get("link_type", ""), "confidence": props.get("confidence", 0.0)})
             if props.get("is_file_ref"):
                 cur = await conn.execute(
                     "SELECT uid FROM nodes WHERE project_name = ? AND file_path LIKE ? ESCAPE '\\' "
@@ -1115,7 +1144,7 @@ class SqliteGraphClient:
             "VALUES (?, 'Project', ?, NULL, NULL, ?, NULL, NULL, ?) "
             "ON CONFLICT(uid) DO UPDATE SET project_name = excluded.project_name, name = excluded.name, "
             "props_json = json_patch(nodes.props_json, excluded.props_json)",
-            (project_name, project_name, project_name, json.dumps(metadata)),
+            (project_name, project_name, project_name, _dumps(metadata)),
         )
         await conn.commit()
 
@@ -1125,7 +1154,7 @@ class SqliteGraphClient:
         conn = await self._get_conn()
         await conn.execute(
             "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ? AND labels = 'Project'",
-            (json.dumps(metadata), project_name),
+            (_dumps(metadata), project_name),
         )
         await conn.commit()
 
@@ -1283,7 +1312,7 @@ class SqliteGraphClient:
             await conn.execute(
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) "
                 f"WHERE project_name = ? AND file_path = ? AND labels IN ({_FILE_HASH_LABELS_SQL})",
-                (json.dumps({prop: v}), project_name, fp),
+                (_dumps({prop: v}), project_name, fp),
             )
         await conn.commit()
 
@@ -1482,14 +1511,14 @@ class SqliteGraphClient:
             await conn.execute(
                 f"INSERT INTO nodes({_NODE_COLUMNS}) "
                 "VALUES (?, 'ExternalSymbol', ?, ?, NULL, ?, NULL, NULL, ?) ON CONFLICT(uid) DO NOTHING",
-                (sym["uid"], project_name, sym["qn"], sym["name"], json.dumps({"package": sym["package"]})),
+                (sym["uid"], project_name, sym["qn"], sym["name"], _dumps({"package": sym["package"]})),
             )
             await conn.execute(
                 "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'CONTAINS', '{}')",
                 (f"{project_name}:ext/{sym['package']}", sym["uid"]),
             )
         for from_uid, to_uid, type_only in import_edges:
-            props = json.dumps({"type_only": True}) if type_only else "{}"
+            props = _dumps({"type_only": True}) if type_only else "{}"
             await conn.execute(
                 "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'IMPORTS', ?) "
                 "ON CONFLICT(from_uid, to_uid, rel_type) DO UPDATE SET props_json = excluded.props_json",
@@ -1668,7 +1697,7 @@ class SqliteGraphClient:
                     f,
                     t,
                     "CALLS",
-                    json.dumps(
+                    _dumps(
                         {
                             "confidence": facts.confidence,
                             "strategy": facts.strategy,
@@ -1784,7 +1813,7 @@ class SqliteGraphClient:
                 (
                     from_uid,
                     to_uid,
-                    json.dumps({"link_type": "anchor", "confidence": 1.0, "anchor_hash": to_hash, "stale": False}),
+                    _dumps({"link_type": "anchor", "confidence": 1.0, "anchor_hash": to_hash, "stale": False}),
                 ),
             )
 
@@ -1792,7 +1821,7 @@ class SqliteGraphClient:
         for note_uid in all_notes:
             await conn.execute(
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ? AND labels = 'Note'",
-                (json.dumps({"unresolved_anchors": unresolved_by_note.get(note_uid, [])}), note_uid),
+                (_dumps({"unresolved_anchors": unresolved_by_note.get(note_uid, [])}), note_uid),
             )
         await conn.commit()
         total_unresolved = sum(len(v) for v in unresolved_by_note.values())
@@ -1822,7 +1851,7 @@ class SqliteGraphClient:
                     props["stale"] = True
                     await conn.execute(
                         "UPDATE edges SET props_json = ? WHERE from_uid = ? AND to_uid = ? AND rel_type = 'DOCUMENTS'",
-                        (json.dumps(props), from_uid, to_uid),
+                        (_dumps(props), from_uid, to_uid),
                     )
                     count += 1
         if count:
@@ -1925,14 +1954,14 @@ class SqliteGraphClient:
                 (
                     doc_uid,
                     entity_uid,
-                    json.dumps({"link_type": "citation", "confidence": confidence, "citation": citation}),
+                    _dumps({"link_type": "citation", "confidence": confidence, "citation": citation}),
                 ),
             )
 
         for uid in pending:
             await conn.execute(
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
-                (json.dumps({"unresolved_citations": unresolved_by_uid.get(uid, [])}), uid),
+                (_dumps({"unresolved_citations": unresolved_by_uid.get(uid, [])}), uid),
             )
         await conn.commit()
 
@@ -2068,7 +2097,7 @@ class SqliteGraphClient:
                     f,
                     t,
                     "USES_TYPE",
-                    json.dumps(
+                    _dumps(
                         {
                             "strategy": st,
                             "confidence": _TYPE_REF_FACTS[st][0],
@@ -2192,10 +2221,7 @@ class SqliteGraphClient:
             "SELECT ?, uid, 'DEPENDS_ON', ? FROM nodes WHERE uid = ? AND labels = 'ExternalPackage' "
             "ON CONFLICT(from_uid, to_uid, rel_type) DO UPDATE SET "
             "props_json = json_patch(edges.props_json, excluded.props_json)",
-            [
-                (project_name, json.dumps({"version": ver}), f"{project_name}:ext/{pkg}")
-                for pkg, ver in versions.items()
-            ],
+            [(project_name, _dumps({"version": ver}), f"{project_name}:ext/{pkg}") for pkg, ver in versions.items()],
         )
         await conn.commit()
 
@@ -2356,7 +2382,7 @@ class SqliteGraphClient:
         return len(rows)
 
     async def apply_property_enrichments(self, enrichments: list[PropertyEnrichment]) -> None:
-        items = [(e.qualified_name, json.dumps(e.properties)) for e in enrichments if e.properties]
+        items = [(e.qualified_name, _dumps(e.properties)) for e in enrichments if e.properties]
         if not items:
             return
         conn = await self._get_conn()
@@ -2531,7 +2557,7 @@ class SqliteGraphClient:
         for uid, h in items:
             await conn.execute(
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
-                (json.dumps({"embed_hash": h}), uid),
+                (_dumps({"embed_hash": h}), uid),
             )
         await conn.commit()
 
@@ -2557,7 +2583,7 @@ class SqliteGraphClient:
                 props["embed_hash"] = h
                 await conn.execute(
                     "UPDATE nodes SET embedding = ?, props_json = json_patch(props_json, ?) WHERE uid = ?",
-                    (blob, json.dumps(props), uid),
+                    (blob, _dumps(props), uid),
                 )
                 await self._write_embedding_row(conn, uid, blob)
             await conn.commit()
@@ -2656,7 +2682,7 @@ class SqliteGraphClient:
                 if patch:
                     await conn.execute(
                         "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
-                        (json.dumps(patch), uid),
+                        (_dumps(patch), uid),
                     )
             await conn.commit()
         return len(affected)
@@ -2906,7 +2932,7 @@ class SqliteGraphClient:
                     "INSERT INTO nodes (uid, labels, project_name, props_json, embedding) "
                     "VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(uid) DO UPDATE SET props_json = excluded.props_json, embedding = excluded.embedding",
-                    (item.uid, NodeLabel.EMBED_CHUNK.value, item.project_name, json.dumps(props), blob),
+                    (item.uid, NodeLabel.EMBED_CHUNK.value, item.project_name, _dumps(props), blob),
                 )
                 await self._write_embedding_row(conn, item.uid, blob)
             await conn.commit()
@@ -4300,7 +4326,7 @@ class SqliteGraphClient:
                 "UPDATE nodes SET props_json = json_patch(props_json, ?) "
                 "WHERE project_name = ? AND file_path = ? AND labels = ?",
                 (
-                    json.dumps(
+                    _dumps(
                         {
                             "git_commit_count": item["cc"],
                             "git_author_count": item["ac"],
@@ -4336,7 +4362,7 @@ class SqliteGraphClient:
             b_row = await cur_b.fetchone()
             await cur_b.close()
             if a_row and b_row:
-                rows.append((a_row[0], b_row[0], "CO_CHANGES_WITH", json.dumps({"count": pair["cnt"]})))
+                rows.append((a_row[0], b_row[0], "CO_CHANGES_WITH", _dumps({"count": pair["cnt"]})))
         if rows:
             await conn.executemany(
                 "INSERT INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, ?, ?) "
