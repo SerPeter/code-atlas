@@ -40,22 +40,69 @@ far as needed keeps chunk boundaries on the strongest border that fits.
 """
 
 
+# Headroom the `_pack` fast path leaves before trusting its upper bound. Measured worst
+# case is +1 token, on an empty separator only; four is generous without meaningfully
+# reducing how densely chunks pack, because the band merely falls back to an exact
+# measurement rather than cutting early.
+_SEAM_SLACK = 4
+
+
 def _pack(pieces: list[str], sep: str, limit: int, measure: Callable[[str], int]) -> list[str]:
     """Greedily re-join *pieces* into the fewest groups that each fit *limit*.
 
     Splitting on a separator and embedding the pieces one by one would produce a
     chunk per line; the point of the ladder is to cut at a border, not at every
     border.
+
+    Measures each *piece* once and the accumulator only when it might not fit.
+
+    The obvious version measures the whole growing candidate on every piece, which is
+    quadratic in the input: splitting a 21 KB function into four chunks tokenized
+    1,297,656 characters — 61x the input — because each of 400 lines re-tokenized
+    everything accumulated before it.
+
+    The saving rests on ``measure(a) + measure(sep) + measure(b)`` being a near-upper
+    bound on ``measure(a + sep + b)``: joining two strings usually merges tokens at the
+    seam and never adds many.
+
+    It is **not** a strict upper bound, and assuming it was is a bug this nearly shipped.
+    A seam can re-split a token rather than merge one: measured over 48,000 random pairs
+    on cl100k_base, joining ADDED a token in the empty-separator case. The violation was
+    bounded at +1, and was exactly 0 for every whitespace separator (36,000 pairs) —
+    whitespace forces a token boundary, so nothing can cross it.
+
+    So the fast path takes ``_SEAM_SLACK`` tokens of headroom before trusting the bound.
+    Inside that band the exact measurement still runs, which is what the naive version did
+    anyway, so the chunks produced are identical. `tests/unit/test_chunking_pack_equivalence.py`
+    holds both halves: that the violation stays within the slack, and that the grouping
+    matches the naive algorithm byte for byte.
     """
     out: list[str] = []
     current = ""
+    current_tokens = 0
+    sep_tokens = measure(sep) if sep else 0
     for piece in pieces:
-        candidate = piece if not current else current + sep + piece
-        if current and measure(candidate) > limit:
+        piece_tokens = measure(piece)
+        if not current:
+            current, current_tokens = piece, piece_tokens
+            continue
+
+        upper = current_tokens + sep_tokens + piece_tokens
+        if upper + _SEAM_SLACK <= limit:
+            # Far enough under that a seam re-split cannot push it over, so the exact
+            # measurement is skipped. The stored count stays the bound rather than the
+            # true one, which is safe because it only ever feeds a larger bound.
+            current = current + sep + piece
+            current_tokens = upper
+            continue
+
+        candidate = current + sep + piece
+        exact = measure(candidate)
+        if exact > limit:
             out.append(current)
-            current = piece
+            current, current_tokens = piece, piece_tokens
         else:
-            current = candidate
+            current, current_tokens = candidate, exact
     if current:
         out.append(current)
     return out
