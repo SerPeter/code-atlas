@@ -824,7 +824,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
 
             # A block, not the command's stack: the probe is used once and its redis
             # pool should go with it rather than outlive the whole index run.
-            async with _EmbedClient(settings.embeddings, settings.redis) as _probe:
+            async with _EmbedClient(settings.embeddings, settings) as _probe:
                 try:
                     resolved_dim = await _probe.detect_dimension()
                 except Exception:
@@ -1296,7 +1296,7 @@ async def _run_search(
                 )
 
             if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
-                embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
+                embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings))
 
         results = await hybrid_search(
             graph=graph,

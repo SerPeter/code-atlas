@@ -161,7 +161,7 @@ class DaemonManager:
 
         embed: EmbedClient | None = None
         if settings.embeddings.enabled:
-            embed = EmbedClient(settings.embeddings, settings.redis)
+            embed = EmbedClient(settings.embeddings, settings)
             self._embed = embed
 
         consumers: list[ASTConsumer | EmbedConsumer] = [

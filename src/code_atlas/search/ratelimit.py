@@ -25,13 +25,17 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import TYPE_CHECKING, Self
+import time
+from typing import TYPE_CHECKING, NamedTuple, Self
 
+import aiosqlite
 import redis.asyncio as aioredis
 from loguru import logger
 
 if TYPE_CHECKING:
-    from code_atlas.settings import RedisSettings
+    from pathlib import Path
+
+    from code_atlas.settings import AtlasSettings, RedisSettings
 
 # AIMD constants. The decrease must be sharp (a 429 means we are already over) and the
 # recovery slow enough that a fleet of processes does not re-converge on the limit in
@@ -44,6 +48,14 @@ _AIMD_FLOOR = 0.05
 _AIMD_PENALTY_COOLDOWN_MS = 5_000
 
 # Bucket state is worthless once idle for longer than the window it meters.
+_DEGRADED_RETRY_MS = 30_000
+"""Cooldown before retrying a coordination store that just failed.
+
+Long enough that a missing Valkey costs a couple of timeouts across a whole index, short
+enough that a restarted one is picked up within a batch or two. Pacing is unavailable
+for that window either way -- the alternative was paying for the discovery every batch.
+"""
+
 _BUCKET_TTL_MS = 300_000
 
 
@@ -242,6 +254,12 @@ class RateLimiter:
         # One failure log per limiter, not one per call: if Valkey is down the embed
         # path still works and the noise would bury the errors that matter.
         self._degraded = False
+        # Wall-clock (ms) before the next attempt after a failure. Suppressing only the
+        # *log* was not enough: every embed batch still opened a socket to a Valkey that
+        # was not there and paid the connect timeout. Measured on a 10-file corpus with
+        # the provider stubbed, that was 4.08s of a 14s index -- 29% of the run spent
+        # dialling a host the first call already proved absent.
+        self._retry_at_ms = 0.0
 
     @property
     def rpm(self) -> int:
@@ -263,6 +281,11 @@ class RateLimiter:
         no pacing, which is exactly the behaviour before this existed.
         """
         while True:
+            if self._degraded and time.time() * 1000 < self._retry_at_ms:
+                # Still inside the cooldown from the last failure. Skipping the call
+                # rather than the log is the point: an unreachable store must cost one
+                # timeout per window, not one per batch.
+                return
             try:
                 result = await self._acquire_script(
                     keys=self._keys,
@@ -283,6 +306,7 @@ class RateLimiter:
                         "Rate limiter cannot reach Valkey; embedding continues without cross-process "
                         "pacing (AIMD backoff still applies within this process)"
                     )
+                self._retry_at_ms = time.time() * 1000 + _DEGRADED_RETRY_MS
                 return
 
             self._degraded = False
@@ -334,3 +358,332 @@ class RateLimiter:
         failed.
         """
         await self.close()
+
+
+# ---------------------------------------------------------------------------
+# Shared bucket arithmetic
+# ---------------------------------------------------------------------------
+
+
+class BucketDecision(NamedTuple):
+    """What one bucket says about admitting a call of a given cost."""
+
+    wait_ms: int
+    """0 means admissible now."""
+    level: float
+    """The refilled level, before any debit."""
+    cap: float
+    debit: float
+    """What to subtract when the call is admitted — the cost, clamped to the cap."""
+
+
+def bucket_decision(*, limit: int, scale: float, cost: float, level: float | None, ts: int, now: int) -> BucketDecision:
+    """Refill a leaky bucket to *now* and say whether *cost* fits.
+
+    Extracted so the SQLite limiter and the Valkey Lua script are demonstrably the same
+    arithmetic rather than two independent readings of the same intent. They remain two
+    implementations — Lua cannot call this — so
+    `tests/integration/search/test_ratelimit_conformance.py` runs both against one
+    sequence and asserts they agree. That is the same shape the backend conformance
+    suite uses, and for the same reason: a hand-written mirror drifts silently.
+
+    A *limit* of 0 is unlimited and costs nothing to evaluate.
+    """
+    if limit <= 0:
+        return BucketDecision(0, 0.0, 0.0, 0.0)
+
+    cap = max(1.0, limit * scale)
+    refill = cap / 60000.0
+    current = cap if level is None else min(cap, level + ((now - ts) * refill))
+    # A cost larger than the whole bucket would never admit; clamp so one oversized
+    # chunk drains the bucket instead of waiting forever.
+    want = min(cost, cap)
+    if current >= want:
+        return BucketDecision(0, current, cap, want)
+    return BucketDecision(math.ceil((want - current) / refill), current, cap, want)
+
+
+def aimd_increase(scale: float, next_at: int, now: int) -> tuple[float, int] | None:
+    """Additive recovery toward 1.0, at most once per interval.
+
+    Returns the new ``(scale, next_at)`` or None when nothing changed, so a caller can
+    skip a write it does not need — the common case, since recovery is deliberately
+    slower than the call rate.
+    """
+    if scale >= 1.0 or now < next_at:
+        return None
+    return min(1.0, scale + _AIMD_INCREASE), now + _AIMD_INCREASE_INTERVAL_MS
+
+
+def aimd_penalty(scale: float, next_at: int, now: int) -> tuple[float, int] | None:
+    """Multiplicative decrease, floored, at most once per cooldown.
+
+    Returns None inside the cooldown: one decrease per burst, not one per rejected
+    chunk, or a batch of 128 rejections would drive the scale to the floor in one go.
+    """
+    if now < next_at:
+        return None
+    return max(_AIMD_FLOOR, scale * _AIMD_DECREASE), now + _AIMD_PENALTY_COOLDOWN_MS
+
+
+# ---------------------------------------------------------------------------
+# SQLite-backed limiter
+# ---------------------------------------------------------------------------
+
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS rate_bucket (
+    key   TEXT PRIMARY KEY,
+    level REAL NOT NULL,
+    ts    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rate_scale (
+    key     TEXT PRIMARY KEY,
+    v       REAL NOT NULL,
+    next_at INTEGER NOT NULL
+);
+"""
+
+
+class SqliteRateLimiter:
+    """The same buckets and AIMD factor, coordinated through SQLite instead of Valkey.
+
+    The embedded backend exists to run without Valkey, and until this existed it still
+    built a Valkey-backed limiter: every embed batch dialled a server that was not there
+    and paid a connection timeout before degrading. Measured on a 10-file corpus that was
+    **4.08 seconds of a 14 second index**, with the provider itself stubbed to return
+    instantly.
+
+    Deleting the limiter on that path would have been the smaller change and the wrong
+    one. The pacing is not Valkey's feature, it is the pipeline's, and an embedded
+    deployment calling a cloud provider needs it exactly as much. So the coordination
+    store follows the backend choice, the way ``SqliteEventBus`` and ``SqliteGraphClient``
+    already do.
+
+    **Cross-process, not merely in-process.** SQLite in WAL mode with ``BEGIN IMMEDIATE``
+    serialises writers across processes, which is what the Lua script's atomicity buys on
+    the Valkey side. Two daemons on one machine share a budget; an in-memory limiter would
+    silently give each of them its own, which is the bug the buckets exist to prevent.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        model: str,
+        rpm: int,
+        tpm: int,
+        gate: ConcurrencyGate | None = None,
+    ) -> None:
+        self._path = path
+        self._req_key = f"rl:{model}:req"
+        self._tok_key = f"rl:{model}:tok"
+        self._scale_key = f"rl:{model}:scale"
+        self._rpm = max(0, rpm)
+        self._tpm = max(0, tpm)
+        self._gate = gate
+        self._scale = 1.0
+        self._degraded = False
+        self._retry_at_ms = 0.0
+        self._conn: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def rpm(self) -> int:
+        return self._rpm
+
+    @property
+    def tpm(self) -> int:
+        return self._tpm
+
+    @property
+    def scale(self) -> float:
+        """Last observed AIMD factor (1.0 = unthrottled)."""
+        return self._scale
+
+    async def _get_conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            conn = await aiosqlite.connect(self._path)
+            # WAL so a reader never blocks the writer, and a busy timeout so a contended
+            # BEGIN IMMEDIATE waits rather than raising -- under contention is exactly
+            # when the limiter matters most.
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA busy_timeout=5000")
+            await conn.executescript(_SCHEMA_SQL)
+            await conn.commit()
+            self._conn = conn
+        return self._conn
+
+    async def _read_bucket(self, conn: aiosqlite.Connection, key: str) -> tuple[float | None, int]:
+        cur = await conn.execute("SELECT level, ts FROM rate_bucket WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return None, 0
+        return float(row[0]), int(row[1])
+
+    async def _write_bucket(self, conn: aiosqlite.Connection, key: str, level: float, ts: int) -> None:
+        await conn.execute(
+            "INSERT INTO rate_bucket(key, level, ts) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET level = excluded.level, ts = excluded.ts",
+            (key, level, ts),
+        )
+
+    async def _read_scale(self, conn: aiosqlite.Connection) -> tuple[float, int]:
+        cur = await conn.execute("SELECT v, next_at FROM rate_scale WHERE key = ?", (self._scale_key,))
+        row = await cur.fetchone()
+        await cur.close()
+        return (1.0, 0) if row is None else (float(row[0]), int(row[1]))
+
+    async def _write_scale(self, conn: aiosqlite.Connection, value: float, next_at: int) -> None:
+        await conn.execute(
+            "INSERT INTO rate_scale(key, v, next_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET v = excluded.v, next_at = excluded.next_at",
+            (self._scale_key, value, next_at),
+        )
+
+    async def acquire(self, *, tokens: int = 0) -> None:
+        """Block until one request of *tokens* tokens fits within both budgets.
+
+        Never raises: an unusable coordination store degrades to no pacing, the same
+        contract the Valkey limiter carries.
+        """
+        while True:
+            if self._degraded and time.time() * 1000 < self._retry_at_ms:
+                return
+            try:
+                wait_ms, scale = await self._try_acquire(max(0, tokens))
+            except Exception:
+                if not self._degraded:
+                    self._degraded = True
+                    logger.opt(exception=True).warning(
+                        "Rate limiter cannot use its SQLite store; embedding continues without "
+                        "cross-process pacing (AIMD backoff still applies within this process)"
+                    )
+                self._retry_at_ms = time.time() * 1000 + _DEGRADED_RETRY_MS
+                return
+
+            self._degraded = False
+            await self._apply_scale(scale)
+            if wait_ms <= 0:
+                return
+            await asyncio.sleep(wait_ms / 1000.0)
+
+    async def _try_acquire(self, tokens: int) -> tuple[int, float]:
+        """One atomic check-and-debit of both buckets.
+
+        Both in a single transaction for the reason the Lua script gives: a call that
+        consumed its request budget and then blocked on tokens leaks budget on every
+        retry, and with several processes live-locks.
+        """
+        conn = await self._get_conn()
+        now = int(time.time() * 1000)
+
+        # The asyncio lock serialises coroutines inside this process; BEGIN IMMEDIATE
+        # serialises processes. Both are needed -- aiosqlite funnels one connection
+        # through a worker thread, so without the lock two coroutines interleave inside
+        # one transaction.
+        async with self._lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                scale, next_at = await self._read_scale(conn)
+                bumped = aimd_increase(scale, next_at, now)
+                if bumped is not None:
+                    scale, next_at = bumped
+                    await self._write_scale(conn, scale, next_at)
+
+                req_level, req_ts = await self._read_bucket(conn, self._req_key)
+                tok_level, tok_ts = await self._read_bucket(conn, self._tok_key)
+                req = bucket_decision(limit=self._rpm, scale=scale, cost=1, level=req_level, ts=req_ts, now=now)
+                tok = bucket_decision(limit=self._tpm, scale=scale, cost=tokens, level=tok_level, ts=tok_ts, now=now)
+                wait = max(req.wait_ms, tok.wait_ms)
+
+                # Persist the refilled levels even when waiting, so the next caller's
+                # arithmetic starts from now rather than replaying the same window.
+                debit_req = 0.0 if wait > 0 else req.debit
+                debit_tok = 0.0 if wait > 0 else tok.debit
+                if self._rpm > 0:
+                    await self._write_bucket(conn, self._req_key, req.level - debit_req, now)
+                if self._tpm > 0:
+                    await self._write_bucket(conn, self._tok_key, tok.level - debit_tok, now)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return wait, scale
+
+    async def penalize(self) -> float:
+        """Halve the shared scale factor after a provider rate-limit rejection."""
+        now = int(time.time() * 1000)
+        try:
+            conn = await self._get_conn()
+            async with self._lock:
+                await conn.execute("BEGIN IMMEDIATE")
+                try:
+                    scale, next_at = await self._read_scale(conn)
+                    hit = aimd_penalty(scale, next_at, now)
+                    if hit is not None:
+                        scale, next_at = hit
+                        await self._write_scale(conn, scale, next_at)
+                    await conn.commit()
+                except Exception:
+                    await conn.rollback()
+                    raise
+        except Exception:
+            # Local-only decrease, so a broken store does not also disable backoff.
+            scale = max(_AIMD_FLOOR, self._scale * _AIMD_DECREASE)
+
+        await self._apply_scale(scale)
+        logger.warning("Provider rate limit hit; embedding throughput scaled to {:.0%}", scale)
+        return scale
+
+    async def _apply_scale(self, scale: float) -> None:
+        if scale == self._scale:
+            return
+        self._scale = scale
+        if self._gate is not None:
+            await self._gate.set_scale(scale)
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
+
+# ---------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------
+
+
+def make_rate_limiter(
+    settings: AtlasSettings,
+    *,
+    model: str,
+    rpm: int,
+    tpm: int,
+    gate: ConcurrencyGate | None = None,
+) -> RateLimiter | SqliteRateLimiter:
+    """The limiter for whichever queue backend this project is configured for.
+
+    Keyed on ``backend.queue`` rather than on a probe of its own. The bus factory
+    already probes once at startup, and a second probe here would reintroduce exactly
+    the connect timeout this selection exists to remove.
+
+    ``"auto"`` therefore resolves to Valkey, not to a guess: the Valkey limiter degrades
+    on its own when the store is absent, and since it now holds a retry cooldown that
+    costs a couple of timeouts per index rather than one per batch. Choosing SQLite for
+    ``"auto"`` would be worse -- it would pace against a private file while the rest of
+    the fleet paced against Valkey, and the shared budget the buckets exist to enforce
+    would quietly stop being shared.
+    """
+    if settings.backend.queue == "sqlite":
+        data_dir = settings.project_root / settings.backend.sqlite_data_dir
+        return SqliteRateLimiter(data_dir / "ratelimit.sqlite3", model=model, rpm=rpm, tpm=tpm, gate=gate)
+    return RateLimiter(settings.redis, model=model, rpm=rpm, tpm=tpm, gate=gate)

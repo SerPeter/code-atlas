@@ -230,7 +230,7 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
         app.embed = None
         app.vector_enabled = False
     else:
-        app.embed = EmbedClient(app.settings.embeddings, app.settings.redis)
+        app.embed = EmbedClient(app.settings.embeddings, app.settings)
         app.vector_enabled = True
         # Per project, not database-wide: comparing against the database default
         # disabled vector search for every project that was not the last one to
@@ -831,7 +831,7 @@ def create_mcp_server(  # noqa: PLR0915
             # Implicit degradation: probe TEI, fall back to lightweight if unreachable.
             # Kept only once the probe passes -- on the failure path it is closed here,
             # so lightweight mode does not hold an idle Valkey pool for the process.
-            candidate = EmbedClient(settings.embeddings, settings.redis)
+            candidate = EmbedClient(settings.embeddings, settings)
             tei_ok = False
             with contextlib.suppress(Exception):
                 tei_ok = await candidate.health_check()

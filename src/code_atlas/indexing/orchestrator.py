@@ -2195,7 +2195,7 @@ async def _index_project_inner(  # noqa: PLR0915
     # 2. Embedding setup + model lock check (skipped in lightweight mode)
     embed: EmbedClient | None = None
     if settings.embeddings.enabled:
-        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
+        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings))
 
     if reset:
         # The flush is here and not under --full because the streams are shared: an
@@ -2522,7 +2522,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     embed: EmbedClient | None = None
     cleared_by_lock = False
     if settings.embeddings.enabled:
-        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings.redis))
+        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings))
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
         # Destruction is the opt-in, not enumeration -- see _index_project_inner.
         cleared_by_lock = await _check_model_lock(
