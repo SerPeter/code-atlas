@@ -446,6 +446,27 @@ def dream() -> None:
 
 
 @app.command()
+def bench(
+    path: str = typer.Argument(".", help="Repository to index. Defaults to the current project."),
+    backend: str = typer.Option(
+        "sqlite", "--backend", help="sqlite (a throwaway database) or memgraph (the configured one)."
+    ),
+    label: str = typer.Option("", "--label", help="Name this run in the report and in a stored baseline."),
+) -> None:
+    """Index a corpus and report where the time went, stage by stage.
+
+    Separates three things a single wall-clock number blends: work, contention, and
+    deliberate pacing. Production pacing constants are read and reported, never lowered
+    — a benchmark that speeds them up is measuring a system nobody runs.
+
+    Defaults to a throwaway SQLite database so a benchmark can never write into the
+    index you actually use. ``--backend memgraph`` opts in to the configured one, under
+    a ``bench-`` prefixed project name.
+    """
+    asyncio.run(_run_bench(path=path, backend=backend, label=label))
+
+
+@app.command()
 def ui(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address. Non-loopback exposes the whole graph."),
     port: int = typer.Option(
@@ -1466,6 +1487,112 @@ async def _mine_and_write_git_signals(
 # ---------------------------------------------------------------------------
 # Dream-mode async helper
 # ---------------------------------------------------------------------------
+
+
+async def _run_bench(*, path: str, backend: str, label: str) -> None:
+    """Async implementation of the ``atlas bench`` command.
+
+    Order matters in one place: the capture is installed *before* any client is built.
+    A lazy tracer caches its resolved handle once telemetry is enabled, so a graph
+    client constructed first would hold a handle to a provider this never sees, and the
+    run would report an empty table rather than an error.
+    """
+    import shutil
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from code_atlas.bench import capture, render, stub_provider
+
+    try:
+        cap = capture()
+    except ModuleNotFoundError:
+        logger.error(
+            "atlas bench needs the OTel SDK, which is an optional extra. Install it with: uv sync --extra otel"
+        )
+        raise typer.Exit(code=1) from None
+
+    from code_atlas.backends import connected
+    from code_atlas.indexing.orchestrator import index_project
+    from code_atlas.settings import derive_project_name
+
+    root, _ = _resolve_project_root(path)
+    scratch = Path(tempfile.mkdtemp(prefix="atlas-bench-"))
+    corpus = label or derive_project_name(root)
+
+    overrides: dict[str, object] = {"project_root": root}
+    if backend == "sqlite":
+        # Both halves pinned to a throwaway directory, and pinned *explicitly* rather
+        # than left on "auto": auto probes Memgraph first and falls back only if it is
+        # unreachable, so on a machine where it is up a benchmark would quietly write
+        # into the index someone actually queries.
+        overrides["backend"] = {"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(scratch)}
+    elif backend != "memgraph":
+        raise typer.BadParameter("--backend must be 'sqlite' or 'memgraph'")
+
+    settings = _load_settings(**overrides)
+    project_name = f"bench-{corpus}"
+
+    try:
+        # The stub wraps the whole run, including schema bootstrap: nothing inside may
+        # reach a provider. Everything above `litellm.aembedding` stays real, so
+        # chunking, batching, the rate limiter and the dedup lookup are still measured.
+        with stub_provider(settings.embeddings.dimension or 768) as provider:
+            async with connected(settings, with_bus=True, on_unreachable=_unreachable_backend) as backends:
+                bus = backends.bus
+                started = time.perf_counter()
+                result = await index_project(
+                    settings,
+                    backends.graph,  # ty: ignore[invalid-argument-type]
+                    bus,  # ty: ignore[invalid-argument-type]
+                    full_reindex=True,
+                    project_name=project_name,
+                )
+                total_s = time.perf_counter() - started
+
+        report = cap.report(
+            total_s=total_s,
+            corpus=f"{corpus} ({result.files_scanned} files, {result.entities_total} entities)",
+            backend=backend,
+            notes=(
+                "pacing constants are at production values and are reported, not lowered",
+                "work counters reproduce exactly between runs; times do not",
+                (f"embedding provider stubbed in-process: {provider.calls} calls, {provider.texts} texts, no network"),
+                (
+                    "the external line is embed_batch, which also holds the concurrency gate "
+                    "and the rate limiter - it is not provider latency alone"
+                ),
+            ),
+        )
+        if _output.json:
+            _json_output(
+                {
+                    "corpus": report.corpus,
+                    "backend": report.backend,
+                    "total_s": round(report.total_s, 3),
+                    "accounted_s": round(report.accounted_s, 3),
+                    "unaccounted_s": round(report.unaccounted_s, 3),
+                    "phases": [
+                        {
+                            "stage": p.stage,
+                            "phase": p.phase,
+                            "class": p.kind,
+                            "seconds": round(p.seconds, 4),
+                            "calls": p.calls,
+                            "units": p.units,
+                            "unit": p.unit_name,
+                        }
+                        for c in report.consumers
+                        for p in c.phases
+                    ],
+                    "round_trips": {f"{op}:{kind}": n for (op, kind), n in report.round_trips.items()},
+                    "work_counters": report.work_counters(),
+                }
+            )
+        else:
+            print(render(report))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 async def _run_dream() -> None:
