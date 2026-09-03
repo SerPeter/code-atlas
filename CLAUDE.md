@@ -53,7 +53,27 @@ atlas ui                         # Web UI; takes the first free port from 8420 u
 atlas daemon start               # Start indexing daemon (watcher + pipeline)
 atlas dream                      # Knowledge-vault lint report (inbox, orphans, dangling links, duplicates) + wiki/HOME.md
 atlas project rm <name>          # Delete a project's graph data (e.g. a stale worktree project)
+atlas bench                      # Index a corpus and report per-stage cost (throwaway SQLite db by default)
+atlas bench --repo <url> --ref <sha>   # ...against a pinned, cached clone instead
+atlas bench --record-baseline    # Store this run as the baseline; never happens automatically
+atlas bench --embed-transport    # Route embeddings over a local loopback endpoint (latency, jitter, 429s)
 ```
+
+**Benchmarks (ADR-0043).** `atlas bench` separates three numbers that a single wall-clock
+figure blends: **work**, **contention** (lock/semaphore waits) and **pacing** (drain settle,
+batch windows, poll intervals). Production pacing constants are read and reported, never
+lowered — on a small corpus pacing is most of the run.
+
+- **Counters are the comparison, not clocks.** Round-trips per `op`, rows, statements, events
+  and tokenizer calls reproduce exactly on any machine; `--record-baseline` then compares them
+  exactly, while stored timings never drive a verdict.
+- **A different machine, backend or corpus commit produces no comparison at all** — a report,
+  not a lenient threshold.
+- **It never reaches a provider.** Embeddings are stubbed at `litellm.aembedding`, the one line
+  on that path that leaves the machine, so chunking, batching, the limiter and the dedup lookup
+  stay real and measured.
+- It defaults to a **throwaway SQLite database**, pinned explicitly rather than left on `auto`,
+  so a benchmark can never write into the index you actually query.
 
 ## Architecture
 
