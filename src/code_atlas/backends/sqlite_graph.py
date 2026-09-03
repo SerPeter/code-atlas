@@ -164,6 +164,39 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS ix_edges_to ON edges(to_uid, rel_type);
 CREATE INDEX IF NOT EXISTS ix_edges_from_type ON edges(from_uid, rel_type);
 
+-- The two indices every label shares. `_node_index_ddl` builds ~124 partial indices
+-- from schema.py's registries, and each is `WHERE labels = '<Label>'` -- which SQLite
+-- can only use when the predicate names that same label as a **literal**. Three of the
+-- four hottest shapes never do:
+--
+--   labels = ?              a bound parameter; unknown when the plan is built
+--   labels IN (...)         does not imply any single-label predicate
+--   labels NOT IN (...)     implies the opposite of one
+--
+-- So the file-hash gate, the per-file diff, the resolution lookups and the worktree
+-- sweep all fell to `SCAN nodes`, on a table that grows with the whole graph. Measured
+-- with EXPLAIN QUERY PLAN, seven distinct hot statements scanned; with these two, none
+-- do.
+--
+-- Not fixed by adding more partial indices, and not fixable in schema.py either: those
+-- registries also drive Memgraph, which has no label-free index and genuinely needs
+-- per-label ones. The unqualified pair is a SQLite-side answer to a SQLite-side planner
+-- rule.
+CREATE INDEX IF NOT EXISTS ix_nodes_project_file ON nodes(project_name, file_path);
+CREATE INDEX IF NOT EXISTS ix_nodes_labels_project_name ON nodes(labels, project_name, name);
+
+-- The dedup lookup (ADR-0036) asks whether ANY node -- any project, any label -- already
+-- holds a vector for this text under this model, so no per-label index can serve it by
+-- construction. It ran once per embed batch and walked the whole table each time; on the
+-- graph sizes this backend is meant to reach, that is the expensive kind of once.
+-- Partial on `embedding IS NOT NULL` because the query says exactly that as a literal,
+-- which SQLite can prove -- and because it keeps the index to the rows that have vectors
+-- rather than to every node in the graph.
+CREATE INDEX IF NOT EXISTS ix_nodes_embed_hash ON nodes(
+    json_extract(props_json, '$.embed_hash'),
+    json_extract(props_json, '$.embed_model')
+) WHERE embedding IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT

@@ -215,13 +215,17 @@ class TestScanDetection:
         """Bidirectional on purpose.
 
         A detector that reports every statement as a scan would satisfy a one-sided
-        assertion while being useless, so a known index-seeking query has to come back
-        clean in the same run that a known scanning one is caught.
+        assertion while being useless, so a known scanning query has to be caught in the
+        same run that a known index-seeking one comes back clean.
 
-        `_get_batch_file_prop` is the scanning side, and it is worth naming: it is the
-        file-hash gate, whose entire purpose is to make an unchanged file cheap. Every
-        node index in this schema is partial (`WHERE labels = '<Label>'`), so its
-        `labels IN (...)` predicate can use none of them.
+        The scanning side is a **control statement written here**, not a product query.
+        It used to be `_get_batch_file_prop` — the file-hash gate — because that genuinely
+        scanned: every node index was partial (`WHERE labels = '<Label>'`) and its
+        `labels IN (...)` predicate could use none of them. Adding the two unqualified
+        indices fixed that, and this test failed, which is the suite working. But it
+        showed the test had been resting on a product defect as its fixture, so the next
+        fix would break it again. A `json_extract` on a key nobody indexes cannot be
+        optimised away by any schema change, so it stays a scan on purpose.
         """
         async with SqliteGraphClient(tmp_path / "g.sqlite3", dimension=8) as client:
             await client.ensure_schema()
@@ -230,14 +234,24 @@ class TestScanDetection:
             async with capture_statements(conn) as log:
                 await client.get_batch_file_hashes("testproj", ["a.py", "b.py"])
                 await client._nodes_by_uid(conn, ["testproj:module:a"])
+                # Through the proxy, not `conn.raw`: capture happens in the wrapper, so a
+                # raw execute is never recorded and the control would be silently absent.
+                cur = await conn.execute(
+                    "SELECT uid FROM nodes WHERE json_extract(props_json, '$.unindexed_control') = ?", ("x",)
+                )
+                await cur.close()
             report = await analyse_scans(conn, log)
 
         scanning_ops = {op for op, _, _ in report.scanning}
-        assert "_get_batch_file_prop" in scanning_ops, f"the file-hash gate was not flagged: {report.summary()}"
+        assert scanning_ops, f"the control statement was not flagged — the detector is silent: {report.summary()}"
         assert report.non_scanning >= 1, (
             f"no statement came back clean — the detector is flagging everything: {report.summary()}"
         )
         assert "_nodes_by_uid" not in scanning_ops, "a uid lookup should seek its index, not scan"
+        assert "_get_batch_file_prop" not in scanning_ops, (
+            "the file-hash gate is scanning again — ix_nodes_labels_project_name is gone or no longer applies, "
+            f"and every unchanged file now costs a walk of the whole nodes table: {report.summary()}"
+        )
 
     async def test_amplification_is_executions_times_rows(self):
         from code_atlas.backends.instrumentation import ScanReport

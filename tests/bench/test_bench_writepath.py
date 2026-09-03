@@ -163,6 +163,18 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
                     project_name=project,
                 )
             scans = await analyse_scans(conn, statements)
+            # A control, captured separately so it stays out of the measured window.
+            # Every product statement is now index-served, and "no scans found" is also
+            # what a broken detector reports -- so one statement that CANNOT be
+            # index-served has to come back flagged in the same run. A json_extract on a
+            # key nobody indexes cannot be optimised away by a later schema change, which
+            # is why the control is written here rather than borrowed from the product.
+            async with capture_statements(conn) as control_log:
+                cur = await conn.execute(
+                    "SELECT uid FROM nodes WHERE json_extract(props_json, '$.unindexed_control') = ?", ("x",)
+                )
+                await cur.close()
+            control = await analyse_scans(conn, control_log)
             entities = await backends.graph.count_entities(project)
             vectors_after = (await backends.graph.count_embeddings_by_project()).get(project, 0)
 
@@ -181,15 +193,17 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
         "new_entities": entities - entities_before,
         "new_vectors": vectors_after - vectors_before,
         "embedding_statements": by_op.get("_write_embedding_row", 0),
-        # Every node index in this schema is partial (`WHERE labels = '<Label>'`), so a
-        # predicate that does not name one label uses none of them. Amplification is row
-        # visits: scanning executions times table rows, which grows linearly with the
-        # corpus and makes the shape self-evident across the sweep (ATL-158).
+        # Amplification is row visits: scanning executions times table rows. It read 64
+        # -> 184 across this sweep while every node index was partial
+        # (`WHERE labels = '<Label>'`), because a predicate that does not name one label
+        # as a literal uses none of them. Three unqualified indices took it to 0; the
+        # number is kept because it is the thing that would move if they were dropped.
         "scan_amplification": scans.amplification,
         "scanning_statements": len(scans.scanning),
         "scanning_executions": scans.scanning_executions,
         "non_scanning_statements": scans.non_scanning,
         "scanning_ops": sorted({op for op, _sql, _n in scans.scanning}),
+        "detector_live": len(control.scanning) > 0,
         "by_op": by_op,
     }
 
@@ -334,16 +348,40 @@ class TestEmbeddingWriteVolume:
 
 
 class TestScanAmplification:
-    """What the partial-index schema costs, swept.
+    """That the hot write path plans as index seeks, and keeps doing so.
 
-    Every node index is `CREATE INDEX ... WHERE labels = '<Label>'` and there is no
-    unqualified index on `nodes`, so any `labels IN (...)` / `NOT IN (...)` predicate uses
-    none of them and falls to a full table scan. That includes `_get_batch_file_prop` —
-    the file-hash gate, whose entire purpose is making an unchanged file cheap.
+    This class was written the other way round. Every node index came from schema.py's
+    registries and was therefore partial -- `CREATE INDEX ... WHERE labels = '<Label>'` --
+    and SQLite can only use one of those when the predicate names that same label as a
+    **literal**. The three shapes that dominate the write path never do:
 
-    Reported, never fixed here. The epic measures; whether 124 partial indices are the
-    right shape is a separate decision that should be taken against a number.
+        labels = ?              a bound parameter, unknown when the plan is built
+        labels IN (...)         does not imply any single-label predicate
+        labels NOT IN (...)     implies the opposite of one
+
+    So the file-hash gate, the per-file diff, the resolution lookups, the worktree sweep
+    and the ADR-0036 dedup all fell to `SCAN nodes`, and this class reported that with
+    "reported, never fixed here -- whether 124 partial indices are the right shape is a
+    separate decision that should be taken against a number." The number was 64 row
+    visits at 50 entities and 184 at 146, on a batch held constant.
+
+    The decision was then taken. Three unqualified indices -- `(project_name, file_path)`,
+    `(labels, project_name, name)`, and a partial expression index on `embed_hash` --
+    took twelve scanning shapes to zero. Not more partial indices, and not a change in
+    schema.py either: those registries also drive Memgraph, which has no label-free index
+    and genuinely needs per-label ones.
+
+    So the class inverts. It now fails if a scan comes back, and it carries its own
+    control statement, because "no scans found" is also what a silent detector reports.
     """
+
+    def test_the_detector_is_live(self, sweep):
+        """Checked first, because every assertion below reads a zero as good news."""
+        for point in sweep:
+            assert point["detector_live"], (
+                f"ballast={point['ballast_files']}: the control statement, which cannot be index-served, "
+                "was not flagged — the scan report is silent and its zeros mean nothing"
+            )
 
     def test_amplification_is_reported_per_corpus_size(self, sweep):
         rows = [
@@ -359,32 +397,30 @@ class TestScanAmplification:
         print(f"\n(ballast, entities, scanning_stmts, scanning_execs, row_visits): {rows}")
         assert rows
 
-    def test_the_detector_discriminates(self, sweep):
-        """Bidirectional. A detector that flags everything satisfies a one-sided check
-        while being useless, so some statement must come back clean."""
-        last = sweep[-1]
-        assert int(last["scanning_statements"]) > 0, "no scanning statement found at all — the detector is silent"
-        assert int(last["non_scanning_statements"]) > 0, (
-            "every statement was flagged as a scan — the detector is not discriminating"
-        )
+    def test_nothing_on_the_write_path_scans(self, sweep):
+        """The regression this exists to catch.
 
-    def test_amplification_grows_with_the_corpus(self, sweep):
-        """The shape that makes the cost legible.
-
-        Row visits are scanning executions times table rows, so on a fixed batch this
-        climbs purely because the table got bigger. That is the argument the number
-        exists to make.
+        A scan reappearing is not a slow query in isolation -- it is a query whose cost
+        is the size of the whole graph, on a path that runs per file. That is invisible
+        on a test corpus and fatal on a real one, which is the only reason it survived
+        this long.
         """
-        first, last = int(sweep[0]["scan_amplification"]), int(sweep[-1]["scan_amplification"])
-        assert last > first, f"scan amplification did not grow with the corpus: {first} -> {last}"
+        for point in sweep:
+            ops = sorted(point["scanning_ops"])
+            assert not ops, (
+                f"ballast={point['ballast_files']}: {ops} plan as a full scan of nodes "
+                f"({point['scan_amplification']} row visits). An index was dropped, or a new predicate "
+                "uses `labels IN`/`NOT IN`/`= ?` in a shape the three unqualified indices do not cover."
+            )
 
-    def test_the_file_hash_gate_is_among_the_scanners(self, sweep):
+    def test_the_file_hash_gate_seeks_its_index(self, sweep):
         """Named specifically because it is the sharpest instance.
 
-        `_get_batch_file_prop` exists to make an unchanged file cheap, and it cannot use
-        a partial index. If this ever stops being true the schema changed, and the report
-        above should be re-read rather than trusted.
+        `_get_batch_file_prop` exists to make an unchanged file cheap. Scanning the node
+        table to decide that a file has not changed inverts the gate's entire purpose,
+        and does so more expensively the larger the graph gets.
         """
-        ops = set(sweep[-1]["scanning_ops"])
-        assert ops, "no scanning ops attributed"
-        print(f"\nops whose statements plan as a full scan of nodes: {sorted(ops)}")
+        for point in sweep:
+            assert "_get_batch_file_prop" not in set(point["scanning_ops"]), (
+                f"ballast={point['ballast_files']}: the file-hash gate is scanning again"
+            )
