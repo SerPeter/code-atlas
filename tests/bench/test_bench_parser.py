@@ -95,9 +95,27 @@ def test_parse_medium_corpus_instruction_count(benchmark, bench_medium: tuple[Pa
 
     Instruction counts do not care what else the machine is doing, so this is the one
     that can gate a pull request. Parsing is the right place to spend it: it is pure CPU
-    with no I/O, and it is where the time actually goes -- a profiled index of this
-    repo's own parsing package spent 0.957s in the parse phase, 0.600s of that in our
-    handlers against 0.129s in tree-sitter itself.
+    with no I/O -- the only `open` in the whole parsing package is unreachable from
+    `parse_file`, which is always handed its source -- and it is where the time actually
+    goes.
+
+    Re-profiled 2026-09-02 over this repo's own parsing package (20 files, ~840 KB). The
+    durable fact is the **ratio: handlers are roughly 6.5x tree-sitter**, which is why
+    counting instructions here is worth it. The absolutes are one machine and drift
+    between runs -- the parse phase measured 0.85s to 1.03s across repeats -- so take
+    them as a shape, not a budget: roughly **0.99s = 0.79s handlers + 0.12s tree-sitter
+    + 0.08s post-parse passes**, and over all of `src/code_atlas` (64 files, 2.68 MB)
+    2.90s = 2.27s + 0.37s + 0.26s.
+
+    That earlier figure -- "0.957s in the parse phase, 0.600s in our handlers against
+    0.129s in tree-sitter" -- was wrong and did not close: 0.600 + 0.129 leaves 24% of
+    the stated total unattributed and unmentioned. The tree-sitter number was right; the
+    handler number was not.
+
+    Where the handler time actually goes is not the main tree walk. By cumtime the late
+    whole-tree passes dominate: `_extract_text_blocks` 0.416s, `_extract_constant_reads`
+    0.265s and `_extract_config_refs` 0.206s, together 0.887s against `_walk_all_nodes`
+    at 0.431s. A benchmark aimed at "the tree walk" measures the smaller half.
 
     Deliberately NOT applied to test_vector_search_latency, which is the test that
     prompted reaching for this. That one is dominated by a network round-trip to
