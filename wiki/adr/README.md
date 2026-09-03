@@ -53,6 +53,9 @@ An ADR is a document that captures an important architectural decision made alon
 | [0040](./0040-oversized-nodes-are-split-two-different-ways.md)         | Oversized Nodes Are Split Two Different Ways                   | Accepted                      | 2026-08-30 |
 | [0041](./0041-a-version-belongs-to-the-dependency-not-the-package.md)  | A Version Belongs To The Dependency Not The Package            | Accepted                      | 2026-08-30 |
 | [0042](./0042-reindex-scope-and-destruction-are-separate-decisions.md) | Reindex Scope And Destruction Are Separate Decisions           | Proposed                      | 2026-08-31 |
+| [0043](./0043-benchmarks-count-work-and-account-for-waiting.md)        | Benchmarks Count Work And Account For Waiting                  | Accepted                      | 2026-09-03 |
+| [0044](./0044-the-coordination-store-follows-the-backend.md)           | The Coordination Store Follows The Backend Choice              | Accepted                      | 2026-09-03 |
+| [0045](./0045-sqlite-indexes-what-the-planner-can-prove.md)            | The SQLite Backend Indexes What The Planner Can Prove          | Accepted                      | 2026-09-03 |
 
 ## Creating a New ADR
 

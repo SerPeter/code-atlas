@@ -121,7 +121,13 @@ src/code_atlas/
 
 **Embedding dedup:** the graph is the dedup layer, not Valkey (ADR-0036). Before calling the provider, the
 embed stage asks whether any node — any project, any label — already has a vector for the same `embed_hash`
-under the same model, and copies it. Valkey carries streams, consumer groups and the indexer lease only.
+under the same model, and copies it. Valkey carries streams, consumer groups, the indexer lease and the
+rate-limit buckets — no vectors.
+
+**Pacing follows the backend (ADR-0044):** `backend.queue = "sqlite"` gets a `SqliteRateLimiter` holding the
+same buckets and AIMD factor in `ratelimit.sqlite3`; `"valkey"`/`"auto"` get the Valkey one. The two are
+hand-written mirrors (Lua cannot call Python) and are pinned together by
+`tests/integration/search/test_ratelimit_conformance.py` — edit both, or that test fails.
 
 **Oversized nodes (ADR-0040):** set `[embeddings] max_input_tokens` for any routed model name — litellm's
 registry has no entry for one, and an unknown cap means no chunking and no truncation, so a single
@@ -184,7 +190,10 @@ times. Almost all of that is avoidable.
   (graph, indexing, search, server, backends), so directory scoping is a natural unit. Do NOT re-run the
   full suite after every edit.
 - **Run the full suite once, at the end**, before reporting or committing. That is the gate; the iteration
-  loop is not.
+  loop is not. The gate is `uv run pytest tests/unit -n auto` (~70s) — a **bare `uv run pytest` also collects
+  `tests/integration` and `tests/bench`**, because nothing in `addopts` deselects them, so it needs Docker and
+  runs for 15+ minutes. Two runs were abandoned at 400s and 600s before this was noticed; the symptom looks
+  like a hang, not like a wider selection.
 - **Use `-n auto` for unit tests** — measured 63s → 31s. `pytest-xdist` is already a dev dependency.
   It is deliberately NOT in `addopts`, because it would also apply to single-test debugging runs where it
   adds startup cost, scrambles output order and breaks `pdb`.
