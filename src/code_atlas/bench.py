@@ -522,6 +522,13 @@ class CorpusProfile:
     labels: dict[str, int]
     files: int
     entities: int
+    files_by_language: dict[str, int] = field(default_factory=dict)
+    """Files per registered language.
+
+    Derived from `get_language_for_file`, the same lookup indexing uses, rather than from
+    bare extensions: `.h` routes by content and `Dockerfile` has no extension at all, so
+    an extension histogram would disagree with what was actually parsed.
+    """
 
     @property
     def doc_sections(self) -> int:
@@ -531,12 +538,26 @@ class CorpusProfile:
     def notes(self) -> int:
         return self.labels.get("Note", 0)
 
+    @property
+    def embed_chunks(self) -> int:
+        """Overflow vectors for entities too large for one provider call (ADR-0040).
+
+        Zero on a small corpus, and that is correct — so it is not required by default.
+        A corpus meant to exercise chunking asks for it explicitly via `missing`.
+        """
+        return self.labels.get("EmbedChunk", 0)
+
     def missing(self, *, require: tuple[str, ...] = ("DocSection",)) -> tuple[str, ...]:
         """Required labels the corpus did not produce."""
         return tuple(label for label in require if self.labels.get(label, 0) == 0)
 
     def summary(self) -> dict[str, int]:
-        return {"files": self.files, "entities": self.entities, **{k: v for k, v in sorted(self.labels.items()) if v}}
+        return {
+            "files": self.files,
+            "entities": self.entities,
+            **{k: v for k, v in sorted(self.labels.items()) if v},
+            **{f"lang:{k}": v for k, v in sorted(self.files_by_language.items()) if v},
+        }
 
 
 async def profile_corpus(graph: Any, project_name: str) -> CorpusProfile:
@@ -546,10 +567,22 @@ async def profile_corpus(graph: Any, project_name: str) -> CorpusProfile:
     a profile that worked on one and silently returned zeros on the other would be
     worse than none, since zero reads as "the corpus lacks this shape".
     """
+    from code_atlas.parsing.ast import get_language_for_file  # noqa: PLC0415
+
     labels = await graph.get_label_counts()
-    files = len(await graph.get_project_file_paths(project_name))
+    paths = await graph.get_project_file_paths(project_name)
     entities = await graph.count_entities(project_name)
-    return CorpusProfile(labels=dict(labels), files=files, entities=entities)
+
+    by_language: dict[str, int] = {}
+    for path in paths:
+        # Source is deliberately not passed. This counts which language *claims* the
+        # file; resolving the dialect of a shared suffix would need the bytes, which is
+        # not worth a read per file for a histogram.
+        config = get_language_for_file(path)
+        name = config.name if config is not None else "(none)"
+        by_language[name] = by_language.get(name, 0) + 1
+
+    return CorpusProfile(labels=dict(labels), files=len(paths), entities=entities, files_by_language=by_language)
 
 
 # ---------------------------------------------------------------------------

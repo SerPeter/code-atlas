@@ -454,6 +454,11 @@ def bench(
     label: str = typer.Option("", "--label", help="Name this run in the report and in a stored baseline."),
     repo: str = typer.Option("", "--repo", help="Git URL to clone, pin and cache instead of a local path."),
     ref: str = typer.Option("", "--ref", help="Commit, tag or branch to pin --repo to. Defaults to HEAD."),
+    require: list[str] | None = typer.Option(
+        None,
+        "--require",
+        help="Node label the corpus must produce, or the run fails (repeatable). Default: DocSection.",
+    ),
 ) -> None:
     """Index a corpus and report where the time went, stage by stage.
 
@@ -465,7 +470,7 @@ def bench(
     index you actually use. ``--backend memgraph`` opts in to the configured one, under
     a ``bench-`` prefixed project name.
     """
-    asyncio.run(_run_bench(path=path, backend=backend, label=label, repo=repo, ref=ref))
+    asyncio.run(_run_bench(path=path, backend=backend, label=label, repo=repo, ref=ref, require=require))
 
 
 @app.command()
@@ -1525,7 +1530,7 @@ def _bench_payload(report: Any, profile: Any, corpus: Any) -> dict[str, Any]:
     }
 
 
-def _emit_bench(report: Any, profile: Any, corpus: Any) -> None:
+def _emit_bench(report: Any, profile: Any, corpus: Any, require: tuple[str, ...] = ("DocSection",)) -> None:
     """Print a bench run, then fail if the corpus was missing a shape it needed.
 
     The failure is not a warning. A corpus with no DocSection leaves the whole doc-link
@@ -1541,7 +1546,7 @@ def _emit_bench(report: Any, profile: Any, corpus: Any) -> None:
         _echo("")
         _echo(f"corpus profile: {profile.summary()}")
 
-    missing = profile.missing()
+    missing = profile.missing(require=require)
     if missing:
         logger.error(
             "Corpus produced no {} — the paths that depend on them never ran, so these numbers understate the work.",
@@ -1550,7 +1555,9 @@ def _emit_bench(report: Any, profile: Any, corpus: Any) -> None:
         raise typer.Exit(code=1)
 
 
-async def _run_bench(*, path: str, backend: str, label: str, repo: str = "", ref: str = "") -> None:
+async def _run_bench(
+    *, path: str, backend: str, label: str, repo: str = "", ref: str = "", require: list[str] | None = None
+) -> None:
     """Async implementation of the ``atlas bench`` command.
 
     Order matters in one place: the capture is installed *before* any client is built.
@@ -1634,7 +1641,7 @@ async def _run_bench(*, path: str, backend: str, label: str, repo: str = "", ref
                 ),
             ),
         )
-        _emit_bench(report, profile, target)
+        _emit_bench(report, profile, target, tuple(require) if require else ("DocSection",))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

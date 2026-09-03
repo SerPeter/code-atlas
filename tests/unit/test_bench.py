@@ -338,3 +338,65 @@ class TestCorpusProfile:
         summary = profile.summary()
         assert summary["Callable"] == 3
         assert "Note" not in summary, "a zero count reads as a shape the corpus has"
+
+
+class TestOfflineBehaviour:
+    """No network must degrade honestly: a cached corpus works, an uncached one says so."""
+
+    def test_a_cached_corpus_resolves_after_the_source_is_gone(self, tmp_path):
+        """The offline path, proved by deleting the remote rather than by mocking it.
+
+        This is also what makes the cache trustworthy: resolving a cached corpus performs
+        no fetch at all, so it cannot pick up a moved ref behind a comparison's back.
+        """
+        from code_atlas.bench import resolve_corpus
+
+        src = tmp_path / "src"
+        TestCorpusResolution._source_repo(src)
+        url = src.as_uri()
+        first = resolve_corpus(url, cache=tmp_path / "cache")
+
+        # Renamed rather than deleted: git marks its object files read-only, so rmtree
+        # raises PermissionError on Windows. Moving it makes the URL just as dead.
+        src.rename(tmp_path / "src-moved")
+        second = resolve_corpus(url, cache=tmp_path / "cache")
+
+        assert second.reused_cache is True
+        assert second.commit == first.commit
+        assert (second.path / "a.py").exists()
+
+    def test_an_uncached_unreachable_corpus_fails_with_a_named_reason(self, tmp_path):
+        """Never a silent substitution — a benchmark that quietly measures nothing is worse
+        than one that stops."""
+        from code_atlas.bench import resolve_corpus
+
+        missing = (tmp_path / "does-not-exist").as_uri()
+        with pytest.raises(RuntimeError) as exc:
+            resolve_corpus(missing, cache=tmp_path / "cache")
+
+        assert "fetch" in str(exc.value).lower()
+        assert missing in str(exc.value), "the error must name the corpus it could not get"
+
+
+class TestPerLanguageCounts:
+    def test_languages_are_counted_by_the_lookup_indexing_uses(self):
+        from code_atlas.bench import CorpusProfile
+
+        profile = CorpusProfile(
+            labels={"Callable": 4},
+            files=10,
+            entities=4,
+            files_by_language={"python": 9, "markdown": 1, "(none)": 0},
+        )
+        summary = profile.summary()
+        assert summary["lang:python"] == 9
+        assert summary["lang:markdown"] == 1
+        assert "lang:(none)" not in summary, "a zero count reads as a language the corpus has"
+
+    def test_embed_chunks_are_reported_but_not_required_by_default(self):
+        from code_atlas.bench import CorpusProfile
+
+        small = CorpusProfile(labels={"DocSection": 1}, files=2, entities=2)
+        assert small.embed_chunks == 0
+        assert small.missing() == (), "a small corpus must not fail for lacking oversized entities"
+        assert small.missing(require=("EmbedChunk",)) == ("EmbedChunk",)
