@@ -1634,6 +1634,19 @@ def _emit_bench(report: Any, profile: Any, corpus: Any, require: tuple[str, ...]
         raise typer.Exit(code=1)
 
 
+def _handle_baseline(baseline_dir: str, *, backend: str, corpus: str, report: Any, commit: str, record: bool) -> None:
+    """Record or compare, never both. Recording is only ever explicit."""
+    from code_atlas.bench import baseline_path, compare_baseline, save_baseline
+
+    path = baseline_path(baseline_dir, backend=backend, corpus=corpus)
+    if record:
+        save_baseline(path, report=report, corpus_commit=commit)
+        _echo(f"baseline written to {path}")
+        return
+    _echo("")
+    _echo(compare_baseline(path, report=report, corpus_commit=commit).render())
+
+
 async def _run_bench(
     *,
     path: str,
@@ -1660,12 +1673,9 @@ async def _run_bench(
     from code_atlas.bench import (
         StubStats,
         TransportConfig,
-        baseline_path,
         capture,
-        compare_baseline,
         count_tokenizer,
         profile_corpus,
-        save_baseline,
         stub_provider,
     )
     from code_atlas.bench import embed_transport as embed_transport_ctx
@@ -1716,6 +1726,13 @@ async def _run_bench(
         try:
             async with connected(settings, with_bus=True, on_unreachable=_unreachable_backend) as backends:
                 bus = backends.bus
+                # `index_project` does not create the schema — only `_run_index` did, so
+                # a bench run had no text or vector indices and every FTS/vec write was
+                # skipped as "no such index". That understates write cost and leaves both
+                # search arms measuring an empty engine. Inside the timed region because
+                # it is work a real first index pays too; on a warm database it is a
+                # version check.
+                await backends.graph.ensure_schema()
                 started = time.perf_counter()
                 result = await index_project(
                     settings,
@@ -1749,13 +1766,14 @@ async def _run_bench(
                 )
                 raise typer.Exit(code=1)
 
-            path = baseline_path(baseline_dir, backend=backend, corpus=corpus)
-            if record_baseline:
-                save_baseline(path, report=report, corpus_commit=target.commit)
-                _echo(f"baseline written to {path}")
-            else:
-                _echo("")
-                _echo(compare_baseline(path, report=report, corpus_commit=target.commit).render())
+            _handle_baseline(
+                baseline_dir,
+                backend=backend,
+                corpus=corpus,
+                report=report,
+                commit=target.commit,
+                record=record_baseline,
+            )
 
             _emit_bench(report, profile, target, tuple(require) if require else ("DocSection",))
         finally:
