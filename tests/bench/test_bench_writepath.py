@@ -121,6 +121,11 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
     cap = capture()
     with stub_provider(16):
         async with use_backends(settings, with_bus=True) as backends:
+            # `index_project` does not create the schema -- the CLI calls `ensure_schema`
+            # separately. Without it every FTS5 and vec0 write is swallowed by
+            # `_safe_exec` as "no such table", so the measured system has no text or
+            # vector index at all and its write cost is understated.
+            await backends.graph.ensure_schema()
             # Load-bearing arm: build the graph to size M. Not measured.
             await index_project(
                 settings,

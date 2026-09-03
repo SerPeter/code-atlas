@@ -59,6 +59,11 @@ async def _run(root: Path, db_dir: Path, project: str) -> BenchReport:
     cap.clear()
     with stub_provider(settings.embeddings.dimension or 768):
         async with use_backends(settings, with_bus=True) as backends:
+            # `index_project` does not create the schema -- the CLI calls `ensure_schema`
+            # separately. Without it every FTS5 and vec0 write is swallowed by
+            # `_safe_exec` as "no such table", so the measured system has no text or
+            # vector index at all and its write cost is understated.
+            await backends.graph.ensure_schema()
             started = time.perf_counter()
             await index_project(
                 settings,

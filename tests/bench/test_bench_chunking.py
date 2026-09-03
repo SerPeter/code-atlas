@@ -90,6 +90,11 @@ async def _index(root: Path, db_dir: Path, project: str, *, max_source_chars: in
     cap.clear()
     with stub_provider(32):
         async with use_backends(settings, with_bus=True) as backends:
+            # `index_project` does not create the schema -- the CLI calls `ensure_schema`
+            # separately. Without it every FTS5 and vec0 write is swallowed by
+            # `_safe_exec` as "no such table", so the measured system has no text or
+            # vector index at all and its write cost is understated.
+            await backends.graph.ensure_schema()
             await index_project(
                 settings,
                 backends.graph,  # ty: ignore[invalid-argument-type]
