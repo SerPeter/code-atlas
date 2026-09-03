@@ -87,6 +87,14 @@ async def indexed(graph_client: GraphClient, event_bus: EventBus, tmp_path: Path
     # test that calls it afterwards finds an empty reader and reads that as "this run
     # issued no queries". Same ordering trap as the CLI, where a graph client built first
     # holds a lazy tracer resolved against a provider the harness never sees.
+    # `index_project` does not create the schema; the CLI calls `ensure_schema`
+    # separately. Without it Memgraph has no text or vector indices at all, every
+    # `text_search.search_all` and `vector_search.search` fails with "index doesn't
+    # exist", and the client catches and warns — so both arms return nothing and the
+    # run still looks clean. Identical to the SQLite arm's failure, in a different
+    # engine's error message.
+    await graph_client.ensure_schema()
+
     cap = capture()
     cap.clear()
     with stub_provider(graph_client.dimension):
