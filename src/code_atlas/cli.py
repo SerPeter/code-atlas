@@ -1634,13 +1634,29 @@ async def _run_bench(
             notes=(
                 "pacing constants are at production values and are reported, not lowered",
                 "work counters reproduce exactly between runs; times do not",
-                (f"embedding provider stubbed in-process: {provider.calls} calls, {provider.texts} texts, no network"),
+                (
+                    f"embedding provider stubbed in-process: {provider.calls} calls, "
+                    f"{provider.texts} texts, {provider.tokenizer_calls} tokenizer calls, no network"
+                ),
+                f"vector provenance (ADR-0036): {cap.embedding_provenance() or 'none recorded'}",
                 (
                     "the external line is embed_batch, which also holds the concurrency gate "
                     "and the rate limiter - it is not provider latency alone"
                 ),
             ),
         )
+        # Fail closed. If embeddings were enabled and the stub saw no traffic, either the
+        # stage did not run or something reached past the seam — both make the numbers a
+        # lie, and a silent zero here is exactly the shape of a benchmark that quietly
+        # measures nothing.
+        if settings.embeddings.enabled and provider.calls == 0 and result.entities_total > 0:
+            logger.error(
+                "The embedding stub was never called on a run with {} entities — the embed stage "
+                "either did not run or bypassed the provider seam.",
+                result.entities_total,
+            )
+            raise typer.Exit(code=1)
+
         _emit_bench(report, profile, target, tuple(require) if require else ("DocSection",))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

@@ -400,3 +400,55 @@ class TestPerLanguageCounts:
         assert small.embed_chunks == 0
         assert small.missing() == (), "a small corpus must not fail for lacking oversized entities"
         assert small.missing(require=("EmbedChunk",)) == ("EmbedChunk",)
+
+
+class TestTokenizerAccounting:
+    """`litellm.encode` is the embed stage's largest piece of pure CPU and nothing measured it.
+
+    `_truncate_texts` encodes every text to decide whether it needs truncating, and
+    `split_text` encodes the same text repeatedly walking down the border ladder. On the
+    sample corpus that is 71 tokenizer calls for 36 texts — not a rounding error, and
+    entirely our own code.
+    """
+
+    async def test_tokenizer_calls_are_counted(self):
+        import contextlib
+
+        import litellm
+
+        from code_atlas.bench import stub_provider
+
+        with stub_provider(dimension=8) as stats:
+            for _ in range(3):
+                # An unmapped model raises inside litellm. The call still happened and
+                # still counts — the counter measures our calls, not their outcomes.
+                with contextlib.suppress(Exception):
+                    litellm.encode(model="text-embedding-3-small", text="hello")
+
+        assert stats.tokenizer_calls == 3
+
+    async def test_the_real_tokenizer_is_restored(self):
+        import litellm
+
+        from code_atlas.bench import stub_provider
+
+        original = litellm.encode
+        with stub_provider(dimension=8):
+            assert litellm.encode is not original
+        assert litellm.encode is original
+
+    async def test_the_tokenizer_is_restored_when_the_body_raises(self):
+        import litellm
+
+        from code_atlas.bench import stub_provider
+
+        original = litellm.encode
+        with pytest.raises(RuntimeError), stub_provider(dimension=8):
+            raise RuntimeError("boom")
+        assert litellm.encode is original
+
+    async def test_the_summary_carries_all_three_counts(self):
+        from code_atlas.bench import StubStats
+
+        stats = StubStats(calls=2, texts=36, tokenizer_calls=71)
+        assert stats.summary() == {"provider_calls": 2, "texts_embedded": 36, "tokenizer_calls": 71}

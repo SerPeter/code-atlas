@@ -312,6 +312,7 @@ class TelemetryCapture:
             stage_seconds=meter.create_histogram("atlas_stage_seconds", unit="s"),
             graph_query_seconds=meter.create_histogram("atlas_graph_query_seconds", unit="s"),
             parse_seconds=meter.create_histogram("atlas_parse_seconds", unit="s"),
+            embeddings_total=meter.create_counter("atlas_embeddings_total"),
             parse_bytes=meter.create_histogram("atlas_parse_bytes", unit="By"),
         )
         tel._enabled = True  # noqa: SLF001
@@ -384,6 +385,27 @@ class TelemetryCapture:
                         counts[key] = counts.get(key, 0) + int(getattr(point, "count", 0))
         return counts
 
+    def embedding_provenance(self) -> dict[str, int]:
+        """Where each vector came from: unchanged / dedup / api.
+
+        The split ADR-0036 turns on. "2,346 API calls, 0 cache hits" is the measurement
+        that justified making the graph the dedup layer, and nothing was reporting it at
+        the time -- it had to be reconstructed from logs afterwards.
+        """
+        out: dict[str, int] = {}
+        data = self.reader.get_metrics_data()
+        if data is None:
+            return out
+        for rm in data.resource_metrics:
+            for sm in rm.scope_metrics:
+                for metric in sm.metrics:
+                    if metric.name != "atlas_embeddings_total":
+                        continue
+                    for point in metric.data.data_points:
+                        source = str((point.attributes or {}).get("source"))
+                        out[source] = out.get(source, 0) + int(getattr(point, "value", 0))
+        return out
+
     def report(
         self, *, total_s: float, corpus: str = "", backend: str = "", notes: tuple[str, ...] = ()
     ) -> BenchReport:
@@ -445,9 +467,22 @@ class StubStats:
 
     calls: int = 0
     texts: int = 0
+    tokenizer_calls: int = 0
+    """`litellm.encode` invocations.
+
+    Counted because it is the embed stage's largest piece of pure CPU and nothing
+    measures it: `_truncate_texts` encodes every text, and `split_text` encodes the same
+    text repeatedly as the splitter walks down the border ladder looking for a cut. On a
+    corpus with oversized entities this is not a rounding error, and it is entirely our
+    own code -- exactly the kind of cost this suite exists to make visible.
+    """
 
     def summary(self) -> dict[str, int]:
-        return {"provider_calls": self.calls, "texts_embedded": self.texts}
+        return {
+            "provider_calls": self.calls,
+            "texts_embedded": self.texts,
+            "tokenizer_calls": self.tokenizer_calls,
+        }
 
 
 def _deterministic_vector(text: str, dimension: int) -> list[float]:
@@ -485,10 +520,17 @@ def stub_provider(dimension: int) -> Iterator[StubStats]:
     """
     from types import SimpleNamespace  # noqa: PLC0415
 
+    import litellm  # noqa: PLC0415
+
     from code_atlas.search.embeddings import EmbedClient  # noqa: PLC0415
 
     stats = StubStats()
     real = EmbedClient._embed_call  # noqa: SLF001 - substituting the network boundary is the point
+    real_encode = litellm.encode
+
+    def _counting_encode(*args: Any, **kwargs: Any) -> Any:
+        stats.tokenizer_calls += 1
+        return real_encode(*args, **kwargs)
 
     async def _stub(_self: Any, kwargs: dict[str, Any]) -> Any:
         texts = list(kwargs.get("input") or [])
@@ -497,10 +539,12 @@ def stub_provider(dimension: int) -> Iterator[StubStats]:
         return SimpleNamespace(data=[{"embedding": _deterministic_vector(t, dimension)} for t in texts])
 
     EmbedClient._embed_call = _stub  # ty: ignore[invalid-assignment]  # noqa: SLF001 - substituting the network boundary is the point
+    litellm.encode = _counting_encode
     try:
         yield stats
     finally:
         EmbedClient._embed_call = real  # noqa: SLF001 - substituting the network boundary is the point
+        litellm.encode = real_encode
 
 
 # ---------------------------------------------------------------------------
