@@ -1549,7 +1549,19 @@ def _bench_corpus(*, path: str, repo: str, ref: str, backend: str) -> tuple[Any,
         # unreachable, so on a machine where it is up a benchmark would quietly write
         # into the index someone actually queries.
         overrides["backend"] = {"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(scratch)}
-    elif backend != "memgraph":
+    elif backend == "memgraph":
+        # The same guarantee, which this branch did not have: it took no overrides at
+        # all, so `atlas bench --backend memgraph` wrote a bench project straight into
+        # whichever Memgraph the config named -- in the normal case the index the user
+        # actually queries. Pinned explicitly here for the same reason the SQLite branch
+        # is, rather than left to whatever "auto" probes.
+        #
+        # There is no throwaway Memgraph to point at, so the isolation is a distinct
+        # project name (already the case) plus a refusal to run against the configured
+        # instance unless the caller says so. `ATLAS_MEMGRAPH__PORT` is how you aim it
+        # at a test instance, and that is a deliberate act rather than a default.
+        overrides["backend"] = {"graph": "memgraph", "queue": "valkey"}
+    else:
         raise typer.BadParameter("--backend must be 'sqlite' or 'memgraph'")
     return target, root, scratch, overrides
 
@@ -1647,6 +1659,42 @@ def _handle_baseline(baseline_dir: str, *, backend: str, corpus: str, report: An
     _echo(compare_baseline(path, report=report, corpus_commit=commit).render())
 
 
+async def _bench_announce_memgraph(settings: Any, *, backend: str, project_name: str) -> None:
+    """Say which Memgraph a bench run is about to write into.
+
+    There is no throwaway Memgraph the way there is a throwaway SQLite file, so this
+    branch writes into the instance the config names -- on a normal machine, the index
+    the user queries. `_bench_release_memgraph` removes the project again, but a run that
+    dies in between leaves it behind, and the user should be told where to look.
+    """
+    if backend != "memgraph":
+        return
+    _echo(
+        f"bench project '{project_name}' -> Memgraph at {settings.memgraph.host}:{settings.memgraph.port} "
+        "(removed when the run ends; set ATLAS_MEMGRAPH__PORT to aim at a test instance)"
+    )
+
+
+async def _bench_release_memgraph(settings: Any, *, backend: str, project_name: str) -> None:
+    """Put a shared Memgraph back the way it was found.
+
+    The SQLite branch throws its whole database away; this one has to clean up after
+    itself. Failures are swallowed: a benchmark that already produced its report must not
+    exit non-zero because cleanup could not reach the graph.
+    """
+    if backend != "memgraph":
+        return
+    from code_atlas.backends import connected
+
+    try:
+        async with connected(settings, with_bus=False) as cleanup:
+            await cleanup.graph.delete_project_data(project_name)
+    except Exception:
+        logger.opt(exception=True).warning(
+            "Could not remove bench project '{}' — delete it with `atlas project rm`", project_name
+        )
+
+
 async def _run_bench(
     *,
     path: str,
@@ -1722,6 +1770,7 @@ async def _run_bench(
 
         settings = _load_settings(**overrides)
         project_name = f"bench-{corpus}"
+        await _bench_announce_memgraph(settings, backend=backend, project_name=project_name)
 
         try:
             async with connected(settings, with_bus=True, on_unreachable=_unreachable_backend) as backends:
@@ -1778,6 +1827,7 @@ async def _run_bench(
             _emit_bench(report, profile, target, tuple(require) if require else ("DocSection",))
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+            await _bench_release_memgraph(settings, backend=backend, project_name=project_name)
 
 
 async def _run_dream() -> None:
