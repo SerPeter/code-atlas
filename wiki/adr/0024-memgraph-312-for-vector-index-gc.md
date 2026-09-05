@@ -90,6 +90,18 @@ as licence to switch back.
 still reproduces on 3.12.0; its fix ([#4475](https://github.com/memgraph/memgraph/pull/4475)) is merged but milestoned
 for an unreleased 3.13.0. If crashes recur, that is the expected next suspect, not evidence the upgrade failed.
 
+> **Re-checked 2026-09-06 — still true.** #4473 is now _closed_ and #4475 merged to master on 2026-07-25, but the
+> milestone is still `mg-v3.13.0` and **3.13.0 has not been released**: the newest release remains 3.12.0 (2026-07-15),
+> which shipped ten days _before_ the fix merged. So the pin is still the newest build available and it still carries
+> the bug. This is also why `_EMBED_WRITE_CONCURRENCY = 2` (`indexing/consumers.py`) stays bounded rather than being
+> removed — that constant's entire justification is this issue. Upgrade to 3.13.0 when it exists, then re-evaluate the
+> semaphore.
+>
+> One detail worth recording, because it loosens the link this ADR draws: the upstream crash is in
+> `InMemoryEdgeTypePropertyIndex::RemoveObsoleteEntries` — an _edge-type-property_ index, not a vector index. #4475 pins
+> object stores during index cleanup generally, so it plausibly covers vector-index GC too, but nothing upstream says
+> so. Our own crashes were correlated with vector indices coming into existence; that correlation is ours, not theirs.
+
 Ruled out with evidence so they are not re-litigated: it is **not** memory pressure, **not** MAGE (#4473 was reported
 against the plain `memgraph/memgraph` image), and **not** WAL or snapshots (that reporter disabled both independently
 with no effect).
