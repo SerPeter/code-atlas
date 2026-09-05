@@ -928,7 +928,16 @@ class ASTConsumer(TierConsumer):
             # Final resolution flush for any remaining deferred rels, plus the
             # end-of-run citation retry sweep (which must run even when every
             # buffer is already empty — see _flush_deferred_resolution).
-            await self._flush_deferred_resolution(final=True)
+            #
+            # Inside a phase, unlike before. The interim flushes are wrapped where
+            # process_batch calls them, but this one was not, so the benchmark saw
+            # `ast.resolve` twice and attributed the final flush to nothing. On this
+            # repo that hid **128 seconds** -- 76% of the run's wall clock -- in the
+            # report's "pacing + gaps" line, which is exactly the case
+            # `BenchReport.unaccounted_s` warns about: "if this grows and no phase did,
+            # something is running that nobody is measuring."
+            with timed_phase("ast", "final_flush", rels=self._pending_rel_count()):
+                await self._flush_deferred_resolution(final=True)
 
     def _pending_rel_count(self) -> int:
         """Relationships buffered since the last flush — what a deferred flush costs in memory."""
@@ -1077,6 +1086,18 @@ class ASTConsumer(TierConsumer):
                 # just became resolvable is already in this lookup's import_map —
                 # strategy 1 of _resolve_one_call reads exactly that.
                 shared_lookup, td_map = await self.graph.build_resolution_lookup(project_name)
+                # Heartbeat between each of these, not just after all four. Teardown
+                # cancels a consumer that has shown no progress for `_CONSUMER_STALL_S`
+                # (120s), and this block is the most expensive in the flush:
+                # `build_resolution_lookup` alone measured 405ms on a 592-module project
+                # and 812ms on one with more classes, and `resolve_calls` is heavier
+                # still. One heartbeat covering all four means the watchdog can only
+                # tell "working" from "stuck" at the granularity of the whole block --
+                # and on a large enough project that block exceeds the window, so the
+                # final flush is cancelled mid-resolution and the run's whole-project
+                # sweeps never run. Measured on this repo: the final flush takes ~128s
+                # against a 120s window, i.e. it is cancelled 8 seconds from finishing.
+                self.note_progress()
                 if proj_calls:
                     replay = await self.graph.resolve_calls(
                         project_name,
@@ -1087,12 +1108,14 @@ class ASTConsumer(TierConsumer):
                     )
                     unresolved += replay.unresolved
                     stale_candidates += replay.stale_candidates
+                    self.note_progress()
                 if proj_types:
                     replay = await self.graph.resolve_type_refs(
                         project_name, proj_types, lookup=shared_lookup, name_to_typedefs=td_map
                     )
                     unresolved += replay.unresolved
                     stale_candidates += replay.stale_candidates
+                    self.note_progress()
                 if proj_members:
                     await self.graph.resolve_member_defines(
                         project_name, proj_members, lookup=shared_lookup, name_to_typedefs=td_map
@@ -1146,6 +1169,7 @@ class ASTConsumer(TierConsumer):
         if final:
             for project_name in self._citation_projects:
                 await self.graph.resolve_citations(project_name, {}, retry_unresolved=True)
+                self.note_progress()
             self._citation_projects.clear()
 
         # Reference-counted GC, last: every project's resolve_config_refs above
@@ -2086,6 +2110,12 @@ class EmbedConsumer(TierConsumer):
             with logger.contextualize(consumer=self.consumer_name):
                 deferred = await self.process_batch(events, batch_id) or set()
             await self._ack_processed(events, msg_ids, deferred)
+            # The base class does this and the override dropped it, so `progress_at`
+            # stayed 0.0 for the life of the process -- measured. Teardown reads
+            # `max(c.progress_at ...)` across consumers, so an embed consumer that was
+            # still writing contributed nothing to the "is anyone making progress"
+            # decision and was indistinguishable from a wedged one.
+            self.note_progress()
         except Exception:
             outcome = "failed"
             logger.exception("{} batch {} failed, will retry via PEL", self.consumer_name, batch_id)
