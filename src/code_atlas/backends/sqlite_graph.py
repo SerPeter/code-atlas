@@ -296,6 +296,26 @@ def _prefix_clause(column: str, path: str) -> tuple[str, list[Any]]:
 _LIKE_ESCAPES = (("\\", "\\\\"), ("%", "\\%"), ("_", "\\_"))
 
 
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _ascii_fold(value: str) -> str:
+    """Lower-case exactly the characters SQLite's ``LIKE`` folds, and no others.
+
+    ``LIKE`` is case-insensitive by default, but only over ASCII -- ``'ÄÖ.md' LIKE
+    '%äö.md'`` is 0 while ``'README.md' LIKE '%readme.md'`` is 1, and this file never sets
+    ``PRAGMA case_sensitive_like``. So a Python suffix match has to fold the same subset:
+    ``str.endswith`` alone is too strict and ``str.lower()`` is too permissive, and both
+    are wrong in a way that shows up as edges rather than errors.
+
+    Too strict is the dangerous direction. A doc reference to ``readme.md`` in a project
+    holding both ``docs/readme.md`` and ``README.md`` has two candidates and is correctly
+    refused; matching case-sensitively leaves one candidate and writes a confident
+    DOCUMENTS edge to an arbitrary one of two equally plausible targets.
+    """
+    return value.translate(_ASCII_FOLD)
+
+
 def _like_literal(value: str) -> str:
     """Escape *value* for use inside a ``LIKE`` pattern.
 
@@ -1380,8 +1400,8 @@ class SqliteGraphClient:
 
         # Suffix matching moves into Python, over distinct paths rather than nodes: a
         # file with 40 entities is one comparison here and was 40 rows in the old scan.
-        # `_like_literal` escaped LIKE's `%`/`_` so the old match was already literal —
-        # `str.endswith` is the same predicate without the escaping.
+        # `_like_literal` escaped LIKE's `%`/`_`, so the old match was already literal in
+        # that respect -- but it was NOT case-sensitive, and `str.endswith` is.
         uids_by_path: dict[str, list[str]] = defaultdict(list)
         if file_refs:
             cur = await conn.execute(
@@ -1395,7 +1415,8 @@ class SqliteGraphClient:
                 uids_by_path[file_path].append(uid)
 
         def _file_candidates(suffix: str) -> list[str]:
-            return [uid for path, uids in uids_by_path.items() if path.endswith(suffix) for uid in uids]
+            folded = _ascii_fold(suffix)
+            return [uid for path, uids in uids_by_path.items() if _ascii_fold(path).endswith(folded) for uid in uids]
 
         writes: list[tuple[str, str, str]] = []
         for r in doc_rels:

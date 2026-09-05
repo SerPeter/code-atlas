@@ -129,6 +129,42 @@ class TestFileReferences:
         assert await _documents(client) == [("proj:note:doc", "proj:src.mod.py.fn")]
 
 
+class TestCaseFolding:
+    """SQLite's LIKE folds ASCII case; `str.endswith` does not. Matching it is not a
+    detail — getting it wrong writes edges rather than raising.
+
+    This was shipped wrong and caught by an adversarial review of the change. The batched
+    rewrite used a bare `str.endswith`, which is case-SENSITIVE, so it silently shrank the
+    candidate set. Shrinking is the dangerous direction: two candidates means the edge is
+    correctly refused, and one means a confident edge to an arbitrary target.
+    """
+
+    async def test_an_ascii_case_difference_still_makes_it_ambiguous(self, client):
+        """The regression that mattered. `LIKE '%readme.md'` matched both of these, so the
+        link was refused; a case-sensitive match sees one and writes an edge to it."""
+        await client.upsert_file_entities("proj", "docs/readme.md", [_entity("a", path="docs/readme.md")], [])
+        await client.upsert_file_entities("proj", "README.md", [_entity("b", path="README.md")], [])
+        await client.resolve_doc_links("proj", [_link("readme.md", is_file_ref=True)])
+        assert await _documents(client) == [], (
+            "a reference matching two files differing only in case resolved to one of them"
+        )
+
+    async def test_a_differently_cased_reference_still_matches(self, client):
+        """The mirror: matching too strictly loses an edge that used to resolve."""
+        await client.upsert_file_entities("proj", "docs/readme.md", [_entity("a", path="docs/readme.md")], [])
+        await client.resolve_doc_links("proj", [_link("README.md", is_file_ref=True)])
+        assert await _documents(client) == [("proj:note:doc", "proj:docs.readme.md.a")]
+
+    async def test_folding_stops_at_ascii_like_sqlite_does(self, client):
+        """`str.lower()` would be the obvious fix and is also wrong — it folds Unicode,
+        while LIKE folds only A-Z. Verified against SQLite: `'ÄÖ.md' LIKE '%äö.md'` is 0.
+        Over-folding invents candidates, which turns a resolvable link into an ambiguous
+        one and silently drops it."""
+        await client.upsert_file_entities("proj", "docs/ÄÖ.md", [_entity("a", path="docs/ÄÖ.md")], [])
+        await client.resolve_doc_links("proj", [_link("äö.md", is_file_ref=True)])
+        assert await _documents(client) == []
+
+
 class TestBatching:
     async def test_queries_do_not_scale_with_relationship_count(self, client):
         """The whole point. Two lookups per flush, whatever the flush holds."""
