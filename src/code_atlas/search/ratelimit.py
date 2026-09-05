@@ -32,6 +32,8 @@ import aiosqlite
 import redis.asyncio as aioredis
 from loguru import logger
 
+from code_atlas.settings import ensure_sqlite_data_dir
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -684,6 +686,6 @@ def make_rate_limiter(
     would quietly stop being shared.
     """
     if settings.backend.queue == "sqlite":
-        data_dir = settings.project_root / settings.backend.sqlite_data_dir
-        return SqliteRateLimiter(data_dir / "ratelimit.sqlite3", model=model, rpm=rpm, tpm=tpm, gate=gate)
+        path = ensure_sqlite_data_dir(settings) / "ratelimit.sqlite3"
+        return SqliteRateLimiter(path, model=model, rpm=rpm, tpm=tpm, gate=gate)
     return RateLimiter(settings.redis, model=model, rpm=rpm, tpm=tpm, gate=gate)

@@ -17,7 +17,7 @@ from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.events import EventBus
 from code_atlas.graph.client import GraphClient
-from code_atlas.settings import derive_project_name
+from code_atlas.settings import derive_project_name, ensure_sqlite_data_dir
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -135,15 +135,11 @@ async def use_backends(
 
 
 def _sqlite_queue_path(settings: AtlasSettings) -> Path:
-    data_dir = settings.project_root / settings.backend.sqlite_data_dir
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir / "queue.sqlite3"
+    return ensure_sqlite_data_dir(settings) / "queue.sqlite3"
 
 
 def _sqlite_graph_path(settings: AtlasSettings) -> Path:
-    data_dir = settings.project_root / settings.backend.sqlite_data_dir
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir / "graph.sqlite3"
+    return ensure_sqlite_data_dir(settings) / "graph.sqlite3"
 
 
 async def create_event_bus(settings: AtlasSettings) -> EventBus | SqliteEventBus:

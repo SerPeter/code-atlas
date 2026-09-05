@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
@@ -923,3 +924,39 @@ def extraction_key(settings: AtlasSettings) -> str:
         "rationale.tasks": settings.rationale.tasks,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+_DATA_DIR_GITIGNORE = """# The embedded backend's databases: a local index of this checkout, rebuilt by
+# `atlas index`. Machine-specific and often gigabytes, so it is never shared.
+#
+# Written by Code Atlas the first time the directory is created. Delete it if your
+# team decides to commit the index; nothing recreates it once the directory exists.
+*
+"""
+
+
+def ensure_sqlite_data_dir(settings: AtlasSettings) -> Path:
+    """Create the embedded backend's data directory, ignoring it from git on first use.
+
+    `.atlas/` holds a rebuildable, machine-specific index — a different embedding model,
+    a different absolute path, a different checkout all produce a different database, and
+    it is measured in hundreds of megabytes. It is the same class of thing as `.venv`,
+    and the repo's own `.gitignore` is the wrong place to say so: that file is the team's,
+    and whether a *user* runs the embedded backend at all is not a team decision.
+
+    So the directory ignores itself. `*` rather than naming the files, because the set
+    grows (graph, queue, ratelimit, and whatever a future backend adds) and a list that
+    has to be maintained is a list that will miss one.
+
+    Written only when the directory does not yet exist. A `.gitignore` a user edited --
+    or deleted, having decided to commit the index -- must not come back on the next run.
+    """
+    data_dir = settings.project_root / settings.backend.sqlite_data_dir
+    if data_dir.exists():
+        return data_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        (data_dir / ".gitignore").write_text(_DATA_DIR_GITIGNORE, encoding="utf-8")
+    except OSError as exc:  # a read-only or exotic filesystem must not fail indexing
+        logger.debug("Could not write {}/.gitignore: {}", data_dir, exc)
+    return data_dir
