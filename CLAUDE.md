@@ -129,6 +129,18 @@ same buckets and AIMD factor in `ratelimit.sqlite3`; `"valkey"`/`"auto"` get the
 hand-written mirrors (Lua cannot call Python) and are pinned together by
 `tests/integration/search/test_ratelimit_conformance.py` — edit both, or that test fails.
 
+**The SQLite side tables are keys, not copies (ADR-0045, ADR-0046).** Both are keyed by `nodes.rowid`,
+so neither survives a `VACUUM` — nothing runs one. The FTS document is deleted by rowid because `uid` is an
+`UNINDEXED` fts5 column and deleting by it scans the whole table (quadratic in graph size). The `vec0` table
+holds **bit-quantized** vectors: a query shortlists `k * _VEC_OVERSAMPLE` by hamming distance, then ranks
+those by real `vec_distance_cosine` against `nodes.embedding`, so only the shortlist is approximate. Both
+shapes carry a backend-local `meta` marker (`fts_key`, `vec_kind`) rather than a `SCHEMA_VERSION` bump —
+that number is shared with Memgraph, where advancing it drops its vector indices.
+
+**`.atlas/` ignores itself.** `ensure_sqlite_data_dir` writes a `.gitignore` when it creates the directory,
+because the index is machine-specific and the target repo's `.gitignore` is not ours to edit. Only on first
+creation, so deleting the file sticks.
+
 **Oversized nodes (ADR-0040):** set `[embeddings] max_input_tokens` for any routed model name — litellm's
 registry has no entry for one, and an unknown cap means no chunking and no truncation, so a single
 over-length node fails the whole 128-text provider call it was batched into. Past the cap, a _document_
