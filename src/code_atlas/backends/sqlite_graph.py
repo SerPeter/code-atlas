@@ -135,6 +135,47 @@ _NODE_COLUMNS = "uid, labels, project_name, qualified_name, file_path, name, kin
 _CITATION_EDGE_PREDICATE = "rel_type = 'DOCUMENTS' AND json_extract(props_json, '$.link_type') = 'citation'"
 
 
+def _fts_document(name: str, qualified_name: str, props: dict[str, Any]) -> str:
+    """The BM25 document for one node.
+
+    Memgraph's text index is label-wide (``CREATE TEXT INDEX ... ON :Label``), so a new
+    property becomes BM25-visible there for free; the SQLite FTS document is an explicit
+    field list and has to name them.
+
+    One function, two callers -- the write path (from a ParsedEntity) and the rowid
+    migration (from a stored row). They must produce the same bytes, or a rebuilt index
+    silently ranks differently from a freshly written one.
+    """
+    parts = [
+        name,
+        qualified_name,
+        props.get("docstring"),
+        props.get("signature"),
+        props.get("source"),
+        " ".join(props.get("tags") or []),
+        props.get("rationale"),
+        " ".join(props.get("citations") or []),
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def _fts_document_from_entity(e: ParsedEntity) -> str:
+    uid = e.qualified_name
+    qn = uid.split(":", 1)[1] if ":" in uid else uid
+    return _fts_document(
+        e.name,
+        qn,
+        {
+            "docstring": e.docstring,
+            "signature": e.signature,
+            "source": e.source,
+            "tags": e.tags,
+            "rationale": e.rationale,
+            "citations": e.citations,
+        },
+    )
+
+
 def _node_columns(alias: str) -> str:
     """``_NODE_COLUMNS`` prefixed with a table alias, for JOIN queries — e.g. ``_node_columns("p")``."""
     return ", ".join(f"{alias}.{col.strip()}" for col in _NODE_COLUMNS.split(","))
@@ -679,6 +720,56 @@ class SqliteGraphClient:
         for stmt in _fts_table_ddl():
             await conn.execute(stmt)
         await conn.commit()
+        await self._ensure_fts_keyed_by_rowid(conn)
+
+    async def _ensure_fts_keyed_by_rowid(self, conn: SqlConnection) -> None:
+        """Rebuild the FTS tables once, so their rowid is the node's rowid.
+
+        Deliberately **not** a `SCHEMA_VERSION` bump. That number is shared with Memgraph,
+        where advancing it drops and recreates vector indices; taking semantic search down
+        on the networked backend to re-key a table only the embedded one has would be a
+        cost with nothing to buy. This is a storage detail of one backend, so it carries
+        its own marker.
+
+        Idempotent and self-describing: the marker records what the tables are keyed *by*,
+        not which migration ran. A database with no FTS rows is marked without doing work,
+        and a future re-keying gets a different value rather than a version number nobody
+        can interpret later.
+        """
+        cur = await conn.execute("SELECT value FROM meta WHERE key = 'fts_key'")
+        row = await cur.fetchone()
+        await cur.close()
+        if row is not None and row[0] == "rowid":
+            return
+
+        rebuilt = 0
+        for spec in TEXT_INDICES:
+            table = f"text_{spec.label.value.lower()}"
+            try:
+                await conn.execute(f"DELETE FROM {table}")
+            except aiosqlite.OperationalError:
+                continue  # no such table yet — nothing to re-key
+            cur = await conn.execute(
+                "SELECT rowid, uid, name, qualified_name, props_json FROM nodes WHERE labels = ?",
+                (spec.label.value,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            payload = [
+                (rowid, uid, _fts_document(name or "", qn or "", json.loads(props or "{}")))
+                for rowid, uid, name, qn, props in rows
+            ]
+            if payload:
+                await self._safe_exec_many(conn, f"INSERT INTO {table}(rowid, uid, text) VALUES (?, ?, ?)", payload)
+                rebuilt += len(payload)
+
+        await conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('fts_key', 'rowid') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
+        await conn.commit()
+        if rebuilt:
+            logger.info("Re-keyed {} FTS document(s) by rowid (BM25 deletes no longer scan)", rebuilt)
 
     async def ensure_schema(self, *, force_drop_embeddings: bool = False) -> None:  # noqa: ARG002  # parity with GraphClient.ensure_schema; see docstring
         """Apply or migrate the graph schema.
@@ -757,6 +848,15 @@ class SqliteGraphClient:
 
     # -- Internal helpers -----------------------------------------------------
 
+    async def _safe_exec_many(self, conn: SqlConnection, stmt: str, rows: list[tuple[Any, ...]]) -> None:
+        """`_safe_exec` for a batch -- one dispatch instead of one per row."""
+        if not rows:
+            return
+        try:
+            await conn.executemany(stmt, rows)
+        except aiosqlite.OperationalError as exc:
+            logger.debug("Side-table statement skipped ({}): {}", exc, stmt[:80])
+
     async def _safe_exec(self, conn: SqlConnection, stmt: str, params: Any = ()) -> None:
         """Execute a side-table (vec0/FTS5) statement, tolerating a missing virtual
         table (``ensure_schema`` not yet run) the way Memgraph tolerates writing
@@ -799,24 +899,63 @@ class SqliteGraphClient:
                     rowids = ",".join(str(rid) for _uid, rid in items)
                     await self._safe_exec(conn, f"DELETE FROM {table} WHERE rowid IN ({rowids})")
                 if label in _TEXT_LABEL_VALUES:
+                    # By rowid, like the vec table above it: `uid` is an UNINDEXED fts5
+                    # column, so an `IN` over uids scans the whole FTS table.
                     table = f"text_{label.lower()}"
-                    uid_ph = ",".join("?" * len(items))
-                    await self._safe_exec(conn, f"DELETE FROM {table} WHERE uid IN ({uid_ph})", [u for u, _r in items])
+                    text_rowids = ",".join(str(rid) for _uid, rid in items)
+                    await self._safe_exec(conn, f"DELETE FROM {table} WHERE rowid IN ({text_rowids})")
 
-    async def _sync_fts_row(self, conn: SqlConnection, e: ParsedEntity) -> None:
-        label = e.label.value
-        if label not in _TEXT_LABEL_VALUES:
+    async def _rowids_for(self, conn: SqlConnection, uids: list[str]) -> dict[str, int]:
+        """``uid -> nodes.rowid``, via the uid primary key."""
+        out: dict[str, int] = {}
+        for chunk in _chunks(list(dict.fromkeys(uids))):
+            if not chunk:
+                continue
+            placeholders = ",".join("?" * len(chunk))
+            cur = await conn.execute(f"SELECT uid, rowid FROM nodes WHERE uid IN ({placeholders})", chunk)
+            rows = await cur.fetchall()
+            await cur.close()
+            for uid, rowid in rows:
+                out[uid] = rowid  # noqa: PERF403 — a comprehension here would rebuild the dict per chunk
+        return out
+
+    async def _sync_fts_rows(self, conn: SqlConnection, entities: list[ParsedEntity]) -> None:
+        """Rewrite the FTS documents for *entities*, keyed by rowid, two statements per label.
+
+        The version this replaced deleted by ``uid``, one entity at a time. ``uid`` is an
+        ``UNINDEXED`` fts5 column, so that delete had no index to use and planned as
+        ``SCAN text_<label> VIRTUAL TABLE INDEX 0:`` -- a full scan of the FTS table, per
+        entity, while holding the write lock.
+
+        The cost is not merely linear, it compounds: measured at 0.592 / 1.905 / 11.022 ms
+        per row against tables of 2k / 8k / 32k rows, against 0.134 / 0.201 / 0.348 ms by
+        rowid. Sixteen times the table gave nineteen times the per-row cost, so the total
+        is quadratic in graph size -- and the sharpest case is not a reindex but a single
+        file save, where every entity in the file pays a scan of the whole table.
+
+        Keying on ``nodes.rowid`` puts no new constraint on the schema: the vec0 tables are
+        already keyed that way. It does mean neither side table survives a ``VACUUM``,
+        which renumbers rowids; nothing here runs one.
+        """
+        by_label: dict[str, list[ParsedEntity]] = defaultdict(list)
+        for e in entities:
+            if e.label.value in _TEXT_LABEL_VALUES:
+                by_label[e.label.value].append(e)
+        if not by_label:
             return
-        table = f"text_{label.lower()}"
-        uid = e.qualified_name
-        qn = uid.split(":", 1)[1] if ":" in uid else uid
-        # Memgraph's text index is label-wide (CREATE TEXT INDEX ... ON :Label),
-        # so new properties are BM25-visible there for free; the SQLite FTS
-        # document is an explicit field list and has to name them.
-        parts = [e.name, qn, e.docstring, e.signature, e.source, " ".join(e.tags), e.rationale, " ".join(e.citations)]
-        text = " ".join(p for p in parts if p)
-        await self._safe_exec(conn, f"DELETE FROM {table} WHERE uid = ?", (uid,))
-        await self._safe_exec(conn, f"INSERT INTO {table}(uid, text) VALUES (?, ?)", (uid, text))
+
+        rowids = await self._rowids_for(conn, [e.qualified_name for es in by_label.values() for e in es])
+        for label, group in by_label.items():
+            table = f"text_{label.lower()}"
+            rows = [
+                (rowids[e.qualified_name], e.qualified_name, _fts_document_from_entity(e))
+                for e in group
+                if e.qualified_name in rowids
+            ]
+            if not rows:
+                continue
+            await self._safe_exec_many(conn, f"DELETE FROM {table} WHERE rowid = ?", [(r[0],) for r in rows])
+            await self._safe_exec_many(conn, f"INSERT INTO {table}(rowid, uid, text) VALUES (?, ?, ?)", rows)
 
     async def _get_file_content_hashes(
         self, conn: SqlConnection, project_name: str, file_path: str
@@ -902,8 +1041,7 @@ class SqliteGraphClient:
             "kind=excluded.kind, content_hash=excluded.content_hash, props_json=excluded.props_json",
             rows,
         )
-        for e in entities:
-            await self._sync_fts_row(conn, e)
+        await self._sync_fts_rows(conn, entities)
 
     async def _batch_update_entities(self, conn: SqlConnection, entities: list[ParsedEntity]) -> None:
         if not entities:
@@ -921,7 +1059,7 @@ class SqliteGraphClient:
                 "WHERE uid = ?",
                 (e.name, e.kind, e.content_hash, _dumps(_entity_props(e)), e.qualified_name),
             )
-            await self._sync_fts_row(conn, e)
+        await self._sync_fts_rows(conn, entities)
 
     async def _batch_update_positions(self, conn: SqlConnection, entities: list[ParsedEntity]) -> None:
         for e in entities:
