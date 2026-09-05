@@ -1350,28 +1350,71 @@ class SqliteGraphClient:
         if not doc_rels:
             return
         conn = await self._get_conn()
+
+        name_refs = [r for r in doc_rels if not r.properties.get("is_file_ref")]
+        file_refs = [r for r in doc_rels if r.properties.get("is_file_ref")]
+
+        # Two lookups for the whole flush, not two per relationship. Both of the old
+        # per-rel queries were unindexable by construction: `labels NOT IN (...)` implies
+        # no single-label predicate so none of the partial indices apply (ADR-0045), and
+        # `file_path LIKE '%suffix'` has a leading wildcard, which the docstring above
+        # already admitted. At ~40ms each that was the single most expensive call in the
+        # entire index: measured at **124.08 seconds** for one call on this repo, 72% of
+        # the run's wall clock, and it is the reason the final flush was being cancelled
+        # by the teardown watchdog four seconds before it would have finished.
+        by_name: dict[str, list[str]] = defaultdict(list)
+        if name_refs:
+            for chunk in _chunks(sorted({r.to_name for r in name_refs}), 900):
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" * len(chunk))
+                cur = await conn.execute(
+                    f"SELECT name, uid FROM nodes WHERE project_name = ? AND name IN ({placeholders}) "
+                    "AND labels NOT IN ('Note', 'DocSection')",
+                    (project_name, *chunk),
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+                for name, uid in rows:
+                    by_name[name].append(uid)
+
+        # Suffix matching moves into Python, over distinct paths rather than nodes: a
+        # file with 40 entities is one comparison here and was 40 rows in the old scan.
+        # `_like_literal` escaped LIKE's `%`/`_` so the old match was already literal —
+        # `str.endswith` is the same predicate without the escaping.
+        uids_by_path: dict[str, list[str]] = defaultdict(list)
+        if file_refs:
+            cur = await conn.execute(
+                "SELECT file_path, uid FROM nodes WHERE project_name = ? AND file_path IS NOT NULL "
+                "AND labels NOT IN ('Note', 'DocSection')",
+                (project_name,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for file_path, uid in rows:
+                uids_by_path[file_path].append(uid)
+
+        def _file_candidates(suffix: str) -> list[str]:
+            return [uid for path, uids in uids_by_path.items() if path.endswith(suffix) for uid in uids]
+
+        writes: list[tuple[str, str, str]] = []
         for r in doc_rels:
             props = r.properties
-            entry_props = _dumps({"link_type": props.get("link_type", ""), "confidence": props.get("confidence", 0.0)})
-            if props.get("is_file_ref"):
-                cur = await conn.execute(
-                    "SELECT uid FROM nodes WHERE project_name = ? AND file_path LIKE ? ESCAPE '\\' "
-                    "AND labels NOT IN ('Note', 'DocSection')",
-                    (project_name, f"%{_like_literal(r.to_name)}"),
-                )
-            else:
-                cur = await conn.execute(
-                    "SELECT uid FROM nodes WHERE project_name = ? AND name = ? "
-                    "AND labels NOT IN ('Note', 'DocSection')",
-                    (project_name, r.to_name),
-                )
-            candidates = list(await cur.fetchall())
-            await cur.close()
+            candidates = _file_candidates(r.to_name) if props.get("is_file_ref") else by_name.get(r.to_name, [])
+            # The never-multi-link discipline, unchanged: an ambiguous match is left
+            # unresolved rather than guessed at. Counted over *nodes*, as before — a file
+            # reference matching one path with two entities in it is still ambiguous.
             if len(candidates) == 1:
-                await conn.execute(
-                    "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'DOCUMENTS', ?)",
-                    (r.from_qualified_name, candidates[0][0], entry_props),
+                entry_props = _dumps(
+                    {"link_type": props.get("link_type", ""), "confidence": props.get("confidence", 0.0)}
                 )
+                writes.append((r.from_qualified_name, candidates[0], entry_props))
+
+        if writes:
+            await conn.executemany(
+                "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'DOCUMENTS', ?)",
+                writes,
+            )
         await conn.commit()
 
     async def _recreate_file_relationships(
