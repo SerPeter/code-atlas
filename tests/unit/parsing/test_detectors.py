@@ -323,7 +323,7 @@ async def test_test_mapping_class():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.find_entity_uid = AsyncMock(return_value="proj:src.app.Foo")
+    graph.find_entity_uids = AsyncMock(return_value={("TypeDef", "Foo"): "proj:src.app.Foo"})
 
     det = TestMappingDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -343,7 +343,7 @@ async def test_test_mapping_function():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.find_entity_uid = AsyncMock(return_value="proj:src.app.create_user")
+    graph.find_entity_uids = AsyncMock(return_value={("Callable", "create_user"): "proj:src.app.create_user"})
 
     det = TestMappingDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -362,7 +362,7 @@ async def test_test_mapping_not_found():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.find_entity_uid = AsyncMock(return_value=None)
+    graph.find_entity_uids = AsyncMock(return_value={})
 
     det = TestMappingDetector()
     result = await det.detect(parsed, "proj", graph)
@@ -416,7 +416,7 @@ async def test_di_injection_relationship():
     parsed = _make_parsed(entities=[entity])
 
     graph = AsyncMock()
-    graph.find_entity_uid = AsyncMock(return_value="proj:src.deps.get_db")
+    graph.find_entity_uids = AsyncMock(return_value={("Callable", "get_db"): "proj:src.deps.get_db"})
 
     det = DIInjectionDetector()
     result = await det.detect(parsed, "proj", graph)

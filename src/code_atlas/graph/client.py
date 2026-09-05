@@ -4191,19 +4191,45 @@ class GraphClient:
 
     # -- Detector lookups (parsing/languages/*.py) -----------------------------
 
-    async def find_entity_uid(self, project_name: str, label: str, name: str) -> str | None:
-        """Exact ``(project_name, name)`` -> uid lookup scoped to *label*.
+    async def find_entity_uids(self, project_name: str, wanted: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+        """Exact ``(label, name)`` -> uid lookups, one round-trip per distinct label.
 
         Used by parsing/languages detectors (test_mapping, di_injection) to
-        cross-reference an entity by name during indexing — a plain point
-        lookup, distinct from ``get_node_exact_matches`` (which also matches
-        by uid and searches every label for the interactive ``get_node`` tool).
+        cross-reference entities by name during indexing — plain point lookups,
+        distinct from ``get_node_exact_matches`` (which also matches by uid and searches
+        every label for the interactive ``get_node`` tool).
+
+        Batched because the singular version it replaces was the **largest single cost
+        on this backend**: a full-repo benchmark measured 3,975 of them, 70% of every
+        round-trip the run made, and `detectors` was consequently the largest AST phase
+        at 27.7s. Each one is a network hop, and the detector already knows every name
+        it wants before it asks for the first.
+
+        Invisible on the SQLite backend, where the same 3,975 calls are local lookups
+        costing microseconds — which is why this shape survived: the benchmark that could
+        see it had only ever been run against SQLite.
+
+        ``collect(...)[0]`` rather than ``LIMIT 1`` because the LIMIT would apply to the
+        whole UNWIND rather than per name. Ambiguity between two same-named entities is
+        resolved arbitrarily, exactly as the singular version's LIMIT 1 did.
         """
-        records = await self.execute(
-            f"MATCH (n:{label} {{project_name: $p, name: $n}}) RETURN n.uid AS uid LIMIT 1",
-            {"p": project_name, "n": name},
-        )
-        return records[0]["uid"] if records else None
+        if not wanted:
+            return {}
+        by_label: dict[str, set[str]] = defaultdict(set)
+        for label, name in wanted:
+            by_label[label].add(name)
+
+        out: dict[tuple[str, str], str] = {}
+        for label, names in by_label.items():
+            records = await self.execute(
+                f"UNWIND $names AS nm MATCH (n:{label} {{project_name: $p, name: nm}}) "
+                "WITH nm, collect(n.uid) AS uids RETURN nm AS name, uids[0] AS uid",
+                {"p": project_name, "names": sorted(names)},
+            )
+            for rec in records:
+                if rec["uid"]:
+                    out[(label, rec["name"])] = rec["uid"]
+        return out
 
     async def find_overridden_method(
         self, project_name: str, bases: list[str], method_name: str

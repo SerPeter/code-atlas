@@ -55,7 +55,7 @@ _COMPARED: frozenset[str] = frozenset(
         "get_entity_by_uid",
         "get_existing_uids",
         "node_exists",
-        "find_entity_uid",
+        "find_entity_uids",
         "get_label_counts",
         "get_node_exact_matches",
         "get_node_partial_matches",
@@ -434,12 +434,25 @@ class TestSharedSurfaceAgrees:
         for uid in (f"{PROJECT}:mod.caller", f"{PROJECT}:mod.absent"):
             assert await mg.node_exists(uid) == await lite.node_exists(uid)
 
-    async def test_find_entity_uid(self, both):
+    async def test_find_entity_uids(self, both):
+        """Same answer, and a present name mixed with an absent one in one call.
+
+        A batched lookup can agree on the easy shapes and still differ on the two that
+        matter: a name with no match (must be absent from the mapping, not present with
+        a null) and several labels in one request (each must be scoped to its own).
+        """
         mg, lite = both
-        for name in ("caller", "absent"):
-            assert await mg.find_entity_uid(PROJECT, "Callable", name) == await lite.find_entity_uid(
-                PROJECT, "Callable", name
-            )
+        wanted = [("Callable", "caller"), ("Callable", "absent"), ("TypeDef", "caller")]
+        a, b = await mg.find_entity_uids(PROJECT, wanted), await lite.find_entity_uids(PROJECT, wanted)
+        assert a == b, f"batched lookups diverged: memgraph={a} sqlite={b}"
+        assert ("Callable", "caller") in a, "the present name was not found — the comparison is vacuous"
+        assert ("Callable", "absent") not in a, "a missing name must be absent from the mapping, not null"
+        assert ("TypeDef", "caller") not in a, "the Callable named 'caller' was returned under TypeDef"
+
+    async def test_an_empty_batch_costs_nothing(self, both):
+        mg, lite = both
+        assert await mg.find_entity_uids(PROJECT, []) == {}
+        assert await lite.find_entity_uids(PROJECT, []) == {}
 
     async def test_get_entity_by_uid(self, both):
         mg, lite = both

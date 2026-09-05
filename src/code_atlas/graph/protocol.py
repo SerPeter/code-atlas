@@ -235,7 +235,9 @@ if TYPE_CHECKING:
 
         # -- Detector lookups (parsing/languages/*.py) -------------------------
 
-        async def find_entity_uid(self, project_name: str, label: str, name: str) -> str | None: ...
+        async def find_entity_uids(
+            self, project_name: str, wanted: list[tuple[str, str]]
+        ) -> dict[tuple[str, str], str]: ...
 
         async def find_overridden_method(
             self, project_name: str, bases: list[str], method_name: str

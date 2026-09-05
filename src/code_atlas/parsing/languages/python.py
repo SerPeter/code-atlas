@@ -2470,22 +2470,39 @@ class TestMappingDetector:
         return "test_mapping"
 
     async def detect(self, parsed: ParsedFile, project_name: str, graph: GraphClient) -> DetectorResult:
-        relationships: list[ParsedRelationship] = []
+        """Every name this file wants, asked for once.
+
+        The per-entity lookup this replaces was the largest single cost on the Memgraph
+        backend -- 3,975 point lookups, 70% of a full-repo run's round-trips -- because
+        each one is a network hop and the names were all known before the first was sent.
+        """
+        if graph is None:
+            return DetectorResult(relationships=[])
+
+        # (label, name) per test entity, in file order: the lookup is a set, the results
+        # are not, and a TypeDef test and a Callable test can want the same name.
+        targets: list[tuple[ParsedEntity, tuple[str, str]]] = []
         for entity in parsed.entities:
             target_name = self._extract_target_name(entity)
             if target_name is None:
                 continue
-            # Look up target in graph
-            target_uid = await self._find_target(graph, project_name, entity, target_name)
-            if target_uid:
-                relationships.append(
-                    ParsedRelationship(
-                        from_qualified_name=entity.qualified_name,
-                        rel_type=RelType.TESTS,
-                        to_name=target_uid,
-                    )
+            label = "TypeDef" if entity.label == NodeLabel.TYPE_DEF else "Callable"
+            targets.append((entity, (label, target_name)))
+        if not targets:
+            return DetectorResult(relationships=[])
+
+        found = await graph.find_entity_uids(project_name, [key for _e, key in targets])
+        return DetectorResult(
+            relationships=[
+                ParsedRelationship(
+                    from_qualified_name=entity.qualified_name,
+                    rel_type=RelType.TESTS,
+                    to_name=found[key],
                 )
-        return DetectorResult(relationships=relationships)
+                for entity, key in targets
+                if key in found
+            ]
+        )
 
     @staticmethod
     def _extract_target_name(entity: ParsedEntity) -> str | None:
@@ -2495,14 +2512,6 @@ class TestMappingDetector:
         if entity.label == NodeLabel.CALLABLE and entity.name.startswith("test_"):
             return entity.name[5:] or None
         return None
-
-    @staticmethod
-    async def _find_target(graph: GraphClient, project_name: str, source: ParsedEntity, target_name: str) -> str | None:
-        if graph is None:
-            return None
-        # TypeDef test -> look for TypeDef; Callable test -> look for Callable
-        label = "TypeDef" if source.label == NodeLabel.TYPE_DEF else "Callable"
-        return await graph.find_entity_uid(project_name, label, target_name)
 
 
 class ClassOverridesDetector:
@@ -2572,8 +2581,14 @@ class DIInjectionDetector:
         return "di_injection"
 
     async def detect(self, parsed: ParsedFile, project_name: str, graph: GraphClient) -> DetectorResult:
+        """Enrichments always; provider edges only when there is a graph to ask.
+
+        The enrichment half deliberately runs with ``graph is None`` -- the dependency
+        names come from the signature, not the graph -- so the collection pass stays
+        separate from the lookup rather than being skipped with it.
+        """
         enrichments: list[PropertyEnrichment] = []
-        relationships: list[ParsedRelationship] = []
+        wanted: list[tuple[ParsedEntity, str]] = []
         for entity in parsed.entities:
             if not entity.signature:
                 continue
@@ -2586,20 +2601,24 @@ class DIInjectionDetector:
                     properties={"di_framework": "fastapi", "dependencies": dep_names},
                 )
             )
-            # Try to resolve provider UIDs in graph
-            if graph is None:
-                continue
-            for dep_name in dep_names:
-                dep_uid = await graph.find_entity_uid(project_name, "Callable", dep_name)
-                if dep_uid:
-                    relationships.append(
-                        ParsedRelationship(
-                            from_qualified_name=dep_uid,
-                            rel_type=RelType.INJECTED_INTO,
-                            to_name=entity.qualified_name,
-                        )
-                    )
-        return DetectorResult(relationships=relationships, enrichments=enrichments)
+            wanted.extend((entity, dep) for dep in dep_names)
+
+        if graph is None or not wanted:
+            return DetectorResult(relationships=[], enrichments=enrichments)
+
+        found = await graph.find_entity_uids(project_name, [("Callable", dep) for _e, dep in wanted])
+        return DetectorResult(
+            relationships=[
+                ParsedRelationship(
+                    from_qualified_name=found[("Callable", dep)],
+                    rel_type=RelType.INJECTED_INTO,
+                    to_name=entity.qualified_name,
+                )
+                for entity, dep in wanted
+                if ("Callable", dep) in found
+            ],
+            enrichments=enrichments,
+        )
 
 
 _DATACLASS_TAGS: dict[str, tuple[str, list[str]]] = {

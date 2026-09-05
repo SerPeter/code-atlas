@@ -4228,15 +4228,36 @@ class SqliteGraphClient:
 
     # -- Detector lookups (parsing/languages/*.py) -----------------------------
 
-    async def find_entity_uid(self, project_name: str, label: str, name: str) -> str | None:
+    async def find_entity_uids(self, project_name: str, wanted: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+        """One statement per distinct label; see the Memgraph docstring for why batched.
+
+        ``(labels, project_name, name)`` is exactly `ix_nodes_labels_project_name`, so
+        this seeks rather than scans even though `labels` is a bound parameter — which no
+        partial index could have served (ADR-0045).
+        """
+        if not wanted:
+            return {}
+        by_label: dict[str, list[str]] = defaultdict(list)
+        for label, name in wanted:
+            by_label[label].append(name)
+
         conn = await self._get_conn()
-        cur = await conn.execute(
-            "SELECT uid FROM nodes WHERE labels = ? AND project_name = ? AND name = ? LIMIT 1",
-            (label, project_name, name),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        return row[0] if row else None
+        out: dict[tuple[str, str], str] = {}
+        for label, names in by_label.items():
+            for chunk in _chunks(sorted(set(names)), 900):
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" * len(chunk))
+                cur = await conn.execute(
+                    f"SELECT name, uid FROM nodes WHERE labels = ? AND project_name = ? AND name IN ({placeholders})",
+                    (label, project_name, *chunk),
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+                # First row wins, matching the singular version's LIMIT 1.
+                for name, uid in rows:
+                    out.setdefault((label, name), uid)
+        return out
 
     async def find_overridden_method(
         self, project_name: str, bases: list[str], method_name: str
