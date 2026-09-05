@@ -56,6 +56,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0043](./0043-benchmarks-count-work-and-account-for-waiting.md)        | Benchmarks Count Work And Account For Waiting                  | Accepted                      | 2026-09-03 |
 | [0044](./0044-the-coordination-store-follows-the-backend.md)           | The Coordination Store Follows The Backend Choice              | Accepted                      | 2026-09-03 |
 | [0045](./0045-sqlite-indexes-what-the-planner-can-prove.md)            | The SQLite Backend Indexes What The Planner Can Prove          | Accepted                      | 2026-09-03 |
+| [0046](./0046-the-vector-index-is-a-shortlist-not-a-copy.md)           | The SQLite Vector Index Is A Shortlist Not A Copy              | Accepted                      | 2026-09-05 |
 
 ## Creating a New ADR
 

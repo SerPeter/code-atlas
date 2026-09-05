@@ -352,7 +352,56 @@ def _node_index_ddl() -> list[str]:
     return stmts
 
 
+# Candidates pulled from the bit index per result actually wanted, before exact
+# rescoring. Measured on 9,118 real 1536-d embeddings, recall@10 against exact search is
+# 1.000 at every factor from 4 to 64 -- so this is chosen for headroom at larger graphs
+# rather than to buy back accuracy that was lost. 8 was 24x faster than exact search; 4
+# was 33x, and the extra margin is cheap insurance against the recall question nobody has
+# answered yet (see the module docstring on 1M).
+_VEC_OVERSAMPLE = 8
+
+
+def _bit_quantizable(dimension: int) -> bool:
+    """Whether `vec_quantize_binary` accepts this dimension.
+
+    It requires a length divisible by 8 -- one bit per component, packed into bytes.
+    Every embedding model in practical use is a multiple of 8 (384, 768, 1024, 1536,
+    3072), but `dimension` is user configuration, and a 100-dimension setting must
+    degrade to the exact index rather than fail every write.
+    """
+    return dimension > 0 and dimension % 8 == 0
+
+
 def _vec_table_ddl(dimension: int) -> list[str]:
+    """Vector side tables: bit-quantized where possible, float otherwise.
+
+    The float table this replaces was a **second copy of every vector**, stored beside
+    the authoritative one in `nodes.embedding` and used only to answer KNN. sqlite-vec's
+    KNN is a brute-force scan either way, so that copy bought no algorithmic advantage --
+    it only made the scan read 32 bits per component instead of 1.
+
+    A bit index plus an exact rescore of the candidates is strictly better on both axes,
+    measured on 9,118 real 1536-d embeddings:
+
+        exact (float table)   24.23 ms/query   0.33 s to build
+        bit + rescore(x8)      1.00 ms/query   0.09 s to build   recall@10 1.000
+
+    24x on retrieval, 3.7x on indexing, a thirty-second of the index storage, and the
+    same answers. The exactness is not an approximation that happens to look good: the
+    rescore step computes real cosine distance against `nodes.embedding`, so the ranking
+    returned is exact for whatever the bit index shortlisted, and only the shortlist is
+    approximate.
+
+    Binary quantization keeps the sign of each component. Cosine distance is invariant to
+    positive scaling, so the sign pattern is an equally good proxy whether or not the
+    vectors are normalized -- which matters because this repo's index stores normalized
+    vectors (mean L2 norm 1.000) and at least one production index does not (0.739).
+    """
+    if _bit_quantizable(dimension):
+        return [
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS {spec.name} USING vec0(embedding bit[{dimension}]);"
+            for spec in build_vector_index_specs(dimension)
+        ]
     return [
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {spec.name} "
         f"USING vec0(embedding float[{dimension}] distance_metric=cosine);"
@@ -522,6 +571,10 @@ class SqliteGraphClient:
     ) -> None:
         self._db_path = db_path
         self._dimension = dimension
+        # Decided once: the DDL, the write and the query all have to agree about which
+        # index shape this database holds, and re-deriving it at three call sites is how
+        # they come to disagree.
+        self._bit_vectors = _bit_quantizable(dimension)
         self._embeddings_enabled = embeddings_enabled
         # Injected connections are used as-is (no PRAGMA/extension-load/schema
         # bootstrap) — the caller (real setup code or a test fake) owns that.
@@ -721,6 +774,62 @@ class SqliteGraphClient:
             await conn.execute(stmt)
         await conn.commit()
         await self._ensure_fts_keyed_by_rowid(conn)
+        await self._ensure_vector_index_shape(conn)
+
+    async def _ensure_vector_index_shape(self, conn: SqlConnection) -> None:
+        """Rebuild the vector side tables when the index shape changes.
+
+        A vec0 column type cannot be altered, so switching between the float and bit
+        shapes means dropping and recreating. That costs nothing but time: the vectors
+        themselves live in `nodes.embedding` and are never re-embedded, so a rebuild is a
+        local re-index of data already on disk and never a provider bill.
+
+        A backend-local `meta` marker rather than a `SCHEMA_VERSION` bump, for the reason
+        `_ensure_fts_keyed_by_rowid` gives: that number is shared with Memgraph, where
+        advancing it drops and recreates *its* vector indices.
+
+        The marker records the shape, not the migration, so a database that predates it
+        is rebuilt once and a future third shape is a different value rather than a
+        version number nobody can interpret.
+        """
+        if not self._embeddings_enabled:
+            return
+        want = "bit" if self._bit_vectors else "float"
+        cur = await conn.execute("SELECT value FROM meta WHERE key = 'vec_kind'")
+        row = await cur.fetchone()
+        await cur.close()
+        if row is not None and row[0] == want:
+            return
+
+        rebuilt = 0
+        for spec in build_vector_index_specs(self._dimension):
+            await self._safe_exec(conn, f"DROP TABLE IF EXISTS {spec.name}")
+        for stmt in _vec_table_ddl(self._dimension):
+            await conn.execute(stmt)
+        for spec in build_vector_index_specs(self._dimension):
+            cur = await conn.execute(
+                "SELECT rowid, embedding FROM nodes WHERE labels = ? AND embedding IS NOT NULL",
+                (spec.label.value,),
+            )
+            payload = [(rid, blob) for rid, blob in await cur.fetchall()]
+            await cur.close()
+            if not payload:
+                continue
+            insert = (
+                f"INSERT INTO {spec.name}(rowid, embedding) VALUES (?, vec_quantize_binary(?))"
+                if self._bit_vectors
+                else f"INSERT INTO {spec.name}(rowid, embedding) VALUES (?, ?)"
+            )
+            await self._safe_exec_many(conn, insert, payload)
+            rebuilt += len(payload)
+
+        await conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('vec_kind', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (want,),
+        )
+        await conn.commit()
+        if rebuilt:
+            logger.info("Rebuilt {} vector(s) into the {} index (no re-embedding)", rebuilt, want)
 
     async def _ensure_fts_keyed_by_rowid(self, conn: SqlConnection) -> None:
         """Rebuild the FTS tables once, so their rowid is the node's rowid.
@@ -2706,7 +2815,12 @@ class SqliteGraphClient:
                 continue
             table = f"vec_{label.lower()}"
             await self._safe_exec_many(conn, f"DELETE FROM {table} WHERE rowid = ?", [(rid,) for rid, _b in pairs])
-            await self._safe_exec_many(conn, f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)", pairs)
+            insert = (
+                f"INSERT INTO {table}(rowid, embedding) VALUES (?, vec_quantize_binary(?))"
+                if self._bit_vectors
+                else f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)"
+            )
+            await self._safe_exec_many(conn, insert, pairs)
 
     async def _write_embedding_row(self, conn: SqlConnection, uid: str, blob: bytes) -> None:
         """Single-row vec0 sync, for the paths that write one vector at a time."""
@@ -3058,33 +3172,37 @@ class SqliteGraphClient:
         fetch_limit = limit * 3
         blob = sqlite_vec.serialize_float32(vector)
 
+        # One statement, shortlist and rescore together. The shortlist comes from the
+        # side table and the distance from `nodes.embedding`, so the number returned is a
+        # real cosine distance in both index shapes -- with a bit index the approximation
+        # is confined to *which* rows are considered, never to how they are then ranked.
+        #
+        # The float fallback runs the same SQL with `k = fetch_limit` and an unquantized
+        # probe; its rescore is then a re-sort of rows already in cosine order, which
+        # costs a few dozen distance computations and keeps this to one code path
+        # instead of two.
+        # The probe is quantized by the extension, not by us. A hand-written bit packer
+        # that disagreed with `vec_quantize_binary` on bit order would return confidently
+        # wrong neighbours with nothing failing, and the write side already uses the SQL
+        # function -- so both ends are the same implementation by construction.
+        match_expr = "vec_quantize_binary(?)" if self._bit_vectors else "?"
+        sql = (
+            f"WITH cand AS (SELECT rowid AS rid FROM {{table}} WHERE embedding MATCH {match_expr} AND k = ?) "
+            f"SELECT n.rowid, vec_distance_cosine(n.embedding, ?) AS distance, {_node_columns('n')} "
+            "FROM cand JOIN nodes n ON n.rowid = cand.rid "
+            "WHERE n.embedding IS NOT NULL ORDER BY distance LIMIT ?"
+        )
+        candidates = fetch_limit * _VEC_OVERSAMPLE if self._bit_vectors else fetch_limit
+
         async def _one(spec: Any) -> list[dict[str, Any]]:
             try:
-                cur = await conn.execute(
-                    f"SELECT rowid, distance FROM {spec.name} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    (blob, fetch_limit),
-                )
+                cur = await conn.execute(sql.format(table=spec.name), (blob, candidates, blob, fetch_limit))
                 rows = await cur.fetchall()
                 await cur.close()
             except aiosqlite.OperationalError as exc:
                 logger.warning("Vector search on {} failed: {}", spec.name, exc)
                 return []
-            if not rows:
-                return []
-            rowids = [r[0] for r in rows]
-            placeholders = ",".join("?" * len(rowids))
-            cur = await conn.execute(
-                f"SELECT rowid, {_NODE_COLUMNS} FROM nodes WHERE rowid IN ({placeholders})", rowids
-            )
-            node_rows = await cur.fetchall()
-            await cur.close()
-            node_by_rowid = {r[0]: _row_to_node(r[1:]) for r in node_rows}
-            dist_by_rowid = {r[0]: r[1] for r in rows}
-            return [
-                {"node": node_by_rowid[rid], "similarity": 1.0 - dist_by_rowid[rid]}
-                for rid in rowids
-                if rid in node_by_rowid
-            ]
+            return [{"node": _row_to_node(r[2:]), "similarity": 1.0 - r[1]} for r in rows]
 
         results_per_index = await asyncio.gather(*(_one(s) for s in specs))
         all_results: list[dict[str, Any]] = [r for batch in results_per_index for r in batch]
