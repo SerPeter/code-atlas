@@ -997,6 +997,91 @@ def _fast_drain_poll(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_POLL_MAX_S", 0.02)
 
 
+class CountingDrainBus:
+    """Reports busy for the first *busy_polls* queries, then drained. Records call times."""
+
+    def __init__(self, busy_polls: int = 0) -> None:
+        self._busy = busy_polls
+        self.calls: list[float] = []
+
+    async def stream_group_info_multi(self, queries):
+        self.calls.append(time.monotonic())
+        info = {"pending": 1, "lag": 1} if self._busy > 0 else {"pending": 0, "lag": 0}
+        self._busy -= 1
+        return [dict(info) for _ in queries]
+
+
+class TestSettleWindowIsNotOvershot:
+    """The settle costs what the constant says, and not a second longer.
+
+    The idle backoff grows 1.5x per poll, so from `_DRAIN_POLL_S` the sleeps are 0.75,
+    1.125 and 1.6875 and the `>= settle_s` check first passed at **t=3.56s for a
+    settle_s of 2.0** — 78% over, on every drain of every index. The clamp shortens the
+    *sleep* so the loop stops sleeping past the moment it could have concluded.
+
+    Both directions are asserted, because the way this change goes wrong is by shortening
+    the window rather than the sleep: a drain believed after less than `settle_s` of
+    observed quiet is a drain that can advance `git_hash` past unprocessed work.
+
+    Production-shaped ratios at a tenth of the scale, so the test costs ~1s. The autouse
+    `_fast_drain_poll` fixture is overridden here on purpose: it shrinks the poll below
+    the settle window, which is exactly the regime where the overshoot disappears and
+    this test would prove nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _realistic_poll(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_POLL_S", 0.25)
+        monkeypatch.setattr("code_atlas.indexing.orchestrator._DRAIN_POLL_MAX_S", 1.0)
+
+    async def test_it_returns_at_the_settle_boundary_not_past_it(self):
+        bus = CountingDrainBus()
+        started = time.monotonic()
+
+        drained = await _wait_for_drain(bus, 10.0, embed_enabled=False, settle_s=1.0)  # ty: ignore[invalid-argument-type]
+        elapsed = time.monotonic() - started
+
+        assert drained is True
+        assert elapsed >= 1.0, (
+            f"returned after {elapsed:.3f}s of observed quiet for a 1.0s settle — the clamp has "
+            "shortened the window itself, not just the sleep, and a drain can now be believed early"
+        )
+        assert elapsed < 1.4, (
+            f"settling took {elapsed:.3f}s for a 1.0s window. Unclamped this lands at ~1.78s; the "
+            "backoff is sleeping past the point where the drain could have been concluded"
+        )
+
+    async def test_the_quiet_window_restarts_when_work_reappears(self):
+        """The clamp must not make a settle stick across a busy poll.
+
+        `settled_since = None` resets it, and the clamp reads `settled_since` — so if the
+        reset and the clamp ever disagree, the loop could carry a stale window forward and
+        return a full settle earlier than it should.
+        """
+        bus = CountingDrainBus(busy_polls=3)
+        started = time.monotonic()
+
+        drained = await _wait_for_drain(bus, 10.0, embed_enabled=False, settle_s=1.0)  # ty: ignore[invalid-argument-type]
+        elapsed = time.monotonic() - started
+        last_busy = bus.calls[2]
+
+        assert drained is True
+        assert time.monotonic() - last_busy >= 1.0, (
+            "returned less than a full settle after the last poll that still saw work"
+        )
+        assert elapsed >= 1.0
+
+    async def test_it_does_not_busy_spin(self):
+        """The floor exists so the final clamped sleep cannot collapse to ~0 and spin."""
+        bus = CountingDrainBus()
+
+        await _wait_for_drain(bus, 10.0, embed_enabled=False, settle_s=1.0)  # ty: ignore[invalid-argument-type]
+
+        assert len(bus.calls) <= 8, (
+            f"{len(bus.calls)} polls for a 1.0s settle — the clamp is driving the sleep toward zero"
+        )
+
+
 class TestWaitForDrain:
     async def test_drained_returns_true(self):
         """pending == 0 and lag == 0 sustained for settle_s returns True."""

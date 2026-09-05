@@ -1603,6 +1603,9 @@ _TEARDOWN_POLL_S = 2.0
 # locals they were unpatchable, and three drain tests each paid ~1s of real sleeping.
 _DRAIN_POLL_S = 0.5
 _DRAIN_POLL_MAX_S = 2.0
+# Floor for the settle-window clamp below, so the last poll before a drain is believed
+# cannot become a busy-spin when only microseconds of the window remain.
+_DRAIN_POLL_MIN_S = 0.05
 # How long `lag == 0` must hold before a drain is believed. Costs more than it reads:
 # the poll interval grows 1.5x per idle poll, so with the defaults the sleeps after the
 # first idle poll are 0.75, 1.125 and 1.6875 and the `>= settle_s` check first passes at
@@ -2883,11 +2886,24 @@ async def _wait_for_drain(
                 return True
             # Adaptive backoff: poll less frequently once idle
             poll_interval = min(_DRAIN_POLL_MAX_S, poll_interval * 1.5)
+            # ...but never sleep past the end of the settle window. Without this the
+            # backoff overshoots badly: from 0.5 the idle sleeps are 0.75, 1.125 and
+            # 1.6875, so the `>= settle_s` check above first passes at t=3.56s for a
+            # settle_s of 2.0 -- 78% more than the constant reads, on every drain.
+            #
+            # This shortens the *sleep*, never the window. The check is unchanged, so a
+            # drain is still only believed after a full `settle_s` of observed quiet;
+            # what changes is that the loop stops sleeping past the moment it could have
+            # concluded. Same poll count, honest cost -- which matters because ADR-0043
+            # reports production pacing constants rather than lowering them, and a
+            # constant that charges 78% more than it says makes that report a lie.
+            sleep_for = min(poll_interval, max(_DRAIN_POLL_MIN_S, settle_s - (time.monotonic() - settled_since)))
         else:
             settled_since = None
             poll_interval = _DRAIN_POLL_S  # reset to fast polling when work is happening
+            sleep_for = poll_interval
 
-        await asyncio.sleep(poll_interval)
+        await asyncio.sleep(sleep_for)
 
     logger.error(
         "Pipeline drain timed out after {:.0f}s — t2={} t3={}; "
