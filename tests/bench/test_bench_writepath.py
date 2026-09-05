@@ -192,7 +192,12 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
         # labelled it as one and read a fivefold "leak" that was mostly statements per row.
         "new_entities": entities - entities_before,
         "new_vectors": vectors_after - vectors_before,
-        "embedding_statements": by_op.get("_write_embedding_row", 0),
+        # `write_embeddings_and_hashes`, not `_write_embedding_row`: the latter no longer
+        # runs on the batch path at all (RETURNING replaced the rowid lookup it existed
+        # for), so reading it here would report a permanent 0 and the two assertions
+        # below would pass by measuring nothing. The op that remains is one statement per
+        # vector, which is what this number is for.
+        "embedding_statements": by_op.get("write_embeddings_and_hashes", 0),
         # Amplification is row visits: scanning executions times table rows. It read 64
         # -> 184 across this sweep while every node index was partial
         # (`WHERE labels = '<Label>'`), because a predicate that does not name one label
@@ -319,8 +324,12 @@ class TestEmbeddingWriteVolume:
         ]
         print(f"\n(ballast, graph_entities, new_entities, new_vectors, embedding_row_writes): {rows}")
 
-        for ballast, _graph, new_entities, new_vectors, _writes in rows:
+        for ballast, _graph, new_entities, new_vectors, writes in rows:
             assert new_vectors > 0, f"ballast={ballast}: no vectors appeared, so the row is vacuous"
+            assert writes > 0, (
+                f"ballast={ballast}: no embedding statements were attributed — the op name this reads "
+                "has been renamed away and the excess check below is measuring nothing"
+            )
             assert new_vectors <= new_entities, (
                 f"ballast={ballast}: {new_vectors} new vectors for {new_entities} new entities"
             )
