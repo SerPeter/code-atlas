@@ -727,6 +727,109 @@ def test_apex_class_on_a_variable_is_an_import():
 
 
 # ---------------------------------------------------------------------------
+# 4b. LightningComponentBundle
+# ---------------------------------------------------------------------------
+
+LWC = "force-app/main/default/lwc"
+
+
+def test_a_bundle_with_no_template_still_gets_a_node():
+    """`trailheadapps/lwc-recipes` `errorPanel` has no `errorPanel.html` at all.
+
+    It picks a template in `render()`. So the template cannot be what mints the
+    component, and a real bundle's meta file can be this bare.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8" ?>
+<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>66.0</apiVersion>
+    <isExposed>false</isExposed>
+</LightningComponentBundle>
+"""
+    parsed = _parse(source, f"{LWC}/errorPanel/errorPanel.js-meta.xml")
+    component = _one(parsed, "lwc_component")
+    assert component.qualified_name == f"{PROJECT}:{LWC_NAMESPACE}.errorPanel"
+    assert component.name == "errorPanel"
+    assert component.extra_properties["is_exposed"] is False
+
+
+def test_the_bundle_is_named_for_its_directory_not_its_master_label():
+    """Every referencing surface spells the folder name, and `masterLabel` is prose."""
+    source = """\
+<?xml version="1.0" encoding="UTF-8" ?>
+<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>67.0</apiVersion>
+    <isExposed>true</isExposed>
+    <masterLabel>Product Tile List</masterLabel>
+    <targets>
+        <target>lightning__AppPage</target>
+        <target>lightningCommunity__Default</target>
+    </targets>
+</LightningComponentBundle>
+"""
+    parsed = _parse(source, f"{LWC}/productTileList/productTileList.js-meta.xml")
+    component = _one(parsed, "lwc_component")
+    assert component.qualified_name == f"{PROJECT}:{LWC_NAMESPACE}.productTileList"
+    assert component.extra_properties["master_label"] == "Product Tile List"
+    # Opaque strings: `lightningCommunity__Default` and `lightning_VoiceExtension`
+    # coexist in real files, so a validated enum would be wrong within a release.
+    assert component.extra_properties["targets"] == ["lightning__AppPage", "lightningCommunity__Default"]
+
+
+def test_target_config_objects_and_apex_datasource_become_imports():
+    """`<objects>` nests two levels in; `datasource` is an attribute, not text.
+
+    Shapes from `trailheadapps/ebikes-lwc` `productTileList` and `hero`.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8" ?>
+<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
+    <isExposed>true</isExposed>
+    <targets>
+        <target>lightning__RecordPage</target>
+    </targets>
+    <targetConfigs>
+        <targetConfig targets="lightning__RecordPage">
+            <property name="heroDetailsPosition" type="String"
+                      datasource="apex://HeroDetailsPositionCustomPicklist" />
+            <objects>
+                <object>Order__c</object>
+            </objects>
+        </targetConfig>
+    </targetConfigs>
+</LightningComponentBundle>
+"""
+    parsed = _parse(source, f"{LWC}/hero/hero.js-meta.xml")
+    component = _one(parsed, "lwc_component")
+    assert _targets(parsed, component.qualified_name, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Order__c",
+        f"{APEX_NAMESPACE}.HeroDetailsPositionCustomPicklist",
+    }
+
+
+def test_the_bundle_node_and_its_module_are_two_nodes_from_one_file():
+    """The meta file mints both, and nothing else may mint either.
+
+    `uid = project:qualified_name` and `_recreate_file_relationships` deletes edges
+    by their source node's `file_path`. Two files minting one uid means each
+    re-parse silently deletes the other's edges -- the ADR-0032 failure mode.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8" ?>
+<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
+    <isExposed>true</isExposed>
+</LightningComponentBundle>
+"""
+    path = f"{LWC}/eDRD_lwc_RelatedPhysicians/eDRD_lwc_RelatedPhysicians.js-meta.xml"
+    parsed = _parse(source, path)
+    assert {entity.file_path for entity in parsed.entities} == {path}
+    # Underscored folder names are real -- 13 of them in one public repo.
+    assert _one(parsed, "lwc_component").qualified_name.endswith("lwc.eDRD_lwc_RelatedPhysicians")
+    modules = [entity for entity in parsed.entities if entity.label is NodeLabel.MODULE]
+    assert len(modules) == 1
+
+
+# ---------------------------------------------------------------------------
 # 5. CustomLabels and CustomMetadata
 # ---------------------------------------------------------------------------
 
@@ -836,27 +939,42 @@ def test_custom_metadata_filename_that_already_carries_mdt_is_not_doubled():
     ("path", "source"),
     [
         (
-            "web/lwc/propertyTile/propertyTile.js-meta.xml",
-            (
-                '<?xml version="1.0"?>\n<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-                "  <isExposed>true</isExposed>\n</LightningComponentBundle>\n"
-            ),
-        ),
-        (
             "force-app/main/default/permissionsets/Admin.permissionset-meta.xml",
             (
                 '<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n'
                 "  <label>Admin</label>\n</PermissionSet>\n"
             ),
         ),
+        (
+            "force-app/main/default/flexipages/Property_Record_Page.flexipage-meta.xml",
+            (
+                '<?xml version="1.0"?>\n<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <masterLabel>Property Record Page</masterLabel>\n</FlexiPage>\n"
+            ),
+        ),
         ("pom.xml", "<project>\n  <artifactId>acme</artifactId>\n</project>\n"),
     ],
-    ids=["lwc-bundle", "permission-set", "maven"],
+    ids=["permission-set", "flexipage", "maven"],
 )
 def test_unmodelled_root_elements_fall_through_to_the_generic_parse(path: str, source: str):
     parsed = _parse(source, path)
     assert _by_kind(parsed, "xml_document")
     assert _by_kind(parsed, "xml_element")
+
+
+def test_a_bundle_whose_folder_is_not_an_api_name_falls_through():
+    """The component is named for its directory, so an unusable directory declines.
+
+    Declining hands the file to the generic structural parse, which is what it got
+    before this handler existed -- never an empty ParsedFile.
+    """
+    source = (
+        '<?xml version="1.0"?>\n<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <isExposed>true</isExposed>\n</LightningComponentBundle>\n"
+    )
+    parsed = _parse(source, "force-app/main/default/lwc/9lives/9lives.js-meta.xml")
+    assert _by_kind(parsed, "lwc_component") == []
+    assert _by_kind(parsed, "xml_document")
 
 
 def test_a_non_salesforce_flow_document_is_not_claimed():

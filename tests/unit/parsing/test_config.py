@@ -750,23 +750,29 @@ def test_wide_hand_written_config_survives_the_key_census() -> None:
 
 
 def test_xml_structural_parse() -> None:
+    """`FlexiPage` deliberately: a root element no Salesforce handler claims.
+
+    `LightningComponentBundle` used to stand here and now reaches its own handler,
+    which is what `test_salesforce_metadata_bypasses_the_structural_parse` covers.
+    This one has to keep testing the fallback.
+    """
     source = """\
 <?xml version="1.0" encoding="UTF-8"?>
-<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
+<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">
     <apiVersion>59.0</apiVersion>
-    <isExposed>true</isExposed>
-    <targets>
-        <target>lightning__RecordPage</target>
-    </targets>
-    <masterLabel>Property Tile</masterLabel>
-</LightningComponentBundle>
+    <type>RecordPage</type>
+    <flexiPageRegions>
+        <name>main</name>
+    </flexiPageRegions>
+    <masterLabel>Property Record Page</masterLabel>
+</FlexiPage>
 """
-    parsed = _parse(source, "force-app/lwc/propertyTile/propertyTile.js-meta.xml")
+    parsed = _parse(source, "force-app/flexipages/Property_Record_Page.flexipage-meta.xml")
 
-    module = _entity_by_name(parsed, "propertyTile.js-meta.xml")
+    module = _entity_by_name(parsed, "Property_Record_Page.flexipage-meta.xml")
     assert module.kind == "xml_document"
 
-    root = _entity_by_name(parsed, "LightningComponentBundle")
+    root = _entity_by_name(parsed, "FlexiPage")
     assert root.label == NodeLabel.TYPE_DEF
     assert root.kind == "xml_element"
     assert root.line_start == 2
@@ -774,15 +780,15 @@ def test_xml_structural_parse() -> None:
     label = _entity_by_name(parsed, "masterLabel")
     assert label.label == NodeLabel.VALUE
     assert label.kind == "xml_setting"
-    assert label.source == "Property Tile"
+    assert label.source == "Property Record Page"
 
     # A child with element children stays a container, not a setting.
-    assert _entity_by_name(parsed, "targets").label == NodeLabel.TYPE_DEF
+    assert _entity_by_name(parsed, "flexiPageRegions").label == NodeLabel.TYPE_DEF
 
-    stem = ".propertyTile_js-meta_xml"
-    root_qn = f"{PROJECT}:force-app.lwc.propertyTile.propertyTile_js-meta_xml.LightningComponentBundle"
+    stem = ".Property_Record_Page_flexipage-meta_xml"
+    root_qn = f"{PROJECT}:force-app.flexipages.Property_Record_Page_flexipage-meta_xml.FlexiPage"
     assert _targets(parsed, stem, RelType.DEFINES) == {root_qn}
-    assert len(_rels_from(parsed, f"{stem}.LightningComponentBundle", RelType.DEFINES)) == 4
+    assert len(_rels_from(parsed, f"{stem}.FlexiPage", RelType.DEFINES)) == 4
 
 
 def test_salesforce_metadata_bypasses_the_structural_parse() -> None:

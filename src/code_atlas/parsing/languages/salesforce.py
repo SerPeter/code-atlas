@@ -42,14 +42,14 @@ Two namespaces are added here, following the same rule:
 
     flow.<FlowApiName>            Flows
     cmdt.<Type__mdt>.<Record>     CustomMetadata records
+    lwc.<BundleFolderName>        Lightning Web Component bundles
 
 A namespace constant lives in the module that *mints* the node it addresses, and
 every other module imports it — ``apex.py`` owns ``APEX_NAMESPACE`` and
-``SOBJECT_NAMESPACE`` and this module imports both.  ``LWC_NAMESPACE`` is
-declared here and not yet minted by anything: a flow screen names a component
-before any parser reads the bundle, so those edges rest on ``ext/lwc.<Bundle>``
-stubs and join the real node the moment one exists.  That is ``resolve_imports``
-working as intended, not a gap.
+``SOBJECT_NAMESPACE`` and this module imports both, while ``typescript.py``
+imports ``LWC_NAMESPACE`` from here to rewrite a ``c/<name>`` sibling import.
+The rule exists because an unreconciled namespace is silent: every edge lands on
+a different ``ext/`` stub and nothing ever converges.
 
 Schema mapping (no new NodeLabels, no new RelTypes — both have import-time
 validators that RuntimeError):
@@ -1228,6 +1228,115 @@ def _cmdt_values(element: Node) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# LightningComponentBundle
+# ---------------------------------------------------------------------------
+
+_LWC_MODULE_KIND = "sf_lwc_bundle"
+_LWC_KIND = "lwc_component"
+
+_APEX_DATASOURCE_PREFIX = "apex://"
+_SCHEMA_TYPE_PREFIX = "@salesforce/schema/"
+
+
+def _parse_lwc_bundle(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:  # noqa: ARG001
+    """``lwc/<b>/<b>.js-meta.xml`` -> one ``TypeDef`` named for the **bundle folder**.
+
+    The bundle is three files and this is the one that mints the component, because
+    it is the only one that is 1:1 with a bundle and it is the file that declares
+    the component exists.  The ``.js`` cannot: 26% of real bundles do not export
+    ``PascalCase(folder)`` and three export an anonymous class, so its TypeDef's
+    name is unpredictable.  The ``.html`` cannot either — real bundles exist with
+    no ``<name>.html`` at all, picking a template in ``render()`` instead.
+
+    All three files keep minting their own ``Module``.  Only ``FILE_HASH_LABELS``
+    nodes carry ``file_hash``, so a file that mints none is re-parsed on every pass
+    forever (ADR-0049 §3).
+
+    The name comes from the **directory**, not from ``masterLabel`` (absent on real
+    bundles) and not from the filename: the directory is what every referencing
+    surface spells.  A template writes ``<c-error-panel>``, a ``.js`` writes
+    ``c/errorPanel``, an Aura file ``<c:errorPanel>``, a flow ``c:errorPanel`` and a
+    FlexiPage ``errorPanel``; all five must land here.
+    """
+    bundle = _api_name(PurePosixPath(path).parent.name)
+    if bundle is None:
+        return None
+
+    module_uid = _module(emit, path, _LWC_MODULE_KIND, element)
+    targets_element = _child(element, "targets")
+    targets = _texts_of(targets_element, "target") if targets_element is not None else []
+
+    line_start, line_end = _lines(element)
+    bundle_uid = emit.add(
+        name=bundle,
+        qn_suffix=f"{LWC_NAMESPACE}.{bundle}",
+        label=NodeLabel.TYPE_DEF,
+        kind=_LWC_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact(
+            {
+                "master_label": _text_of(element, "masterLabel"),
+                "is_exposed": _bool_of(element, "isExposed"),
+                "api_version": _text_of(element, "apiVersion"),
+                # Opaque strings, deliberately: 21 distinct values across 406 real
+                # files, including `lightning_VoiceExtension` with a single
+                # underscore where every sibling has two. An enum would be wrong
+                # within a release.
+                "targets": targets or None,
+            }
+        ),
+    )
+    emit.rel(module_uid, RelType.DEFINES, bundle_uid)
+
+    for api in sorted(_lwc_sobjects(element)):
+        emit.imports_sobject(bundle_uid, api)
+    for apex_class in sorted(_lwc_apex_classes(element)):
+        emit.rel(bundle_uid, RelType.IMPORTS, f"{APEX_NAMESPACE}.{apex_class}")
+
+    return emit.result()
+
+
+def _lwc_sobjects(element: Node) -> set[str]:
+    """SObjects the bundle is scoped to, from ``objects`` and schema-typed properties.
+
+    ``<objects><object>`` sits two levels inside ``targetConfigs/targetConfig``, so
+    this descends rather than reading direct children.
+    """
+    found: set[str] = set()
+    for descendant in _iter_elements(element):
+        if xml_tag(descendant) == "objects":
+            for value in _texts_of(descendant, "object"):
+                name = _api_name(value)
+                if name is not None:
+                    found.add(name)
+        declared = _xml_attributes(descendant).get("type", "")
+        if declared.startswith(_SCHEMA_TYPE_PREFIX):
+            reference = declared.removeprefix(_SCHEMA_TYPE_PREFIX).strip("/")
+            name = _api_name(reference.split(".")[0])
+            if name is not None:
+                found.add(name)
+    return found
+
+
+def _lwc_apex_classes(element: Node) -> set[str]:
+    """Apex classes backing a design-time picklist — ``datasource="apex://<Class>"``.
+
+    An **attribute**, not element text, which is why this cannot go through the
+    ``_texts_of`` helpers the rest of the module uses.
+    """
+    found: set[str] = set()
+    for descendant in _iter_elements(element):
+        datasource = _xml_attributes(descendant).get("datasource", "")
+        if datasource.startswith(_APEX_DATASOURCE_PREFIX):
+            name = _api_name(datasource.removeprefix(_APEX_DATASOURCE_PREFIX).strip())
+            if name is not None:
+                found.add(name)
+    return found
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1237,13 +1346,14 @@ _HANDLERS: dict[str, Callable[[_Emit, Node, str, _MetaFile], ParsedFile | None]]
     "Flow": _parse_flow,
     "CustomLabels": _parse_labels,
     "CustomMetadata": _parse_custom_metadata,
+    "LightningComponentBundle": _parse_lwc_bundle,
 }
 """Root element name -> handler.  This *is* the supported-type list.
 
-Every other Salesforce root element — ``LightningComponentBundle`` on an LWC's
-``.js-meta.xml``, ``PermissionSet``, ``Layout``, ``FlexiPage``, ``ApexClass`` on
-a ``.cls-meta.xml`` sidecar — falls through to ``config.py``'s generic
-structural parse, which is the pre-existing behaviour for all of them.
+Every other Salesforce root element — ``PermissionSet``, ``Layout``,
+``FlexiPage``, ``ApexClass`` on a ``.cls-meta.xml`` sidecar — falls through to
+``config.py``'s generic structural parse, which is the pre-existing behaviour
+for all of them.
 """
 
 
