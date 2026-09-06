@@ -170,6 +170,15 @@ _SAMPLES = [
         "}\n",
     ),
     _Sample(
+        # Owns .html everywhere, not only under `lwc/`. The sample is a real LWC
+        # template because that is the branch with edges; an ordinary web page takes
+        # the same route and mints only its Module.
+        "html",
+        "tree_sitter_html",
+        "force-app/main/default/lwc/productTile/productTile.html",
+        "<template>\n    <c-product-card product={product}></c-product-card>\n</template>\n",
+    ),
+    _Sample(
         "c",
         "tree_sitter_c",
         "src/util.c",
