@@ -158,6 +158,23 @@ _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
 # of edges. Chunking keeps any single transaction well inside the write timeout.
 _CALLS_WRITE_CHUNK = 2000
 
+_WAREHOUSE_PREFIX = "ext/warehouse."
+"""How a warehouse-object stub's ``qualified_name`` actually reads once minted.
+
+NOT ``powerbi.WAREHOUSE_PREFIX``, and the difference cost a round of green-but-meaningless
+tests: the parser emits an import target of ``warehouse.<obj>``, and ``resolve_imports``
+then mints the stub under ``ext/`` like every other external symbol. Matching the parser's
+spelling here found nothing at all against the real pipeline, while hand-seeded fixtures
+that skipped the minting step passed happily.
+
+Kept as a literal rather than imported so the graph layer does not depend on a parser
+module; the integration tests seed through ``resolve_imports`` so the two cannot drift
+without something failing.
+"""
+
+_WAREHOUSE_PRODUCER_KINDS: frozenset[str] = frozenset({"dbt_model", "dbt_snapshot"})
+"""Entity kinds that produce a warehouse object. Both come from ``sql.py``'s dbt mode."""
+
 # Labels the per-file content-hash reads cover: every entity label except the two
 # structural ones the hash gate deliberately ignores. Package and Project carry a
 # file_hash rather than per-entity content hashes, and the callers' `_classify_file`
@@ -252,6 +269,10 @@ _OUT_OF_BAND_REL_TYPES: frozenset[RelType] = frozenset(
         RelType.DEPENDS_ON,
         RelType.SIMILAR_TO,
         RelType.CO_CHANGES_WITH,
+        # Written by resolve_warehouse_objects at monorepo level, not by any parser: the
+        # producer and the consumer are in different sub-projects and neither file names
+        # the other.
+        RelType.FEEDS,
     }
 )
 
@@ -4126,6 +4147,100 @@ class GraphClient:
             "Cross-project import resolution: {} imports rewired across {} projects", rewired, len(project_names)
         )
         return rewired
+
+    async def resolve_warehouse_objects(self, project_names: list[str]) -> int:
+        """Rewire warehouse-object stubs onto the pipeline models that produce them.
+
+        A BI table names the warehouse object it loads from, and a dbt model names the
+        object it produces, and nothing in either file mentions the other. This is the
+        pass that joins them -- and it has to run at monorepo level, because the two live
+        in different sub-projects and every per-project resolver is scoped to one.
+
+        The join is a case fold, and that is not a shortcut: warehouse identifiers are
+        conventionally upper case and dbt model names lower case, so the same object is
+        written two ways by two tools. *Conventionally* -- there is no rule -- which is why
+        an ambiguous match is graded rather than picked, and an unmatched one is left
+        standing.
+
+        Three outcomes, and the two that are not a match matter as much as the one that is:
+
+        * **One producer.** ``dbt_model -FEEDS-> table``, the stub's IMPORTS edge deleted,
+          and the stub itself removed once nothing else points at it.
+        * **Several.** No edge. The stub survives carrying ``confidence: "ambiguous"``, so
+          the collision is a queryable fact instead of a coin flip. Two sub-projects owning
+          a model of the same name is a real thing in a monorepo.
+        * **None.** The stub survives, and that is the feature: a BI table reading an
+          object no model produces is hand-built or is drift, and either way somebody
+          wants to know.
+
+        Returns the number of FEEDS edges written.
+        """
+        if not project_names:
+            return 0
+
+        stubs = await self.execute(
+            f"MATCH (t:{NodeLabel.ENTITY})-[r:{RelType.IMPORTS}]->(es:{NodeLabel.EXTERNAL_SYMBOL}) "
+            "WHERE t.project_name IN $projects AND es.qualified_name STARTS WITH $prefix "
+            "RETURN t.uid AS table_uid, es.uid AS stub_uid, es.qualified_name AS qn",
+            {"projects": project_names, "prefix": _WAREHOUSE_PREFIX},
+        )
+        if not stubs:
+            return 0
+
+        producers = await self.execute(
+            f"MATCH (m:{NodeLabel.TYPE_DEF}) WHERE m.project_name IN $projects AND m.kind IN $kinds "
+            "RETURN m.name AS name, m.uid AS uid",
+            {"projects": project_names, "kinds": list(_WAREHOUSE_PRODUCER_KINDS)},
+        )
+        by_name: dict[str, set[str]] = defaultdict(set)
+        for row in producers:
+            if row["name"]:
+                by_name[row["name"].strip().lower()].add(row["uid"])
+
+        written = 0
+        ambiguous: list[dict[str, str]] = []
+        for stub in stubs:
+            obj = stub["qn"][len(_WAREHOUSE_PREFIX) :].strip().lower()
+            candidates = by_name.get(obj, set())
+            if len(candidates) != 1:
+                if candidates:
+                    ambiguous.append({"stub_uid": stub["stub_uid"], "table_uid": stub["table_uid"]})
+                continue
+            # MERGE, not CREATE: this runs on every flush and nothing else sweeps the
+            # edge, so a CREATE would add one parallel edge per re-index, forever.
+            await self.execute_write(
+                f"MATCH (m:{NodeLabel.ENTITY} {{uid: $model_uid}}), (t:{NodeLabel.ENTITY} {{uid: $table_uid}}) "
+                f"MERGE (m)-[:{RelType.FEEDS}]->(t) "
+                f"WITH t MATCH (t)-[r:{RelType.IMPORTS}]->(es {{uid: $stub_uid}}) DELETE r",
+                {
+                    "model_uid": next(iter(candidates)),
+                    "table_uid": stub["table_uid"],
+                    "stub_uid": stub["stub_uid"],
+                },
+            )
+            written += 1
+
+        if ambiguous:
+            await self.execute_write(
+                f"UNWIND $rows AS row MATCH (t {{uid: row.table_uid}})-[r:{RelType.IMPORTS}]->"
+                f"(es {{uid: row.stub_uid}}) SET r.confidence = 'ambiguous'",
+                {"rows": ambiguous},
+            )
+
+        # Only stubs nothing points at any more. A warehouse object read by two tables
+        # where only one resolved must keep its stub for the other.
+        await self.execute_write(
+            f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL}) WHERE es.qualified_name STARTS WITH $prefix "
+            f"AND NOT ()-[:{RelType.IMPORTS}]->(es) DETACH DELETE es",
+            {"prefix": _WAREHOUSE_PREFIX},
+        )
+        logger.debug(
+            "Warehouse resolution: {} FEEDS edge(s) written, {} ambiguous, {} stub(s) seen",
+            written,
+            len(ambiguous),
+            len(stubs),
+        )
+        return written
 
     async def create_depends_on_edges(self, project_names: list[str]) -> int:
         """Create DEPENDS_ON edges between Project nodes based on cross-project IMPORTS.

@@ -836,7 +836,11 @@ class TestWarehouseObjects:
             "\t\t\t\tSource\n"
         )
         imports = [r for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS]
-        assert [(r.to_name, r.properties["via"]) for r in imports] == [("warehouse.fct_orders", "partition")]
+        assert [r.to_name for r in imports] == ["warehouse.fct_orders"]
+        # No properties, deliberately: `resolve_imports` builds its edge from from_uid and
+        # to_uid alone and drops whatever a parser attached, so anything set here would be
+        # informative-looking and never stored. Pinned in test_sqlite_warehouse.py.
+        assert imports[0].properties == {}
 
     def test_a_direct_lake_partition_is_not_missed(self):
         """Direct Lake gives `source` children instead of an expression and names its object

@@ -24,6 +24,7 @@ from code_atlas.schema import (
     SCHEMA_VERSION,
     NodeLabel,
     RelType,
+    Visibility,
     generate_clear_file_hashes_ddl,
 )
 from code_atlas.server.analysis import _analyze_communities
@@ -7481,3 +7482,178 @@ async def test_value_reference_ignores_a_same_named_twin_it_does_not_import(grap
     assert [r["dst"] for r in records] == [f"{project}:src.utils.helper"], (
         "resolved to the un-imported twin — import scope is not being enforced"
     )
+
+
+# ---------------------------------------------------------------------------
+# Warehouse-object resolution (ATL-169)
+# ---------------------------------------------------------------------------
+#
+# Every seeding helper below goes through `resolve_imports` rather than writing an
+# ExternalSymbol by hand, and that is the whole point of how they are written. A first
+# version hand-built the stub with `qualified_name = "warehouse.<obj>"`, all five tests
+# passed, and the resolver matched NOTHING against a real index -- because
+# `resolve_imports` mints external stubs under `ext/`, so the real name is
+# `ext/warehouse.<obj>`. The fixtures agreed with the code about a shape neither the
+# parser nor the graph ever produces.
+
+
+async def _seed_warehouse_import(client, project: str, table: str, warehouse_object: str) -> str:
+    """A BI table importing a warehouse object, minted the way an index really mints it."""
+    table_uid = f"{project}:pbi.model.M.table.{table}"
+    await client.upsert_file_entities(
+        project,
+        f"tables/{table}.tmdl",
+        [
+            ParsedEntity(
+                name=table,
+                qualified_name=table_uid,
+                label=NodeLabel.TYPE_DEF,
+                kind="pbi_table",
+                line_start=1,
+                line_end=2,
+                file_path=f"tables/{table}.tmdl",
+                visibility=Visibility.PUBLIC,
+                content_hash=f"h-{table_uid}",
+            )
+        ],
+        [],
+    )
+    await client.resolve_imports(
+        project,
+        [
+            ParsedRelationship(
+                from_qualified_name=table_uid,
+                rel_type=RelType.IMPORTS,
+                to_name=f"warehouse.{warehouse_object}",
+                properties={"via": "partition"},
+            )
+        ],
+    )
+    return table_uid
+
+
+async def _seed_dbt_model(client, project: str, name: str) -> str:
+    uid = f"{project}:dbt.model.{name}"
+    await client.upsert_file_entities(
+        project,
+        f"models/{name}.sql",
+        [
+            ParsedEntity(
+                name=name,
+                qualified_name=uid,
+                label=NodeLabel.TYPE_DEF,
+                kind="dbt_model",
+                line_start=1,
+                line_end=2,
+                file_path=f"models/{name}.sql",
+                visibility=Visibility.PUBLIC,
+                content_hash=f"h-{uid}",
+            )
+        ],
+        [],
+    )
+    return uid
+
+
+async def _feeds_count(client, model_uid: str, table_uid: str) -> int:
+    rows = await client.execute(
+        f"MATCH (m {{uid: $m}})-[r:{RelType.FEEDS}]->(t {{uid: $t}}) RETURN count(r) AS c",
+        {"m": model_uid, "t": table_uid},
+    )
+    return rows[0]["c"] if rows else 0
+
+
+async def _warehouse_stubs(client) -> list[str]:
+    rows = await client.execute(
+        f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL}) WHERE es.qualified_name STARTS WITH 'ext/warehouse.' "
+        "RETURN es.qualified_name AS qn ORDER BY qn"
+    )
+    return [r["qn"] for r in rows]
+
+
+async def test_the_seeded_stub_has_the_shape_the_resolver_looks_for(graph_client: GraphClient):
+    """A guard on the fixtures, not on the resolver.
+
+    The other tests here are only worth their runtime if the stub they seed is the one a
+    real index produces. This asserts the shape directly, so a change to how
+    `resolve_imports` names external symbols fails HERE -- loudly, with the reason -- rather
+    than turning the four tests below into a suite that passes while the feature is dead.
+    """
+    await graph_client.ensure_schema()
+    await _seed_warehouse_import(graph_client, "bi", "Orders", "fct_orders")
+    assert await _warehouse_stubs(graph_client) == ["ext/warehouse.fct_orders"]
+
+
+async def test_a_dbt_model_feeds_the_bi_table_that_reads_it(graph_client: GraphClient):
+    """The edge the whole story exists for: impact crossing the warehouse boundary.
+
+    The BI file names an uppercase warehouse object, the dbt file names a lowercase model,
+    and neither mentions the other. A case fold is the entire join.
+    """
+    await graph_client.ensure_schema()
+    table_uid = await _seed_warehouse_import(graph_client, "bi", "Orders", "fct_orders")
+    model_uid = await _seed_dbt_model(graph_client, "transform", "fct_orders")
+
+    assert await graph_client.resolve_warehouse_objects(["bi", "transform"]) == 1
+    assert await _feeds_count(graph_client, model_uid, table_uid) == 1
+    assert await _warehouse_stubs(graph_client) == [], "the stub was rewired but not removed"
+
+
+async def test_an_ambiguous_warehouse_object_is_graded_never_guessed(graph_client: GraphClient):
+    """Two sub-projects owning a model of the same name is a real thing in a monorepo, and
+    a case fold cannot tell them apart. Picking one would be a coin flip written as
+    structural fact, so nothing is written and the collision becomes queryable."""
+    await graph_client.ensure_schema()
+    table_uid = await _seed_warehouse_import(graph_client, "bi", "Orders", "orders")
+    a = await _seed_dbt_model(graph_client, "transform_a", "orders")
+    b = await _seed_dbt_model(graph_client, "transform_b", "orders")
+
+    assert await graph_client.resolve_warehouse_objects(["bi", "transform_a", "transform_b"]) == 0
+    assert await _feeds_count(graph_client, a, table_uid) == 0
+    assert await _feeds_count(graph_client, b, table_uid) == 0
+
+    rows = await graph_client.execute(
+        f"MATCH (t {{uid: $t}})-[r:{RelType.IMPORTS}]->(es:{NodeLabel.EXTERNAL_SYMBOL}) "
+        "RETURN r.confidence AS confidence",
+        {"t": table_uid},
+    )
+    assert [r["confidence"] for r in rows] == ["ambiguous"], "the stub must survive, graded"
+
+
+async def test_an_unmatched_warehouse_object_keeps_its_stub(graph_client: GraphClient):
+    """A BI table reading an object no model produces is hand-built or is drift. Either way
+    somebody wants to know, so the stub is the answer rather than silence."""
+    await graph_client.ensure_schema()
+    await _seed_warehouse_import(graph_client, "bi", "Manual", "hand_built_thing")
+
+    assert await graph_client.resolve_warehouse_objects(["bi"]) == 0
+    assert await _warehouse_stubs(graph_client) == ["ext/warehouse.hand_built_thing"]
+
+
+async def test_resolve_warehouse_objects_is_idempotent(graph_client: GraphClient):
+    """It runs on every index of a monorepo, and nothing else sweeps a FEEDS edge — so a
+    CREATE would add one parallel copy per run, without bound."""
+    await graph_client.ensure_schema()
+    table_uid = await _seed_warehouse_import(graph_client, "bi", "Orders", "fct_orders")
+    model_uid = await _seed_dbt_model(graph_client, "transform", "fct_orders")
+
+    assert await graph_client.resolve_warehouse_objects(["bi", "transform"]) == 1
+    for _ in range(2):
+        # A real re-index re-mints the stub through resolve_imports before this runs.
+        await _seed_warehouse_import(graph_client, "bi", "Orders", "fct_orders")
+        await graph_client.resolve_warehouse_objects(["bi", "transform"])
+        assert await _feeds_count(graph_client, model_uid, table_uid) == 1, "a re-run added a parallel FEEDS edge"
+
+
+async def test_a_stub_two_tables_read_survives_a_partial_match(graph_client: GraphClient):
+    """Deleting every stub after a successful match would take one another table still
+    needs. Only stubs nothing points at any more may go."""
+    await graph_client.ensure_schema()
+    resolved = await _seed_warehouse_import(graph_client, "bi", "Orders", "fct_orders")
+    await _seed_warehouse_import(graph_client, "bi", "Report", "no_such_model")
+    model_uid = await _seed_dbt_model(graph_client, "transform", "fct_orders")
+
+    await graph_client.resolve_warehouse_objects(["bi", "transform"])
+
+    assert await _feeds_count(graph_client, model_uid, resolved) == 1
+    assert await _warehouse_stubs(graph_client) == ["ext/warehouse.no_such_model"]

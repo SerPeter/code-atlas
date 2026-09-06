@@ -45,6 +45,13 @@ _RELATIONSHIP_SUMMARY: dict[str, str] = {
     RelType.OVERRIDES: "Method -> parent method it overrides",
     RelType.READS_ENV: "Entity -> EnvVar it reads (EnvVar is GLOBAL: uid 'env/NAME', project_name '_global')",
     RelType.REFERENCES_FILE: "Entity -> ResourceFile it reads/writes (project-scoped, uid '{project}:res/{path}')",
+    RelType.FEEDS: (
+        "Pipeline model -> BI table it produces the data for (dbt model -> Power BI table). "
+        "The one edge that crosses the warehouse boundary, so blast_radius on a dbt model "
+        "reaches the reports built on it. Written at monorepo level by matching a table's "
+        "warehouse object against a model's name, case-folded; an ambiguous match writes no "
+        "edge and leaves an ExternalSymbol stub with confidence 'ambiguous' instead."
+    ),
     RelType.DEPENDS_ON: (
         "Project -> project dependency (monorepo), OR Project -> ExternalPackage carrying the "
         "manifest-declared version (edge property 'version'; absent when the manifest does not "

@@ -676,12 +676,14 @@ def _handle_table(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
         # the same name onto it, which is exactly the lifecycle a warehouse object needs
         # before anything knows what produces it. A partition importing data is also a
         # fair reading of the word.
+        # No `properties` here, deliberately: `resolve_imports` builds its edge from
+        # from_uid/to_uid alone and drops whatever the parser attached, on both backends.
+        # A `via` marker looked informative and was provably never stored.
         ctx.relationships.append(
             ParsedRelationship(
                 from_qualified_name=table_uid,
                 rel_type=RelType.IMPORTS,
                 to_name=f"{WAREHOUSE_PREFIX}{obj}",
-                properties={"via": "partition"},
             )
         )
     # `defaultDetailRowsDefinition` -- DAX hanging off the table itself.

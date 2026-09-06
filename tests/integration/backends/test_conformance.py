@@ -131,6 +131,7 @@ _NOT_COMPARED: dict[str, str] = {
     "resolve_doc_links": "resolution pass",
     "resolve_citations": "resolution pass",
     "resolve_cross_project_imports": "resolution pass",
+    "resolve_warehouse_objects": "resolution pass; its FEEDS output is compared by its own integration test",
     "resolve_protocol_conformance": "returns 0 unconditionally on SQLite — a known, recorded gap",
     "build_resolution_lookup": "internal to resolve_calls",
     "build_anchor_lookup": "internal to resolve_anchors",

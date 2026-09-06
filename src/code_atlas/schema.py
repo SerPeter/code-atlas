@@ -91,6 +91,13 @@ class RelType(StrEnum):
     REFERENCES_FILE = "REFERENCES_FILE"
     # Dependencies
     DEPENDS_ON = "DEPENDS_ON"
+    # A pipeline model produces the warehouse object a BI table loads from -- the one
+    # edge that carries impact across the warehouse boundary, so `blast_radius` on a dbt
+    # model reaches the reports built on it. Its own type rather than DEPENDS_ON, which
+    # already carries two endpoint shapes (project-to-project, and Project ->
+    # ExternalPackage with a version); a third would make the deletion queries harder to
+    # keep correct than one more name is worth.
+    FEEDS = "FEEDS"
     # Documentation
     DOCUMENTS = "DOCUMENTS"
     # Similarity

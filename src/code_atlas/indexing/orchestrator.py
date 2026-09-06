@@ -2733,6 +2733,10 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         logger.debug("Cross-project import resolution: {} imports rewired", rewired)
         depends_count = await graph.create_depends_on_edges(all_project_names)
         logger.debug("Created {} DEPENDS_ON edge(s)", depends_count)
+        # After the import rewire, so a warehouse stub that a sibling project turned out to
+        # define is already gone rather than being matched twice.
+        fed = await graph.resolve_warehouse_objects(all_project_names)
+        logger.debug("Warehouse resolution: {} FEEDS edge(s)", fed)
 
     logger.debug("Monorepo indexing completed in {:.1f}s", time.monotonic() - start)
 

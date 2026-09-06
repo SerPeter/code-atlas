@@ -316,6 +316,13 @@ def _ascii_fold(value: str) -> str:
     return value.translate(_ASCII_FOLD)
 
 
+_WAREHOUSE_PREFIX = "ext/warehouse."
+"""Mirror of ``GraphClient._WAREHOUSE_PREFIX``; see that constant for why it is ``ext/``."""
+
+_WAREHOUSE_PRODUCER_KINDS: frozenset[str] = frozenset({"dbt_model", "dbt_snapshot"})
+"""Mirror of ``GraphClient._WAREHOUSE_PRODUCER_KINDS``."""
+
+
 def _like_literal(value: str) -> str:
     """Escape *value* for use inside a ``LIKE`` pattern.
 
@@ -2568,6 +2575,77 @@ class SqliteGraphClient:
             [(project_name, _dumps({"version": ver}), f"{project_name}:ext/{pkg}") for pkg, ver in versions.items()],
         )
         await conn.commit()
+
+    async def resolve_warehouse_objects(self, project_names: list[str]) -> int:
+        """Mirror of ``GraphClient.resolve_warehouse_objects`` -- see that docstring.
+
+        Same three outcomes and the same case-folded join; the difference is only that a
+        unified table makes the reads plain SELECTs.
+        """
+        if not project_names:
+            return 0
+        conn = await self._get_conn()
+        placeholders = ",".join("?" * len(project_names))
+
+        cur = await conn.execute(
+            f"SELECT e.from_uid, n.uid, n.qualified_name FROM edges e "
+            f"JOIN nodes n ON n.uid = e.to_uid AND n.labels = 'ExternalSymbol' "
+            f"JOIN nodes t ON t.uid = e.from_uid "
+            f"WHERE e.rel_type = 'IMPORTS' AND t.project_name IN ({placeholders}) "
+            f"AND n.qualified_name LIKE ? ESCAPE '\\'",
+            (*project_names, f"{_like_literal(_WAREHOUSE_PREFIX)}%"),
+        )
+        stubs = list(await cur.fetchall())
+        await cur.close()
+        if not stubs:
+            return 0
+
+        kind_slots = ",".join("?" * len(_WAREHOUSE_PRODUCER_KINDS))
+        cur = await conn.execute(
+            f"SELECT name, uid FROM nodes WHERE labels = 'TypeDef' AND project_name IN ({placeholders}) "
+            f"AND kind IN ({kind_slots})",
+            (*project_names, *sorted(_WAREHOUSE_PRODUCER_KINDS)),
+        )
+        by_name: dict[str, set[str]] = defaultdict(set)
+        for name, uid in await cur.fetchall():
+            if name:
+                by_name[name.strip().lower()].add(uid)
+        await cur.close()
+
+        written = 0
+        async with self._write_lock, _txn():
+            for table_uid, stub_uid, qn in stubs:
+                obj = qn[len(_WAREHOUSE_PREFIX) :].strip().lower()
+                candidates = by_name.get(obj, set())
+                if len(candidates) != 1:
+                    if candidates:
+                        await conn.execute(
+                            "UPDATE edges SET props_json = json_set(coalesce(props_json, '{}'), "
+                            "'$.confidence', 'ambiguous') "
+                            "WHERE from_uid = ? AND to_uid = ? AND rel_type = 'IMPORTS'",
+                            (table_uid, stub_uid),
+                        )
+                    continue
+                await conn.execute(
+                    "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'FEEDS', '{}')",
+                    (next(iter(candidates)), table_uid),
+                )
+                await conn.execute(
+                    "DELETE FROM edges WHERE from_uid = ? AND to_uid = ? AND rel_type = 'IMPORTS'",
+                    (table_uid, stub_uid),
+                )
+                written += 1
+
+            # Only stubs nothing points at any more: an object read by two tables where
+            # only one resolved must keep its stub for the other.
+            await conn.execute(
+                "DELETE FROM nodes WHERE labels = 'ExternalSymbol' "
+                "AND qualified_name LIKE ? ESCAPE '\\' "
+                "AND uid NOT IN (SELECT to_uid FROM edges WHERE rel_type = 'IMPORTS')",
+                (f"{_like_literal(_WAREHOUSE_PREFIX)}%",),
+            )
+            await conn.commit()
+        return written
 
     async def resolve_cross_project_imports(self, project_names: list[str]) -> int:  # noqa: PLR0915
         """Simplified port of ``GraphClient.resolve_cross_project_imports`` —
