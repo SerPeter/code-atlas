@@ -27,6 +27,7 @@ from code_atlas.parsing.languages.powerbi import (
     model_name_for,
     split_dotted_reference,
     unquote,
+    warehouse_objects,
 )
 from code_atlas.schema import NodeLabel, RelType
 
@@ -784,3 +785,96 @@ class TestRelationships:
         text = self.TEXT + "\nrelationship r2\n\tfromColumn: A.X\n\ttoColumn: B.Y\n"
         names = {e.name for e in _parse(text, self.PATH).entities if e.kind == "pbi_relationship"}
         assert names == {"Sales -> Product", "A -> B"}
+
+
+class TestWarehouseObjects:
+    """A partition names the warehouse object its table actually loads from, in plain text.
+    That name is the one thread connecting a semantic model back to the pipeline producing
+    its data -- and it is the input to the resolver that turns it into a real edge.
+
+    Folded to lower case because that IS the join: warehouse identifiers are conventionally
+    upper case and dbt model names lower case, so `FCT_ORDERS` and `fct_orders` are one
+    object written by two tools. Conventionally, not by rule, which is why the resolver
+    consuming this must grade an ambiguous match rather than pick one.
+    """
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            # The navigation step every Snowflake-shaped connector emits.
+            ('Schema{[Name="FCT_ORDERS",Kind="Table"]}[Data]', {"fct_orders"}),
+            # A view is an object the warehouse produces too; which it is says nothing
+            # about who produces it.
+            ('Schema{[Name="DIM_CUSTOMER",Kind="View"]}[Data]', {"dim_customer"}),
+            # The SQL Server shape of the same step.
+            ('Sql.Database(s, d){[Schema="dbo",Item="Orders"]}[Data]', {"orders"}),
+            # A native query names its objects in SQL rather than through the connector.
+            ('Sql.Database(a, b, [Query="select * from analytics.marts.fct_sales"])', {"fct_sales"}),
+            ('Value.NativeQuery(Source, "select 1 from RAW.EVENTS e join DIM_DATE d on 1=1")', {"events", "dim_date"}),
+            # Nothing to find is a normal answer, not a failure.
+            ("let x = 1 in x", set()),
+            ("", set()),
+        ],
+    )
+    def test_extraction(self, expression: str, expected: set[str]):
+        assert warehouse_objects(expression) == expected
+
+    def test_the_last_dotted_segment_wins_in_sql(self):
+        """`analytics.marts.orders` and `orders` name one table with different amounts of
+        qualification, and a dbt model is known by the bare name."""
+        assert warehouse_objects('[Query="select * from analytics.marts.orders"]') == {"orders"}
+
+    def test_a_partition_produces_an_import_edge(self):
+        text = (
+            "table Orders\n"
+            "\tpartition Orders = m\n"
+            "\t\tmode: import\n"
+            "\t\tsource =\n"
+            "\t\t\tlet\n"
+            '\t\t\t\tSource = Schema{[Name="FCT_ORDERS",Kind="Table"]}[Data]\n'
+            "\t\t\tin\n"
+            "\t\t\t\tSource\n"
+        )
+        imports = [r for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS]
+        assert [(r.to_name, r.properties["via"]) for r in imports] == [("warehouse.fct_orders", "partition")]
+
+    def test_a_direct_lake_partition_is_not_missed(self):
+        """Direct Lake gives `source` children instead of an expression and names its object
+        in `entityName:` -- so looking for `source =` misses every such model."""
+        text = (
+            "table Sales\n"
+            "\tpartition Sales = entity\n"
+            "\t\tmode: directLake\n"
+            "\t\tsource\n"
+            "\t\t\tentityName: FCT_SALES\n"
+            "\t\t\tschemaName: dbo\n"
+        )
+        imports = {r.to_name for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS}
+        assert imports == {"warehouse.fct_sales"}
+
+    def test_every_partition_of_a_table_contributes(self):
+        """A table partitioned by year reads the same object several times; one partitioned
+        by source reads several. Reading only the first would under-report either way."""
+        text = (
+            "table Sales\n"
+            '\tpartition P1 = m\n\t\tsource = Schema{[Name="FCT_2023",Kind="Table"]}[Data]\n'
+            '\tpartition P2 = m\n\t\tsource = Schema{[Name="FCT_2024",Kind="Table"]}[Data]\n'
+        )
+        imports = {r.to_name for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS}
+        assert imports == {"warehouse.fct_2023", "warehouse.fct_2024"}
+
+    def test_a_table_reading_nothing_emits_nothing(self):
+        """A calculated table has no partition source. An edge to a warehouse object that
+        was never named would be invented, not inferred."""
+        text = 'table Calc\n\tpartition Calc = calculated\n\t\tsource = ROW("a", 1)\n'
+        assert [r for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS] == []
+
+    def test_two_tables_reading_one_object_converge_on_one_name(self):
+        """The convergence the dotted namespace exists for: `resolve_imports` mints one stub
+        per name, so both tables end up pointing at the same node."""
+        text = (
+            'table A\n\tpartition A = m\n\t\tsource = Schema{[Name="SHARED",Kind="Table"]}[Data]\n'
+            '\ntable B\n\tpartition B = m\n\t\tsource = Schema{[Name="shared",Kind="Table"]}[Data]\n'
+        )
+        imports = {r.to_name for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS}
+        assert imports == {"warehouse.shared"}, "case folding is what makes them converge"

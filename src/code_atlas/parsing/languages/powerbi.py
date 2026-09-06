@@ -379,6 +379,69 @@ def expression_children(block: _Block, source_lines: list[str]) -> dict[str, str
 
 
 # ---------------------------------------------------------------------------
+# Warehouse objects — what a partition actually loads from
+# ---------------------------------------------------------------------------
+
+WAREHOUSE_PREFIX = "warehouse."
+"""Namespace for the object a partition reads, before anything knows what produces it.
+
+A dotted namespace rather than a bare name, so `resolve_imports` mints one stub per
+warehouse object and every table loading from it converges on that stub — the same
+convergence `sobject.`/`apex.` rely on in `salesforce.py`.
+"""
+
+# `Schema{[Name="FCT_ORDERS",Kind="Table"]}[Data]` — the navigation step every
+# Snowflake/SQL connector emits. Kind is Table or View; both are objects a warehouse
+# produces, and which one it is says nothing about who produces it.
+_M_NAME_KIND_RE = re.compile(r"""\[\s*Name\s*=\s*"([^"]+)"\s*,\s*Kind\s*=\s*"(?:Table|View)"\s*\]""")
+# `{[Schema="dbo",Item="Orders"]}` — the SQL Server shape of the same step.
+_M_SCHEMA_ITEM_RE = re.compile(r"""Item\s*=\s*"([^"]+)"\s*\]""")
+# `[Query="select ... from analytics.marts.orders o join ..."]` — a native query, where
+# the objects are named in SQL rather than by the connector.
+_M_QUERY_RE = re.compile(r"""Query\s*=\s*"((?:[^"]|"")*)"|Value\.NativeQuery\s*\([^,]+,\s*"((?:[^"]|"")*)\"""")
+_SQL_FROM_RE = re.compile(r"\b(?:from|join)\s+([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*)", re.IGNORECASE)
+_SQL_KEYWORDS = frozenset({"select", "where", "on", "as", "lateral", "unnest", "values", "table"})
+
+
+def warehouse_objects(m_expression: str) -> set[str]:
+    """Warehouse object names an M expression loads from, case-folded.
+
+    Folded to lower case because that is the whole join: warehouse identifiers are
+    conventionally upper case and dbt model names lower case, so ``FCT_ORDERS`` and
+    ``fct_orders`` are the same object written by two tools. Conventionally -- not by rule,
+    which is exactly why the resolver that consumes this grades an ambiguous match rather
+    than picking one.
+
+    Three shapes, because connectors differ: the ``[Name=..., Kind=...]`` navigation step,
+    the ``[Schema=..., Item=...]`` one, and a native query where the objects are named in
+    SQL. The SQL case takes the last dotted segment, since ``analytics.marts.orders`` and
+    ``orders`` name the same table with different amounts of qualification.
+    """
+    found = set(_M_NAME_KIND_RE.findall(m_expression))
+    found |= set(_M_SCHEMA_ITEM_RE.findall(m_expression))
+    for query in (q or v for q, v in _M_QUERY_RE.findall(m_expression)):
+        for ref in _SQL_FROM_RE.findall(query.replace('""', '"')):
+            tail = ref.rsplit(".", 1)[-1]
+            if tail.lower() not in _SQL_KEYWORDS:
+                found.add(tail)
+    return {name.strip().lower() for name in found if name.strip()}
+
+
+def partition_warehouse_objects(block: _Block, source_lines: list[str]) -> set[str]:
+    """Warehouse objects a single ``partition`` block reads."""
+    found: set[str] = set()
+    for expr in expression_children(block, source_lines).values():
+        found |= warehouse_objects(expr)
+    for child in block.children:
+        header = _HEADER_RE.match(child.text)
+        # Direct Lake: `source` takes children rather than an expression, and names its
+        # object in `entityName:`. Grepping for `source =` misses every such model.
+        if header and header.group("kw").lower() == "source" and (entity := properties_of(child).get("entityName")):
+            found.add(entity.strip().lower())
+    return found
+
+
+# ---------------------------------------------------------------------------
 # DAX references
 # ---------------------------------------------------------------------------
 
@@ -574,18 +637,19 @@ def _handle_table(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
     ctx.recognised = True
     props = properties_of(block)
     # A partition says how the table is loaded, and it is a property of the table rather
-    # than a thing anyone searches for -- so it is folded on rather than given a node.
-    # Its `source` is what ATL-169 reads to find the warehouse object behind the table.
+    # than a thing anyone searches for -- so it is folded on rather than given a node. Its
+    # source names the warehouse object the table actually reads, which is the one thread
+    # connecting a semantic model back to the pipeline that produces its data.
+    warehouse: set[str] = set()
     for child in block.children:
         child_header = _HEADER_RE.match(child.text)
         # Every partition, not the first: a table partitioned by year has one per year,
         # and reading only partition #1 reports a mode the table may not uniformly have.
-        if (
-            child_header
-            and child_header.group("kw").lower() == "partition"
-            and (mode := properties_of(child).get("mode", ""))
-        ):
+        if not child_header or child_header.group("kw").lower() != "partition":
+            continue
+        if mode := properties_of(child).get("mode", ""):
             props["mode"] = mode if props.get("mode", mode) == mode else "mixed"
+        warehouse |= partition_warehouse_objects(child, lines)
 
     # Collected before anything is emitted: a measure may be declared above the column it
     # references, and `_emit_dax_edges` needs the whole set to tell a row-context column
@@ -606,6 +670,20 @@ def _handle_table(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
         extra=_describe(props, _TABLE_EXTRA),
     )
     ctx.defines(ctx.root_uid, table_uid)
+    for obj in sorted(warehouse):
+        # IMPORTS, not a bespoke relationship type: `resolve_imports` already mints an
+        # ExternalSymbol stub when a target does not exist and converges every importer of
+        # the same name onto it, which is exactly the lifecycle a warehouse object needs
+        # before anything knows what produces it. A partition importing data is also a
+        # fair reading of the word.
+        ctx.relationships.append(
+            ParsedRelationship(
+                from_qualified_name=table_uid,
+                rel_type=RelType.IMPORTS,
+                to_name=f"{WAREHOUSE_PREFIX}{obj}",
+                properties={"via": "partition"},
+            )
+        )
     # `defaultDetailRowsDefinition` -- DAX hanging off the table itself.
     _emit_expression_children(ctx, table_uid, block, lines, table=table, own_columns=own_columns)
 
