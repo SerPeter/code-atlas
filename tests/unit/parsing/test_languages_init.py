@@ -261,6 +261,19 @@ _SAMPLES = [
         "CREATE TABLE users (\n  id INT PRIMARY KEY,\n  email TEXT NOT NULL\n);\n",
     ),
     _Sample(
+        # Reached by content, not by suffix: `.json` belongs to the config language and a
+        # PBIR file is claimed by the `$schema` it declares (ADR-0048). Like tmdl it has no
+        # grammar of its own — the document is read with `json.loads`.
+        "pbir",
+        "code_atlas.parsing.languages.powerbi",
+        "Sales.Report/definition/pages/abc123/visuals/def456/visual.json",
+        '{"$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition'
+        '/visualContainer/2.4.0/schema.json", "name": "def456", "position": {"x": 0, "y": 0, "z": 0,'
+        ' "width": 100, "height": 100}, "visual": {"visualType": "barChart", "query": {"queryState":'
+        ' {"Y": {"projections": [{"field": {"Measure": {"Expression": {"SourceRef": {"Entity":'
+        ' "Sales"}}, "Property": "Amount"}}, "queryRef": "Sales.Amount"}]}}}}}\n',
+    ),
+    _Sample(
         # The only language with no grammar at all: TMDL is indentation-scoped, which
         # tree-sitter reaches only with an external scanner, so it parses text itself
         # through `text_parse_func`. The "grammar" here is its own module, which always
@@ -321,7 +334,13 @@ def test_installed_grammar_registers_its_language(sample: _Sample):
     """
     pytest.importorskip(sample.grammar, reason=f"{sample.grammar} not installed")
 
-    config = get_language_for_file(sample.path)
+    # The source is passed, not just the path. A language reached through the dialect
+    # route (`pbir`) is chosen by what the file DECLARES, so a path-only lookup resolves
+    # it to whichever language owns the suffix and this assertion could never hold for
+    # one. Passing the bytes costs the grammar-backed languages nothing — the suffix
+    # decides those either way — and it means this test exercises the dispatch a real
+    # parse performs rather than a simpler one.
+    config = get_language_for_file(sample.path, sample.source.encode("utf-8"))
     assert config is not None, (
         f"{sample.grammar} is installed but {sample.path} resolved to no language — registration failed silently"
     )

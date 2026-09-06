@@ -19,6 +19,8 @@ The traps, all of which fail silently rather than loudly:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from code_atlas.parsing.ast import ParsedEntity, parse_file
@@ -882,3 +884,250 @@ class TestWarehouseObjects:
         )
         imports = {r.to_name for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS}
         assert imports == {"warehouse.shared"}, "case folding is what makes them converge"
+
+
+# ---------------------------------------------------------------------------
+# PBIR — the report layer (ATL-170)
+# ---------------------------------------------------------------------------
+
+REPORT_PATH = "Sales.Report/definition/report.json"
+PAGE_PATH = "Sales.Report/definition/pages/3cf1cedb01b04a3b132e/page.json"
+VISUAL_PATH = "Sales.Report/definition/pages/3cf1cedb01b04a3b132e/visuals/19eb7a5feb78ab3943a8/visual.json"
+
+
+def _schema(kind: str, version: str = "1.0.0") -> str:
+    return f"https://developer.microsoft.com/json-schemas/fabric/item/report/definition/{kind}/{version}/schema.json"
+
+
+def _pbir(path: str, document: dict):
+    result = parse_file(path, json.dumps(document).encode("utf-8"), "proj")
+    assert result is not None
+    return result
+
+
+VISUAL_DOC = {
+    "$schema": _schema("visualContainer", "2.4.0"),
+    "name": "19eb7a5feb78ab3943a8",
+    "position": {"x": 0, "y": 0, "z": 0, "width": 100, "height": 100},
+    "visual": {
+        "visualType": "barChart",
+        "query": {
+            "queryState": {
+                "Category": {
+                    "projections": [
+                        {
+                            "field": {
+                                "Column": {
+                                    "Expression": {"SourceRef": {"Entity": "Product"}},
+                                    "Property": "Brand",
+                                }
+                            },
+                            "queryRef": "Product.Brand",
+                            "nativeQueryRef": "Brand",
+                        }
+                    ]
+                },
+                "Y": {
+                    "projections": [
+                        {
+                            "field": {
+                                "Aggregation": {
+                                    "Expression": {
+                                        "Column": {
+                                            "Expression": {"SourceRef": {"Entity": "Sales"}},
+                                            "Property": "Amount",
+                                        }
+                                    },
+                                    "Function": 0,
+                                }
+                            },
+                            "queryRef": "Sum(Sales.Amount)",
+                            "nativeQueryRef": "Total Amount",
+                        }
+                    ]
+                },
+            }
+        },
+    },
+    "filterConfig": {
+        "filters": [
+            {
+                "name": "f1",
+                "field": {"Column": {"Expression": {"SourceRef": {"Entity": "Calendar"}}, "Property": "Year"}},
+            }
+        ]
+    },
+}
+
+
+class TestThePbirRoute:
+    """`.json` belongs to the config language; a PBIR file is claimed by what it declares."""
+
+    def test_a_pbir_file_is_claimed(self):
+        assert _pbir(VISUAL_PATH, VISUAL_DOC).entities[0].kind == "pbi_visual"
+
+    def test_an_ordinary_json_file_is_untouched(self):
+        """A theme, a layout, a lockfile — the generic handler keeps every one of them."""
+        result = parse_file("StaticResources/theme.json", b'{"name": "Blue", "background": "#FFF"}', "proj")
+        assert result is not None
+        assert {e.kind for e in result.entities} == {"config_file", "config_setting"}
+
+    @pytest.mark.parametrize("version", ["1.0.0", "2.4.0", "2.11.0", "99.0.0"])
+    def test_the_sniff_does_not_pin_a_version(self, version: str):
+        """Each kind is versioned independently and they move — files in the wild declare
+        visualContainer 2.4.0, page 1.4.0, report 1.3.0. Pinning one dates the parser."""
+        doc = {**VISUAL_DOC, "$schema": _schema("visualContainer", version)}
+        assert _pbir(VISUAL_PATH, doc).entities[0].kind == "pbi_visual"
+
+    @pytest.mark.parametrize("kind", ["pagesMetadata", "versionMetadata", "bookmark", "visualContainerMobileState"])
+    def test_pbir_files_carrying_no_object_are_declined(self, kind: str):
+        """Page order, a format version, a captured UI state, a phone layout. All real PBIR
+        files, none of them a thing anyone searches for or an edge anyone traverses."""
+        result = parse_file(
+            f"Sales.Report/definition/{kind}.json", json.dumps({"$schema": _schema(kind)}).encode(), "proj"
+        )
+        assert result is not None
+        assert result.entities == []
+
+
+class TestPbirEntities:
+    def test_a_report_is_named_by_its_folder(self):
+        """`report.json` carries no name of its own — verified against real files."""
+        entity = _pbir(REPORT_PATH, {"$schema": _schema("report", "1.3.0")}).entities[0]
+        assert (entity.kind, entity.name) == ("pbi_report", "Sales")
+        assert entity.qualified_name == "proj:pbi.report.Sales"
+
+    def test_a_page_is_named_by_its_display_name(self):
+        doc = {"$schema": _schema("page", "1.4.0"), "name": "3cf1cedb01b04a3b132e", "displayName": "Page 1"}
+        entity = _pbir(PAGE_PATH, doc).entities[0]
+        assert (entity.kind, entity.name) == ("pbi_page", "Page 1")
+        assert entity.qualified_name == "proj:pbi.report.Sales.page.3cf1cedb01b04a3b132e"
+
+    def test_a_visual_is_named_by_its_type_because_that_is_all_there_usually_is(self):
+        """Real visuals carry no title, so the type IS the usual name rather than a
+        fallback. The generated id keeps the uid unique."""
+        entity = _pbir(VISUAL_PATH, VISUAL_DOC).entities[0]
+        assert (entity.kind, entity.name) == ("pbi_visual", "barChart")
+        assert entity.qualified_name.endswith(".page.3cf1cedb01b04a3b132e.visual.19eb7a5feb78ab3943a8")
+
+    def test_two_visuals_of_one_type_on_one_page_stay_distinct(self):
+        """They share a display name, which is fine — names repeat in code too. The uid
+        must not, or the page's two bar charts merge into one node."""
+        a = _pbir(VISUAL_PATH, VISUAL_DOC).entities[0]
+        other = {**VISUAL_DOC, "name": "aaaa1111bbbb2222cccc"}
+        b = _pbir(VISUAL_PATH.replace("19eb7a5feb78ab3943a8", "aaaa1111bbbb2222cccc"), other).entities[0]
+        assert a.name == b.name
+        assert a.qualified_name != b.qualified_name
+
+    def test_every_file_has_exactly_one_module(self):
+        """Only Module, Package and DocFile carry `file_hash`, so a report object modelled
+        as anything else re-parses on every indexing pass forever."""
+        for path, doc in ((REPORT_PATH, {"$schema": _schema("report")}), (VISUAL_PATH, VISUAL_DOC)):
+            entities = _pbir(path, doc).entities
+            assert [e.label for e in entities] == [NodeLabel.MODULE]
+            assert entities[0].line_start == 1
+
+    def test_the_field_wells_are_searchable_text(self):
+        """A visual named `barChart` is unfindable by what it shows. The queryRefs are what
+        a report author sees in the field well, so they go where BM25 can reach them."""
+        source = _source(_pbir(VISUAL_PATH, VISUAL_DOC).entities[0])
+        assert "Brand" in source
+        assert "Total Amount" in source
+
+
+class TestPbirFieldReferences:
+    def _uses(self, path: str, doc: dict) -> set:
+        return {(r.to_name, r.properties["column"]) for r in _pbir(path, doc).relationships if r.properties}
+
+    def test_a_bare_column_projection(self):
+        assert ("Product", "Brand") in self._uses(VISUAL_PATH, VISUAL_DOC)
+
+    def test_an_aggregated_projection_is_not_missed(self):
+        """`Aggregation` WRAPS the column. Matching one level deep finds the bare
+        projections and misses every Sum(...) — which is most of them in a real report."""
+        assert ("Sales", "Amount") in self._uses(VISUAL_PATH, VISUAL_DOC)
+
+    def test_a_filter_outside_the_query_state_is_found(self):
+        """The same container appears under filterConfig, sortDefinition and formatting
+        rules. Walking only `queryState` under-reports what a visual depends on."""
+        assert ("Calendar", "Year") in self._uses(VISUAL_PATH, VISUAL_DOC)
+
+    def test_a_measure_reference_is_found(self):
+        doc = {
+            "$schema": _schema("visualContainer"),
+            "name": "v1",
+            "visual": {
+                "visualType": "card",
+                "query": {
+                    "queryState": {
+                        "Values": {
+                            "projections": [
+                                {
+                                    "field": {
+                                        "Measure": {
+                                            "Expression": {"SourceRef": {"Entity": "Measures"}},
+                                            "Property": "Total Sales",
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
+        }
+        assert ("Measures", "Total Sales") in self._uses(VISUAL_PATH, doc)
+
+    def test_a_source_alias_without_an_entity_produces_nothing(self):
+        """`semanticQuery`'s own SourceRef documents only `Source`, a query alias into a
+        `From` clause a visual has none of. Real files carry `Entity` instead; an alias
+        cannot be resolved to a table here, and guessing would invent an edge."""
+        doc = {
+            "$schema": _schema("visualContainer"),
+            "name": "v1",
+            "visual": {
+                "visualType": "card",
+                "query": {
+                    "queryState": {
+                        "Values": {
+                            "projections": [
+                                {"field": {"Column": {"Expression": {"SourceRef": {"Source": "s"}}, "Property": "X"}}}
+                            ]
+                        }
+                    }
+                },
+            },
+        }
+        assert self._uses(VISUAL_PATH, doc) == set()
+
+    def test_a_page_level_filter_gives_the_page_its_edges(self):
+        doc = {
+            "$schema": _schema("page"),
+            "name": "p1",
+            "displayName": "Overview",
+            "filterConfig": {
+                "filters": [
+                    {"field": {"Column": {"Expression": {"SourceRef": {"Entity": "Store"}}, "Property": "Region"}}}
+                ]
+            },
+        }
+        assert self._uses(PAGE_PATH, doc) == {("Store", "Region")}
+
+
+class TestPbirRobustness:
+    def test_malformed_json_is_declined_rather_than_raised(self):
+        result = parse_file(VISUAL_PATH, b'{"$schema": "' + _schema("visualContainer").encode() + b'", broken', "proj")
+        assert result is not None
+        assert result.entities == []
+
+    def test_a_json_array_at_the_top_level_is_declined(self):
+        result = parse_file(VISUAL_PATH, b"[1, 2, 3]", "proj")
+        assert result is not None
+
+    def test_an_unknown_pbir_kind_degrades_to_nothing_rather_than_an_error(self):
+        """Microsoft adds file kinds. A new one must cost its own node, never the report."""
+        result = parse_file(
+            "Sales.Report/definition/newThing.json", json.dumps({"$schema": _schema("newThing")}).encode(), "proj"
+        )
+        assert result is not None
+        assert result.entities == []

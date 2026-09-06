@@ -24,9 +24,10 @@ strictness here is an entire semantic model vanishing from the graph on a Power 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
 from code_atlas.parsing.ast import (
@@ -34,6 +35,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    register_dialect,
     register_language,
 )
 from code_atlas.schema import NodeLabel, RelType, Visibility
@@ -1159,3 +1161,222 @@ register_language(
         text_parse_func=parse_tmdl,
     )
 )
+
+
+# ---------------------------------------------------------------------------
+# PBIR — the report layer
+# ---------------------------------------------------------------------------
+
+KIND_REPORT = "pbi_report"
+KIND_PAGE = "pbi_page"
+KIND_VISUAL = "pbi_visual"
+
+_PBIR_SCHEMA_MARKER = "/json-schemas/fabric/item/report/definition/"
+"""What every PBIR file declares in its own first bytes.
+
+Matched on the schema PATH and never on a version. Each kind is versioned independently
+and they move -- files sampled in the wild declare visualContainer 2.4.0, page 1.4.0,
+report 1.3.0 and pagesMetadata 1.0.0 -- so pinning one dates the parser immediately.
+"""
+
+_PBIR_KINDS = {"report": KIND_REPORT, "page": KIND_PAGE, "visualContainer": KIND_VISUAL}
+"""The three files that carry something worth a node.
+
+`pagesMetadata` is page ORDER, `versionMetadata` a format version, `bookmark` a captured
+UI state, `visualContainerMobileState` a phone layout. All declined: they are real PBIR
+files and none of them is a thing anyone searches for or an edge anyone traverses.
+"""
+
+
+def looks_like_pbir(head: bytes) -> bool:
+    """Whether *head* is the start of a PBIR file this module handles.
+
+    A substring test on the raw bytes, deliberately: this runs before any grammar, on
+    every ``.json`` in the repo, so it must not parse. A theme or a layout file carries no
+    such schema and falls through to the generic config handler untouched.
+    """
+    return _PBIR_SCHEMA_MARKER.encode() in head
+
+
+def _pbir_kind(schema: str) -> str:
+    """The entity kind a ``$schema`` URL names, or ``""`` for one this module declines."""
+    _, _, tail = schema.partition(_PBIR_SCHEMA_MARKER)
+    return _PBIR_KINDS.get(tail.split("/", 1)[0], "")
+
+
+def report_name_for(path: str) -> str:
+    """The report a PBIR file belongs to, from its path.
+
+    `report.json` carries no name of its own -- verified against real files -- so the
+    report is named by its folder, the same way a semantic model is. PBIP puts the
+    definition under ``<Name>.Report/``.
+    """
+    parts = PurePosixPath(path).parts
+    for part in parts:
+        if part.lower().endswith(".report"):
+            return _qn_segment(part[: -len(".Report")])
+    for i, part in enumerate(parts):
+        if part.lower() == "definition" and i:
+            return _qn_segment(parts[i - 1])
+    return "report"
+
+
+def _page_id_for(path: str) -> str:
+    """The page folder a file sits under, or ``""`` for a file outside ``pages/``."""
+    parts = PurePosixPath(path).parts
+    for i, part in enumerate(parts):
+        if part.lower() == "pages" and i + 1 < len(parts) - 1:
+            return _qn_segment(parts[i + 1])
+    return ""
+
+
+def field_references(node: object) -> set[tuple[str, str]]:
+    """Every ``(table, property)`` a PBIR document references, found anywhere in it.
+
+    A whole-document walk rather than a walk of known paths, and that is the point. The
+    same field container appears under ``query.queryState``, ``sortDefinition.sort``,
+    ``filterConfig.filters`` and inside formatting rules; enumerating those paths means
+    re-enumerating them every time Microsoft adds one, and quietly under-reporting until
+    somebody notices.
+
+    Recursive because the container nests: an aggregated projection reads
+
+        {"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"}},
+          "Function": 0}}
+
+    and `QueryExpressionContainer` has around fifty variants, several of which wrap
+    another one. Matching a single level finds the bare projections and misses every
+    ``Sum(...)`` -- which is most of them in a real report.
+
+    ``queryRef`` is not a shortcut either: it reads ``Sales.Amount`` for a bare column but
+    ``Sum(Sales.Amount)`` once aggregated.
+    """
+    found: set[tuple[str, str]] = set()
+    if isinstance(node, list):
+        for item in node:
+            found |= field_references(item)
+        return found
+    if not isinstance(node, dict):
+        return found
+
+    for key in ("Column", "Measure", "HierarchyLevel", "NativeColumn", "NativeMeasure"):
+        inner = node.get(key)
+        if isinstance(inner, dict):
+            prop = inner.get("Property") or inner.get("Level") or ""
+            # `Entity` is the table name and is what real files carry, even though
+            # `semanticQuery`'s own SourceRef definition documents only `Source` (a query
+            # alias). Reading the schema instead of the files would have matched nothing.
+            source = inner.get("Expression", {})
+            entity = source.get("SourceRef", {}).get("Entity", "") if isinstance(source, dict) else ""
+            if entity and prop:
+                found.add((entity, prop))
+    for value in node.values():
+        found |= field_references(value)
+    return found
+
+
+def _query_summary(document: dict) -> str:
+    """The field names a visual displays, as text, so BM25 can find it by them.
+
+    A visual is named for its type -- real files carry no title -- so "the report showing
+    total product cost" is unanswerable from the name alone. ``queryRef``/``nativeQueryRef``
+    are what a report author sees in the field well, which makes them the right thing to
+    put where search can reach it.
+    """
+    lines: list[str] = []
+    query_state = document.get("visual", {}).get("query", {}).get("queryState", {})
+    for role, state in sorted(query_state.items()) if isinstance(query_state, dict) else ():
+        refs = [
+            p.get("nativeQueryRef") or p.get("queryRef") or ""
+            for p in (state or {}).get("projections", [])
+            if isinstance(p, dict)
+        ]
+        if any(refs):
+            lines.append(f"{role}: {', '.join(r for r in refs if r)}")
+    return "\n".join(lines)
+
+
+def parse_pbir(path: str, source: bytes, project_name: str) -> ParsedFile | None:
+    """Parse one PBIR file into the object it declares, plus what that object reads."""
+    try:
+        document = json.loads(source.decode("utf-8-sig", errors="replace"))
+    except json.JSONDecodeError, UnicodeDecodeError:
+        return None
+    if not isinstance(document, dict):
+        return None
+    kind = _pbir_kind(str(document.get("$schema", "")))
+    if not kind:
+        return None
+
+    report = report_name_for(path)
+    page_id = _page_id_for(path)
+    object_id = _qn_segment(str(document.get("name", "")) or PurePosixPath(path).parent.name)
+
+    if kind == KIND_REPORT:
+        name, qualified_name = report, f"pbi.report.{report}"
+    elif kind == KIND_PAGE:
+        name = str(document.get("displayName") or "") or object_id
+        qualified_name = f"pbi.report.{report}.page.{object_id}"
+    else:
+        # No title in the real files sampled, so the type IS the usual name rather than a
+        # fallback. The uid carries the generated id, which is unique by construction --
+        # a page holding three bar charts must not collapse them into one node.
+        name = str(document.get("visual", {}).get("visualType") or "") or "visual"
+        qualified_name = (
+            f"pbi.report.{report}.page.{page_id}.visual.{object_id}"
+            if page_id
+            else (f"pbi.report.{report}.visual.{object_id}")
+        )
+
+    ctx = _Ctx(project_name=project_name, file_path=path, model=report, line_count=source.count(b"\n") + 1)
+    # Only when the document actually declares one. `report.json` carries no `name`, and
+    # recording the folder it happens to sit in ("definition") as its object name would be
+    # a property that looks like an identifier and is not one.
+    extra: dict[str, object] = {"objectName": object_id} if document.get("name") else {}
+    if kind == KIND_VISUAL:
+        extra["visualType"] = name
+        if page_id:
+            extra["page"] = page_id
+    if kind == KIND_PAGE and (order := document.get("displayOption")):
+        extra["displayOption"] = order
+
+    uid = ctx.set_file_root(
+        # Module, not TypeDef as the design sketch had it: only Module, Package and
+        # DocFile carry `file_hash` (schema.FILE_HASH_LABELS), and without one every PBIR
+        # file re-parses on every indexing pass forever. One file holds exactly one of
+        # these objects, so the object IS the file's node and no wrapper is needed --
+        # which also keeps the node count falling, the point of the exercise.
+        name=name,
+        qualified_name=qualified_name,
+        kind=kind,
+        extra=extra,
+    )
+    ctx.entities[0] = replace(ctx.entities[0], source=_query_summary(document))
+
+    for table, prop in sorted(field_references(document)):
+        ctx.relationships.append(
+            ParsedRelationship(
+                from_qualified_name=uid,
+                rel_type=RelType.USES_TYPE,
+                to_name=table,
+                properties={"column": prop, "via": "pbir"},
+            )
+        )
+    return ParsedFile(file_path=path, language="pbir", entities=ctx.entities, relationships=ctx.relationships)
+
+
+register_language(
+    LanguageConfig(
+        name="pbir",
+        # Reached only through the dialect route -- `.json` belongs to the config language,
+        # and a PBIR file is claimed by what it declares rather than by its suffix.
+        extensions=frozenset(),
+        # No grammar: the document is read with `json.loads`, so paying tree-sitter to
+        # build a syntax tree nothing then walks would be pure cost.
+        language=None,
+        query=None,
+        text_parse_func=parse_pbir,
+    )
+)
+register_dialect(".json", "pbir", looks_like_pbir)
