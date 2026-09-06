@@ -51,6 +51,7 @@ KIND_EXPRESSION = "pbi_m_expression"
 KIND_CALC_ITEM = "pbi_calc_item"
 KIND_FUNCTION = "pbi_udf"
 KIND_ROLE = "pbi_role"
+KIND_RELATIONSHIP = "pbi_relationship"
 
 _TAB_WIDTH = 4
 """Tabs are the TMDL convention, but exports and hand edits both produce spaces. Indent is
@@ -109,6 +110,25 @@ def _qn_segment(text: str) -> str:
     if folded == text:
         return folded
     return f"{folded}~{hashlib.blake2s(text.encode(), digest_size=3).hexdigest()}"
+
+
+_DOTTED_REF_RE = re.compile(r"^\s*(?P<table>'(?:[^']|'')*'|[^.\s]+)\s*\.\s*(?P<column>'(?:[^']|'')*'|.+?)\s*$")
+
+
+def split_dotted_reference(text: str) -> tuple[str, str]:
+    """``Table.Column`` -> ``(table, column)``, with either side optionally quoted.
+
+    TMDL references a fully qualified object with dot notation, and quotes each half only
+    when it has to -- ``Sales.'Product Key'``, ``'My Table'.Col``, ``Sales.Col``. Splitting
+    on the first dot would break ``'A.B'.Col``, where the dot is inside the name.
+
+    Returns ``("", "")`` for anything that is not a two-part reference, so a caller can
+    tell "no reference" from "a reference to something odd" without a second parse.
+    """
+    match = _DOTTED_REF_RE.match(text)
+    if not match:
+        return ("", "")
+    return (unquote(match.group("table")), unquote(match.group("column")))
 
 
 def model_name_for(path: str) -> str:
@@ -316,6 +336,7 @@ _OWN_HANDLER_KEYWORDS = frozenset(
         "function",
         "role",
         "tablepermission",
+        "relationship",
     }
 )
 """Constructs this module dispatches for itself, so nothing else may collect them."""
@@ -837,6 +858,77 @@ def _handle_role(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
             _emit_dax_edges(ctx, role_uid, dax, default_table=table)
 
 
+_RELATIONSHIP_EXTRA = (
+    "fromCardinality",
+    "toCardinality",
+    "crossFilteringBehavior",
+    "isActive",
+    "securityFilteringBehavior",
+    "joinOnDateBehavior",
+)
+
+
+def _handle_relationship(block: _Block, ctx: _Ctx, _lines: list[str]) -> None:
+    """One row of ``relationships.tmdl`` -- an edge in the model's join graph.
+
+    Given a node of its own rather than being written as a direct table-to-table edge, and
+    that is a lifetime decision rather than a modelling preference.
+    ``_recreate_file_relationships`` deletes a file's edges by their SOURCE node's
+    ``file_path``. A relationship is declared in ``relationships.tmdl`` but would be
+    sourced at a table living in ``tables/<T>.tmdl``, so re-parsing the relationships file
+    would delete none of its own old edges (they belong to another file) while re-parsing
+    the *table* would delete edges it knows nothing about and cannot put back. Stale edges
+    one way, vanishing edges the other.
+
+    A node in the file that states the fact has neither problem, and it is where the
+    relationship's own properties -- cardinality, cross-filter direction, active/inactive
+    -- belong anyway. The cost is that table-to-table reachability is two hops rather than
+    one, which traversal handles and which ``salesforce.py`` already accepts for the same
+    reason.
+
+    Named for its endpoints, not for the GUID TMDL declares it with. The GUID keeps its
+    place in ``extra_properties``, like every other stable-but-unsearchable identifier here.
+    """
+    props = properties_of(block)
+    from_table, from_column = split_dotted_reference(props.get("fromColumn", ""))
+    to_table, to_column = split_dotted_reference(props.get("toColumn", ""))
+    if not from_table or not to_table:
+        # A relationship naming no endpoints is not a relationship. Skipped rather than
+        # emitted as a node with no edges, which would read as an orphan in the graph.
+        return
+    ctx.recognised = True
+
+    header = _HEADER_RE.match(block.text)
+    guid = unquote(header.group("name") or "") if header else ""
+    name = f"{from_table} -> {to_table}"
+    extra: dict[str, object] = _describe(props, _RELATIONSHIP_EXTRA) | {
+        "fromColumn": from_column,
+        "toColumn": to_column,
+    }
+    if guid:
+        extra["relationshipId"] = guid
+
+    uid = ctx.add(
+        name=name,
+        qualified_name=f"{ctx.model_qn}.relationship.{_qn_segment(from_table)}__{_qn_segment(to_table)}",
+        label=NodeLabel.TYPE_DEF,
+        kind=KIND_RELATIONSHIP,
+        block=block,
+        docstring=block.description,
+        extra=extra,
+    )
+    ctx.defines(ctx.root_uid, uid)
+    for table, column in ((from_table, from_column), (to_table, to_column)):
+        ctx.relationships.append(
+            ParsedRelationship(
+                from_qualified_name=uid,
+                rel_type=RelType.USES_TYPE,
+                to_name=table,
+                properties={"column": column, "via": "relationship"},
+            )
+        )
+
+
 def _handle_expression(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
     """A shared M expression -- a named query every partition can draw from."""
     header = _HEADER_RE.match(block.text)
@@ -914,6 +1006,7 @@ _ROOT_HANDLERS = {
     "expression": _handle_expression,
     "function": _handle_function,
     "role": _handle_role,
+    "relationship": _handle_relationship,
 }
 
 

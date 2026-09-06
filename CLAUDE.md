@@ -124,6 +124,20 @@ embed stage asks whether any node — any project, any label — already has a v
 under the same model, and copies it. Valkey carries streams, consumer groups, the indexer lease and the
 rate-limit buckets — no vectors.
 
+**Not every parser is tree-sitter any more.** A `LanguageConfig` may set `language=None` and
+supply `text_parse_func` instead, for line-oriented indentation-scoped formats tree-sitter can
+only reach with an external scanner. TMDL (`parsing/languages/powerbi.py`) is the only one, and
+Microsoft publishes no grammar for it. Consequences worth knowing before touching `parsing/ast.py`:
+
+- `config.language` and `config.query` are `| None`. Anything that does `Parser(config.language)`
+  must guard — `tests/support/langcov.py` does not, which is why TMDL has no coverage floor: its
+  `LangSpec` is built from tree-sitter node-type names and cannot express a grammar-less language,
+  and `named_funcs`/`calls` both return **1.0 when there is nothing to measure**, so wiring one in
+  naively records a floor that guards nothing.
+- The hatch skips the grammar and nothing else. `_parse_hazard`, the `RecursionError` catch, the
+  empty-ParsedFile-on-decline rule and content hashing all still apply.
+- `__post_init__` enforces exactly one handler, matching the grammar, at registration.
+
 **An extension can be claimed by the format inside it (ADR-0048).** `register_dialect(ext, name,
 sniff)` in `parsing/ast.py` lets an application format claim files of a suffix somebody else owns;
 `.json` is wired to it, with no built-in dialects yet. First registered match wins, the order is

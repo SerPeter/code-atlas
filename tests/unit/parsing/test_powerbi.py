@@ -22,7 +22,12 @@ from __future__ import annotations
 import pytest
 
 from code_atlas.parsing.ast import ParsedEntity, parse_file
-from code_atlas.parsing.languages.powerbi import dax_references, model_name_for, unquote
+from code_atlas.parsing.languages.powerbi import (
+    dax_references,
+    model_name_for,
+    split_dotted_reference,
+    unquote,
+)
 from code_atlas.schema import NodeLabel, RelType
 
 PATH = "Contoso.SemanticModel/definition/tables/Sales.tmdl"
@@ -695,3 +700,87 @@ class TestUidsAreDistinct:
         text = "table Sales\n\tmeasure 'Sales Amount' = SUM(Sales[X])\n"
         names = {e.name: e.qualified_name for e in _parse(text).entities}
         assert "~" not in names["Sales Amount"]
+
+
+class TestSplitDottedReference:
+    """TMDL references a fully qualified object with dot notation, quoting each half only
+    when it must. Splitting on the first dot breaks the case where the dot is inside a
+    quoted name -- which is the one that produces a silently wrong table."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Sales.Col", ("Sales", "Col")),
+            ("Sales.'Product Key'", ("Sales", "Product Key")),
+            ("'My Table'.'My Col'", ("My Table", "My Col")),
+            ("'A.B'.Col", ("A.B", "Col")),
+            ("", ("", "")),
+            ("NoDotHere", ("", "")),
+        ],
+    )
+    def test_split(self, text: str, expected: tuple[str, str]):
+        assert split_dotted_reference(text) == expected
+
+
+class TestRelationships:
+    """`relationships.tmdl` is the model's join graph.
+
+    Each relationship gets a node rather than being written as a direct table-to-table
+    edge, and that is a lifetime decision. `_recreate_file_relationships` deletes a file's
+    edges by their SOURCE node's file_path -- so a table-sourced edge declared in
+    relationships.tmdl would never be deleted when that file changed, and WOULD be deleted,
+    unrecoverably, when the table's own file was re-parsed.
+    """
+
+    PATH = "Contoso.SemanticModel/definition/relationships.tmdl"
+    TEXT = (
+        "relationship cdb6e6a9-c9d1-42b9-b9e0-484a1bc7e123\n"
+        "\tfromColumn: Sales.'Product Key'\n"
+        "\ttoColumn: Product.'Product Key'\n"
+        "\ttoCardinality: one\n"
+        "\tcrossFilteringBehavior: bothDirections\n"
+        "\tisActive: false\n"
+    )
+
+    def test_a_relationship_becomes_a_node(self):
+        rel = next(e for e in _parse(self.TEXT, self.PATH).entities if e.kind == "pbi_relationship")
+        assert rel.name == "Sales -> Product"
+
+    def test_it_links_both_tables(self):
+        uses = {
+            (r.to_name, r.properties["column"])
+            for r in _parse(self.TEXT, self.PATH).relationships
+            if r.rel_type == RelType.USES_TYPE
+        }
+        assert uses == {("Sales", "Product Key"), ("Product", "Product Key")}
+
+    def test_the_join_metadata_rides_on_the_node(self):
+        """Cardinality and cross-filter direction describe the relationship, not either
+        table -- so they belong on it rather than becoming seven more nodes."""
+        rel = next(e for e in _parse(self.TEXT, self.PATH).entities if e.kind == "pbi_relationship")
+        assert rel.extra_properties["toCardinality"] == "one"
+        assert rel.extra_properties["crossFilteringBehavior"] == "bothDirections"
+        assert rel.extra_properties["isActive"] == "false"
+
+    def test_the_guid_is_kept_but_is_not_the_identity(self):
+        rel = next(e for e in _parse(self.TEXT, self.PATH).entities if e.kind == "pbi_relationship")
+        assert rel.extra_properties["relationshipId"] == "cdb6e6a9-c9d1-42b9-b9e0-484a1bc7e123"
+        assert "cdb6e6a9" not in rel.qualified_name
+
+    def test_a_dot_inside_a_quoted_table_name_is_not_a_separator(self):
+        text = "relationship r1\n\tfromColumn: 'My.Table'.Col\n\ttoColumn: Other.Col\n"
+        uses = {r.to_name for r in _parse(text, self.PATH).relationships if r.rel_type == RelType.USES_TYPE}
+        assert uses == {"My.Table", "Other"}
+
+    def test_a_relationship_naming_no_endpoints_is_skipped(self):
+        """Emitting it would put an edgeless node in the graph, which reads as an orphan
+        rather than as a malformed declaration."""
+        text = "relationship r1\n\tisActive: true\n"
+        result = parse_file(self.PATH, text.encode("utf-8"), "proj")
+        assert result is not None
+        assert [e for e in result.entities if e.kind == "pbi_relationship"] == []
+
+    def test_every_relationship_in_the_file_is_read(self):
+        text = self.TEXT + "\nrelationship r2\n\tfromColumn: A.X\n\ttoColumn: B.Y\n"
+        names = {e.name for e in _parse(text, self.PATH).entities if e.kind == "pbi_relationship"}
+        assert names == {"Sales -> Product", "A -> B"}
