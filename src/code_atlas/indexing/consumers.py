@@ -38,8 +38,8 @@ from code_atlas.graph.client import _CONFIG_REF_REL_TYPES, EmbedChunkWrite
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, parse_file
 from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, run_detectors
 from code_atlas.schema import NodeLabel, RelType
-from code_atlas.search.embeddings import _CODE_ENTITY_LABELS, build_embed_text, hash_text
-from code_atlas.settings import derive_project_name, extraction_key
+from code_atlas.search.embeddings import _CODE_ENTITY_LABELS, EmbedPolicy, build_embed_text, hash_text
+from code_atlas.settings import EmbeddingSettings, derive_project_name, extraction_key
 from code_atlas.telemetry import get_metrics, get_tracer, timed_phase
 
 if TYPE_CHECKING:
@@ -817,6 +817,8 @@ class ASTConsumer(TierConsumer):
         # which reads as a performance regression rather than a config divergence.
         self._extraction_key = extraction_key(settings)
         logger.debug("AST consumer extraction key: {}", self._extraction_key)
+        # Compiled once for the same reason: one settings object serves the whole run.
+        self._embed_policy = EmbedPolicy.from_settings(settings.embeddings)
         # `atlas index --full` distrusts the file_hash gate without destroying
         # anything (ADR-0042): re-parse every file, delete nothing. Never set in
         # daemon mode — the watch loop's whole economy is the gate.
@@ -1631,6 +1633,15 @@ class ASTConsumer(TierConsumer):
                                     node_type=entity.label.value,
                                     file_path=entity.file_path,
                                 )
+                                # Embedding is a decision of its own (ATL-166). An entity
+                                # the policy excludes is still parsed, named, traversable
+                                # and findable by BM25 and the graph — it simply never
+                                # reaches a provider. Gated here, before the text is
+                                # built, so an excluded entity costs neither the build nor
+                                # the hash; and gated at the source, so the work is not
+                                # merely dropped later but never queued.
+                                if not self._embed_policy.allows(entity.kind, entity.file_path):
+                                    continue
                                 # Build embed text from parsed entity data (same fields as graph)
                                 qn_bare = (
                                     entity.qualified_name.split(":", 1)[1]
@@ -2008,6 +2019,7 @@ class EmbedConsumer(TierConsumer):
         *,
         project_filter: set[str] | None = None,
         policy: BatchPolicy | None = None,
+        embedding_policy: EmbedPolicy | None = None,
         max_concurrency: int | None = None,
         defer_to_lease: bool = False,
         lease_owner: str | None = None,
@@ -2035,6 +2047,10 @@ class EmbedConsumer(TierConsumer):
         # attribute surfaces as a swallowed per-batch error and the vectors simply
         # never appear. Read at construction it is an immediate, obvious failure.
         self._embed_model: str = embed.configured_model
+        # None means "the shipped default policy", not "embed everything": a caller that
+        # says nothing about the policy gets the same answer a fresh config gives, and a
+        # forgotten argument cannot quietly re-admit what the AST stage just excluded.
+        self._embed_policy = embedding_policy or EmbedPolicy.from_settings(EmbeddingSettings())
         self._max_concurrency = _max_conc
         self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
@@ -2170,6 +2186,19 @@ class EmbedConsumer(TierConsumer):
         by_hash = {th: vec for (_u, _t, th), vec in zip(unique, vectors, strict=True)}
         return [(uid, by_hash[th], th) for uid, _text, th in need_embed]
 
+    def _allowed_by_policy(self, entity_props: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop the entities the embedding policy excludes (ATL-166).
+
+        Defence in depth. The AST stage is the gate that stops new work being *queued*;
+        this one catches what is already on the stream — a poison-parked event, an
+        abandoned PEL entry, or work published before the policy changed. Neither gate is
+        redundant: without the first the queue fills anyway, and without this one a policy
+        change does not take effect until the stream has drained.
+        """
+        if self._embed_policy.is_permissive:
+            return entity_props
+        return [p for p in entity_props if self._embed_policy.allows(p.get("kind") or "", p.get("file_path") or "")]
+
     async def process_batch(self, events: list[Event], batch_id: str) -> set[str] | None:  # noqa: PLR0915
         # Collect and deduplicate entities across all events in the batch
         seen: dict[str, EntityRef] = {}
@@ -2206,7 +2235,7 @@ class EmbedConsumer(TierConsumer):
                 to_process: list[tuple[str, str, str]] = []  # (uid, text, text_hash)
                 uid_to_label: dict[str, str] = {}
                 graph_hits = 0
-                for props in entity_props:
+                for props in self._allowed_by_policy(entity_props):
                     text = build_embed_text(props)
                     if not text:
                         continue

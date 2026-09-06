@@ -4338,7 +4338,7 @@ class GraphClient:
 
         Returns list of dicts with keys: ``uid``, ``qualified_name``, ``name``,
         ``signature``, ``docstring``, ``source``, ``tags``, ``kind``, ``_label``,
-        ``embed_hash``, ``has_embedding``, ``line_start``.
+        ``embed_hash``, ``has_embedding``, ``line_start``, ``file_path``.
         """
         ret = (
             "RETURN n.uid AS uid, n.qualified_name AS qualified_name, n.name AS name, "
@@ -4348,7 +4348,10 @@ class GraphClient:
             "n.embed_hash AS embed_hash, n.embedding IS NOT NULL AS has_embedding, "
             # For the chunk line span (ATL-138): one more projected property on a query
             # that already runs, rather than a second read.
-            "n.line_start AS line_start"
+            "n.line_start AS line_start, "
+            # Likewise for the embedding policy's path axis (ATL-166) — the embed stage
+            # is the second gate, and it cannot apply a path rule it cannot see.
+            "n.file_path AS file_path"
         )
 
         if labels is None or len(labels) != len(uids):
@@ -4422,21 +4425,88 @@ class GraphClient:
                 result[r["uid"]] = (r["embed_hash"], r["has_embedding"])
         return result
 
-    async def find_unembedded_entities(self, project_name: str, *, limit: int = 5000) -> list[tuple[str, str, str]]:
-        """``(uid, label, file_path)`` for entities that should carry a vector but do not.
+    async def find_unembedded_entities(
+        self, project_name: str, *, limit: int = 5000, exclude_kinds: Collection[str] = ()
+    ) -> list[tuple[str, str, str, str]]:
+        """``(uid, label, kind, file_path)`` for entities that should carry a vector but do not.
 
         Only :data:`~code_atlas.schema._EMBEDDABLE_LABELS` are considered, because that is
         exactly the set the vector indices serve. ``DocFile``/``Package`` do get embedded by
         the AST stage but have no vector index, so re-embedding them would cost API calls
         for a vector nothing can search.
+
+        *exclude_kinds* drops kinds in the query rather than after it, so the ``limit``
+        below is spent on entities that actually need a vector. It matters: on a repo where
+        the embedding policy excludes two thousand config nodes, an unfiltered page would be
+        mostly those, the caller would re-queue them, the embed stage would drop them again,
+        and the reconcile loop would report no progress on every single index (ATL-166).
+        Nodes with no ``kind`` at all are kept -- the filter names what to skip, and an
+        absent value is not one of those names.
         """
         labels = "|".join(sorted(lbl.value for lbl in _EMBEDDABLE_LABELS))
+        skip = list(exclude_kinds)
+        kind_clause = "AND (n.kind IS NULL OR NOT n.kind IN $skip_kinds) " if skip else ""
         rows = await self.execute(
             f"MATCH (n:{labels}) WHERE n.project_name = $project AND n.embedding IS NULL AND n.uid IS NOT NULL "
-            f"RETURN n.uid AS uid, {primary_label_expr('n')} AS label, n.file_path AS file_path LIMIT $limit",
-            {"project": project_name, "limit": limit},
+            f"{kind_clause}"
+            f"RETURN n.uid AS uid, {primary_label_expr('n')} AS label, n.kind AS kind, "
+            "n.file_path AS file_path LIMIT $limit",
+            {"project": project_name, "limit": limit, "skip_kinds": skip},
         )
-        return [(r["uid"], r["label"], r["file_path"] or "") for r in rows]
+        return [(r["uid"], r["label"], r["kind"] or "", r["file_path"] or "") for r in rows]
+
+    async def find_embedded_entities(
+        self, project_name: str, *, kinds: Collection[str] = ()
+    ) -> list[tuple[str, str, str]]:
+        """``(uid, kind, file_path)`` for every node in *project_name* that holds a vector.
+
+        Narrowed to *kinds* when given. Unlike :meth:`find_unembedded_entities` this is not
+        restricted to the labels a vector index serves: ``DocFile`` and ``Package`` are
+        embedded by the AST stage and have no index, so their vectors are exactly the kind
+        of paid-for-and-unsearchable that a reclaim sweep exists to find.
+
+        Uncapped on purpose. A ``LIMIT`` here would make the sweep silently partial, and a
+        partial reclaim looks identical to a complete one from the outside.
+
+        Matched on the primary labels rather than on the ``:Entity`` marker, even though the
+        marker would be shorter. The marker is indexed on ``uid`` and ``embed_hash`` only
+        (``_MARKER_INDEX_PROPERTIES``), so a ``project_name`` predicate under it is a scan of
+        every node in the graph — and this runs at the end of *every* index, not on the rare
+        destructive path ``clear_embeddings`` serves. Each primary label indexes
+        ``project_name`` and ``kind``.
+        """
+        labels = "|".join(sorted(lbl.value for lbl in _ENTITY_LABELS))
+        kind_clause = "AND n.kind IN $kinds " if kinds else ""
+        rows = await self.execute(
+            f"MATCH (n:{labels}) WHERE n.project_name = $project AND n.embedding IS NOT NULL "
+            f"{kind_clause}"
+            "RETURN n.uid AS uid, n.kind AS kind, n.file_path AS file_path",
+            {"project": project_name, "kinds": list(kinds)},
+        )
+        return [(r["uid"], r["kind"] or "", r["file_path"] or "") for r in rows]
+
+    async def clear_embeddings_for_uids(self, uids: list[str]) -> int:
+        """Strip the vector, hash and model stamp from *uids*, and delete their chunks.
+
+        The uid-scoped counterpart of :meth:`clear_embeddings`, for the embedding policy's
+        reclaim sweep (ATL-166): a node the policy now excludes should stop competing in
+        the vector channel without ``--reset-embeddings``, which would re-bill every vector
+        in the database for a dimension change nobody made.
+
+        Chunks are deleted rather than stripped, for the same reason ``clear_embeddings``
+        gives: a chunk's entire content is its vector.
+        """
+        if not uids:
+            return 0
+        unique = list(dict.fromkeys(uids))
+        rows = await self.execute(
+            "UNWIND $uids AS u MATCH (n) WHERE n.uid = u AND "
+            "(n.embedding IS NOT NULL OR n.embed_hash IS NOT NULL) "
+            "REMOVE n.embedding, n.embed_hash, n.embed_model RETURN count(n) AS c",
+            {"uids": unique},
+        )
+        await self.delete_embed_chunks(unique)
+        return rows[0]["c"] if rows else 0
 
     async def write_embeddings(
         self,

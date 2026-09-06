@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from code_atlas.events import FileChanged, Topic, encode_event
+from code_atlas.events import EmbedDirty, FileChanged, Topic, encode_event
 from code_atlas.graph.client import UpsertResult
 from code_atlas.indexing.consumers import (
     _MAX_BATCH_FAILURES,
@@ -37,16 +37,18 @@ if TYPE_CHECKING:
 
 
 class RecordingBus:
-    """Fake EventBus that records ACKs."""
+    """Fake EventBus that records ACKs and what was published."""
 
     def __init__(self) -> None:
         self.acked: list[bytes] = []
+        self.published: list[tuple[Topic, list[Event]]] = []
 
     async def ack(self, topic: Topic, group: str, *msg_ids: bytes) -> int:
         self.acked.extend(msg_ids)
         return len(msg_ids)
 
     async def publish_many(self, topic: Topic, events: list[Event]) -> list[bytes]:
+        self.published.append((topic, list(events)))
         return []
 
 
@@ -93,6 +95,11 @@ class StubGraph:
             fp: UpsertResult(added=[e.qualified_name.split(":", 1)[1] for e in entities])
             for fp, (entities, _rels) in file_data.items()
         }
+
+    async def read_embed_hashes(
+        self, uids: list[str], *, labels: list[str] | None = None
+    ) -> dict[str, tuple[str | None, bool]]:
+        return {}
 
     async def invalidate_stale_anchors(self, changed_uids: set[str]) -> int:
         return 0
@@ -1059,3 +1066,60 @@ class TestStandDownForAForeignLease:
         await asyncio.wait_for(consumer._defer_to_foreign_lease(), timeout=2)
 
         assert bus.reads == 0
+
+
+# ---------------------------------------------------------------------------
+# The embedding policy's first gate (ATL-166)
+# ---------------------------------------------------------------------------
+
+
+def _embed_uids(bus: RecordingBus) -> list[str]:
+    return [
+        e.entity.qualified_name
+        for topic, events in bus.published
+        if topic is Topic.EMBED_DIRTY
+        for e in events
+        if isinstance(e, EmbedDirty)
+    ]
+
+
+async def _index_one(tmp_path: Path, name: str, body: str, settings: AtlasSettings) -> RecordingBus:
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    bus = RecordingBus()
+    consumer = ASTConsumer(bus, StubGraph(), settings)  # ty: ignore[invalid-argument-type]
+    await consumer.process_batch([_event(name, "proj", str(tmp_path))], "b1")
+    return bus
+
+
+_BLOB = '{"service": {"name": "api", "port": 8080}}'
+
+
+async def test_the_ast_stage_never_queues_an_entity_the_policy_excludes(tmp_path: Path) -> None:
+    """A JSON file no dialect recognises yields config_file / config_section /
+    config_setting. Under the default policy only the file-level node earns a vector, and
+    the rest never reach the queue at all -- gated at the source, so the work is not
+    merely dropped downstream but never published."""
+    settings = AtlasSettings(project_root=tmp_path)
+    queued = _embed_uids(await _index_one(tmp_path, "app.json", _BLOB, settings))
+
+    assert queued == ["proj:app_json"], f"only the config_file node should be queued, got {queued}"
+
+
+async def test_the_same_file_queues_everything_when_the_policy_is_permissive(tmp_path: Path) -> None:
+    """The control. Without it the test above passes just as well against a consumer that
+    stopped publishing altogether, or a parser that stopped producing those entities."""
+    settings = AtlasSettings(project_root=tmp_path, embeddings=EmbeddingSettings(exclude_kinds=[]))
+    queued = _embed_uids(await _index_one(tmp_path, "app.json", _BLOB, settings))
+
+    assert len(queued) > 1
+    assert any(uid.endswith(".port") for uid in queued), f"expected the leaf settings too, got {queued}"
+
+
+async def test_code_is_untouched_by_the_default_policy(tmp_path: Path) -> None:
+    """The default is aimed at structured data nobody could read. It must be invisible to
+    every language that carries actual prose."""
+    settings = AtlasSettings(project_root=tmp_path)
+    body = "def handler():\n    return 1\n"
+    queued = _embed_uids(await _index_one(tmp_path, "mod.py", body, settings))
+
+    assert "proj:mod.handler" in queued

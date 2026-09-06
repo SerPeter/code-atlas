@@ -1345,10 +1345,10 @@ class FakeReconcileGraph:
         self.stuck = set(stuck or ())
         self.pages: list[list[str]] = []
 
-    async def find_unembedded_entities(self, project_name: str):
+    async def find_unembedded_entities(self, project_name: str, *, limit: int = 5000, exclude_kinds=()):
         page = self.pending[: self.limit]
         self.pages.append(list(page))
-        return [(uid, "Callable", "f.py") for uid in page]
+        return [(uid, "Callable", "function", "f.py") for uid in page]
 
     def embed(self, uids: set[str]) -> None:
         """Whatever the drain would have embedded stops being pending."""

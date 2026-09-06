@@ -47,7 +47,7 @@ from code_atlas.schema import (
     ValueKind,
     Visibility,
 )
-from code_atlas.search.embeddings import EmbedClient, EmbeddingError
+from code_atlas.search.embeddings import EmbedClient, EmbeddingError, EmbedPolicy
 from code_atlas.search.engine import (
     CompactNode,
     SearchMode,
@@ -1414,7 +1414,10 @@ def _register_search_tools(mcp: FastMCP) -> None:
             "Returns: {results: [{uid, name, qualified_name, kind, file_path, "
             "line_start, line_end, signature, docstring, similarity}], count, truncated, query_ms}. "
             "Pass detail='full' to include source code, full docstrings, and caller/callee info. "
-            "Use offset to page beyond the first `limit` results."
+            "Use offset to page beyond the first `limit` results. "
+            "This channel only sees entities that carry a vector: [embeddings] exclude/exclude_kinds "
+            "can withhold one deliberately (unstructured config data does by default), and those "
+            "entities are still findable by hybrid_search, text_search and the graph."
         ),
     )
     async def vector_search(  # noqa: PLR0911
@@ -1666,6 +1669,7 @@ def _register_hybrid_tool(mcp: FastMCP) -> None:
                 code_only=code_only,
                 mode=search_mode,
                 secondary_projects=frozenset(v.project_name for v in app.settings.knowledge.extra_vaults),
+                embed_policy=EmbedPolicy.from_settings(app.settings.embeddings),
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")

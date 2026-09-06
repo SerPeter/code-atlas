@@ -24,12 +24,12 @@ from code_atlas.events import EmbedDirty, EntityRef, Event, EventBus, FileChange
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
-from code_atlas.search.embeddings import EmbedClient, EmbeddingError
-from code_atlas.settings import derive_project_name, extraction_key, resolve_git_dir
+from code_atlas.search.embeddings import EmbedClient, EmbeddingError, EmbedPolicy
+from code_atlas.settings import EmbeddingSettings, derive_project_name, extraction_key, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
     from typing import Protocol
 
     from code_atlas.graph.protocol import GraphBackend
@@ -1709,6 +1709,8 @@ async def _run_pipeline(
         if reindex_mode and embed is not None
         else None
     )
+    # Compiled once for the run: it holds pathspecs, and three sites below want it.
+    embedding_policy = EmbedPolicy.from_settings(settings.embeddings)
 
     ast_consumer = ASTConsumer(
         bus,
@@ -1731,6 +1733,7 @@ async def _run_pipeline(
             embed,
             project_filter=project_filter,
             policy=embed_policy,
+            embedding_policy=embedding_policy,
         )
         embed_task = asyncio.create_task(embed_consumer.run())
 
@@ -1746,6 +1749,10 @@ async def _run_pipeline(
         # these consumers are still alive to act on what it finds.
         sweep = reconcile_projects or project_filter
         if drained and embed is not None and sweep:
+            # Reclaim before reconcile: strip what the policy excludes, then heal the
+            # holes that are left. The other order would have the reconcile inspect
+            # vectors this sweep is about to remove.
+            await _reclaim_excluded_embeddings(graph, sweep, embedding_policy)
             drained = await _reconcile_until_embedded(
                 graph,
                 bus,
@@ -1757,6 +1764,7 @@ async def _run_pipeline(
                     on_drain_progress=on_drain_progress,
                     settle_s=_DRAIN_SETTLE_S,
                 ),
+                embedding_policy,
             )
     finally:
         ast_consumer.stop()
@@ -2554,6 +2562,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
         if reindex_mode and embed is not None
         else None
     )
+    embedding_policy = EmbedPolicy.from_settings(settings.embeddings)
 
     ast_consumer = ASTConsumer(
         bus, graph, settings, project_root=project_root, policy=ast_policy, force_reparse=full_reindex or reset
@@ -2565,7 +2574,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     embed_consumer: EmbedConsumer | None = None
     if embed is not None:
         await bus.ensure_group(Topic.EMBED_DIRTY, "embed")
-        embed_consumer = EmbedConsumer(bus, graph, embed, policy=embed_policy)
+        embed_consumer = EmbedConsumer(bus, graph, embed, policy=embed_policy, embedding_policy=embedding_policy)
         consumer_tasks.append(asyncio.create_task(embed_consumer.run()))
 
     start = time.monotonic()
@@ -2638,6 +2647,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             names |= (
                 await _cleared_embedding_scope(graph, root_name, cleared=reset_embeddings or cleared_by_lock) or set()
             )
+            await _reclaim_excluded_embeddings(graph, names, embedding_policy)
             drained = await _reconcile_until_embedded(
                 graph,
                 bus,
@@ -2649,6 +2659,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
                     on_drain_progress=on_drain_progress,
                     settle_s=_DRAIN_SETTLE_S,
                 ),
+                embedding_policy,
             )
 
     finally:
@@ -2735,7 +2746,44 @@ def _build_delta_stats(decision: _DeltaDecision, ast_stats: Any) -> DeltaStats:
     )
 
 
-async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, project_names: Iterable[str]) -> set[str]:
+async def _reclaim_excluded_embeddings(graph: GraphClient, project_names: Iterable[str], policy: EmbedPolicy) -> int:
+    """Strip vectors from nodes the embedding policy now excludes. Returns how many.
+
+    A policy applied only at write time leaves every vector bought under the old one in
+    place, and on a project holding a large generated-config tree that can be most of the
+    graph's vectors. This is what makes a policy change take effect on the next
+    ``atlas index`` rather than on a ``--reset-embeddings``, which would re-bill every
+    vector in the database for a dimension change nobody made.
+
+    Pure graph work: no provider call, no re-embedding, nothing recomputed. And nothing
+    is deleted but the vector — the node keeps its name, its edges and its FTS document,
+    which is the whole claim that excluded is not invisible.
+    """
+    if policy.is_permissive:
+        return 0
+    # Same rule as the reconcile sweep: the kind axis can be pushed into the query unless
+    # `include` re-admits by path, because that decision needs the path and kind together.
+    kinds: Collection[str] = () if policy.include_paths is not None else policy.exclude_kinds
+    if not kinds and policy.exclude_paths is None:
+        return 0
+    total = 0
+    for project_name in project_names:
+        rows = await graph.find_embedded_entities(project_name, kinds=kinds)
+        doomed = [uid for uid, kind, file_path in rows if not policy.allows(kind, file_path)]
+        if doomed:
+            total += await graph.clear_embeddings_for_uids(doomed)
+    if total:
+        logger.info(
+            "Reclaimed {} vector(s) from entities the embedding policy excludes — they stay "
+            "indexed and searchable by name and by BM25",
+            total,
+        )
+    return total
+
+
+async def _reconcile_missing_embeddings(
+    graph: GraphClient, bus: EventBus, project_names: Iterable[str], policy: EmbedPolicy
+) -> set[str]:
     """Republish embed work for entities that hold no vector, and return their uids.
 
     The AST stage already refuses to re-embed an entity that has one
@@ -2750,11 +2798,24 @@ async def _reconcile_missing_embeddings(graph: GraphClient, bus: EventBus, proje
     the file is not in the batch at all. Reconciling desired state against actual
     state is what makes the pipeline self-healing rather than merely retryable,
     and it catches every cause rather than the one that happened to be found.
+
+    *policy* is what teaches it that "no vector" can be intentional (ATL-166). This is
+    the gate site that bites: ungated, every entity the policy excludes is re-queued on
+    every single run, the embed stage drops them all, the next pass finds exactly the
+    same set, and :func:`_reconcile_until_embedded` gives up with a warning about lost
+    work — permanently, on a graph where nothing is wrong.
     """
     refs: list[Event] = []
     queued: set[str] = set()
+    # The kind axis goes into the query so the per-project cap is spent on real holes
+    # rather than on excluded entities. It can only go there when nothing re-admits by
+    # path, because `include` beats `exclude_kinds` and that decision needs both halves;
+    # with an include list the query filters nothing and the policy is applied below.
+    db_kinds: Collection[str] = () if policy.include_paths is not None else policy.exclude_kinds
     for project_name in project_names:
-        for uid, label, file_path in await graph.find_unembedded_entities(project_name):
+        for uid, label, kind, file_path in await graph.find_unembedded_entities(project_name, exclude_kinds=db_kinds):
+            if not policy.allows(kind, file_path):
+                continue
             # EntityRef.qualified_name carries the *uid* — the embed consumer feeds it
             # straight to read_entity_texts(uids=...), so a real qualified name silently
             # matches nothing and the batch completes having done no work.
@@ -2795,6 +2856,7 @@ async def _reconcile_until_embedded(
     bus: EventBus,
     project_names: Iterable[str],
     drain: Callable[[], Awaitable[bool]],
+    policy: EmbedPolicy | None = None,
 ) -> bool:
     """Re-queue vector-less entities and drain, repeatedly, until none are left.
 
@@ -2814,7 +2876,9 @@ async def _reconcile_until_embedded(
     drained = True
     previous: set[str] | None = None
     while True:
-        queued = await _reconcile_missing_embeddings(graph, bus, names)
+        queued = await _reconcile_missing_embeddings(
+            graph, bus, names, policy or EmbedPolicy.from_settings(EmbeddingSettings())
+        )
         if not queued:
             return drained
         if queued == previous:

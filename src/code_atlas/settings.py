@@ -333,6 +333,31 @@ class EmbeddingSettings(StrictSection):
     enabled: bool = Field(
         default=True, description="Enable embedding pipeline and vector search. False for lightweight mode."
     )
+
+    # Which entities get a vector — a policy of its own, because indexing a file and
+    # embedding its entities are two decisions (ATL-166). Two axes: the kind axis carries
+    # the shipped default and the path axis is the user's instrument. `[scope]`'s gitignore
+    # dialect, and its replace semantics on the one field that has a default to replace.
+    #
+    # There is no `extend_exclude` here, unlike `[scope]`. The path default is empty, so it
+    # would do exactly what `exclude` does under a second name.
+    exclude: list[str] = Field(
+        default_factory=list,
+        description="Path patterns whose entities are not embedded. Empty by default.",
+    )
+    include: list[str] = Field(
+        default_factory=list,
+        description="Path patterns to embed even when an exclude rule matches. Beats both exclude axes.",
+    )
+    exclude_kinds: list[str] | None = Field(
+        default=None,
+        description=(
+            "Entity kinds not to embed. Replaces the default when set. Defaults to the generic "
+            "structural fallback kinds ('config_setting', 'config_section') — data no dialect could "
+            "make sense of, which is a name and a value and never a semantic neighbour of anything."
+        ),
+    )
+
     provider: str = Field(default="tei", description="Embedding provider: 'tei', 'litellm', or 'ollama'.")
     model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")
     base_url: str = Field(default="http://localhost:8080", description="OpenAI-compatible embedding endpoint URL.")

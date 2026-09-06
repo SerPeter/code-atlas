@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 import litellm
+import pathspec
 from loguru import logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -445,6 +447,75 @@ class EmbedClient:
             return False
         else:
             return True
+
+
+# ---------------------------------------------------------------------------
+# Embedding policy
+# ---------------------------------------------------------------------------
+
+DEFAULT_EXCLUDE_KINDS: tuple[str, ...] = ("config_setting", "config_section")
+"""Kinds that carry no vector unless the user asks for one.
+
+These two are emitted by exactly one code path -- ``config.py``'s generic structural
+fallback (``_GENERIC_SECTION_KIND`` / ``_GENERIC_SETTING_KIND``), the handler that runs
+when no dialect recognised the file. So "structured data nobody could make sense of" is
+not a path pattern to be guessed at; it is a kind, and excluding the kind needs no
+per-repo tuning. A file a dialect *did* recognise gets ``k8s_resource``,
+``compose_service``, ``ci_job``, ``dbt_source`` and so on, and keeps its vector.
+
+``config_file`` is deliberately absent: the file-level node is named after the file and
+answers "what is this config for", which is a fair semantic target. The XML fallback's
+twins (``xml_element``, ``xml_setting``) are absent too -- ATL-144 is actively trying to
+extract *more* from Salesforce metadata, and pre-empting it here would be working against
+it. Both are one line away for a user who disagrees.
+"""
+
+
+@dataclass(frozen=True)
+class EmbedPolicy:
+    """Which entities are allowed to carry a vector.
+
+    Recomputed from settings wherever it is needed rather than stamped onto nodes. A node
+    property would mean a ``SCHEMA_VERSION`` bump, and a bump drops the vector indices
+    unconditionally while recreating them only conditionally (ADR-0024). It would also
+    freeze the policy at index time, so changing it would need a reindex -- where this
+    takes effect on the next pass, and at query time immediately.
+
+    Cheap by construction: one set lookup and at most two pathspec matches, on inputs the
+    caller already holds.
+    """
+
+    exclude_kinds: frozenset[str]
+    exclude_paths: pathspec.PathSpec | None
+    include_paths: pathspec.PathSpec | None
+
+    @classmethod
+    def from_settings(cls, settings: EmbeddingSettings) -> EmbedPolicy:
+        """Compile *settings* into a policy."""
+        kinds = settings.exclude_kinds if settings.exclude_kinds is not None else list(DEFAULT_EXCLUDE_KINDS)
+        return cls(
+            exclude_kinds=frozenset(kinds),
+            exclude_paths=pathspec.PathSpec.from_lines("gitignore", settings.exclude) if settings.exclude else None,
+            include_paths=pathspec.PathSpec.from_lines("gitignore", settings.include) if settings.include else None,
+        )
+
+    @property
+    def is_permissive(self) -> bool:
+        """True when nothing is excluded, so callers can skip the check entirely."""
+        return not self.exclude_kinds and self.exclude_paths is None
+
+    def allows(self, kind: str, file_path: str) -> bool:
+        """Whether an entity of *kind* at *file_path* may be embedded.
+
+        ``include`` is checked first and wins outright: the default is broad on purpose,
+        and one line should be able to bring a directory back without having to restate
+        the kind list it collides with.
+        """
+        if self.include_paths is not None and file_path and self.include_paths.match_file(file_path):
+            return True
+        if kind in self.exclude_kinds:
+            return False
+        return not (self.exclude_paths is not None and file_path and self.exclude_paths.match_file(file_path))
 
 
 # ---------------------------------------------------------------------------

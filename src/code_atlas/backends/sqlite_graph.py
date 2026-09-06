@@ -2800,13 +2800,13 @@ class SqliteGraphClient:
             chunk = uids[i : i + chunk_size]
             placeholders = ",".join("?" * len(chunk))
             cur = await conn.execute(
-                f"SELECT uid, qualified_name, name, kind, labels, props_json, embedding IS NOT NULL "
+                f"SELECT uid, qualified_name, name, kind, labels, file_path, props_json, embedding IS NOT NULL "
                 f"FROM nodes WHERE uid IN ({placeholders})",
                 chunk,
             )
             rows = await cur.fetchall()
             await cur.close()
-            for uid, qn, name, kind, label, props_json, has_emb in rows:
+            for uid, qn, name, kind, label, file_path, props_json, has_emb in rows:
                 props = json.loads(props_json) if props_json else {}
                 results.append(
                     {
@@ -2819,6 +2819,7 @@ class SqliteGraphClient:
                         "tags": props.get("tags"),
                         "kind": kind,
                         "_label": label,
+                        "file_path": file_path,
                         "embed_hash": props.get("embed_hash"),
                         "has_embedding": bool(has_emb),
                     }
@@ -2849,17 +2850,24 @@ class SqliteGraphClient:
                 result[uid] = (props.get("embed_hash"), bool(has_emb))
         return result
 
-    async def find_unembedded_entities(self, project_name: str, *, limit: int = 5000) -> list[tuple[str, str, str]]:
+    async def find_unembedded_entities(
+        self, project_name: str, *, limit: int = 5000, exclude_kinds: Collection[str] = ()
+    ) -> list[tuple[str, str, str, str]]:
         conn = await self._get_conn()
         placeholders = ",".join("?" * len(_VEC_LABEL_VALUES))
+        skip = sorted(exclude_kinds)
+        # `kind IS NULL OR` is not decoration: SQL's NOT IN yields NULL, not true, for a
+        # NULL left operand, so without it every entity with no kind would be filtered out
+        # by a policy that never named it.
+        kind_clause = f"AND (kind IS NULL OR kind NOT IN ({','.join('?' * len(skip))})) " if skip else ""
         cur = await conn.execute(
-            f"SELECT uid, labels, file_path FROM nodes WHERE project_name = ? AND embedding IS NULL "
-            f"AND labels IN ({placeholders}) LIMIT ?",
-            (project_name, *sorted(_VEC_LABEL_VALUES), limit),
+            f"SELECT uid, labels, kind, file_path FROM nodes WHERE project_name = ? AND embedding IS NULL "
+            f"AND labels IN ({placeholders}) {kind_clause}LIMIT ?",
+            (project_name, *sorted(_VEC_LABEL_VALUES), *skip, limit),
         )
         rows = await cur.fetchall()
         await cur.close()
-        return [(uid, label, file_path or "") for uid, label, file_path in rows]
+        return [(uid, label, kind or "", file_path or "") for uid, label, kind, file_path in rows]
 
     async def _sync_vector_rows(self, conn: SqlConnection, by_label: dict[str, list[tuple[int, bytes]]]) -> None:
         """Replace the vec0 rows for a whole batch, two statements per label.
@@ -3117,6 +3125,77 @@ class SqliteGraphClient:
             await cur.close()
             await self._delete_chunk_uids(conn, chunk_uids)
         await conn.commit()
+        return cleared
+
+    async def find_embedded_entities(
+        self, project_name: str, *, kinds: Collection[str] = ()
+    ) -> list[tuple[str, str, str]]:
+        """Mirror of ``GraphClient.find_embedded_entities`` — see that docstring."""
+        conn = await self._get_conn()
+        skip = sorted(kinds)
+        kind_clause = f"AND kind IN ({','.join('?' * len(skip))}) " if skip else ""
+        # EmbedChunk is excluded explicitly, because this table is unified where Memgraph's
+        # graph is not: there, `MATCH (n:Entity)` skips chunks for free, since a chunk
+        # deliberately carries no :Entity marker (schema.py). A chunk is not an entity the
+        # policy has an opinion about — its vector belongs to its parent's lifecycle, and
+        # `clear_embeddings_for_uids` removes it via `delete_embed_chunks`.
+        cur = await conn.execute(
+            f"SELECT uid, kind, file_path FROM nodes WHERE project_name = ? AND embedding IS NOT NULL "
+            f"AND labels != ? {kind_clause}",
+            (project_name, NodeLabel.EMBED_CHUNK.value, *skip),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(uid, kind or "", file_path or "") for uid, kind, file_path in rows]
+
+    async def clear_embeddings_for_uids(self, uids: list[str]) -> int:
+        """Mirror of ``GraphClient.clear_embeddings_for_uids`` — see that docstring.
+
+        The vec0 rows go too, which the project-scoped ``clear_embeddings`` above leaves
+        behind. It can afford to: what it clears is about to be re-embedded, so the rows
+        are re-keyed on the next write. These nodes are not — the policy just said they
+        never get a vector again — so a stale row would sit in the shortlist forever,
+        spending `k * _VEC_OVERSAMPLE` slots that the rescore then discards.
+
+        The FTS rows deliberately stay. Excluded from embeddings is not excluded from the
+        index, and BM25 is the channel this node now lives in.
+        """
+        if not uids:
+            return 0
+        unique = list(dict.fromkeys(uids))
+        conn = await self._get_conn()
+        cleared = 0
+        async with self._write_lock, _txn():
+            for chunk in _chunks(unique):
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" * len(chunk))
+                cur = await conn.execute(
+                    f"SELECT uid, labels, rowid FROM nodes WHERE uid IN ({placeholders}) "
+                    "AND (embedding IS NOT NULL OR json_extract(props_json, '$.embed_hash') IS NOT NULL)",
+                    chunk,
+                )
+                rows = list(await cur.fetchall())
+                await cur.close()
+                if not rows:
+                    continue
+                cleared += len(rows)
+                by_label: dict[str, list[int]] = defaultdict(list)
+                for _uid, label, rowid in rows:
+                    by_label[label].append(rowid)
+                for label, rowids in by_label.items():
+                    if label in _VEC_LABEL_VALUES:
+                        ids = ",".join(str(r) for r in rowids)
+                        await self._safe_exec(conn, f"DELETE FROM vec_{label.lower()} WHERE rowid IN ({ids})")
+                await conn.execute(
+                    "UPDATE nodes SET embedding = NULL, "
+                    "props_json = json_remove(props_json, '$.embed_hash', '$.embed_model') "
+                    f"WHERE uid IN ({placeholders})",
+                    chunk,
+                )
+            await conn.commit()
+        # Outside the lock: delete_embed_chunks takes it itself, and it is not reentrant.
+        await self.delete_embed_chunks(unique)
         return cleared
 
     async def count_embeddings_by_project(self) -> dict[str, int]:

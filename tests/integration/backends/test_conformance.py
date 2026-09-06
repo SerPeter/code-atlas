@@ -67,6 +67,8 @@ _COMPARED: frozenset[str] = frozenset(
         "get_project_file_paths",
         "read_embed_hashes",
         "find_embeddings_by_hash",
+        "find_embedded_entities",
+        "clear_embeddings_for_uids",
     }
 )
 
@@ -516,6 +518,43 @@ class TestSharedSurfaceAgrees:
         # And the model filter agrees too — a vector from another space is not copied.
         assert await mg.find_embeddings_by_hash(["shared-hash"], "model-y") == {}
         assert await lite.find_embeddings_by_hash(["shared-hash"], "model-y") == {}
+
+    async def test_find_embedded_entities(self, both):
+        """The embedding policy's reclaim sweep reads this and then strips what it names
+        (ATL-166), so a backend that reported a different set would silently reclaim a
+        different set of vectors."""
+        mg, lite = both
+        dim = mg._dimension
+        uid = f"{PROJECT}:mod.caller"
+        for client in (mg, lite):
+            await client.write_embeddings_and_hashes(
+                [(uid, [0.25] * dim, "h-caller")], labels=["Callable"], model="model-x"
+            )
+        assert sorted(await mg.find_embedded_entities(PROJECT)) == sorted(await lite.find_embedded_entities(PROJECT))
+        assert sorted(await mg.find_embedded_entities(PROJECT, kinds=["function"])) == sorted(
+            await lite.find_embedded_entities(PROJECT, kinds=["function"])
+        )
+        assert await mg.find_embedded_entities(PROJECT, kinds=["nothing_has_this_kind"]) == []
+        assert await lite.find_embedded_entities(PROJECT, kinds=["nothing_has_this_kind"]) == []
+
+    async def test_clear_embeddings_for_uids(self, both):
+        """Both must strip the same vectors and leave the same node behind — the promise
+        is that only the vector goes."""
+        mg, lite = both
+        dim = mg._dimension
+        kept, doomed = f"{PROJECT}:mod.caller", f"{PROJECT}:mod.callee"
+        for client in (mg, lite):
+            await client.write_embeddings_and_hashes(
+                [(kept, [0.25] * dim, "h-kept"), (doomed, [0.5] * dim, "h-doomed")],
+                labels=["Callable", "Callable"],
+                model="model-x",
+            )
+        assert await mg.clear_embeddings_for_uids([doomed]) == await lite.clear_embeddings_for_uids([doomed]) == 1
+        assert await mg.read_embed_hashes([kept, doomed]) == await lite.read_embed_hashes([kept, doomed])
+        # The node itself survives on both: excluded from embeddings is not unindexed.
+        assert _uid_of(await mg.get_entity_by_uid(doomed)) == _uid_of(await lite.get_entity_by_uid(doomed)) == doomed
+        # Idempotent on both, and honest about it — the count is what the sweep logs.
+        assert await mg.clear_embeddings_for_uids([doomed]) == await lite.clear_embeddings_for_uids([doomed]) == 0
 
     async def test_gc_orphaned_embed_chunks(self, both):
         """A chunk has no edge to its parent, so nothing takes it along when the parent

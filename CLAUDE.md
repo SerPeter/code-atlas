@@ -124,6 +124,27 @@ embed stage asks whether any node — any project, any label — already has a v
 under the same model, and copies it. Valkey carries streams, consumer groups, the indexer lease and the
 rate-limit buckets — no vectors.
 
+**Indexing and embedding are two decisions (ADR-0047).** `[embeddings] exclude` / `include` /
+`exclude_kinds` say which entities get a vector, in `[scope]`'s gitignore dialect. `include` beats
+both axes; `exclude_kinds` replaces its default when set. The default is a **kind** rule,
+`["config_setting", "config_section"]`: those come from exactly one code path, `config.py`'s generic
+structural fallback, so they are precisely "data no dialect could read". A recognised dialect
+(`ci_job`, `k8s_resource`, `dbt_source`, …) keeps its vector with no re-admit line.
+
+- **Three gate sites, and the third is the one that bites.** The AST stage stops work being queued,
+  `EmbedConsumer._allowed_by_policy` catches what is already on the stream, and
+  `_reconcile_missing_embeddings` must be gated or it re-queues every excluded entity on every run,
+  forever, while shouting that earlier embed work was lost.
+- **Excluded is not invisible.** The node keeps its name, edges and FTS document. Where a query gates
+  on vector similarity, `_floor_excluded_in_vector_channel` admits it at the tail of the vector list
+  instead of dropping it — `analyze_query` weights vector at 2.0, so absence would be a silent
+  handicap. Only uids another channel surfaced, and only policy-excluded ones: a vector missing by
+  accident is a pipeline hole, and flooring it would hide it.
+- **No node property and no `SCHEMA_VERSION` bump** — a bump drops the vector indices (ADR-0024). The
+  policy is recomputed from settings wherever it is needed, so a change takes effect on the next index.
+- `_reclaim_excluded_embeddings` strips vectors bought under an older policy at the end of an index.
+  Pure graph work; it never re-bills anything, which `--reset-embeddings` would.
+
 **Pacing follows the backend (ADR-0044):** `backend.queue = "sqlite"` gets a `SqliteRateLimiter` holding the
 same buckets and AIMD factor in `ratelimit.sqlite3`; `"valkey"`/`"auto"` get the Valkey one. The two are
 hand-written mirrors (Lua cannot call Python) and are pinned together by
@@ -268,7 +289,9 @@ in a sub-directory is not read, and `cli._warn_shadowed_config` says so when one
 
 - `atlas.toml` — committed, describes the codebase (scope, search settings, detectors, monorepo layout, vault)
 - `atlas.local.toml` — gitignored, merges per key over the above. For `[redis]`, `[memgraph]`, `[embeddings]`,
-  `[backend]`, which differ per machine and should not be in the shared file
+  `[backend]`, which differ per machine and should not be in the shared file. The exception is
+  `[embeddings]`'s policy keys (`exclude`, `include`, `exclude_kinds`) — those describe the codebase,
+  not the machine, and belong in the committed `atlas.toml`
 - Environment variables: `ATLAS_*` prefix with double-underscore nesting (e.g. `ATLAS_EMBEDDINGS__MODEL`).
   Atlas never reads `.env` itself — export from `.envrc` (direnv) if you want that
 - `.atlasignore` — gitignore-style exclusion patterns for indexing

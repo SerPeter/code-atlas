@@ -26,7 +26,7 @@ from code_atlas.indexing.orchestrator import (
     publish_project_changes,
 )
 from code_atlas.indexing.watcher import FileWatcher
-from code_atlas.search.embeddings import EmbedClient
+from code_atlas.search.embeddings import EmbedClient, EmbedPolicy
 from code_atlas.settings import derive_project_name
 from code_atlas.telemetry import is_enabled as telemetry_enabled
 from code_atlas.telemetry import set_backlog
@@ -175,7 +175,16 @@ class DaemonManager:
             ),
         ]
         if embed is not None:
-            consumers.append(EmbedConsumer(bus, graph, embed, defer_to_lease=True, lease_owner=lease_owner))
+            consumers.append(
+                EmbedConsumer(
+                    bus,
+                    graph,
+                    embed,
+                    defer_to_lease=True,
+                    lease_owner=lease_owner,
+                    embedding_policy=EmbedPolicy.from_settings(settings.embeddings),
+                )
+            )
         self._consumers = consumers
 
         if include_watcher:

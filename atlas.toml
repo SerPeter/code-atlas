@@ -5,7 +5,9 @@
 # rationale markers, monorepo layout, knowledge vault. It is the same for everyone.
 #
 # Anything that differs per machine — [redis], [memgraph], [embeddings], [backend] —
-# belongs in one of these instead, most specific first:
+# belongs in one of these instead, most specific first. (The exception is the embedding
+# POLICY keys below: which entities deserve a vector is a property of the codebase, so
+# they stay here.)
 #
 #   1. ATLAS_* environment variables    ATLAS_MEMGRAPH__HOST=box.local
 #                                       (nested sections use a double underscore;
@@ -58,6 +60,20 @@ dimension = 768
 # max_input_tokens = 2048
 # Max embedding chunks for a node whose text exceeds the cap (default 8).
 # max_chunks = 8
+#
+# Which entities get a vector (ADR-0047). Indexing a file and embedding its entities are
+# two decisions: an entity excluded here is still parsed, named, traversable and found by
+# BM25 and the graph — it just never reaches the provider, and in hybrid search it ranks
+# at the floor of the vector channel rather than vanishing from it.
+#
+# The default excludes the two kinds the generic structural fallback emits — the handler
+# that runs when NO dialect recognised the file. A recognised one (ci_job, k8s_resource,
+# compose_service, dbt_source, ...) keeps its vector without a line of config.
+# exclude_kinds = ["config_setting", "config_section"]
+# Path patterns, gitignore dialect. Empty by default.
+# exclude = ["vendor/**", "generated/**"]
+# Re-admit; beats both axes.
+# include = ["ops/critical/"]
 
 [memgraph]
 host = "localhost"

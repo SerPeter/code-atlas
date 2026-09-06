@@ -20,6 +20,7 @@ from code_atlas.schema import (
     RelType,
     generate_clear_file_hashes_ddl,
 )
+from code_atlas.search.embeddings import DEFAULT_EXCLUDE_KINDS, EmbedPolicy
 from code_atlas.settings import (
     AtlasSettings,
     EmbeddingSettings,
@@ -726,12 +727,12 @@ class TestEmbeddingReconciliation:
         from code_atlas.schema import _EMBEDDABLE_LABELS
 
         embeddable = {lbl.value for lbl in _EMBEDDABLE_LABELS}
-        assert {label for _uid, label, _fp in missing} <= embeddable
+        assert {label for _uid, label, _kind, _fp in missing} <= embeddable
 
         # uid, not qualified_name: the embed consumer feeds this field straight into
         # read_entity_texts(uids=...), so a bare qualified name matches nothing and the
         # batch silently completes having embedded zero entities.
-        assert all(uid.startswith(f"{project}:") for uid, _label, _fp in missing)
+        assert all(uid.startswith(f"{project}:") for uid, _label, _kind, _fp in missing)
 
     async def test_reconcile_requeues_an_entity_whose_embed_was_lost(
         self, project_dir, graph_client, event_bus
@@ -744,14 +745,16 @@ class TestEmbeddingReconciliation:
         await graph_client.ensure_schema()
         await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
 
-        unembedded = {uid for uid, _, _ in await graph_client.find_unembedded_entities(project)}
+        unembedded = {uid for uid, _, _, _ in await graph_client.find_unembedded_entities(project)}
         assert unembedded
 
         await event_bus.ensure_group(Topic.EMBED_DIRTY, "reconcile-test")
         # Returns the uids it re-queued, not a count: the caller loops until a pass
         # re-queues the same set twice, which is how it tells "still working" from
         # "these will never embed" without paying for the second one.
-        queued = await _reconcile_missing_embeddings(graph_client, event_bus, [project])
+        queued = await _reconcile_missing_embeddings(
+            graph_client, event_bus, [project], EmbedPolicy.from_settings(NO_EMBED)
+        )
         assert queued == unembedded
 
         published = await event_bus.read_batch(Topic.EMBED_DIRTY, "reconcile-test", "c1", count=1, block_ms=500)
@@ -1828,3 +1831,106 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         assert await _calls(graph_client, project) == [("run", "widen")]
         assert all((await graph_client.get_batch_file_hashes(project, files)).values())
         assert all((await graph_client.get_batch_rels_hashes(project, files)).values())
+
+
+# ---------------------------------------------------------------------------
+# The embedding policy, end to end (ATL-166 / ADR-0047)
+# ---------------------------------------------------------------------------
+
+
+_BLOB_JSON = '{"service": {"name": "api", "port": 8080, "replicas": 3}}'
+
+
+async def _vectors_by_kind(graph_client, project: str) -> dict[str, int]:
+    records = await graph_client.execute(
+        f"MATCH (n:{NodeLabel.ENTITY}) WHERE n.project_name = $p AND n.embedding IS NOT NULL "
+        "RETURN n.kind AS kind, count(n) AS c",
+        {"p": project},
+    )
+    return {r["kind"]: r["c"] for r in records}
+
+
+class TestTheEmbeddingPolicy:
+    """Indexing a file and embedding its entities are two decisions.
+
+    The failure this guards is not "an excluded node got a vector" -- that one is loud.
+    It is the re-queue sweep: ungated, it republishes every excluded entity on every run,
+    the embed stage drops them all, and the loop reports the same set twice and warns that
+    earlier embed work was lost. On a graph where nothing is wrong. Forever.
+    """
+
+    @pytest.fixture
+    def project_dir(self, tmp_path):
+        _write(tmp_path, "src/app.py", 'def hello():\n    """Say hello."""\n    return "hello"\n')
+        _write(tmp_path, "conf/app.json", _BLOB_JSON)
+        return tmp_path
+
+    async def test_the_default_policy_buys_no_vector_for_an_unrecognised_blob(
+        self, project_dir, graph_client, event_bus, provider
+    ):
+        settings = AtlasSettings(project_root=project_dir, embeddings=_embedding_settings(graph_client._dimension))
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        by_kind = await _vectors_by_kind(graph_client, project)
+        assert by_kind.get("config_setting", 0) == 0
+        assert by_kind.get("config_section", 0) == 0
+        assert by_kind.get("function", 0) > 0, "precondition: code is still embedded"
+
+    async def test_the_excluded_nodes_are_still_in_the_graph(self, project_dir, graph_client, event_bus, provider):
+        """Excluded from embeddings is not excluded from the index -- the whole promise."""
+        settings = AtlasSettings(project_root=project_dir, embeddings=_embedding_settings(graph_client._dimension))
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        records = await graph_client.execute(
+            f"MATCH (n:{NodeLabel.ENTITY}) WHERE n.project_name = $p AND n.kind = 'config_setting' "
+            "RETURN n.name AS name ORDER BY name",
+            {"p": project},
+        )
+        assert [r["name"] for r in records] == ["name", "port", "replicas"]
+
+    async def test_a_second_run_re_queues_nothing(self, project_dir, graph_client, event_bus, provider):
+        """The gate that bites. Without it the second run finds three vector-less config
+        nodes, republishes them, and logs that earlier embed work was lost."""
+        settings = AtlasSettings(project_root=project_dir, embeddings=_embedding_settings(graph_client._dimension))
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        assert await graph_client.find_unembedded_entities(project, exclude_kinds=DEFAULT_EXCLUDE_KINDS) == []
+
+        provider.calls = 0
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        assert provider.calls == 0, "an unchanged tree under an unchanged policy must cost nothing"
+
+    async def test_a_vector_bought_under_an_older_policy_is_reclaimed(
+        self, project_dir, graph_client, event_bus, provider
+    ):
+        """The sweep. A policy applied only at write time would leave these behind, and a
+        user would have to reach for --reset-embeddings, which re-bills the whole graph."""
+        dim = graph_client._dimension
+        permissive = AtlasSettings(
+            project_root=project_dir,
+            embeddings=EmbeddingSettings(model=_FAKE_MODEL, dimension=dim, exclude_kinds=[]),
+        )
+        default = AtlasSettings(project_root=project_dir, embeddings=_embedding_settings(dim))
+        await graph_client.ensure_schema()
+        project = derive_project_name(project_dir)
+
+        await index_project(permissive, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        before = await _vectors_by_kind(graph_client, project)
+        assert before.get("config_setting", 0) == 3, f"precondition: the blob was embedded, got {before}"
+
+        provider.calls = 0
+        await index_project(default, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+
+        after = await _vectors_by_kind(graph_client, project)
+        assert after.get("config_setting", 0) == 0
+        assert after.get("function", 0) == before.get("function", 0), "code must keep its vectors"
+        assert provider.calls == 0, "reclaiming is pure graph work and must never reach the provider"
