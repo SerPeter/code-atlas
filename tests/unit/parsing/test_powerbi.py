@@ -562,3 +562,84 @@ class TestPartitions:
         text = "table Sales\n\tpartition A = m\n\t\tmode: import\n\tpartition B = m\n\t\tmode: import\n"
         table = next(e for e in _parse(text).entities if e.kind == "pbi_table")
         assert table.extra_properties["mode"] == "import"
+
+
+class TestUserDefinedFunctions:
+    """`functions.tmdl` holds DAX UDFs -- top-level declarations, not nested under a
+    table. They are called from measures, calculation items AND role filters, so a UDF is
+    often the shared dependency that makes several parts of a model move together; miss it
+    and each of them looks independent."""
+
+    TEXT = (
+        "/// Applies a rate.\n"
+        "/// @param value The base value\n"
+        "function 'RLS.Pct' =\n"
+        "\t\t(value: DOUBLE) => value * [Rate]\n"
+        "\tannotation DAXLIB_PackageId = acme\n"
+    )
+    PATH = "Contoso.SemanticModel/definition/functions.tmdl"
+
+    def test_a_function_is_a_callable(self):
+        result = _parse(self.TEXT, self.PATH)
+        fn = next(e for e in result.entities if e.kind == "pbi_udf")
+        assert fn.label == NodeLabel.CALLABLE
+        assert fn.name == "RLS.Pct"
+
+    def test_it_carries_its_body(self):
+        fn = next(e for e in _parse(self.TEXT, self.PATH).entities if e.kind == "pbi_udf")
+        assert _source(fn) == "(value: DOUBLE) => value * [Rate]"
+
+    def test_its_body_produces_call_edges(self):
+        calls = {r.to_name for r in _parse(self.TEXT, self.PATH).relationships if r.rel_type == RelType.CALLS}
+        assert calls == {"Rate"}
+
+    def test_the_jsdoc_style_description_is_the_docstring(self):
+        """`/// @param` is the documented convention for documenting a UDF."""
+        fn = next(e for e in _parse(self.TEXT, self.PATH).entities if e.kind == "pbi_udf")
+        assert fn.docstring == "Applies a rate.\n@param value The base value"
+
+    def test_a_name_with_a_dot_is_one_uid_segment(self):
+        fn = next(e for e in _parse(self.TEXT, self.PATH).entities if e.kind == "pbi_udf")
+        assert fn.qualified_name == "proj:pbi.model.Contoso.function.RLS_Pct"
+
+
+class TestSecurityRoles:
+    """Row-level security is DAX naming real tables and columns, in a file nothing else in
+    the model references. So "what does this role depend on" -- and its mirror, "what
+    breaks if I rename this column" -- have no other witness anywhere in the graph.
+
+    Three spellings occur in the wild and the DOCUMENTED one is the rare one: measured over
+    public repositories, the default-property form outnumbers an explicit
+    `filterExpression` child roughly 28 to 1.
+    """
+
+    PATH = "Contoso.SemanticModel/definition/roles/R.tmdl"
+
+    DEFAULT_FORM = "role Store1\n\tmodelPermission: read\n\n\ttablePermission Store = 'Store'[Code] IN {1,2}\n"
+    CHILD_EQUALS = "role Region\n\ttablePermission Sales\n\t\tfilterExpression = 'Sales'[Region] = \"EU\"\n"
+    CHILD_COLON = "role All\n\ttablePermission Sales\n\t\tfilterExpression: TRUE()\n"
+
+    def _uses(self, text: str) -> set:
+        return {(r.to_name, r.properties.get("column")) for r in _parse(text, self.PATH).relationships if r.properties}
+
+    def test_a_role_becomes_an_entity(self):
+        role = next(e for e in _parse(self.DEFAULT_FORM, self.PATH).entities if e.kind == "pbi_role")
+        assert role.name == "Store1"
+        assert role.extra_properties["modelPermission"] == "read"
+
+    @pytest.mark.parametrize("form", ["DEFAULT_FORM", "CHILD_EQUALS", "CHILD_COLON"])
+    def test_every_spelling_links_the_role_to_the_table_it_filters(self, form: str):
+        """The permission names its table in the declaration, so this edge is certain even
+        when the filter expression itself is one this parser cannot read."""
+        assert any(t for t, _c in self._uses(getattr(self, form))), form
+
+    def test_the_default_property_filter_is_read(self):
+        assert ("Store", "Code") in self._uses(self.DEFAULT_FORM)
+
+    def test_an_equals_assigned_child_filter_is_read(self):
+        assert ("Sales", "Region") in self._uses(self.CHILD_EQUALS)
+
+    def test_a_role_file_is_no_longer_declined(self):
+        """Before roles were handled, a roles/*.tmdl file produced nothing and was hashed
+        as empty -- so it was never revisited either."""
+        assert _parse(self.CHILD_COLON, self.PATH).entities

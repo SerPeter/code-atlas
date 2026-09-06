@@ -48,6 +48,8 @@ KIND_MEASURE = "pbi_measure"
 KIND_COLUMN = "pbi_column"
 KIND_EXPRESSION = "pbi_m_expression"
 KIND_CALC_ITEM = "pbi_calc_item"
+KIND_FUNCTION = "pbi_udf"
+KIND_ROLE = "pbi_role"
 
 _TAB_WIDTH = 4
 """Tabs are the TMDL convention, but exports and hand edits both produce spaces. Indent is
@@ -281,7 +283,19 @@ def properties_of(block: _Block) -> dict[str, str]:
 
 
 _OWN_HANDLER_KEYWORDS = frozenset(
-    {"model", "table", "column", "measure", "partition", "calculationgroup", "calculationitem", "expression"}
+    {
+        "model",
+        "table",
+        "column",
+        "measure",
+        "partition",
+        "calculationgroup",
+        "calculationitem",
+        "expression",
+        "function",
+        "role",
+        "tablepermission",
+    }
 )
 """Constructs this module dispatches for itself, so nothing else may collect them."""
 
@@ -684,6 +698,95 @@ def _handle_calculation_group(
         _emit_dax_edges(ctx, uid, dax, default_table=table, own_columns=own_columns)
 
 
+def _handle_function(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
+    """A DAX user-defined function, from ``functions.tmdl``.
+
+    Top-level, not nested under a table, and called from measures, calculation items and
+    role filters alike -- so a UDF is frequently the shared dependency several parts of a
+    model have in common, and missing it leaves each of them looking independent.
+
+    ``Callable`` for the same reason a measure is: something calls it, and the existing
+    tooling reads CALLS as "executes".
+    """
+    header = _HEADER_RE.match(block.text)
+    name = unquote(header.group("name") or "") if header else ""
+    if not name:
+        return
+    ctx.recognised = True
+    dax = _expression_of(block, lines)
+    uid = ctx.add(
+        name=name,
+        qualified_name=f"{ctx.model_qn}.function.{_qn_segment(name)}",
+        label=NodeLabel.CALLABLE,
+        kind=KIND_FUNCTION,
+        block=block,
+        source=dax,
+        # `/// @param` / `/// @returns` is the documented convention for UDF docs, and
+        # descriptions are already collected for every object.
+        docstring=block.description,
+        extra=_describe(properties_of(block), ("returnType",)),
+    )
+    ctx.defines(ctx.root_uid, uid)
+    _emit_dax_edges(ctx, uid, dax, default_table="")
+
+
+def _handle_role(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
+    """A security role from ``roles/<Role>.tmdl``, and the tables its filters read.
+
+    Row-level security is DAX naming real tables and columns, in a file nothing else in
+    the model references -- so "what does this role depend on", and its mirror "what
+    breaks if I rename this column", have no other witness in the graph.
+
+    Three spellings occur in the wild and the documented one is the rare one: measured
+    over public repositories, ``tablePermission <Table> = <DAX>`` (the filter as the
+    object's default property, which is what Power BI Desktop writes) outnumbers an
+    explicit ``filterExpression`` child roughly 28 to 1, and a colon-assigned
+    ``filterExpression:`` appears in hand-written files. All three are read here.
+    """
+    header = _HEADER_RE.match(block.text)
+    name = unquote(header.group("name") or "") if header else ""
+    if not name:
+        return
+    ctx.recognised = True
+    props = properties_of(block)
+    role_uid = ctx.add(
+        name=name,
+        qualified_name=f"{ctx.model_qn}.role.{_qn_segment(name)}",
+        label=NodeLabel.TYPE_DEF,
+        kind=KIND_ROLE,
+        block=block,
+        docstring=block.description,
+        extra=_describe(props, ("modelPermission",)),
+    )
+    ctx.defines(ctx.root_uid, role_uid)
+
+    for child in block.children:
+        child_header = _HEADER_RE.match(child.text)
+        if not child_header or child_header.group("kw").lower() != "tablepermission":
+            continue
+        table = unquote(child_header.group("name") or "")
+        if not table:
+            continue
+        # The permission names its table in the declaration itself, so the edge to it is
+        # certain even when the filter expression is one this parser cannot read.
+        ctx.relationships.append(
+            ParsedRelationship(
+                from_qualified_name=role_uid,
+                rel_type=RelType.USES_TYPE,
+                to_name=table,
+                properties={"via": "rls"},
+            )
+        )
+        # Spelling 1: the filter is the default property. Spellings 2 and 3: a
+        # `filterExpression` child, assigned with `=` or with `:`.
+        filters = [_expression_of(child, lines)] if _has_default_property(child) else []
+        filters += list(expression_children(child, lines).values())
+        if colon_form := properties_of(child).get("filterExpression"):
+            filters.append(colon_form)
+        for dax in filters:
+            _emit_dax_edges(ctx, role_uid, dax, default_table=table)
+
+
 def _handle_expression(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
     """A shared M expression -- a named query every partition can draw from."""
     header = _HEADER_RE.match(block.text)
@@ -759,6 +862,8 @@ _ROOT_HANDLERS = {
     "model": _handle_model,
     "table": _handle_table,
     "expression": _handle_expression,
+    "function": _handle_function,
+    "role": _handle_role,
 }
 
 
