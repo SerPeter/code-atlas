@@ -2047,8 +2047,8 @@ class TestGrammarGapReporting:
 
         real_lookup = orch.get_language_for_file
 
-        def _no_ts(path: str):
-            return None if path.endswith(".ts") else real_lookup(path)
+        def _no_ts(path: str, source: bytes | None = None, **kwargs):
+            return None if path.endswith(".ts") else real_lookup(path, source, **kwargs)
 
         monkeypatch.setattr(orch, "get_language_for_file", _no_ts)
 
@@ -2065,7 +2065,7 @@ class TestGrammarGapReporting:
         from code_atlas.indexing.orchestrator import FileScope
 
         (tmp_path / "b.ts").write_text("const x = 1", encoding="utf-8")
-        monkeypatch.setattr(orch, "get_language_for_file", lambda _p: None)
+        monkeypatch.setattr(orch, "get_language_for_file", lambda _p, **_kw: None)
 
         scope = FileScope(tmp_path, _make_settings(tmp_path))
         scope.scan()

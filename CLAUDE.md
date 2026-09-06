@@ -124,6 +124,23 @@ embed stage asks whether any node — any project, any label — already has a v
 under the same model, and copies it. Valkey carries streams, consumer groups, the indexer lease and the
 rate-limit buckets — no vectors.
 
+**An extension can be claimed by the format inside it (ADR-0048).** `register_dialect(ext, name,
+sniff)` in `parsing/ast.py` lets an application format claim files of a suffix somebody else owns;
+`.json` is wired to it, with no built-in dialects yet. First registered match wins, the order is
+`_BUILTIN_LANGUAGE_MODULES`, a sniff sees 4 KiB and never parses, and anything it does not claim
+falls to the generic handler unchanged. Two rules:
+
+- **The generic handler is the floor.** No match, an unknown language name, or a sniff that raises
+  all land there. A route that swallowed unmatched files would replace every config entity in the
+  graph and never error.
+- **No new handler may copy the XML hand-off.** `config.py`'s `_parse_xml` calls into
+  `salesforce.parse_salesforce_metadata` directly — a second mechanism for the same question, kept
+  only because ATL-144 owns that surface. New dialects use the registry.
+
+`get_language_for_file(..., resolve_content=False)` answers "is this indexable at all" without
+reading the file. `FileScope.scan` is the caller that needs it; with resolution on, it reads every
+ambiguous-suffix file in the repo to pick between dialects that would answer identically.
+
 **Indexing and embedding are two decisions (ADR-0047).** `[embeddings] exclude` / `include` /
 `exclude_kinds` say which entities get a vector, in `[scope]`'s gitignore dialect. `include` beats
 both axes; `exclude_kinds` replaces its default when set. The default is a **kind** rule,

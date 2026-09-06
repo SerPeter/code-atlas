@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -159,7 +160,77 @@ def register_language(config: LanguageConfig) -> None:
         _AMBIGUOUS_EXTENSIONS.update(config.ambiguous_extensions)
 
 
-def get_language_for_file(path: str, source: bytes | None = None) -> LanguageConfig | None:
+# ---------------------------------------------------------------------------
+# Application dialects: one extension, several formats that declare themselves
+# ---------------------------------------------------------------------------
+
+DIALECT_SNIFF_BYTES = 4096
+"""How much of a file a sniff is shown.
+
+A sniff runs before any grammar does, on every file with that suffix in the repo,
+so it gets a bounded prefix and nothing more. A format that cannot identify itself
+in its first 4 KiB is not identifying itself; it is being parsed.
+"""
+
+_DIALECTS: dict[str, list[tuple[str, Callable[[bytes], bool]]]] = defaultdict(list)
+"""``extension -> [(language name, sniff)]``, in registration order.
+
+``.json`` is the motivating case (ATL-167): it is owned by the generic structural
+config handler, which is the right floor and the wrong ceiling — a Power BI PBIR
+``visual.json`` says what it is in its own first bytes, and so do a great many other
+application formats. Keyed by extension rather than hard-coded for JSON because the
+same question is already asked of Salesforce ``.xml`` (ATL-144), and answered there a
+second way entirely: a hand-off buried inside the XML handler.
+"""
+
+_BROKEN_SNIFFS: set[str] = set()
+"""Dialects whose sniff raised. Logged once each — a bad plugin must not turn every
+file of that suffix into a log line, nor make it unparseable."""
+
+
+def register_dialect(extension: str, language_name: str, sniff: Callable[[bytes], bool]) -> None:
+    """Claim files of *extension* whose first bytes *sniff* recognises, for *language_name*.
+
+    Registration order is the tie-break — first sniff to match wins — and it is the
+    order of ``_BUILTIN_LANGUAGE_MODULES`` in ``languages/__init__.py``. Stated rather
+    than implied: "first match wins" is only a rule if the order is predictable.
+
+    The language must also be registered with :func:`register_language`, and whoever owns
+    *extension* must list it in ``ambiguous_extensions`` — otherwise nothing consults this.
+    """
+    _DIALECTS[extension.lower()].append((language_name, sniff))
+
+
+def dialect_resolver(extension: str, default: str) -> Callable[[bytes], str]:
+    """A ``resolve_dialect`` for *extension* that consults :func:`register_dialect`.
+
+    Reads the registry at call time, so a dialect registered by a module imported later
+    than the extension owner still wins. Returns *default* when nothing matches, which is
+    the whole safety property: the generic handler is the floor and is always reachable.
+    """
+
+    def _resolve(source: bytes) -> str:
+        head = source[:DIALECT_SNIFF_BYTES]
+        for name, sniff in _DIALECTS.get(extension.lower(), ()):
+            try:
+                matched = sniff(head)
+            except Exception:
+                # Contained deliberately: one bad sniff must not make every file of this
+                # suffix unparseable. Logged once, then treated as no-match thereafter.
+                if name not in _BROKEN_SNIFFS:
+                    _BROKEN_SNIFFS.add(name)
+                    logger.warning("Dialect sniff for {} raised; treating it as no-match", name)
+                continue
+            if matched:
+                return name
+        return default
+
+    return _resolve
+
+
+def get_language_for_file(
+    path: str, source: bytes | None = None, *, resolve_content: bool = True
+) -> LanguageConfig | None:
     """Look up language config by exact basename, then by file extension.
 
     Basename wins so that extensionless formats (``Dockerfile``,
@@ -167,11 +238,17 @@ def get_language_for_file(path: str, source: bytes | None = None) -> LanguageCon
     ``dockerfile.txt`` does not route to the container language — that file's
     basename is ``dockerfile.txt`` and its suffix is ``.txt``.
 
-    For a suffix two languages share (``.h``), the winner is decided by the
-    file's content — see ``LanguageConfig.resolve_dialect``. Pass *source* when
-    you have it; callers that do not are read from disk, because the answer must
-    not depend on who is asking. A caller that only needs "is this file
-    indexable at all" can ignore this entirely: both candidates are non-None.
+    For a suffix several languages share (``.h``, ``.json``), the winner is decided
+    by the file's content — see ``LanguageConfig.resolve_dialect``. Pass *source*
+    when you have it; callers that do not are read from disk, because the answer
+    must not depend on who is asking.
+
+    ``resolve_content=False`` skips that step and returns the registered default.
+    A caller that only needs "is this file indexable at all" wants exactly that: the
+    answer is the same for every dialect of a suffix, and reading the file to reach
+    it is a syscall per file for nothing. ``FileScope.scan`` is that caller, and
+    before this existed it read every ``.h`` in the repo in full to answer a question
+    whose answer it already had.
 
     Triggers plugin discovery on first call so that built-in and
     external languages are available.
@@ -189,7 +266,7 @@ def get_language_for_file(path: str, source: bytes | None = None) -> LanguageCon
     if lang_name is None:
         return None
     config = _LANGUAGES.get(lang_name)
-    if matched_by_name or suffix not in _AMBIGUOUS_EXTENSIONS or config is None:
+    if matched_by_name or not resolve_content or suffix not in _AMBIGUOUS_EXTENSIONS or config is None:
         return config
 
     if source is None:

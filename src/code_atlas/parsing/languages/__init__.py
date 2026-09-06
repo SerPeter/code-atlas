@@ -147,7 +147,7 @@ def missing_grammar_extras(extensions: Iterable[str]) -> dict[str, str]:
     missing: dict[str, str] = {}
     for ext in extensions:
         extra = _EXTENSION_EXTRAS.get(ext.lower())
-        if extra is not None and get_language_for_file(f"probe{ext}") is None:
+        if extra is not None and get_language_for_file(f"probe{ext}", resolve_content=False) is None:
             missing[ext.lower()] = extra
     return missing
 

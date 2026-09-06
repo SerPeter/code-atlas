@@ -530,8 +530,12 @@ class FileScope:
                 rel_path = f"{rel_dir}/{fname}" if rel_dir else fname
                 if not self.is_included(rel_path):
                     continue
-                # Language support check (not in is_included — watcher may skip this)
-                if get_language_for_file(rel_path) is None:
+                # Language support check (not in is_included — watcher may skip this).
+                # resolve_content=False: this asks whether the file is indexable AT ALL,
+                # and every dialect of a suffix answers that the same way. Without it the
+                # lookup reads the file from disk to pick between them — one full read per
+                # `.h`, and per `.json` once that became a conditioned route (ATL-167).
+                if get_language_for_file(rel_path, resolve_content=False) is None:
                     # Recorded, not merely skipped. A file the scope WANTED and no
                     # grammar could read is the difference between "this repo has no
                     # code" and "you did not install the extra" (ATL-110).

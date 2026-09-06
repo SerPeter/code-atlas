@@ -532,7 +532,7 @@ class TestMissingGrammarReporting:
         from code_atlas.parsing import languages as lang_mod
 
         # Simulate a default install: nothing is registered.
-        monkeypatch.setattr("code_atlas.parsing.ast.get_language_for_file", lambda _p: None)
+        monkeypatch.setattr("code_atlas.parsing.ast.get_language_for_file", lambda _p, **_kw: None)
         assert lang_mod.missing_grammar_extras({".ts"}) == {".ts": "typescript"}
         assert lang_mod.missing_grammar_extras({".go", ".rs"}) == {".go": "go", ".rs": "rust"}
 
@@ -547,7 +547,7 @@ class TestMissingGrammarReporting:
         """Telling a user to install something that would not help is worse than silence."""
         from code_atlas.parsing import languages as lang_mod
 
-        monkeypatch.setattr("code_atlas.parsing.ast.get_language_for_file", lambda _p: None)
+        monkeypatch.setattr("code_atlas.parsing.ast.get_language_for_file", lambda _p, **_kw: None)
         assert lang_mod.missing_grammar_extras({".zzz", ".kt"}) == {}
 
     def test_the_install_hint_collapses_once_it_is_most_of_them(self):

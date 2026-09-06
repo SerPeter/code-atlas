@@ -124,6 +124,7 @@ from code_atlas.parsing.ast import (
     ParsedEntity,
     ParsedFile,
     ParsedRelationship,
+    dialect_resolver,
     node_text,
     register_language,
 )
@@ -1888,6 +1889,14 @@ try:
             query=Query(_JSON_LANGUAGE, "(document) @root"),
             parse_func=_parse_config,
             comment_node_types=frozenset({"comment"}),
+            # A conditioned route (ATL-167). Structural parsing is the floor for JSON and
+            # the wrong ceiling: an application format declares itself in its own first
+            # bytes, and one that does should get a handler that understands it rather
+            # than a tree of `config_setting` leaves. `register_dialect(".json", ...)` is
+            # how such a handler claims its files; with none registered the resolver
+            # returns "json" and nothing about this registration has changed.
+            ambiguous_extensions=frozenset({".json"}),
+            resolve_dialect=dialect_resolver(".json", "json"),
         )
     )
 except ImportError:
