@@ -89,6 +89,13 @@ shell = ["tree-sitter-bash~=0.25"]
 # Windows wheels.
 docker = ["tree-sitter-containerfile~=0.9"]
 sql = ["tree-sitter-sql~=0.3"]
+# Markup: LWC templates, Aura .cmp/.app/.evt and Visualforce .page/.component all
+# parse with this one grammar. NOT tree-sitter-xml, which is already a dependency and
+# cannot do the job -- measured, it fails 364 of 387 real LWC templates with 4,181
+# ERROR nodes, because an LWC template is HTML5, not XML: unquoted `value={greeting}`
+# attribute values, valueless `lwc:else`, and void `<br>` each break it, and the last
+# swallows the rest of the document.
+html = ["tree-sitter-html~=0.23"]
 config = [
     "tree-sitter-yaml~=0.7",
     "tree-sitter-json~=0.24",
