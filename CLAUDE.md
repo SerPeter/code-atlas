@@ -147,9 +147,12 @@ falls to the generic handler unchanged. Two rules:
 - **The generic handler is the floor.** No match, an unknown language name, or a sniff that raises
   all land there. A route that swallowed unmatched files would replace every config entity in the
   graph and never error.
-- **No new handler may copy the XML hand-off.** `config.py`'s `_parse_xml` calls into
-  `salesforce.parse_salesforce_metadata` directly — a second mechanism for the same question, kept
-  only because ATL-144 owns that surface. New dialects use the registry.
+- **Claiming is a commitment.** A dialect that claims a file and then declines gets an _empty_
+  `ParsedFile`, not a fallback — so the claimed file's entities are deleted from the graph. A sniff
+  sees 4 KiB of bytes and never the path, so it cannot anticipate a path-shaped decline. `.xml` is
+  the worked example: `salesforce` is a registered dialect of it, and its handler is a wrapper in
+  `config.py` that falls back to the generic structural parse precisely so a decline cannot delete
+  anything. (This replaced the direct `_parse_xml` hand-off in ATL-176 — there is one mechanism now.)
 
 `get_language_for_file(..., resolve_content=False)` answers "is this indexable at all" without
 reading the file. `FileScope.scan` is the caller that needs it; with resolution on, it reads every

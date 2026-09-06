@@ -42,7 +42,8 @@ that for `.json`. The resolver reads the registry at call time, so a dialect reg
 the extension's owner still wins.
 
 Keyed by extension rather than written for JSON because the same question is already being asked of Salesforce `.xml`
-(ATL-144). When that surface is revisited, the hand-off inside `_parse_xml` moves here and there is one mechanism again.
+(ATL-144). That surface has since been migrated (ATL-176): `.xml` declares itself ambiguous, `salesforce` is registered
+as a dialect of it, and there is one mechanism again.
 
 **2. The generic handler is the floor, and it is always reachable.**
 
@@ -83,5 +84,9 @@ every user, whether or not they own a single file any dialect claims.
   fallback to the generic handler. Claiming is a commitment — sniff conservatively.
 - `resolve_dialect` remains the lower-level hook. A language with one fixed rule (`.h`) has no reason to move to the
   registry, and `cpp.py` has not.
-- The XML/Salesforce hand-off still exists. It is not migrated here, deliberately — ATL-144 owns that surface — but no
-  _new_ handler may copy it.
+- The XML/Salesforce hand-off was migrated in ATL-176 and no longer exists; `salesforce` is a registered dialect of
+  `.xml`. Its handler is a wrapper owned by `config.py` — the SFDX parse with the generic structural parse beneath it —
+  because the sniff sees bytes only and cannot anticipate the handler's path-shaped declines (a name that is not
+  `*-meta.xml`, a field file outside `objects/<X>/fields/`). Without that fallback each of those would have become an
+  empty `ParsedFile`, which is the previous bullet's failure realised. Verified byte-identical over 3,442 real XML
+  files: zero differ.
