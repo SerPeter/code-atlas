@@ -225,11 +225,20 @@ class TestNameQuoting:
 
     def test_a_name_needing_quotes_is_still_a_single_uid_segment(self):
         """A colon in a name would split `{project}:{qualified_name}` for every consumer
-        downstream; a dot would split the segment boundary."""
+        downstream; a dot would split the segment boundary. Both fold, and the fold earns
+        a suffix because it is lossy -- see TestUidsAreDistinct."""
         text = "table 'A.B: C'\n\tcolumn Quantity\n\t\tdataType: int64\n"
         table = next(e for e in _parse(text).entities if e.kind == "pbi_table")
-        assert table.qualified_name == "proj:pbi.model.Contoso.table.A_B_C"
+        assert table.qualified_name.startswith("proj:pbi.model.Contoso.table.A_B_ C~")
         assert table.name == "A.B: C", "the display name keeps what the author typed"
+
+    def test_a_name_needing_no_folding_stays_readable(self):
+        """Only `.` and `:` fold, because only those two break something downstream. A
+        space is safe everywhere the qualified name is consumed, and folding it would make
+        every uid in a Power BI model less legible for nothing."""
+        text = "table 'Sales Amount'\n\tcolumn Quantity\n\t\tdataType: int64\n"
+        table = next(e for e in _parse(text).entities if e.kind == "pbi_table")
+        assert table.qualified_name == "proj:pbi.model.Contoso.table.Sales Amount"
 
 
 class TestDaxReferences:
@@ -308,7 +317,7 @@ class TestModelName:
         ("path", "expected"),
         [
             ("Contoso.SemanticModel/definition/tables/Sales.tmdl", "Contoso"),
-            ("a/b/Sales Model.SemanticModel/definition/model.tmdl", "Sales_Model"),
+            ("a/b/Sales Model.SemanticModel/definition/model.tmdl", "Sales Model"),
             ("some/Model/definition/tables/Sales.tmdl", "Model"),
             ("tables/Sales.tmdl", "model"),
         ],
@@ -599,8 +608,10 @@ class TestUserDefinedFunctions:
         assert fn.docstring == "Applies a rate.\n@param value The base value"
 
     def test_a_name_with_a_dot_is_one_uid_segment(self):
+        """`RLS.Pct` is a normal UDF naming convention, and an unfolded dot would fake a
+        nesting level in the qualified name."""
         fn = next(e for e in _parse(self.TEXT, self.PATH).entities if e.kind == "pbi_udf")
-        assert fn.qualified_name == "proj:pbi.model.Contoso.function.RLS_Pct"
+        assert fn.qualified_name.startswith("proj:pbi.model.Contoso.function.RLS_Pct~")
 
 
 class TestSecurityRoles:
@@ -643,3 +654,44 @@ class TestSecurityRoles:
         """Before roles were handled, a roles/*.tmdl file produced nothing and was hashed
         as empty -- so it was never revisited either."""
         assert _parse(self.CHILD_COLON, self.PATH).entities
+
+
+class TestUidsAreDistinct:
+    """A uid is the graph's identity. Two objects emitting the same one merge into a single
+    node carrying an arbitrary winner's DAX and the union of both edge sets -- worse than a
+    missing entity, because a missing entity is silence and a merged one is a confident
+    wrong answer. For a *table* the merge takes every measure and column with it.
+
+    Folding `.` and `:` is lossy, so it can do exactly that: `'A.B'` and `'A_B'` both fold
+    to `A_B`. This is the same fold `config.py` performs and accepts; the difference is the
+    stakes, so here a folded name earns a suffix.
+    """
+
+    TWO_TABLES = "table 'A.B'\n\tcolumn X\n\t\tdataType: int64\n\ntable 'A_B'\n\tcolumn Y\n\t\tdataType: int64\n"
+
+    def test_two_names_that_fold_alike_do_not_collide(self):
+        uids = [e.qualified_name for e in _parse(self.TWO_TABLES).entities]
+        assert len(uids) == len(set(uids)), uids
+
+    def test_children_hang_off_the_uid_their_parent_actually_got(self):
+        """The subtle half. The table is disambiguated, but its columns are built from a
+        qualified name computed before that -- so they would hang off the OTHER table."""
+        result = _parse(self.TWO_TABLES)
+        tables = {e.name: e.qualified_name for e in result.entities if e.kind == "pbi_table"}
+        for column in (e for e in result.entities if e.kind == "pbi_column"):
+            parent = column.qualified_name.rsplit(".column.", 1)[0]
+            assert parent in tables.values(), f"{column.name} hangs off {parent}, which is no table here"
+
+    def test_the_suffix_does_not_depend_on_declaration_order(self):
+        """Derived from the name, not from arrival order. Order-dependence would mean
+        reordering a file changes a uid and churns the whole subtree under it."""
+        reversed_text = "table 'A_B'\n\tcolumn Y\n\t\tdataType: int64\n\ntable 'A.B'\n\tcolumn X\n\t\tdataType: int64\n"
+        first = {e.name: e.qualified_name for e in _parse(self.TWO_TABLES).entities}
+        second = {e.name: e.qualified_name for e in _parse(reversed_text).entities}
+        assert first == second
+
+    def test_an_unfolded_name_carries_no_suffix(self):
+        """The overwhelming majority. A suffix on every name would be pure noise."""
+        text = "table Sales\n\tmeasure 'Sales Amount' = SUM(Sales[X])\n"
+        names = {e.name: e.qualified_name for e in _parse(text).entities}
+        assert "~" not in names["Sales Amount"]

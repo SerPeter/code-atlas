@@ -23,6 +23,7 @@ strictness here is an entire semantic model vanishing from the graph on a Power 
 
 from __future__ import annotations
 
+import hashlib
 import re
 import textwrap
 from dataclasses import dataclass, field
@@ -78,16 +79,36 @@ def unquote(name: str) -> str:
     return name
 
 
-def _qn_segment(text: str) -> str:
-    """A name, made safe for a dotted qualified name.
+_QN_UNSAFE_RE = re.compile(r"[.:]+")
 
-    Folds exactly the five characters TMDL requires a name to be quoted for -- dot, equals,
-    colon, single quote and whitespace -- because each of them breaks something downstream:
-    a dot breaks the segment boundary ``qualified_name`` relies on, and a colon breaks the
-    ``{project}:{qualified_name}`` split every uid consumer performs. Model object names
-    contain all of them freely (``'Sales Amount'``, ``'Margin: YTD'``).
+
+def _qn_segment(text: str) -> str:
+    """A name, made safe for a dotted qualified name -- and kept distinct.
+
+    Only two characters are folded, because only two actually break something: a dot ends
+    the segment ``qualified_name`` is built from, and a colon ends the ``{project}:`` half
+    of every uid. Whitespace, ``=`` and ``'`` are all safe downstream, and leaving them
+    keeps the uid readable -- ``'Sales Amount'`` stays ``Sales Amount`` rather than becoming
+    ``Sales_Amount``.
+
+    Folding is lossy, so it can merge two different objects onto one uid: ``'A.B'`` and
+    ``'A_B'`` both fold to ``A_B``. A merged node is worse than a missing one -- it carries
+    an arbitrary winner's DAX and the union of both edge sets -- and for a table it takes
+    every measure and column with it. So a folded name earns a suffix derived from the
+    original.
+
+    Derived from the name, never from arrival order: a first draft suffixed only the
+    *second* of two colliding names, which meant reordering a file changed a uid and churned
+    the whole subtree under it for an edit that changed nothing. Names that need no folding
+    -- the overwhelming majority -- are untouched and carry no suffix.
     """
-    return re.sub(r"[\s.:=']+", "_", text.strip()) or "_"
+    text = text.strip()
+    folded = _QN_UNSAFE_RE.sub("_", text)
+    if not folded:
+        return "_"
+    if folded == text:
+        return folded
+    return f"{folded}~{hashlib.blake2s(text.encode(), digest_size=3).hexdigest()}"
 
 
 def model_name_for(path: str) -> str:
@@ -383,6 +404,7 @@ class _Ctx:
     entities: list[ParsedEntity] = field(default_factory=list)
     relationships: list[ParsedRelationship] = field(default_factory=list)
     root_uid: str = ""
+    _uids: set[str] = field(default_factory=set)
     recognised: bool = False
     """Whether any root handler fired.
 
@@ -408,7 +430,7 @@ class _Ctx:
         Spanning line 1 to the end of the file whatever the declaration's own line is,
         because it stands for the document rather than for the object inside it.
         """
-        self.root_uid = f"{self.project_name}:{qualified_name}"
+        self.root_uid = self._distinct_uid(f"{self.project_name}:{qualified_name}", name)
         # Replaces, never appends. `parse_tmdl` sets a document root up front so tables
         # have something to hang off, and `model.tmdl` then declares the real thing --
         # two calls, and one file may only ever have one Module. A second one would be a
@@ -443,7 +465,7 @@ class _Ctx:
         docstring: str = "",
         extra: dict[str, object] | None = None,
     ) -> str:
-        uid = f"{self.project_name}:{qualified_name}"
+        uid = self._distinct_uid(f"{self.project_name}:{qualified_name}", name)
         self.entities.append(
             ParsedEntity(
                 name=name,
@@ -460,6 +482,30 @@ class _Ctx:
             )
         )
         return uid
+
+    def _distinct_uid(self, uid: str, name: str) -> str:
+        """*uid*, made unique within this file.
+
+        ``_qn_segment`` folds five different characters to ``_``, so distinct model objects
+        can land on one uid: ``'Sales: YTD'`` and ``'Sales YTD'`` both become
+        ``Sales_YTD``. That is not a missing entity but a merged one -- a single node with
+        an arbitrary winner's DAX and the union of both edge sets -- and for a *table* it
+        takes every measure and column with it.
+
+        The suffix comes from the unfolded name rather than from a counter, so it is stable
+        when the author reorders the file. Reordering a counter would change the uid and
+        churn the whole subtree for a move that changed nothing.
+
+        Within one file only. Two folding-equal names in two different files still collide,
+        which matches what ``config.py`` accepts for the same fold; the realistic case --
+        two measures on one table -- is the one closed here.
+        """
+        if uid not in self._uids:
+            self._uids.add(uid)
+            return uid
+        distinct = f"{uid}~{hashlib.blake2s(name.encode(), digest_size=3).hexdigest()}"
+        self._uids.add(distinct)
+        return distinct
 
     def defines(self, parent_uid: str, child_uid: str) -> None:
         self.relationships.append(
@@ -529,10 +575,9 @@ def _handle_table(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
         if (child_header := _HEADER_RE.match(child.text)) and child_header.group("kw").lower() == "column"
     )
 
-    table_qn = f"{ctx.model_qn}.table.{_qn_segment(table)}"
     table_uid = ctx.add(
         name=table,
-        qualified_name=table_qn,
+        qualified_name=f"{ctx.model_qn}.table.{_qn_segment(table)}",
         label=NodeLabel.TYPE_DEF,
         kind=KIND_TABLE,
         block=block,
@@ -542,6 +587,11 @@ def _handle_table(block: _Block, ctx: _Ctx, lines: list[str]) -> None:
     ctx.defines(ctx.root_uid, table_uid)
     # `defaultDetailRowsDefinition` -- DAX hanging off the table itself.
     _emit_expression_children(ctx, table_uid, block, lines, table=table, own_columns=own_columns)
+
+    # Derived from the uid the table ACTUALLY got, not from the one requested: `ctx.add`
+    # may have disambiguated it, and children built from the requested name would then
+    # hang off a sibling table's namespace.
+    table_qn = table_uid.split(":", 1)[1]
 
     for child in block.children:
         child_header = _HEADER_RE.match(child.text)
