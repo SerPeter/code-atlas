@@ -122,6 +122,13 @@ _DEFAULT_EXCLUDE: list[str] = [
     ".claude/",
     ".cursor/",
     ".copilot/",
+    # Generated HTML reports. Reachable only now that *.html is indexable, and
+    # each is hundreds of machine-written files with no architectural signal.
+    "htmlcov/",
+    "coverage-html/",
+    # Salesforce static resources: vendored third-party bundles, often minified,
+    # the SFDX equivalent of node_modules.
+    "staticresources/",
     # Code Atlas
     ".atlas/",
     # Terraform provider cache — the .tf equivalent of node_modules, and now
@@ -258,6 +265,12 @@ _DEFAULT_INCLUDE: list[str] = [
     # pass is_included() but are dropped by scan()'s language-support gate.
     "*.cls",
     "*.trigger",
+    # Markup. Included globally rather than only under `lwc/` because an
+    # extension is matched by suffix, and a template that fell outside the
+    # allowlist would never reach the watcher either. `markup.py` is what keeps
+    # this cheap: a page that is not an LWC template mints exactly one node.
+    "*.html",
+    "*.htm",
 ]
 
 # NOTE: the config/data globs above (*.yaml, *.yml, *.json, *.toml, *.xml) put
