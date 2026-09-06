@@ -1136,6 +1136,22 @@ def test_lwc_custom_object_field_reduces_to_the_object():
     assert "sobject.My_Object__c" in _lwc_imports("import F from '@salesforce/schema/My_Object__c.My_Field__c';\n")
 
 
+def test_lwc_sibling_import_targets_the_bundle_node():
+    """`c/<name>` is how one LWC imports another; `c` is the default namespace.
+
+    It resolves to the node `salesforce.py` mints from that bundle's
+    `.js-meta.xml`. Without the rewrite every sibling import leaves an
+    `ext/c/<name>` stub sitting beside the real node it should have been.
+    """
+    assert "lwc.ldsUtils" in _lwc_imports("import { reduceErrors } from 'c/ldsUtils';\n")
+
+
+def test_the_lwc_framework_module_is_not_a_bundle():
+    """A bare `lwc` import is the framework, not a component in the `c` namespace."""
+    imports = _lwc_imports("import { LightningElement } from 'lwc';\n")
+    assert imports == {"lwc"}
+
+
 def test_lwc_rewrite_replaces_the_raw_specifier():
     """Emitting both would leave a second, unjoinable ext/ stub beside the resolved target."""
     imports = _lwc_imports("import getAccounts from '@salesforce/apex/AccountService.getAccounts';\n")

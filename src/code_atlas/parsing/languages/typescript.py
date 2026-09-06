@@ -17,6 +17,7 @@ from code_atlas.parsing.ast import (
     node_text,
     register_language,
 )
+from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind, ValueKind, Visibility
 
 if TYPE_CHECKING:
@@ -135,6 +136,7 @@ def _get_string_content(string_node: Node) -> str:
 
 _SALESFORCE_APEX_PREFIX = "@salesforce/apex/"
 _SALESFORCE_SCHEMA_PREFIX = "@salesforce/schema/"
+_LWC_SIBLING_PREFIX = "c/"
 
 
 def _salesforce_import_target(specifier: str) -> str | None:
@@ -145,6 +147,7 @@ def _salesforce_import_target(specifier: str) -> str | None:
 
         @salesforce/apex/AccountService.getAccounts  ->  apex.AccountService.getAccounts
         @salesforce/schema/Account.Name              ->  sobject.Account
+        c/ldsUtils                                   ->  lwc.ldsUtils
 
     ``apex.<Class>.<method>`` is the qualified name ``parsing/languages/apex.py``
     stores for Apex members, so ``GraphClient.resolve_imports`` matches it as an
@@ -157,6 +160,12 @@ def _salesforce_import_target(specifier: str) -> str | None:
     of ``Account.Name`` is dropped: object-level is the granularity the Apex side
     can supply, and a half-populated field graph is worse than none.
 
+    ``c/<name>`` is not a ``@salesforce/*`` module at all — it is how one LWC
+    imports a sibling bundle, and ``c`` is the default namespace.  It resolves to
+    the node ``salesforce.py`` mints from that bundle's ``.js-meta.xml``; without
+    the rewrite every sibling import leaves an ``ext/c/<name>`` stub sitting beside
+    the real node it should have been.
+
     Returns ``None`` for every other specifier, including other ``@salesforce/*``
     pseudo-modules (labels, static resources, user context), which stay ordinary
     external imports.
@@ -168,6 +177,9 @@ def _salesforce_import_target(specifier: str) -> str | None:
         reference = specifier.removeprefix(_SALESFORCE_SCHEMA_PREFIX).strip("/")
         sobject = reference.split(".")[0]
         return f"sobject.{sobject}" if sobject else None
+    if specifier.startswith(_LWC_SIBLING_PREFIX):
+        bundle = specifier.removeprefix(_LWC_SIBLING_PREFIX).strip("/")
+        return f"{LWC_NAMESPACE}.{bundle}" if bundle else None
     return None
 
 
