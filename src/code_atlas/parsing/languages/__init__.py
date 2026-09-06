@@ -38,6 +38,7 @@ _BUILTIN_LANGUAGE_MODULES: tuple[str, ...] = (
     "code_atlas.parsing.languages.jvm",
     "code_atlas.parsing.languages.markdown",
     "code_atlas.parsing.languages.php",
+    "code_atlas.parsing.languages.powerbi",
     "code_atlas.parsing.languages.python",
     "code_atlas.parsing.languages.ruby",
     "code_atlas.parsing.languages.rust",

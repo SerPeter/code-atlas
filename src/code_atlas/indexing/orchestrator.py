@@ -245,6 +245,8 @@ _DEFAULT_INCLUDE: list[str] = [
     "containerfile",
     # SQL
     "*.sql",
+    # Power BI semantic model (TMDL)
+    "*.tmdl",
     # Structured config / data. Deliberately broad — see the volume note below.
     "*.yaml",
     "*.yml",

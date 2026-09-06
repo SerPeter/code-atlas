@@ -260,6 +260,16 @@ _SAMPLES = [
         "db/schema.sql",
         "CREATE TABLE users (\n  id INT PRIMARY KEY,\n  email TEXT NOT NULL\n);\n",
     ),
+    _Sample(
+        # The only language with no grammar at all: TMDL is indentation-scoped, which
+        # tree-sitter reaches only with an external scanner, so it parses text itself
+        # through `text_parse_func`. The "grammar" here is its own module, which always
+        # imports -- there is no extra to skip on.
+        "tmdl",
+        "code_atlas.parsing.languages.powerbi",
+        "Contoso.SemanticModel/definition/tables/Sales.tmdl",
+        "table Sales\n\tcolumn Quantity\n\t\tdataType: int64\n\n\tmeasure Total = SUM(Sales[Quantity])\n",
+    ),
     _Sample("toml", "tree_sitter_toml", "pyproject.toml", '[project]\nname = "acme"\nversion = "1.0.0"\n'),
     _Sample("tsx", "tree_sitter_typescript", "web/App.tsx", "export function App() {\n  return <div>hi</div>;\n}\n"),
     _Sample(
