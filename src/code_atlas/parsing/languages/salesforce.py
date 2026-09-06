@@ -43,6 +43,14 @@ Two namespaces are added here, following the same rule:
     flow.<FlowApiName>            Flows
     cmdt.<Type__mdt>.<Record>     CustomMetadata records
 
+A namespace constant lives in the module that *mints* the node it addresses, and
+every other module imports it — ``apex.py`` owns ``APEX_NAMESPACE`` and
+``SOBJECT_NAMESPACE`` and this module imports both.  ``LWC_NAMESPACE`` is
+declared here and not yet minted by anything: a flow screen names a component
+before any parser reads the bundle, so those edges rest on ``ext/lwc.<Bundle>``
+stubs and join the real node the moment one exists.  That is ``resolve_imports``
+working as intended, not a gap.
+
 Schema mapping (no new NodeLabels, no new RelTypes — both have import-time
 validators that RuntimeError):
 
@@ -139,7 +147,7 @@ from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
 from code_atlas.schema import NodeLabel, RelType
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Iterator
 
     from tree_sitter import Node
 
@@ -170,6 +178,16 @@ Nothing points at these yet: ``typescript.py`` leaves ``@salesforce/label/c.X``
 as an ordinary external import and ``apex.py`` does not extract
 ``System.Label.X``.  The namespace is chosen so that whichever side is taught to
 emit it first meets the definitions here.
+"""
+
+LWC_NAMESPACE = "lwc"
+"""Root qualified-name segment for Lightning Web Component bundles — ``lwc.errorPanel``.
+
+The bundle folder name, verbatim. A flow screen names a component as
+``c:navigateToRecord`` and an Aura component as ``<c:navigateToRecord>``; both
+strip to the same folder name, so both meet the bundle wherever it is minted —
+or, until it is, the same ``ext/lwc.navigateToRecord`` stub. That convergence is
+the whole reason to spell it out here rather than emit the raw ``c:`` string.
 """
 
 _METADATA_NS = "http://soap.sforce.com/2006/04/metadata"
@@ -733,24 +751,136 @@ _FLOW_READ_ELEMENTS: tuple[tuple[str, str], ...] = (
 )
 """``(flow element name, child element holding an SObject API name)`` — read side."""
 
-_FLOW_WRITE_ELEMENTS: tuple[tuple[str, str], ...] = (
-    ("recordCreates", "object"),
-    ("recordUpdates", "object"),
-    ("recordDeletes", "object"),
+_FLOW_DML_ELEMENTS: tuple[str, ...] = ("recordCreates", "recordUpdates", "recordDeletes")
+"""Elements that perform DML. Their object is resolved, not read — see :func:`_flow_element_object`."""
+
+_FLOW_RECORD_ELEMENTS: tuple[str, ...] = (*_FLOW_DML_ELEMENTS, "recordLookups")
+"""Every element that both names an SObject and doubles as a record variable of that type."""
+
+_OBJECT_BEARING_TAGS: tuple[str, ...] = ("object", "picklistObject")
+_REFERENCE_BEARING_TAGS: tuple[str, ...] = ("inputReference", "outputReference", "collectionReference")
+
+_FIELD_CONTAINER_PATHS: tuple[tuple[str, str, bool], ...] = (
+    ("recordCreates", "inputAssignments", True),
+    ("recordUpdates", "inputAssignments", True),
+    ("recordUpdates", "filters", False),
+    ("recordLookups", "filters", False),
+    ("recordDeletes", "filters", False),
+    ("recordLookups", "outputAssignments", False),
+    ("dynamicChoiceSets", "filters", False),
+    ("dynamicChoiceSets", "outputAssignments", False),
 )
-"""Same, for elements that perform DML."""
+"""``(element, repeated container holding <field>, is_write)`` — the field sites with a wrapper."""
+
+_FIELD_DIRECT_PATHS: tuple[tuple[str, str], ...] = (
+    ("recordLookups", "sortField"),
+    ("dynamicChoiceSets", "picklistField"),
+    ("dynamicChoiceSets", "displayField"),
+    ("dynamicChoiceSets", "valueField"),
+    ("dynamicChoiceSets", "sortField"),
+)
+"""``(element, child naming a field directly)`` — all reads."""
+
+_ACTION_SITE_TAGS: tuple[tuple[str, str], ...] = (
+    ("actionName", "actionType"),
+    ("exitActionName", "exitActionType"),
+    ("entryActionName", "entryActionType"),
+)
+"""``(name tag, type tag)`` pairs that together name an invocable, wherever they appear."""
+
+_FLOW_ACTION_TYPES: frozenset[str] = frozenset(
+    {"flow", "createWorkItem", "stepBackground", "stepInteractive", "stepApproval"}
+)
+"""``actionType`` values whose ``actionName`` is a Flow API name.
+
+``flow`` is the ordinary subflow-as-action spelling; the other four are
+Orchestrator steps, each of which runs a screen or autolaunched flow. Every other
+value — ~310 of them — names something this module does not model and is skipped
+rather than guessed at.
+"""
+_FLOW_ACTION_TYPES_FOLDED: frozenset[str] = frozenset(value.lower() for value in _FLOW_ACTION_TYPES)
+
+
+def _iter_elements(element: Node) -> Iterator[Node]:
+    """Every descendant element, depth-first, *excluding* ``element`` itself.
+
+    Flow nests references arbitrarily deep — 70 of 381 ``extensionName`` sites sit
+    three ``fields`` levels down, and orchestration hides ``actionName`` two levels
+    below the root — so the reference sweeps descend rather than enumerate paths.
+    Depth is bounded by the document, and ``parse_file`` already catches
+    ``RecursionError``.
+    """
+    for child in xml_child_elements(element):
+        yield child
+        yield from _iter_elements(child)
+
+
+def _flow_symbol_table(element: Node) -> dict[str, str]:
+    """``flow-local name -> SObject API name``, for the whole document.
+
+    A ``<field>`` names a field on its element's sibling ``<object>`` — except when
+    the element carries ``inputReference`` / ``outputReference`` instead, which names
+    a flow variable. 43% of ``recordUpdates`` elements in a 419-flow corpus have no
+    ``<object>`` at all, so without this table 27% of the field references they state
+    are unresolvable and, worse, the object they *write* is recorded only as a read.
+    """
+    table: dict[str, str] = {}
+    for variable in _children(element, "variables"):
+        name = _text_of(variable, "name")
+        api = _api_name(_text_of(variable, "objectType"))
+        if name and api:
+            table[name.strip()] = api
+    # A record element's own <name> is the implicit record variable holding its result
+    # when storeOutputAutomatically is set, so it belongs in the table too.
+    for tag in _FLOW_RECORD_ELEMENTS:
+        for record_element in _children(element, tag):
+            name = _text_of(record_element, "name")
+            api = _api_name(_text_of(record_element, "object"))
+            if name and api:
+                table[name.strip()] = api
+    start = _child(element, "start")
+    triggering = _api_name(_text_of(start, "object")) if start is not None else None
+    if triggering is not None:
+        table["$Record"] = triggering
+        table["$Record__Prior"] = triggering
+    return table
+
+
+def _flow_resolve_reference(reference: str | None, table: dict[str, str]) -> str | None:
+    """The SObject a ``<recordVariable>[.<anything>]`` reference names, or ``None``."""
+    if reference is None:
+        return None
+    return table.get(reference.strip().partition(".")[0])
+
+
+def _flow_element_object(element: Node, table: dict[str, str]) -> str | None:
+    """The SObject an element operates on — its own tag first, then a flow-local reference."""
+    for tag in _OBJECT_BEARING_TAGS:
+        direct = _api_name(_text_of(element, tag))
+        if direct is not None:
+            return direct
+    for tag in _REFERENCE_BEARING_TAGS:
+        resolved = _flow_resolve_reference(_text_of(element, tag), table)
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def _parse_flow(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
     """``flows/<Flow>.flow-meta.xml`` -> one ``Callable`` plus its references.
 
     Deliberately *not* one node per flow element.  A large orchestration flow has
-    hundreds of them and modelling each would multiply the graph's node count for
-    questions nobody asks; what is worth extracting is which SObjects, Apex
-    classes and subflows the flow reaches, rolled up to the flow itself.  The
-    read/write split that would otherwise be lost (``IMPORTS`` edges carry no
-    properties through ``resolve_imports``) is preserved on the flow node as
-    ``sobjects_read`` / ``sobjects_written``.
+    hundreds of them, and every reference they state resolves to an existing
+    namespace — ``sobject.X``, ``sobject.X.Y``, ``apex.X``, ``flow.X``, ``lwc.X`` —
+    from inside this one file.  The element is *where* a reference lives, not the
+    thing anyone searches for: nobody asks for ``Decision_3``, they ask which flow
+    writes ``Case.Status``, and that is an edge.  Measured on a 419-flow corpus, a
+    node per element is 18x the flow count and answers nothing the edges do not.
+
+    The read/write split is preserved on the node as ``sobjects_read`` /
+    ``sobjects_written`` / ``fields_read`` / ``fields_written`` because
+    ``resolve_imports`` builds its edge from ``{from_uid, to_uid}`` alone and drops
+    every property — so the split cannot live on the edge.
     """
     api_name = _api_name(meta.base)
     if api_name is None:
@@ -758,9 +888,16 @@ def _parse_flow(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> Parse
 
     module_uid = _module(emit, path, _FLOW_MODULE_KIND, element)
     start = _child(element, "start")
+    table = _flow_symbol_table(element)
 
     reads = _flow_sobjects(element, _FLOW_READ_ELEMENTS)
-    writes = _flow_sobjects(element, _FLOW_WRITE_ELEMENTS)
+    writes = {
+        owner
+        for tag in _FLOW_DML_ELEMENTS
+        for dml in _children(element, tag)
+        if (owner := _flow_element_object(dml, table)) is not None
+    }
+    fields_read, fields_written = _flow_field_references(element, table)
 
     line_start, line_end = _lines(element)
     flow_uid = emit.add(
@@ -782,6 +919,8 @@ def _parse_flow(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> Parse
                 "record_trigger_type": _text_of(start, "recordTriggerType") if start is not None else None,
                 "sobjects_read": sorted(reads) or None,
                 "sobjects_written": sorted(writes) or None,
+                "fields_read": sorted(fields_read) or None,
+                "fields_written": sorted(fields_written) or None,
             }
         ),
     )
@@ -789,8 +928,12 @@ def _parse_flow(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> Parse
 
     for api in sorted(reads | writes):
         emit.imports_sobject(flow_uid, api)
+    for qualified in sorted(fields_read | fields_written):
+        emit.rel(flow_uid, RelType.IMPORTS, f"{SOBJECT_NAMESPACE}.{qualified}")
     for apex_class in sorted(_flow_apex_classes(element)):
         emit.rel(flow_uid, RelType.IMPORTS, f"{APEX_NAMESPACE}.{apex_class}")
+    for bundle in sorted(_flow_lwc_bundles(element)):
+        emit.rel(flow_uid, RelType.IMPORTS, f"{LWC_NAMESPACE}.{bundle}")
     for subflow in sorted(_flow_subflows(element)):
         emit.rel(flow_uid, RelType.CALLS, subflow)
 
@@ -809,35 +952,156 @@ def _flow_sobjects(element: Node, sources: Iterable[tuple[str, str]]) -> set[str
     return found
 
 
+def _flow_field_references(element: Node, table: dict[str, str]) -> tuple[set[str], set[str]]:
+    """``(read, written)`` sets of ``<Object>.<Field>``, from structured paths only.
+
+    ``elementReference`` values and ``{!...}`` merge fields inside formulas and text
+    templates are *not* mined: measured on a 419-flow corpus, 37-38% of them name a
+    flow variable, a global or a screen component rather than a field, and a wrong
+    uid is worse than a missing entity (ADR-0032).  Every path swept here is a slot
+    whose contract is "an SObject field API name", and all of them resolve.
+    """
+    read: set[str] = set()
+    written: set[str] = set()
+    for owner, field_name, is_write in _iter_field_sites(element, table):
+        api_owner = _api_name(owner)
+        api_field = _api_name(field_name)
+        if api_owner is not None and api_field is not None:
+            (written if is_write else read).add(f"{api_owner}.{api_field}")
+    return read, written
+
+
+def _iter_field_sites(element: Node, table: dict[str, str]) -> Iterator[tuple[str | None, str, bool]]:
+    """``(owning SObject, field API name, is_write)`` for every structured field slot."""
+    yield from _wrapped_field_sites(element, table)
+    yield from _direct_field_sites(element, table)
+    yield from _nested_field_sites(element, table)
+    yield from _object_field_reference_sites(element, table)
+
+
+def _wrapped_field_sites(element: Node, table: dict[str, str]) -> Iterator[tuple[str | None, str, bool]]:
+    """``<element>/<container>/<field>`` — assignments and filters."""
+    for parent_tag, container_tag, is_write in _FIELD_CONTAINER_PATHS:
+        for parent in _children(element, parent_tag):
+            owner = _flow_element_object(parent, table)
+            for container in _children(parent, container_tag):
+                for value in _texts_of(container, "field"):
+                    yield owner, value, is_write
+
+
+def _direct_field_sites(element: Node, table: dict[str, str]) -> Iterator[tuple[str | None, str, bool]]:
+    """``<element>/<sortField|picklistField|displayField|valueField>`` — all reads."""
+    for parent_tag, field_tag in _FIELD_DIRECT_PATHS:
+        for parent in _children(element, parent_tag):
+            owner = _flow_element_object(parent, table)
+            for value in _texts_of(parent, field_tag):
+                yield owner, value, False
+
+
+def _nested_field_sites(element: Node, table: dict[str, str]) -> Iterator[tuple[str | None, str, bool]]:
+    """The two families whose container is not a direct child of the element."""
+    start = _child(element, "start")
+    if start is not None:
+        owner = _flow_element_object(start, table)
+        for criterion in _children(start, "filters"):
+            for value in _texts_of(criterion, "field"):
+                yield owner, value, False
+    for processor in _children(element, "collectionProcessors"):
+        owner = _flow_element_object(processor, table)
+        for option in _children(processor, "sortOptions"):
+            for value in _texts_of(option, "sortField"):
+                yield owner, value, False
+
+
+def _object_field_reference_sites(element: Node, table: dict[str, str]) -> Iterator[tuple[str | None, str, bool]]:
+    """``objectFieldReference``, always ``<recordVariableName>.<FieldApiName>``.
+
+    Never ``<Object>.<Field>``, so the head goes through the symbol table like any
+    other reference.  Swept over the whole document rather than under ``screens``
+    alone: the value's shape is unambiguous and a screen field can nest three deep.
+    """
+    for descendant in _iter_elements(element):
+        for value in _texts_of(descendant, "objectFieldReference"):
+            head, _, field_name = value.strip().partition(".")
+            if field_name:
+                yield table.get(head), field_name, False
+
+
+def _flow_action_sites(element: Node) -> list[tuple[str, str]]:
+    """Every ``(name, type)`` invocable reference in the document, at any depth.
+
+    Four spellings carry one, and only the first is a direct child of ``<Flow>``:
+    ``actionCalls``, ``orchestratedStages/stageSteps``, ``steppedStages/steps`` and
+    ``screens/actions``.  ``steppedStages`` is not in the published WSDL at all and
+    was found only by reading real files.  A descent costs nothing and also catches
+    ``FlowStart.fanOutAction``, which is documented but absent from every public flow
+    sampled, so its shape could not be confirmed.
+    """
+    sites: list[tuple[str, str]] = []
+    for descendant in _iter_elements(element):
+        for name_tag, type_tag in _ACTION_SITE_TAGS:
+            raw = _text_of(descendant, name_tag)
+            if raw is None:
+                continue
+            sites.append((raw.strip(), (_text_of(descendant, type_tag) or "").strip().lower()))
+    return sites
+
+
 def _flow_apex_classes(element: Node) -> set[str]:
     """Apex classes the flow invokes.
 
-    Two spellings: the modern ``actionCalls`` with ``actionType=apex`` (whose
-    ``actionName`` is the class holding the ``@InvocableMethod``) and the legacy
-    ``apexPluginCalls`` with an explicit ``apexClass``.  Every other
-    ``actionType`` — ``emailAlert``, ``quickAction``, ``lwcComponent``,
-    ``externalService`` and ~100 more — names something this module does not
-    model, and is skipped rather than guessed at.
+    Three spellings: an action site whose type is ``apex`` (whose name is the class
+    holding the ``@InvocableMethod``), the legacy ``apexPluginCalls`` with an explicit
+    ``apexClass``, and an ``apexClass`` on a ``variables`` or ``transforms`` element.
     """
-    classes = {_api_name(_text_of(call, "actionName")) for call in _action_calls(element, "apex")}
-    classes |= {_api_name(_text_of(call, "apexClass")) for call in _children(element, "apexPluginCalls")}
-    return {name for name in classes if name is not None}
+    classes = {name for name, action_type in _flow_action_sites(element) if action_type == "apex"}
+    for tag in ("apexPluginCalls", "variables", "transforms"):
+        classes |= set(_texts_of_descendants(element, tag, "apexClass"))
+    return {name for name in (_api_name(candidate) for candidate in classes) if name is not None}
+
+
+def _texts_of_descendants(element: Node, parent_tag: str, child_tag: str) -> list[str]:
+    """``child_tag`` texts under every direct ``parent_tag`` child."""
+    return [text for parent in _children(element, parent_tag) for text in _texts_of(parent, child_tag)]
 
 
 def _flow_subflows(element: Node) -> set[str]:
-    """Flows this flow invokes — ``subflows.flowName`` and ``actionType=flow``."""
-    names = {_api_name(_text_of(subflow, "flowName")) for subflow in _children(element, "subflows")}
-    names |= {_api_name(_text_of(call, "actionName")) for call in _action_calls(element, "flow")}
-    return {name for name in names if name is not None}
+    """Flows this flow invokes, overrides or was templated from.
+
+    ``subflows.flowName`` is the ordinary call.  An action site typed ``flow`` is the
+    same thing spelled as an action, and the four Orchestrator step types each run a
+    flow.  ``overriddenFlow`` and ``sourceTemplate`` are flow-to-flow references that
+    the HTML documentation omits and the Metadata API WSDL declares — the HTML field
+    table is an incomplete rendering of the WSDL, which is the real spec.
+
+    Returns **bare API names, not** ``flow.<Name>``.  ``CALLS`` is resolved by
+    ``resolve_calls``, which matches a Callable's *name*; a namespaced target matches
+    nothing and every subflow edge silently disappears.  This is the opposite
+    convention to the ``IMPORTS`` targets above, which ``resolve_imports`` matches on
+    the full qualified name — the two resolvers do not agree and the difference is
+    load-bearing.
+    """
+    names = set(_texts_of_descendants(element, "subflows", "flowName"))
+    names |= {name for name, action_type in _flow_action_sites(element) if action_type in _FLOW_ACTION_TYPES_FOLDED}
+    names |= {text for tag in ("overriddenFlow", "sourceTemplate") for text in _texts_of(element, tag)}
+    return {name for name in (_api_name(candidate) for candidate in names) if name is not None}
 
 
-def _action_calls(element: Node, action_type: str) -> list[Node]:
-    """``actionCalls`` children of the given ``actionType``, matched case-insensitively."""
-    return [
-        call
-        for call in _children(element, "actionCalls")
-        if (_text_of(call, "actionType") or "").strip().lower() == action_type
-    ]
+def _flow_lwc_bundles(element: Node) -> set[str]:
+    """LWC bundles placed on a screen, from ``screens//fields/extensionName``.
+
+    The value is namespaced — ``c:navigateToRecord`` — and the prefix is stripped
+    before validation, because ``_api_name`` rejects the colon and would drop every
+    one of them.  Walked as a descent: 70 of 381 real occurrences sit three ``fields``
+    levels deep, where a direct-children sweep sees nothing.
+    """
+    bundles: set[str] = set()
+    for descendant in _iter_elements(element):
+        for value in _texts_of(descendant, "extensionName"):
+            name = _api_name(value.strip().rpartition(":")[2])
+            if name is not None:
+                bundles.add(name)
+    return bundles
 
 
 # ---------------------------------------------------------------------------

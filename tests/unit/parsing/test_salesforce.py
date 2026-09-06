@@ -20,6 +20,7 @@ pytest.importorskip("tree_sitter_xml", reason="tree-sitter-xml not installed")
 
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, parse_file
 from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
+from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE
 from code_atlas.schema import NodeLabel, RelType
 
 PROJECT = "test_project"
@@ -517,7 +518,212 @@ def test_screen_flow_with_no_data_access_still_parses():
     flow = _one(parsed, "flow")
     assert "sobjects_read" not in flow.extra_properties
     assert "sobjects_written" not in flow.extra_properties
-    assert _rels(parsed, RelType.IMPORTS) == set()
+    # A screen flow touches no data and still states one thing: which component it
+    # puts on the screen. The `c:` prefix is stripped so the target meets the bundle
+    # wherever it is minted -- `_api_name` rejects the colon outright.
+    assert _rels(parsed, RelType.IMPORTS) == {(flow.qualified_name, f"{LWC_NAMESPACE}.navigateToRecord")}
+
+
+def test_dml_object_resolves_through_a_flow_local_variable():
+    """The shape that made 11.5% of real flows report a write as a read.
+
+    ``recordUpdates`` with no ``<object>`` — 43% of them in a 419-flow corpus — names
+    a flow variable instead. Shape from navikt/crm-hot-tolk
+    ``HOT_AssignInterestedResource``, which writes ServiceAppointment and, before
+    this, said so nowhere.
+    """
+    source = """\
+<?xml version="1.0"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <variables>
+        <name>appointmentVar</name>
+        <objectType>ServiceAppointment</objectType>
+    </variables>
+    <recordUpdates>
+        <name>Update_Appointment</name>
+        <inputReference>appointmentVar</inputReference>
+        <inputAssignments>
+            <field>Status</field>
+            <value><stringValue>Assigned</stringValue></value>
+        </inputAssignments>
+    </recordUpdates>
+</Flow>
+"""
+    parsed = _parse(source, f"{FLOWS}/Assign.flow-meta.xml")
+    flow = _one(parsed, "flow")
+    assert flow.extra_properties["sobjects_written"] == ["ServiceAppointment"]
+    assert flow.extra_properties["fields_written"] == ["ServiceAppointment.Status"]
+    assert f"{SOBJECT_NAMESPACE}.ServiceAppointment.Status" in _targets(parsed, flow.qualified_name, RelType.IMPORTS)
+
+
+def test_dollar_record_resolves_to_the_triggering_object():
+    """``$Record`` in a record-triggered flow is the object named by ``start``."""
+    source = """\
+<?xml version="1.0"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <start>
+        <object>Case</object>
+        <recordTriggerType>CreateAndUpdate</recordTriggerType>
+        <triggerType>RecordAfterSave</triggerType>
+    </start>
+    <recordUpdates>
+        <name>Close_It</name>
+        <inputReference>$Record</inputReference>
+        <inputAssignments>
+            <field>Status__c</field>
+            <value><stringValue>Closed</stringValue></value>
+        </inputAssignments>
+    </recordUpdates>
+</Flow>
+"""
+    parsed = _parse(source, f"{FLOWS}/Close_Case.flow-meta.xml")
+    flow = _one(parsed, "flow")
+    assert flow.extra_properties["fields_written"] == ["Case.Status__c"]
+
+
+def test_field_writes_and_reads_are_separated():
+    """``inputAssignments`` is a write; ``filters`` on the same element is a read.
+
+    Shape from trailheadapps/dreamhouse-lwc ``Create_property``, whose ``<object>``
+    is a *later* sibling than the assignments that depend on it.
+    """
+    source = """\
+<?xml version="1.0"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <recordCreates>
+        <name>create_property</name>
+        <inputAssignments>
+            <field>Address__c</field>
+            <value><elementReference>property_address.street</elementReference></value>
+        </inputAssignments>
+        <object>Property__c</object>
+    </recordCreates>
+    <recordLookups>
+        <name>find_broker</name>
+        <object>Broker__c</object>
+        <filters>
+            <field>Email__c</field>
+            <operator>EqualTo</operator>
+        </filters>
+        <sortField>Name</sortField>
+    </recordLookups>
+</Flow>
+"""
+    parsed = _parse(source, f"{FLOWS}/Create_property.flow-meta.xml")
+    flow = _one(parsed, "flow")
+    assert flow.extra_properties["fields_written"] == ["Property__c.Address__c"]
+    assert flow.extra_properties["fields_read"] == ["Broker__c.Email__c", "Broker__c.Name"]
+    # `elementReference` names a flow variable, not a field, and is never mined:
+    # 37-38% of them are unresolvable and a wrong uid beats no uid to nothing.
+    assert not any("street" in target for target in _targets(parsed, flow.qualified_name, RelType.IMPORTS))
+
+
+def test_object_field_reference_resolves_through_the_symbol_table():
+    """``objectFieldReference`` is ``<recordVariable>.<Field>``, never ``<Object>.<Field>``."""
+    source = """\
+<?xml version="1.0"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <variables>
+        <name>curKnowledge</name>
+        <objectType>Knowledge__kav</objectType>
+    </variables>
+    <screens>
+        <name>Review</name>
+        <fields>
+            <name>Outer</name>
+            <fields>
+                <name>Inner</name>
+                <objectFieldReference>curKnowledge.Title</objectFieldReference>
+            </fields>
+        </fields>
+    </screens>
+</Flow>
+"""
+    parsed = _parse(source, f"{FLOWS}/Review.flow-meta.xml")
+    flow = _one(parsed, "flow")
+    assert flow.extra_properties["fields_read"] == ["Knowledge__kav.Title"]
+
+
+def test_orchestration_steps_and_overrides_are_calls():
+    """Three flow-to-flow spellings a direct-children sweep of ``actionCalls`` misses.
+
+    ``steppedStages`` appears in no published WSDL and was found only by reading real
+    files (UnofficialSF ``Automation_Orchestration``); ``overriddenFlow`` is in the
+    WSDL but not in the HTML field table (trailheadapps/coral-cloud
+    ``Send_Verification_Code``).
+    """
+    source = """\
+<?xml version="1.0"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <overriddenFlow>SvcCopilotTmpl__SendVerificationCode</overriddenFlow>
+    <sourceTemplate>runtime_revenue_arcflows__Auto_Renew</sourceTemplate>
+    <steppedStages>
+        <name>Submit_Content</name>
+        <steps>
+            <name>Submit_Content_for_Approval</name>
+            <actionName>testflow</actionName>
+            <actionType>createWorkItem</actionType>
+        </steps>
+    </steppedStages>
+    <orchestratedStages>
+        <name>Stage_One</name>
+        <stageSteps>
+            <name>Step_A</name>
+            <actionName>Nested_Screen_Flow</actionName>
+            <actionType>stepInteractive</actionType>
+        </stageSteps>
+    </orchestratedStages>
+</Flow>
+"""
+    parsed = _parse(source, f"{FLOWS}/Orchestration.flow-meta.xml")
+    flow_uid = _one(parsed, "flow").qualified_name
+    assert _targets(parsed, flow_uid, RelType.CALLS) == {
+        "SvcCopilotTmpl__SendVerificationCode",
+        "runtime_revenue_arcflows__Auto_Renew",
+        "testflow",
+        "Nested_Screen_Flow",
+    }
+
+
+def test_screen_component_is_found_three_levels_deep():
+    """70 of 381 real ``extensionName`` sites sit three ``fields`` levels down."""
+    source = """\
+<?xml version="1.0"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <screens>
+        <name>Wizard</name>
+        <fields>
+            <name>Section</name>
+            <fields>
+                <name>Column</name>
+                <fields>
+                    <name>Widget</name>
+                    <extensionName>c:hot_flowFooterButtons</extensionName>
+                </fields>
+            </fields>
+        </fields>
+    </screens>
+</Flow>
+"""
+    parsed = _parse(source, f"{FLOWS}/Wizard.flow-meta.xml")
+    flow_uid = _one(parsed, "flow").qualified_name
+    assert _targets(parsed, flow_uid, RelType.IMPORTS) == {f"{LWC_NAMESPACE}.hot_flowFooterButtons"}
+
+
+def test_apex_class_on_a_variable_is_an_import():
+    """``variables/apexClass`` — 46 real occurrences, none reachable via actionCalls."""
+    source = """\
+<?xml version="1.0"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <variables>
+        <name>request</name>
+        <apexClass>QuoteRequest</apexClass>
+    </variables>
+</Flow>
+"""
+    parsed = _parse(source, f"{FLOWS}/Apex_Var.flow-meta.xml")
+    flow_uid = _one(parsed, "flow").qualified_name
+    assert _targets(parsed, flow_uid, RelType.IMPORTS) == {f"{APEX_NAMESPACE}.QuoteRequest"}
 
 
 # ---------------------------------------------------------------------------
