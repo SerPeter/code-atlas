@@ -89,19 +89,43 @@ class ParsedFile:
 
 @dataclass(frozen=True)
 class LanguageConfig:
-    """Configuration for a tree-sitter language."""
+    """Configuration for a language — a tree-sitter grammar, or a text handler."""
 
     name: str
     extensions: frozenset[str]
-    language: Language
-    query: Query
-    parse_func: Callable[[str, bytes, Node, str], ParsedFile | None]
-    """Handler for a matched file.
+    language: Language | None
+    """The tree-sitter grammar, or ``None`` for a language that parses text itself.
+
+    ``None`` is the escape hatch for line-oriented, indentation-scoped formats that
+    tree-sitter can only reach with an external scanner. TMDL is the first: a Microsoft
+    format with no public grammar, where vendoring one with a hand-written scanner would
+    be a standing maintenance commitment for a single file type.
+
+    It skips the grammar and nothing else. ``_parse_hazard``, the ``RecursionError``
+    catch, the per-language timing, ``split_oversized_doc_sections`` and the content
+    hashing all stay on the shared path — those are the parts that stop one pathological
+    file taking the indexer down, and a text parser is no less capable of meeting one.
+    """
+    query: Query | None
+    """Unused by the framework — every handler holds its own ``Query`` objects. Kept on
+    the config because a registration reads as a declaration of what the language is,
+    and ``None`` beside ``language=None`` says "no grammar" in one place."""
+    parse_func: Callable[[str, bytes, Node, str], ParsedFile | None] | None = None
+    """Handler for a matched file, given the parsed tree's root node.
 
     Returning ``None`` means "this handler declines the file" — the framework
     turns that into an *empty* ``ParsedFile`` rather than propagating ``None``.
     See ``parse_file`` for why declining must not look like an unsupported
     language.
+    """
+    text_parse_func: Callable[[str, bytes, str], ParsedFile | None] | None = None
+    """Handler for a language with no grammar, given ``(path, source, project_name)``.
+
+    A separate field rather than widening ``parse_func``'s node parameter to
+    ``Node | None``. That widening would have been honest about the framework and a lie
+    about every handler: all sixteen grammar-backed handlers would have had to declare a
+    ``None`` they can never receive, and each would have grown a guard for it. Two fields
+    make the modes mutually exclusive, and ``__post_init__`` enforces that they are.
     """
     filenames: frozenset[str] = frozenset()
     """Exact basenames claimed by this language, lowercased, e.g. ``{"dockerfile"}``.
@@ -136,6 +160,17 @@ class LanguageConfig:
     undecidable file must get, because the registered default is the status quo
     and the status quo is the safe answer.
     """
+
+    def __post_init__(self) -> None:
+        """Exactly one handler, and it must match the grammar.
+
+        Checked at registration because the alternative is a ``TypeError`` deep in
+        ``parse_file``, once per file, on a language somebody added months ago.
+        """
+        if (self.parse_func is None) == (self.text_parse_func is None):
+            raise ValueError(f"{self.name}: set exactly one of parse_func / text_parse_func")
+        if (self.language is None) != (self.text_parse_func is not None):
+            raise ValueError(f"{self.name}: language=None and text_parse_func go together, or neither does")
 
 
 _LANGUAGES: dict[str, LanguageConfig] = {}
@@ -1142,15 +1177,25 @@ def parse_file(
     # the aggregate question instead: which language costs what, and is it the grammar
     # or our handler. Tree-sitter's error recovery is superlinear (an unparseable 4 MiB
     # T-SQL dump measured four minutes), so the grammar/handler split is not academic.
-    parser = Parser(lang_config.language)
+    #
+    # `language is None` is the text hatch: the handler parses the bytes itself and gets
+    # no root node. Measured all the same, and reported under the same phase, so a text
+    # language that turns out to be slow is as visible as a grammar that is.
+    root_node: Node | None = None
     _t0 = time.perf_counter()
-    tree = parser.parse(source)
+    if lang_config.language is not None:
+        root_node = Parser(lang_config.language).parse(source).root_node
     _lang_attrs = {"language": lang_config.name}
     get_metrics().stage_seconds.record(time.perf_counter() - _t0, {"stage": "parse", "phase": "tree_sitter"})
 
     _t1 = time.perf_counter()
     try:
-        result = lang_config.parse_func(path, source, tree.root_node, project_name)
+        if lang_config.text_parse_func is not None:
+            result = lang_config.text_parse_func(path, source, project_name)
+        else:
+            assert lang_config.parse_func is not None  # __post_init__ guarantees one of the two
+            assert root_node is not None
+            result = lang_config.parse_func(path, source, root_node, project_name)
     except RecursionError:
         # Handlers walk the tree recursively, so nesting the byte guard cannot
         # see — keyword blocks ("if/then/fi" 993 deep), bracket chains (490+) —
@@ -1175,12 +1220,16 @@ def parse_file(
         result = ParsedFile(file_path=path, language=lang_config.name, entities=[], relationships=[])
 
     entities = result.entities
-    if lang_config.comment_node_types:
+    # `root_node is not None` is not defensive: rationale extraction walks the tree, so a
+    # text language cannot have it. Such a language leaves `comment_node_types` empty and
+    # opts out that way — this is the second lock, so that setting the field by mistake
+    # produces no rationale rather than an AttributeError on every file.
+    if lang_config.comment_node_types and root_node is not None:
         markers, citation_schemes = _resolve_rationale_markers(rationale)
         if markers or citation_schemes:
             entities = extract_rationale(
                 source,
-                tree.root_node,
+                root_node,
                 entities,
                 comment_types=lang_config.comment_node_types,
                 markers=markers,
