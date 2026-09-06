@@ -190,6 +190,32 @@ or, until it is, the same ``ext/lwc.navigateToRecord`` stub. That convergence is
 the whole reason to spell it out here rather than emit the raw ``c:`` string.
 """
 
+VALIDATION_RULE_NAMESPACE = "validationrule"
+RECORD_TYPE_NAMESPACE = "recordtype"
+FIELD_SET_NAMESPACE = "fieldset"
+WEB_LINK_NAMESPACE = "weblink"
+LIST_VIEW_NAMESPACE = "listview"
+"""Namespaces for the decomposed children of a ``CustomObject``.
+
+Each is ``<kind>.<Object>.<Name>`` because none of these names is unique across
+objects — every second object has a ``ListView`` called ``All`` — and the owner is
+taken from the ``objects/<Object>/<child>/`` path rather than from the document,
+which never states it.
+"""
+
+PAGE_NAMESPACE = "page"
+"""Root qualified-name segment for Visualforce pages — ``page.HH_ManageHHAccount``.
+
+Declared here and minted by nothing yet: a ``WebLink`` names the page it opens
+before any parser reads ``pages/*.page`` (ATL-182), so those edges rest on
+``ext/page.<Name>`` stubs and join the real node the moment one exists.  It lives
+in this module rather than in ``markup.py`` because ``markup`` already imports
+from here, and the reverse would be a cycle.
+
+``page.<Name>`` matches the syntax Apex uses to reference one (``Page.<Name>``),
+so the Apex side can join here unchanged if it is ever taught to emit it.
+"""
+
 _METADATA_NS = "http://soap.sforce.com/2006/04/metadata"
 _META_XML_SUFFIX = "-meta.xml"
 
@@ -649,6 +675,7 @@ _PROSE_TAGS: tuple[str, ...] = (
     "description",
     "inlineHelpText",
     "masterLabel",
+    "errorMessage",
 )
 """Elements holding prose a person wrote for another person.
 
@@ -1170,6 +1197,17 @@ def _parse_labels(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> Par
 # CustomMetadata records
 # ---------------------------------------------------------------------------
 
+_VALIDATION_RULE_MODULE_KIND = "sf_validation_rule"
+_VALIDATION_RULE_KIND = "validation_rule"
+_RECORD_TYPE_MODULE_KIND = "sf_record_type"
+_RECORD_TYPE_KIND = "record_type"
+_FIELD_SET_MODULE_KIND = "sf_field_set"
+_FIELD_SET_KIND = "field_set"
+_WEB_LINK_MODULE_KIND = "sf_web_link"
+_WEB_LINK_KIND = "web_link"
+_LIST_VIEW_MODULE_KIND = "sf_list_view"
+_LIST_VIEW_KIND = "list_view"
+
 _CMDT_MODULE_KIND = "sf_custom_metadata"
 _CMDT_KIND = "custom_metadata_record"
 _MDT_SUFFIX = "__mdt"
@@ -1337,6 +1375,232 @@ def _lwc_apex_classes(element: Node) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Decomposed children of CustomObject
+#
+# SFDX splits an object into a directory tree, so each of these files states one
+# component of an object named nowhere in the document — only in the path. They
+# had no handler and fell to the generic structural parse, which walks the whole
+# body: measured across seven public repos, 1,271 such files minted 20,819 nodes
+# against 10,165 SFDX files minting 20,330. 11% of the files, 51% of the nodes,
+# and every one contentless (`picklistValues#17`, no name, no source, no
+# docstring). Handling them is node-count *negative*.
+# ---------------------------------------------------------------------------
+
+_LABEL_REFERENCE_RE = re.compile(r"\$Label\.([A-Za-z0-9_]+)")
+
+
+def _formula_labels(formula: str | None) -> set[str]:
+    """Custom labels a formula references as ``$Label.X``.
+
+    The only thing mined out of formula text.  Bare identifiers in a formula are
+    *not*: a field, a function name, a global and a cross-object path all look
+    alike, and a wrong uid is worse than a missing entity (ADR-0032).
+    ``$Label.`` is unambiguous — nothing else is spelled that way.
+    """
+    if not formula:
+        return set()
+    return {match.group(1) for match in _LABEL_REFERENCE_RE.finditer(formula)}
+
+
+def _decomposed_component(
+    emit: _Emit,
+    element: Node,
+    path: str,
+    meta: _MetaFile,
+    *,
+    child_dir: str,
+    namespace: str,
+    module_kind: str,
+    kind: str,
+    source: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> tuple[str | None, str] | None:
+    """Mint the file's Module and its one component, or ``None`` to decline.
+
+    The owner comes from the path — ``objects/<Object>/<child_dir>/<Name>...`` —
+    because the document never names it.  The ``IMPORTS -> sobject.<Owner>`` is
+    emitted from the component rather than from the object, so the edge lives in
+    the file that states it: ``_recreate_file_relationships`` deletes edges by
+    their *source* node's ``file_path``, and an edge sourced at the object would
+    be wiped whenever the object file alone was re-parsed.
+    """
+    owner = _decomposed_owner(path, child_dir)
+    name = _api_name(meta.base)
+    if owner is None or name is None:
+        return None
+    module_uid = _module(emit, path, module_kind, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=name,
+        qn_suffix=f"{namespace}.{owner}.{name}",
+        label=NodeLabel.VALUE,
+        kind=kind,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        source=source,
+        extra=_compact({"sobject": owner, "active": _bool_of(element, "active"), **(extra or {})}),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+    emit.imports_sobject(uid, owner)
+    return uid, owner
+
+
+def _owned_field(emit: _Emit, uid: str | None, owner: str, value: str | None) -> None:
+    """``IMPORTS -> sobject.<Owner>.<Field>`` for a field named on the owning object."""
+    field = _api_name(value)
+    if field is not None:
+        emit.rel(uid, RelType.IMPORTS, f"{SOBJECT_NAMESPACE}.{owner}.{field}")
+
+
+def _parse_validation_rule(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``objects/<Obj>/validationRules/<Name>.validationRule-meta.xml``.
+
+    ``errorMessage`` is the reason this type is worth indexing at all: it is the
+    admin's own explanation of a business rule, written for the user who tripped
+    it, and it was the most searchable prose in the object tree with no node to
+    hang on.  It reaches the docstring through ``_PROSE_TAGS``.
+
+    Only ``errorDisplayField`` becomes a field edge.  It is a plain API name, so
+    it costs no parsing and cannot be wrong; the formula beside it is mined for
+    ``$Label.X`` and nothing else.
+    """
+    formula = _text_of(element, "errorConditionFormula")
+    minted = _decomposed_component(
+        emit,
+        element,
+        path,
+        meta,
+        child_dir="validationRules",
+        namespace=VALIDATION_RULE_NAMESPACE,
+        module_kind=_VALIDATION_RULE_MODULE_KIND,
+        kind=_VALIDATION_RULE_KIND,
+        source=formula,
+        extra={"error_display_field": _text_of(element, "errorDisplayField")},
+    )
+    if minted is None:
+        return None
+    uid, owner = minted
+    _owned_field(emit, uid, owner, _text_of(element, "errorDisplayField"))
+    for label in sorted(_formula_labels(formula)):
+        emit.rel(uid, RelType.IMPORTS, f"{LABEL_NAMESPACE}.{label}")
+    return emit.result()
+
+
+def _parse_record_type(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``objects/<Obj>/recordTypes/<Name>.recordType-meta.xml``.
+
+    ``picklistValues`` is deliberately not walked.  A single real record type file
+    carries 266 of them across eight files — a 33x node multiplier on a type that
+    looks harmless — and a picklist value answers no question anybody asks of a
+    code graph.
+    """
+    minted = _decomposed_component(
+        emit,
+        element,
+        path,
+        meta,
+        child_dir="recordTypes",
+        namespace=RECORD_TYPE_NAMESPACE,
+        module_kind=_RECORD_TYPE_MODULE_KIND,
+        kind=_RECORD_TYPE_KIND,
+        extra={"compact_layout": _text_of(element, "compactLayoutAssignment")},
+    )
+    return emit.result() if minted is not None else None
+
+
+def _parse_field_set(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``objects/<Obj>/fieldSets/<Name>.fieldSet-meta.xml``.
+
+    A field set is what an LWC or Aura component iterates over, so this is the
+    answer to "which UI reads this field".
+
+    ``displayedFields`` only.  Its sibling ``availableFields`` is far more numerous
+    — 53 against 7 in a real file — but means "an admin could add this", not "this
+    is shown", and edges for what *might* be read would drown the ones for what is.
+    """
+    minted = _decomposed_component(
+        emit,
+        element,
+        path,
+        meta,
+        child_dir="fieldSets",
+        namespace=FIELD_SET_NAMESPACE,
+        module_kind=_FIELD_SET_MODULE_KIND,
+        kind=_FIELD_SET_KIND,
+    )
+    if minted is None:
+        return None
+    uid, owner = minted
+    for displayed in _children(element, "displayedFields"):
+        for value in _texts_of(displayed, "field"):
+            _owned_field(emit, uid, owner, value)
+    return emit.result()
+
+
+def _parse_web_link(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``objects/<Obj>/webLinks/<Name>.webLink-meta.xml``.
+
+    A button on a record page.  When its ``linkType`` is ``page`` the ``<page>``
+    element names a Visualforce page by API name, which is a real cross-component
+    edge; every other ``linkType`` (``url``, ``javascript``) names something this
+    module does not model and is skipped rather than guessed at.
+    """
+    minted = _decomposed_component(
+        emit,
+        element,
+        path,
+        meta,
+        child_dir="webLinks",
+        namespace=WEB_LINK_NAMESPACE,
+        module_kind=_WEB_LINK_MODULE_KIND,
+        kind=_WEB_LINK_KIND,
+        extra={
+            "link_type": _text_of(element, "linkType"),
+            "display_type": _text_of(element, "displayType"),
+        },
+    )
+    if minted is None:
+        return None
+    uid, _owner = minted
+    if (_text_of(element, "linkType") or "").strip().lower() == "page":
+        page = _api_name(_text_of(element, "page"))
+        if page is not None:
+            emit.rel(uid, RelType.IMPORTS, f"{PAGE_NAMESPACE}.{page}")
+    return emit.result()
+
+
+def _parse_list_view(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``objects/<Obj>/listViews/<Name>.listView-meta.xml``.
+
+    ``columns`` mixes real field API names with legacy report tokens —
+    ``NAME``, ``RECORDTYPE``, ``CORE.USERS.ALIAS`` — which name no field and would
+    each mint an ``ext/`` stub for a thing that does not exist.  Only ``__c``
+    columns become edges: 143 of 225 in the sampled corpus, and the 82 skipped are
+    exactly those tokens.  Standard fields are lost with them, which is the price
+    of not inventing 82 targets.
+    """
+    minted = _decomposed_component(
+        emit,
+        element,
+        path,
+        meta,
+        child_dir="listViews",
+        namespace=LIST_VIEW_NAMESPACE,
+        module_kind=_LIST_VIEW_MODULE_KIND,
+        kind=_LIST_VIEW_KIND,
+        extra={"filter_scope": _text_of(element, "filterScope")},
+    )
+    if minted is None:
+        return None
+    uid, owner = minted
+    for column in _texts_of(element, "columns"):
+        if column.endswith("__c"):
+            _owned_field(emit, uid, owner, column)
+    return emit.result()
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1347,6 +1611,11 @@ _HANDLERS: dict[str, Callable[[_Emit, Node, str, _MetaFile], ParsedFile | None]]
     "CustomLabels": _parse_labels,
     "CustomMetadata": _parse_custom_metadata,
     "LightningComponentBundle": _parse_lwc_bundle,
+    "ValidationRule": _parse_validation_rule,
+    "RecordType": _parse_record_type,
+    "FieldSet": _parse_field_set,
+    "WebLink": _parse_web_link,
+    "ListView": _parse_list_view,
 }
 """Root element name -> handler.  This *is* the supported-type list.
 

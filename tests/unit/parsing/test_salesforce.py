@@ -20,7 +20,12 @@ pytest.importorskip("tree_sitter_xml", reason="tree-sitter-xml not installed")
 
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, parse_file
 from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
-from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE, looks_like_salesforce_metadata
+from code_atlas.parsing.languages.salesforce import (
+    LABEL_NAMESPACE,
+    LWC_NAMESPACE,
+    PAGE_NAMESPACE,
+    looks_like_salesforce_metadata,
+)
 from code_atlas.schema import NodeLabel, RelType
 
 PROJECT = "test_project"
@@ -827,6 +832,221 @@ def test_the_bundle_node_and_its_module_are_two_nodes_from_one_file():
     assert _one(parsed, "lwc_component").qualified_name.endswith("lwc.eDRD_lwc_RelatedPhysicians")
     modules = [entity for entity in parsed.entities if entity.label is NodeLabel.MODULE]
     assert len(modules) == 1
+
+
+# ---------------------------------------------------------------------------
+# 4c. Decomposed children of CustomObject
+# ---------------------------------------------------------------------------
+
+OBJECTS = "force-app/main/default/objects"
+
+
+def test_a_validation_rule_carries_the_admins_error_message():
+    """SalesforceFoundation/EDA `Relationship__c/Related_Contact_Do_Not_Change`, verbatim.
+
+    `errorMessage` is why this type earns a node: it is the admin's own explanation
+    of a business rule, and it had nowhere to live.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Related_Contact_Do_Not_Change</fullName>
+    <active>true</active>
+    <description>Do not allow user to change Related Contact value</description>
+    <errorConditionFormula>and(not( ISNEW()), ISCHANGED( RelatedContact__c ))</errorConditionFormula>
+    <errorDisplayField>RelatedContact__c</errorDisplayField>
+    <errorMessage>Instead of changing the Contacts, delete this record.</errorMessage>
+</ValidationRule>
+"""
+    path = f"{OBJECTS}/Relationship__c/validationRules/Related_Contact_Do_Not_Change.validationRule-meta.xml"
+    parsed = _parse(source, path)
+    rule = _one(parsed, "validation_rule")
+    assert rule.qualified_name == _uid("validationrule.Relationship__c.Related_Contact_Do_Not_Change")
+    assert "Instead of changing the Contacts" in (rule.docstring or "")
+    assert rule.source is not None
+    assert "ISCHANGED" in rule.source
+    assert _targets(parsed, rule.qualified_name, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Relationship__c",
+        f"{SOBJECT_NAMESPACE}.Relationship__c.RelatedContact__c",
+    }
+
+
+def test_only_dollar_label_is_mined_out_of_a_formula():
+    """A formula's bare identifiers are not edges; `$Label.X` is unambiguous.
+
+    `ISCHANGED`, `Contact__c` and `Account.Owner.Name` all look alike to a regex,
+    and inventing a target is worse than missing one (ADR-0032).
+    """
+    source = """\
+<?xml version="1.0"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Needs_Reason</fullName>
+    <errorConditionFormula>AND(ISBLANK(Reason__c), $Label.Reason_Required,
+        ISPICKVAL(Stage__c, "X"))</errorConditionFormula>
+    <errorMessage>A reason is required.</errorMessage>
+</ValidationRule>
+"""
+    path = f"{OBJECTS}/Case/validationRules/Needs_Reason.validationRule-meta.xml"
+    parsed = _parse(source, path)
+    targets = _targets(parsed, _one(parsed, "validation_rule").qualified_name, RelType.IMPORTS)
+    assert f"{LABEL_NAMESPACE}.Reason_Required" in targets
+    # Neither the function names nor the bare field references become edges.
+    assert not any(t.endswith(("Reason__c", "Stage__c", "ISBLANK", "ISPICKVAL")) for t in targets)
+
+
+def test_a_record_type_does_not_mint_its_picklist_values():
+    """266 picklist values sit inside 8 real record-type files -- a 33x multiplier."""
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<RecordType xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Certificate</fullName>
+    <active>true</active>
+    <description>A certification related to the completion of specific courses.</description>
+    <label>Certificate</label>
+    <picklistValues>
+        <picklist>Academic_Level__c</picklist>
+        <values><fullName>Adult Education</fullName><default>false</default></values>
+        <values><fullName>Doctoral</fullName><default>false</default></values>
+    </picklistValues>
+</RecordType>
+"""
+    path = f"{OBJECTS}/Academic_Certification__c/recordTypes/Certificate.recordType-meta.xml"
+    parsed = _parse(source, path)
+    # The Module and the record type, and nothing per picklist value.
+    assert len(parsed.entities) == 2
+    assert _one(parsed, "record_type").qualified_name == _uid("recordtype.Academic_Certification__c.Certificate")
+
+
+def test_a_field_set_uses_displayed_fields_not_available_ones():
+    """`availableFields` outnumbers `displayedFields` 53 to 7 in a real file.
+
+    It means "an admin could add this", not "this is shown", so edges for it would
+    drown the ones that answer "which UI reads this field".
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<FieldSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>BDE_Entry_FS</fullName>
+    <availableFields>
+        <field>AccountNumber</field>
+        <isFieldManaged>false</isFieldManaged>
+    </availableFields>
+    <displayedFields>
+        <field>Name</field>
+        <isFieldManaged>false</isFieldManaged>
+    </displayedFields>
+    <label>BDE Entry</label>
+</FieldSet>
+"""
+    path = f"{OBJECTS}/Account/fieldSets/BDE_Entry_FS.fieldSet-meta.xml"
+    parsed = _parse(source, path)
+    targets = _targets(parsed, _one(parsed, "field_set").qualified_name, RelType.IMPORTS)
+    assert f"{SOBJECT_NAMESPACE}.Account.Name" in targets
+    assert f"{SOBJECT_NAMESPACE}.Account.AccountNumber" not in targets
+
+
+def test_a_web_link_opens_a_visualforce_page():
+    """SalesforceFoundation/NPSP `Account/Manage_Household`, verbatim."""
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<WebLink xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Manage_Household</fullName>
+    <displayType>button</displayType>
+    <linkType>page</linkType>
+    <masterLabel>Manage Household</masterLabel>
+    <page>HH_ManageHHAccount</page>
+</WebLink>
+"""
+    path = f"{OBJECTS}/Account/webLinks/Manage_Household.webLink-meta.xml"
+    parsed = _parse(source, path)
+    assert f"{PAGE_NAMESPACE}.HH_ManageHHAccount" in _targets(
+        parsed, _one(parsed, "web_link").qualified_name, RelType.IMPORTS
+    )
+
+
+def test_a_web_link_that_is_not_a_page_names_nothing():
+    """`linkType` url/javascript names something this module does not model."""
+    source = """\
+<?xml version="1.0"?>
+<WebLink xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Open_Docs</fullName>
+    <linkType>url</linkType>
+    <url>https://example.invalid/docs</url>
+</WebLink>
+"""
+    path = f"{OBJECTS}/Account/webLinks/Open_Docs.webLink-meta.xml"
+    parsed = _parse(source, path)
+    targets = _targets(parsed, _one(parsed, "web_link").qualified_name, RelType.IMPORTS)
+    assert targets == {f"{SOBJECT_NAMESPACE}.Account"}
+
+
+def test_a_list_view_skips_legacy_report_tokens():
+    """`columns` mixes field API names with `NAME`, `RECORDTYPE`, `CORE.USERS.ALIAS`.
+
+    Those name no field; each would mint an `ext/` stub for something that does not
+    exist. Standard fields are lost with them, which is the price of not inventing
+    82 targets out of 225.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<ListView xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>All</fullName>
+    <columns>NAME</columns>
+    <columns>Issuer__c</columns>
+    <columns>RECORDTYPE</columns>
+    <columns>CORE.USERS.ALIAS</columns>
+    <filterScope>Everything</filterScope>
+    <label>All</label>
+</ListView>
+"""
+    path = f"{OBJECTS}/Academic_Certification__c/listViews/All.listView-meta.xml"
+    parsed = _parse(source, path)
+    targets = _targets(parsed, _one(parsed, "list_view").qualified_name, RelType.IMPORTS)
+    assert targets == {
+        f"{SOBJECT_NAMESPACE}.Academic_Certification__c",
+        f"{SOBJECT_NAMESPACE}.Academic_Certification__c.Issuer__c",
+    }
+
+
+@pytest.mark.parametrize("kind", ["validation_rule", "record_type", "field_set", "web_link", "list_view"])
+def test_a_decomposed_child_is_never_a_callable(kind: str):
+    """None of these may be a `Callable`, and the reason is not stylistic.
+
+    `resolve_calls` builds `name_to_callables` from every Callable in the project
+    and matches on **bare name**, project-wide. A validation rule named `validate`
+    would be a candidate for an Apex `validate()` call, and if it were the only
+    one it would resolve at confidence `resolved` -- a confidently wrong edge,
+    which is exactly what ADR-0032 exists to prevent.
+
+    A `Flow` is a Callable because `subflows` genuinely invokes one by name.
+    Nothing invokes a validation rule or a list view by name, so `Callable` buys
+    nothing here and costs that. Every IMPORTS edge is unaffected by the label.
+    """
+    sources = {
+        "validation_rule": (
+            "validationRules",
+            "V",
+            "<ValidationRule xmlns='{ns}'><fullName>V</fullName></ValidationRule>",
+        ),
+        "record_type": ("recordTypes", "R", "<RecordType xmlns='{ns}'><fullName>R</fullName></RecordType>"),
+        "field_set": ("fieldSets", "F", "<FieldSet xmlns='{ns}'><fullName>F</fullName></FieldSet>"),
+        "web_link": ("webLinks", "W", "<WebLink xmlns='{ns}'><fullName>W</fullName></WebLink>"),
+        "list_view": ("listViews", "L", "<ListView xmlns='{ns}'><fullName>L</fullName></ListView>"),
+    }
+    child_dir, name, template = sources[kind]
+    suffix = {
+        "validation_rule": "validationRule",
+        "record_type": "recordType",
+        "field_set": "fieldSet",
+        "web_link": "webLink",
+        "list_view": "listView",
+    }[kind]
+    body = template.format(ns="http://soap.sforce.com/2006/04/metadata")
+    parsed = _parse(
+        f'<?xml version="1.0"?>\n{body}\n',
+        f"{OBJECTS}/Account/{child_dir}/{name}.{suffix}-meta.xml",
+    )
+    assert _one(parsed, kind).label is NodeLabel.VALUE
 
 
 # ---------------------------------------------------------------------------
