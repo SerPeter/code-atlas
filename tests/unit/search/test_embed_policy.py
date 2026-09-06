@@ -420,8 +420,18 @@ class TestHybridSearchIsWiredToThePolicy:
 def test_every_default_excluded_kind_is_one_the_generic_handler_emits(kind: str):
     """The default is only defensible because these kinds come from exactly one code path
     -- ``config.py``'s structural fallback. If one of them were also emitted by a dialect
-    handler, excluding it would take vectors off entities somebody understood."""
+    handler, excluding it would take vectors off entities somebody understood.
+
+    The fallback has two branches -- the key-tree one for YAML/JSON/TOML and the element
+    one for XML -- and both mean equally "no handler recognised this"."""
     from code_atlas.parsing.languages import config
 
-    generic = {config._GENERIC_MODULE_KIND, config._GENERIC_SECTION_KIND, config._GENERIC_SETTING_KIND}
-    assert kind in generic
+    fallback = {
+        config._GENERIC_MODULE_KIND,
+        config._GENERIC_SECTION_KIND,
+        config._GENERIC_SETTING_KIND,
+        config._XML_DOCUMENT_KIND,
+        config._XML_ELEMENT_KIND,
+        config._XML_SETTING_KIND,
+    }
+    assert kind in fallback

@@ -453,7 +453,7 @@ class EmbedClient:
 # Embedding policy
 # ---------------------------------------------------------------------------
 
-DEFAULT_EXCLUDE_KINDS: tuple[str, ...] = ("config_setting", "config_section")
+DEFAULT_EXCLUDE_KINDS: tuple[str, ...] = ("config_setting", "config_section", "xml_setting", "xml_element")
 """Kinds that carry no vector unless the user asks for one.
 
 These two are emitted by exactly one code path -- ``config.py``'s generic structural
@@ -463,11 +463,22 @@ not a path pattern to be guessed at; it is a kind, and excluding the kind needs 
 per-repo tuning. A file a dialect *did* recognise gets ``k8s_resource``,
 ``compose_service``, ``ci_job``, ``dbt_source`` and so on, and keeps its vector.
 
-``config_file`` is deliberately absent: the file-level node is named after the file and
-answers "what is this config for", which is a fair semantic target. The XML fallback's
-twins (``xml_element``, ``xml_setting``) are absent too -- ATL-144 is actively trying to
-extract *more* from Salesforce metadata, and pre-empting it here would be working against
-it. Both are one line away for a user who disagrees.
+``xml_element`` and ``xml_setting`` are the XML branch's twins of those two and are
+excluded for the same reason. They were held back while ATL-144 was pending, on the
+grounds that excluding them would pre-empt a story trying to extract *more* from
+Salesforce metadata. ATL-144 settled it the other way: a recognised type gets a
+Salesforce kind (``sf_flow``, ``sobject``, ``sobject_field``, ...) and keeps its vector,
+so these two now mean precisely "XML no handler recognised". One real permission set
+contributed 1,944 of them, all named ``fieldPermissions``, all with an empty ``source``,
+and every one was embedded.
+
+``config_file`` and ``xml_document`` are deliberately absent: the file-level node is named
+after the file and answers "what is this config for", which is a fair semantic target. It
+is one node per file, so it is not what floods anything.
+
+Excluded is not invisible -- the node keeps its name, its edges and its FTS document, and
+``_floor_excluded_in_vector_channel`` admits it at the tail of the vector list wherever a
+query gates on vector similarity (ADR-0047).
 """
 
 
