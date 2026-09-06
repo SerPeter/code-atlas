@@ -1374,6 +1374,41 @@ def _module(emit: _Emit, path: str, kind: str, element: Node) -> str | None:
     )
 
 
+_SNIFF_NAMESPACE_MARKER = b"soap.sforce.com"
+_SNIFF_ROOT_RE = re.compile(rb"<\s*([A-Za-z_][\w.-]*)")
+
+
+def looks_like_salesforce_metadata(head: bytes) -> bool:
+    """Does this document declare itself as SFDX metadata this module models?
+
+    The dialect sniff (ADR-0048). It sees the first 4 KiB and **never the path** —
+    the signature is ``Callable[[bytes], bool]`` — so it can use only what the
+    document says about itself: a root element in :data:`_HANDLERS`, corroborated
+    by the Metadata API namespace.
+
+    ``soap.sforce.com`` as a **substring**, not the exact ``_METADATA_NS``. A real
+    ``.cls-meta.xml`` sidecar declares ``urn:metadata.tooling.soap.sforce.com``,
+    which exact equality misses; today such a file is rescued by
+    :func:`_looks_like_sfdx`'s filename branch, which a sniff cannot reach.
+
+    Claiming is a commitment: a claimed file that the handler declines gets an
+    **empty** ``ParsedFile``, which would delete its entities from the graph. That
+    is why the caller pairs this with the generic structural parse rather than
+    letting a decline stand — see ``config._parse_salesforce_xml``.
+
+    4 KiB is ample: every SFDX file puts its XML declaration on line 1 and the root
+    element on line 2, at byte 41 in every sample measured.
+    """
+    if _SNIFF_NAMESPACE_MARKER not in head:
+        return False
+    for match in _SNIFF_ROOT_RE.finditer(head):
+        name = match.group(1).decode("ascii", "replace")
+        if name.startswith(("?", "!")):
+            continue
+        return name in _HANDLERS
+    return False
+
+
 def _looks_like_sfdx(path: str, element: Node) -> bool:
     """Corroborate the root element name with a Salesforce-specific signal.
 

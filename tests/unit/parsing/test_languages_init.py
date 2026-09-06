@@ -292,6 +292,21 @@ _SAMPLES = [
         "Contoso.SemanticModel/definition/tables/Sales.tmdl",
         "table Sales\n\tcolumn Quantity\n\t\tdataType: int64\n\n\tmeasure Total = SUM(Sales[Quantity])\n",
     ),
+    _Sample(
+        # Reached by content, not by suffix. `.xml` belongs to the `xml` language and an
+        # SFDX document is claimed by what it declares -- a modelled root element plus the
+        # Metadata API namespace (ADR-0048). The sniff never sees the path, so the source
+        # here has to carry both signals.
+        "salesforce",
+        "tree_sitter_xml",
+        "force-app/main/default/flows/Create_Property.flow-meta.xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <label>Create Property</label>\n"
+        "    <processType>AutoLaunchedFlow</processType>\n"
+        "    <status>Active</status>\n"
+        "</Flow>\n",
+    ),
     _Sample("toml", "tree_sitter_toml", "pyproject.toml", '[project]\nname = "acme"\nversion = "1.0.0"\n'),
     _Sample("tsx", "tree_sitter_typescript", "web/App.tsx", "export function App() {\n  return <div>hi</div>;\n}\n"),
     _Sample(

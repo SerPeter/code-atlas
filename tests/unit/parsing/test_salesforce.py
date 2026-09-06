@@ -20,7 +20,7 @@ pytest.importorskip("tree_sitter_xml", reason="tree-sitter-xml not installed")
 
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, parse_file
 from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
-from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE
+from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE, looks_like_salesforce_metadata
 from code_atlas.schema import NodeLabel, RelType
 
 PROJECT = "test_project"
@@ -975,6 +975,73 @@ def test_a_bundle_whose_folder_is_not_an_api_name_falls_through():
     parsed = _parse(source, "force-app/main/default/lwc/9lives/9lives.js-meta.xml")
     assert _by_kind(parsed, "lwc_component") == []
     assert _by_kind(parsed, "xml_document")
+
+
+# ---------------------------------------------------------------------------
+# 6b. The dialect route (ADR-0048)
+# ---------------------------------------------------------------------------
+
+_SFDX_PERMISSION_SET = (
+    '<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+    "  <label>Admin</label>\n</PermissionSet>\n"
+)
+
+_SFDX_FLOW = (
+    '<?xml version="1.0"?>\n<Flow xmlns="http://soap.sforce.com/2006/04/metadata">\n  <label>Loose</label>\n</Flow>\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("head", "claimed", "why"),
+    [
+        (_SFDX_FLOW, True, "a modelled root element plus the metadata namespace"),
+        (
+            '<?xml version="1.0"?>\n<Flow xmlns="urn:metadata.tooling.soap.sforce.com">\n</Flow>\n',
+            True,
+            (
+                "the tooling namespace is a substring match, not exact equality -- "
+                "a real .cls-meta.xml sidecar declares this one"
+            ),
+        ),
+        (
+            '<?xml version="1.0"?>\n<Flow>\n  <label>An orchestration</label>\n</Flow>\n',
+            False,
+            "a bare <Flow> root is generic enough for BPMN exports and workflow engines",
+        ),
+        (
+            '<?xml version="1.0"?>\n<project><artifactId>acme</artifactId></project>\n',
+            False,
+            "an ordinary XML document",
+        ),
+        (
+            _SFDX_PERMISSION_SET,
+            False,
+            (
+                "SFDX, but a root element this module models no handler for -- claiming "
+                "it would buy nothing and the generic parse already handles it"
+            ),
+        ),
+    ],
+    ids=["modelled", "tooling-namespace", "no-namespace", "not-salesforce", "unmodelled-type"],
+)
+def test_the_sniff_claims_only_what_it_models(head: str, claimed: bool, why: str):
+    assert looks_like_salesforce_metadata(head.encode()) is claimed, why
+
+
+def test_a_claimed_file_the_handler_declines_still_gets_its_entities():
+    """The load-bearing property of this route.
+
+    ADR-0048: a dialect that claims a file and then declines gets an **empty**
+    `ParsedFile`, not a fallback -- which would delete the file's entities from the
+    graph. The sniff sees bytes only, so it cannot anticipate the handler's
+    path-shaped declines: this document has a modelled root element and the right
+    namespace, and is declined solely because its name is not `*-meta.xml`.
+    """
+    parsed = _parse(_SFDX_FLOW, "exports/Loose.xml")
+    assert _by_kind(parsed, "flow") == []
+    # Exactly what it produced before the dialect route existed.
+    assert _by_kind(parsed, "xml_document")
+    assert _by_kind(parsed, "xml_element")
 
 
 def test_a_non_salesforce_flow_document_is_not_claimed():

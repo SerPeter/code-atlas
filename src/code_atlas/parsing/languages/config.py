@@ -127,9 +127,11 @@ from code_atlas.parsing.ast import (
     ParsedRelationship,
     dialect_resolver,
     node_text,
+    register_dialect,
     register_language,
 )
 from code_atlas.parsing.languages.salesforce import (
+    looks_like_salesforce_metadata,
     parse_salesforce_metadata,
     xml_child_elements,
     xml_tag,
@@ -1252,14 +1254,42 @@ excluding it would take vectors off entities somebody understood.
 """
 
 
+def _parse_salesforce_xml(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile | None:
+    """The ``salesforce`` dialect's handler: the SFDX parse, with the generic one beneath it.
+
+    Registered against ``.xml`` through :func:`register_dialect`, so a document is
+    routed here by what it *declares* — ``salesforce.looks_like_salesforce_metadata``
+    reading its first 4 KiB — rather than by a hand-off inside the ``xml`` handler.
+    ADR-0048 named that hand-off as the one exception to the registry and this is it
+    removed.
+
+    **The fallback below is load-bearing, not defensive.** ADR-0048: a dialect that
+    claims a file and then declines gets an *empty* ``ParsedFile``, not a fallback to
+    the generic handler — so a decline here would delete the file's entities from the
+    graph. ``parse_salesforce_metadata`` still declines for several reasons a
+    bytes-only sniff cannot anticipate, every one of them path-shaped: a file whose
+    name is not ``*-meta.xml``, a field file outside ``objects/<X>/fields/``, a
+    CustomMetadata file with no record name in its basename. Each one lands on the
+    same structural parse it landed on before this route existed, so the output is
+    byte-identical either way.
+
+    This wrapper lives in ``config.py`` rather than in ``salesforce.py`` for the same
+    reason the registration does: ``config`` already imports ``salesforce`` and owns
+    the generic parse, so nothing new is imported in either direction.
+    """
+    parsed = parse_salesforce_metadata(path, root, project_name)
+    if parsed is not None:
+        return parsed
+    return _parse_xml(path, source, root, project_name)
+
+
 def _parse_xml(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile | None:
-    """Salesforce metadata if the document is any, otherwise a minimal structural parse.
+    """A minimal structural parse: the document type and its direct children.
 
-    ``salesforce.parse_salesforce_metadata`` claims the SFDX metadata types it
-    models (CustomObject, CustomField, Flow, CustomLabels, CustomMetadata) and
-    declines everything else, which lands here.
+    The floor for every XML document, and what a Salesforce file falls back to when
+    its type is one this repo does not model.
 
-    The fallback is deliberately one level deep: the root element is the
+    It is deliberately one level deep: the root element is the
     document type and its direct children are the settings worth searching for
     (``<status>``, ``<label>``, ``<isExposed>``), whereas walking the whole tree
     of a large FlexiPage or permission set would mint hundreds of nodes per file
@@ -1279,10 +1309,6 @@ def _parse_xml(path: str, source: bytes, root: Node, project_name: str) -> Parse
     ``file_hash`` on, and ``set_batch_file_hashes`` writes onto exactly those —
     so the file would be re-read and re-parsed on every indexing pass, forever.
     """
-    parsed = parse_salesforce_metadata(path, root, project_name)
-    if parsed is not None:
-        return parsed
-
     element = next((child for child in root.children if child.type == "element"), None)
     tag = xml_tag(element) if element is not None else None
     if element is None or tag is None:
@@ -1966,6 +1992,22 @@ try:
     # language() attribute on this module, and AttributeError would escape the
     # ImportError guard below.
     _XML_LANGUAGE = Language(_ts_xml.language_xml())
+    # The SFDX dialect, registered before the language that owns the suffix so the
+    # resolver has something to find. `salesforce.py` supplies the sniff and the
+    # handler; this module supplies the `Language` and the generic fallback, which is
+    # why the registration lives here and adds no import edge in either direction.
+    register_dialect(".xml", "salesforce", looks_like_salesforce_metadata)
+    register_language(
+        LanguageConfig(
+            name="salesforce",
+            # No `extensions`: a dialect is reached by content, never by suffix.
+            extensions=frozenset(),
+            language=_XML_LANGUAGE,
+            query=Query(_XML_LANGUAGE, "(document) @root"),
+            parse_func=_parse_salesforce_xml,
+            comment_node_types=frozenset({"Comment"}),
+        )
+    )
     register_language(
         LanguageConfig(
             name="xml",
@@ -1975,6 +2017,12 @@ try:
             parse_func=_parse_config,
             # Capital C — the XML grammar names this node "Comment".
             comment_node_types=frozenset({"Comment"}),
+            # A conditioned route (ADR-0048). SFDX gives every metadata file the same
+            # plain `.xml` suffix, so the format inside is the only thing that can tell
+            # a CustomObject from a Maven pom. Nothing consults `_DIALECTS` unless the
+            # suffix is declared ambiguous here.
+            ambiguous_extensions=frozenset({".xml"}),
+            resolve_dialect=dialect_resolver(".xml", "xml"),
         )
     )
 except ImportError:
