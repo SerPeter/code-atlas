@@ -213,11 +213,28 @@ the same plain ``.xml`` suffix.
 """
 
 _MAX_ENTITIES_PER_FILE = 1000
-"""Cap on components minted from one file.
+"""Default cap on components minted from one file.
 
-Only ``CustomLabels`` can realistically reach it — one
-``CustomLabels.labels-meta.xml`` holds every label in the org, and large orgs
-run to thousands.  Every other Tier-1 type is one component per file.
+Every modelled type except ``CustomLabels`` is one component per file, or a
+handful, so this is unreachable for them and exists only as a backstop against a
+pathological document.
+"""
+
+_LABELS_MAX_ENTITIES = 20_000
+"""``CustomLabels``' own cap, and the reason :class:`_Emit` takes a budget at all.
+
+One ``CustomLabels.labels-meta.xml`` holds *every* label in the org, so unlike
+every other type its component count is a property of the org rather than of the
+document — the default cap read "large orgs run to thousands" and then stopped at
+1,000.  NPSP's declares 2,046 in 777 KB and lost 1,047 of them, silently as far as
+the graph was concerned and in source order, so *which* labels survived depended
+on file layout.
+
+Splitting the file was rejected: a label's uid is ``label.<Name>`` precisely so
+that whichever module learns to emit ``System.Label.X`` or
+``@salesforce/label/c.X`` meets the definition here, and a per-chunk uid would
+break that.  This is one file per project, and a label is a short string, so the
+node cost is bounded and small.
 """
 
 
@@ -380,6 +397,7 @@ class _Emit:
 
     file_path: str
     project_name: str
+    budget: int = _MAX_ENTITIES_PER_FILE
     entities: list[ParsedEntity] = field(default_factory=list)
     relationships: list[ParsedRelationship] = field(default_factory=list)
     seen_qns: set[str] = field(default_factory=set)
@@ -388,7 +406,7 @@ class _Emit:
 
     @property
     def full(self) -> bool:
-        return len(self.entities) >= _MAX_ENTITIES_PER_FILE
+        return len(self.entities) >= self.budget
 
     def add(
         self,
@@ -469,7 +487,7 @@ class _Emit:
             logger.warning(
                 "salesforce: {} declares more than {} components — the rest were skipped",
                 self.file_path,
-                _MAX_ENTITIES_PER_FILE,
+                self.budget,
             )
         return ParsedFile(
             file_path=self.file_path,
@@ -1259,6 +1277,15 @@ def _looks_like_sfdx(path: str, element: Node) -> bool:
     return any(value == _METADATA_NS for key, value in _xml_attributes(element).items() if key.startswith("xmlns"))
 
 
+_BUDGETS: dict[str, int] = {"CustomLabels": _LABELS_MAX_ENTITIES}
+"""Per-root-element node budget, for the one type whose default is wrong.
+
+Keyed by root element rather than raised inside the handler, because ``_Emit`` is
+built before dispatch and a handler that raised its own budget mid-parse would
+have to re-admit entities it had already dropped.
+"""
+
+
 def parse_salesforce_metadata(path: str, root: Node, project_name: str) -> ParsedFile | None:
     """Parse an SFDX metadata document, or return ``None`` to decline it.
 
@@ -1283,5 +1310,5 @@ def parse_salesforce_metadata(path: str, root: Node, project_name: str) -> Parse
         # directory either. The generic parse still indexes the content.
         return None
 
-    emit = _Emit(file_path=path, project_name=project_name)
+    emit = _Emit(file_path=path, project_name=project_name, budget=_BUDGETS.get(tag, _MAX_ENTITIES_PER_FILE))
     return _HANDLERS[tag](emit, element, path, meta)

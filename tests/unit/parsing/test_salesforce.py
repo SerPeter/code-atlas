@@ -766,13 +766,15 @@ def test_custom_labels_produce_one_value_each():
 
 def test_one_file_many_labels_is_capped():
     """The one Tier-1 type where a single file can hold thousands of components."""
-    from code_atlas.parsing.languages.salesforce import _MAX_ENTITIES_PER_FILE
 
     entries = "".join(f"    <labels><fullName>L{i}</fullName><value>v</value></labels>\n" for i in range(1500))
     source = f'<?xml version="1.0"?>\n<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">\n{entries}</CustomLabels>\n'
 
     parsed = _parse(source, "force-app/main/default/labels/CustomLabels.labels-meta.xml")
-    assert len(parsed.entities) == _MAX_ENTITIES_PER_FILE
+    # CustomLabels has its own budget: one file holds every label in the org, so its
+    # component count is a property of the org, not of the document. NPSP's declares
+    # 2,046 and used to lose 1,047 of them in source order.
+    assert len(parsed.entities) == 1501
     # Every surviving label still got its containment edge — no dangling refs to
     # entities the budget cut.
     minted = {entity.qualified_name for entity in parsed.entities}

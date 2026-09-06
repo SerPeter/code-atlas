@@ -117,6 +117,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import yaml
+from loguru import logger
 from tree_sitter import Language, Query
 
 from code_atlas.parsing.ast import (
@@ -1240,7 +1241,18 @@ def _entry_position(out: _Out, pair: tuple[yaml.Node, yaml.Node] | None, doc: _D
 # ---------------------------------------------------------------------------
 
 
-def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
+_XML_DOCUMENT_KIND = "xml_document"
+_XML_ELEMENT_KIND = "xml_element"
+_XML_SETTING_KIND = "xml_setting"
+"""The XML fallback's kinds — the ``.xml`` twins of ``_GENERIC_*_KIND``.
+
+Named rather than inline so that ``DEFAULT_EXCLUDE_KINDS``' completeness guard can
+assert they come from this one code path.  If a dialect handler ever emits one,
+excluding it would take vectors off entities somebody understood.
+"""
+
+
+def _parse_xml(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile | None:
     """Salesforce metadata if the document is any, otherwise a minimal structural parse.
 
     ``salesforce.parse_salesforce_metadata`` claims the SFDX metadata types it
@@ -1254,6 +1266,18 @@ def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
     for no additional answerable question.  The element-tree primitives it uses
     live in ``salesforce.py`` so that the import between the two modules runs in
     exactly one direction.
+
+    **One level deep is not a cap.**  A 427 KB permission set has 1,399 direct
+    children and used to mint 1,947 entities from this branch — 1,944 of them
+    ``TypeDef{xml_element}`` all named ``fieldPermissions``, every one with an
+    empty ``source`` — which is exactly the outcome the paragraph above claims to
+    avoid.  So the same two limits the generic key-tree path applies now apply
+    here: ``MAX_GENERIC_CONFIG_BYTES`` and ``_GENERIC_MAX_ENTITIES``.
+
+    Unlike that path, an over-limit file still gets its ``Module``.  Returning
+    ``None`` would leave the file with no ``FILE_HASH_LABELS`` node to store a
+    ``file_hash`` on, and ``set_batch_file_hashes`` writes onto exactly those —
+    so the file would be re-read and re-parsed on every indexing pass, forever.
     """
     parsed = parse_salesforce_metadata(path, root, project_name)
     if parsed is not None:
@@ -1269,7 +1293,7 @@ def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
         name=PurePosixPath(path).name,
         qn_suffix=_module_qualified_name(path),
         label=NodeLabel.MODULE,
-        kind="xml_document",
+        kind=_XML_DOCUMENT_KIND,
         line_start=1,
         line_end=root.end_point[0] + 1,
     )
@@ -1277,13 +1301,29 @@ def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
         name=tag,
         qn_suffix=f"{_suffix(module_uid)}.{_qn_segment(tag)}",
         label=NodeLabel.TYPE_DEF,
-        kind="xml_element",
+        kind=_XML_ELEMENT_KIND,
         line_start=element.start_point[0] + 1,
         line_end=element.end_point[0] + 1,
     )
     out.rel(module_uid, RelType.DEFINES, root_uid)
 
+    if len(source) > MAX_GENERIC_CONFIG_BYTES:
+        logger.debug(
+            "xml: {} is {} bytes — indexed as its root element only (limit {})",
+            path,
+            len(source),
+            MAX_GENERIC_CONFIG_BYTES,
+        )
+        return ParsedFile(file_path=path, language="xml", entities=out.entities, relationships=out.relationships)
+
     for child in xml_child_elements(element):
+        if len(out.entities) >= _GENERIC_MAX_ENTITIES:
+            logger.debug(
+                "xml: {} declares more than {} elements — the rest were skipped",
+                path,
+                _GENERIC_MAX_ENTITIES,
+            )
+            break
         child_tag = xml_tag(child)
         if child_tag is None:
             continue
@@ -1292,7 +1332,7 @@ def _parse_xml(path: str, root: Node, project_name: str) -> ParsedFile | None:
             name=child_tag,
             qn_suffix=f"{_suffix(root_uid)}.{_qn_segment(child_tag)}",
             label=NodeLabel.TYPE_DEF if has_children else NodeLabel.VALUE,
-            kind="xml_element" if has_children else "xml_setting",
+            kind=_XML_ELEMENT_KIND if has_children else _XML_SETTING_KIND,
             line_start=child.start_point[0] + 1,
             line_end=child.end_point[0] + 1,
             source=None if has_children else xml_text(child),
@@ -1846,7 +1886,7 @@ def _parse_config(path: str, source: bytes, root: Node, project_name: str) -> Pa
     if not source.strip() or suffix in _DATA_SUFFIXES:
         return None
     if suffix == ".xml":
-        return _parse_xml(norm_path, root, project_name)
+        return _parse_xml(norm_path, source, root, project_name)
     if suffix == ".json":
         return _parse_json(norm_path, source, root, project_name)
     if suffix == ".toml":

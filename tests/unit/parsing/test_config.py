@@ -17,6 +17,7 @@ from tree_sitter import Parser
 
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, get_language_for_file, parse_file
 from code_atlas.parsing.languages.config import (
+    _GENERIC_MAX_ENTITIES,
     MAX_GENERIC_CONFIG_BYTES,
     _load_yaml_documents,
     _Out,
@@ -803,6 +804,62 @@ def test_salesforce_metadata_bypasses_the_structural_parse() -> None:
     kinds = {entity.kind for entity in parsed.entities}
     assert kinds == {"sf_object", "sobject"}
     assert not kinds & {"xml_document", "xml_element", "xml_setting"}
+
+
+def _permission_set(rows: int) -> str:
+    """A PermissionSet with *rows* direct children — the real flooding shape.
+
+    `Salesforce_Backup_Administrator.permissionset-meta.xml` in bcgov/MoH-SAT is
+    427,477 bytes with 1,399 direct children, and used to mint 1,947 entities:
+    1,944 `TypeDef{xml_element}` all named `fieldPermissions`, every one with an
+    empty `source`, and every one embedded under the shipped policy.
+    """
+    body = "".join(f"    <fieldPermissions><field>Account.F{i}__c</field></fieldPermissions>\n" for i in range(rows))
+    return f'<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n{body}</PermissionSet>\n'
+
+
+def test_xml_fallback_stops_at_the_entity_cap() -> None:
+    """One level deep is not a cap when the root has hundreds of children."""
+    parsed = _parse(_permission_set(500), "force-app/main/default/permissionsets/Wide.permissionset-meta.xml")
+    assert len(parsed.entities) == _GENERIC_MAX_ENTITIES
+
+
+def test_an_over_size_xml_file_still_gets_its_module() -> None:
+    """Over the size gate the tree is skipped -- but never the ``Module``.
+
+    A file with no ``FILE_HASH_LABELS`` node has nowhere for
+    ``set_batch_file_hashes`` to store a ``file_hash``, so it would be re-read and
+    re-parsed on every indexing pass, forever, with no error anywhere.
+    """
+    rows = 12_000
+    source = _permission_set(rows)
+    assert len(source.encode()) > MAX_GENERIC_CONFIG_BYTES, "fixture must exceed the size gate"
+
+    parsed = _parse(source, "force-app/main/default/permissionsets/Huge.permissionset-meta.xml")
+    modules = [entity for entity in parsed.entities if entity.label is NodeLabel.MODULE]
+    assert len(modules) == 1
+    # The root element survives as the document's type; its 12,000 children do not.
+    assert len(parsed.entities) == 2
+
+
+def test_the_xml_fallback_kinds_carry_no_vector_by_default() -> None:
+    """``xml_element``/``xml_setting`` are excluded; the file-level node is not.
+
+    The same split as ``config_section``/``config_setting`` vs ``config_file``: the
+    per-file node is named after the file and answers "what is this", and there is
+    only ever one of it.
+    """
+    from code_atlas.search.embeddings import EmbedPolicy
+    from code_atlas.settings import EmbeddingSettings
+
+    policy = EmbedPolicy.from_settings(EmbeddingSettings())
+    parsed = _parse(_permission_set(50), "force-app/main/default/permissionsets/Small.permissionset-meta.xml")
+    embedded = {
+        entity.kind for entity in parsed.entities if policy.allows(kind=entity.kind, file_path=entity.file_path)
+    }
+    assert "xml_element" not in embedded
+    assert "xml_setting" not in embedded
+    assert embedded == {"xml_document"}
 
 
 def test_xml_without_an_element_declines() -> None:
