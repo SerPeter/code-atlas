@@ -134,6 +134,36 @@ _NODE_COLUMNS = "uid, labels, project_name, qualified_name, file_path, name, kin
 # inbound and the two _recreate_* sweeps below cannot see them).
 _CITATION_EDGE_PREDICATE = "rel_type = 'DOCUMENTS' AND json_extract(props_json, '$.link_type') = 'citation'"
 
+# The second carve-out, and the twin of Memgraph's
+# `NOT (type(r) = 'DEFINES' AND coalesce(m.file_path, n.file_path) <> n.file_path)`.
+#
+# `resolve_member_defines` creates DEFINES edges that run from a TypeDef to a member
+# declared in a DIFFERENT file -- a C++ method in `foo.cpp` whose class is in `foo.h`,
+# a Go method whose receiver struct is declared elsewhere in the package, a Rust `impl`
+# split from its `struct`, an SFDX `objects/X/fields/Y.field-meta.xml` under its
+# `objects/X/X.object-meta.xml`. The edge is SOURCED at the owning file's node but
+# STATED by the member's file, so re-parsing the owner alone would delete it and only a
+# re-parse of the *member* file could restore it -- which the content-hash gate exists
+# to prevent. It would stay gone.
+#
+# Both `nodes.uid` lookups are against the PRIMARY KEY, so this is two point lookups per
+# candidate DEFINES edge rather than a scan (ADR-0045).
+#
+# Comparing against the SOURCE node's file_path rather than a bound parameter makes one
+# predicate correct for both the single-file and the batch sweep: the single-file sweep
+# already restricts `from_uid` to nodes in that file, so the two are equivalent there.
+#
+# A dangling `to_uid` (no node row yet) is NOT carved out, matching the behaviour before
+# this predicate existed and matching Memgraph, where a pattern with no target simply
+# does not match. A target whose `file_path` is NULL is likewise deleted, which is what
+# Memgraph's `coalesce` collapses to.
+_CROSS_FILE_DEFINES_PREDICATE = (
+    "rel_type = 'DEFINES' AND EXISTS ("
+    "SELECT 1 FROM nodes AS target, nodes AS source "
+    "WHERE target.uid = edges.to_uid AND source.uid = edges.from_uid "
+    "AND target.file_path IS NOT NULL AND target.file_path <> source.file_path)"
+)
+
 
 def _fts_document(name: str, qualified_name: str, props: dict[str, Any]) -> str:
     """The BM25 document for one node.
@@ -1459,7 +1489,8 @@ class SqliteGraphClient:
                 "DELETE FROM edges WHERE from_uid IN "
                 "(SELECT uid FROM nodes WHERE project_name = ? AND file_path = ? "
                 "AND labels NOT IN ('Package', 'Project')) "
-                f"AND NOT ({_CITATION_EDGE_PREDICATE})",
+                f"AND NOT ({_CITATION_EDGE_PREDICATE}) "
+                f"AND NOT ({_CROSS_FILE_DEFINES_PREDICATE})",
                 (project_name, file_path),
             )
         await self._create_relationships(conn, project_name, relationships)
@@ -1480,7 +1511,8 @@ class SqliteGraphClient:
                 f"DELETE FROM edges WHERE from_uid IN "
                 f"(SELECT uid FROM nodes WHERE project_name = ? AND file_path IN ({placeholders}) "
                 f"AND labels NOT IN ('Package', 'Project')) "
-                f"AND NOT ({_CITATION_EDGE_PREDICATE})",
+                f"AND NOT ({_CITATION_EDGE_PREDICATE}) "
+                f"AND NOT ({_CROSS_FILE_DEFINES_PREDICATE})",
                 (project_name, *chunk),
             )
         all_rels: list[ParsedRelationship] = [r for rels in file_rels.values() for r in rels]

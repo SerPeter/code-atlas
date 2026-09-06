@@ -120,12 +120,22 @@ _NOT_COMPARED: dict[str, str] = {
     "stamp_note_relations": "write path",
     # -- resolution passes: stateful, order-dependent, and compared only in
     #    aggregate by the edge-shaped reads above -----------------------------
+    #
+    #    A bare "resolution pass" means NOT COMPARED. It does not mean "covered
+    #    elsewhere" -- the entries that are say so and name what covers them. ATL-171
+    #    reached main through this gap: SQLite deleted cross-file DEFINES edges that
+    #    Memgraph carves out, and the only test for that invariant took the Memgraph
+    #    fixture. If you add an entry here, prefer naming its cover.
     "resolve_calls": "resolution pass; its output is the CALLS edges get_callers compares",
     "resolve_imports": "resolution pass",
     "resolve_inherits": "resolution pass",
     "resolve_type_refs": "resolution pass",
     "resolve_value_references": "resolution pass",
-    "resolve_member_defines": "resolution pass",
+    "resolve_member_defines": (
+        "resolution pass; the cross-file DEFINES it creates are pinned on both backends by "
+        "tests/unit/backends/test_sqlite_cross_file_defines.py and "
+        "test_client.py::test_resolve_member_defines_cross_file"
+    ),
     "resolve_config_refs": "resolution pass",
     "resolve_anchors": "resolution pass",
     "resolve_doc_links": "resolution pass",
