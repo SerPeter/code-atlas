@@ -100,6 +100,40 @@ Produces ``ext/sobject.Account`` — one ExternalPackage (``ext/sobject``) holdi
 one ExternalSymbol per referenced object, named after the object.
 """
 
+# The declarative namespaces Apex references by a reserved dotted prefix. They live
+# here rather than in `salesforce.py`, which mints the nodes, because `salesforce`
+# already imports from this module -- the same arrangement `SOBJECT_NAMESPACE`
+# has had since it was coined. One definition, imported downhill; the alternative
+# is a cycle.
+LABEL_NAMESPACE = "label"
+"""Root qualified-name segment for CustomLabels — ``label.Greeting``.
+
+Nothing points at these yet: ``typescript.py`` leaves ``@salesforce/label/c.X``
+as an ordinary external import and ``apex.py`` does not extract
+``System.Label.X``.  The namespace is chosen so that whichever side is taught to
+emit it first meets the definitions here.
+"""
+
+PAGE_NAMESPACE = "page"
+"""Root qualified-name segment for Visualforce pages — ``page.HH_ManageHHAccount``.
+
+Declared here and minted by nothing yet: a ``WebLink`` names the page it opens
+before any parser reads ``pages/*.page`` (ATL-182), so those edges rest on
+``ext/page.<Name>`` stubs and join the real node the moment one exists.  It lives
+in this module rather than in ``markup.py`` because ``markup`` already imports
+from here, and the reverse would be a cycle.
+
+``page.<Name>`` matches the syntax Apex uses to reference one (``Page.<Name>``),
+so the Apex side can join here unchanged if it is ever taught to emit it.
+"""
+
+COMPONENT_NAMESPACE = "component"
+"""Root qualified-name segment for Visualforce components — ``component.MyWidget``.
+
+Declared here, minted by ATL-182, for the same reason as :data:`PAGE_NAMESPACE`.
+"""
+
+
 _TRIGGER_BODY_SUFFIX = "__body"
 # Fixed-length synthetic wrapper method name — see _TriggerFacts.body_name for why
 # this must NOT embed the trigger's name.
@@ -130,6 +164,21 @@ _SOQL = re.compile(rb"\[[ \t\r\n]*(?:SELECT|FIND)\b.*?\]", re.IGNORECASE | re.DO
 # names back to objects needs org metadata this parser does not have, and the
 # relationship name is still the truest thing the source says.
 _SOQL_FROM = re.compile(rb"\bFROM[ \t\r\n]+([A-Za-z_]\w*)", re.IGNORECASE)
+
+# Declarative metadata Apex addresses by a reserved dotted prefix. Each is the
+# published reference syntax for its type, so these are contracts rather than
+# heuristics -- but two of them are commonly written WITHOUT the `System.` the
+# documentation shows, and that is the form real code uses: measured over 674
+# public Apex files, bare `Label.X` appears 1,249 times against 3 for
+# `System.Label.X`, and both `Page.X` and `System.Page.X` occur.
+#
+# `(?<![\w.])` is what keeps this honest: it rejects `myLabel.foo` (word char
+# before) and `a.Label.foo` (dot before), so only the reserved prefix matches.
+# Apex is case-insensitive, hence IGNORECASE throughout.
+_APEX_LABEL = re.compile(rb"(?<![\w.])(?:System\.)?Label\.([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?", re.IGNORECASE)
+_APEX_PAGE = re.compile(rb"(?<![\w.])(?:System\.)?Page\.([A-Za-z_]\w*)", re.IGNORECASE)
+_APEX_COMPONENT = re.compile(rb"(?<![\w.])(?:System\.)?Component\.(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)", re.IGNORECASE)
+_APEX_FLOW = re.compile(rb"(?<![\w.])Flow\.Interview\.(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)", re.IGNORECASE)
 _SOSL_RETURNING = re.compile(rb"\bRETURNING\b(.*)", re.IGNORECASE | re.DOTALL)
 _SOSL_OBJECT = re.compile(rb"([A-Za-z_]\w*)[ \t\r\n]*\(")
 # Statement-anchored: a DML keyword only counts at the start of a line or right
@@ -650,8 +699,18 @@ def _sobject_relationships(
     facts: _ShimFacts,
     declarations: list[tuple[int, str, str]],
     module_uid: str,
+    source: bytes,
 ) -> list[ParsedRelationship]:
-    """IMPORTS edges from the entity owning each SOQL/DML site to ``ext/sobject.<Name>``."""
+    """Every reference this file makes to something outside it.
+
+    SObjects from SOQL/DML sites, and the four declarative types Apex addresses by
+    a reserved dotted prefix. Both attach to the innermost entity at the reference's
+    line, so an edge hangs off the method that makes it rather than off the file.
+
+    *source* is the ORIGINAL bytes, not the shimmed ones -- the shim blanks SOQL
+    and rewrites trigger headers, and a `Label.X` inside a blanked span would be
+    lost.
+    """
     references: list[tuple[int, str]] = [(line, name) for line, name in facts.sobjects if _is_sobject_name(name)]
     for line, variable in facts.dml:
         declared = [decl for decl in declarations if decl[1] == variable and decl[0] <= line]
@@ -674,7 +733,53 @@ def _sobject_relationships(
                 to_name=f"{SOBJECT_NAMESPACE}.{name}",
             )
         )
+
+    for line, rel_type, target in _declarative_references(source):
+        owner = _innermost(entities, line, skip=1)
+        from_uid = entities[owner].qualified_name if owner is not None else module_uid
+        key = (from_uid, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        relationships.append(ParsedRelationship(from_qualified_name=from_uid, rel_type=rel_type, to_name=target))
     return relationships
+
+
+def _declarative_references(source: bytes) -> list[tuple[int, RelType, str]]:
+    """``(line, rel type, target)`` for every declarative component this Apex names.
+
+    Four reserved prefixes, each the published way to reference its type::
+
+        Label.Greeting / System.Label.ns.Greeting  ->  IMPORTS  label.Greeting
+        Page.MyPage    / System.Page.MyPage        ->  IMPORTS  page.MyPage
+        Component.c.MyWidget                       ->  IMPORTS  component.MyWidget
+        Flow.Interview.MyFlow                      ->  CALLS    MyFlow
+
+    The flow target is a **bare name**, unlike the other three.  ``CALLS`` is
+    resolved by ``resolve_calls``, which matches a Callable's *name*; a namespaced
+    target matches nothing and the edge disappears silently.  ``IMPORTS`` is
+    resolved on the full qualified name, so those three carry their namespace.
+    The two resolvers disagree and the difference is load-bearing — the same trap
+    ``salesforce._flow_subflows`` documents.
+
+    Comments are stripped first so a mention in prose does not become an edge.
+    """
+    stripped = _COMMENT.sub(b"", source)
+    found: list[tuple[int, RelType, str]] = []
+    for pattern, rel_type, prefix in (
+        (_APEX_LABEL, RelType.IMPORTS, f"{LABEL_NAMESPACE}."),
+        (_APEX_PAGE, RelType.IMPORTS, f"{PAGE_NAMESPACE}."),
+        (_APEX_COMPONENT, RelType.IMPORTS, f"{COMPONENT_NAMESPACE}."),
+        (_APEX_FLOW, RelType.CALLS, ""),
+    ):
+        for match in pattern.finditer(stripped):
+            groups = [group for group in match.groups() if group]
+            if not groups:
+                continue
+            # A namespaced reference puts the component name last.
+            name = _decode(groups[-1])
+            found.append((_line_of(stripped, match.start()), rel_type, f"{prefix}{name}"))
+    return found
 
 
 def _warn_if_degenerate(path: str, source: bytes, entity_count: int) -> None:
@@ -786,7 +891,7 @@ def _parse_trigger_file(
     body = _find_trigger_body(shimmed_root, trigger.body_name)
     if body is not None:
         _extract_calls(body, source, trigger_uid, relationships)
-    relationships += _sobject_relationships(entities, facts, declarations, module_uid)
+    relationships += _sobject_relationships(entities, facts, declarations, module_uid, source)
 
     return ParsedFile(file_path=path, language="apex", entities=entities, relationships=relationships)
 
@@ -847,7 +952,7 @@ def _parse_class_file(
 
     _apply_property_kind(entities, facts)
     _apply_tags(entities, facts, source_lines)
-    relationships += _sobject_relationships(entities, facts, declarations, module_uid)
+    relationships += _sobject_relationships(entities, facts, declarations, module_uid, source)
 
     _warn_if_degenerate(path, source, len(entities) - 1)
     return ParsedFile(file_path=path, language="apex", entities=entities, relationships=relationships)

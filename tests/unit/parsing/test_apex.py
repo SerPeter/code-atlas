@@ -718,3 +718,97 @@ def test_trigger_wrapper_always_fits_its_header(header: str):
     assert len(wrapper) <= len(header) + 2, (  # +2 for the " {" the header's brace supplies
         f"wrapper ({len(wrapper)}) exceeds header ({len(header) + 2}) for {name!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Declarative references (ATL-179)
+# ---------------------------------------------------------------------------
+
+
+def test_a_bare_label_reference_is_an_edge():
+    """`Label.X` without `System.` is what real Apex writes.
+
+    Measured over 674 public Apex files: bare `Label.X` appears 1,249 times against
+    3 for the documented `System.Label.X`. Implementing only the documented form
+    would have found almost nothing.
+    """
+    source = (
+        "public class Greeter {\n"
+        "    public static String hello() {\n"
+        "        return Label.DefaultHouseholdName;\n"
+        "    }\n"
+        "}\n"
+    )
+    parsed = _parse(source, "force-app/main/default/classes/Greeter.cls")
+    assert "label.DefaultHouseholdName" in _rel_targets(parsed, RelType.IMPORTS)
+
+
+def test_a_system_prefixed_label_resolves_to_the_same_node():
+    source = (
+        "public class Greeter {\n"
+        "    public static String hello() {\n"
+        "        return System.Label.DefaultHouseholdName;\n"
+        "    }\n"
+        "}\n"
+    )
+    parsed = _parse(source, "force-app/main/default/classes/Greeter.cls")
+    assert "label.DefaultHouseholdName" in _rel_targets(parsed, RelType.IMPORTS)
+
+
+def test_an_identifier_ending_in_label_is_not_a_label_reference():
+    """`myLabel.trim()` and `a.Label.x` must not match the reserved prefix."""
+    source = (
+        "public class Greeter {\n"
+        "    public static String hello(String myLabel) {\n"
+        "        return myLabel.trim();\n"
+        "    }\n"
+        "}\n"
+    )
+    parsed = _parse(source, "force-app/main/default/classes/Greeter.cls")
+    assert not any(target.startswith("label.") for target in _rel_targets(parsed, RelType.IMPORTS))
+
+
+def test_a_label_named_only_in_a_comment_is_not_an_edge():
+    source = (
+        "public class Greeter {\n"
+        "    // Uses Label.NotReallyReferenced when the flag is on.\n"
+        "    public static String hello() {\n"
+        "        return 'x';\n"
+        "    }\n"
+        "}\n"
+    )
+    parsed = _parse(source, "force-app/main/default/classes/Greeter.cls")
+    assert not any(target.startswith("label.") for target in _rel_targets(parsed, RelType.IMPORTS))
+
+
+def test_a_visualforce_page_reference_is_an_edge():
+    """Both `Page.X` and `System.Page.X` occur in real code."""
+    source = (
+        "public class Nav {\n"
+        "    public static PageReference go() {\n"
+        "        return Page.lmsSubscriberVisualforcePostbackAction;\n"
+        "    }\n"
+        "}\n"
+    )
+    parsed = _parse(source, "force-app/main/default/classes/Nav.cls")
+    assert "page.lmsSubscriberVisualforcePostbackAction" in _rel_targets(parsed, RelType.IMPORTS)
+
+
+def test_starting_a_flow_is_a_call_to_a_bare_name():
+    """`CALLS` is resolved by name, not by qualified name.
+
+    A namespaced target would match nothing and the edge would vanish silently --
+    the same constraint `salesforce._flow_subflows` documents.
+    """
+    source = (
+        "public class Starter {\n"
+        "    public static void run() {\n"
+        "        Flow.Interview.Create_Property flow = new Flow.Interview.Create_Property(new Map<String, Object>());\n"
+        "        flow.start();\n"
+        "    }\n"
+        "}\n"
+    )
+    parsed = _parse(source, "force-app/main/default/classes/Starter.cls")
+    calls = {rel.to_name for rel in parsed.relationships if rel.rel_type is RelType.CALLS}
+    assert "Create_Property" in calls
+    assert not any(name.startswith("flow.") for name in calls)
