@@ -198,6 +198,30 @@ LANGS: dict[str, LangSpec] = {
         calls=("call_expression",),
         skip=("/vendor/",),
     ),
+    "salesforce": LangSpec(
+        # SFDX metadata is declarative: there are no functions and no call sites, so
+        # `named` and `calls` are EMPTY ON PURPOSE and both ratios are vacuous here.
+        # `Coverage.named_funcs` and `Coverage.calls` return 1.0 when their
+        # denominator is zero, so a floor built from them would record two green
+        # numbers that guard nothing -- worse than no floor, because it reads as
+        # coverage. `floor.json` records 0.0 for both and explains why; the real
+        # ratchet is `retrievability`, which asks how much of each file's text
+        # reaches the search index and has a genuine denominator (ADR-0049 s6 made
+        # the same call for TMDL).
+        exts=(".xml",),
+        named=(),
+        calls=(),
+    ),
+    "apex": LangSpec(
+        # Apex has no grammar of its own: `parsing/languages/apex.py` rewrites the
+        # source through a length-preserving shim and hands the residue to
+        # tree-sitter-java, so every node type below is a JAVA node type. Verified by
+        # --census against the corpus repo in floor.json, not assumed.
+        exts=(".cls", ".trigger"),
+        named=("method_declaration", "constructor_declaration"),
+        anon=("lambda_expression",),
+        calls=("method_invocation", "object_creation_expression"),
+    ),
     "java": LangSpec(
         exts=(".java",),
         named=("method_declaration", "constructor_declaration"),
@@ -361,7 +385,7 @@ def _captured_by(spans: list[tuple[int, int]], start: int, end: int) -> bool:
     return any(s <= start and e >= end and (start - s) <= 4 and (e - end) <= 1 for s, e in spans)
 
 
-def measure(root: Path, lang: str) -> Coverage:
+def measure(root: Path, lang: str) -> Coverage:  # noqa: PLR0912
     """Parse every file of *lang* under *root* and compare AST against output."""
     discover_plugins()
     spec = LANGS[lang]
@@ -390,9 +414,17 @@ def measure(root: Path, lang: str) -> Coverage:
         if config is None or parsed is None:
             cov.failed += 1
             continue
+        # A language may have no grammar at all — `LanguageConfig.language` is
+        # `Language | None` since ADR-0048, and TMDL parses text directly through
+        # `text_parse_func`. Both ratios below are AST-denominated, so such a file
+        # can be measured for `retrievability` but never for `named_funcs` or
+        # `calls`; counting it as parsed while skipping the tree would silently
+        # inflate the denominators of neither and the numerators of both.
+        if config.language is None:
+            continue
         if config.name not in parsers:
             parsers[config.name] = Parser(config.language)
-        tree = parsers[config.name].parse(src)
+        tree = parsers[config.name].parse(_tree_source(path, src))
         cov.files += 1
 
         cov.file_bytes += len(src)
@@ -482,6 +514,27 @@ def _report(cov: Coverage) -> None:
     print(f"  at module scope:            {cov.calls_at_module:6d}  {_pct(cov.calls_at_module, cov.ast_calls)}")
 
 
+def _tree_source(path: Path, src: bytes) -> bytes:
+    """The bytes the language's own parser hands to tree-sitter.
+
+    Identical to *src* for every grammar-backed language. Apex is the exception:
+    it has no grammar, so `apex.py` rewrites Apex-only syntax out of the source
+    and parses the residue as Java. Measuring the raw bytes instead would build
+    both ratios' denominators from a parse the product never performs -- on a real
+    Apex checkout that is 7,984 ERROR nodes and zero `constructor_declaration`.
+
+    The shim is length-preserving apart from one appended brace for a trigger, so
+    the node offsets it yields still line up with the entity spans `measure`
+    compares them against.
+    """
+    if path.suffix.lower() not in {".cls", ".trigger"}:
+        return src
+    from code_atlas.parsing.languages.apex import _shim
+
+    shimmed, _facts = _shim(src, allow_trigger=path.suffix.lower() == ".trigger")
+    return shimmed
+
+
 def _census(root: Path, lang: str) -> None:
     """Raw node-type histogram — use to verify a LangSpec against real code."""
     discover_plugins()
@@ -495,11 +548,13 @@ def _census(root: Path, lang: str) -> None:
         if ".git/" in posix or any(s in posix for s in spec.skip):
             continue
         config = get_language_for_file(str(path))
-        if config is None:
+        # Same guard as `measure`: a census is a node-type histogram and a
+        # grammar-less language has no nodes to count.
+        if config is None or config.language is None:
             continue
         if config.name not in parsers:
             parsers[config.name] = Parser(config.language)
-        for node in _walk(parsers[config.name].parse(path.read_bytes()).root_node):
+        for node in _walk(parsers[config.name].parse(_tree_source(path, path.read_bytes())).root_node):
             counts[node.type] += 1
     for node_type, n in counts.most_common(60):
         print(f"{n:8d}  {node_type}")
