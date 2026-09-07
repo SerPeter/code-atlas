@@ -90,6 +90,8 @@ from code_atlas.graph.client import (
     _resolve_one_call,
     _resolve_one_path_anchor,
     _test_callable_uids,
+    build_case_folded_map,
+    resolve_component_alias,
 )
 from code_atlas.graph.client import (
     _classify_file as _classify_file_delta,
@@ -1834,8 +1836,9 @@ class SqliteGraphClient:
         return lookup, name_to_typedefs
 
     async def resolve_imports(self, project_name: str, import_rels: list[ParsedRelationship]) -> ReplayableRels:
-        """Simplified vs. ``GraphClient.resolve_imports`` — exact ``qualified_name``
-        match only (no Python dotted-prefix fallback for re-exported names).
+        """Simplified vs. ``GraphClient.resolve_imports`` — no Python dotted-prefix
+        fallback for re-exported names. The exact match, the ``cmp.`` alias widening and
+        the Salesforce case fold all behave identically to the Memgraph side.
 
         Returns the rels with no exact in-project match, for the caller to retry
         once later batches have upserted more of the project.
@@ -1852,6 +1855,7 @@ class SqliteGraphClient:
         rows = await cur.fetchall()
         await cur.close()
         internal_map = {qn: uid for qn, uid in rows if qn}
+        folded_map = build_case_folded_map((qn, uid) for qn, uid in rows)
 
         import_edges: list[tuple[str, str, bool]] = []
         ext_packages: dict[str, dict[str, str]] = {}
@@ -1862,11 +1866,17 @@ class SqliteGraphClient:
             to_name = rel.to_name
             from_uid = rel.from_qualified_name
             is_type_only = bool(rel.properties.get("type_only", False))
-            target_uid = internal_map.get(to_name)
+            target_uid = internal_map.get(to_name) or resolve_component_alias(to_name, internal_map)
             if target_uid is not None:
                 import_edges.append((from_uid, target_uid, is_type_only))
                 continue
             inexact.append(rel)
+            # After `inexact.append`, matching the Memgraph side: a folded match is a
+            # guess a later batch could improve on, so the rel stays replayable.
+            folded_uid = folded_map.get(to_name.lower())
+            if folded_uid is not None:
+                import_edges.append((from_uid, folded_uid, is_type_only))
+                continue
 
             top_level = to_name.split(".")[0]
             if not top_level:

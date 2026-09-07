@@ -308,6 +308,35 @@ _ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LA
 FILE_HASH_LABELS: tuple[NodeLabel, ...] = (NodeLabel.MODULE, NodeLabel.PACKAGE, NodeLabel.DOC_FILE)
 
 
+CUSTOM_COMPONENT_PREFIX: str = "cmp."
+"""Target prefix for a custom component whose KIND one file cannot determine.
+
+Salesforce shares one ``c`` namespace between Aura and LWC and forbids the two from
+holding the same name — "A custom Lightning web component and a custom Aura
+component in the same namespace can't have the same name" (LWC Dev Guide, Component
+Namespaces). So ``<c:foo>`` in Aura markup, and a FlexiPage ``componentName``, each
+name exactly one component identity — but nothing in the *file* says whether it is
+an Aura bundle or an LWC one.
+
+Nothing ever mints a ``cmp.`` node. The parsers emit this kind-agnostic target and
+``resolve_imports`` widens it across :data:`COMPONENT_ALIAS_PREFIXES`, so the one
+real node is found and no false stub is minted for the kind that does not exist.
+Emitting both targets instead — which is what shipped first — resolved the true
+edge and left an ``ext/`` stub asserting a component that was never referenced.
+
+Lives here rather than in ``parsing/`` because both graph backends need it and
+neither may import a parser module; ``schema.py`` is the only module all four share.
+"""
+
+COMPONENT_ALIAS_PREFIXES: tuple[str, ...] = ("aura.", "lwc.")
+"""The namespaces a :data:`CUSTOM_COMPONENT_PREFIX` target may resolve into.
+
+Order is fixed but arbitrary: it decides which node wins if a repo somehow holds
+both, and such a repo cannot deploy. Aura first because Aura-in-Aura is the
+majority — 94 of 132 references in the measured corpus.
+"""
+
+
 # Bumped BY HAND when extraction output changes for a reason no setting captures: a
 # parser fix, a new language handler or grammar, a changed uid scheme, a different
 # _compute_content_hash formula, a detector implementation change.
@@ -323,7 +352,7 @@ FILE_HASH_LABELS: tuple[NodeLabel, ...] = (NodeLabel.MODULE, NodeLabel.PACKAGE, 
 # re-parse of every project. Deliberately NOT SCHEMA_VERSION either: an extraction change
 # and a schema change are different events, and coupling them makes each pay the other's
 # cost, most sharply the vector-index drop and rebuild every schema migration performs.
-EXTRACTION_EPOCH: int = 9
+EXTRACTION_EPOCH: int = 10
 
 
 # ---------------------------------------------------------------------------

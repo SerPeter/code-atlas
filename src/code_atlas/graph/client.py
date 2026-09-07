@@ -30,6 +30,8 @@ from code_atlas.schema import (
     _ENTITY_LABELS,
     _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
+    COMPONENT_ALIAS_PREFIXES,
+    CUSTOM_COMPONENT_PREFIX,
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
     RESOURCE_FILE_PREFIX,
@@ -58,7 +60,7 @@ from code_atlas.telemetry import caller_name, get_metrics, get_tracer
 from code_atlas.telemetry import is_enabled as telemetry_enabled
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Generator, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Generator, Iterable, Mapping, Sequence
 
     from neo4j import AsyncDriver
 
@@ -157,6 +159,113 @@ _NAME_ROUTED_REL_TYPES: frozenset[RelType] = frozenset(
 # tracks the codebase, not a batch — fmtlib/fmt alone resolves tens of thousands
 # of edges. Chunking keeps any single transaction well inside the write timeout.
 _CALLS_WRITE_CHUNK = 2000
+
+_CASE_INSENSITIVE_NAMESPACES: frozenset[str] = frozenset(
+    {
+        # apex.py coins these
+        "apex",
+        "sobject",
+        "label",
+        "page",
+        "component",
+        # salesforce.py coins these
+        "flow",
+        "cmdt",
+        "aura",
+        "lwc",
+        "validationrule",
+        "recordtype",
+        "fieldset",
+        "weblink",
+        "listview",
+        "permset",
+        "profile",
+        "flexipage",
+        "quickaction",
+        "app",
+        "layout",
+        "tab",
+        "messagechannel",
+        "globalvalueset",
+    }
+)
+"""Root qualified-name segments whose names Salesforce itself matches case-insensitively.
+
+``FROM ACCOUNT`` in Apex and ``Account.object-meta.xml`` are the same object, and an
+LWC importing ``@salesforce/apex/marketServices.foo`` against a class named
+``MarketServices`` deploys. **Only Salesforce works this way** — Python, TypeScript,
+Go and Rust imports are case-sensitive, and folding those would mint edges the
+language itself rejects.
+
+The gate is on the *node* side: a node enters the fold map only if its
+``qualified_name``'s first dotted segment is one of these. In a repo with no
+Salesforce metadata the map is therefore empty and the feature costs one
+``partition()`` per node. Six of these segments (``app``, ``page``, ``component``,
+``layout``, ``tab``, ``profile``) are also plausible directory names, but a
+path-derived qualified name is rooted at a top-level directory (``src.``,
+``force-app.``), so a bare one never appears first: measured across 77,540 entities
+in three non-Salesforce repos, zero entered the map.
+
+Literals rather than an import from ``parsing.languages.*`` — the graph layer does
+not depend on a parser module, the same rule ``_WAREHOUSE_PREFIX`` follows. The
+integration tests resolve through real parser output, so the two cannot drift
+silently.
+"""
+
+
+def resolve_component_alias(to_name: str, internal_map: dict[str, str]) -> str | None:
+    """The uid a ``cmp.<Name>`` target resolves to, or ``None``.
+
+    Nothing mints a ``cmp.`` node: the prefix is a parser saying "a custom component
+    named X, whose kind this file cannot determine". Salesforce shares one ``c``
+    namespace between Aura and LWC and forbids the two from holding the same name,
+    so at most one of ``aura.X`` / ``lwc.X`` exists in a deployable org and the first
+    alias to match is the only one that can.
+
+    Shared by both backends for the same reason :func:`build_case_folded_map` is:
+    they are hand-written mirrors and a divergence here resolves an edge on one
+    backend and stubs it on the other, silently.
+    """
+    if not to_name.startswith(CUSTOM_COMPONENT_PREFIX):
+        return None
+    bare = to_name[len(CUSTOM_COMPONENT_PREFIX) :]
+    for alias in COMPONENT_ALIAS_PREFIXES:
+        uid = internal_map.get(alias + bare)
+        if uid is not None:
+            return uid
+    return None
+
+
+def build_case_folded_map(pairs: Iterable[tuple[str, str]]) -> dict[str, str | None]:
+    """``lowercased qualified_name -> uid``, or ``None`` where two nodes collide.
+
+    Shared by both backends rather than written twice, because the two
+    ``resolve_imports`` implementations are hand-written mirrors and a divergence
+    here would be silent: one backend would resolve an edge the other left as a
+    stub, and the conformance ledger classifies resolution passes as not
+    output-compared.
+
+    Only nodes under :data:`_CASE_INSENSITIVE_NAMESPACES` enter the map — see there
+    for why the gate is on the node side and why it is empty in a repo with no
+    Salesforce metadata.
+
+    A key mapping to ``None`` is a refusal, not a miss. Two SObjects differing only
+    by case cannot both exist in one org, but two *nodes* can — a monorepo, a
+    managed package, a parse artefact — and picking one would point an edge at an
+    arbitrary member of the pair. ADR-0032's "a uid must identify exactly one
+    definition" applied to what an edge points at.
+    """
+    folded: dict[str, str | None] = {}
+    for qualified_name, uid in pairs:
+        if not qualified_name:
+            continue
+        namespace, dot, _rest = qualified_name.partition(".")
+        if not dot or namespace not in _CASE_INSENSITIVE_NAMESPACES:
+            continue
+        key = qualified_name.lower()
+        folded[key] = None if key in folded else uid
+    return folded
+
 
 _WAREHOUSE_PREFIX = "ext/warehouse."
 """How a warehouse-object stub's ``qualified_name`` actually reads once minted.
@@ -2583,6 +2692,10 @@ class GraphClient:
             uid_label[r["uid"]] = r["lbl"]
             if (r["fp"] or "").endswith((".py", ".pyi")):
                 py_importers.add(r["uid"])
+        # Consulted only when the exact match misses; empty unless the project holds
+        # Salesforce-namespaced nodes. One extra pass over `records` rather than a branch
+        # inside the loop above, so both backends can share one builder.
+        folded_map = build_case_folded_map((r["qn"], r["uid"]) for r in records)
 
         # 2. Classify imports as internal or external
         import_edges: list[dict[str, Any]] = []  # [{from_uid, to_uid, type_only?}]
@@ -2602,14 +2715,20 @@ class GraphClient:
             # import paths (java.util.List, System.Collections.Generic) live in
             # a different namespace than path-derived qualified_names, so a
             # prefix hit there would misclassify an external import as internal.
-            target_uid = internal_map.get(to_name)
+            target_uid = internal_map.get(to_name) or resolve_component_alias(to_name, internal_map)
             if target_uid is None:
                 # Retry later: the name may belong to a module this run has not
                 # upserted yet. The prefix fallback below hides that — it lands
                 # on the root Package, which looks like a resolved import and is
                 # useless for the import-match strategy in _resolve_one_call.
                 inexact.append(rel)
-                if from_uid in py_importers:
+                # A Salesforce-namespaced target may still match case-insensitively.
+                # This stays AFTER `inexact.append` deliberately: a folded match is a
+                # guess a later batch could improve on, so the rel must remain
+                # replayable and the docstring's "every rel whose exact dotted name
+                # matched nothing comes back" stays literally true.
+                target_uid = folded_map.get(to_name.lower())
+                if target_uid is None and from_uid in py_importers:
                     prefix = to_name
                     while target_uid is None and "." in prefix:
                         prefix = prefix.rsplit(".", 1)[0]
