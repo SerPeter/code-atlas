@@ -1824,10 +1824,18 @@ the node smaller would throw away the information and keep the problem, because 
 permission set is the highest-degree node in its graph at 400 edges just as surely
 as at 1,900.
 
-The real mitigation for that degree is to stop *traversing* permission edges
-transitively in impact scoring — a change in the graph layer, not the parser, and
-not made here.  `permissions_truncated` on the node records when this cap bit, so
-a truncated answer is never silently wrong.
+The degree itself was measured and turned out to harm one query rather than all of
+them.  Nothing traverses *through* a permission set — these nodes have zero
+in-degree over every edge set any traversal uses — so there was never anything
+transitive to stop, which is what an earlier draft of this paragraph claimed.  The
+real harm was at `blast_radius`'s `limit`: every grant lands at depth 1 with a
+perfect confidence score, so N permission sets filled the first N slots of a
+limited answer.  `server/analysis.py` now ranks grant-only kinds below everything
+that is a dependency rather than a visibility rule, and
+`graph.get_dead_code_candidates` excludes them from its inbound liveness test.
+
+`permissions_truncated` on the node records when this cap bit, so a truncated
+answer is never silently wrong.
 """
 
 # CumulusCI templates a package namespace into metadata it ships, with a different
