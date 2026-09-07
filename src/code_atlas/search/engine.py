@@ -433,6 +433,21 @@ def expand_scope(
 _IDENTIFIER_RE = re.compile(r"^[A-Z][a-zA-Z0-9]+$")  # PascalCase
 _SNAKE_RE = re.compile(r"^[a-z][a-z0-9_]+$")  # snake_case
 _DOTTED_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")  # dotted path (whole token, e.g. pkg.mod.Class)
+# Mixed case WITH an underscore: SCREAMING_SNAKE (`MAX_RETRIES`), the Apex house style
+# (`ADDR_Addresses_UTIL`) and — the case that exposed this — every Salesforce custom
+# object and field, which end `__c`. Such a token defeats both regexes above at once:
+# the underscore fails `_IDENTIFIER_RE` and the leading capital fails `_SNAKE_RE`, so
+# the single most common thing a Salesforce developer types routed as *prose*, giving
+# the graph channel half the weight it should have and the vector channel double.
+_MIXED_SNAKE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]*$")
+# camelCase: the LWC, JavaScript and Java convention (`addressSettings`, `getUserById`).
+_CAMEL_RE = re.compile(r"^[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*$")
+
+# Deliberately additive: neither existing regex is widened. `_SNAKE_RE` matches a bare
+# lowercase English word (`authentication`), so requiring an underscore in it would
+# silently reroute prose queries. Every token that routes as an identifier today still
+# does.
+_IDENTIFIER_PATTERNS = (_IDENTIFIER_RE, _SNAKE_RE, _DOTTED_RE, _MIXED_SNAKE_RE, _CAMEL_RE)
 
 
 def rrf_fuse(
@@ -472,8 +487,8 @@ def rrf_fuse(
 def analyze_query(query: str) -> dict[str, float]:
     """Return per-channel weight adjustments based on query shape.
 
-    - Identifier-like (PascalCase, snake_case, dotted, short ≤2 words):
-      boost graph + BM25, suppress vector.
+    - Identifier-like (PascalCase, snake_case, camelCase, mixed-case-with-underscore,
+      dotted, or short ≤2 words): boost graph + BM25, suppress vector.
     - Natural language (3+ words, no structural patterns):
       boost vector, suppress graph.
     - Default: balanced 1.0 weights.
@@ -482,13 +497,15 @@ def analyze_query(query: str) -> dict[str, float]:
     words = stripped.split()
 
     # Identifier-like patterns
-    is_identifier = (
-        _IDENTIFIER_RE.match(stripped)
-        or _SNAKE_RE.match(stripped)
-        or _DOTTED_RE.match(stripped)
-        or (
-            len(words) <= 2
-            and any(_IDENTIFIER_RE.match(w) or _DOTTED_RE.match(w) or ("_" in w and _SNAKE_RE.match(w)) for w in words)
+    is_identifier = any(pattern.match(stripped) for pattern in _IDENTIFIER_PATTERNS) or (
+        len(words) <= 2
+        and any(
+            _IDENTIFIER_RE.match(w)
+            or _DOTTED_RE.match(w)
+            or _MIXED_SNAKE_RE.match(w)
+            or _CAMEL_RE.match(w)
+            or ("_" in w and _SNAKE_RE.match(w))
+            for w in words
         )
     )
     if is_identifier:

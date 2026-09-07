@@ -335,6 +335,58 @@ class TestTheVectorFloor:
         gained = scores["p:blob"] - without["p:blob"]
         assert gained < weights["vector"] / 61, "and it must pay less than a rank-1 vector hit"
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "ADR-0047 calibrates the floor against the worst FETCHED vector hit, but the "
+            "entities a floored one competes with for the top 10 mostly were not fetched "
+            "at all -- 60 rows of ~15k embedded -- and earn zero. Where the excluded kinds "
+            "are the majority (xml_element + xml_setting are 68.7% of a real Salesforce "
+            "repo) that over-pays: a BM25 rank-1 code hit falls behind the floored cohort. "
+            "Recalibrating is a design decision, not a bug fix -- capping to the vector "
+            "channel's shortfall effectively deletes the floor on any real corpus, and an "
+            "epsilon contribution is too small to cure the 'cannot win' case the ADR was "
+            "written for. Drop this marker once it is recalibrated."
+        ),
+    )
+    def test_a_saturated_vector_channel_does_not_promote_the_excluded_cohort(self):
+        """The 1-vs-1 case above, generalised to the regime a real corpus creates.
+
+        A saturated vector channel (60 unrelated hits, none of them either rival) and a
+        BM25 list whose rank-1 entry is real code followed by excluded blobs. The code
+        node must still win.
+        """
+        weights = {"graph": 0.5, "vector": 2.0, "bm25": 1.0}
+        filler = [f"p:v{i}" for i in range(60)]
+        excluded = [f"p:x{i}" for i in range(20)]
+        props = {
+            **PROPS,
+            "p:code": {"kind": "function", "file_path": "src/mod.py"},
+            **{uid: {"kind": "xml_element", "file_path": f"meta/{uid}.xml"} for uid in excluded},
+            **{uid: {"kind": "function", "file_path": f"src/{uid}.py"} for uid in filler},
+        }
+        ranked = _lists(vector=list(filler), bm25=["p:code", *excluded])
+        _floor_excluded_in_vector_channel(ranked, props, _policy(exclude_kinds=["xml_element"]))
+        scores = rrf_fuse(ranked, k=60, weights=weights)
+
+        assert scores["p:code"] > scores["p:x0"], (
+            "a rank-1 BM25 hit must outrank a floored entity that no channel ranked first"
+        )
+
+    def test_the_floor_is_what_promotes_the_excluded_cohort(self):
+        """The ablation for the xfail above: without the floor, the code node wins.
+
+        Without this, the xfail could be recording an artefact of the fixture rather than
+        the floor's own arithmetic.
+        """
+        weights = {"graph": 0.5, "vector": 2.0, "bm25": 1.0}
+        filler = [f"p:v{i}" for i in range(60)]
+        excluded = [f"p:x{i}" for i in range(20)]
+        ranked = _lists(vector=list(filler), bm25=["p:code", *excluded])
+        scores = rrf_fuse(ranked, k=60, weights=weights)
+
+        assert scores["p:code"] > scores["p:x0"]
+
     def test_provenance_still_reports_the_ranks_the_channels_returned(self):
         """A floored uid did not come back from a vector search and must not claim it did
         -- which is why the floor is applied after provenance is built."""

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from pydantic import ValidationError
@@ -82,6 +82,42 @@ class TestRRFFuse:
 
 
 class TestAnalyzeQuery:
+    _IDENTIFIER_WEIGHTS: ClassVar[dict[str, float]] = {"graph": 2.0, "vector": 0.5, "bm25": 1.5}
+    _PROSE_WEIGHTS: ClassVar[dict[str, float]] = {"graph": 0.5, "vector": 2.0, "bm25": 1.0}
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # Every Salesforce custom object and field ends `__c`, and such a token
+            # defeats both original regexes at once: the underscore fails the
+            # PascalCase pattern and the leading capital fails the snake_case one.
+            "Address__c",
+            "Academic_Level__c",
+            # The Apex house style, and SCREAMING_SNAKE, miss for the same reason.
+            "ADDR_Addresses_UTIL",
+            "MAX_RETRIES",
+            # camelCase was never matched by any of the three.
+            "addressSettings",
+            "getUserById",
+        ],
+    )
+    def test_mixed_case_and_underscored_identifiers_route_as_identifiers(self, query: str):
+        """These routed as balanced weights, so the graph channel — the only one doing
+        exact-name matching — got half the weight it should and vector got double."""
+        assert analyze_query(query) == self._IDENTIFIER_WEIGHTS
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "how does address matching work",
+            "what is the flow for onboarding a contact",
+            "where are permissions checked",
+        ],
+    )
+    def test_prose_still_routes_to_the_vector_channel(self, query: str):
+        """The guard on the widening: a regex that swallowed prose would fail here."""
+        assert analyze_query(query) == self._PROSE_WEIGHTS
+
     def test_pascal_case(self):
         weights = analyze_query("UserService")
         assert weights["graph"] > weights["vector"]
