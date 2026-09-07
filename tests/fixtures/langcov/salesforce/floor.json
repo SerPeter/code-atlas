@@ -1,0 +1,16 @@
+{
+  "lang": "salesforce",
+  "named_funcs": 0.0,
+  "calls": 0.0,
+  "retrievability": 0.11,
+  "max_duplicate_uids": 0,
+  "source_repo": "SalesforceFoundation/EDA + bcgov/MoH-SAT + trailheadapps/lwc-recipes",
+  "source_commit": "b311845eb082fc6b8fafdbcebdbe03cc570df3a6",
+  "license": "BSD-3-Clause (EDA), Apache-2.0 (MoH-SAT), CC0-1.0 (lwc-recipes)",
+  "rationale": "named_funcs and calls are recorded as 0.0 because they are VACUOUS for this language, not because coverage is poor. SFDX metadata is declarative: it has no function forms and no call sites, so both denominators are zero -- and Coverage.named_funcs and Coverage.calls both return 1.0 when their denominator is zero. Recording the measured 1.000 would put two green numbers in this file that assert nothing whatsoever, which is worse than no floor because it reads as perfect coverage; 0.0 is an explicit non-claim, and the schema requires both keys to be present. ADR-0049 s6 made the same call for TMDL, where it went further and declined the fixture entirely. The real ratchet here is retrievability, which has a genuine denominator: how much of each file's bytes reaches the search index as docstring, source or signature. Measured 0.120 across 39 files. It is low by design and comparing it to a code language would be a category error -- a metadata file is mostly XML syntax and typed attributes, and the epic that built these handlers records that a field measures ~0.25 with all of its prose captured. What this number catches is a handler that stops reading errorMessage, description or inlineHelpText, which is where the searchable text in a metadata tree actually lives. Fixture drawn from non-sample repos on purpose: across all eight trailheadapps repos, profile, validationRule, recordType and translation are entirely empty, and those are the types that dominate a production org. Directory structure is load-bearing -- _decomposed_owner takes a field's or validation rule's object from objects/<Object>/<child>/ -- so these files keep their SFDX paths rather than being flattened.",
+  "files": [
+    "39 files across 14 metadata types: object, field, validationRule, recordType,",
+    "listView, flow, labels, permissionset, layout, flexipage, tab, quickAction,",
+    "globalValueSet-shaped md, and LightningComponentBundle js-meta"
+  ]
+}

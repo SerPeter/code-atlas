@@ -1,0 +1,22 @@
+{
+  "lang": "apex",
+  "named_funcs": 0.99,
+  "calls": 0.93,
+  "retrievability": 0.86,
+  "max_duplicate_uids": 0,
+  "source_repo": "SalesforceFoundation/EDA",
+  "source_commit": "b311845eb082fc6b8fafdbcebdbe03cc570df3a6",
+  "license": "BSD-3-Clause",
+  "rationale": "Measured 1.000 named_funcs (86/86: 77 method_declaration, 9 constructor_declaration), 0.948 calls (925/976) and 0.884 retrievability. Apex has no grammar of its own -- apex.py rewrites Apex-only syntax out of the source with a length-preserving shim and parses the residue as tree-sitter-java -- so every node type in this language's LangSpec is a JAVA node type, and langcov parses the SHIMMED bytes for the denominator. Measuring the raw bytes instead builds both ratios from a parse the product never performs: on this corpus that is 7,984 ERROR nodes against 1,741, and zero constructor_declaration against 9. The 5.2% of call nodes not emitted are the residue of that shim -- SOQL and DML sites are blanked before Java sees them, so a method_invocation inside a query expression has no node to attribute. 7.5% of calls sit at module scope, which for Apex means inside a trigger body: the shim wraps a trigger in a synthetic class and method, and those spans satisfy langcov's _captured_by tolerance, so nothing lands inside a MISSED function. Files chosen for shape rather than size: a trigger handler, a static-heavy utility, an interface, a small view model, a mapper, and two triggers, which are the only file type needing the synthetic wrapper.",
+  "files": [
+    "ACCT_IndividualAccounts_TDTM.cls",
+    "ADDR_Addresses_UTIL.cls",
+    "AccountModelHealthCheckVMapper.cls",
+    "HealthCheckGroupAPIServiceInterface.cls",
+    "PrimaryAffiliationSettingsVModel.cls",
+    "TDTM_Account.trigger",
+    "TDTM_Address.trigger",
+    "TDTM_Filter.cls",
+    "UTIL_ACCT_Naming.cls"
+  ]
+}
