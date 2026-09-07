@@ -28,6 +28,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
     _ENTITY_LABELS,
+    _GRANT_ONLY_KINDS,
     _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     COMPONENT_ALIAS_PREFIXES,
@@ -213,7 +214,11 @@ silently.
 """
 
 
-def resolve_component_alias(to_name: str, internal_map: dict[str, str]) -> str | None:
+def resolve_component_alias(
+    to_name: str,
+    internal_map: dict[str, str],
+    folded_map: dict[str, str | None] | None = None,
+) -> str | None:
     """The uid a ``cmp.<Name>`` target resolves to, or ``None``.
 
     Nothing mints a ``cmp.`` node: the prefix is a parser saying "a custom component
@@ -221,6 +226,14 @@ def resolve_component_alias(to_name: str, internal_map: dict[str, str]) -> str |
     namespace between Aura and LWC and forbids the two from holding the same name,
     so at most one of ``aura.X`` / ``lwc.X`` exists in a deployable org and the first
     alias to match is the only one that can.
+
+    *folded_map* is consulted after an exact alias misses, because a component name
+    is an API name and Salesforce matches those case-insensitively like every other
+    — ``<c:MyPanel>`` against a bundle folder named ``myPanel`` is the same
+    component. Without it the two fixes compose into a gap: ``cmp.`` can never be a
+    fold key itself, since nothing mints a ``cmp.`` qualified_name, so the widened
+    target routes around the fold that would otherwise have caught it. An ambiguous
+    fold refuses, exactly as it does everywhere else.
 
     Shared by both backends for the same reason :func:`build_case_folded_map` is:
     they are hand-written mirrors and a divergence here resolves an edge on one
@@ -231,6 +244,12 @@ def resolve_component_alias(to_name: str, internal_map: dict[str, str]) -> str |
     bare = to_name[len(CUSTOM_COMPONENT_PREFIX) :]
     for alias in COMPONENT_ALIAS_PREFIXES:
         uid = internal_map.get(alias + bare)
+        if uid is not None:
+            return uid
+    if folded_map is None:
+        return None
+    for alias in COMPONENT_ALIAS_PREFIXES:
+        uid = folded_map.get((alias + bare).lower())
         if uid is not None:
             return uid
     return None
@@ -2715,7 +2734,7 @@ class GraphClient:
             # import paths (java.util.List, System.Collections.Generic) live in
             # a different namespace than path-derived qualified_names, so a
             # prefix hit there would misclassify an external import as internal.
-            target_uid = internal_map.get(to_name) or resolve_component_alias(to_name, internal_map)
+            target_uid = internal_map.get(to_name) or resolve_component_alias(to_name, internal_map, folded_map)
             if target_uid is None:
                 # Retry later: the name may belong to a module this run has not
                 # upserted yet. The prefix fallback below hides that — it lands
@@ -5473,6 +5492,7 @@ class GraphClient:
             "WHERE affected.uid <> $uid "
             "RETURN affected.uid AS uid, affected.name AS name, affected.qualified_name AS qn, "
             f"{primary_label_expr('affected')} AS label, affected.file_path AS file_path, "
+            "affected.kind AS kind, "
             "min(length(p)) AS min_depth, "
             f"max(reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}))) "
             "AS confidence_score, "
@@ -5513,6 +5533,11 @@ class GraphClient:
                 "qualified_name": r["qn"],
                 "label": r["label"],
                 "file_path": r["file_path"],
+                # Ranking needs it: `blast_radius` demotes grant-only kinds so a
+                # permission set cannot fill a limited answer ahead of code. `.get`,
+                # matching `via` below -- a row that predates the column ranks as
+                # ordinary code rather than raising.
+                "kind": r.get("kind"),
                 "min_depth": r["min_depth"],
                 "direction": direction_kind,
                 "via": sorted(r.get("via") or []),
@@ -5745,7 +5770,7 @@ class GraphClient:
         }
 
     async def get_dead_code_candidates(self, project: str, path: str) -> list[dict[str, Any]]:
-        """Invocable Callables/TypeDefs with zero incoming CALLS edges — ``analyze_repo(analysis="dead_code")``.
+        """Invocable Callables/TypeDefs nothing references — ``analyze_repo(analysis="dead_code")``.
 
         Restricted to ``_CODE_ENTITY_KINDS`` so that config/infra declarations
         (Terraform resources, k8s objects, SQL tables, Dockerfile stages, CI
@@ -5758,6 +5783,7 @@ class GraphClient:
             "path": path,
             "code_kinds": sorted(_CODE_ENTITY_KINDS),
             "hook_decorators": sorted(_FRAMEWORK_HOOK_DECORATORS),
+            "grant_kinds": sorted(_GRANT_ONLY_KINDS),
         }
         pa = " AND n.file_path STARTS WITH $path" if path else ""
         # "Unused" cannot mean "no CALLS edge". A class is used by being annotated,
@@ -5777,7 +5803,14 @@ class GraphClient:
             "MATCH (n {project_name: $project}) "
             f"WHERE (n:Callable OR n:TypeDef) AND n.kind IN $code_kinds "
             f"AND NOT n.name STARTS WITH '__'{pa} "
-            f"AND NOT ()-[:{refs}]->(n) "
+            # The inbound test names its source so grants can be excluded from it. A
+            # permission set gives every Apex class it grants an inbound IMPORTS, which
+            # made `NOT ()-[...]->(n)` false for all of them the moment permission sets
+            # were indexed: the analysis returned zero dead Apex in any org where most
+            # classes are granted somewhere, which is every org. Being *visible to* a
+            # profile is not being *used by* anything.
+            f"AND NOT EXISTS {{ MATCH (src)-[:{refs}]->(n) "
+            "WHERE NOT coalesce(src.kind, '') IN $grant_kinds } "
             # Constructing a class produces an edge to its __init__, not to the class.
             f"AND NOT (n)-[:{RelType.DEFINES}]->()<-[:{RelType.CALLS}]-() "
             # A function defined INSIDE another function is reached through its enclosing

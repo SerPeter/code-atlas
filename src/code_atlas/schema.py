@@ -308,6 +308,22 @@ _ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LA
 FILE_HASH_LABELS: tuple[NodeLabel, ...] = (NodeLabel.MODULE, NodeLabel.PACKAGE, NodeLabel.DOC_FILE)
 
 
+_GRANT_ONLY_KINDS: frozenset[str] = frozenset({"permission_set", "profile"})
+"""Entity kinds whose edges say "who may see this", not "what depends on this".
+
+Both come from ``salesforce.py``'s ``_parse_permission_document``, which gives one
+node an ``IMPORTS`` edge per grant — 1,900 from one measured 427 KB file. Every one
+lands at depth 1 with a perfect ``confidence_score``, because ``IMPORTS`` carries no
+``weight`` property, so without a demotion they outrank every transitive code
+dependent under ``blast_radius``'s depth-first ordering.
+
+Held here rather than in ``graph/client.py`` because ``server/analysis.py`` — the
+one place that ranks on it — already imports ``schema`` and takes no dependency on
+the graph layer. Literals rather than an import from ``parsing.languages``, the
+same rule every other cross-layer kind constant follows; a test pins the two
+spellings together so they cannot drift silently.
+"""
+
 CUSTOM_COMPONENT_PREFIX: str = "cmp."
 """Target prefix for a custom component whose KIND one file cannot determine.
 

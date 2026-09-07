@@ -98,6 +98,7 @@ from code_atlas.graph.client import (
 )
 from code_atlas.schema import (
     _EMBEDDABLE_LABELS,
+    _GRANT_ONLY_KINDS,
     _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     COMPOSITE_INDICES,
@@ -1866,7 +1867,7 @@ class SqliteGraphClient:
             to_name = rel.to_name
             from_uid = rel.from_qualified_name
             is_type_only = bool(rel.properties.get("type_only", False))
-            target_uid = internal_map.get(to_name) or resolve_component_alias(to_name, internal_map)
+            target_uid = internal_map.get(to_name) or resolve_component_alias(to_name, internal_map, folded_map)
             if target_uid is not None:
                 import_edges.append((from_uid, target_uid, is_type_only))
                 continue
@@ -3911,7 +3912,7 @@ class SqliteGraphClient:
         affected_uids = list(reached)
         placeholders = ",".join("?" * len(affected_uids))
         cur = await conn.execute(
-            f"SELECT uid, name, qualified_name, file_path, labels FROM nodes WHERE uid IN ({placeholders})",
+            f"SELECT uid, name, qualified_name, file_path, labels, kind FROM nodes WHERE uid IN ({placeholders})",
             affected_uids,
         )
         node_rows = await cur.fetchall()
@@ -3928,6 +3929,9 @@ class SqliteGraphClient:
                     "qualified_name": node[2] if node else None,
                     "label": node[4] if node else None,
                     "file_path": node[3] if node else None,
+                    # Ranking needs it -- see `_GRANT_ONLY_KINDS`. `node` may be None:
+                    # a dangling edge is tolerated here deliberately.
+                    "kind": node[5] if node else None,
                     "min_depth": depth,
                     "direction": direction_kind,
                     "ambiguous_only": nuid not in resolved,
@@ -4235,6 +4239,8 @@ class SqliteGraphClient:
         # config/infra declarations (which can never be a CALLS target) out.
         code_kinds = sorted(_CODE_ENTITY_KINDS)
         kind_placeholders = ", ".join("?" * len(code_kinds))
+        grant_kinds = sorted(_GRANT_ONLY_KINDS)
+        grant_placeholders = ", ".join("?" * len(grant_kinds))
         cur = await conn.execute(
             "SELECT name, qualified_name, labels, kind, file_path, "
             "json_extract(props_json, '$.line_start') FROM nodes n "
@@ -4247,8 +4253,13 @@ class SqliteGraphClient:
             # REFERENCES included, matching Memgraph: handed to a registry or a callback
             # slot counts as used, even though the call that eventually runs it belongs to
             # a framework rather than to this codebase.
-            "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = n.uid AND e.rel_type IN "
-            "('CALLS', 'USES_TYPE', 'IMPORTS', 'INHERITS', 'IMPLEMENTS', 'OVERRIDES', 'REFERENCES')) "
+            # Joined to the source node so grant-only kinds can be excluded: a permission
+            # set gives every Apex class it grants an inbound IMPORTS, and counting that as
+            # a reference returned zero dead Apex in any org where most classes are granted.
+            "AND NOT EXISTS (SELECT 1 FROM edges e JOIN nodes s ON s.uid = e.from_uid "
+            "WHERE e.to_uid = n.uid AND e.rel_type IN "
+            "('CALLS', 'USES_TYPE', 'IMPORTS', 'INHERITS', 'IMPLEMENTS', 'OVERRIDES', 'REFERENCES') "
+            f"AND COALESCE(s.kind, '') NOT IN ({grant_placeholders})) "
             "AND NOT EXISTS (SELECT 1 FROM edges d JOIN edges c ON c.to_uid = d.to_uid "
             "WHERE d.from_uid = n.uid AND d.rel_type = 'DEFINES' AND c.rel_type = 'CALLS') "
             "AND NOT EXISTS (SELECT 1 FROM edges d JOIN nodes p ON p.uid = d.from_uid "
@@ -4267,7 +4278,9 @@ class SqliteGraphClient:
             # inbound edges is the expected state for one, not evidence about it.
             "AND kind != 'property' "
             "ORDER BY file_path, json_extract(props_json, '$.line_start')",
-            [project, *code_kinds, *extra],
+            # Binding order follows the SQL: project, the kind gate, the path prefix, then
+            # the grant kinds inside the NOT EXISTS.
+            [project, *code_kinds, *extra, *grant_kinds],
         )
         rows = await cur.fetchall()
         await cur.close()

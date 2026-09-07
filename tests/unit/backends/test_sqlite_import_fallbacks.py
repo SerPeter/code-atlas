@@ -171,3 +171,18 @@ async def test_an_exact_match_still_wins_over_a_fold(client: SqliteGraphClient):
 
     assert ("apex.Caller", "sobject.ACCOUNT") in await _edges(client)
     assert ("apex.Caller", "sobject.Account") not in await _edges(client)
+
+
+async def test_a_cmp_target_folds_case_like_every_other_api_name(client: SqliteGraphClient):
+    """`<c:MyPanel>` against a bundle folder named `myPanel` is the same component.
+
+    The alias widening and the case fold compose into a gap without this: `cmp.` can
+    never be a fold key itself, because nothing mints a `cmp.` qualified_name, so a
+    widened target routes around the fold that would otherwise have caught it.
+    """
+    await client.upsert_file_entities(PROJECT, "src/a.cls", [_entity("apex.Caller"), _entity("lwc.myPanel")], [])
+    await client.resolve_imports(PROJECT, [_imports("apex.Caller", "cmp.MyPanel")])
+
+    edges = await _edges(client)
+    assert ("apex.Caller", "lwc.myPanel") in edges
+    assert not any(to_uid.endswith("ext/cmp.MyPanel") for _from, to_uid in edges)
