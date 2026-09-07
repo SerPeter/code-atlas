@@ -25,6 +25,8 @@ from code_atlas.parsing.languages.salesforce import (
     LABEL_NAMESPACE,
     LWC_NAMESPACE,
     PAGE_NAMESPACE,
+    PERMISSION_SET_NAMESPACE,
+    TAB_NAMESPACE,
     looks_like_salesforce_metadata,
 )
 from code_atlas.schema import NodeLabel, RelType
@@ -1215,6 +1217,167 @@ def test_a_decomposed_child_is_never_a_callable(kind: str):
 
 
 # ---------------------------------------------------------------------------
+# 4d. PermissionSet and Profile
+# ---------------------------------------------------------------------------
+
+PERMSETS = "force-app/main/default/permissionsets"
+PROFILES = "force-app/main/default/profiles"
+
+
+def test_a_permission_set_is_one_node_and_its_grants_are_edges():
+    """The shape from bcgov/MoH-SAT `Salesforce_Backup_Administrator`, trimmed.
+
+    That real 427 KB file became 1,947 nodes under the generic parse -- 1,944 of
+    them all named `fieldPermissions` with empty source. Every fact is in the edges.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Backup Administrator</label>
+    <hasActivationRequired>false</hasActivationRequired>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>Employee.AlternateEmail</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <objectPermissions>
+        <allowRead>true</allowRead>
+        <object>AIInsightReason</object>
+    </objectPermissions>
+    <classAccesses>
+        <apexClass>BackupController</apexClass>
+        <enabled>true</enabled>
+    </classAccesses>
+    <userPermissions>
+        <enabled>true</enabled>
+        <name>AssignTopics</name>
+    </userPermissions>
+</PermissionSet>
+"""
+    parsed = _parse(source, f"{PERMSETS}/Salesforce_Backup_Administrator.permissionset-meta.xml")
+    node = _one(parsed, "permission_set")
+    assert node.qualified_name == _uid(f"{PERMISSION_SET_NAMESPACE}.Salesforce_Backup_Administrator")
+    # The Module and the permission set, and nothing per row.
+    assert len(parsed.entities) == 2
+    assert _targets(parsed, node.qualified_name, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Employee.AlternateEmail",
+        f"{SOBJECT_NAMESPACE}.AIInsightReason",
+        f"{APEX_NAMESPACE}.BackupController",
+    }
+    # A non-referential grant is rolled up, not dropped.
+    assert node.extra_properties["user_permissions"] == ["AssignTopics"]
+    assert node.extra_properties["fields_editable"] == ["Employee.AlternateEmail"]
+
+
+def test_an_all_false_permission_row_grants_nothing():
+    """A permission set can only add, so an all-false row is noise by construction.
+
+    One real 6,441-line permission set carries 1,276 such rows and 8 real facts.
+    """
+    source = """\
+<?xml version="1.0"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>External Committee User</label>
+    <fieldPermissions>
+        <editable>false</editable>
+        <field>Account.Rating</field>
+        <readable>false</readable>
+    </fieldPermissions>
+    <fieldPermissions>
+        <editable>false</editable>
+        <field>Account.Industry</field>
+        <readable>true</readable>
+    </fieldPermissions>
+</PermissionSet>
+"""
+    parsed = _parse(source, f"{PERMSETS}/External_Committee_User.permissionset-meta.xml")
+    node = _one(parsed, "permission_set")
+    targets = _targets(parsed, node.qualified_name, RelType.IMPORTS)
+    assert targets == {f"{SOBJECT_NAMESPACE}.Account.Industry"}
+    assert node.extra_properties["fields_readable"] == ["Account.Industry"]
+
+
+def test_a_cumulusci_namespace_token_is_folded_away():
+    """CumulusCI templates a package namespace into the metadata it ships.
+
+    An unmanaged build substitutes the empty string, and that is what the field
+    file in the same repo is named -- so folding the token is what makes the target
+    meet a real node instead of `ext/%%%NAMESPACE%%%Course_Enrollment__c`.
+    """
+    source = """\
+<?xml version="1.0"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>EDA</label>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>%%%NAMESPACE%%%Course_Enrollment__c.%%%NAMESPACE%%%Grade__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
+</PermissionSet>
+"""
+    parsed = _parse(source, f"{PERMSETS}/EDA.permissionset-meta.xml")
+    assert _targets(parsed, _one(parsed, "permission_set").qualified_name, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Course_Enrollment__c.Grade__c"
+    }
+
+
+def test_a_profile_reads_tab_visibilities_where_a_permission_set_reads_tab_settings():
+    """Two element names for one concept, and neither doc mentions the other.
+
+    A shared handler reading one name returns nothing at all for the other type,
+    and the file still parses fine -- so the failure is silent.
+    """
+    permset = """\
+<?xml version="1.0"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Ops</label>
+    <tabSettings><tab>Broker__c</tab><visibility>Visible</visibility></tabSettings>
+</PermissionSet>
+"""
+    profile = """\
+<?xml version="1.0"?>
+<Profile xmlns="http://soap.sforce.com/2006/04/metadata">
+    <custom>true</custom>
+    <tabVisibilities><tab>Broker__c</tab><visibility>DefaultOn</visibility></tabVisibilities>
+</Profile>
+"""
+    parsed_set = _parse(permset, f"{PERMSETS}/Ops.permissionset-meta.xml")
+    parsed_profile = _parse(profile, f"{PROFILES}/Admin.profile-meta.xml")
+    assert f"{TAB_NAMESPACE}.Broker__c" in _targets(
+        parsed_set, _one(parsed_set, "permission_set").qualified_name, RelType.IMPORTS
+    )
+    assert f"{TAB_NAMESPACE}.Broker__c" in _targets(
+        parsed_profile, _one(parsed_profile, "profile").qualified_name, RelType.IMPORTS
+    )
+
+
+def test_a_hidden_tab_is_not_a_grant():
+    source = """\
+<?xml version="1.0"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Ops</label>
+    <tabSettings><tab>Broker__c</tab><visibility>Hidden</visibility></tabSettings>
+</PermissionSet>
+"""
+    parsed = _parse(source, f"{PERMSETS}/Ops.permissionset-meta.xml")
+    assert _targets(parsed, _one(parsed, "permission_set").qualified_name, RelType.IMPORTS) == set()
+
+
+@pytest.mark.parametrize("kind", ["permission_set", "profile"])
+def test_permission_documents_keep_their_vector(kind: str):
+    """Excluding these was considered and rejected.
+
+    The volume argument is already answered -- one node per file instead of 1,947 --
+    and what remains carries the admin's own `label` and `description` as its
+    docstring. The grants are properties and edges, not text, so there is nothing
+    table-shaped to exclude.
+    """
+    from code_atlas.search.embeddings import DEFAULT_EXCLUDE_KINDS
+
+    assert kind not in DEFAULT_EXCLUDE_KINDS
+
+
+# ---------------------------------------------------------------------------
 # 5. CustomLabels and CustomMetadata
 # ---------------------------------------------------------------------------
 
@@ -1324,10 +1487,10 @@ def test_custom_metadata_filename_that_already_carries_mdt_is_not_doubled():
     ("path", "source"),
     [
         (
-            "force-app/main/default/permissionsets/Admin.permissionset-meta.xml",
+            "force-app/main/default/workflows/Account.workflow-meta.xml",
             (
-                '<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-                "  <label>Admin</label>\n</PermissionSet>\n"
+                '<?xml version="1.0"?>\n<Workflow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <fullName>Account</fullName>\n</Workflow>\n"
             ),
         ),
         (
@@ -1339,7 +1502,7 @@ def test_custom_metadata_filename_that_already_carries_mdt_is_not_doubled():
         ),
         ("pom.xml", "<project>\n  <artifactId>acme</artifactId>\n</project>\n"),
     ],
-    ids=["permission-set", "flexipage", "maven"],
+    ids=["workflow", "flexipage", "maven"],
 )
 def test_unmodelled_root_elements_fall_through_to_the_generic_parse(path: str, source: str):
     parsed = _parse(source, path)
@@ -1366,9 +1529,9 @@ def test_a_bundle_whose_folder_is_not_an_api_name_falls_through():
 # 6b. The dialect route (ADR-0048)
 # ---------------------------------------------------------------------------
 
-_SFDX_PERMISSION_SET = (
-    '<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-    "  <label>Admin</label>\n</PermissionSet>\n"
+_SFDX_WORKFLOW = (
+    '<?xml version="1.0"?>\n<Workflow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+    "  <fullName>Account</fullName>\n</Workflow>\n"
 )
 
 _SFDX_FLOW = (
@@ -1399,7 +1562,7 @@ _SFDX_FLOW = (
             "an ordinary XML document",
         ),
         (
-            _SFDX_PERMISSION_SET,
+            _SFDX_WORKFLOW,
             False,
             (
                 "SFDX, but a root element this module models no handler for -- claiming "

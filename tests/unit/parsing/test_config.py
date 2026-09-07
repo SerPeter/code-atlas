@@ -812,21 +812,24 @@ def test_salesforce_metadata_bypasses_the_structural_parse() -> None:
     assert not kinds & {"xml_document", "xml_element", "xml_setting"}
 
 
-def _permission_set(rows: int) -> str:
-    """A PermissionSet with *rows* direct children — the real flooding shape.
+def _wide_xml_document(rows: int) -> str:
+    """A `Workflow` with *rows* direct children — the real flooding shape.
 
-    `Salesforce_Backup_Administrator.permissionset-meta.xml` in bcgov/MoH-SAT is
-    427,477 bytes with 1,399 direct children, and used to mint 1,947 entities:
-    1,944 `TypeDef{xml_element}` all named `fieldPermissions`, every one with an
-    empty `source`, and every one embedded under the shipped policy.
+    `Workflow` rather than `PermissionSet` because the latter now reaches its own
+    handler; this test has to keep exercising the structural fallback.
+
+    The shape this guards against was measured on a permission set before that type
+    had a handler: 427,477 bytes, 1,399 direct children, 1,947 entities, 1,944 of
+    them identically named with an empty `source` and every one embedded. Any wide
+    XML document the fallback still handles can do the same.
     """
-    body = "".join(f"    <fieldPermissions><field>Account.F{i}__c</field></fieldPermissions>\n" for i in range(rows))
-    return f'<?xml version="1.0"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n{body}</PermissionSet>\n'
+    body = "".join(f"    <alerts><fullName>Alert_{i}</fullName></alerts>\n" for i in range(rows))
+    return f'<?xml version="1.0"?>\n<Workflow xmlns="http://soap.sforce.com/2006/04/metadata">\n{body}</Workflow>\n'
 
 
 def test_xml_fallback_stops_at_the_entity_cap() -> None:
     """One level deep is not a cap when the root has hundreds of children."""
-    parsed = _parse(_permission_set(500), "force-app/main/default/permissionsets/Wide.permissionset-meta.xml")
+    parsed = _parse(_wide_xml_document(500), "force-app/main/default/workflows/Wide.workflow-meta.xml")
     assert len(parsed.entities) == _GENERIC_MAX_ENTITIES
 
 
@@ -838,10 +841,10 @@ def test_an_over_size_xml_file_still_gets_its_module() -> None:
     re-parsed on every indexing pass, forever, with no error anywhere.
     """
     rows = 12_000
-    source = _permission_set(rows)
+    source = _wide_xml_document(rows)
     assert len(source.encode()) > MAX_GENERIC_CONFIG_BYTES, "fixture must exceed the size gate"
 
-    parsed = _parse(source, "force-app/main/default/permissionsets/Huge.permissionset-meta.xml")
+    parsed = _parse(source, "force-app/main/default/workflows/Huge.workflow-meta.xml")
     modules = [entity for entity in parsed.entities if entity.label is NodeLabel.MODULE]
     assert len(modules) == 1
     # The root element survives as the document's type; its 12,000 children do not.
@@ -859,7 +862,7 @@ def test_the_xml_fallback_kinds_carry_no_vector_by_default() -> None:
     from code_atlas.settings import EmbeddingSettings
 
     policy = EmbedPolicy.from_settings(EmbeddingSettings())
-    parsed = _parse(_permission_set(50), "force-app/main/default/permissionsets/Small.permissionset-meta.xml")
+    parsed = _parse(_wide_xml_document(50), "force-app/main/default/workflows/Small.workflow-meta.xml")
     embedded = {
         entity.kind for entity in parsed.entities if policy.allows(kind=entity.kind, file_path=entity.file_path)
     }

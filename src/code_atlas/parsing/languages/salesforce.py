@@ -199,6 +199,19 @@ taken from the ``objects/<Object>/<child>/`` path rather than from the document,
 which never states it.
 """
 
+PERMISSION_SET_NAMESPACE = "permset"
+PROFILE_NAMESPACE = "profile"
+"""Who may reach what.  Separate namespaces because the two types are separate
+metadata and an org has both, but their handlers are otherwise the same shape.
+"""
+
+LAYOUT_NAMESPACE = "layout"
+TAB_NAMESPACE = "tab"
+"""Declared here and minted by ATL-180, like :data:`PAGE_NAMESPACE`.  A permission
+set assigns a layout and a tab before anything reads those files, so the edges rest
+on ``ext/`` stubs until they do.
+"""
+
 MESSAGE_CHANNEL_NAMESPACE = "messagechannel"
 """Root qualified-name segment for Lightning Message Service channels.
 
@@ -1471,6 +1484,222 @@ def _lwc_apex_classes(element: Node) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# PermissionSet and Profile
+#
+# The worst node-quality artefact measured anywhere in this metadata tree: one
+# real 427 KB permission set became 1,947 nodes under the generic parse, 1,944 of
+# them `TypeDef{kind=xml_element}` ALL named `fieldPermissions`, every one with an
+# empty `source`. Every fact in the file is in the edges.
+# ---------------------------------------------------------------------------
+
+_PERMISSION_SET_MODULE_KIND = "sf_permission_set"
+_PERMISSION_SET_KIND = "permission_set"
+_PROFILE_MODULE_KIND = "sf_profile"
+_PROFILE_KIND = "profile"
+
+_MAX_PERMISSION_EDGES = 2000
+"""Edges one permission file may contribute — a runaway guard, not a policy.
+
+Deliberately above what real files need: the broadest permission set measured
+grants 1,900 distinct things, and every one of those is the answer to "who can see
+this field", which is the whole reason to index the type.  Truncating them to make
+the node smaller would throw away the information and keep the problem, because a
+permission set is the highest-degree node in its graph at 400 edges just as surely
+as at 1,900.
+
+The real mitigation for that degree is to stop *traversing* permission edges
+transitively in impact scoring — a change in the graph layer, not the parser, and
+not made here.  `permissions_truncated` on the node records when this cap bit, so
+a truncated answer is never silently wrong.
+"""
+
+# CumulusCI templates a package namespace into metadata it ships, with a different
+# token in file bodies (`%%%NAMESPACE%%%Course_Enrollment__c`) than in layout
+# filenames (`___NAMESPACE___`). Unmanaged builds substitute the empty string, and
+# that is what the object and field files in the same repo are named — so folding
+# both to nothing is what makes these targets meet real nodes. Measured on one
+# corpus' layout assignments: 35% resolve literally, 84% after folding.
+_NAMESPACE_TOKENS: tuple[str, ...] = ("%%%NAMESPACE%%%", "___NAMESPACE___")
+
+_GRANT_FLAGS: tuple[str, ...] = (
+    "readable",
+    "editable",
+    "allowRead",
+    "allowEdit",
+    "allowCreate",
+    "allowDelete",
+    "modifyAllRecords",
+    "viewAllRecords",
+    "enabled",
+)
+"""Any of these true means the row grants something.
+
+Two vocabularies in one document: `fieldPermissions` says `readable`/`editable`,
+`objectPermissions` says `allowRead`/`allowEdit` and four more. Reading the union
+means neither is silently skipped.
+"""
+
+_HIDDEN_TAB_VISIBILITIES = frozenset({"hidden", "none"})
+
+
+def _denamespaced(value: str | None) -> str | None:
+    """*value* with any CumulusCI namespace token removed."""
+    if value is None:
+        return None
+    for token in _NAMESPACE_TOKENS:
+        value = value.replace(token, "")
+    return value or None
+
+
+def _grants(row: Node) -> bool:
+    """Does this permission row give access to anything?
+
+    A permission set cannot deny — it only adds — so a row with every flag false
+    is noise by construction. In one real 6,441-line permission set, 1,276 of
+    1,284 rows are all-false and carry 8 load-bearing facts between them.
+    """
+    return any(_bool_of(row, flag) for flag in _GRANT_FLAGS)
+
+
+def _permission_targets(element: Node, is_profile: bool) -> tuple[list[str], dict[str, list[str]]]:
+    """``(edge targets, rolled-up node properties)`` for one permission document."""
+    targets: list[str] = []
+    readable: list[str] = []
+    editable: list[str] = []
+
+    for row in _children(element, "fieldPermissions"):
+        reference = _denamespaced(_text_of(row, "field"))
+        if reference is None or not _grants(row):
+            continue
+        owner, _, field = reference.partition(".")
+        api_owner, api_field = _api_name(owner), _api_name(field)
+        if api_owner is None or api_field is None:
+            continue
+        qualified = f"{api_owner}.{api_field}"
+        targets.append(f"{SOBJECT_NAMESPACE}.{qualified}")
+        if _bool_of(row, "editable"):
+            editable.append(qualified)
+        elif _bool_of(row, "readable"):
+            readable.append(qualified)
+
+    for row_tag, child_tag, namespace in (
+        ("objectPermissions", "object", SOBJECT_NAMESPACE),
+        ("classAccesses", "apexClass", APEX_NAMESPACE),
+        ("pageAccesses", "apexPage", PAGE_NAMESPACE),
+    ):
+        for row in _children(element, row_tag):
+            name = _api_name(_denamespaced(_text_of(row, child_tag)))
+            if name is not None and _grants(row):
+                targets.append(f"{namespace}.{name}")
+
+    # A layout assignment names a layout whatever its flags say -- assigning one IS
+    # the grant, and the row carries no boolean at all.
+    for row in _children(element, "layoutAssignments"):
+        layout = _denamespaced(_text_of(row, "layout"))
+        if layout:
+            targets.append(f"{LAYOUT_NAMESPACE}.{_qn_segment(layout)}")
+
+    # `tabSettings` on a PermissionSet, `tabVisibilities` on a Profile. Both docs
+    # are correct and neither mentions the other; a shared handler reading one name
+    # returns nothing at all for the other type, and the file still parses fine.
+    for row in _children(element, "tabVisibilities" if is_profile else "tabSettings"):
+        tab = _api_name(_denamespaced(_text_of(row, "tab")))
+        visibility = (_text_of(row, "visibility") or "").strip().lower()
+        if tab is not None and visibility not in _HIDDEN_TAB_VISIBILITIES:
+            targets.append(f"{TAB_NAMESPACE}.{tab}")
+
+    granted = sorted(
+        name
+        for row in _children(element, "userPermissions")
+        if _bool_of(row, "enabled") and (name := _text_of(row, "name"))
+    )
+    rolled = {"fields_readable": sorted(readable), "fields_editable": sorted(editable), "user_permissions": granted}
+    return targets, rolled
+
+
+def _parse_permission_document(
+    emit: _Emit,
+    element: Node,
+    path: str,
+    meta: _MetaFile,
+    *,
+    namespace: str,
+    module_kind: str,
+    kind: str,
+    is_profile: bool,
+) -> ParsedFile | None:
+    """One ``Value`` per file, and an edge only for a grant."""
+    api_name = _api_name(_qn_segment(meta.base))
+    if api_name is None:
+        return None
+
+    module_uid = _module(emit, path, module_kind, element)
+    targets, rolled = _permission_targets(element, is_profile)
+    unique = sorted(set(targets))
+    truncated = len(unique) > _MAX_PERMISSION_EDGES
+
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=api_name,
+        qn_suffix=f"{namespace}.{api_name}",
+        label=NodeLabel.VALUE,
+        kind=kind,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact(
+            {
+                "has_activation_required": _bool_of(element, "hasActivationRequired"),
+                "license": _text_of(element, "license"),
+                "custom": _bool_of(element, "custom"),
+                "grant_count": len(unique) or None,
+                "permissions_truncated": True if truncated else None,
+                **{key: value or None for key, value in rolled.items()},
+            }
+        ),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+    if truncated:
+        logger.warning(
+            "salesforce: {} grants {} distinct targets — only the first {} became edges",
+            path,
+            len(unique),
+            _MAX_PERMISSION_EDGES,
+        )
+    for target in unique[:_MAX_PERMISSION_EDGES]:
+        emit.rel(uid, RelType.IMPORTS, target)
+    return emit.result()
+
+
+def _parse_permission_set(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``permissionsets/<Name>.permissionset-meta.xml`` -> one ``Value`` plus its grants."""
+    return _parse_permission_document(
+        emit,
+        element,
+        path,
+        meta,
+        namespace=PERMISSION_SET_NAMESPACE,
+        module_kind=_PERMISSION_SET_MODULE_KIND,
+        kind=_PERMISSION_SET_KIND,
+        is_profile=False,
+    )
+
+
+def _parse_profile(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``profiles/<Name>.profile-meta.xml`` -> one ``Value`` plus its grants."""
+    return _parse_permission_document(
+        emit,
+        element,
+        path,
+        meta,
+        namespace=PROFILE_NAMESPACE,
+        module_kind=_PROFILE_MODULE_KIND,
+        kind=_PROFILE_KIND,
+        is_profile=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # LightningMessageChannel and the Apex sidecars
 # ---------------------------------------------------------------------------
 
@@ -1835,6 +2064,8 @@ _HANDLERS: dict[str, Callable[[_Emit, Node, str, _MetaFile], ParsedFile | None]]
     "ListView": _parse_list_view,
     "GlobalValueSet": _parse_global_value_set,
     "LightningMessageChannel": _parse_message_channel,
+    "PermissionSet": _parse_permission_set,
+    "Profile": _parse_profile,
     "ApexClass": _parse_apex_sidecar,
     "ApexTrigger": _parse_apex_sidecar,
     "ApexPage": _parse_apex_sidecar,
