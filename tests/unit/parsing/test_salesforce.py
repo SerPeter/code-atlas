@@ -21,11 +21,15 @@ pytest.importorskip("tree_sitter_xml", reason="tree-sitter-xml not installed")
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, parse_file
 from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
 from code_atlas.parsing.languages.salesforce import (
+    AURA_NAMESPACE,
+    FLEXIPAGE_NAMESPACE,
     GLOBAL_VALUE_SET_NAMESPACE,
     LABEL_NAMESPACE,
+    LAYOUT_NAMESPACE,
     LWC_NAMESPACE,
     PAGE_NAMESPACE,
     PERMISSION_SET_NAMESPACE,
+    QUICK_ACTION_NAMESPACE,
     TAB_NAMESPACE,
     looks_like_salesforce_metadata,
 )
@@ -1378,6 +1382,198 @@ def test_permission_documents_keep_their_vector(kind: str):
 
 
 # ---------------------------------------------------------------------------
+# 4e. Where a component is surfaced
+# ---------------------------------------------------------------------------
+
+LAYOUTS = "force-app/main/default/layouts"
+FLEXIPAGES = "force-app/main/default/flexipages"
+QUICKACTIONS = "force-app/main/default/quickActions"
+TABS = "force-app/main/default/tabs"
+
+
+def test_a_flexipage_names_the_components_it_places():
+    """trailheadapps/dreamhouse-lwc `Property_Record_Page`, trimmed.
+
+    A colon means a platform component (`force:highlightsPanel`, `flexipage:column`)
+    with no node here. A bare name is custom -- and is written identically for Aura
+    and LWC, so both are emitted.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8" ?>
+<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">
+    <flexiPageRegions>
+        <itemInstances>
+            <componentInstance>
+                <componentName>force:highlightsPanel</componentName>
+            </componentInstance>
+        </itemInstances>
+        <itemInstances>
+            <componentInstance>
+                <componentName>propertyMap</componentName>
+            </componentInstance>
+        </itemInstances>
+    </flexiPageRegions>
+    <sobjectType>Property__c</sobjectType>
+    <type>RecordPage</type>
+</FlexiPage>
+"""
+    parsed = _parse(source, f"{FLEXIPAGES}/Property_Record_Page.flexipage-meta.xml")
+    page = _one(parsed, "flexipage")
+    targets = _targets(parsed, page.qualified_name, RelType.IMPORTS)
+    assert f"{LWC_NAMESPACE}.propertyMap" in targets
+    assert f"{AURA_NAMESPACE}.propertyMap" in targets
+    assert f"{SOBJECT_NAMESPACE}.Property__c" in targets
+    assert not any("highlightsPanel" in target for target in targets)
+
+
+def test_a_flexipage_action_list_uses_the_plural_element():
+    """`valueList/valueListItems/value` -- the published doc says `valueListItem`.
+
+    A parser written from the documentation matches nothing here, silently.
+    """
+    source = """\
+<?xml version="1.0"?>
+<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">
+    <flexiPageRegions>
+        <itemInstances>
+            <componentInstance>
+                <componentInstanceProperties>
+                    <name>actionNames</name>
+                    <valueList>
+                        <valueListItems>
+                            <value>Contact.Personalized_Schedule</value>
+                        </valueListItems>
+                    </valueList>
+                </componentInstanceProperties>
+                <componentName>force:highlightsPanel</componentName>
+            </componentInstance>
+        </itemInstances>
+    </flexiPageRegions>
+</FlexiPage>
+"""
+    parsed = _parse(source, f"{FLEXIPAGES}/Contact_Record_Page.flexipage-meta.xml")
+    assert f"{QUICK_ACTION_NAMESPACE}.Contact.Personalized_Schedule" in _targets(
+        parsed, _one(parsed, "flexipage").qualified_name, RelType.IMPORTS
+    )
+
+
+def test_a_layout_takes_its_object_from_the_filename():
+    """SalesforceFoundation/EDA, trimmed. The document never states its own object.
+
+    A layout name may contain spaces, so the uid folds the whole base -- and a
+    permission set referencing it must fold identically.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<Layout xmlns="http://soap.sforce.com/2006/04/metadata">
+    <layoutSections>
+        <label>Information</label>
+        <layoutColumns>
+            <layoutItems><behavior>Required</behavior><field>Name</field></layoutItems>
+            <layoutItems><behavior>Edit</behavior><field>Issuer__c</field></layoutItems>
+        </layoutColumns>
+    </layoutSections>
+</Layout>
+"""
+    path = f"{LAYOUTS}/Academic_Certification__c-EDA Academic Certification Layout.layout-meta.xml"
+    parsed = _parse(source, path)
+    layout = _one(parsed, "layout")
+    assert layout.qualified_name == _uid(
+        f"{LAYOUT_NAMESPACE}.Academic_Certification__c-EDA_Academic_Certification_Layout"
+    )
+    assert layout.extra_properties["sobject"] == "Academic_Certification__c"
+    assert _targets(parsed, layout.qualified_name, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Academic_Certification__c",
+        f"{SOBJECT_NAMESPACE}.Academic_Certification__c.Name",
+        f"{SOBJECT_NAMESPACE}.Academic_Certification__c.Issuer__c",
+    }
+
+
+def test_a_standard_action_token_is_not_a_quick_action():
+    """Real layouts mix `FeedItem.ContentPost` with `LogACall`, `Edit` and `Delete`.
+
+    The bare ones are Salesforce's own standard actions with no file anywhere, so
+    requiring the dot is what stops them minting stubs for things that do not exist.
+    """
+    source = """\
+<?xml version="1.0"?>
+<Layout xmlns="http://soap.sforce.com/2006/04/metadata">
+    <platformActionList>
+        <platformActionListItems><actionName>FeedItem.ContentPost</actionName></platformActionListItems>
+        <platformActionListItems><actionName>LogACall</actionName></platformActionListItems>
+        <platformActionListItems><actionName>Edit</actionName></platformActionListItems>
+    </platformActionList>
+</Layout>
+"""
+    parsed = _parse(source, f"{LAYOUTS}/Account-Account Layout.layout-meta.xml")
+    targets = _targets(parsed, _one(parsed, "layout").qualified_name, RelType.IMPORTS)
+    assert f"{QUICK_ACTION_NAMESPACE}.FeedItem.ContentPost" in targets
+    assert not any(target.endswith((".LogACall", ".Edit")) for target in targets)
+
+
+def test_a_tabs_custom_object_flag_is_a_boolean_not_a_name():
+    """`<customObject>true</customObject>` -- the object is the FILENAME.
+
+    Read as a name it yields `sobject.true`, which is why this is worth a test.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomTab xmlns="http://soap.sforce.com/2006/04/metadata">
+    <customObject>true</customObject>
+    <motif>Custom48: Trophy</motif>
+</CustomTab>
+"""
+    parsed = _parse(source, f"{TABS}/Trigger_Handler__c.tab-meta.xml")
+    assert _targets(parsed, _one(parsed, "custom_tab").qualified_name, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Trigger_Handler__c"
+    }
+
+
+def test_a_quick_action_calls_the_flow_it_launches():
+    """bcgov/MoH-SAT, verbatim. Both halves of its identity are in the filename.
+
+    `CALLS` takes a bare name because `resolve_calls` matches a Callable's name and
+    never its qualified one.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<QuickAction xmlns="http://soap.sforce.com/2006/04/metadata">
+    <flowDefinition>EDRD_Change_Enrollee_Status_OnPatient</flowDefinition>
+    <label>Change Patient EDRD Enrollee Status</label>
+    <type>Flow</type>
+</QuickAction>
+"""
+    path = f"{QUICKACTIONS}/Account.Change_Patient_Enrollee_Status.quickAction-meta.xml"
+    parsed = _parse(source, path)
+    action = _one(parsed, "quick_action")
+    assert action.qualified_name == _uid(f"{QUICK_ACTION_NAMESPACE}.Account.Change_Patient_Enrollee_Status")
+    assert _targets(parsed, action.qualified_name, RelType.CALLS) == {"EDRD_Change_Enrollee_Status_OnPatient"}
+
+
+def test_an_application_skips_standard_tabs_and_folds_namespace_tokens():
+    """`standard-Account` names a Salesforce tab with no file; `%%%NAMESPACE%%%` is CumulusCI."""
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomApplication xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Education Data Architecture</label>
+    <tabs>standard-Account</tabs>
+    <tabs>%%%NAMESPACE%%%Course_Enrollment__c</tabs>
+    <actionOverrides>
+        <actionName>View</actionName>
+        <content>%%%NAMESPACE%%%EDA_Record_Page</content>
+        <type>Flexipage</type>
+    </actionOverrides>
+</CustomApplication>
+"""
+    parsed = _parse(source, "force-app/main/default/applications/EDA.app-meta.xml")
+    targets = _targets(parsed, _one(parsed, "custom_application").qualified_name, RelType.IMPORTS)
+    assert targets == {
+        f"{TAB_NAMESPACE}.Course_Enrollment__c",
+        f"{FLEXIPAGE_NAMESPACE}.EDA_Record_Page",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 5. CustomLabels and CustomMetadata
 # ---------------------------------------------------------------------------
 
@@ -1494,15 +1690,15 @@ def test_custom_metadata_filename_that_already_carries_mdt_is_not_doubled():
             ),
         ),
         (
-            "force-app/main/default/flexipages/Property_Record_Page.flexipage-meta.xml",
+            "force-app/main/default/approvalProcesses/Account.Approve.approvalProcess-meta.xml",
             (
-                '<?xml version="1.0"?>\n<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-                "  <masterLabel>Property Record Page</masterLabel>\n</FlexiPage>\n"
+                '<?xml version="1.0"?>\n<ApprovalProcess xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                "  <label>Approve</label>\n</ApprovalProcess>\n"
             ),
         ),
         ("pom.xml", "<project>\n  <artifactId>acme</artifactId>\n</project>\n"),
     ],
-    ids=["workflow", "flexipage", "maven"],
+    ids=["workflow", "approval-process", "maven"],
 )
 def test_unmodelled_root_elements_fall_through_to_the_generic_parse(path: str, source: str):
     parsed = _parse(source, path)

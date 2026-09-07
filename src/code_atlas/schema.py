@@ -323,7 +323,7 @@ FILE_HASH_LABELS: tuple[NodeLabel, ...] = (NodeLabel.MODULE, NodeLabel.PACKAGE, 
 # re-parse of every project. Deliberately NOT SCHEMA_VERSION either: an extraction change
 # and a schema change are different events, and coupling them makes each pay the other's
 # cost, most sharply the vector-index drop and rebuild every schema migration performs.
-EXTRACTION_EPOCH: int = 8
+EXTRACTION_EPOCH: int = 9
 
 
 # ---------------------------------------------------------------------------

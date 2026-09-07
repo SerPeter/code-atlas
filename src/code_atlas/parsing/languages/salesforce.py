@@ -215,6 +215,15 @@ PROFILE_NAMESPACE = "profile"
 metadata and an org has both, but their handlers are otherwise the same shape.
 """
 
+FLEXIPAGE_NAMESPACE = "flexipage"
+QUICK_ACTION_NAMESPACE = "quickaction"
+APP_NAMESPACE = "app"
+"""Where a component is surfaced, and what surfaces it.
+
+A quick action is ``quickaction.<Object>.<Name>`` because its own filename is
+``<Object>.<Name>.quickAction-meta.xml`` and its name is unique only per object.
+"""
+
 LAYOUT_NAMESPACE = "layout"
 TAB_NAMESPACE = "tab"
 """Declared here and minted by ATL-180, like :data:`PAGE_NAMESPACE`.  A permission
@@ -1494,6 +1503,305 @@ def _lwc_apex_classes(element: Node) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Where a component is surfaced: Layout, FlexiPage, QuickAction, CustomTab, App
+# ---------------------------------------------------------------------------
+
+_LAYOUT_MODULE_KIND = "sf_layout"
+_LAYOUT_KIND = "layout"
+_FLEXIPAGE_MODULE_KIND = "sf_flexipage"
+_FLEXIPAGE_KIND = "flexipage"
+_QUICK_ACTION_MODULE_KIND = "sf_quick_action"
+_QUICK_ACTION_KIND = "quick_action"
+_TAB_MODULE_KIND = "sf_tab"
+_TAB_KIND = "custom_tab"
+_APP_MODULE_KIND = "sf_application"
+_APP_KIND = "custom_application"
+
+_STANDARD_TAB_PREFIX = "standard-"
+
+
+def _surfaced_component_targets(name: str | None) -> list[str]:
+    """A FlexiPage ``componentName`` -> the component it places, if it is a custom one.
+
+    A colon means a platform component (``force:highlightsPanel``,
+    ``flexipage:column``) — those are Salesforce's own and have no node here. A bare
+    name is a custom component, and is written **identically** for Aura and LWC, so
+    both are emitted for the reason :func:`markup._custom_component_targets` gives at
+    length: the platform shares one namespace between the two kinds, so the name is
+    unambiguous in an org and ambiguous in a file.
+    """
+    if not name or ":" in name:
+        return []
+    api_name = _api_name(name)
+    if api_name is None:
+        return []
+    return [f"{LWC_NAMESPACE}.{api_name}", f"{AURA_NAMESPACE}.{api_name}"]
+
+
+def _quick_action_reference(value: str | None) -> str | None:
+    """``<Object>.<Name>`` -> a quick-action target; a bare token names a standard action.
+
+    Real layouts mix ``FeedItem.ContentPost`` with ``LogACall``, ``Edit`` and
+    ``Delete``. The bare ones are Salesforce's own standard actions with no file
+    anywhere, so requiring the dot is what keeps them from minting `ext/` stubs for
+    things that do not exist.
+    """
+    reference = _denamespaced(value)
+    if not reference or "." not in reference:
+        return None
+    owner, _, name = reference.partition(".")
+    api_owner, api_name = _api_name(owner), _api_name(name)
+    if api_owner is None or api_name is None:
+        return None
+    return f"{QUICK_ACTION_NAMESPACE}.{api_owner}.{api_name}"
+
+
+def _parse_layout(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``layouts/<Object>-<Layout Name>.layout-meta.xml`` -> one ``Value`` plus its fields.
+
+    The best edge-to-node ratio of any type here: a real layout states dozens of
+    fields and one node holds them all.  It answers a question nothing else in the
+    graph can — *which fields does a user actually see on this object* — because a
+    field existing and a field being on a page are different facts.
+
+    The object is the filename up to the first hyphen; a layout name may itself
+    contain spaces and hyphens, so the uid folds the whole base through
+    ``_qn_segment`` and a profile's reference to it must be folded the same way.
+    """
+    base = _denamespaced(meta.base)
+    if base is None:
+        return None
+    owner = _api_name(base.partition("-")[0])
+    module_uid = _module(emit, path, _LAYOUT_MODULE_KIND, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=base,
+        qn_suffix=f"{LAYOUT_NAMESPACE}.{_qn_segment(base)}",
+        label=NodeLabel.VALUE,
+        kind=_LAYOUT_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact({"sobject": owner}),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+    if owner is not None:
+        emit.imports_sobject(uid, owner)
+
+    for target in sorted(_layout_references(element, owner)):
+        emit.rel(uid, RelType.IMPORTS, target)
+    return emit.result()
+
+
+def _layout_references(element: Node, owner: str | None) -> set[str]:
+    """The fields a layout shows and the quick actions it offers.
+
+    Fields are bare names relative to the object in the *filename* -- the document
+    never states its own object -- so a layout with no parseable owner contributes
+    no field edges rather than guessing one.
+    """
+    targets: set[str] = set()
+    for section in _children(element, "layoutSections"):
+        for column in _children(section, "layoutColumns"):
+            for item in _children(column, "layoutItems"):
+                if owner is not None:
+                    targets.update(
+                        f"{SOBJECT_NAMESPACE}.{owner}.{field}"
+                        for value in _texts_of(item, "field")
+                        if (field := _api_name(_denamespaced(value))) is not None
+                    )
+                reference = _quick_action_reference(_text_of(item, "quickActionName"))
+                if reference is not None:
+                    targets.add(reference)
+    for listing_tag in ("quickActionList", "platformActionList"):
+        for listing in _children(element, listing_tag):
+            for row_tag in ("quickActionListItems", "platformActionListItems"):
+                for row in _children(listing, row_tag):
+                    targets.update(
+                        reference
+                        for tag in ("quickActionName", "actionName")
+                        if (reference := _quick_action_reference(_text_of(row, tag))) is not None
+                    )
+    return targets
+
+
+def _parse_flexipage(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``flexipages/<Name>.flexipage-meta.xml`` -> the answer to "where is this surfaced".
+
+    The only metadata type that says which components a Lightning page places, and
+    therefore the other half of the epic's component-usage question.
+    """
+    api_name = _api_name(_denamespaced(meta.base))
+    if api_name is None:
+        return None
+    module_uid = _module(emit, path, _FLEXIPAGE_MODULE_KIND, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=api_name,
+        qn_suffix=f"{FLEXIPAGE_NAMESPACE}.{api_name}",
+        label=NodeLabel.VALUE,
+        kind=_FLEXIPAGE_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact(
+            {
+                "page_type": _text_of(element, "type"),
+                "sobject": _api_name(_denamespaced(_text_of(element, "sobjectType"))),
+            }
+        ),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+    emit.imports_sobject(uid, _api_name(_denamespaced(_text_of(element, "sobjectType"))))
+
+    targets: set[str] = set()
+    for descendant in _iter_elements(element):
+        for value in _texts_of(descendant, "componentName"):
+            targets.update(_surfaced_component_targets(_denamespaced(value)))
+        # `componentInstanceProperties` with name=actionNames lists quick actions,
+        # under `valueList/valueListItems/value` -- note the PLURAL. The published
+        # doc says `valueListItem`, and a parser written from it matches nothing.
+        if _text_of(descendant, "name") == "actionNames":
+            for value_list in _children(descendant, "valueList"):
+                for item in _children(value_list, "valueListItems"):
+                    for value in _texts_of(item, "value"):
+                        reference = _quick_action_reference(value)
+                        if reference is not None:
+                            targets.add(reference)
+            for value in _texts_of(descendant, "value"):
+                reference = _quick_action_reference(value)
+                if reference is not None:
+                    targets.add(reference)
+
+    for target in sorted(targets):
+        emit.rel(uid, RelType.IMPORTS, target)
+    return emit.result()
+
+
+def _parse_quick_action(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``quickActions/<Object>.<Name>.quickAction-meta.xml`` -> one ``Value``.
+
+    A button that runs something. Its filename carries both halves of its identity,
+    and its body names what it runs: a flow, an LWC, or a Visualforce page.
+    """
+    base = _denamespaced(meta.base)
+    if base is None or "." not in base:
+        return None
+    owner, _, name = base.partition(".")
+    api_owner, api_name = _api_name(owner), _api_name(name)
+    if api_owner is None or api_name is None:
+        return None
+
+    module_uid = _module(emit, path, _QUICK_ACTION_MODULE_KIND, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=api_name,
+        qn_suffix=f"{QUICK_ACTION_NAMESPACE}.{api_owner}.{api_name}",
+        label=NodeLabel.VALUE,
+        kind=_QUICK_ACTION_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact({"sobject": api_owner, "action_type": _text_of(element, "type")}),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+    emit.imports_sobject(uid, api_owner)
+    emit.imports_sobject(uid, _api_name(_denamespaced(_text_of(element, "targetObject"))))
+
+    lwc = _api_name(_denamespaced(_text_of(element, "lightningWebComponent")))
+    if lwc is not None:
+        emit.rel(uid, RelType.IMPORTS, f"{LWC_NAMESPACE}.{lwc}")
+    page = _api_name(_denamespaced(_text_of(element, "page")))
+    if page is not None:
+        emit.rel(uid, RelType.IMPORTS, f"{PAGE_NAMESPACE}.{page}")
+    # A `type=Flow` quick action names the flow it launches. CALLS takes a bare name,
+    # because `resolve_calls` matches a Callable's name and never its qualified one.
+    flow = _api_name(_denamespaced(_text_of(element, "flowDefinition")))
+    if flow is not None:
+        emit.rel(uid, RelType.CALLS, flow)
+    return emit.result()
+
+
+def _parse_custom_tab(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``tabs/<Name>.tab-meta.xml`` -> one ``Value`` naming what it opens.
+
+    ``<customObject>`` is a **boolean**, not a name: a tab on an object is declared
+    by ``<customObject>true</customObject>`` and the object is the *filename*. Read
+    as a name it yields ``sobject.true``, which is why this is worth stating.
+    """
+    api_name = _api_name(_denamespaced(meta.base))
+    if api_name is None:
+        return None
+    module_uid = _module(emit, path, _TAB_MODULE_KIND, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=api_name,
+        qn_suffix=f"{TAB_NAMESPACE}.{api_name}",
+        label=NodeLabel.VALUE,
+        kind=_TAB_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+
+    if _bool_of(element, "customObject"):
+        emit.imports_sobject(uid, api_name)
+    flexipage = _api_name(_denamespaced(_text_of(element, "flexiPage")))
+    if flexipage is not None:
+        emit.rel(uid, RelType.IMPORTS, f"{FLEXIPAGE_NAMESPACE}.{flexipage}")
+    page = _api_name(_denamespaced(_text_of(element, "page")))
+    if page is not None:
+        emit.rel(uid, RelType.IMPORTS, f"{PAGE_NAMESPACE}.{page}")
+    lwc = _api_name(_denamespaced(_text_of(element, "lwcComponent")))
+    if lwc is not None:
+        emit.rel(uid, RelType.IMPORTS, f"{LWC_NAMESPACE}.{lwc}")
+    return emit.result()
+
+
+def _parse_custom_application(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``applications/<Name>.app-meta.xml`` -> the tabs and pages an app collects.
+
+    ``actionOverrides/content`` is the answer to "which page overrides this object's
+    default view", which is otherwise unaskable.
+
+    Only the ``*-meta.xml`` form reaches here. The legacy ``applications/<N>.app``
+    spelling has its suffix owned by ``markup.py`` — Aura bundles use ``.app`` too —
+    and gets a bare ``Module`` there.
+    """
+    api_name = _api_name(_denamespaced(meta.base))
+    if api_name is None:
+        return None
+    module_uid = _module(emit, path, _APP_MODULE_KIND, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=api_name,
+        qn_suffix=f"{APP_NAMESPACE}.{api_name}",
+        label=NodeLabel.VALUE,
+        kind=_APP_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact(
+            {"nav_type": _text_of(element, "navType"), "form_factors": _texts_of(element, "formFactors") or None}
+        ),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+
+    for value in _texts_of(element, "tabs"):
+        tab = _denamespaced(value)
+        # `standard-Account` names a Salesforce tab with no file anywhere.
+        if tab and not tab.startswith(_STANDARD_TAB_PREFIX) and (name := _api_name(tab)) is not None:
+            emit.rel(uid, RelType.IMPORTS, f"{TAB_NAMESPACE}.{name}")
+    for override in _children(element, "actionOverrides"):
+        content = _api_name(_denamespaced(_text_of(override, "content")))
+        if content is not None and (_text_of(override, "type") or "").strip().lower() == "flexipage":
+            emit.rel(uid, RelType.IMPORTS, f"{FLEXIPAGE_NAMESPACE}.{content}")
+        emit.imports_sobject(uid, _api_name(_denamespaced(_text_of(override, "pageOrSobjectType"))))
+    return emit.result()
+
+
+# ---------------------------------------------------------------------------
 # PermissionSet and Profile
 #
 # The worst node-quality artefact measured anywhere in this metadata tree: one
@@ -2075,6 +2383,11 @@ _HANDLERS: dict[str, Callable[[_Emit, Node, str, _MetaFile], ParsedFile | None]]
     "GlobalValueSet": _parse_global_value_set,
     "LightningMessageChannel": _parse_message_channel,
     "PermissionSet": _parse_permission_set,
+    "Layout": _parse_layout,
+    "FlexiPage": _parse_flexipage,
+    "QuickAction": _parse_quick_action,
+    "CustomTab": _parse_custom_tab,
+    "CustomApplication": _parse_custom_application,
     "Profile": _parse_profile,
     "ApexClass": _parse_apex_sidecar,
     "ApexTrigger": _parse_apex_sidecar,
