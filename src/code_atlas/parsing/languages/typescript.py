@@ -17,7 +17,11 @@ from code_atlas.parsing.ast import (
     node_text,
     register_language,
 )
-from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE
+from code_atlas.parsing.languages.salesforce import (
+    LABEL_NAMESPACE,
+    LWC_NAMESPACE,
+    MESSAGE_CHANNEL_NAMESPACE,
+)
 from code_atlas.schema import CallableKind, NodeLabel, RelType, TypeDefKind, ValueKind, Visibility
 
 if TYPE_CHECKING:
@@ -137,6 +141,8 @@ def _get_string_content(string_node: Node) -> str:
 _SALESFORCE_APEX_PREFIX = "@salesforce/apex/"
 _SALESFORCE_SCHEMA_PREFIX = "@salesforce/schema/"
 _LWC_SIBLING_PREFIX = "c/"
+_SALESFORCE_LABEL_PREFIX = "@salesforce/label/"
+_SALESFORCE_CHANNEL_PREFIX = "@salesforce/messageChannel/"
 
 
 def _salesforce_import_targets(specifier: str) -> list[str]:
@@ -191,9 +197,14 @@ def _salesforce_import_target(specifier: str) -> str | None:
     the rewrite every sibling import leaves an ``ext/c/<name>`` stub sitting beside
     the real node it should have been.
 
-    Returns ``None`` for every other specifier, including other ``@salesforce/*``
-    pseudo-modules (labels, static resources, user context), which stay ordinary
-    external imports.
+    ``@salesforce/label/c.<Name>`` is the most common cross-tier reference in real
+    LWC code — 360 occurrences against 4 for ``messageChannel`` in one sampled
+    corpus — and it was discarded, leaving the ``label.<X>`` nodes ``salesforce.py``
+    mints with no inbound edge at all.
+
+    Returns ``None`` for every other specifier, including the remaining
+    ``@salesforce/*`` pseudo-modules (static resources, user context, apex
+    continuations), which stay ordinary external imports.
     """
     if specifier.startswith(_SALESFORCE_APEX_PREFIX):
         member = specifier.removeprefix(_SALESFORCE_APEX_PREFIX).strip("/")
@@ -205,6 +216,18 @@ def _salesforce_import_target(specifier: str) -> str | None:
     if specifier.startswith(_LWC_SIBLING_PREFIX):
         bundle = specifier.removeprefix(_LWC_SIBLING_PREFIX).strip("/")
         return f"{LWC_NAMESPACE}.{bundle}" if bundle else None
+    if specifier.startswith(_SALESFORCE_LABEL_PREFIX):
+        # `c.Greeting` -- the namespace is always present and is `c` for every
+        # unmanaged label. The label's own node is named for the label alone.
+        reference = specifier.removeprefix(_SALESFORCE_LABEL_PREFIX).strip("/")
+        name = reference.rpartition(".")[2]
+        return f"{LABEL_NAMESPACE}.{name}" if name else None
+    if specifier.startswith(_SALESFORCE_CHANNEL_PREFIX):
+        # The specifier carries a `__c` the filename does not:
+        # `Record_Selected__c` is defined by `Record_Selected.messageChannel-meta.xml`.
+        reference = specifier.removeprefix(_SALESFORCE_CHANNEL_PREFIX).strip("/")
+        name = reference.removesuffix("__c")
+        return f"{MESSAGE_CHANNEL_NAMESPACE}.{name}" if name else None
     return None
 
 

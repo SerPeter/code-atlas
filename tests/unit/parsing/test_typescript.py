@@ -1159,10 +1159,32 @@ def test_lwc_rewrite_replaces_the_raw_specifier():
 
 
 def test_other_salesforce_pseudo_modules_are_left_alone():
+    """`user/`, `resourceUrl/`, `i18n/` and friends stay ordinary external imports."""
     imports = _lwc_imports(
-        "import userId from '@salesforce/user/Id';\nimport label from '@salesforce/label/c.Greeting';\n"
+        "import userId from '@salesforce/user/Id';\nimport logo from '@salesforce/resourceUrl/company_logo';\n"
     )
-    assert imports == {"@salesforce/user/Id", "@salesforce/label/c.Greeting"}
+    assert imports == {"@salesforce/user/Id", "@salesforce/resourceUrl/company_logo"}
+
+
+def test_a_label_import_targets_the_custom_label_node():
+    """The most common cross-tier reference in real LWC code, and it was discarded.
+
+    Measured on one public corpus: 360 `@salesforce/label` specifiers against 4 for
+    `messageChannel`. The `label.<X>` nodes salesforce.py mints had no inbound edge
+    at all until this.
+    """
+    assert _lwc_imports("import greeting from '@salesforce/label/c.Greeting';\n") == {"label.Greeting"}
+
+
+def test_a_message_channel_import_drops_the_suffix_the_file_does_not_have():
+    """`Record_Selected__c` is defined by `Record_Selected.messageChannel-meta.xml`.
+
+    The specifier carries a `__c` the filename does not, so a verbatim target would
+    miss the node by exactly two characters.
+    """
+    assert _lwc_imports("import CHANNEL from '@salesforce/messageChannel/Record_Selected__c';\n") == {
+        "messagechannel.Record_Selected"
+    }
 
 
 def test_ordinary_imports_are_unaffected():
