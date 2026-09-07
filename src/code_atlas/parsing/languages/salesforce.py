@@ -203,6 +203,16 @@ taken from the ``objects/<Object>/<child>/`` path rather than from the document,
 which never states it.
 """
 
+GLOBAL_VALUE_SET_NAMESPACE = "globalvalueset"
+"""Root qualified-name segment for GlobalValueSets — ``globalvalueset.Payment_ACH_Code``.
+
+Minted from the **file base**, not from ``masterLabel``.  The documentation says
+``masterLabel`` and the documentation is wrong: NPSP's file declares
+``<masterLabel>Payment ACH Code</masterLabel>`` while every field referencing it
+writes ``<valueSetName>Payment_ACH_Code</valueSetName>`` — the filename, with
+underscores.  Minting from the label would join nothing.
+"""
+
 PAGE_NAMESPACE = "page"
 """Root qualified-name segment for Visualforce pages — ``page.HH_ManageHHAccount``.
 
@@ -635,6 +645,21 @@ def _parse_object(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> Par
 
     for field_element in _children(element, "fields"):
         _emit_field(emit, field_element, owner=api_name, module_uid=module_uid, parent_uid=object_uid)
+    # `<nameField>` is a CustomField in every respect except that it states no
+    # `fullName` -- it is always `Name`. Without it `sobject.<Obj>.Name` is the target
+    # of every `SELECT Name` and every `@salesforce/schema/<Obj>.Name` with no
+    # definition anywhere, so the reference resolves to an `ext/` stub beside the
+    # object it belongs to.
+    name_field = _child(element, "nameField")
+    if name_field is not None:
+        _emit_field(
+            emit,
+            name_field,
+            owner=api_name,
+            module_uid=module_uid,
+            parent_uid=object_uid,
+            fallback_name="Name",
+        )
 
     return emit.result()
 
@@ -705,6 +730,72 @@ def _prose(element: Node) -> str | None:
     return "\n".join(seen) or None
 
 
+def _field_reference(owner: str, value: str | None) -> str | None:
+    """A field reference's ``sobject.<Object>.<Field>`` target, or ``None``.
+
+    Salesforce writes field references two ways in the same document and the
+    difference is not marked: ``summarizedField``, ``summaryForeignKey`` and every
+    ``filterItems/field`` carry a **dotted** ``<Object>.<Field>`` naming a *different*
+    object (``Grant_Deadline__c.Grant_Deadline_Due_Date__c`` on an Opportunity field),
+    while ``controllingField`` and friends carry a bare name relative to the owning
+    object.
+
+    Reading the dot rather than the element name means one rule covers both, and it
+    stays correct if an element this module has not sampled turns out to use the other
+    form — which matters, because three of the eight elements handled here occur in
+    none of the 400 real field files sampled.
+    """
+    if not value:
+        return None
+    head, dot, tail = value.strip().partition(".")
+    if dot:
+        target_object, field = _api_name(head), _api_name(tail)
+    else:
+        target_object, field = _api_name(owner), _api_name(head)
+    if target_object is None or field is None:
+        return None
+    return f"{SOBJECT_NAMESPACE}.{target_object}.{field}"
+
+
+_FIELD_REFERENCE_TAGS: tuple[str, ...] = (
+    "summarizedField",
+    "summaryForeignKey",
+    "referenceTargetField",
+    "metadataRelationshipControllingField",
+)
+"""Direct children of ``CustomField`` naming one field."""
+
+_FIELD_REFERENCE_CONTAINERS: tuple[str, ...] = ("summaryFilterItems", "lookupFilter")
+"""Children holding ``filterItems``/``field`` pairs — a roll-up's filter and a lookup's."""
+
+
+def _field_references(element: Node, owner: str, value_set: Node | None) -> set[str]:
+    """Every ``sobject.<Object>.<Field>`` this field's declaration names.
+
+    Eight elements across three shapes: a direct child holding one name, a
+    ``filterItems``-bearing container (``summaryFilterItems`` holds ``field``
+    directly, ``lookupFilter`` wraps its own ``filterItems``), and
+    ``controllingField`` inside ``<valueSet>``.
+    """
+    targets: set[str] = set()
+    for tag in _FIELD_REFERENCE_TAGS:
+        reference = _field_reference(owner, _text_of(element, tag))
+        if reference is not None:
+            targets.add(reference)
+    for container_tag in _FIELD_REFERENCE_CONTAINERS:
+        for container in _children(element, container_tag):
+            for item in (container, *_children(container, "filterItems")):
+                for value in _texts_of(item, "field"):
+                    reference = _field_reference(owner, value)
+                    if reference is not None:
+                        targets.add(reference)
+    if value_set is not None:
+        controlling = _field_reference(owner, _text_of(value_set, "controllingField"))
+        if controlling is not None:
+            targets.add(controlling)
+    return targets
+
+
 def _emit_field(
     emit: _Emit,
     element: Node,
@@ -731,6 +822,7 @@ def _emit_field(
     field_type = _text_of(element, "type")
     formula = _text_of(element, "formula")
     reference_to = _texts_of(element, "referenceTo")
+    value_set = _child(element, "valueSet")
     field_uid = emit.add(
         name=api_name,
         qn_suffix=f"{SOBJECT_NAMESPACE}.{owner}.{_qn_segment(api_name)}",
@@ -752,7 +844,10 @@ def _emit_field(
                 "reference_to": reference_to[0] if reference_to else None,
                 "relationship_name": _text_of(element, "relationshipName"),
                 "delete_constraint": _text_of(element, "deleteConstraint"),
-                "value_set_name": _text_of(element, "valueSetName"),
+                # `valueSetName` and `controllingField` are children of `<valueSet>`,
+                # not of `CustomField`, and `_text_of` reads direct children only —
+                # so reading them off the root silently produced nothing at all.
+                "value_set_name": _text_of(value_set, "valueSetName") if value_set is not None else None,
             }
         ),
     )
@@ -774,10 +869,20 @@ def _emit_field(
     # module docstring for why.
     for target in reference_to:
         emit.imports_sobject(field_uid, target)
-    # A roll-up summary names its child object as `Object.Field`.
-    summary_key = _text_of(element, "summaryForeignKey")
-    if summary_key and "." in summary_key:
-        emit.imports_sobject(field_uid, summary_key.split(".", 1)[0])
+
+    # Every field-level reference this field states. All are emitted from the field,
+    # never from the object: `_recreate_file_relationships` deletes by the source
+    # node's file_path, and a decomposed field lives in its own file.
+    for target in sorted(_field_references(element, owner, value_set)):
+        emit.rel(field_uid, RelType.IMPORTS, target)
+        # The object half as well: it is the only answer when a retrieve is partial
+        # or the field is standard and has no file of its own.
+        emit.imports_sobject(field_uid, target.split(".")[1])
+
+    if value_set is not None:
+        value_set_name = _api_name(_text_of(value_set, "valueSetName"))
+        if value_set_name is not None:
+            emit.rel(field_uid, RelType.IMPORTS, f"{GLOBAL_VALUE_SET_NAMESPACE}.{value_set_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -1375,6 +1480,51 @@ def _lwc_apex_classes(element: Node) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# GlobalValueSet
+# ---------------------------------------------------------------------------
+
+_GLOBAL_VALUE_SET_MODULE_KIND = "sf_global_value_set"
+_GLOBAL_VALUE_SET_KIND = "global_value_set"
+
+
+def _parse_global_value_set(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``globalValueSets/<Name>.globalValueSet-meta.xml`` -> one ``Value``.
+
+    The picklist definition several fields share.  Named for the **file base**
+    because that is what a field's ``valueSetName`` writes; see
+    :data:`GLOBAL_VALUE_SET_NAMESPACE` for why the documented ``masterLabel`` is
+    the wrong choice.
+
+    ``customValue`` children are not minted, for the reason ``recordTypes``'
+    ``picklistValues`` are not: a picklist entry answers no question asked of a
+    code graph, and there are dozens per file.
+    """
+    api_name = _api_name(meta.base)
+    if api_name is None:
+        return None
+    module_uid = _module(emit, path, _GLOBAL_VALUE_SET_MODULE_KIND, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=api_name,
+        qn_suffix=f"{GLOBAL_VALUE_SET_NAMESPACE}.{api_name}",
+        label=NodeLabel.VALUE,
+        kind=_GLOBAL_VALUE_SET_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact(
+            {
+                "master_label": _text_of(element, "masterLabel"),
+                "sorted": _bool_of(element, "sorted"),
+                "value_count": len(_children(element, "customValue")) or None,
+            }
+        ),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+    return emit.result()
+
+
+# ---------------------------------------------------------------------------
 # Decomposed children of CustomObject
 #
 # SFDX splits an object into a directory tree, so each of these files states one
@@ -1616,6 +1766,7 @@ _HANDLERS: dict[str, Callable[[_Emit, Node, str, _MetaFile], ParsedFile | None]]
     "FieldSet": _parse_field_set,
     "WebLink": _parse_web_link,
     "ListView": _parse_list_view,
+    "GlobalValueSet": _parse_global_value_set,
 }
 """Root element name -> handler.  This *is* the supported-type list.
 

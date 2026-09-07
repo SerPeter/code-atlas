@@ -21,6 +21,7 @@ pytest.importorskip("tree_sitter_xml", reason="tree-sitter-xml not installed")
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, parse_file
 from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
 from code_atlas.parsing.languages.salesforce import (
+    GLOBAL_VALUE_SET_NAMESPACE,
     LABEL_NAMESPACE,
     LWC_NAMESPACE,
     PAGE_NAMESPACE,
@@ -403,7 +404,12 @@ def test_formula_body_is_searchable_source():
     assert _one(parsed, "sobject_field").source == "TODAY() - Date_Listed__c"
 
 
-def test_rollup_summary_references_the_child_object():
+def test_rollup_summary_references_the_child_object_and_its_fields():
+    """A roll-up names the child field it aggregates, not only the child object.
+
+    Both halves are kept: the object is the only answer when the field is standard
+    and has no file of its own.
+    """
     source = """\
 <?xml version="1.0"?>
 <CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
@@ -415,7 +421,166 @@ def test_rollup_summary_references_the_child_object():
 """
     parsed = _parse(source, f"{OBJECTS}/Broker__c/fields/Total_Price__c.field-meta.xml")
     field_uid = _one(parsed, "sobject_field").qualified_name
-    assert _targets(parsed, field_uid, RelType.IMPORTS) == {f"{SOBJECT_NAMESPACE}.Property__c"}
+    assert _targets(parsed, field_uid, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Property__c",
+        f"{SOBJECT_NAMESPACE}.Property__c.Price__c",
+        f"{SOBJECT_NAMESPACE}.Property__c.Broker__c",
+    }
+
+
+def test_a_rollup_states_every_reference_it_carries():
+    """SalesforceFoundation/NPSP `Opportunity/Next_Grant_Deadline_Due_Date__c`, verbatim.
+
+    Four field-level references in one file. Before this story the graph held the
+    object half of one of them.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Next_Grant_Deadline_Due_Date__c</fullName>
+    <label>Next Deliverable Date</label>
+    <summarizedField>Grant_Deadline__c.Grant_Deadline_Due_Date__c</summarizedField>
+    <summaryFilterItems>
+        <field>Grant_Deadline__c.Grant_Deadline_Due_Date__c</field>
+        <operation>notEqual</operation>
+    </summaryFilterItems>
+    <summaryFilterItems>
+        <field>Grant_Deadline__c.Grant_Deliverable_Close_Date__c</field>
+        <operation>equals</operation>
+    </summaryFilterItems>
+    <summaryForeignKey>Grant_Deadline__c.Opportunity__c</summaryForeignKey>
+    <summaryOperation>min</summaryOperation>
+    <type>Summary</type>
+</CustomField>
+"""
+    path = f"{OBJECTS}/Opportunity/fields/Next_Grant_Deadline_Due_Date__c.field-meta.xml"
+    parsed = _parse(source, path)
+    assert _targets(parsed, _one(parsed, "sobject_field").qualified_name, RelType.IMPORTS) == {
+        f"{SOBJECT_NAMESPACE}.Grant_Deadline__c",
+        f"{SOBJECT_NAMESPACE}.Grant_Deadline__c.Grant_Deadline_Due_Date__c",
+        f"{SOBJECT_NAMESPACE}.Grant_Deadline__c.Grant_Deliverable_Close_Date__c",
+        f"{SOBJECT_NAMESPACE}.Grant_Deadline__c.Opportunity__c",
+    }
+
+
+def test_a_lookup_filter_names_the_fields_it_filters_on():
+    """SalesforceFoundation/NPSP `Allocation__c/General_Accounting_Unit__c`, trimmed.
+
+    `lookupFilter` wraps its own `filterItems`, one level deeper than
+    `summaryFilterItems`, which holds `field` directly.
+    """
+    source = """\
+<?xml version="1.0"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>General_Accounting_Unit__c</fullName>
+    <type>Lookup</type>
+    <referenceTo>General_Accounting_Unit__c</referenceTo>
+    <lookupFilter>
+        <active>true</active>
+        <filterItems>
+            <field>General_Accounting_Unit__c.Active__c</field>
+            <operation>equals</operation>
+        </filterItems>
+    </lookupFilter>
+</CustomField>
+"""
+    path = f"{OBJECTS}/Allocation__c/fields/General_Accounting_Unit__c.field-meta.xml"
+    parsed = _parse(source, path)
+    targets = _targets(parsed, _one(parsed, "sobject_field").qualified_name, RelType.IMPORTS)
+    assert f"{SOBJECT_NAMESPACE}.General_Accounting_Unit__c.Active__c" in targets
+
+
+def test_a_bare_field_reference_is_relative_to_the_owning_object():
+    """`controllingField` carries a bare name where the roll-up elements carry a dotted one.
+
+    Reading the dot rather than the element name means one rule covers both shapes,
+    which matters because three of the eight elements handled occur in none of the
+    400 real field files sampled and their form could not be confirmed.
+    """
+    source = """\
+<?xml version="1.0"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Sub_Type__c</fullName>
+    <type>Picklist</type>
+    <valueSet>
+        <controllingField>Type__c</controllingField>
+        <restricted>true</restricted>
+    </valueSet>
+</CustomField>
+"""
+    parsed = _parse(source, f"{OBJECTS}/Account/fields/Sub_Type__c.field-meta.xml")
+    targets = _targets(parsed, _one(parsed, "sobject_field").qualified_name, RelType.IMPORTS)
+    assert f"{SOBJECT_NAMESPACE}.Account.Type__c" in targets
+
+
+def test_a_global_value_set_reference_is_read_from_inside_value_set():
+    """SalesforceFoundation/NPSP `DataImport__c/Payment_ACH_Code__c`, verbatim.
+
+    `valueSetName` is a child of `<valueSet>`, and `_text_of` reads direct children
+    only -- so reading it off the `CustomField` root produced nothing at all, and
+    `extra_properties["value_set_name"]` could never be populated.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Payment_ACH_Code__c</fullName>
+    <label>Payment ACH Code</label>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetName>Payment_ACH_Code</valueSetName>
+    </valueSet>
+</CustomField>
+"""
+    path = f"{OBJECTS}/DataImport__c/fields/Payment_ACH_Code__c.field-meta.xml"
+    parsed = _parse(source, path)
+    field = _one(parsed, "sobject_field")
+    assert field.extra_properties["value_set_name"] == "Payment_ACH_Code"
+    assert f"{GLOBAL_VALUE_SET_NAMESPACE}.Payment_ACH_Code" in _targets(parsed, field.qualified_name, RelType.IMPORTS)
+
+
+def test_a_global_value_set_is_named_for_its_file_not_its_label():
+    """The documentation says `masterLabel` and the documentation is wrong.
+
+    NPSP's file declares `<masterLabel>Payment ACH Code</masterLabel>` while every
+    field referencing it writes `Payment_ACH_Code` -- the filename. Minting from the
+    label would join nothing.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<GlobalValueSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <customValue><fullName>PPD</fullName><label>Prearranged</label></customValue>
+    <customValue><fullName>CCD</fullName><label>Cash Concentration</label></customValue>
+    <masterLabel>Payment ACH Code</masterLabel>
+    <sorted>false</sorted>
+</GlobalValueSet>
+"""
+    path = "force-app/main/default/globalValueSets/Payment_ACH_Code.globalValueSet-meta.xml"
+    parsed = _parse(source, path)
+    value_set = _one(parsed, "global_value_set")
+    assert value_set.qualified_name == _uid(f"{GLOBAL_VALUE_SET_NAMESPACE}.Payment_ACH_Code")
+    assert value_set.extra_properties["master_label"] == "Payment ACH Code"
+    # The individual picklist entries are not nodes, for the same reason record
+    # types' picklistValues are not.
+    assert len(parsed.entities) == 2
+
+
+def test_the_name_field_becomes_a_real_field_node():
+    """`sobject.<Obj>.Name` is the target of every `SELECT Name` and had no definition."""
+    source = """\
+<?xml version="1.0"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Broker</label>
+    <nameField>
+        <label>Broker Name</label>
+        <type>Text</type>
+    </nameField>
+    <pluralLabel>Brokers</pluralLabel>
+</CustomObject>
+"""
+    parsed = _parse(source, f"{OBJECTS}/Broker__c/Broker__c.object-meta.xml")
+    names = {entity.qualified_name for entity in parsed.entities}
+    assert _uid(f"{SOBJECT_NAMESPACE}.Broker__c.Name") in names
 
 
 def test_field_outside_the_decomposed_layout_falls_back_to_the_generic_parse():
