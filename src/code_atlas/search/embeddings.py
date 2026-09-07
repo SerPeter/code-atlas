@@ -472,6 +472,14 @@ so these two now mean precisely "XML no handler recognised". One real permission
 contributed 1,944 of them, all named ``fieldPermissions``, all with an empty ``source``,
 and every one was embedded.
 
+``permission_set`` and ``profile`` were considered and NOT excluded. The volume argument
+that motivated it is already answered -- ATL-181 made one 427 KB permission set a single
+node instead of 1,947 -- and the node that remains carries its ``label`` and
+``description`` as its docstring, which is real prose an admin wrote. Its grants live in
+properties and edges, not in its text, so there is nothing table-shaped to exclude. The
+completeness test below is what caught this: every kind excluded here must come from the
+structural fallback, and a kind a handler mints deliberately does not qualify.
+
 ``config_file`` and ``xml_document`` are deliberately absent: the file-level node is named
 after the file and answers "what is this config for", which is a fair semantic target. It
 is one node per file, so it is not what floods anything.
