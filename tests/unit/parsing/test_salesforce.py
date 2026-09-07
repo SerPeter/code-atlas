@@ -21,7 +21,6 @@ pytest.importorskip("tree_sitter_xml", reason="tree-sitter-xml not installed")
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, parse_file
 from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
 from code_atlas.parsing.languages.salesforce import (
-    AURA_NAMESPACE,
     FLEXIPAGE_NAMESPACE,
     GLOBAL_VALUE_SET_NAMESPACE,
     LABEL_NAMESPACE,
@@ -33,7 +32,7 @@ from code_atlas.parsing.languages.salesforce import (
     TAB_NAMESPACE,
     looks_like_salesforce_metadata,
 )
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import CUSTOM_COMPONENT_PREFIX, NodeLabel, RelType
 
 PROJECT = "test_project"
 
@@ -1420,8 +1419,9 @@ def test_a_flexipage_names_the_components_it_places():
     parsed = _parse(source, f"{FLEXIPAGES}/Property_Record_Page.flexipage-meta.xml")
     page = _one(parsed, "flexipage")
     targets = _targets(parsed, page.qualified_name, RelType.IMPORTS)
-    assert f"{LWC_NAMESPACE}.propertyMap" in targets
-    assert f"{AURA_NAMESPACE}.propertyMap" in targets
+    # Kind-agnostic: a FlexiPage writes a custom Aura and a custom LWC name
+    # identically, so the target names neither and `resolve_imports` widens it.
+    assert f"{CUSTOM_COMPONENT_PREFIX}propertyMap" in targets
     assert f"{SOBJECT_NAMESPACE}.Property__c" in targets
     assert not any("highlightsPanel" in target for target in targets)
 

@@ -65,7 +65,7 @@ from code_atlas.parsing.languages.apex import (
     SOBJECT_NAMESPACE,
 )
 from code_atlas.parsing.languages.salesforce import AURA_NAMESPACE, LWC_NAMESPACE
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import CUSTOM_COMPONENT_PREFIX, NodeLabel, RelType
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -287,28 +287,22 @@ def _markup_text_references(source: bytes) -> set[str]:
 
 
 def _custom_component_targets(tag: str) -> list[str]:
-    """`<c:foo>` -> the component it names, which the file does not say enough to identify.
+    """`<c:foo>` -> one kind-agnostic target, because a file cannot say which kind it is.
 
-    Salesforce shares one `c` namespace between Aura and LWC -- you cannot have an
-    Aura and an LWC component of the same name -- so `<c:foo>` is unambiguous *in an
-    org* and completely ambiguous *in a file*. A parser sees one file and has no way
-    to know which kind `foo` is, and this codebase mints the two under different
-    namespaces (`aura.foo`, `lwc.foo`).
+    Salesforce shares one `c` namespace between Aura and LWC and forbids the two from
+    holding the same name, so `<c:foo>` names exactly one component identity -- but
+    nothing in this file says whether `foo` is an Aura bundle or an LWC one, and the
+    two are minted under different namespaces.
 
-    Both are emitted. `resolve_imports` matches the one that exists and mints an
-    `ext/` stub for the other, so every real edge lands and the cost is a stub per
-    reference. The alternative -- picking one -- loses a real edge every time it
-    guesses wrong, and in one measured corpus 38 of 132 Aura `<c:X>` references
-    point at LWC bundles, so neither choice is rare enough to ignore.
-
-    The clean fix is a shared `cmp.<Name>` namespace minted by both handlers, which
-    is what the platform itself has. That would change uids ATL-173 already shipped,
-    so it is a follow-up rather than a detour.
+    So the target is `cmp.foo`, which nothing mints; `resolve_imports` widens it to
+    `aura.foo` then `lwc.foo` and finds the one that exists. Emitting both targets
+    instead -- which is what shipped first -- resolved the true edge and left an
+    `ext/` stub asserting a component of the other kind that was never referenced.
     """
     name = tag.partition(":")[2]
     if not _API_NAME.match(name):
         return []
-    return [f"{AURA_NAMESPACE}.{name}", f"{LWC_NAMESPACE}.{name}"]
+    return [f"{CUSTOM_COMPONENT_PREFIX}{name}"]
 
 
 def _aura_bundle(file_path: str) -> str | None:
@@ -337,7 +331,11 @@ def _aura_references(root: Node, source: bytes) -> set[str]:
             # INHERITS target never matches and a missing base vanishes silently.
             extends = attributes.get("extends", "")
             if extends.startswith(_CUSTOM_TAG_PREFIX):
-                targets.update(_custom_component_targets(extends))
+                # Not the kind-agnostic form: only an Aura component can be extended,
+                # so this one reference IS resolvable from a single file.
+                extended = extends.partition(":")[2]
+                if _API_NAME.match(extended):
+                    targets.add(f"{AURA_NAMESPACE}.{extended}")
     return targets
 
 

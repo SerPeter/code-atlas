@@ -23,7 +23,7 @@ from code_atlas.parsing.languages.apex import (
 )
 from code_atlas.parsing.languages.markup import kebab_to_module
 from code_atlas.parsing.languages.salesforce import AURA_NAMESPACE, LWC_NAMESPACE
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import CUSTOM_COMPONENT_PREFIX, NodeLabel, RelType
 
 PROJECT = "test_project"
 LWC = "force-app/main/default/lwc"
@@ -176,20 +176,35 @@ def test_an_aura_bundle_names_its_controller_children_and_labels():
     assert not any(target.endswith((".doInit", ".this")) for target in targets)
 
 
-def test_a_custom_tag_targets_both_component_kinds():
-    """`<c:foo>` cannot say whether `foo` is Aura or LWC, and both are emitted.
+def test_a_custom_tag_takes_one_kind_agnostic_target():
+    """`<c:foo>` cannot say whether `foo` is Aura or LWC, so it names neither.
 
-    Salesforce shares one `c` namespace between the two, so the reference is
-    unambiguous in an org and completely ambiguous in a file. `resolve_imports`
-    matches whichever node exists and stubs the other; picking one instead would
-    lose a real edge every time it guessed wrong, and in one measured corpus 38 of
-    132 Aura `<c:X>` references point at LWC bundles.
+    Salesforce shares one `c` namespace between the two and forbids them holding the
+    same name, so the reference is unambiguous in an org and ambiguous in a file.
+    Emitting `aura.foo` AND `lwc.foo` -- which shipped first -- resolved the true
+    edge and left an `ext/` stub asserting a component that was never referenced.
+    `resolve_imports` widens the single `cmp.` target instead.
     """
     source = "<aura:component>\n    <c:bdiObjectMappings />\n</aura:component>\n"
     parsed = _parse(source, f"{AURA}/Wrapper/Wrapper.cmp")
     targets = _imports(parsed)
-    assert f"{AURA_NAMESPACE}.bdiObjectMappings" in targets
-    assert f"{LWC_NAMESPACE}.bdiObjectMappings" in targets
+    assert f"{CUSTOM_COMPONENT_PREFIX}bdiObjectMappings" in targets
+    assert f"{AURA_NAMESPACE}.bdiObjectMappings" not in targets
+    assert f"{LWC_NAMESPACE}.bdiObjectMappings" not in targets
+
+
+def test_extends_names_an_aura_component_directly():
+    """`extends` is the one component reference a single file CAN resolve.
+
+    Only an Aura component can be extended -- an LWC cannot be, and an Aura
+    component cannot extend an LWC -- so this one does not need widening.
+    """
+    parsed = _parse(
+        '<aura:component extends="c:BaseCmp"></aura:component>\n',
+        f"{AURA}/Child/Child.cmp",
+    )
+    assert f"{AURA_NAMESPACE}.BaseCmp" in _imports(parsed)
+    assert f"{CUSTOM_COMPONENT_PREFIX}BaseCmp" not in _imports(parsed)
 
 
 def test_a_visualforce_page_names_its_controllers_and_object():

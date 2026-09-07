@@ -149,7 +149,7 @@ from code_atlas.parsing.languages.apex import (
     PAGE_NAMESPACE,
     SOBJECT_NAMESPACE,
 )
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import CUSTOM_COMPONENT_PREFIX, NodeLabel, RelType
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -1525,17 +1525,16 @@ def _surfaced_component_targets(name: str | None) -> list[str]:
 
     A colon means a platform component (``force:highlightsPanel``,
     ``flexipage:column``) — those are Salesforce's own and have no node here. A bare
-    name is a custom component, and is written **identically** for Aura and LWC, so
-    both are emitted for the reason :func:`markup._custom_component_targets` gives at
-    length: the platform shares one namespace between the two kinds, so the name is
-    unambiguous in an org and ambiguous in a file.
+    name is a custom component, written **identically** for Aura and LWC, so it takes
+    the kind-agnostic ``cmp.`` target that ``resolve_imports`` widens across both —
+    see :func:`markup._custom_component_targets`.
     """
     if not name or ":" in name:
         return []
     api_name = _api_name(name)
     if api_name is None:
         return []
-    return [f"{LWC_NAMESPACE}.{api_name}", f"{AURA_NAMESPACE}.{api_name}"]
+    return [f"{CUSTOM_COMPONENT_PREFIX}{api_name}"]
 
 
 def _quick_action_reference(value: str | None) -> str | None:
