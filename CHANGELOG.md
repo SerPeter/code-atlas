@@ -2,6 +2,278 @@
 
 <!-- version list -->
 
+## v0.12.0 (2026-09-07)
+
+### Bug Fixes
+
+- **backends**: Match SQLite LIKE's ASCII case folding in doc-link suffixes
+  ([`e475900`](https://github.com/SerPeter/code-atlas/commit/e475900ce0d8f7b1d1ff888cd9f5f3fbfba32d99))
+
+- **backends**: Serialise temporal frontmatter values in SQLite props
+  ([`1e83e07`](https://github.com/SerPeter/code-atlas/commit/1e83e07e47798f55c4f6adefe7fb4e2dd6935126))
+
+- **backends**: Stop SQLite dropping cross-file DEFINES on re-parse
+  ([`d6ea10e`](https://github.com/SerPeter/code-atlas/commit/d6ea10e5caca7185206da2303ea9891d36fc8a00))
+
+- **bench**: Create the schema before measuring, and correct the numbers
+  ([`effcee3`](https://github.com/SerPeter/code-atlas/commit/effcee3eff4c261c9845aef93ad4b181d1840133))
+
+- **bench**: Create the schema in atlas bench too
+  ([`9782b47`](https://github.com/SerPeter/code-atlas/commit/9782b47341cd805b894b38b3aae0ae0952dbe87e))
+
+- **cli**: Stop the memgraph benchmark writing into the live index
+  ([`8dd572e`](https://github.com/SerPeter/code-atlas/commit/8dd572e4610b9cc9906fd912cce9896192e45c49))
+
+- **graph**: Close the cmp. fold gap and stop grants faking liveness
+  ([`08ad5ee`](https://github.com/SerPeter/code-atlas/commit/08ad5ee94c13ce9438f8efc309d40752a0df832e))
+
+- **indexing**: Make the final resolution flush visible to teardown and the bench
+  ([`0258752`](https://github.com/SerPeter/code-atlas/commit/02587520e2bd7011d9172e15cea8d8be4aabc047))
+
+- **parsing**: Cap the XML fallback and stop truncating CustomLabels
+  ([`1dc4254`](https://github.com/SerPeter/code-atlas/commit/1dc4254c95619fb39ddfa40bd0178896e119054c))
+
+- **parsing**: Stop TMDL name folding merging two objects onto one uid
+  ([`3270d1d`](https://github.com/SerPeter/code-atlas/commit/3270d1d19c3e6f96499ac352f6df557ad47b2ca9))
+
+- **search**: Route underscored and camelCase identifiers as identifiers
+  ([`c5c9526`](https://github.com/SerPeter/code-atlas/commit/c5c95267b3fd668a8b4d217615c4174c6a7cc5da))
+
+- **server**: Rank permission grants below code in blast_radius
+  ([`6719142`](https://github.com/SerPeter/code-atlas/commit/6719142126b1458419827f411c8ee50a2b3b33a1))
+
+- **tests**: Measure langcov's denominator on the tree the parser walks
+  ([`b957de3`](https://github.com/SerPeter/code-atlas/commit/b957de3d1dd5fc2e74746d6fbe449fd565f1969b))
+
+### Build System
+
+- **deps**: Add tree-sitter-html as an optional extra
+  ([`a460ccf`](https://github.com/SerPeter/code-atlas/commit/a460ccf419ebcffee20b872eaf7ba3403fa67c85))
+
+### Documentation
+
+- Correct two claims the benchmark work disproved
+  ([`b248a0b`](https://github.com/SerPeter/code-atlas/commit/b248a0bd1f29b210589f772bd964591fe85d8f69))
+
+- Document atlas bench and what its numbers mean
+  ([`b496a64`](https://github.com/SerPeter/code-atlas/commit/b496a64548ce39c8b89fec02c19010a4e26da6f6))
+
+- Record that ADR-0048's XML exception is closed
+  ([`0d11fa9`](https://github.com/SerPeter/code-atlas/commit/0d11fa93ad38c7470101979cee3cf3617246cace))
+
+- Record the config resolution order in CLAUDE.md
+  ([`3f737af`](https://github.com/SerPeter/code-atlas/commit/3f737af071baf9d2bac898975e12b32e0d28d9f1))
+
+- Record the SQLite side-table invariants
+  ([`f63974e`](https://github.com/SerPeter/code-atlas/commit/f63974ebc181ff00c27a487a9a9f1f0946f0104f))
+
+- **adr**: Re-check memgraph#4473 against the current release
+  ([`42c0c59`](https://github.com/SerPeter/code-atlas/commit/42c0c59c18465ba8bbb630d9dec5003d1c8e3c6d))
+
+- **adr**: Record how Power BI is modelled in the graph
+  ([`16d9896`](https://github.com/SerPeter/code-atlas/commit/16d98966ca1152c126fbb59e11c497c835d3e076))
+
+- **adr**: Record how the benchmark suite decides what to measure
+  ([`c8c1385`](https://github.com/SerPeter/code-atlas/commit/c8c13854cb9d27a23f27dbc09af0fbc3236fbe49))
+
+- **embeddings**: Record why permission kinds keep their vector
+  ([`87c6b26`](https://github.com/SerPeter/code-atlas/commit/87c6b260a5f0563d7b380bb0b82e363cf5a6f725))
+
+- **parsing**: Correct what the permission-edge cap says the real fix is
+  ([`076887f`](https://github.com/SerPeter/code-atlas/commit/076887ff5ffe2b8363c270982c6cf371afab9892))
+
+### Features
+
+- **backends**: Instrument the SQLite backend on Memgraph's metrics
+  ([`5680462`](https://github.com/SerPeter/code-atlas/commit/5680462e91eefdaf264d88a931fbade6b60b663a))
+
+- **backends**: Let the .atlas directory ignore itself
+  ([`7d6f3c6`](https://github.com/SerPeter/code-atlas/commit/7d6f3c664c50e43ba3955632065a078ac2e8a59c))
+
+- **bench**: --embed-transport routes embeddings over a real loopback socket
+  ([`6badb85`](https://github.com/SerPeter/code-atlas/commit/6badb85467f008b691cb3ba027df7f8411672b35))
+
+- **bench**: Count languages, demand shapes, and survive offline
+  ([`bb2050e`](https://github.com/SerPeter/code-atlas/commit/bb2050e000db2e5b6fd5b82fb644a8fedefdd1a2))
+
+- **bench**: Count tokenizer calls, report vector provenance, fail closed
+  ([`f5c5616`](https://github.com/SerPeter/code-atlas/commit/f5c5616393abcad1d82024269f95c626b75b8c11))
+
+- **bench**: Pin the corpus and assert what it contained
+  ([`405490f`](https://github.com/SerPeter/code-atlas/commit/405490f264c68d45083bd8ee2084f8480918685b))
+
+- **bench**: Separate work from pacing and contention in one report
+  ([`74f781c`](https://github.com/SerPeter/code-atlas/commit/74f781c3316d68f4d8f5e33b60feceedf7f5f82f))
+
+- **bench**: Store baselines with a fingerprint, and refuse invalid comparisons
+  ([`fca0102`](https://github.com/SerPeter/code-atlas/commit/fca0102ec604ea2737f6d64659cab2223132fb4e))
+
+- **embeddings**: Exclude the XML fallback's kinds by default
+  ([`258e20c`](https://github.com/SerPeter/code-atlas/commit/258e20c8f4fde76a010ff877782123616ce910b8))
+
+- **embeddings**: Separate embedding from indexing with a policy
+  ([`7dae4f0`](https://github.com/SerPeter/code-atlas/commit/7dae4f01a17152dcdf2a070207ee432ef2c43105))
+
+- **graph**: Resolve warehouse objects to the models that produce them
+  ([`32b75f5`](https://github.com/SerPeter/code-atlas/commit/32b75f514ccf41c84bf7936d266bebb73cbf8bce))
+
+- **graph**: Widen cmp. targets and fold Salesforce names case-insensitively
+  ([`4e0a66b`](https://github.com/SerPeter/code-atlas/commit/4e0a66bd1860949a729114aea5e4062e9c231cb6))
+
+- **indexing**: Index .html, and exclude generated HTML reports
+  ([`0923be3`](https://github.com/SerPeter/code-atlas/commit/0923be3a36808e3e5ca2cf0fc5156e96c3025201))
+
+- **indexing**: Put Aura and Visualforce suffixes in scope
+  ([`cd6e910`](https://github.com/SerPeter/code-atlas/commit/cd6e9103bb074f11bed48e64275ffdc58e8f307e))
+
+- **parsing**: Declare the Aura bundle namespace
+  ([`1586398`](https://github.com/SerPeter/code-atlas/commit/1586398158e799988b5a0a927decc18dd55242e2))
+
+- **parsing**: Emit one kind-agnostic target for a custom component
+  ([`32f549b`](https://github.com/SerPeter/code-atlas/commit/32f549b9dc76ce11377088df82b4227f301066f1))
+
+- **parsing**: Extract the warehouse object each TMDL partition reads
+  ([`f605e45`](https://github.com/SerPeter/code-atlas/commit/f605e45aabaaf198c6f55a02433205ae389fcb99))
+
+- **parsing**: Give CustomObject's decomposed children their own handlers
+  ([`8f4fac9`](https://github.com/SerPeter/code-atlas/commit/8f4fac96d7c6cd5009e2203c017e7937127e2642))
+
+- **parsing**: Index Aura bundles and Visualforce markup
+  ([`03ea953`](https://github.com/SerPeter/code-atlas/commit/03ea953264c081e4cd819a07bbe4a98142b91b63))
+
+- **parsing**: Index Lightning message channels and thin the Apex sidecars
+  ([`dd1b586`](https://github.com/SerPeter/code-atlas/commit/dd1b586ea287e6e45771fc3da3ea2518a1eaa53d))
+
+- **parsing**: Keep the field half of an LWC schema import
+  ([`14437fe`](https://github.com/SerPeter/code-atlas/commit/14437fe364aaae46cc43b409ff44f73952cd5d87))
+
+- **parsing**: Let a language parse text with no tree-sitter grammar
+  ([`c99286f`](https://github.com/SerPeter/code-atlas/commit/c99286feda5840c8d285727108f235eb0a338853))
+
+- **parsing**: Let an application format claim files of a shared extension
+  ([`991d6f0`](https://github.com/SerPeter/code-atlas/commit/991d6f0969e8eee93dd9f3997c5ba65c23847049))
+
+- **parsing**: Make a field's roll-up, filter and picklist references edges
+  ([`21b16de`](https://github.com/SerPeter/code-atlas/commit/21b16de4ade517be5d939dd5252e2f36c14b8c77))
+
+- **parsing**: Make a flow's field and component references edges
+  ([`e76e8ec`](https://github.com/SerPeter/code-atlas/commit/e76e8ec4ed7ef52073ee748a0cc53344e3674fe6))
+
+- **parsing**: Make a permission set say who can reach what
+  ([`fe80193`](https://github.com/SerPeter/code-atlas/commit/fe80193cddf8f8b40af68da409fc7f802397e335))
+
+- **parsing**: Make an LWC bundle one addressable node
+  ([`65843c9`](https://github.com/SerPeter/code-atlas/commit/65843c9e0917e142cfcc8ce1a388be5c5ed6f75a))
+
+- **parsing**: Make Apex's declarative references edges
+  ([`6f3bca3`](https://github.com/SerPeter/code-atlas/commit/6f3bca317309d88ad30e98c499c20e03592fb232))
+
+- **parsing**: Make LWC template composition an edge in the graph
+  ([`9ef1268`](https://github.com/SerPeter/code-atlas/commit/9ef126897cf4402dba7290d9c464daaa61c44be0))
+
+- **parsing**: Parse PBIR reports into named pages and visuals
+  ([`f8716a8`](https://github.com/SerPeter/code-atlas/commit/f8716a86ec6710082ce97ab215cbefd1efe7ec45))
+
+- **parsing**: Parse Power BI TMDL semantic models
+  ([`9d37184`](https://github.com/SerPeter/code-atlas/commit/9d37184ab96b9819ff6472e8d34c990159238301))
+
+- **parsing**: Read the TMDL model relationship graph
+  ([`42262ce`](https://github.com/SerPeter/code-atlas/commit/42262cea044902b095eba20ef62f7bc227c3b49f))
+
+- **parsing**: Read TMDL user-defined functions and security roles
+  ([`0405f11`](https://github.com/SerPeter/code-atlas/commit/0405f111528756dd3348534c1aa423e2e8bca616))
+
+- **parsing**: Resolve an LWC sibling import to the bundle node
+  ([`c35ac3a`](https://github.com/SerPeter/code-atlas/commit/c35ac3ae49d666f54055145cab1f10c325b5108b))
+
+- **parsing**: Resolve LWC label and message-channel imports
+  ([`ac37f05`](https://github.com/SerPeter/code-atlas/commit/ac37f05cb821202299517d1b08a0a901541776c8))
+
+- **parsing**: Say where a component is surfaced
+  ([`64cbdd9`](https://github.com/SerPeter/code-atlas/commit/64cbdd9888a04f7e05f4a960dd3b8a98d7891e7a))
+
+- **search**: Back the rate limiter with SQLite when the queue is SQLite
+  ([`07a5b9a`](https://github.com/SerPeter/code-atlas/commit/07a5b9a892f2ff3b4aace59bb2b3ac07773a3787))
+
+### Performance Improvements
+
+- **backends**: Index what the SQLite planner can prove
+  ([`58a90cc`](https://github.com/SerPeter/code-atlas/commit/58a90ccee26d7ff73652eca71469d0d0b6764dc4))
+
+- **backends**: Key the SQLite FTS tables by rowid, not uid
+  ([`4b01781`](https://github.com/SerPeter/code-atlas/commit/4b017818b02efc4682f08149086dfe42eb3df31e))
+
+- **backends**: Make the SQLite vector index a shortlist, not a second copy
+  ([`42a4bbd`](https://github.com/SerPeter/code-atlas/commit/42a4bbde3e34184edbc1d36f73e7879de4494cf6))
+
+- **backends**: Resolve doc links in two queries, not two per link
+  ([`8cecdda`](https://github.com/SerPeter/code-atlas/commit/8cecdda7e03815753f968057db1fdbef19a01251))
+
+- **backends**: Write a batch of vectors in one pass, not four per vector
+  ([`494f616`](https://github.com/SerPeter/code-atlas/commit/494f61653fcaab98e1fa077acf705668f246022f))
+
+- **chunking**: Stop re-tokenizing the accumulator on every piece
+  ([`67515e9`](https://github.com/SerPeter/code-atlas/commit/67515e92cc1048eeb973835ed019a32ae9a68941))
+
+- **embeddings**: Memoise count_tokens, bounded
+  ([`0d5e92b`](https://github.com/SerPeter/code-atlas/commit/0d5e92b7e23ad36e67a1d40a19f89e5729d49aa5))
+
+- **graph**: Ask for every detector name at once
+  ([`ebf5905`](https://github.com/SerPeter/code-atlas/commit/ebf5905c7316b2fd916417933fe30fdca3ba9ef4))
+
+- **indexing**: Stop the drain settle overshooting its own window
+  ([`cb1afe5`](https://github.com/SerPeter/code-atlas/commit/cb1afe59e733378467d9416785f7f70deae72b51))
+
+### Refactoring
+
+- **parsing**: Claim Salesforce XML by dialect, not by a hand-off
+  ([`a9dc689`](https://github.com/SerPeter/code-atlas/commit/a9dc68966929bcbbd4abfff72be71307e15b46c6))
+
+### Testing
+
+- **bench**: Benchmark every language against real source, with a ledger
+  ([`7342860`](https://github.com/SerPeter/code-atlas/commit/7342860a56bee71ddabf1c99a2eda8ff32b5239c))
+
+- **bench**: Correct the parser profile figures, which did not add up
+  ([`d40310d`](https://github.com/SerPeter/code-atlas/commit/d40310d819636399570996795c3be0158431f78a))
+
+- **bench**: Count refused files, catch vanished grammars, pin determinism
+  ([`e4e106f`](https://github.com/SerPeter/code-atlas/commit/e4e106face7ec11110387050e6c5c6a2da0cb6ee))
+
+- **bench**: Instruction-count the query path's pure-CPU stages
+  ([`c1fca5c`](https://github.com/SerPeter/code-atlas/commit/c1fca5cef46ea901a3addba6bd9e90a0888adee9))
+
+- **bench**: Measure each retrieval arm alone, and assert results not latency
+  ([`774aa75`](https://github.com/SerPeter/code-atlas/commit/774aa755b972559f8f5e6fc47829703bb6881238))
+
+- **bench**: Measure Memgraph's per-arm search fan-out
+  ([`5bf12f1`](https://github.com/SerPeter/code-atlas/commit/5bf12f1eb8fa830984da1fc8784e2b71a46b9679))
+
+- **bench**: Measure traversal cost against graph size
+  ([`4f14e0a`](https://github.com/SerPeter/code-atlas/commit/4f14e0a17818307c6cd814ff8886074dd881bea6))
+
+- **bench**: Pin Memgraph's per-label round-trip multipliers to their tuples
+  ([`b059f57`](https://github.com/SerPeter/code-atlas/commit/b059f5702318cc479cc8887ce2ab236f2034e73b))
+
+- **bench**: Prove pacing stays out of the work number
+  ([`24bea72`](https://github.com/SerPeter/code-atlas/commit/24bea72af9939d04dba390ab620eb9a49efc060f))
+
+- **bench**: Quantify SQLite scan amplification across the sweep
+  ([`523e28d`](https://github.com/SerPeter/code-atlas/commit/523e28d3118272ff946418ac05a35b50d2d48175))
+
+- **bench**: Re-create the chunking regression max_source_chars caused
+  ([`ec7558c`](https://github.com/SerPeter/code-atlas/commit/ec7558c761cdecb5c41345fa8fed544ffaf82a52))
+
+- **bench**: Report embedding write volume without guessing its cause
+  ([`df0cb21`](https://github.com/SerPeter/code-atlas/commit/df0cb21b9591e129f6ef97281c670050888c17a3))
+
+- **bench**: Sweep graph size independently of batch size on the write path
+  ([`b219a2c`](https://github.com/SerPeter/code-atlas/commit/b219a2c9bdddbe80113a4adf05451b86b0b3c1fd))
+
+- **parsing**: Give apex and salesforce langcov fixtures and floors
+  ([`8c5aab7`](https://github.com/SerPeter/code-atlas/commit/8c5aab73962147883e70b5836d16372b72109d1e))
+
+
 ## v0.11.2 (2026-09-02)
 
 ### Bug Fixes
