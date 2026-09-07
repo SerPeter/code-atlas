@@ -139,6 +139,25 @@ _SALESFORCE_SCHEMA_PREFIX = "@salesforce/schema/"
 _LWC_SIBLING_PREFIX = "c/"
 
 
+def _salesforce_import_targets(specifier: str) -> list[str]:
+    """Every graph target for one specifier — see :func:`_salesforce_import_target`.
+
+    A schema specifier naming a field produces the field *and* its object; every
+    other rewrite produces exactly one target, and an unrecognised specifier none.
+    """
+    if specifier.startswith(_SALESFORCE_SCHEMA_PREFIX):
+        reference = specifier.removeprefix(_SALESFORCE_SCHEMA_PREFIX).strip("/")
+        sobject, _, field = reference.partition(".")
+        if not sobject:
+            return []
+        targets = [f"sobject.{sobject}"]
+        if field:
+            targets.append(f"sobject.{sobject}.{field}")
+        return targets
+    target = _salesforce_import_target(specifier)
+    return [target] if target is not None else []
+
+
 def _salesforce_import_target(specifier: str) -> str | None:
     """Rewrite an LWC ``@salesforce/*`` module specifier into a graph import target.
 
@@ -156,9 +175,15 @@ def _salesforce_import_target(specifier: str) -> str | None:
     exactly, instead of guessing by bare name project-wide).
 
     ``sobject.<Object>`` is the same target the Apex parser emits for SOQL and
-    DML, so both tiers meet on one ``ext/sobject.<Object>`` node.  The field half
-    of ``Account.Name`` is dropped: object-level is the granularity the Apex side
-    can supply, and a half-populated field graph is worse than none.
+    DML, so both tiers meet on one ``ext/sobject.<Object>`` node.
+
+    A specifier naming a field yields **two** targets, the field and its object.
+    The field half used to be dropped, on the grounds that object-level was all the
+    Apex side could supply and a half-populated field graph is worse than none —
+    true when it was written, and no longer: ``salesforce.py`` now mints
+    ``sobject.<Object>.<Field>`` for every decomposed field file, so the specifier
+    lands on a real node.  The object half is kept as well, because it is the only
+    answer when the field is standard and has no file of its own.
 
     ``c/<name>`` is not a ``@salesforce/*`` module at all — it is how one LWC
     imports a sibling bundle, and ``c`` is the default namespace.  It resolves to
@@ -426,14 +451,17 @@ def _process_import(
     # LWC's @salesforce/* pseudo-modules are rewritten, not duplicated: emitting
     # the raw specifier too would leave a second, unjoinable ext/ stub next to the
     # resolved target.
-    salesforce_target = _salesforce_import_target(import_source)
-    relationships.append(
+    # A schema specifier naming a field yields two targets, the field and its object;
+    # everything else yields one, and an unrecognised specifier keeps its raw form.
+    salesforce_targets = _salesforce_import_targets(import_source)
+    relationships.extend(
         ParsedRelationship(
             from_qualified_name=f"{project_name}:{module_qn}",
             rel_type=RelType.IMPORTS,
-            to_name=salesforce_target or import_source,
+            to_name=target,
             properties=props,
         )
+        for target in salesforce_targets or [import_source]
     )
 
 
