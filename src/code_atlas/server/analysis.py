@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
-from code_atlas.schema import primary_label_expr
+from code_atlas.schema import _GRANT_ONLY_KINDS, primary_label_expr
 from code_atlas.search.engine import matches_test_pattern
 
 if TYPE_CHECKING:
@@ -389,6 +389,21 @@ async def blast_radius(
     results = sorted(
         affected.values(),
         key=lambda x: (
+            # Above min_depth, and the only thing that is. A permission set grants one
+            # IMPORTS edge per field it can see — 1,900 from one measured 427 KB file —
+            # and every one lands at depth 1 with a perfect confidence_score, because
+            # IMPORTS carries no `weight` property. With N such documents granting an
+            # entity, the first N slots of a limit-20 answer are permission sets, the
+            # code dependents this tool exists to find are cut, and `truncated` claims
+            # the cut entries were the lowest-impact ones — precisely inverted. Depth-1
+            # code survived only by an accident of the alphabet: `apex.` sorts before
+            # `permset.`.
+            #
+            # They are KEPT, not dropped: deleting a granted field really does break
+            # that permission set's deploy, and ADR-0029 settled that a smaller answer
+            # is not a better one. They simply rank after everything that is a
+            # dependency rather than a visibility rule.
+            x.get("kind") in _GRANT_ONLY_KINDS,
             x["min_depth"],
             x.get("test_only", False),
             -x.get("confidence_score", 1.0),

@@ -1368,6 +1368,43 @@ class TestDeadCodeExclusions:
 
         assert "handler" not in await self._dead(client)
 
+    async def test_a_permission_grant_is_not_proof_of_life(self, client: SqliteGraphClient) -> None:
+        """Being *visible to* a profile is not being *used by* anything.
+
+        A permission set gives every Apex class it grants an inbound IMPORTS, so from
+        the moment permission sets were indexed the plain `NOT ()-[...]->(n)` test was
+        false for every granted class — and in a real org most Apex is granted
+        somewhere. The analysis returned zero dead Apex: a green answer over a
+        denominator the grants had driven to zero, which is the worst shape a
+        regression can take here.
+        """
+        await client.ensure_schema()
+        await self._seed(
+            client,
+            [
+                _entity("UnusedService", "apex.UnusedService", label=NodeLabel.TYPE_DEF, kind="class"),
+                _entity("Admin", "permset.Admin", label=NodeLabel.VALUE, kind="permission_set"),
+            ],
+        )
+        await _insert_edge(client, "proj:permset.Admin", "proj:apex.UnusedService", "IMPORTS", {})
+
+        assert "UnusedService" in await self._dead(client)
+
+    async def test_a_real_reference_still_proves_life(self, client: SqliteGraphClient) -> None:
+        """The ablation for the test above: the exclusion is on the SOURCE's kind, not
+        on IMPORTS itself, so an ordinary IMPORTS from real code still counts."""
+        await client.ensure_schema()
+        await self._seed(
+            client,
+            [
+                _entity("UsedService", "apex.UsedService", label=NodeLabel.TYPE_DEF, kind="class"),
+                _entity("Caller", "apex.Caller", label=NodeLabel.TYPE_DEF, kind="class"),
+            ],
+        )
+        await _insert_edge(client, "proj:apex.Caller", "proj:apex.UsedService", "IMPORTS", {})
+
+        assert "UsedService" not in await self._dead(client)
+
     async def test_an_override_is_reached_through_its_base(self, client: SqliteGraphClient) -> None:
         """Liveness is an OUTBOUND test here — the override runs when the base is called."""
         await client.ensure_schema()
