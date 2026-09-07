@@ -271,6 +271,16 @@ _DEFAULT_INCLUDE: list[str] = [
     # this cheap: a page that is not an LWC template mints exactly one node.
     "*.html",
     "*.htm",
+    # Aura bundles and Visualforce, parsed by the same grammar as an LWC template.
+    # `.app` is two formats: `aura/<B>/<B>.app` is markup while
+    # `applications/<N>.app` is XML metadata, and `markup.py` tells them apart by
+    # the directory rather than by the suffix.
+    "*.cmp",
+    "*.app",
+    "*.evt",
+    "*.intf",
+    "*.page",
+    "*.component",
 ]
 
 # NOTE: the config/data globs above (*.yaml, *.yml, *.json, *.toml, *.xml) put
