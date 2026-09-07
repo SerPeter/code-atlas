@@ -14,8 +14,15 @@ import pytest
 pytest.importorskip("tree_sitter_html", reason="tree-sitter-html not installed")
 
 from code_atlas.parsing.ast import ParsedFile, parse_file
+from code_atlas.parsing.languages.apex import (
+    APEX_NAMESPACE,
+    COMPONENT_NAMESPACE,
+    LABEL_NAMESPACE,
+    PAGE_NAMESPACE,
+    SOBJECT_NAMESPACE,
+)
 from code_atlas.parsing.languages.markup import kebab_to_module
-from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE
+from code_atlas.parsing.languages.salesforce import AURA_NAMESPACE, LWC_NAMESPACE
 from code_atlas.schema import NodeLabel, RelType
 
 PROJECT = "test_project"
@@ -136,3 +143,136 @@ def test_html_comments_do_not_contribute_components():
     parsed = _parse(source, f"{LWC}/productTileList/productTileList.html")
     assert f"{LWC_NAMESPACE}.legacyTile" not in _imports(parsed)
     assert f"{LWC_NAMESPACE}.productTile" in _imports(parsed)
+
+
+# ---------------------------------------------------------------------------
+# Aura bundles and Visualforce markup
+# ---------------------------------------------------------------------------
+
+AURA = "force-app/main/default/aura"
+PAGES = "force-app/main/default/pages"
+
+
+def test_an_aura_bundle_names_its_controller_children_and_labels():
+    """SalesforceFoundation/NPSP `BDI_ManageAdvancedMapping.cmp`, trimmed."""
+    source = """\
+<aura:component implements="lightning:isUrlAddressable" controller="BDI_ManageAdvancedMappingCtrl">
+    <aura:handler name="init" value="{!this}" action="{!c.doInit}" />
+    <div class="slds-grid">
+        <c:bdiObjectMappings ondeployment="{!c.handleDeploymentNotification}" />
+        <c:utilIllustration title="{!$Label.c.commonAdminPermissionErrorTitle}" />
+    </div>
+</aura:component>
+"""
+    path = f"{AURA}/BDI_ManageAdvancedMapping/BDI_ManageAdvancedMapping.cmp"
+    parsed = _parse(source, path)
+    component = next(e for e in parsed.entities if e.kind == "aura_component")
+    assert component.qualified_name == f"{PROJECT}:{AURA_NAMESPACE}.BDI_ManageAdvancedMapping"
+    targets = _imports(parsed)
+    assert f"{APEX_NAMESPACE}.BDI_ManageAdvancedMappingCtrl" in targets
+    assert f"{LABEL_NAMESPACE}.commonAdminPermissionErrorTitle" in targets
+    # `{!c.doInit}` names a controller action and `{!this}` a component reference;
+    # neither is a graph target.
+    assert not any(target.endswith((".doInit", ".this")) for target in targets)
+
+
+def test_a_custom_tag_targets_both_component_kinds():
+    """`<c:foo>` cannot say whether `foo` is Aura or LWC, and both are emitted.
+
+    Salesforce shares one `c` namespace between the two, so the reference is
+    unambiguous in an org and completely ambiguous in a file. `resolve_imports`
+    matches whichever node exists and stubs the other; picking one instead would
+    lose a real edge every time it guessed wrong, and in one measured corpus 38 of
+    132 Aura `<c:X>` references point at LWC bundles.
+    """
+    source = "<aura:component>\n    <c:bdiObjectMappings />\n</aura:component>\n"
+    parsed = _parse(source, f"{AURA}/Wrapper/Wrapper.cmp")
+    targets = _imports(parsed)
+    assert f"{AURA_NAMESPACE}.bdiObjectMappings" in targets
+    assert f"{LWC_NAMESPACE}.bdiObjectMappings" in targets
+
+
+def test_a_visualforce_page_names_its_controllers_and_object():
+    """SalesforceFoundation/NPSP `ACCT_ViewOverride.page`, verbatim.
+
+    `extensions` is the only attribute that takes a list, and real files put spaces
+    after the commas.
+    """
+    source = """\
+<apex:page standardController="Account" extensions="ACCT_ViewOverride_CTRL, ACCT_Second_CTRL">
+    <apex:pageMessages />
+    <c:UTIL_Message />
+</apex:page>
+"""
+    parsed = _parse(source, f"{PAGES}/ACCT_ViewOverride.page")
+    page = next(e for e in parsed.entities if e.kind == "vf_page")
+    assert page.qualified_name == f"{PROJECT}:{PAGE_NAMESPACE}.ACCT_ViewOverride"
+    assert _imports(parsed) == {
+        f"{SOBJECT_NAMESPACE}.Account",
+        f"{APEX_NAMESPACE}.ACCT_ViewOverride_CTRL",
+        f"{APEX_NAMESPACE}.ACCT_Second_CTRL",
+        f"{COMPONENT_NAMESPACE}.UTIL_Message",
+    }
+
+
+def test_object_type_is_the_only_field_reference_markup_can_resolve():
+    """`$ObjectType.O.Fields.F` names both halves; `{!account.Name}` names neither.
+
+    It is the only object-qualified field reference in the Salesforce markup
+    surface, and therefore the only one that can form a valid uid without guessing
+    an owner.
+    """
+    source = """\
+<apex:page standardController="Account">
+    <apex:outputText value="{!$ObjectType.Account.Fields.Rating.Label}" />
+    <apex:outputField value="{!account.Industry}" />
+</apex:page>
+"""
+    parsed = _parse(source, f"{PAGES}/Ratings.page")
+    targets = _imports(parsed)
+    assert f"{SOBJECT_NAMESPACE}.Account.Rating" in targets
+    assert f"{SOBJECT_NAMESPACE}.Account.Industry" not in targets
+
+
+def test_an_application_dot_app_is_not_an_aura_bundle():
+    """`.app` is two formats and only the directory tells them apart.
+
+    `applications/<N>.app` is XML `<CustomApplication>` metadata; treating it as
+    markup would mint an `aura.<N>` node for something that is not a component.
+    """
+    source = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomApplication xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Education Data Architecture</label>
+</CustomApplication>
+"""
+    parsed = _parse(source, "unpackaged/config/dev/applications/Education_Data_Architecture.app")
+    assert [e.kind for e in parsed.entities] == ["html_document"]
+    assert parsed.relationships == []
+
+
+def test_an_aura_application_does_mint_its_bundle():
+    """`aura/<B>/<B>.app` is the one bundle shape whose primary file is not `.cmp`."""
+    source = '<aura:application extends="force:slds">\n    <c:STG_Container />\n</aura:application>\n'
+    parsed = _parse(source, f"{AURA}/STG_App/STG_App.app")
+    component = next(e for e in parsed.entities if e.kind == "aura_component")
+    assert component.qualified_name == f"{PROJECT}:{AURA_NAMESPACE}.STG_App"
+
+
+def test_an_underscore_in_a_tag_name_survives_the_grammar():
+    """The HTML grammar truncates a tag name at an underscore, and Salesforce uses them.
+
+    `<c:UTIL_Message />` parses as `tag_name 'c:UTIL'` plus an `attribute '_Message'`,
+    and plain `<my_widget>` yields `my`. Defensible for HTML, where an underscore is
+    invalid in a custom-element name -- and wrong for Aura and Visualforce, which are
+    not HTML. Trusting the node would have dropped most Salesforce component
+    references, since `UTIL_`/`STG_`/`ACCT_` prefixes are the house style.
+    """
+    parsed = _parse(
+        "<apex:page>\n    <c:UTIL_Message />\n    <c:STG_Container></c:STG_Container>\n</apex:page>\n",
+        f"{PAGES}/Underscores.page",
+    )
+    assert _imports(parsed) == {
+        f"{COMPONENT_NAMESPACE}.UTIL_Message",
+        f"{COMPONENT_NAMESPACE}.STG_Container",
+    }

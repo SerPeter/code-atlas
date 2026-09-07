@@ -44,6 +44,7 @@ error anywhere.
 
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -56,11 +57,23 @@ from code_atlas.parsing.ast import (
     ParsedRelationship,
     register_language,
 )
-from code_atlas.parsing.languages.salesforce import LWC_NAMESPACE
+from code_atlas.parsing.languages.apex import (
+    APEX_NAMESPACE,
+    COMPONENT_NAMESPACE,
+    LABEL_NAMESPACE,
+    PAGE_NAMESPACE,
+    SOBJECT_NAMESPACE,
+)
+from code_atlas.parsing.languages.salesforce import AURA_NAMESPACE, LWC_NAMESPACE
 from code_atlas.schema import NodeLabel, RelType
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from tree_sitter import Node
+
+_API_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_RAW_TAG_NAME = re.compile(r"</?\s*([A-Za-z_][\w:.\-]*)")
 
 _LANGUAGE_NAME = "html"
 
@@ -72,6 +85,28 @@ _TAG_PARENT_TYPES = frozenset({"start_tag", "self_closing_tag"})
 
 _TEMPLATE_KIND = "lwc_template"
 _DOCUMENT_KIND = "html_document"
+
+_AURA_DIRECTORY = "aura"
+_AURA_ROOTS = frozenset({"aura:component", "aura:application", "aura:event", "aura:interface"})
+_AURA_SUFFIXES = frozenset({".cmp", ".app", ".evt", ".intf"})
+_AURA_KIND = "aura_component"
+_AURA_MODULE_KIND = "aura_markup"
+
+_VISUALFORCE_KINDS: dict[str, tuple[str, str]] = {
+    ".page": (PAGE_NAMESPACE, "vf_page"),
+    ".component": (COMPONENT_NAMESPACE, "vf_component"),
+}
+_VISUALFORCE_MODULE_KIND = "visualforce_markup"
+
+_CUSTOM_TAG_PREFIX = "c:"
+
+# `{!$Label.c.commonAdminPermissionErrorTitle}` in Aura, `{!$Label.X}` in Visualforce.
+# The namespace segment is optional and the label is always last.
+_MARKUP_LABEL = re.compile(r"\$Label\.(?:([A-Za-z_]\w*)\.)?([A-Za-z_]\w*)")
+# `{!$ObjectType.Account.Fields.Name}` -- the ONLY object-qualified field reference in
+# the whole Salesforce markup surface, and therefore the only one that can form a valid
+# `sobject.<Object>.<Field>` uid without guessing an owner.
+_MARKUP_OBJECT_FIELD = re.compile(r"\$ObjectType\.([A-Za-z_]\w*)\.Fields\.([A-Za-z_]\w*)")
 
 
 def _module_qualified_name(file_path: str) -> str:
@@ -150,12 +185,26 @@ def _root_element(root: Node) -> Node | None:
 
 
 def _tag_name(element: Node) -> str | None:
+    """The element's tag name, read from the raw tag text rather than the `tag_name` node.
+
+    The HTML grammar truncates a tag name at an underscore — `<c:UTIL_Message />`
+    parses as `tag_name 'c:UTIL'` plus an `attribute '_Message'`, and plain
+    `<my_widget>` yields `my`. That is defensible for HTML, where an underscore is
+    not valid in a custom-element name, and wrong for the two markup dialects that
+    are not HTML: Aura and Visualforce component names are full of underscores
+    (`c:STG_Container`, `c:UTIL_Message`), so trusting the node would silently drop
+    most Salesforce component references.
+
+    Reading the tag's own bytes costs one regex and gives the same answer for every
+    well-formed name, hyphenated LWC tags included.
+    """
     for child in element.children:
-        if child.type in _TAG_PARENT_TYPES:
-            for part in child.children:
-                if part.type == "tag_name":
-                    return part.text.decode("utf-8", "replace") if part.text is not None else None
+        if child.type not in _TAG_PARENT_TYPES:
+            continue
+        if child.text is None:
             return None
+        match = _RAW_TAG_NAME.match(child.text.decode("utf-8", "replace"))
+        return match.group(1) if match else None
     return None
 
 
@@ -173,7 +222,265 @@ def _iter_tag_names(node: Node) -> list[str]:
     return found
 
 
-def _parse_markup(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile | None:  # noqa: ARG001
+def _attributes(element: Node) -> dict[str, str]:
+    """``{name: value}`` for one element's start tag, lower-cased keys.
+
+    Markup attribute names are case-insensitive and real files mix
+    ``standardController`` with ``standardcontroller``.
+    """
+    found: dict[str, str] = {}
+    for child in element.children:
+        if child.type not in _TAG_PARENT_TYPES:
+            continue
+        for attribute in child.children:
+            if attribute.type != "attribute":
+                continue
+            name = value = None
+            for part in attribute.children:
+                if part.type == "attribute_name" and part.text is not None:
+                    name = part.text.decode("utf-8", "replace").lower()
+                elif part.type in {"attribute_value", "quoted_attribute_value"}:
+                    raw = part.text.decode("utf-8", "replace") if part.text is not None else ""
+                    value = raw.strip("\"'")
+            if name is not None:
+                found[name] = value or ""
+        break
+    return found
+
+
+def _iter_elements(node: Node) -> Iterator[Node]:
+    """Every element in the document, depth-first."""
+    stack = list(node.children)
+    while stack:
+        current = stack.pop()
+        if current.type == "element":
+            yield current
+        stack.extend(current.children)
+
+
+def _api_names(value: str | None) -> list[str]:
+    """Split a comma-separated attribute into well-formed API names.
+
+    `extensions="A,B"` is the only attribute that takes a list, and real files put
+    spaces after the commas.
+    """
+    if not value:
+        return []
+    return [part for raw in value.split(",") if (part := raw.strip()) and _API_NAME.match(part)]
+
+
+def _markup_text_references(source: bytes) -> set[str]:
+    """`$Label.X` and `$ObjectType.O.Fields.F` targets in a markup document.
+
+    Both live inside `{!...}` expressions rather than in attributes or elements, so
+    they are read from the raw text. Every other merge-field construct is skipped:
+    `{!v.attr}`, `{!c.handler}` and `{!account.Name}` all name something local to
+    the component or to a controller variable, and a wrong uid is worse than a
+    missing entity (ADR-0032).
+    """
+    text = source.decode("utf-8", "replace")
+    targets = {f"{LABEL_NAMESPACE}.{match.group(2)}" for match in _MARKUP_LABEL.finditer(text)}
+    targets |= {
+        f"{SOBJECT_NAMESPACE}.{match.group(1)}.{match.group(2)}" for match in _MARKUP_OBJECT_FIELD.finditer(text)
+    }
+    return targets
+
+
+def _custom_component_targets(tag: str) -> list[str]:
+    """`<c:foo>` -> the component it names, which the file does not say enough to identify.
+
+    Salesforce shares one `c` namespace between Aura and LWC -- you cannot have an
+    Aura and an LWC component of the same name -- so `<c:foo>` is unambiguous *in an
+    org* and completely ambiguous *in a file*. A parser sees one file and has no way
+    to know which kind `foo` is, and this codebase mints the two under different
+    namespaces (`aura.foo`, `lwc.foo`).
+
+    Both are emitted. `resolve_imports` matches the one that exists and mints an
+    `ext/` stub for the other, so every real edge lands and the cost is a stub per
+    reference. The alternative -- picking one -- loses a real edge every time it
+    guesses wrong, and in one measured corpus 38 of 132 Aura `<c:X>` references
+    point at LWC bundles, so neither choice is rare enough to ignore.
+
+    The clean fix is a shared `cmp.<Name>` namespace minted by both handlers, which
+    is what the platform itself has. That would change uids ATL-173 already shipped,
+    so it is a follow-up rather than a detour.
+    """
+    name = tag.partition(":")[2]
+    if not _API_NAME.match(name):
+        return []
+    return [f"{AURA_NAMESPACE}.{name}", f"{LWC_NAMESPACE}.{name}"]
+
+
+def _aura_bundle(file_path: str) -> str | None:
+    """The bundle directory under ``aura/``, or ``None`` outside an Aura tree."""
+    parts = PurePosixPath(file_path.replace("\\", "/")).parts
+    for index in range(len(parts) - 2, -1, -1):
+        if parts[index] == _AURA_DIRECTORY:
+            return parts[index + 1]
+    return None
+
+
+def _aura_references(root: Node, source: bytes) -> set[str]:
+    """Everything an Aura bundle names: its controller, its children, its labels."""
+    targets = _markup_text_references(source)
+    for element in _iter_elements(root):
+        tag = _tag_name(element)
+        if tag is None:
+            continue
+        if tag.startswith(_CUSTOM_TAG_PREFIX):
+            targets.update(_custom_component_targets(tag))
+        elif tag in _AURA_ROOTS:
+            attributes = _attributes(element)
+            targets.update(f"{APEX_NAMESPACE}.{name}" for name in _api_names(attributes.get("controller")))
+            # `extends="c:Base"` is IMPORTS, not INHERITS: `resolve_inherits` matches a
+            # bare name rather than a qualified one and mints no stub, so a namespaced
+            # INHERITS target never matches and a missing base vanishes silently.
+            extends = attributes.get("extends", "")
+            if extends.startswith(_CUSTOM_TAG_PREFIX):
+                targets.update(_custom_component_targets(extends))
+    return targets
+
+
+def _visualforce_references(root: Node, source: bytes) -> set[str]:
+    """Everything a Visualforce page names: controllers, components, labels, fields."""
+    targets = _markup_text_references(source)
+    for element in _iter_elements(root):
+        tag = _tag_name(element)
+        if tag is None:
+            continue
+        if tag.startswith(_CUSTOM_TAG_PREFIX):
+            name = tag.partition(":")[2]
+            if _API_NAME.match(name):
+                targets.add(f"{COMPONENT_NAMESPACE}.{name}")
+            continue
+        attributes = _attributes(element)
+        for attribute in ("controller", "extensions"):
+            targets.update(f"{APEX_NAMESPACE}.{name}" for name in _api_names(attributes.get(attribute)))
+        targets.update(f"{SOBJECT_NAMESPACE}.{name}" for name in _api_names(attributes.get("standardcontroller")))
+    return targets
+
+
+def _parse_markup(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile | None:
+    """One ``Module`` always, plus whatever the markup dialect this file is says.
+
+    Four dialects share the grammar: an LWC template, an Aura bundle, a Visualforce
+    page or component, and ordinary HTML — which is the floor and mints only the
+    ``Module``.
+    """
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix in _VISUALFORCE_KINDS:
+        return _parse_visualforce(path, source, root, project_name, suffix=suffix)
+    if suffix in _AURA_SUFFIXES:
+        return _parse_aura(path, source, root, project_name)
+    return _parse_lwc_template(path, source, root, project_name)
+
+
+def _module_entity(path: str, root: Node, project_name: str, kind: str) -> tuple[ParsedEntity, str]:
+    """The file's ``Module`` and its uid — every branch needs one, always."""
+    module_qn = f"{project_name}:{_module_qualified_name(path)}"
+    return (
+        ParsedEntity(
+            name=PurePosixPath(path).name,
+            qualified_name=module_qn,
+            label=NodeLabel.MODULE,
+            kind=kind,
+            line_start=1,
+            line_end=root.end_point[0] + 1,
+            file_path=path,
+        ),
+        module_qn,
+    )
+
+
+def _component_file(
+    path: str,
+    root: Node,
+    project_name: str,
+    *,
+    name: str | None,
+    namespace: str,
+    module_kind: str,
+    kind: str,
+    references: set[str],
+) -> ParsedFile:
+    """A markup file that declares one addressable component, plus its references."""
+    module, module_qn = _module_entity(path, root, project_name, module_kind)
+    entities = [module]
+    source_uid = module_qn
+    if name is not None:
+        component_qn = f"{project_name}:{namespace}.{name}"
+        entities.append(
+            ParsedEntity(
+                name=name,
+                qualified_name=component_qn,
+                label=NodeLabel.TYPE_DEF,
+                kind=kind,
+                line_start=1,
+                line_end=root.end_point[0] + 1,
+                file_path=path,
+            )
+        )
+        source_uid = component_qn
+    relationships = (
+        [ParsedRelationship(from_qualified_name=module_qn, rel_type=RelType.DEFINES, to_name=source_uid)]
+        if name is not None
+        else []
+    )
+    relationships += [
+        ParsedRelationship(from_qualified_name=source_uid, rel_type=RelType.IMPORTS, to_name=target)
+        for target in sorted(references)
+    ]
+    return ParsedFile(file_path=path, language=_LANGUAGE_NAME, entities=entities, relationships=relationships)
+
+
+def _parse_aura(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile | None:
+    """``aura/<B>/<B>.cmp|.app|.evt|.intf`` -> ``aura.<B>`` plus what it names.
+
+    A bundle folder holds exactly one of the four primary suffixes, so whichever is
+    present mints the component.
+
+    Guarded on the ``aura/`` directory because ``.app`` is two different formats:
+    ``applications/Foo.app`` is XML ``<CustomApplication>`` metadata, not markup.
+    Such a file gets its ``Module`` and nothing else; a handler for it belongs here,
+    since this module owns the suffix, and is ATL-180's to add.
+    """
+    bundle = _aura_bundle(path)
+    if bundle is None or not _API_NAME.match(bundle):
+        module, _ = _module_entity(path, root, project_name, _DOCUMENT_KIND)
+        return ParsedFile(file_path=path, language=_LANGUAGE_NAME, entities=[module], relationships=[])
+    return _component_file(
+        path,
+        root,
+        project_name,
+        name=bundle,
+        namespace=AURA_NAMESPACE,
+        module_kind=_AURA_MODULE_KIND,
+        kind=_AURA_KIND,
+        references=_aura_references(root, source),
+    )
+
+
+def _parse_visualforce(path: str, source: bytes, root: Node, project_name: str, *, suffix: str) -> ParsedFile | None:
+    """``pages/<N>.page`` and ``components/<N>.component`` -> one addressable node.
+
+    Named for the file, which is what Apex's ``Page.<N>`` and a WebLink's ``<page>``
+    both write.
+    """
+    namespace, kind = _VISUALFORCE_KINDS[suffix]
+    stem = PurePosixPath(path).stem
+    return _component_file(
+        path,
+        root,
+        project_name,
+        name=stem if _API_NAME.match(stem) else None,
+        namespace=namespace,
+        module_kind=_VISUALFORCE_MODULE_KIND,
+        kind=kind,
+        references=_visualforce_references(root, source),
+    )
+
+
+def _parse_lwc_template(path: str, source: bytes, root: Node, project_name: str) -> ParsedFile | None:  # noqa: ARG001
     """One ``Module`` always; component-composition ``IMPORTS`` when it is an LWC template."""
     bundle = _owning_bundle(path)
     root_element = _root_element(root)
@@ -216,7 +523,7 @@ try:
     register_language(
         LanguageConfig(
             name=_LANGUAGE_NAME,
-            extensions=frozenset({".html", ".htm"}),
+            extensions=frozenset({".html", ".htm", ".cmp", ".app", ".evt", ".intf", ".page", ".component"}),
             language=_HTML_LANGUAGE,
             query=Query(_HTML_LANGUAGE, "(document) @root"),
             parse_func=_parse_markup,
