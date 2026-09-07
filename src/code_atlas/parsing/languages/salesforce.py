@@ -176,6 +176,16 @@ The record's *type* is an ordinary SObject and lives under ``sobject.``; only
 the record instances live here.
 """
 
+AURA_NAMESPACE = "aura"
+"""Root qualified-name segment for Aura bundles — ``aura.utilIllustration``.
+
+The bundle folder name verbatim, which is exactly what an Aura file writes when it
+references a sibling (``<c:utilIllustration>``) and what a FlexiPage writes in a
+``componentName``.  Declared here rather than in ``markup.py``, which mints it,
+because ``markup`` already imports from this module and the reverse is a cycle —
+and because ATL-180's FlexiPage handler will need it on this side.
+"""
+
 LWC_NAMESPACE = "lwc"
 """Root qualified-name segment for Lightning Web Component bundles — ``lwc.errorPanel``.
 
