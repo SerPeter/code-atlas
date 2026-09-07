@@ -136,14 +136,19 @@ when it cannot identify the component.  The size and nesting-depth guards in
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship
-from code_atlas.parsing.languages.apex import APEX_NAMESPACE, SOBJECT_NAMESPACE
+from code_atlas.parsing.languages.apex import (
+    APEX_NAMESPACE,
+    LABEL_NAMESPACE,
+    PAGE_NAMESPACE,
+    SOBJECT_NAMESPACE,
+)
 from code_atlas.schema import NodeLabel, RelType
 
 if TYPE_CHECKING:
@@ -171,15 +176,6 @@ The record's *type* is an ordinary SObject and lives under ``sobject.``; only
 the record instances live here.
 """
 
-LABEL_NAMESPACE = "label"
-"""Root qualified-name segment for CustomLabels — ``label.Greeting``.
-
-Nothing points at these yet: ``typescript.py`` leaves ``@salesforce/label/c.X``
-as an ordinary external import and ``apex.py`` does not extract
-``System.Label.X``.  The namespace is chosen so that whichever side is taught to
-emit it first meets the definitions here.
-"""
-
 LWC_NAMESPACE = "lwc"
 """Root qualified-name segment for Lightning Web Component bundles — ``lwc.errorPanel``.
 
@@ -203,6 +199,14 @@ taken from the ``objects/<Object>/<child>/`` path rather than from the document,
 which never states it.
 """
 
+MESSAGE_CHANNEL_NAMESPACE = "messagechannel"
+"""Root qualified-name segment for Lightning Message Service channels.
+
+An LWC imports one as ``@salesforce/messageChannel/Record_Selected__c`` while the
+file is ``Record_Selected.messageChannel-meta.xml`` — the specifier carries a
+``__c`` the filename does not.  ``typescript.py`` strips it so both meet here.
+"""
+
 GLOBAL_VALUE_SET_NAMESPACE = "globalvalueset"
 """Root qualified-name segment for GlobalValueSets — ``globalvalueset.Payment_ACH_Code``.
 
@@ -211,19 +215,6 @@ Minted from the **file base**, not from ``masterLabel``.  The documentation says
 ``<masterLabel>Payment ACH Code</masterLabel>`` while every field referencing it
 writes ``<valueSetName>Payment_ACH_Code</valueSetName>`` — the filename, with
 underscores.  Minting from the label would join nothing.
-"""
-
-PAGE_NAMESPACE = "page"
-"""Root qualified-name segment for Visualforce pages — ``page.HH_ManageHHAccount``.
-
-Declared here and minted by nothing yet: a ``WebLink`` names the page it opens
-before any parser reads ``pages/*.page`` (ATL-182), so those edges rest on
-``ext/page.<Name>`` stubs and join the real node the moment one exists.  It lives
-in this module rather than in ``markup.py`` because ``markup`` already imports
-from here, and the reverse would be a cycle.
-
-``page.<Name>`` matches the syntax Apex uses to reference one (``Page.<Name>``),
-so the Apex side can join here unchanged if it is ever taught to emit it.
 """
 
 _METADATA_NS = "http://soap.sforce.com/2006/04/metadata"
@@ -1480,6 +1471,82 @@ def _lwc_apex_classes(element: Node) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# LightningMessageChannel and the Apex sidecars
+# ---------------------------------------------------------------------------
+
+_MESSAGE_CHANNEL_MODULE_KIND = "sf_message_channel"
+_MESSAGE_CHANNEL_KIND = "message_channel"
+
+_SIDECAR_MODULE_KIND = "sf_apex_sidecar"
+
+
+def _parse_message_channel(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:
+    """``messageChannels/<Name>.messageChannel-meta.xml`` -> one ``Value``.
+
+    Target-only: a channel is published to and subscribed from, and it names
+    nothing itself.  Its ``lightningMessageFields/fieldName`` values look exactly
+    like SObject fields — ``searchKey``, ``maxPrice`` — and are **not**; they are
+    the channel's own payload keys, so emitting field edges for them would invent
+    targets on whichever object happened to share the name.
+    """
+    api_name = _api_name(meta.base)
+    if api_name is None:
+        return None
+    module_uid = _module(emit, path, _MESSAGE_CHANNEL_MODULE_KIND, element)
+    line_start, line_end = _lines(element)
+    uid = emit.add(
+        name=api_name,
+        qn_suffix=f"{MESSAGE_CHANNEL_NAMESPACE}.{api_name}",
+        label=NodeLabel.VALUE,
+        kind=_MESSAGE_CHANNEL_KIND,
+        line_start=line_start,
+        line_end=line_end,
+        docstring=_prose(element),
+        extra=_compact(
+            {
+                "is_exposed": _bool_of(element, "isExposed"),
+                "payload_fields": sorted(
+                    name
+                    for field_element in _children(element, "lightningMessageFields")
+                    if (name := _text_of(field_element, "fieldName"))
+                )
+                or None,
+            }
+        ),
+    )
+    emit.rel(module_uid, RelType.DEFINES, uid)
+    return emit.result()
+
+
+def _parse_apex_sidecar(emit: _Emit, element: Node, path: str, meta: _MetaFile) -> ParsedFile | None:  # noqa: ARG001
+    """``<Name>.cls-meta.xml`` and its siblings -> the file's ``Module`` and nothing else.
+
+    A sidecar carries two facts, ``apiVersion`` and ``status``, and the generic
+    structural parse turned them into four nodes apiece — a document, a root
+    element and a leaf each — across roughly 2,000 sidecars in a corpus.  None of
+    those four is searchable and none is a reference.
+
+    The two facts live on this file's own ``Module`` rather than on the ``.cls``
+    node they describe: a parser sees one file, and a node in another file is not
+    ours to amend.  Cross-file folding would need a post-batch resolver, which is
+    a great deal of machinery for two scalars.
+    """
+    module_uid = _module(emit, path, _SIDECAR_MODULE_KIND, element)
+    if module_uid is not None and emit.entities:
+        emit.entities[-1] = replace(
+            emit.entities[-1],
+            extra_properties=_compact(
+                {
+                    "api_version": _text_of(element, "apiVersion"),
+                    "status": _text_of(element, "status"),
+                    "metadata_type": xml_tag(element),
+                }
+            ),
+        )
+    return emit.result()
+
+
+# ---------------------------------------------------------------------------
 # GlobalValueSet
 # ---------------------------------------------------------------------------
 
@@ -1767,6 +1834,11 @@ _HANDLERS: dict[str, Callable[[_Emit, Node, str, _MetaFile], ParsedFile | None]]
     "WebLink": _parse_web_link,
     "ListView": _parse_list_view,
     "GlobalValueSet": _parse_global_value_set,
+    "LightningMessageChannel": _parse_message_channel,
+    "ApexClass": _parse_apex_sidecar,
+    "ApexTrigger": _parse_apex_sidecar,
+    "ApexPage": _parse_apex_sidecar,
+    "ApexComponent": _parse_apex_sidecar,
 }
 """Root element name -> handler.  This *is* the supported-type list.
 
