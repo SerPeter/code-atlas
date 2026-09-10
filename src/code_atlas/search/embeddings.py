@@ -485,8 +485,11 @@ after the file and answers "what is this config for", which is a fair semantic t
 is one node per file, so it is not what floods anything.
 
 Excluded is not invisible -- the node keeps its name, its edges and its FTS document, and
-``_floor_excluded_in_vector_channel`` admits it at the tail of the vector list wherever a
-query gates on vector similarity (ADR-0047).
+BM25 and graph still return it. Nothing compensates for the missing vector during fusion:
+ATL-166 floored excluded uids at the tail of the vector list, and ATL-184 deleted that
+because a tail row pays 98.4% of a rank-1 BM25 hit rather than the epsilon the prose
+assumed (ADR-0052). What carries the semantics is ``config_file`` / ``xml_document``,
+which this policy never excludes.
 """
 
 

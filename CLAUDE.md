@@ -169,11 +169,14 @@ structural fallback, so they are precisely "data no dialect could read". A recog
   `EmbedConsumer._allowed_by_policy` catches what is already on the stream, and
   `_reconcile_missing_embeddings` must be gated or it re-queues every excluded entity on every run,
   forever, while shouting that earlier embed work was lost.
-- **Excluded is not invisible.** The node keeps its name, edges and FTS document. Where a query gates
-  on vector similarity, `_floor_excluded_in_vector_channel` admits it at the tail of the vector list
-  instead of dropping it — `analyze_query` weights vector at 2.0, so absence would be a silent
-  handicap. Only uids another channel surfaced, and only policy-excluded ones: a vector missing by
-  accident is a pipeline hole, and flooring it would hide it.
+- **Excluded is not invisible** — but nothing compensates for it in fusion (ADR-0052). The node keeps
+  its name, edges and FTS document, BM25 and graph still return it, and the file-level node
+  (`config_file`/`xml_document`) is never excluded, so it keeps its vector and carries the file body.
+  ATL-166 additionally floored excluded uids at the tail of the vector list; ATL-184 deleted that,
+  because RRF rank space has no epsilon — at `k=60` a tail row still pays 98.4% of a rank-1 BM25 hit,
+  while the differential that decides order is 1/3782. **A channel pays for the rank it returned, for
+  every entity.** Absence from a shortlist and exclusion by policy are the same state at query time;
+  do not re-introduce a mechanism that prices them differently.
 - **No node property and no `SCHEMA_VERSION` bump** — a bump drops the vector indices (ADR-0024). The
   policy is recomputed from settings wherever it is needed, so a change takes effect on the next index.
 - `_reclaim_excluded_embeddings` strips vectors bought under an older policy at the end of an index.
