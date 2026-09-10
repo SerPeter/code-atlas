@@ -57,6 +57,7 @@ An ADR is a document that captures an important architectural decision made alon
 | [0044](./0044-the-coordination-store-follows-the-backend.md)             | The Coordination Store Follows The Backend Choice              | Accepted                      | 2026-09-03 |
 | [0045](./0045-sqlite-indexes-what-the-planner-can-prove.md)              | The SQLite Backend Indexes What The Planner Can Prove          | Accepted                      | 2026-09-03 |
 | [0046](./0046-the-vector-index-is-a-shortlist-not-a-copy.md)             | The SQLite Vector Index Is A Shortlist Not A Copy              | Accepted                      | 2026-09-05 |
+| [0052](./0052-rrf-rank-space-has-no-epsilon.md)                          | RRF Rank Space Has No Epsilon                                  | Accepted                      | 2026-09-10 |
 | [0051](./0051-a-permission-grant-is-not-a-reference.md)                  | A Permission Grant Is Not A Reference                          | Accepted                      | 2026-09-07 |
 | [0050](./0050-an-import-target-need-not-name-the-node-it-resolves-to.md) | An Import Target Need Not Name The Node It Resolves To         | Accepted                      | 2026-09-07 |
 | [0049](./0049-power-bi-is-modelled-by-what-a-report-author-names.md)     | Power BI Is Modelled By What A Report Author Names             | Accepted                      | 2026-09-06 |

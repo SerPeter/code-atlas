@@ -10,6 +10,11 @@ kind: decision
 
 Accepted (2026-09-06)
 
+Amended by [ADR-0052](./0052-rrf-rank-space-has-no-epsilon.md), which deletes §4's vector floor without replacing it. §4
+claimed the floor earns "the smallest non-zero contribution the channel can pay"; measured, it is 98.4% of an entire
+rank-1 BM25 hit, and no constant is both small enough to preserve another channel's ordering and large enough to change
+an outcome. §2's sentence about `xml_element`/`xml_setting` is also superseded — see the note there.
+
 ## Context
 
 The only controls over embedding were global: `[embeddings] enabled` and `--no-embed`. Parsing a file and buying vectors
@@ -54,6 +59,15 @@ vector, with no line of config.
 XML fallback's twins (`xml_element`, `xml_setting`) stay too: ATL-144 is actively trying to extract _more_ from
 Salesforce metadata, and pre-empting it here would work against it. Both are one line away for a user who disagrees.
 
+> **Superseded (ATL-183).** ATL-144 settled it the other way — a recognised Salesforce type now gets its own kind and
+> keeps its vector, so `xml_element`/`xml_setting` came to mean precisely "XML no handler recognised" and joined
+> `DEFAULT_EXCLUDE_KINDS`. One real permission set contributed 1,944 of them, all named `fieldPermissions`, every one
+> with an empty `source`. `xml_document` stays embedded, matching `config_file`.
+>
+> That widening is also what broke §4: it turned the excluded cohort from a minority into 68.7% of a real Salesforce
+> repo, the regime in which the floor inverts. Two individually correct changes composing into a defect — see
+> [ADR-0052](./0052-rrf-rank-space-has-no-epsilon.md).
+
 **3. Three gate sites, and the third is the one that bites.**
 
 | #   | site                                     | what it stops                                                                                                          |
@@ -85,6 +99,13 @@ The rule: **a similarity gate filters _scored_ candidates; an entity the policy 
 at the floor.** In `hybrid_search`, a uid another channel surfaced and the policy excludes is appended to the tail of
 the vector list, earning `w · 1/(k + tail + 1)` — the smallest non-zero contribution the channel can pay. Barely
 passing.
+
+> **Removed (ATL-184), and the claim above is false.** `w · 1/(k + tail + 1)` is the smallest contribution _within the
+> vector channel_, which is not the same as small: at the production `fetch_limit` of 63 it is `2/124`, **98.4% of an
+> entire rank-1 BM25 hit**. RRF's curve decays only 1.98× across a fetched window, while the adjacent-rank differential
+> that decides order is `1/3782`. The floor was ~62× coarser than the ordering it must not disturb, and the interval of
+> constants that both preserve that ordering and change any outcome is **empty**. Deleted without replacement by
+> [ADR-0052](./0052-rrf-rank-space-has-no-epsilon.md); the two limits below stood, but they bounded the wrong thing.
 
 Two limits, both deliberate. Only uids another channel already surfaced, so nothing enters a search on the strength of
 having no vector. And only entities the _policy_ excludes — a missing vector can also be a pipeline hole, and
