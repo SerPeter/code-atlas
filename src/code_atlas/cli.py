@@ -1229,7 +1229,7 @@ async def _run_search(
     """Async implementation of the ``atlas search`` command."""
     from code_atlas.backends import connected
     from code_atlas.indexing.orchestrator import StalenessChecker
-    from code_atlas.search.embeddings import EmbedClient, EmbedPolicy
+    from code_atlas.search.embeddings import EmbedClient
     from code_atlas.search.engine import SearchType, hybrid_search
     from code_atlas.settings import derive_project_name
     from code_atlas.telemetry import init_telemetry, shutdown_telemetry
@@ -1309,7 +1309,6 @@ async def _run_search(
             exclude_tests=exclude_tests,
             exclude_stubs=exclude_stubs,
             exclude_generated=exclude_generated,
-            embed_policy=EmbedPolicy.from_settings(settings.embeddings),
         )
 
         # Staleness check (before output so JSON can include it)

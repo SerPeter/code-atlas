@@ -8,12 +8,13 @@ What these tests pin is the pair of claims the feature stands on:
 
 * **Excluded is not indexed-less.** A node the policy excludes keeps its name, its edges
   and its FTS document. Only the vector goes.
-* **Excluded is not invisible.** Where vector similarity gates a query, an entity that was
-  never allowed to be scored is admitted at the floor rather than dropped.
+* **Excluded is not invisible.** BM25 and graph still return it, and the file-level node
+  (``config_file`` / ``xml_document``) is never excluded -- it keeps its vector and carries
+  the file body. There is deliberately no third compensation in fusion: ATL-166 added one,
+  and ADR-0052 records why RRF rank space cannot express it.
 
-Both are easy to half-implement in a way that passes a naive test: gate one of the three
-sites and the queue fills anyway; gate all three and forget the floor and the entity
-quietly stops winning searches it used to win.
+The first is easy to half-implement in a way that passes a naive test: gate one of the
+three sites and the queue fills anyway.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import pytest
 
 from code_atlas.indexing.orchestrator import _reclaim_excluded_embeddings, _reconcile_missing_embeddings
 from code_atlas.search.embeddings import DEFAULT_EXCLUDE_KINDS, EmbedPolicy
-from code_atlas.search.engine import _build_ranked_lists, _floor_excluded_in_vector_channel, rrf_fuse
+from code_atlas.search.engine import _build_ranked_lists, rrf_fuse
 from code_atlas.settings import EmbeddingSettings
 
 if TYPE_CHECKING:
@@ -260,7 +261,7 @@ class TestTheReclaimSweep:
 
 
 # ---------------------------------------------------------------------------
-# The vector floor
+# What fusion pays for
 # ---------------------------------------------------------------------------
 
 
@@ -268,204 +269,77 @@ def _lists(**channels: list[str]) -> dict[str, list[str]]:
     return {name: list(uids) for name, uids in channels.items()}
 
 
-PROPS = {
-    "p:blob": {"kind": "config_setting", "file_path": "conf/app.json"},
-    "p:blob2": {"kind": "config_setting", "file_path": "conf/other.json"},
-    "p:fn": {"kind": "function", "file_path": "src/mod.py"},
-}
+# Natural-language weights: the regime the retired floor was written for, and the one it
+# damaged most. ``analyze_query`` returns these for any query of three words or more.
+_NL_WEIGHTS = {"graph": 0.5, "vector": 2.0, "bm25": 1.0}
 
 
-class TestTheVectorFloor:
-    """A similarity gate filters *scored* candidates. An entity the policy never allowed
-    to be scored is admitted at the floor instead of dropped -- otherwise "stops competing
-    in the vector channel" quietly becomes "cannot win", because ``analyze_query`` weights
-    vector at 2.0 for any natural-language query."""
+class TestFusionPaysOnlyForRanksAChannelReturned:
+    """ATL-166 appended policy-excluded uids to the tail of the vector list so a
+    natural-language query could not gate them off the page. ATL-184 removed it: RRF rank
+    space has no epsilon to append them at (ADR-0052).
 
-    def test_an_excluded_entity_is_appended_after_every_real_hit(self):
-        ranked = _lists(vector=["p:fn"], bm25=["p:blob"])
-        _floor_excluded_in_vector_channel(ranked, PROPS, _policy())
-        assert ranked["vector"] == ["p:fn", "p:blob"]
+    At ``k=60`` the curve is nearly flat across a fetched window -- the 63rd of 63 rows
+    still pays ``2/124``, 98.4% of an entire rank-1 BM25 hit -- while the adjacent-rank
+    differential that decides *order* is 2.6e-4. The floor was ~62x coarser than the
+    ordering it was forbidden to disturb, so it inverted the very comparison it was meant
+    to make fair."""
 
-    def test_an_embedded_entity_missing_from_the_vector_hits_is_not_floored(self):
-        """A missing vector can also be a pipeline hole, and the reconcile sweep exists to
-        heal those. Scoring one at the floor would hide it."""
-        ranked = _lists(vector=[], bm25=["p:fn"])
-        _floor_excluded_in_vector_channel(ranked, PROPS, _policy())
-        assert ranked["vector"] == []
-
-    def test_nothing_enters_a_search_on_the_strength_of_having_no_vector(self):
-        """Only uids another channel already surfaced. The candidate set stays bounded by
-        what was fetched, and the floor can never widen a result set."""
-        ranked = _lists(vector=["p:fn"], bm25=["p:fn"])
-        _floor_excluded_in_vector_channel(ranked, PROPS, _policy())
-        assert ranked["vector"] == ["p:fn"]
-
-    def test_a_skipped_vector_channel_is_not_invented(self):
-        """With no vector channel, embedded entities are not being paid either -- handing
-        excluded ones a contribution would invert the ranking rather than level it."""
-        ranked = _lists(graph=["p:fn"], bm25=["p:blob"])
-        _floor_excluded_in_vector_channel(ranked, PROPS, _policy())
-        assert "vector" not in ranked
-
-    def test_a_permissive_policy_changes_nothing(self):
-        ranked = _lists(vector=["p:fn"], bm25=["p:blob"])
-        _floor_excluded_in_vector_channel(ranked, PROPS, _policy(exclude_kinds=[]))
-        assert ranked["vector"] == ["p:fn"]
-
-    def test_floored_entities_keep_the_order_the_other_channels_gave_them(self):
-        """Their relative order is inherited from a real ranking rather than invented."""
-        ranked = _lists(vector=[], bm25=["p:blob2", "p:blob"])
-        _floor_excluded_in_vector_channel(ranked, PROPS, _policy())
-        assert ranked["vector"] == ["p:blob2", "p:blob"]
-
-    def test_barely_passing_means_below_a_rival_and_above_absence(self):
-        """The whole claim, in RRF's own units. With the natural-language weights the
-        gate is real: without the floor the excluded entity scores 1.0 of the pot and the
-        embedded one 3.0, and the ranking inverts on that alone."""
-        weights = {"graph": 0.5, "vector": 2.0, "bm25": 1.0}
-        ranked = _lists(vector=["p:fn"], bm25=["p:blob", "p:fn"])
-        _floor_excluded_in_vector_channel(ranked, PROPS, _policy())
-        scores = rrf_fuse(ranked, k=60, weights=weights)
-
-        assert scores["p:fn"] > scores["p:blob"], "the embedded entity must still outrank it"
-        assert scores["p:blob"] > 0.0
-
-        without = rrf_fuse(_lists(vector=["p:fn"], bm25=["p:blob", "p:fn"]), k=60, weights=weights)
-        assert scores["p:blob"] > without["p:blob"], "the floor must actually pay something"
-        gained = scores["p:blob"] - without["p:blob"]
-        assert gained < weights["vector"] / 61, "and it must pay less than a rank-1 vector hit"
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "ADR-0047 calibrates the floor against the worst FETCHED vector hit, but the "
-            "entities a floored one competes with for the top 10 mostly were not fetched "
-            "at all -- 60 rows of ~15k embedded -- and earn zero. Where the excluded kinds "
-            "are the majority (xml_element + xml_setting are 68.7% of a real Salesforce "
-            "repo) that over-pays: a BM25 rank-1 code hit falls behind the floored cohort. "
-            "Recalibrating is a design decision, not a bug fix -- capping to the vector "
-            "channel's shortfall effectively deletes the floor on any real corpus, and an "
-            "epsilon contribution is too small to cure the 'cannot win' case the ADR was "
-            "written for. Drop this marker once it is recalibrated."
-        ),
-    )
     def test_a_saturated_vector_channel_does_not_promote_the_excluded_cohort(self):
-        """The 1-vs-1 case above, generalised to the regime a real corpus creates.
+        """A saturated vector channel (60 unrelated hits, neither rival among them) and a
+        BM25 list whose rank-1 entry is real code followed by excluded blobs.
 
-        A saturated vector channel (60 unrelated hits, none of them either rival) and a
-        BM25 list whose rank-1 entry is real code followed by excluded blobs. The code
-        node must still win.
+        This test was a strict xfail for as long as the floor existed. The margin is
+        exactly ``1/61 - 1/62 = 1/3782`` -- BM25's adjacent-rank differential, and the
+        entire budget any floor had to stay under. The floor paid 2/121, 62x that.
         """
-        weights = {"graph": 0.5, "vector": 2.0, "bm25": 1.0}
         filler = [f"p:v{i}" for i in range(60)]
         excluded = [f"p:x{i}" for i in range(20)]
-        props = {
-            **PROPS,
-            "p:code": {"kind": "function", "file_path": "src/mod.py"},
-            **{uid: {"kind": "xml_element", "file_path": f"meta/{uid}.xml"} for uid in excluded},
-            **{uid: {"kind": "function", "file_path": f"src/{uid}.py"} for uid in filler},
-        }
-        ranked = _lists(vector=list(filler), bm25=["p:code", *excluded])
-        _floor_excluded_in_vector_channel(ranked, props, _policy(exclude_kinds=["xml_element"]))
-        scores = rrf_fuse(ranked, k=60, weights=weights)
+        scores = rrf_fuse(_lists(vector=filler, bm25=["p:code", *excluded]), k=60, weights=_NL_WEIGHTS)
 
         assert scores["p:code"] > scores["p:x0"], (
-            "a rank-1 BM25 hit must outrank a floored entity that no channel ranked first"
+            "a rank-1 BM25 hit must outrank an entity that no channel ranked first"
+        )
+        assert scores["p:code"] - scores["p:x0"] == pytest.approx(1 / 3782)
+        ranking = list(scores)
+        assert not [uid for uid in ranking[:20] if uid in set(excluded)], (
+            "the excluded cohort must not occupy the first page; the floor put 11 there"
         )
 
-    def test_the_floor_is_what_promotes_the_excluded_cohort(self):
-        """The ablation for the xfail above: without the floor, the code node wins.
+    def test_an_entity_with_no_vector_is_still_buried_by_a_saturated_channel(self):
+        """The grievance behind ADR-0047 section 4, which this change deliberately does
+        not fix -- recorded as a test so the next reader finds a fact, not a memory.
 
-        Without this, the xfail could be recording an artefact of the fixture rather than
-        the floor's own arithmetic.
+        The corpus's rank-1 BM25 hit still fuses *below* all 60 vector rows, because the
+        worst of them pays ``2/120 = 0.01667`` against its ``1/61 = 0.01639``. That is the
+        2.0 vector weight over a shortlist, and it applies identically to an entity that
+        merely missed the shortlist and to one the policy excluded. Pricing those two
+        states differently is what ATL-184 undid; neither is rescued here.
         """
-        weights = {"graph": 0.5, "vector": 2.0, "bm25": 1.0}
         filler = [f"p:v{i}" for i in range(60)]
-        excluded = [f"p:x{i}" for i in range(20)]
-        ranked = _lists(vector=list(filler), bm25=["p:code", *excluded])
-        scores = rrf_fuse(ranked, k=60, weights=weights)
+        scores = rrf_fuse(_lists(vector=filler, bm25=["p:code", "p:absent"]), k=60, weights=_NL_WEIGHTS)
+        ranking = list(scores)
 
-        assert scores["p:code"] > scores["p:x0"]
+        assert ranking.index("p:code") == 60, "the rank-1 BM25 hit lands behind all 60 vector rows"
+        assert scores["p:code"] < min(scores[uid] for uid in filler)
+        # Same state, same price: neither uid owns a vector row, and nothing distinguishes
+        # "excluded by policy" from "absent from the shortlist" at query time any more.
+        assert scores["p:code"] > scores["p:absent"], "ordering still comes from the ranks BM25 returned"
 
-    def test_provenance_still_reports_the_ranks_the_channels_returned(self):
-        """A floored uid did not come back from a vector search and must not claim it did
-        -- which is why the floor is applied after provenance is built."""
+    def test_provenance_reports_only_the_ranks_the_channels_returned(self):
+        """``sources`` is public MCP payload. Nothing may claim a vector hit it did not
+        get -- the guard that stops a synthetic rank being re-invented."""
         from code_atlas.search.engine import _build_provenance
 
         channel_results = {
             "vector": [{"node": {"uid": "p:fn", "kind": "function", "file_path": "src/mod.py"}}],
             "bm25": [{"node": {"uid": "p:blob", "kind": "config_setting", "file_path": "conf/app.json"}}],
         }
-        ranked, props = _build_ranked_lists(channel_results)
+        ranked, _props = _build_ranked_lists(channel_results)
         provenance = _build_provenance(ranked)
-        _floor_excluded_in_vector_channel(ranked, props, _policy())
 
         assert provenance["p:blob"] == {"bm25": 1}
-        assert "vector" not in provenance["p:blob"]
-
-
-class _FakeSearchGraph:
-    """The three channels, returning fixed rows."""
-
-    def __init__(self, *, vector: list[dict[str, Any]], bm25: list[dict[str, Any]]) -> None:
-        self._vector, self._bm25 = vector, bm25
-
-    async def graph_search(self, query: str, limit: int, projects: list[str] | None = None) -> list[dict[str, Any]]:
-        return []
-
-    async def text_search(self, query: str, limit: int, projects: list[str] | None = None) -> list[dict[str, Any]]:
-        return self._bm25
-
-    async def vector_search(
-        self, vector: list[float], limit: int, projects: list[str] | None = None
-    ) -> list[dict[str, Any]]:
-        return self._vector
-
-
-class _FakeEmbed:
-    async def embed_one(self, text: str) -> list[float]:
-        return [0.1, 0.2]
-
-
-def _node(uid: str, kind: str, file_path: str) -> dict[str, Any]:
-    return {"node": {"uid": uid, "name": uid.rsplit(":", maxsplit=1)[-1], "kind": kind, "file_path": file_path}}
-
-
-class TestHybridSearchIsWiredToThePolicy:
-    """The helper tests above prove the floor; this proves ``hybrid_search`` uses it. A
-    correct helper nobody calls is the failure mode a unit test of the helper cannot see."""
-
-    QUERY = "how does the retry budget get reset"  # natural language -> vector weight 2.0
-
-    async def _search(self, policy: EmbedPolicy | None) -> list[Any]:
-        from code_atlas.search.engine import hybrid_search
-        from code_atlas.settings import SearchSettings
-
-        graph = _FakeSearchGraph(
-            vector=[_node("p:fn", "function", "src/mod.py")],
-            bm25=[_node("p:blob", "config_setting", "conf/app.json"), _node("p:fn", "function", "src/mod.py")],
-        )
-        return await hybrid_search(
-            graph,
-            _FakeEmbed(),
-            SearchSettings(),
-            self.QUERY,
-            embed_policy=policy,
-        )
-
-    async def test_the_excluded_entity_scores_higher_with_the_policy_than_without(self):
-        with_policy = {r.uid: r.rrf_score for r in await self._search(_policy())}
-        without = {r.uid: r.rrf_score for r in await self._search(None)}
-        assert with_policy["p:blob"] > without["p:blob"]
-        assert with_policy["p:fn"] == without["p:fn"], "an embedded entity must be unaffected"
-
-    async def test_it_still_ranks_below_the_embedded_entity(self):
-        results = await self._search(_policy())
-        assert [r.uid for r in results] == ["p:fn", "p:blob"]
-
-    async def test_the_floor_does_not_claim_a_vector_hit_in_the_provenance(self):
-        results = {r.uid: r.sources for r in await self._search(_policy())}
-        assert results["p:blob"] == {"bm25": 1}
+        assert provenance["p:fn"] == {"vector": 1}
 
 
 @pytest.mark.parametrize("kind", DEFAULT_EXCLUDE_KINDS)

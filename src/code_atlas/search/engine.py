@@ -24,7 +24,6 @@ from code_atlas.telemetry import get_meter, get_metrics, get_tracer
 if TYPE_CHECKING:
     from typing import Protocol
 
-    from code_atlas.search.embeddings import EmbedPolicy
     from code_atlas.settings import ImportanceSettings, SearchSettings
 
     class GraphExecutor(Protocol):
@@ -469,6 +468,25 @@ def rrf_fuse(
     Returns
     -------
     ``{uid: rrf_score}`` dict sorted by score descending.
+
+    Notes
+    -----
+    A uid absent from a channel earns nothing there. That is the contract, not a gap to be
+    patched -- and it was patched once. ATL-166 appended entities the embedding policy
+    excludes to the tail of the vector list, so that a natural-language query (which
+    ``analyze_query`` weights vector at 2.0) could not gate them off the page. ATL-184
+    removed it: a tail contribution is not the epsilon that prose assumed.
+
+    RRF's curve is nearly flat across a fetched window -- at ``k=60`` the 63rd of 63 rows
+    still pays ``2/124``, 98.4% of an entire rank-1 BM25 hit. What decides *order* is the
+    adjacent-rank differential ``w / ((k+r+1)(k+r+2))``, 2.6e-4 at the head. So the floor
+    was ~62x coarser than the ordering it was forbidden to disturb, and no constant sits
+    between: changing an outcome needs more than ``w_v/(k+t+1)``, inverting nothing needs
+    less than ``w_b*(1/61-1/62)``, and those bounds diverge as ``k`` grows.
+
+    Hence one rule, for every entity: **a channel pays for the rank it returned.** Absence
+    from a shortlist and exclusion by policy are the same state at query time, and pricing
+    them differently is what ATL-184 undid. See ADR-0052.
     """
     weights = weights or {}
     scores: dict[str, float] = {}
@@ -587,56 +605,6 @@ def _build_ranked_lists(
         ranked_lists[channel] = uids
 
     return ranked_lists, props_by_uid
-
-
-def _floor_excluded_in_vector_channel(
-    ranked_lists: dict[str, list[str]],
-    props_by_uid: dict[str, dict[str, Any]],
-    policy: EmbedPolicy | None,
-) -> None:
-    """Admit entities the embedding policy excludes to the tail of the vector list.
-
-    An entity with no vector is absent from the vector channel, and RRF pays it nothing
-    there. That is a gate, and an invisible one: ``analyze_query`` weights vector at 2.0
-    for any natural-language query of three words or more, so an excluded entity competes
-    for 1.5 of the 3.5 weight its embedded rivals share. It would keep losing to a worse
-    match that happened to own a vector.
-
-    The rule (ATL-166) is that a similarity gate filters *scored* candidates, and an
-    entity the policy never allowed to be scored is admitted at the floor instead of
-    dropped: appended after every real hit, so it earns the smallest non-zero
-    contribution the channel can pay -- ``w * 1 / (k + tail + 1)``. Barely passing.
-
-    Two limits, both deliberate:
-
-    * Only uids another channel already surfaced. Nothing enters a search on the strength
-      of having no vector, and the candidate set stays bounded by what was fetched.
-    * Only entities the *policy* excludes -- not every entity that happens to lack a
-      vector. A missing vector can also be a pipeline hole, and
-      ``_reconcile_missing_embeddings`` exists to heal those; scoring one at the floor
-      would hide it instead.
-
-    Called after :func:`_build_provenance`, so ``sources`` still reports the ranks the
-    channels actually returned. A floored uid did not come back from a vector search and
-    must not claim it did.
-    """
-    if policy is None or policy.is_permissive:
-        return
-    vector_uids = ranked_lists.get("vector")
-    if vector_uids is None:
-        # The vector channel did not run. Inventing one here would hand excluded entities
-        # a contribution that embedded entities are not getting either.
-        return
-    scored = set(vector_uids)
-    elsewhere = dict.fromkeys(uid for channel, uids in ranked_lists.items() if channel != "vector" for uid in uids)
-    vector_uids.extend(
-        uid
-        for uid in elsewhere
-        if uid not in scored
-        and not policy.allows(
-            props_by_uid.get(uid, {}).get("kind") or "", props_by_uid.get(uid, {}).get("file_path") or ""
-        )
-    )
 
 
 def _build_provenance(ranked_lists: dict[str, list[str]]) -> dict[str, dict[str, int]]:
@@ -981,7 +949,6 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
     include_patterns: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
     channel_status: dict[str, str] | None = None,
-    embed_policy: EmbedPolicy | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search across selected channels and fuse with RRF.
 
@@ -1029,11 +996,6 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
         channel name (``graph``/``vector``/``bm25``). Left untouched if
         ``None``. Lets a caller detect silent channel degradation instead
         of an empty/partial result set looking like a complete search.
-    embed_policy:
-        The embedding policy in force. Entities it excludes carry no vector by
-        design, so they are admitted to the vector channel at the floor rather
-        than scoring nothing there -- see
-        :func:`_floor_excluded_in_vector_channel`. ``None`` skips that entirely.
     """
     with _tracer.start_as_current_span(
         "hybrid_search", attributes={"query": query, "limit": limit, "scope": scope}
@@ -1110,7 +1072,6 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
         with _tracer.start_as_current_span("rrf_fuse"):
             ranked_lists, props_by_uid = _build_ranked_lists(channel_results)
             uid_ranks = _build_provenance(ranked_lists)
-            _floor_excluded_in_vector_channel(ranked_lists, props_by_uid, embed_policy)
             fused_scores = rrf_fuse(ranked_lists, k=settings.rrf_k, weights=effective_weights)
 
         # Build all SearchResult objects, apply filters, then slice to limit
