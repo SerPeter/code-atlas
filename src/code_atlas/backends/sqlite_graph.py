@@ -3360,22 +3360,38 @@ class SqliteGraphClient:
                 if uid not in scored or scored[uid][1] < score:
                     scored[uid] = (node, score)
 
+        # Mirrors graph.client._GRAPH_SEARCH_ORDER exactly -- see the rationale there.
+        # ``instr``, never ``LIKE``: LIKE is case-INSENSITIVE over ASCII in SQLite while
+        # Cypher CONTAINS is case-sensitive, so the obvious spelling (reusing the LIKE the
+        # WHERE clause already uses) silently reorders 165 of 400 real rows against
+        # Memgraph, starting at rank 1, and no all-lowercase fixture can see it.
+        # The bound parameter is the RAW query, matching CONTAINS $query -- not the
+        # ``_like_literal`` form, whose escapes are a LIKE-pattern concern.
+        order_sql = "ORDER BY CASE WHEN instr(coalesce(name,''), ?) > 0 THEN 0 ELSE 1 END, coalesce(name,''), uid"
+
         await _run(
-            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE name = ? {label_clause}{proj_sql} LIMIT ?",
-            [query, *label_params, *proj_params, fetch_limit],
+            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE name = ? {label_clause}{proj_sql} {order_sql} LIMIT ?",
+            [query, *label_params, *proj_params, query, fetch_limit],
             3.0,
         )
         await _run(
             f"SELECT {_NODE_COLUMNS} FROM nodes WHERE qualified_name LIKE ? ESCAPE '\\' "
-            f"{label_clause}{proj_sql} LIMIT ?",
-            [f"%.{_like_literal(query)}", *label_params, *proj_params, fetch_limit],
+            f"{label_clause}{proj_sql} {order_sql} LIMIT ?",
+            [f"%.{_like_literal(query)}", *label_params, *proj_params, query, fetch_limit],
             2.0,
         )
         await _run(
             f"SELECT {_NODE_COLUMNS} FROM nodes "
             f"WHERE (qualified_name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\') "
-            f"{label_clause}{proj_sql} LIMIT ?",
-            [f"%{_like_literal(query)}%", f"%{_like_literal(query)}%", *label_params, *proj_params, fetch_limit],
+            f"{label_clause}{proj_sql} {order_sql} LIMIT ?",
+            [
+                f"%{_like_literal(query)}%",
+                f"%{_like_literal(query)}%",
+                *label_params,
+                *proj_params,
+                query,
+                fetch_limit,
+            ],
             1.0,
         )
 

@@ -526,6 +526,35 @@ def _assert_valid_label(label: str) -> None:
         raise ValueError(msg)
 
 
+# Every stage truncates at ``fetch_limit``, so *which* rows survive is part of the
+# answer -- and without an ORDER BY that was decided by storage order (ATL-186). The
+# caller's sort is stable and `rrf_fuse` reads list position as rank, so an arbitrary
+# order was being fused as if it were a relevance signal.
+#
+# The key is mirrored verbatim in ``sqlite_graph.graph_search``; the two are compared
+# by ``test_conformance``'s ranked assertions, so they must move together.
+#
+# * **tier** -- a node whose *name* contains the query beats one where only its
+#   qualified_name (its module path) does. Not a new policy: the cascade already prices
+#   a name match at 3.0 above a suffix match at 2.0. This applies that same rule inside
+#   stage 3's flat 1.0 bucket, which the cascade left unordered.
+# * **name** -- alphabetical, and the reason is de-clustering rather than alphabetisation.
+#   A uid is ``project:module.path.name``, so ordering by it walks one module's entire
+#   block: measured on the live graph, ``ORDER BY n.uid`` returned 188 of 189 rows from a
+#   single module for "client", and was *worse* than storage order on every metric.
+#   Ordering by name interleaves modules (mean longest same-module run 24 vs 100).
+# * **uid** -- the tie-break, so the result is total and reproducible.
+#
+# ``size(name)`` was measured and rejected: it de-clusters slightly better but fetches
+# ~36% more config/private-attribute nodes, ranks short false-substring hits above long
+# true ones ("Research" over ``hybrid_search`` for query "search"), and its SQLite mirror
+# needs ``length(CAST(x AS BLOB))`` because Memgraph ``size()`` counts UTF-8 *bytes*
+# while SQLite ``length()`` counts code points -- a divergence no ASCII fixture can see.
+_GRAPH_SEARCH_ORDER = (
+    "ORDER BY CASE WHEN coalesce(n.name,'') CONTAINS $query THEN 0 ELSE 1 END, coalesce(n.name,''), n.uid"
+)
+
+
 def _build_graph_search_query(
     label: str,
     project_clause: str,
@@ -534,18 +563,24 @@ def _build_graph_search_query(
     """Build a UNION ALL Cypher query for the 3-stage graph search cascade.
 
     Collapses exact / suffix / contains matching into a single round-trip.
+
+    ORDER BY and LIMIT bind per branch, not to the union -- verified on Memgraph 3.12.0,
+    and the plan puts OrderBy *below* Limit in each branch, so each stage is a true top-N
+    rather than a truncation that is then sorted. Stage 1 and stage 2 carry the same key
+    because they truncate too: "__init__" has 286 exact-name matches on this repo alone.
     """
     label_filter = f":{label}" if label else ""
+    order = _GRAPH_SEARCH_ORDER
 
     return (
         f"MATCH (n{label_filter}) WHERE n.name = $query{project_clause} "
-        f"RETURN n AS node, 3.0 AS score LIMIT {fetch_limit} "
+        f"RETURN n AS node, 3.0 AS score {order} LIMIT {fetch_limit} "
         f"UNION ALL "
         f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix{project_clause} "
-        f"RETURN n AS node, 2.0 AS score LIMIT {fetch_limit} "
+        f"RETURN n AS node, 2.0 AS score {order} LIMIT {fetch_limit} "
         f"UNION ALL "
         f"MATCH (n{label_filter}) WHERE (n.qualified_name CONTAINS $query OR n.name CONTAINS $query)"
-        f"{project_clause} RETURN n AS node, 1.0 AS score LIMIT {fetch_limit}"
+        f"{project_clause} RETURN n AS node, 1.0 AS score {order} LIMIT {fetch_limit}"
     )
 
 

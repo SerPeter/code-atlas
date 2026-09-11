@@ -1442,3 +1442,79 @@ class TestGraphQueryTiming:
         await client.ping()
 
         assert recorded == []
+
+
+class TestTheGraphSearchOrdering:
+    """ATL-186. `_build_graph_search_query` had no unit test at all, and the conformance
+    suite compares behaviour rather than SQL -- so the two spellings that silently
+    desynchronise the backends were both invisible."""
+
+    @staticmethod
+    def _q(label: str = "", project_clause: str = "", fetch_limit: int = 30) -> str:
+        from code_atlas.graph.client import _build_graph_search_query
+
+        return _build_graph_search_query(label, project_clause, fetch_limit)
+
+    def test_every_stage_is_ordered(self):
+        """All three, not just the CONTAINS stage: stage 1 truncates too -- `__init__`
+        has 286 exact-name matches on this repo alone, against a production LIMIT of 189."""
+        query = self._q()
+        assert query.count("ORDER BY") == 3
+        assert query.count("LIMIT") == 3
+
+    def test_each_order_by_precedes_its_own_limit(self):
+        """ORDER BY must bind *below* LIMIT in each branch, or a stage truncates first
+        and sorts the leftovers -- which is not a top-N, and would leave the defect in
+        place while looking fixed."""
+        query = self._q()
+        for branch in query.split("UNION ALL"):
+            assert branch.count("ORDER BY") == 1, branch
+            assert branch.index("ORDER BY") < branch.index("LIMIT"), branch
+
+    def test_the_query_is_a_bound_parameter_not_interpolated(self):
+        """The tier predicate references the user's text. Interpolating it would be an
+        injection, and `$query` is already bound for the WHERE clauses."""
+        query = self._q()
+        # 6 uses: stage 1's `n.name = $query`, stage 3's two CONTAINS halves, and one
+        # tier predicate per branch. The point is that none of them is an f-string hole.
+        assert query.count("$query") == 6
+        for branch in query.split("UNION ALL"):
+            assert "CONTAINS $query" in branch.split("ORDER BY")[1]
+
+    def test_the_tier_predicate_uses_contains_not_a_pattern_match(self):
+        """Cypher CONTAINS is case-SENSITIVE, and the SQLite mirror must use `instr` for
+        the same reason. Spelling either as a LIKE-style match reorders 165 of 400 real
+        rows between the backends, starting at rank 1, with no error and no ASCII fixture
+        able to see it."""
+        from code_atlas.graph.client import _GRAPH_SEARCH_ORDER
+
+        assert "CONTAINS $query" in _GRAPH_SEARCH_ORDER
+        assert "=~" not in _GRAPH_SEARCH_ORDER
+        assert "STARTS WITH" not in _GRAPH_SEARCH_ORDER
+
+    def test_the_secondary_key_is_the_name_not_its_size(self):
+        """`size()` was measured and rejected (ATL-186). Memgraph `size()` counts UTF-8
+        BYTES while SQLite `length()` counts code points, so the mirror would need
+        `length(CAST(x AS BLOB))` -- a distinction no ASCII corpus can expose, and one a
+        future simplification to `length()` would silently break."""
+        from code_atlas.graph.client import _GRAPH_SEARCH_ORDER
+
+        assert "size(" not in _GRAPH_SEARCH_ORDER
+        assert "coalesce(n.name,'')" in _GRAPH_SEARCH_ORDER
+        assert _GRAPH_SEARCH_ORDER.rstrip().endswith("n.uid"), "uid must be the final tie-break"
+
+    def test_the_sqlite_mirror_matches_term_for_term(self):
+        """The two keys are hand-written mirrors with no shared source, so nothing but a
+        test keeps them aligned -- the same arrangement as the rate limiters (ADR-0044)."""
+        import inspect
+
+        from code_atlas.backends.sqlite_graph import SqliteGraphClient
+        from code_atlas.graph.client import _GRAPH_SEARCH_ORDER
+
+        src = inspect.getsource(SqliteGraphClient.graph_search)
+        assert "instr(coalesce(name,''), ?)" in src, "must use instr, never LIKE"
+        assert "coalesce(name,'')," in src, "secondary key must be the plain name"
+        assert "length(coalesce" not in src, "length() counts code points, size() counts bytes"
+        assert "length(CAST(" not in src, "the CAST form belongs to the rejected size() key"
+        # Same three terms, same order, in both spellings.
+        assert _GRAPH_SEARCH_ORDER.index("coalesce(n.name,'')") < _GRAPH_SEARCH_ORDER.index("n.uid")

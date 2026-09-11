@@ -316,6 +316,55 @@ async def _seed(client: Any) -> None:
     await client.upsert_file_entities(PROJECT, "mod.py", entities, rels)
 
 
+ORDER_PROJECT = "orderproj"
+
+
+def _order_corpus() -> list[ParsedEntity]:
+    """A corpus built so the per-stage LIMIT binds, and so the ordering key's tiers are
+    all exercised.
+
+    24 entities match "parse". At `limit=5` the cascade fetches 15 per stage, so stage 3
+    truncates and *which* rows it keeps becomes observable -- the thing the 9-entity
+    `_corpus` at limit=20 can never test.
+
+    Everything is lowercase on purpose. SQLite's `LIKE` is case-insensitive over ASCII
+    while Cypher's `CONTAINS` is not, a PRE-EXISTING divergence in the WHERE clauses that
+    is not ATL-186's to fix; a mixed-case name here would make this test red for an
+    unrelated reason and read as a false failure of the ordering.
+    """
+    named = ["parse", "parse_tree", "parser", "do_parse", "zparse", "aparse"]
+    return [
+        # tier 0: the name itself contains the query
+        *(_entity(n, f"{ORDER_PROJECT}:mod.{n}") for n in named),
+        # tier 1: only the module path contains it -- 18 of them, to overflow the window
+        *(_entity(f"helper_{i:02d}", f"{ORDER_PROJECT}:parse.helper_{i:02d}") for i in range(18)),
+    ]
+
+
+@pytest.fixture
+async def ordered_both(graph_client, tmp_path: Path):
+    """Both backends, seeded from `_order_corpus` under its own project.
+
+    A separate fixture rather than an extension of `_corpus`, because the shared corpus
+    is deliberately tiny and shaped around other defects; growing it to 24 entities to
+    make one LIMIT bind would change what every other comparison in this file is testing.
+    """
+    sqlite = SqliteGraphClient(tmp_path / "order.sqlite3")
+    # Seeded in OPPOSITE orders on purpose. Insertion order is what storage order
+    # follows, so seeding both the same way lets the backends agree by coincidence and
+    # the comparison asserts nothing -- verified: with the ORDER BY removed, an
+    # identically-seeded pair still matched. Reversing one makes agreement provable
+    # evidence that the key decides the order rather than the write path.
+    await graph_client.ensure_schema()
+    await graph_client.upsert_file_entities(ORDER_PROJECT, "mod.py", _order_corpus(), [])
+    await sqlite.ensure_schema()
+    await sqlite.upsert_file_entities(ORDER_PROJECT, "mod.py", list(reversed(_order_corpus())), [])
+    try:
+        yield graph_client, sqlite
+    finally:
+        await sqlite.close()
+
+
 @pytest.fixture
 async def both(graph_client, tmp_path: Path):
     """Memgraph and SQLite, seeded from the same corpus.
@@ -365,6 +414,25 @@ def _keys(rows: list[dict[str, Any]], *fields: str) -> set[str]:
             if value:
                 out.add(str(value))
                 break
+    return out
+
+
+def _ranked_uids(rows: list[dict[str, Any]]) -> list[str]:
+    """Compare by uid *sequence*, for the methods that promise an order.
+
+    Deliberately separate from `_uids` rather than making that ordered. Most compared
+    methods legitimately return an unordered set, and several of them
+    (`get_node_partial_matches`, `get_callers`, `get_callees`) still carry the very
+    unordered-LIMIT defect ATL-186 fixed in `graph_search` -- making `_uids` ordered
+    would assert a contract the product does not yet offer, and turn four unrelated
+    methods red.
+    """
+    out: list[str] = []
+    for row in rows:
+        node = row.get("node") or row.get("n") or row
+        value = node.get("uid") if hasattr(node, "get") else None
+        if value:
+            out.append(str(value))
     return out
 
 
@@ -667,6 +735,49 @@ class TestTheDefectsThatMotivatedThis:
         b = _uids(await lite.graph_search("weird_name", project=PROJECT, limit=20))
         assert a == b
         assert f"{PROJECT}:mod.weirdXname" not in b
+
+    async def test_graph_search_returns_the_same_order_from_both_backends(self, ordered_both):
+        """ATL-186: every stage truncates at `limit * 3`, so *which* rows survive is part
+        of the answer -- and the caller's stable sort carries that order into
+        `rrf_fuse`, which reads list position as rank.
+
+        `limit=5` against a corpus of 24 `parse`-matching entities means stage 3 fetches
+        15 of them: the LIMIT binds, which is exactly what the pre-existing comparison
+        could not do at limit=20 over a 9-entity corpus.
+        """
+        mg, lite = ordered_both
+        for limit in (5, 8):
+            a = _ranked_uids(await mg.graph_search("parse", project=ORDER_PROJECT, limit=limit))
+            b = _ranked_uids(await lite.graph_search("parse", project=ORDER_PROJECT, limit=limit))
+            assert a == b, f"backends disagree about graph_search order at limit={limit}"
+            assert len(a) == limit, "the LIMIT must actually bind, or this compares nothing"
+
+    async def test_a_name_match_outranks_a_path_only_match(self, ordered_both):
+        """The ordering key's first tier, and the reason it is not new policy: the
+        cascade already prices an exact name at 3.0 above a suffix at 2.0. Inside stage
+        3's flat 1.0 bucket that rule simply did not apply, so a node matching only on
+        its module path could outrank one matching on its own name."""
+        for client in self._both(ordered_both):
+            rows = await client.graph_search("parse", project=ORDER_PROJECT, limit=12)
+            names = [(r["node"]["uid"].rsplit(".", 1)[-1]) for r in rows]
+            name_hits = [i for i, n in enumerate(names) if "parse" in n]
+            path_only = [i for i, n in enumerate(names) if "parse" not in n]
+            assert name_hits, "no name-matching entity survived the fetch window"
+            if path_only:
+                assert max(name_hits) < min(path_only), f"a path-only match outranked a name match: {names}"
+
+    async def test_the_order_is_stable_across_repeated_calls(self, ordered_both):
+        """Storage order was reproducible run-to-run too, which is how this stayed
+        invisible. The claim worth pinning is agreement *between* backends plus
+        stability, not stability alone."""
+        for client in self._both(ordered_both):
+            first = _ranked_uids(await client.graph_search("parse", project=ORDER_PROJECT, limit=8))
+            for _ in range(3):
+                assert _ranked_uids(await client.graph_search("parse", project=ORDER_PROJECT, limit=8)) == first
+
+    @staticmethod
+    def _both(pair: Any) -> list[Any]:
+        return [pair[0], pair[1]]
 
     async def test_a_percent_query_does_not_match_everything(self, both):
         mg, lite = both
