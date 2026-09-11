@@ -102,16 +102,28 @@ options, most specific first:
 | `atlas.local.toml` | no (gitignored) | machine-specific values you want to persist           |
 | `atlas.toml`       | yes             | everything about the codebase itself                  |
 
-Nested sections use a double underscore: `ATLAS_MEMGRAPH__HOST=box.local`. Atlas never reads `.env` itself — export from
-`.envrc` (direnv) if you want them loaded automatically.
+Nested sections use a double underscore: `ATLAS_BACKEND__GRAPH__MEMGRAPH__HOST=box.local`. Atlas never reads `.env`
+itself — export from `.envrc` (direnv) if you want them loaded automatically.
 
 `atlas.local.toml` merges per key rather than replacing the file, so this is enough to point one developer at a
 different Memgraph while inheriting everything else:
 
 ```toml
 # atlas.local.toml
-[memgraph]
+[backend.graph.memgraph]
 host = "box.local"
+```
+
+Declaring a backend is how you select it — there is no separate `graph = "memgraph"` key. Omit `[backend.graph.*]`
+entirely and Atlas probes Memgraph and falls back to the embedded SQLite backend when it is unreachable; declare one and
+an unreachable backend is an error instead. Since `atlas.local.toml` merges per key, a machine that wants the embedded
+backend while the committed file declares Memgraph writes:
+
+```toml
+# atlas.local.toml
+[backend.graph]
+memgraph = false
+sqlite = {}
 ```
 
 Both files are discovered from the **git root**, so it does not matter which directory you run `atlas` from — a

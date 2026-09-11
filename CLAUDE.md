@@ -182,8 +182,8 @@ structural fallback, so they are precisely "data no dialect could read". A recog
 - `_reclaim_excluded_embeddings` strips vectors bought under an older policy at the end of an index.
   Pure graph work; it never re-bills anything, which `--reset-embeddings` would.
 
-**Pacing follows the backend (ADR-0044):** `backend.queue = "sqlite"` gets a `SqliteRateLimiter` holding the
-same buckets and AIMD factor in `ratelimit.sqlite3`; `"valkey"`/`"auto"` get the Valkey one. The two are
+**Pacing follows the backend (ADR-0044):** a declared `[backend.queue.sqlite]` gets a `SqliteRateLimiter` holding the
+same buckets and AIMD factor in `ratelimit.sqlite3`; Valkey and an undeclared queue get the Valkey one. The two are
 hand-written mirrors (Lua cannot call Python) and are pinned together by
 `tests/integration/search/test_ratelimit_conformance.py` — edit both, or that test fails.
 
@@ -325,10 +325,38 @@ discovered from the **git root**, so the directory you run from never changes wh
 in a sub-directory is not read, and `cli._warn_shadowed_config` says so when one exists.
 
 - `atlas.toml` — committed, describes the codebase (scope, search settings, detectors, monorepo layout, vault)
-- `atlas.local.toml` — gitignored, merges per key over the above. For `[redis]`, `[memgraph]`, `[embeddings]`,
-  `[backend]`, which differ per machine and should not be in the shared file. The exception is
-  `[embeddings]`'s policy keys (`exclude`, `include`, `exclude_kinds`) — those describe the codebase,
-  not the machine, and belong in the committed `atlas.toml`
+- `atlas.local.toml` — gitignored, merges per key over the above. For `[backend]` and `[embeddings]`, which
+  differ per machine and should not be in the shared file. The exception is `[embeddings]`'s policy keys
+  (`exclude`, `include`, `exclude_kinds`) — those describe the codebase, not the machine, and belong in the
+  committed `atlas.toml`
 - Environment variables: `ATLAS_*` prefix with double-underscore nesting (e.g. `ATLAS_EMBEDDINGS__MODEL`).
   Atlas never reads `.env` itself — export from `.envrc` (direnv) if you want that
 - `.atlasignore` — gitignore-style exclusion patterns for indexing
+
+**Declaring a backend is selecting it (ATL-187).** There is no separate selector: `[backend.graph.memgraph]`
+both configures Memgraph and chooses it. Top-level `[memgraph]` / `[redis]` are gone, and a config still
+carrying them fails with the rewritten stanza in the error rather than "extra inputs are not permitted".
+
+| state on an axis | meaning                                                                                  |
+| ---------------- | ---------------------------------------------------------------------------------------- |
+| no section       | `auto` — probe the network backend, fall back to embedded SQLite. The only fallback path |
+| one section      | that backend; unreachable is an **error**, nothing is rebuilt into `.atlas/`             |
+| two sections     | a config error, not a precedence rule                                                    |
+
+The old shape let `backend.graph = "auto"` coexist with a fully tuned `[memgraph]`, so a running, configured
+Memgraph could be read and then not used — which silently built a 214 MB parallel graph and re-bought every
+vector, announced by one warning line. That is why the fallback is now reserved for the case where nothing
+was asked for.
+
+`atlas.local.toml` merges **per key**, so a local `[backend.graph.sqlite]` would sit alongside the committed
+`[backend.graph.memgraph]` and trip the two-backend error. TOML has no null, so `false` un-declares:
+
+```toml
+[backend.graph]
+memgraph = false
+sqlite = {}
+```
+
+`settings.memgraph` / `settings.redis` still exist as read accessors and return defaults when the section is
+absent — `auto` has to probe an address for a backend it may not end up using. Only the file shape moved;
+`ATLAS_MEMGRAPH__HOST` became `ATLAS_BACKEND__GRAPH__MEMGRAPH__HOST`.

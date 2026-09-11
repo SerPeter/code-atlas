@@ -4,6 +4,11 @@
 
 Accepted
 
+Amended by [ADR-0053](./0053-declaring-a-backend-is-selecting-it.md): the `"memgraph" | "sqlite" | "auto"` selector this
+ADR introduced is replaced by the presence of a `[backend.<axis>.<name>]` section, because a separate selector let a
+fully configured Memgraph be read and then not used. `"auto"` survives as the _undeclared_ state, so the zero-config
+promise below is unchanged.
+
 ## Date
 
 2026-07-18

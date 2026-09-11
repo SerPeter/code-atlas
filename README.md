@@ -36,8 +36,9 @@ All powered by [Memgraph](https://memgraph.com/) as a single backend.
 > without Docker running, SQLite is what you get**. It is a fallback, not a parity replacement
 > ([ADR-0015](wiki/adr/0015-embedded-backend-option.md)): community detection (`find_communities`,
 > and the map in `atlas ui`) is unavailable there, and some analyses differ. `health_check` reports a
-> **warning** rather than an OK while it is active, and `index_status` carries a `backend` field. Set
-> `backend.graph = "memgraph"` in `atlas.toml` to fail loudly instead of falling back.
+> **warning** rather than an OK while it is active, and `index_status` carries a `backend` field. Declare
+> `[backend.graph.memgraph]` in `atlas.toml` to fail loudly instead of falling back — the fallback only
+> happens when no backend is declared at all.
 
 ## Key Features
 
