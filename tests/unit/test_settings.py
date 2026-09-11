@@ -93,8 +93,8 @@ class TestEnvVarScoping:
 
     def test_prefixed_nested_env_overrides_apply(self, clean_env, monkeypatch):
         """ATLAS_SECTION__FIELD env vars override nested fields; siblings keep defaults."""
-        monkeypatch.setenv("ATLAS_MEMGRAPH__PORT", "7999")
-        monkeypatch.setenv("ATLAS_REDIS__STREAM_MAXLEN", "500")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__MEMGRAPH__PORT", "7999")
+        monkeypatch.setenv("ATLAS_BACKEND__QUEUE__VALKEY__STREAM_MAXLEN", "500")
 
         settings = AtlasSettings(project_root=clean_env)
 
@@ -104,7 +104,7 @@ class TestEnvVarScoping:
 
     def test_toml_section_still_loads(self, clean_env):
         """atlas.toml sections populate nested settings."""
-        (clean_env / "atlas.toml").write_text("[memgraph]\nport = 7777\n", encoding="utf-8")
+        (clean_env / "atlas.toml").write_text("[backend.graph.memgraph]\nport = 7777\n", encoding="utf-8")
 
         settings = AtlasSettings(project_root=clean_env)
 
@@ -112,8 +112,10 @@ class TestEnvVarScoping:
 
     def test_env_override_beats_toml_within_section(self, clean_env, monkeypatch):
         """Env vars beat atlas.toml for the same nested field; other toml keys survive (test isolation needs this)."""
-        (clean_env / "atlas.toml").write_text('[memgraph]\nport = 7687\nhost = "tomlhost"\n', encoding="utf-8")
-        monkeypatch.setenv("ATLAS_MEMGRAPH__PORT", "7688")
+        (clean_env / "atlas.toml").write_text(
+            '[backend.graph.memgraph]\nport = 7687\nhost = "tomlhost"\n', encoding="utf-8"
+        )
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__MEMGRAPH__PORT", "7688")
 
         settings = AtlasSettings(project_root=clean_env)
 
@@ -122,9 +124,9 @@ class TestEnvVarScoping:
 
     def test_init_kwargs_override_env(self, clean_env, monkeypatch):
         """Explicitly passed nested settings win over env vars (integration conftest relies on this)."""
-        monkeypatch.setenv("ATLAS_MEMGRAPH__PORT", "7999")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__MEMGRAPH__PORT", "7999")
 
-        settings = AtlasSettings(project_root=clean_env, memgraph=MemgraphSettings(port=7688))
+        settings = AtlasSettings(project_root=clean_env, backend={"graph": {"memgraph": MemgraphSettings(port=7688)}})
 
         assert settings.memgraph.port == 7688
 
@@ -152,7 +154,7 @@ class TestAtlasTomlDiscovery:
         cwd_dir.mkdir()
         project_dir = tmp_path / "project"
         project_dir.mkdir()
-        (project_dir / "atlas.toml").write_text("[memgraph]\nport = 7777\n", encoding="utf-8")
+        (project_dir / "atlas.toml").write_text("[backend.graph.memgraph]\nport = 7777\n", encoding="utf-8")
 
         monkeypatch.chdir(cwd_dir)
 
@@ -168,7 +170,7 @@ class TestAtlasTomlDiscovery:
 
         cwd_dir = tmp_path / "cwd"
         cwd_dir.mkdir()
-        (cwd_dir / "atlas.toml").write_text("[memgraph]\nport = 6666\n", encoding="utf-8")
+        (cwd_dir / "atlas.toml").write_text("[backend.graph.memgraph]\nport = 6666\n", encoding="utf-8")
         project_dir = tmp_path / "project"
         project_dir.mkdir()
 
@@ -218,13 +220,17 @@ class TestConfigDiscoveryStartsAtTheProjectRoot:
     """
 
     def test_a_subdirectory_yields_the_same_settings_as_the_root(self, clean_env, monkeypatch):
-        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7777\n[index]\nmax_source_chars = 4321\n")
+        repo = _repo(
+            clean_env / "repo", shared="[backend.graph.memgraph]\nport = 7777\n[index]\nmax_source_chars = 4321\n"
+        )
         sub = repo / "apps" / "web"
         sub.mkdir(parents=True)
         # A competing config in the sub-directory is what makes this assertion mean
         # anything. Without one, cwd-relative discovery walks up and finds the root's file
         # anyway, so the test passes with or without the fix — measured, not assumed.
-        (sub / "atlas.toml").write_text("[memgraph]\nport = 7000\n[index]\nmax_source_chars = 1234\n", encoding="utf-8")
+        (sub / "atlas.toml").write_text(
+            "[backend.graph.memgraph]\nport = 7000\n[index]\nmax_source_chars = 1234\n", encoding="utf-8"
+        )
 
         monkeypatch.chdir(repo)
         from_root = AtlasSettings()
@@ -248,10 +254,10 @@ class TestConfigDiscoveryStartsAtTheProjectRoot:
 
     def test_a_shadowed_subdirectory_config_is_reported(self, clean_env, monkeypatch):
         """Not read is fine; not read and not mentioned is the same defect in a new place."""
-        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7687\n")
+        repo = _repo(clean_env / "repo", shared="[backend.graph.memgraph]\nport = 7687\n")
         sub = repo / "apps" / "web"
         sub.mkdir(parents=True)
-        (sub / "atlas.toml").write_text("[memgraph]\nport = 7111\n", encoding="utf-8")
+        (sub / "atlas.toml").write_text("[backend.graph.memgraph]\nport = 7111\n", encoding="utf-8")
 
         monkeypatch.chdir(sub)
         warnings = _captured_warnings(repo)
@@ -260,7 +266,7 @@ class TestConfigDiscoveryStartsAtTheProjectRoot:
         assert any(str(repo) in w for w in warnings), "the warning must name the root it read instead"
 
     def test_no_warning_when_running_at_the_root(self, clean_env, monkeypatch):
-        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7687\n")
+        repo = _repo(clean_env / "repo", shared="[backend.graph.memgraph]\nport = 7687\n")
         monkeypatch.chdir(repo)
 
         assert _captured_warnings(repo) == []
@@ -269,7 +275,7 @@ class TestConfigDiscoveryStartsAtTheProjectRoot:
         """No .git anywhere, so `_default_project_root` falls back to cwd — unchanged."""
         plain = clean_env / "plain"
         plain.mkdir()
-        (plain / "atlas.toml").write_text("[memgraph]\nport = 7999\n", encoding="utf-8")
+        (plain / "atlas.toml").write_text("[backend.graph.memgraph]\nport = 7999\n", encoding="utf-8")
 
         monkeypatch.chdir(plain)
 
@@ -284,8 +290,8 @@ class TestLocalConfigOverride:
         """The point of merging rather than replacing: override the host, keep the port."""
         repo = _repo(
             clean_env / "repo",
-            shared='[memgraph]\nhost = "shared-host"\nport = 7687\n[index]\nmax_source_chars = 4321\n',
-            local='[memgraph]\nhost = "local-host"\n',
+            shared='[backend.graph.memgraph]\nhost = "shared-host"\nport = 7687\n[index]\nmax_source_chars = 4321\n',
+            local='[backend.graph.memgraph]\nhost = "local-host"\n',
         )
         monkeypatch.chdir(repo)
 
@@ -303,18 +309,18 @@ class TestLocalConfigOverride:
         """
         repo = _repo(
             clean_env / "repo",
-            shared='[memgraph]\nhost = "from-shared"\n',
-            local='[memgraph]\nhost = "from-local"\n',
+            shared='[backend.graph.memgraph]\nhost = "from-shared"\n',
+            local='[backend.graph.memgraph]\nhost = "from-local"\n',
         )
         monkeypatch.chdir(repo)
 
         assert AtlasSettings().memgraph.host == "from-local"
 
-        monkeypatch.setenv("ATLAS_MEMGRAPH__HOST", "from-env")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__MEMGRAPH__HOST", "from-env")
         assert AtlasSettings().memgraph.host == "from-env"
 
     def test_a_local_file_applies_with_no_shared_file(self, clean_env, monkeypatch):
-        repo = _repo(clean_env / "repo", local="[memgraph]\nport = 7555\n")
+        repo = _repo(clean_env / "repo", local="[backend.graph.memgraph]\nport = 7555\n")
         monkeypatch.chdir(repo)
 
         assert AtlasSettings().memgraph.port == 7555
@@ -323,9 +329,9 @@ class TestLocalConfigOverride:
         repo = clean_env / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / "pyproject.toml").write_text(
-            "[tool.atlas.memgraph]\nhost = 'shared-host'\nport = 7687\n", encoding="utf-8"
+            "[tool.atlas.backend.graph.memgraph]\nhost = 'shared-host'\nport = 7687\n", encoding="utf-8"
         )
-        (repo / "atlas.local.toml").write_text("[memgraph]\nhost = 'local-host'\n", encoding="utf-8")
+        (repo / "atlas.local.toml").write_text("[backend.graph.memgraph]\nhost = 'local-host'\n", encoding="utf-8")
         monkeypatch.chdir(repo)
 
         settings = AtlasSettings()
@@ -335,7 +341,7 @@ class TestLocalConfigOverride:
 
     def test_an_unknown_key_still_raises(self, clean_env, monkeypatch):
         """The local file is an override, not an amnesty for typos (StrictSection)."""
-        repo = _repo(clean_env / "repo", local="[memgraph]\nhsot = 'typo'\n")
+        repo = _repo(clean_env / "repo", local="[backend.graph.memgraph]\nhsot = 'typo'\n")
         monkeypatch.chdir(repo)
 
         with pytest.raises(ValidationError):
@@ -343,10 +349,10 @@ class TestLocalConfigOverride:
 
     def test_a_local_file_in_a_subdirectory_is_not_read(self, clean_env, monkeypatch):
         """The ATL-156 boundary holds for this file too — one directory level, never a walk."""
-        repo = _repo(clean_env / "repo", shared="[memgraph]\nport = 7687\n")
+        repo = _repo(clean_env / "repo", shared="[backend.graph.memgraph]\nport = 7687\n")
         sub = repo / "apps" / "web"
         sub.mkdir(parents=True)
-        (sub / "atlas.local.toml").write_text("[memgraph]\nport = 7111\n", encoding="utf-8")
+        (sub / "atlas.local.toml").write_text("[backend.graph.memgraph]\nport = 7111\n", encoding="utf-8")
 
         monkeypatch.chdir(sub)
 
@@ -355,10 +361,14 @@ class TestLocalConfigOverride:
 
 class TestBackendSettings:
     def test_defaults(self):
+        """Declaring nothing means "auto" -- probe the network backend, fall back to the
+        embedded one. The only state in which a fallback may happen at all."""
         settings = BackendSettings()
 
-        assert settings.graph == "auto"
-        assert settings.queue == "auto"
+        assert settings.graph_choice == "auto"
+        assert settings.queue_choice == "auto"
+        assert settings.graph.memgraph is None
+        assert settings.queue.valkey is None
         assert settings.sqlite_data_dir == Path(".atlas")
 
 
@@ -368,48 +378,86 @@ class TestBackendConfigDiscovery:
     """
 
     def test_atlas_toml_overrides_backend_settings(self, clean_env):
-        (clean_env / "atlas.toml").write_text('[backend]\ngraph = "sqlite"\nqueue = "sqlite"\n', encoding="utf-8")
+        (clean_env / "atlas.toml").write_text("[backend.graph.sqlite]\n[backend.queue.sqlite]\n", encoding="utf-8")
 
         settings = AtlasSettings(project_root=clean_env)
 
-        assert settings.backend.graph == "sqlite"
-        assert settings.backend.queue == "sqlite"
+        assert settings.backend.graph_choice == "sqlite"
+        assert settings.backend.queue_choice == "sqlite"
+
+    def test_declaring_nothing_is_auto(self, clean_env):
+        """The zero-config path, and the only one that may fall back to SQLite."""
+        settings = AtlasSettings(project_root=clean_env)
+
+        assert settings.backend.graph_choice == "auto"
+        assert settings.backend.queue_choice == "auto"
+
+    def test_two_backends_on_one_axis_is_an_error(self, clean_env):
+        """A precedence rule is the failure this shape exists to remove -- it would let a
+        file say two things and quietly honour one."""
+        from pydantic import ValidationError
+
+        (clean_env / "atlas.toml").write_text(
+            '[backend.graph.memgraph]\nhost = "h"\n[backend.graph.sqlite]\n', encoding="utf-8"
+        )
+
+        with pytest.raises(ValidationError, match="exactly one may be"):
+            AtlasSettings(project_root=clean_env)
+
+    def test_a_local_file_can_undeclare_what_the_shared_file_declared(self, clean_env):
+        """`atlas.local.toml` merges per key, so declaring sqlite locally would leave the
+        committed memgraph section in place and trip the two-backends error. TOML has no
+        null, so `false` is how a machine opts out without editing a shared file."""
+        (clean_env / "atlas.toml").write_text('[backend.graph.memgraph]\nhost = "shared"\n', encoding="utf-8")
+        (clean_env / "atlas.local.toml").write_text(
+            "[backend.graph]\nmemgraph = false\nsqlite = {}\n", encoding="utf-8"
+        )
+
+        settings = AtlasSettings(project_root=clean_env)
+
+        assert settings.backend.graph_choice == "sqlite"
 
     def test_pyproject_tool_atlas_fallback_picked_up_when_no_atlas_toml(self, clean_env):
-        (clean_env / "pyproject.toml").write_text('[tool.atlas.backend]\ngraph = "sqlite"\n', encoding="utf-8")
+        (clean_env / "pyproject.toml").write_text("[tool.atlas.backend.graph.sqlite]\n", encoding="utf-8")
 
         settings = AtlasSettings(project_root=clean_env)
 
-        assert settings.backend.graph == "sqlite"
+        assert settings.backend.graph_choice == "sqlite"
 
     def test_pyproject_without_tool_atlas_table_is_skipped(self, clean_env):
         """A pyproject.toml with no [tool.atlas] table is transparent — the walk
         continues up to a parent directory's atlas.toml instead of stopping there.
         """
-        (clean_env / "atlas.toml").write_text('[backend]\ngraph = "sqlite"\n', encoding="utf-8")
+        (clean_env / "atlas.toml").write_text("[backend.graph.sqlite]\n", encoding="utf-8")
         project_dir = clean_env / "project"
         project_dir.mkdir()
         (project_dir / "pyproject.toml").write_text('[project]\nname = "some-pkg"\n', encoding="utf-8")
 
         settings = AtlasSettings(project_root=project_dir)
 
-        assert settings.backend.graph == "sqlite"
+        assert settings.backend.graph_choice == "sqlite"
 
     def test_env_var_overrides_atlas_toml_backend(self, clean_env, monkeypatch):
-        (clean_env / "atlas.toml").write_text('[backend]\ngraph = "sqlite"\n', encoding="utf-8")
-        monkeypatch.setenv("ATLAS_BACKEND__GRAPH", "memgraph")
+        """Env outranks both files, and has to be able to un-declare as well as declare --
+        merging a second backend in would be the two-backends error, not an override."""
+        (clean_env / "atlas.toml").write_text("[backend.graph.sqlite]\n", encoding="utf-8")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__SQLITE", "false")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__MEMGRAPH", '{"host": "envhost"}')
 
         settings = AtlasSettings(project_root=clean_env)
 
-        assert settings.backend.graph == "memgraph"
+        assert settings.backend.graph_choice == "memgraph"
+        assert settings.memgraph.host == "envhost"
 
     def test_env_var_overrides_pyproject_fallback_backend(self, clean_env, monkeypatch):
-        (clean_env / "pyproject.toml").write_text('[tool.atlas.backend]\ngraph = "sqlite"\n', encoding="utf-8")
-        monkeypatch.setenv("ATLAS_BACKEND__GRAPH", "memgraph")
+        (clean_env / "pyproject.toml").write_text("[tool.atlas.backend.graph.sqlite]\n", encoding="utf-8")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__SQLITE", "false")
+        monkeypatch.setenv("ATLAS_BACKEND__GRAPH__MEMGRAPH", '{"port": 7999}')
 
         settings = AtlasSettings(project_root=clean_env)
 
-        assert settings.backend.graph == "memgraph"
+        assert settings.backend.graph_choice == "memgraph"
+        assert settings.memgraph.port == 7999
 
 
 class TestProjectNameOverride:
@@ -530,15 +578,29 @@ class TestEverySectionRejectsUnknownKeys:
         exactly what a newly-added section would not appear in, and the whole point is
         that the *next* section is strict too.
         """
+        import typing
+
         from pydantic import BaseModel
 
         from code_atlas.settings import AtlasSettings
 
         found: dict[str, type] = {}
-        for name, field in AtlasSettings.model_fields.items():
-            annotation = field.annotation
-            if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-                found[name] = annotation
+
+        def walk(model: type[BaseModel], prefix: str = "") -> None:
+            for name, field in model.model_fields.items():
+                # `memgraph: MemgraphSettings | None` is a union, so the annotation is not
+                # the model itself. Nesting one under [backend.graph] used to drop it from
+                # this mapping entirely, and with it the guarantee that it rejects typos.
+                candidates = [field.annotation, *typing.get_args(field.annotation)]
+                for candidate in candidates:
+                    if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                        key = f"{prefix}{name}"
+                        if key not in found:
+                            found[key] = candidate
+                            walk(candidate, f"{key}.")
+                        break
+
+        walk(AtlasSettings)
         return found
 
     def test_the_discovery_actually_finds_the_sections(self):
@@ -722,7 +784,7 @@ class TestExtractionKey:
             ("index", IndexSettings(file_hash_gate=False)),
             # Downstream of extraction: gated by embed_hash and by query-time weights.
             ("search", SearchSettings(rrf_k=99)),
-            ("memgraph", MemgraphSettings(port=7688)),
+            ("backend", BackendSettings(graph={"memgraph": MemgraphSettings(port=7688)})),
             # Never reaches the parser: note mode is triggered by frontmatter, not by path.
             ("knowledge", KnowledgeSettings(vault_path="notes")),
             # The rest of the docstring's OUT list, one case per section, so "both lists
@@ -731,8 +793,8 @@ class TestExtractionKey:
             # chunking, which reads like extraction and is not — it splits the embed *text*
             # of an entity the parser has already produced, and is gated by embed_hash.
             ("embeddings", EmbeddingSettings(max_input_tokens=1000)),
-            ("backend", BackendSettings(graph="sqlite")),
-            ("redis", RedisSettings(port=6380)),
+            ("backend", BackendSettings(graph={"sqlite": {}})),
+            ("backend", BackendSettings(queue={"valkey": RedisSettings(port=6380)})),
             ("watcher", WatcherSettings(debounce_s=5.0)),
             ("mcp", McpSettings(port=9000)),
             ("observability", ObservabilitySettings(enabled=True)),

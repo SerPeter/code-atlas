@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from code_atlas.schema import GLOBAL_PROJECT, generate_drop_text_index_ddl, generate_drop_vector_index_ddl
-from code_atlas.settings import AtlasSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
+from code_atlas.settings import AtlasSettings, BackendSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -67,10 +67,10 @@ def _export_atlas_env(ep: InfraEndpoints) -> InfraEndpoints:
     ``AtlasSettings(project_root=tmp_path)`` would otherwise resolve to the
     production infrastructure (init > env > toml). Env beats toml.
     """
-    os.environ["ATLAS_MEMGRAPH__HOST"] = ep.memgraph_host
-    os.environ["ATLAS_MEMGRAPH__PORT"] = str(ep.memgraph_port)
-    os.environ["ATLAS_REDIS__HOST"] = ep.valkey_host
-    os.environ["ATLAS_REDIS__PORT"] = str(ep.valkey_port)
+    os.environ["ATLAS_BACKEND__GRAPH__MEMGRAPH__HOST"] = ep.memgraph_host
+    os.environ["ATLAS_BACKEND__GRAPH__MEMGRAPH__PORT"] = str(ep.memgraph_port)
+    os.environ["ATLAS_BACKEND__QUEUE__VALKEY__HOST"] = ep.valkey_host
+    os.environ["ATLAS_BACKEND__QUEUE__VALKEY__PORT"] = str(ep.valkey_port)
     return ep
 
 
@@ -226,14 +226,20 @@ def settings(tmp_path, _infra_endpoints: InfraEndpoints):
     """
     return AtlasSettings(
         project_root=tmp_path,
-        memgraph=MemgraphSettings(
-            host=_infra_endpoints.memgraph_host,
-            port=_infra_endpoints.memgraph_port,
-        ),
-        redis=RedisSettings(
-            host=_infra_endpoints.valkey_host,
-            port=_infra_endpoints.valkey_port,
-            stream_prefix=f"test-{uuid.uuid4().hex[:8]}",
+        backend=BackendSettings(
+            graph={
+                "memgraph": MemgraphSettings(
+                    host=_infra_endpoints.memgraph_host,
+                    port=_infra_endpoints.memgraph_port,
+                )
+            },
+            queue={
+                "valkey": RedisSettings(
+                    host=_infra_endpoints.valkey_host,
+                    port=_infra_endpoints.valkey_port,
+                    stream_prefix=f"test-{uuid.uuid4().hex[:8]}",
+                )
+            },
         ),
         embeddings=EmbeddingSettings(),
     )

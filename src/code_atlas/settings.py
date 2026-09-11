@@ -6,8 +6,9 @@ import hashlib
 import json
 import tomllib
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -423,25 +424,14 @@ class EmbeddingSettings(StrictSection):
         return self
 
 
-class BackendSettings(StrictSection):
-    """Backend selection for the graph store and event queue.
+class SqliteBackendSettings(StrictSection):
+    """The embedded backend, selected by declaring this section and nothing else.
 
-    ``"auto"`` probes the network backend at startup (``GraphClient.ping()`` /
-    ``EventBus.ping()``) and falls back to the in-process SQLite backend if
-    unreachable. An explicit ``"memgraph"``/``"valkey"`` fails loudly if
-    unreachable rather than silently falling back.
+    Deliberately empty. Its one setting -- where the files live -- is
+    ``[backend] sqlite_data_dir``, shared by the graph, the queue and the rate limiter,
+    because all three write into one directory and a per-axis path would let them drift
+    apart for no reason anybody wants.
     """
-
-    graph: Literal["memgraph", "sqlite", "auto"] = Field(
-        default="auto", description="Graph backend: 'memgraph', 'sqlite', or 'auto'."
-    )
-    queue: Literal["valkey", "sqlite", "auto"] = Field(
-        default="auto", description="Event queue backend: 'valkey', 'sqlite', or 'auto'."
-    )
-    sqlite_data_dir: Path = Field(
-        default=Path(".atlas"),
-        description="Directory (relative to project_root) holding graph.sqlite3 and queue.sqlite3.",
-    )
 
 
 class MemgraphSettings(StrictSection):
@@ -726,6 +716,145 @@ class RedisSettings(StrictSection):
     )
 
 
+def _one_of(configured: dict[str, object], axis: str, example: str) -> None:
+    """Reject two backends on one axis, rather than inventing a precedence rule.
+
+    A precedence rule is the failure this whole shape exists to remove: it would let a
+    file say two things and quietly honour one.
+    """
+    named = sorted(k for k, v in configured.items() if v is not None)
+    if len(named) > 1:
+        listed = ", ".join(f"[backend.{axis}.{k}]" for k in named)
+        msg = (
+            f"{len(named)} {axis} backends are configured ({listed}); exactly one may be. "
+            f"Delete all but the one you want, e.g. keep [backend.{axis}.{example}]. "
+            f"Omit the section entirely to probe {example} and fall back to SQLite when unreachable."
+        )
+        raise ValueError(msg)
+
+
+class GraphBackendSettings(StrictSection):
+    """Which graph backend, and its connection settings, in one place.
+
+    Declaring a section IS selecting it. The previous shape had
+    ``backend.graph = "memgraph"`` decide the backend while a separate top-level
+    ``[memgraph]`` held its settings -- so a fully configured Memgraph (host, port, tuned
+    timeouts) was read and then not used, because the selector still said ``"auto"``.
+    That is not hypothetical: it fell back to an empty embedded graph while Memgraph was
+    running, rebuilt 214 MB of index and re-bought every vector, announced by one warning
+    line.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _false_means_undeclared(cls, data: Any) -> Any:
+        """``memgraph = false`` un-declares a backend that a lower-precedence file declared.
+
+        ``atlas.local.toml`` merges *per key* over ``atlas.toml``, so a machine that wants
+        the embedded backend cannot simply declare it -- the committed section is still
+        there and both would be set, which is the error above. TOML has no null, so
+        ``false`` is the way to say "not this one" without editing a shared, committed
+        file. ``true`` is meaningless here and rejected rather than read as "defaults".
+        """
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        for key, value in data.items():
+            if value is False:
+                out[key] = None
+            elif value is True:
+                msg = (
+                    f"`{key} = true` is not a backend; write [backend.<axis>.{key}] to configure it, "
+                    "or `false` to disable one a shared file declared."
+                )
+                raise ValueError(msg)
+        return out
+
+    memgraph: MemgraphSettings | None = Field(default=None, description="Use Memgraph, with these settings.")
+    sqlite: SqliteBackendSettings | None = Field(default=None, description="Use the embedded SQLite graph.")
+
+    @model_validator(mode="after")
+    def _reject_two_backends(self) -> GraphBackendSettings:
+        _one_of({"memgraph": self.memgraph, "sqlite": self.sqlite}, "graph", "memgraph")
+        return self
+
+
+class QueueBackendSettings(StrictSection):
+    """Which event queue, and its connection settings. See :class:`GraphBackendSettings`."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _false_means_undeclared(cls, data: Any) -> Any:
+        """``memgraph = false`` un-declares a backend that a lower-precedence file declared.
+
+        ``atlas.local.toml`` merges *per key* over ``atlas.toml``, so a machine that wants
+        the embedded backend cannot simply declare it -- the committed section is still
+        there and both would be set, which is the error above. TOML has no null, so
+        ``false`` is the way to say "not this one" without editing a shared, committed
+        file. ``true`` is meaningless here and rejected rather than read as "defaults".
+        """
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        for key, value in data.items():
+            if value is False:
+                out[key] = None
+            elif value is True:
+                msg = (
+                    f"`{key} = true` is not a backend; write [backend.<axis>.{key}] to configure it, "
+                    "or `false` to disable one a shared file declared."
+                )
+                raise ValueError(msg)
+        return out
+
+    valkey: RedisSettings | None = Field(default=None, description="Use Valkey/Redis, with these settings.")
+    sqlite: SqliteBackendSettings | None = Field(default=None, description="Use the embedded SQLite queue.")
+
+    @model_validator(mode="after")
+    def _reject_two_backends(self) -> QueueBackendSettings:
+        _one_of({"valkey": self.valkey, "sqlite": self.sqlite}, "queue", "valkey")
+        return self
+
+
+class BackendSettings(StrictSection):
+    """Backend selection for the graph store and event queue.
+
+    Three states per axis, and the middle one is the point:
+
+    * **no section** -- ``"auto"``. Probe the network backend (``GraphClient.ping()`` /
+      ``EventBus.ping()``) and fall back to embedded SQLite when unreachable. The
+      zero-config path, and the only one that can fall back.
+    * **one section** -- that backend, and an unreachable one is an error. Nothing is
+      rebuilt into ``.atlas/`` behind your back.
+    * **two sections** -- a configuration error, not a precedence rule.
+    """
+
+    graph: GraphBackendSettings = Field(default_factory=GraphBackendSettings)
+    queue: QueueBackendSettings = Field(default_factory=QueueBackendSettings)
+    sqlite_data_dir: Path = Field(
+        default=Path(".atlas"),
+        description="Directory (relative to project_root) holding graph.sqlite3, queue.sqlite3 and ratelimit.sqlite3.",
+    )
+
+    @property
+    def graph_choice(self) -> Literal["memgraph", "sqlite", "auto"]:
+        """Which graph backend to build. ``"auto"`` means probe-then-fall-back."""
+        if self.graph.memgraph is not None:
+            return "memgraph"
+        if self.graph.sqlite is not None:
+            return "sqlite"
+        return "auto"
+
+    @property
+    def queue_choice(self) -> Literal["valkey", "sqlite", "auto"]:
+        """Which event queue to build. ``"auto"`` means probe-then-fall-back."""
+        if self.queue.valkey is not None:
+            return "valkey"
+        if self.queue.sqlite is not None:
+            return "sqlite"
+        return "auto"
+
+
 class ProjectSettings(StrictSection):
     """Project identity overrides."""
 
@@ -859,8 +988,6 @@ class AtlasSettings(BaseSettings):
     monorepo: MonorepoSettings = Field(default_factory=MonorepoSettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     backend: BackendSettings = Field(default_factory=BackendSettings)
-    memgraph: MemgraphSettings = Field(default_factory=MemgraphSettings)
-    redis: RedisSettings = Field(default_factory=RedisSettings)
     index: IndexSettings = Field(default_factory=IndexSettings)
     rationale: RationaleSettings = Field(default_factory=RationaleSettings)
     watcher: WatcherSettings = Field(default_factory=WatcherSettings)
@@ -869,6 +996,75 @@ class AtlasSettings(BaseSettings):
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+
+    @cached_property
+    def memgraph(self) -> MemgraphSettings:
+        """The Memgraph connection settings in effect.
+
+        Defaults when no ``[backend.graph.memgraph]`` is declared, because ``"auto"`` still
+        has to *probe* Memgraph before falling back -- it needs an address for a backend it
+        may not end up using. Readers are unchanged by the move; only the file shape and
+        the selection did.
+        """
+        return self.backend.graph.memgraph or MemgraphSettings()
+
+    @cached_property
+    def redis(self) -> RedisSettings:
+        """The Valkey/Redis connection settings in effect. See :attr:`memgraph`."""
+        return self.backend.queue.valkey or RedisSettings()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_backend_sections(cls, data: Any) -> Any:
+        """Say what to write instead, rather than "extra inputs are not permitted".
+
+        ``StrictSection`` would reject a top-level ``[memgraph]``/``[redis]`` anyway, and
+        that is the right failure -- loud, never a silent fallback. But the generic message
+        names the key and not the rewrite, and a user with one config per project in a
+        monorepo would have to work it out six times.
+        """
+        if not isinstance(data, dict):
+            return data
+        legacy = {axis: data[axis] for axis in ("memgraph", "redis") if axis in data}
+        if not legacy:
+            return data
+        raise ValueError(_legacy_backend_message(legacy))
+
+
+_LEGACY_BACKEND_AXIS = {"memgraph": ("graph", "memgraph"), "redis": ("queue", "valkey")}
+
+
+def _legacy_backend_message(legacy: dict[str, Any]) -> str:
+    """Render the user's own values in the shape that replaced them."""
+    lines = [
+        "Top-level [memgraph] / [redis] sections were replaced by [backend.<axis>.<name>],",
+        "so that configuring a backend is the same act as selecting it. Previously these",
+        "sections were read while `backend.graph`/`backend.queue` still decided, and a",
+        "fully configured Memgraph could be parsed and then not used.",
+        "",
+        "Rewrite in atlas.toml (or atlas.local.toml):",
+        "",
+    ]
+    for key, values in legacy.items():
+        axis, name = _LEGACY_BACKEND_AXIS[key]
+        lines.append(f"    [backend.{axis}.{name}]")
+        if isinstance(values, dict):
+            for field, value in values.items():
+                rendered = (
+                    f'"{value}"' if isinstance(value, str) else str(value).lower() if isinstance(value, bool) else value
+                )
+                lines.append(f"    {field} = {rendered}")
+        lines.append("")
+    lines += [
+        "Declaring the section selects that backend, and an unreachable one now fails",
+        "instead of rebuilding the graph into .atlas/ and re-buying every embedding.",
+        "Omit the section entirely to keep the old probe-then-fall-back behaviour.",
+        "",
+        "Environment variables move the same way:",
+        "    ATLAS_MEMGRAPH__HOST      ->  ATLAS_BACKEND__GRAPH__MEMGRAPH__HOST",
+        "    ATLAS_REDIS__HOST         ->  ATLAS_BACKEND__QUEUE__VALKEY__HOST",
+    ]
+    return "\n".join(lines)
 
 
 def extraction_key(settings: AtlasSettings) -> str:

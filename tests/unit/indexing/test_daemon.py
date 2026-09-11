@@ -11,7 +11,7 @@ import typer
 
 from code_atlas.indexing import daemon as daemon_module
 from code_atlas.indexing.daemon import DaemonManager
-from code_atlas.settings import AtlasSettings, ExtraVaultSettings
+from code_atlas.settings import AtlasSettings, ExtraVaultSettings, GraphBackendSettings, MemgraphSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -758,9 +758,10 @@ class TestDaemonCliWiring:
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda settings: FakeGraph())
         monkeypatch.setattr("code_atlas.indexing.daemon.DaemonManager", FakeDaemon)
         settings = _make_settings(tmp_path)
-        # "memgraph", not the "auto" default: auto probes and falls back to a real
-        # SqliteGraphClient, which graph_backend_label then isinstance-checks.
-        settings.backend.graph = "memgraph"
+        # Declare memgraph rather than leaving it undeclared: an undeclared backend is
+        # "auto", which probes and falls back to a real SqliteGraphClient, which
+        # graph_backend_label then isinstance-checks.
+        settings.backend.graph = GraphBackendSettings(memgraph=MemgraphSettings())
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
 
         with pytest.raises(typer.Exit):

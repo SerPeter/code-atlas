@@ -9,7 +9,7 @@
 # POLICY keys below: which entities deserve a vector is a property of the codebase, so
 # they stay here.)
 #
-#   1. ATLAS_* environment variables    ATLAS_MEMGRAPH__HOST=box.local
+#   1. ATLAS_* environment variables    ATLAS_BACKEND__GRAPH__MEMGRAPH__HOST=box.local
 #                                       (nested sections use a double underscore;
 #                                        export them from .envrc if you want them
 #                                        loaded automatically — atlas never reads .env)
@@ -75,15 +75,55 @@ dimension = 768
 # Re-admit; beats both axes.
 # include = ["ops/critical/"]
 
-[memgraph]
+[backend]
+# Where the embedded backends keep their files: graph.sqlite3, queue.sqlite3 and
+# ratelimit.sqlite3 all live here, relative to the git root. The directory ignores
+# itself from git on creation, since the index is machine-specific.
+sqlite_data_dir = ".atlas"
+
+# Declaring a backend IS selecting it. Configure exactly one graph backend and one
+# queue backend -- two of either is a config error rather than a silent precedence
+# rule.
+#
+# Omit a section entirely to get "auto": probe the network backend and fall back to
+# embedded SQLite when it is unreachable. That is the zero-config path, and the only
+# one that can fall back. Once you name a backend, an unreachable one FAILS -- rather
+# than quietly rebuilding the whole graph into .atlas/ and re-buying every embedding,
+# which is what "auto" did here for 214 MB.
+#
+# To run a different backend on ONE machine without editing this shared file, set the
+# declared one to false in atlas.local.toml and declare yours:
+#     [backend.graph]
+#     memgraph = false
+#     sqlite = {}
+
+[backend.graph.memgraph]
 host = "localhost"
 port = 7687
+# Both timeouts are worth raising on a large monorepo, and neither default is
+# generous. write_timeout_s (60s) is tight for a full reindex under any residual
+# write contention -- several sessions' MCP daemons can auto-catchup concurrently.
+# query_timeout_s (10s) is tight for cross-project import resolution, which is a
+# labelless MATCH on project_name + name and unindexed.
+# write_timeout_s = 180.0
+# query_timeout_s = 120.0
 
-[redis]
+# [backend.graph.sqlite]
+# The embedded graph -- no server, no Docker. Slower on large graphs, and its vector
+# index is a bit-quantized shortlist rescored against the real vectors rather than an
+# exact scan (ADR-0046). Nothing to configure: the location is sqlite_data_dir above,
+# and the dimension follows [embeddings].
+
+[backend.queue.valkey]
 host = "localhost"
 port = 6379
 db = 0
 stream_prefix = "atlas"
+
+# [backend.queue.sqlite]
+# The embedded event queue. Also switches the embedding rate limiter to its SQLite
+# mirror (ADR-0044), which paces against a private file -- so several machines sharing
+# one provider budget should not use it.
 
 [search]
 default_token_budget = 8000

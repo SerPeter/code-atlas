@@ -63,7 +63,7 @@ async def _point(tmp_path: Path, size: int) -> dict[str, object]:
 
     settings = AtlasSettings(
         project_root=root,
-        backend={"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(tmp_path / f"db_{size}")},
+        backend={"graph": {"sqlite": {}}, "queue": {"sqlite": {}}, "sqlite_data_dir": str(tmp_path / f"db_{size}")},
         embeddings={"dimension": 16},
     )
     project = f"bench-chain-{size}"

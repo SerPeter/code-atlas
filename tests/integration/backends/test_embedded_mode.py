@@ -4,7 +4,7 @@ Unlike the rest of ``tests/integration/``, this tier needs no Docker/
 testcontainers — SQLite is a plain file. It drives the real production code
 paths (the ``atlas`` CLI via ``typer.testing.CliRunner``, and the real
 ``@mcp.tool`` implementations via ``_invoke_tool``) against
-``ATLAS_BACKEND__GRAPH=sqlite`` / ``ATLAS_BACKEND__QUEUE=sqlite`` — never
+``ATLAS_BACKEND__GRAPH__SQLITE={}`` / ``ATLAS_BACKEND__QUEUE__SQLITE={}`` — never
 ``SqliteGraphClient`` methods directly, that's what the unit tests already
 cover.
 
@@ -40,7 +40,14 @@ runner = CliRunner()
 
 # Explicit (not "auto") backend choice — never probes/falls back to Memgraph
 # or Valkey, so this tier has zero external dependencies.
-_ENV = {"ATLAS_BACKEND__GRAPH": "sqlite", "ATLAS_BACKEND__QUEUE": "sqlite"}
+# `{}` is the env spelling of a bare `[backend.graph.sqlite]` table: declaring the
+# section is what selects the backend, and it has no fields of its own (ADR-0053).
+_ENV = {
+    "ATLAS_BACKEND__GRAPH__MEMGRAPH": "false",
+    "ATLAS_BACKEND__GRAPH__SQLITE": "{}",
+    "ATLAS_BACKEND__QUEUE__VALKEY": "false",
+    "ATLAS_BACKEND__QUEUE__SQLITE": "{}",
+}
 
 # ---------------------------------------------------------------------------
 # Fixture project — small, real, git-tracked. Mirrors the inline-project
@@ -146,7 +153,7 @@ def project_name(indexed_project: Path) -> str:
 def embedded_settings(indexed_project: Path) -> AtlasSettings:
     return AtlasSettings(
         project_root=indexed_project,
-        backend=BackendSettings(graph="sqlite", queue="sqlite"),
+        backend=BackendSettings(graph={"sqlite": {}}, queue={"sqlite": {}}),
         embeddings=EmbeddingSettings(enabled=False),
     )
 

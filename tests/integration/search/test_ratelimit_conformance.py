@@ -31,6 +31,7 @@ from code_atlas.search.ratelimit import (
     SqliteRateLimiter,
     make_rate_limiter,
 )
+from code_atlas.settings import QueueBackendSettings, RedisSettings, SqliteBackendSettings
 
 pytestmark = pytest.mark.integration
 
@@ -161,19 +162,21 @@ class TestSelection:
 
     def test_sqlite_queue_gets_the_sqlite_limiter(self, settings, tmp_path):
         cfg = settings.model_copy(deep=True)
-        cfg.backend.queue = "sqlite"
+        cfg.backend.queue = QueueBackendSettings(sqlite=SqliteBackendSettings())
         cfg.project_root = tmp_path
         limiter = make_rate_limiter(cfg, model="m", rpm=1, tpm=1)
         assert isinstance(limiter, SqliteRateLimiter)
 
-    @pytest.mark.parametrize("choice", ["valkey", "auto"])
-    def test_everything_else_gets_valkey(self, settings, choice):
-        """`auto` resolves to Valkey deliberately.
+    @pytest.mark.parametrize("declared", [True, False], ids=["valkey", "undeclared"])
+    def test_everything_else_gets_valkey(self, settings, declared):
+        """An UNDECLARED queue backend resolves to Valkey deliberately.
 
         Choosing SQLite here would pace against a private file while the rest of the fleet
         paced against Valkey, and the shared budget would silently stop being shared —
-        worse than the connect timeout the selection exists to avoid.
+        worse than the connect timeout the selection exists to avoid. Note this is the one
+        place where "not configured" does NOT mean "probe": the bus factory already probed
+        at startup, and a second probe here would reintroduce that timeout.
         """
         cfg = settings.model_copy(deep=True)
-        cfg.backend.queue = choice
+        cfg.backend.queue = QueueBackendSettings(valkey=RedisSettings() if declared else None)
         assert isinstance(make_rate_limiter(cfg, model="m", rpm=1, tpm=1), RateLimiter)

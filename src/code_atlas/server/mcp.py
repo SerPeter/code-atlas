@@ -456,7 +456,7 @@ def _compact_node_to_dict(node: CompactNode, *, include_source: bool = True) -> 
 def _backend_note(graph: Any) -> dict[str, Any]:
     """Announce the embedded backend, and stay silent about the supported one.
 
-    `backend.graph = "auto"` falls back to SQLite whenever Memgraph is unreachable, so on
+    An undeclared graph backend falls back to SQLite whenever Memgraph is unreachable, so on
     a machine without Docker running this is the default outcome rather than an exotic
     one — and ADR-0015 calls SQLite explicitly not a parity replacement. Until now the
     identity appeared only in log lines an MCP stdio client never sees, so an agent had

@@ -23,7 +23,7 @@ import pytest
 
 from code_atlas.graph.client import GraphClient
 from code_atlas.schema import generate_drop_text_index_ddl, generate_drop_vector_index_ddl
-from code_atlas.settings import AtlasSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
+from code_atlas.settings import AtlasSettings, BackendSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
 from tests.conftest import _GUARD_OK, _assert_disposable_db  # noqa: F401 — _GUARD_OK re-exported, see docstring
 
 if TYPE_CHECKING:
@@ -134,14 +134,20 @@ async def tei_settings(tmp_path, _infra_endpoints: InfraEndpoints, _tei_endpoint
 
     return AtlasSettings(
         project_root=tmp_path,
-        memgraph=MemgraphSettings(
-            host=_infra_endpoints.memgraph_host,
-            port=_infra_endpoints.memgraph_port,
-        ),
-        redis=RedisSettings(
-            host=_infra_endpoints.valkey_host,
-            port=_infra_endpoints.valkey_port,
-            stream_prefix=f"test-{uuid.uuid4().hex[:8]}",
+        backend=BackendSettings(
+            graph={
+                "memgraph": MemgraphSettings(
+                    host=_infra_endpoints.memgraph_host,
+                    port=_infra_endpoints.memgraph_port,
+                )
+            },
+            queue={
+                "valkey": RedisSettings(
+                    host=_infra_endpoints.valkey_host,
+                    port=_infra_endpoints.valkey_port,
+                    stream_prefix=f"test-{uuid.uuid4().hex[:8]}",
+                )
+            },
         ),
         embeddings=EmbeddingSettings(
             provider="tei",

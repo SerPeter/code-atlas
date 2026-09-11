@@ -179,7 +179,7 @@ async def test_check_memgraph_warns_when_the_sqlite_fallback_is_active(tmp_path)
     """A fully-degraded install must not report an unqualified OK (ATL-112).
 
     This assertion was inverted until ATL-112: it required `status == OK`, which pinned
-    the defect as the contract. `backend.graph = "auto"` falls back to SQLite whenever
+    the defect as the contract. An undeclared graph backend falls back to SQLite whenever
     Memgraph is unreachable, so on a machine without Docker running this is the *default*
     outcome — and ADR-0015 calls SQLite explicitly not a parity replacement. WARN keeps
     `report.ok` True (the tool still works) while flipping `report.degraded`, which is

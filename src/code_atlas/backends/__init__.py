@@ -145,15 +145,14 @@ def _sqlite_graph_path(settings: AtlasSettings) -> Path:
 async def create_event_bus(settings: AtlasSettings) -> EventBus | SqliteEventBus:
     """Build the event bus selected by ``settings.backend.queue``.
 
-    - ``"sqlite"``: always build a :class:`SqliteEventBus` under
+    - ``[backend.queue.sqlite]`` declared: always build a :class:`SqliteEventBus` under
       ``project_root / backend.sqlite_data_dir``.
-    - ``"valkey"``: always build a real :class:`EventBus`; unreachable Valkey
-      fails loudly (no silent fallback for an explicit choice).
-    - ``"auto"`` (default): probe a real :class:`EventBus` via ``ping()``;
-      fall back to :class:`SqliteEventBus` with a logged warning if
-      unreachable.
+    - ``[backend.queue.valkey]`` declared: always build a real :class:`EventBus`;
+      unreachable Valkey fails loudly. Declaring a backend is choosing it.
+    - **neither** declared: probe a real :class:`EventBus` via ``ping()`` and fall back to
+      :class:`SqliteEventBus` with a logged warning if unreachable.
     """
-    choice = settings.backend.queue
+    choice = settings.backend.queue_choice
     project_name = derive_project_name(settings.project_root)
 
     if choice == "sqlite":
@@ -197,15 +196,17 @@ def queue_backend_label(client: EventBus | SqliteEventBus, settings: AtlasSettin
 async def create_graph_client(settings: AtlasSettings) -> GraphClient | SqliteGraphClient:
     """Build the graph client selected by ``settings.backend.graph``.
 
-    - ``"sqlite"``: always build a :class:`SqliteGraphClient` under
+    - ``[backend.graph.sqlite]`` declared: always build a :class:`SqliteGraphClient` under
       ``project_root / backend.sqlite_data_dir``.
-    - ``"memgraph"``: always build a real :class:`GraphClient`; unreachable
-      Memgraph fails loudly (no silent fallback for an explicit choice).
-    - ``"auto"`` (default): probe a real :class:`GraphClient` via ``ping()``;
-      fall back to :class:`SqliteGraphClient` with a logged warning if
-      unreachable.
+    - ``[backend.graph.memgraph]`` declared: always build a real :class:`GraphClient`;
+      unreachable Memgraph fails loudly. Declaring a backend is choosing it -- the old
+      shape let a fully configured Memgraph be read and then not used.
+    - **neither** declared: probe a real :class:`GraphClient` via ``ping()`` and fall back
+      to :class:`SqliteGraphClient` with a logged warning if unreachable. The fallback
+      graph is EMPTY, so the next index rebuilds everything and re-buys every vector --
+      which is why it is reserved for the case where nothing was asked for.
     """
-    choice = settings.backend.graph
+    choice = settings.backend.graph_choice
     dimension = settings.embeddings.dimension or 768
     embeddings_enabled = settings.embeddings.enabled
 

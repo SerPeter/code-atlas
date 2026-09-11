@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 def _settings(tmp_path: Path) -> AtlasSettings:
     """Embedded backends only — no Memgraph, no Valkey, no network."""
-    return AtlasSettings(project_root=tmp_path, backend=BackendSettings(graph="sqlite", queue="sqlite"))
+    return AtlasSettings(project_root=tmp_path, backend=BackendSettings(graph={"sqlite": {}}, queue={"sqlite": {}}))
 
 
 class TestOpenBackends:

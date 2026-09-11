@@ -78,7 +78,7 @@ async def _index(root: Path, db_dir: Path, project: str, *, max_source_chars: in
 
     settings = AtlasSettings(
         project_root=root,
-        backend={"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(db_dir)},
+        backend={"graph": {"sqlite": {}}, "queue": {"sqlite": {}}, "sqlite_data_dir": str(db_dir)},
         # An explicit cap is required, not optional: litellm's registry has no entry for
         # a TEI- or OpenRouter-prefixed model, and an unknown cap means no chunking and
         # no truncation at all (ADR-0040). Leaving it unset would make this test pass

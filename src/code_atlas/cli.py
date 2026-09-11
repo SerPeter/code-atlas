@@ -1548,7 +1548,7 @@ def _bench_corpus(*, path: str, repo: str, ref: str, backend: str) -> tuple[Any,
         # than left on "auto": auto probes Memgraph first and falls back only if it is
         # unreachable, so on a machine where it is up a benchmark would quietly write
         # into the index someone actually queries.
-        overrides["backend"] = {"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(scratch)}
+        overrides["backend"] = {"graph": {"sqlite": {}}, "queue": {"sqlite": {}}, "sqlite_data_dir": str(scratch)}
     elif backend == "memgraph":
         # The same guarantee, which this branch did not have: it took no overrides at
         # all, so `atlas bench --backend memgraph` wrote a bench project straight into
@@ -1558,9 +1558,9 @@ def _bench_corpus(*, path: str, repo: str, ref: str, backend: str) -> tuple[Any,
         #
         # There is no throwaway Memgraph to point at, so the isolation is a distinct
         # project name (already the case) plus a refusal to run against the configured
-        # instance unless the caller says so. `ATLAS_MEMGRAPH__PORT` is how you aim it
+        # instance unless the caller says so. `ATLAS_BACKEND__GRAPH__MEMGRAPH__PORT` aims it
         # at a test instance, and that is a deliberate act rather than a default.
-        overrides["backend"] = {"graph": "memgraph", "queue": "valkey"}
+        overrides["backend"] = {"graph": {"memgraph": {}}, "queue": {"valkey": {}}}
     else:
         raise typer.BadParameter("--backend must be 'sqlite' or 'memgraph'")
     return target, root, scratch, overrides
@@ -1671,7 +1671,7 @@ async def _bench_announce_memgraph(settings: Any, *, backend: str, project_name:
         return
     _echo(
         f"bench project '{project_name}' -> Memgraph at {settings.memgraph.host}:{settings.memgraph.port} "
-        "(removed when the run ends; set ATLAS_MEMGRAPH__PORT to aim at a test instance)"
+        "(removed when the run ends; set ATLAS_BACKEND__GRAPH__MEMGRAPH__PORT to aim at a test instance)"
     )
 
 

@@ -71,7 +71,7 @@ def indexed(tmp_path_factory: pytest.TempPathFactory):
 
         settings = AtlasSettings(
             project_root=root,
-            backend={"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(base / "db")},
+            backend={"graph": {"sqlite": {}}, "queue": {"sqlite": {}}, "sqlite_data_dir": str(base / "db")},
             embeddings={"dimension": 16},
         )
         with stub_provider(16):
@@ -170,7 +170,7 @@ class TestABrokenIndexIsNotAFastOne:
         _write_corpus(root)
         settings = AtlasSettings(
             project_root=root,
-            backend={"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(tmp_path / "db")},
+            backend={"graph": {"sqlite": {}}, "queue": {"sqlite": {}}, "sqlite_data_dir": str(tmp_path / "db")},
             embeddings={"dimension": 16},
         )
 

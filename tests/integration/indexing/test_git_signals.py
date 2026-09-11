@@ -86,7 +86,7 @@ class TestMineGitHistoryCliCommand:
         await _seed_modules(graph_client)
 
         # The CLI opens and closes its own client, as it does in production. It reaches
-        # the same test Memgraph -- tests/conftest.py exports ATLAS_MEMGRAPH__* -- so the
+        # the same test Memgraph -- tests/conftest.py exports ATLAS_BACKEND__GRAPH__MEMGRAPH__* -- so the
         # assertions below still read what the command wrote.
         #
         # This used to patch code_atlas.graph.client.GraphClient to hand the CLI this

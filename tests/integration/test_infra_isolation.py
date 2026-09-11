@@ -30,8 +30,8 @@ def test_env_override_endpoints_respected(_infra_endpoints):  # noqa: PT019 — 
 
 
 def test_atlas_env_exported_for_bare_settings(_infra_endpoints, tmp_path):  # noqa: PT019 — value is used
-    assert os.environ["ATLAS_MEMGRAPH__PORT"] == str(_infra_endpoints.memgraph_port)
-    assert os.environ["ATLAS_REDIS__PORT"] == str(_infra_endpoints.valkey_port)
+    assert os.environ["ATLAS_BACKEND__GRAPH__MEMGRAPH__PORT"] == str(_infra_endpoints.memgraph_port)
+    assert os.environ["ATLAS_BACKEND__QUEUE__VALKEY__PORT"] == str(_infra_endpoints.valkey_port)
     bare = AtlasSettings(project_root=tmp_path)
     assert bare.memgraph.port == _infra_endpoints.memgraph_port
     assert bare.redis.port == _infra_endpoints.valkey_port

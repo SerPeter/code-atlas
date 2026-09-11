@@ -28,7 +28,7 @@ import pytest_asyncio
 
 from code_atlas.graph.client import GraphClient
 from code_atlas.indexing.orchestrator import index_project
-from code_atlas.settings import AtlasSettings, MemgraphSettings, RedisSettings
+from code_atlas.settings import AtlasSettings, BackendSettings, MemgraphSettings, RedisSettings
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
 if TYPE_CHECKING:
@@ -640,11 +640,17 @@ async def indexed_corpus(corpus_root, _infra_endpoints) -> AsyncIterator[tuple[G
     project = f"test-patterns-{uuid.uuid4().hex[:8]}"
     settings = AtlasSettings(
         project_root=corpus_root,
-        memgraph=MemgraphSettings(host=_infra_endpoints.memgraph_host, port=_infra_endpoints.memgraph_port),
-        redis=RedisSettings(
-            host=_infra_endpoints.valkey_host,
-            port=_infra_endpoints.valkey_port,
-            stream_prefix=f"test-{uuid.uuid4().hex[:8]}",
+        backend=BackendSettings(
+            graph={
+                "memgraph": MemgraphSettings(host=_infra_endpoints.memgraph_host, port=_infra_endpoints.memgraph_port)
+            },
+            queue={
+                "valkey": RedisSettings(
+                    host=_infra_endpoints.valkey_host,
+                    port=_infra_endpoints.valkey_port,
+                    stream_prefix=f"test-{uuid.uuid4().hex[:8]}",
+                )
+            },
         ),
         embeddings=NO_EMBED,
     )

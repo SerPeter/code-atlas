@@ -98,7 +98,7 @@ async def check_memgraph(
     try:
         ok = await asyncio.wait_for(graph.ping(), timeout=_CHECK_TIMEOUT)
         if ok and embedded:
-            # WARN, not OK. `backend.graph = "auto"` falls back here whenever Memgraph is
+            # WARN, not OK. An undeclared graph backend falls back here whenever Memgraph is
             # unreachable, so this is the *default* outcome on a machine without Docker
             # running — and ADR-0015 calls SQLite explicitly not a parity replacement.
             # Reporting an unqualified OK meant a fully-degraded install looked healthy,

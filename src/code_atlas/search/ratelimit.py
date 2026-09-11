@@ -674,18 +674,18 @@ def make_rate_limiter(
 ) -> RateLimiter | SqliteRateLimiter:
     """The limiter for whichever queue backend this project is configured for.
 
-    Keyed on ``backend.queue`` rather than on a probe of its own. The bus factory
+    Keyed on the configured queue backend rather than on a probe of its own. The bus factory
     already probes once at startup, and a second probe here would reintroduce exactly
     the connect timeout this selection exists to remove.
 
-    ``"auto"`` therefore resolves to Valkey, not to a guess: the Valkey limiter degrades
+    An undeclared queue backend therefore resolves to Valkey, not to a guess: the Valkey limiter degrades
     on its own when the store is absent, and since it now holds a retry cooldown that
     costs a couple of timeouts per index rather than one per batch. Choosing SQLite for
     ``"auto"`` would be worse -- it would pace against a private file while the rest of
     the fleet paced against Valkey, and the shared budget the buckets exist to enforce
     would quietly stop being shared.
     """
-    if settings.backend.queue == "sqlite":
+    if settings.backend.queue_choice == "sqlite":
         path = ensure_sqlite_data_dir(settings) / "ratelimit.sqlite3"
         return SqliteRateLimiter(path, model=model, rpm=rpm, tpm=tpm, gate=gate)
     return RateLimiter(settings.redis, model=model, rpm=rpm, tpm=tpm, gate=gate)

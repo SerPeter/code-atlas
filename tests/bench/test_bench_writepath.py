@@ -106,7 +106,7 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
 
     settings = AtlasSettings(
         project_root=root,
-        backend={"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(tmp_path / f"db_{ballast}")},
+        backend={"graph": {"sqlite": {}}, "queue": {"sqlite": {}}, "sqlite_data_dir": str(tmp_path / f"db_{ballast}")},
         embeddings={"dimension": 16},
         # Force the delta path at every sweep point. `_decide_delta_mode` falls back to a
         # full reindex when the changed ratio exceeds `delta_threshold`

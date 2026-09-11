@@ -249,8 +249,7 @@ class TestTEIIntegration:
 
         settings = AtlasSettings(
             project_root=tmp_path,
-            memgraph=tei_settings.memgraph,
-            redis=tei_settings.redis,
+            backend=tei_settings.backend,
             embeddings=tei_settings.embeddings,
         )
         await tei_graph_client.ensure_schema()
@@ -280,8 +279,7 @@ class TestTEIIntegration:
 
         settings = AtlasSettings(
             project_root=tmp_path,
-            memgraph=tei_settings.memgraph,
-            redis=tei_settings.redis,
+            backend=tei_settings.backend,
             embeddings=tei_settings.embeddings,
         )
         await tei_graph_client.ensure_schema()

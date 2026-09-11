@@ -53,7 +53,7 @@ async def _run(root: Path, db_dir: Path, project: str) -> BenchReport:
 
     settings = AtlasSettings(
         project_root=root,
-        backend={"graph": "sqlite", "queue": "sqlite", "sqlite_data_dir": str(db_dir)},
+        backend={"graph": {"sqlite": {}}, "queue": {"sqlite": {}}, "sqlite_data_dir": str(db_dir)},
     )
     cap = capture()
     cap.clear()
