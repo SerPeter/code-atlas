@@ -105,6 +105,7 @@ from code_atlas.schema import (
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
     LABEL_PROPERTY_INDICES,
+    STDLIB_MODULE_NAMES,
     TEXT_INDICES,
     NodeLabel,
     build_vector_index_specs,
@@ -2629,6 +2630,7 @@ class SqliteGraphClient:
         name: str = "",
         *,
         min_projects: int = 1,
+        exclude_stdlib: bool = False,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Mirror of ``GraphClient.get_package_dependents`` -- see that docstring.
@@ -2675,12 +2677,17 @@ class SqliteGraphClient:
         # Ordered on the typed mapping rather than on the result rows: those hold a
         # str/int/list union, so a key function over them cannot be checked.
         ranked = sorted(
-            ((pkg, projects) for pkg, projects in grouped.items() if len(projects) >= min_projects),
+            (
+                (pkg, projects)
+                for pkg, projects in grouped.items()
+                if len(projects) >= min_projects and not (exclude_stdlib and pkg in STDLIB_MODULE_NAMES)
+            ),
             key=lambda item: (-len(item[1]), item[0]),
         )
         return [
             {
                 "package": pkg,
+                "stdlib": pkg in STDLIB_MODULE_NAMES,
                 "project_count": len(projects),
                 "projects": sorted(projects, key=lambda p: (-(p["import_sites"] or 0), p["project"] or "")),
             }

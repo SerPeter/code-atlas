@@ -37,6 +37,7 @@ from code_atlas.schema import (
     GLOBAL_PROJECT,
     RESOURCE_FILE_PREFIX,
     SCHEMA_VERSION,
+    STDLIB_MODULE_NAMES,
     CallableKind,
     NodeLabel,
     NoteKind,
@@ -4156,6 +4157,7 @@ class GraphClient:
         name: str = "",
         *,
         min_projects: int = 1,
+        exclude_stdlib: bool = False,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Which indexed projects depend on an external package, and at which version.
@@ -4184,6 +4186,18 @@ class GraphClient:
         Both OPTIONAL for that reason: a plain MATCH would silently shrink the answer to
         the packages someone happened to pin, which is the trap ``get_structure_data``
         already records for the same edge.
+
+        ``stdlib`` marks a name that ships with Python. It is reported rather than
+        filtered here, because "outside this project" and "not a dependency" are different
+        claims and the caller decides which it wants -- but it is reported on every row,
+        because a report whose five most shared entries are ``json``, ``pathlib``,
+        ``time``, ``collections`` and ``datetime`` is answering a question nobody asked.
+        Python-shaped; see :data:`~code_atlas.schema.STDLIB_MODULE_NAMES`.
+
+        ``exclude_stdlib`` is applied **here rather than by the caller**, because the limit
+        has to count rows somebody asked for. Filtering afterwards silently returns fewer:
+        measured, ``--no-stdlib --limit 6`` gave one package, because six of the seven
+        rows fetched were stdlib and the cut had already happened.
         """
         name_clause = " WHERE ep.name = $name" if name else ""
         records = await self.execute(
@@ -4197,15 +4211,22 @@ class GraphClient:
             "WITH ep.name AS package, ep.project_name AS project, dep.version AS version, "
             "size(directs + [u IN vias WHERE NOT u IN directs]) AS import_sites "
             "WITH package, collect({project: project, version: version, import_sites: import_sites}) AS projects "
-            "WHERE size(projects) >= $min_projects "
+            "WHERE size(projects) >= $min_projects AND NOT package IN $stdlib "
             "RETURN package, projects, size(projects) AS project_count "
             "ORDER BY project_count DESC, package ASC "
             "LIMIT $limit",
-            {"name": name, "min_projects": min_projects, "limit": limit},
+            {
+                "name": name,
+                "min_projects": min_projects,
+                # An empty list filters nothing, so the query needs no branch.
+                "stdlib": sorted(STDLIB_MODULE_NAMES) if exclude_stdlib else [],
+                "limit": limit,
+            },
         )
         return [
             {
                 "package": r["package"],
+                "stdlib": r["package"] in STDLIB_MODULE_NAMES,
                 "project_count": r["project_count"],
                 "projects": sorted(
                     ({**p} for p in r["projects"]),

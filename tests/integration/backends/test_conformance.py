@@ -865,6 +865,46 @@ class TestTheDefectsThatMotivatedThis:
         )
         assert a == b
 
+    async def test_stdlib_is_flagged_and_filtered_identically(self, both):
+        """`ext/json` and `ext/litellm` are the same kind of node, and on a real corpus the
+        first kind dominates -- 59 of 90 shared names here.
+
+        The filter lives in the backends rather than in the caller because `limit` has to
+        count rows somebody asked for: filtering afterwards returned ONE package for
+        `--no-stdlib --limit 6`, since six of the seven fetched were stdlib and the cut had
+        already happened.
+        """
+        mg, lite = both
+        for client in (mg, lite):
+            await self._seed_dependency(client, "std_a", "json", None)
+            await self._seed_dependency(client, "std_a", "loguru", "0.7")
+
+        for client, label in ((mg, "memgraph"), (lite, "sqlite")):
+            flagged = {r["package"]: r["stdlib"] for r in await client.get_package_dependents()}
+            assert flagged.get("json") is True, f"{label}: a stdlib name was not flagged"
+            assert flagged.get("loguru") is False, f"{label}: a real dependency was flagged as stdlib"
+
+            kept = {r["package"] for r in await client.get_package_dependents(exclude_stdlib=True)}
+            assert "loguru" in kept
+            assert "json" not in kept, f"{label}: exclude_stdlib did not drop it"
+
+        assert await mg.get_package_dependents(exclude_stdlib=True) == await lite.get_package_dependents(
+            exclude_stdlib=True
+        )
+
+    async def test_the_limit_counts_rows_after_the_stdlib_filter(self, both):
+        """Regression: the filter must be applied before the cut, not after it."""
+        mg, lite = both
+        for client in (mg, lite):
+            for stdlib_name in ("json", "pathlib", "time", "collections"):
+                await self._seed_dependency(client, "std_b", stdlib_name, None)
+            await self._seed_dependency(client, "std_b", "loguru", None)
+            await self._seed_dependency(client, "std_b", "typer", None)
+
+            rows = await client.get_package_dependents(exclude_stdlib=True, limit=2)
+            assert len(rows) == 2, "the limit was spent on rows the filter then removed"
+            assert not any(r["stdlib"] for r in rows)
+
     async def test_package_dependents_min_projects_filters_identically(self, both):
         """The filter is what makes "shared across repos" answerable, so it is compared
         against a package that really is shared rather than against two empty lists."""

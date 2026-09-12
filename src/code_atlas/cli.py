@@ -395,10 +395,11 @@ def search(
 def deps(
     package: str = typer.Argument("", help="Package name; omit to list every package."),
     shared: bool = typer.Option(False, "--shared", help="Only packages used by 2+ projects."),
+    no_stdlib: bool = typer.Option(False, "--no-stdlib", help="Hide names that ship with Python."),
     limit: int = typer.Option(50, min=1, max=1000, help="Max packages to show."),
 ) -> None:
     """Show which indexed projects depend on an external package."""
-    asyncio.run(_run_deps(package, shared, limit))
+    asyncio.run(_run_deps(package, shared, limit, no_stdlib))
 
 
 @app.command()
@@ -1384,7 +1385,7 @@ async def _run_search(
                 logger.warning("  {} file(s) changed since last index", len(info.changed_files))
 
 
-async def _run_deps(package: str, shared: bool, limit: int) -> None:
+async def _run_deps(package: str, shared: bool, limit: int, no_stdlib: bool) -> None:
     """Async implementation of the ``atlas deps`` command.
 
     Reads across every project in the graph, which on Memgraph spans every repo indexed
@@ -1401,7 +1402,9 @@ async def _run_deps(package: str, shared: bool, limit: int) -> None:
         embedded = isinstance(backends.graph, SqliteGraphClient)
         # limit+1 to detect truncation: printing a 50-row slice of 550 packages with
         # no notice reads as "these are all of them".
-        rows = await backends.graph.get_package_dependents(package, min_projects=2 if shared else 1, limit=limit + 1)
+        rows = await backends.graph.get_package_dependents(
+            package, min_projects=2 if shared else 1, exclude_stdlib=no_stdlib, limit=limit + 1
+        )
         truncated = len(rows) > limit
         rows = rows[:limit]
 
@@ -1426,14 +1429,21 @@ async def _run_deps(package: str, shared: bool, limit: int) -> None:
             typer.echo(f"No dependency on {what}{qualifier} found in {scope}.")
             return
 
+        stdlib_shown = sum(1 for r in rows if r["stdlib"])
         for row in rows:
-            typer.echo(f"{row['package']}  ({row['project_count']} project(s))")
+            marker = "  [stdlib]" if row["stdlib"] else ""
+            typer.echo(f"{row['package']}{marker}  ({row['project_count']} project(s))")
             for p in row["projects"]:
                 version = p["version"] or "-"
                 typer.echo(f"    {p['project']:<38} {version:<14} {p['import_sites']} import(s)")
 
         if truncated:
             typer.echo(f"\n... more packages not shown; raise --limit (currently {limit}).")
+        if stdlib_shown:
+            # Named rather than silently filtered: on this corpus 59 of 90 shared names are
+            # stdlib, so a reader who does not know the flag exists reads the report as a
+            # dependency list and it is mostly not one.
+            typer.echo(f"\n{stdlib_shown} of {len(rows)} ship with Python; --no-stdlib hides them.")
         if embedded:
             typer.echo(
                 "\nNote: the embedded backend holds one database per checkout, so this spans this repo's projects only."

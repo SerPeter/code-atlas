@@ -7,6 +7,7 @@ NodeLabel is covered by constraint and index registries.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -306,6 +307,30 @@ _ENTITY_LABELS: frozenset[NodeLabel] = _CODE_LABELS | _DOC_LABELS | _EXTERNAL_LA
 # Package literally, and a third written from that template would silently leave every
 # document gated.
 FILE_HASH_LABELS: tuple[NodeLabel, ...] = (NodeLabel.MODULE, NodeLabel.PACKAGE, NodeLabel.DOC_FILE)
+
+
+STDLIB_MODULE_NAMES: frozenset[str] = frozenset(sys.stdlib_module_names)
+"""Top-level module names shipped with this Python. Used to tell a dependency from a batteries-included import.
+
+An `ExternalPackage` means only "outside this project", so `ext/hashlib` and `ext/litellm`
+are the same kind of node -- and on a real corpus the first kind dominates: of the 90
+package names shared by two or more projects here, **59 are stdlib**, and the five most
+widely shared are `json`, `pathlib`, `time`, `collections` and `datetime`. A dependency
+report that leads with those is answering a question nobody asked.
+
+**Python's list is the only one available in-process, so this is Python-shaped**, and
+deliberately not hidden behind a name that suggests otherwise. A Ruby or Node package
+named after a Python stdlib module is mislabelled by it -- Ruby's `json` and `time` are
+in fact also stdlib, so the two most common collisions happen to land right, which is
+luck rather than design. Recording the importer's language on the node is the honest fix
+and is a larger change: it has to reach the graph through the parse contract, because the
+graph layer cannot import the language registry without pulling tree-sitter into every
+consumer of a graph client.
+
+Kept here rather than in either backend so there is one list. `server/analysis.py` had
+its own copy for `_mark_external`; two frozensets of the same thing is the drift this
+module exists to prevent.
+"""
 
 
 _GRANT_ONLY_KINDS: frozenset[str] = frozenset({"permission_set", "profile"})

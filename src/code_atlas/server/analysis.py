@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import re
-import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
-from code_atlas.schema import _GRANT_ONLY_KINDS, primary_label_expr
+from code_atlas.schema import _GRANT_ONLY_KINDS, STDLIB_MODULE_NAMES, primary_label_expr
 from code_atlas.search.engine import matches_test_pattern
 
 if TYPE_CHECKING:
@@ -2236,7 +2235,7 @@ _RST_LITERAL = re.compile(r"``([^`]+)``")
 # out across the project and say nothing.
 _ADJACENCY_AMBIGUOUS_MAX = 3
 
-_STDLIB_MODULES = frozenset(sys.stdlib_module_names)
+_STDLIB_MODULES = STDLIB_MODULE_NAMES
 _EXTERNAL_PREFIX = "ext/"
 _STDLIB_PREFIX = "std/"
 

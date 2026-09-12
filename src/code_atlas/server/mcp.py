@@ -2046,7 +2046,9 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             "Omit `package` to list every package, or set `min_projects=2` for only those "
             "shared across projects. `version` is what the project's manifest pins and is "
             "null for anything undeclared (the standard library, and every Go/Java/PHP "
-            "coordinate); `import_sites` counts what actually imports it, including "
+            "coordinate); `stdlib` marks a name that ships with Python, which on a real "
+            "corpus is most of the shared ones — pass `exclude_stdlib` to drop them. "
+            "`import_sites` counts what actually imports it, including "
             "`from pkg import thing`. Scope is every project in the graph: on the shared "
             "Memgraph backend that spans every indexed repo, on the embedded SQLite "
             "backend only the current checkout's projects. "
@@ -2061,6 +2063,9 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
         min_projects: Annotated[
             int, Field(1, description="Only packages used by at least this many projects. 2 = shared only.", ge=1)
         ] = 1,
+        exclude_stdlib: Annotated[
+            bool, Field(False, description="Drop names that ship with Python — usually most of the result.")
+        ] = False,
         limit: Annotated[int, Field(50, description="Max packages to return.", ge=1, le=100)] = 50,
         offset: Annotated[int, Field(0, description="Skip this many packages (for paging beyond limit).", ge=0)] = 0,
         ctx: Context = None,  # ty: ignore[invalid-parameter-default]
@@ -2077,7 +2082,10 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             # exactly one fact -- whether a further page exists. Announcing `has_more`
             # with no `offset` to act on it was the defect; the two ship together.
             rows = await app.graph.get_package_dependents(
-                package, min_projects=min_projects, limit=offset + clamped + 1
+                package,
+                min_projects=min_projects,
+                exclude_stdlib=exclude_stdlib,
+                limit=offset + clamped + 1,
             )
         except QueryTimeoutError as exc:
             return _error(str(exc), code="QUERY_TIMEOUT")
