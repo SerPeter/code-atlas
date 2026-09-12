@@ -63,7 +63,7 @@ For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code
 
 ## MCP Tools
 
-23 tools exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), designed to minimize context window overhead. On the SQLite fallback the server registers **22** — `find_communities` needs Memgraph and is unregistered rather than left to fail when called.
+24 tools exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), designed to minimize context window overhead. On the SQLite fallback the server registers **23** — `find_communities` needs Memgraph and is unregistered rather than left to fail when called.
 
 | Tool                       | What it does                                                                                     | Search | Full | Latency (avg / p95) |
 | -------------------------- | ------------------------------------------------------------------------------------------------ | -----: | ---: | ------------------: |
@@ -79,6 +79,7 @@ For a detailed comparison covering DeepWiki, Cursor, Sourcegraph Cody, Kit, code
 | `cypher_query`             | Run read-only Cypher against the graph. Auto-limited, write-protected.                           |    ~48 | ~128 |            3 / 3 ms |
 | **Analysis**               |                                                                                                  |        |      |                     |
 | `analyze_repo`             | Structure, centrality, dependencies, pattern, or quality analysis.                               |    ~50 | ~470 |          22 / 23 ms |
+| `cross_repo_dependencies`  | Which projects depend on an external package, and at which version                               |
 | `blast_radius`             | Transitive closure of callers/callees — "what breaks if I change this". Every hit reports `via`. |   ~214 | ~473 |                   — |
 | `find_communities`         | Clusters modules into subsystems by deterministic greedy modularity. Memgraph only.              |   ~159 | ~341 |                   — |
 | `find_dead_code`           | Entities with no incoming edge. **A lead, not a verdict** — known false positives are listed.    |   ~171 | ~310 |                   — |

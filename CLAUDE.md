@@ -53,6 +53,8 @@ atlas ui                         # Web UI; takes the first free port from 8420 u
 atlas daemon start               # Start indexing daemon (watcher + pipeline)
 atlas dream                      # Knowledge-vault lint report (inbox, orphans, dangling links, duplicates) + wiki/HOME.md
 atlas project rm <name>          # Delete a project's graph data (e.g. a stale worktree project)
+atlas deps [<package>]           # Which projects depend on an external package, and at which version
+atlas deps --shared              # ...only packages used by 2+ projects
 atlas bench                      # Index a corpus and report per-stage cost (throwaway SQLite db by default)
 atlas bench --repo <url> --ref <sha>   # ...against a pinned, cached clone instead
 atlas bench --record-baseline    # Store this run as the baseline; never happens automatically
