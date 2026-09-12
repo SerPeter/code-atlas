@@ -4151,19 +4151,89 @@ class GraphClient:
             {"project": project_name, "items": params},
         )
 
+    async def get_package_dependents(
+        self,
+        name: str = "",
+        *,
+        min_projects: int = 1,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Which indexed projects depend on an external package, and at which version.
+
+        The cross-repo question ATL-088 exists to answer -- "who depends on numpy across
+        all my repos" -- without globalizing the node. Each project owns its own
+        ``ExternalPackage`` node, so the answer is a group-by on ``ep.name``, which is an
+        indexed seek when a name is given (764 nodes on the reference graph, ~4ms).
+
+        ``import_sites`` counts distinct importers, and must span BOTH shapes an import
+        takes: ``import pathlib`` attaches an IMPORTS edge to the package, while
+        ``from pathlib import Path`` attaches it to an ExternalSymbol the package
+        CONTAINS. Counting only the first reported **0 importers for pathlib in a project
+        with 65** -- the node exists solely because something imported out of it. The two
+        sets are unioned by uid rather than summed, because a module doing both is one
+        importer.
+
+        Two things are deliberately separate in the output. ``version`` comes from the
+        ``Project -[DEPENDS_ON]-> ExternalPackage`` edge and is what the project's
+        *manifest* pins; it is ``None`` for the large majority of packages, which have no
+        manifest entry at all -- every Go/Java/PHP coordinate, the whole standard library,
+        and anything imported but undeclared. ``import_sites`` counts what actually
+        imports it. A package with a version and no imports is declared and unused; one
+        with imports and no version is used and undeclared, or is stdlib.
+
+        Both OPTIONAL for that reason: a plain MATCH would silently shrink the answer to
+        the packages someone happened to pin, which is the trap ``get_structure_data``
+        already records for the same edge.
+        """
+        name_clause = " WHERE ep.name = $name" if name else ""
+        records = await self.execute(
+            f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE}){name_clause} "
+            f"OPTIONAL MATCH (ep)<-[:{RelType.IMPORTS}]-(direct) "
+            "WITH ep, collect(DISTINCT direct.uid) AS directs "
+            f"OPTIONAL MATCH (ep)-[:{RelType.CONTAINS}]->(:{NodeLabel.EXTERNAL_SYMBOL})"
+            f"<-[:{RelType.IMPORTS}]-(via) "
+            "WITH ep, directs, collect(DISTINCT via.uid) AS vias "
+            f"OPTIONAL MATCH (:{NodeLabel.PROJECT} {{uid: ep.project_name}})-[dep:{RelType.DEPENDS_ON}]->(ep) "
+            "WITH ep.name AS package, ep.project_name AS project, dep.version AS version, "
+            "size(directs + [u IN vias WHERE NOT u IN directs]) AS import_sites "
+            "WITH package, collect({project: project, version: version, import_sites: import_sites}) AS projects "
+            "WHERE size(projects) >= $min_projects "
+            "RETURN package, projects, size(projects) AS project_count "
+            "ORDER BY project_count DESC, package ASC "
+            "LIMIT $limit",
+            {"name": name, "min_projects": min_projects, "limit": limit},
+        )
+        return [
+            {
+                "package": r["package"],
+                "project_count": r["project_count"],
+                "projects": sorted(
+                    ({**p} for p in r["projects"]),
+                    key=lambda p: (-(p.get("import_sites") or 0), p.get("project") or ""),
+                ),
+            }
+            for r in records
+        ]
+
     # -- Cross-project import resolution helpers --------------------------------
 
     async def _resolve_cross_project_read_phase(
         self,
         project_names: list[str],
         pkg_to_project: dict[str, str],
-    ) -> tuple[list[dict[str, str]], dict[str, str], dict[str, str]]:
+    ) -> tuple[list[dict[str, str]], dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
         """Batch-read stubs and resolve real entities for cross-project imports.
 
-        Returns ``(matched_eps, sym_to_real, ep_to_real_pkg)`` where
-        *matched_eps* are the ExternalPackage stubs that matched a sibling
-        package, *sym_to_real* maps ExternalSymbol uid → real entity uid, and
-        *ep_to_real_pkg* maps ExternalPackage uid → real Package uid.
+        Returns ``(matched_eps, sym_to_real, ep_to_real_pkg)`` where *matched_eps* are the
+        ExternalPackage stubs that matched a sibling package, *sym_to_real* maps
+        ExternalSymbol uid → ``(real entity uid, owning project)``, and *ep_to_real_pkg*
+        maps ExternalPackage uid → ``(real Package uid, owning project)``.
+
+        The owning project rides along because the rewrite below needs it to scope which
+        importers it may re-point. It is available here for free -- every stub was read
+        with its ``project_name`` -- and deriving it later by splitting the uid on ``":"``
+        would make the rewrite depend on the uid *shape*, which is exactly the dependency
+        ATL-088 exists to remove.
         """
         # Fetch ALL ExternalPackage stubs across all projects in one query
         all_ext_pkgs = await self.execute(
@@ -4197,19 +4267,20 @@ class GraphClient:
 
         # Build lookup pairs for bulk entity resolution
         lookup_pairs = [
-            {"name": es["name"], "target_project": target, "es_uid": es["uid"]}
+            {"name": es["name"], "target_project": target, "es_uid": es["uid"], "proj": es["proj"]}
             for es in all_ext_syms
             if (target := ep_target_map.get((es["proj"], es["pkg"])))
         ]
 
         pkg_rewire = [
-            {"ep_uid": ep["uid"], "pkg_name": ep["name"], "target_project": ep["target"]} for ep in matched_eps
+            {"ep_uid": ep["uid"], "pkg_name": ep["name"], "target_project": ep["target"], "proj": ep["proj"]}
+            for ep in matched_eps
         ]
 
         # Bulk-resolve real entities for ExternalSymbols.  No LIMIT — Cypher
         # LIMIT is global (one row for the whole UNWIND, not per pair); the
         # dict comprehension dedups multiple name matches per stub instead.
-        sym_to_real: dict[str, str] = {}
+        sym_to_real: dict[str, tuple[str, str]] = {}
         if lookup_pairs:
             real_matches = await self.execute(
                 "UNWIND $pairs AS p "
@@ -4217,21 +4288,21 @@ class GraphClient:
                 f"WHERE NOT n:{NodeLabel.EXTERNAL_PACKAGE} AND NOT n:{NodeLabel.EXTERNAL_SYMBOL} "
                 f"AND NOT n:{NodeLabel.RESOURCE_FILE} AND NOT n:{NodeLabel.ENV_VAR} "
                 f"AND NOT n:{NodeLabel.PROJECT} AND NOT n:{NodeLabel.SCHEMA_VERSION} "
-                "RETURN p.es_uid AS es_uid, n.uid AS real_uid",
+                "RETURN p.es_uid AS es_uid, n.uid AS real_uid, p.proj AS proj",
                 {"pairs": lookup_pairs},
             )
-            sym_to_real = {m["es_uid"]: m["real_uid"] for m in real_matches}
+            sym_to_real = {m["es_uid"]: (m["real_uid"], m["proj"]) for m in real_matches}
 
         # Bulk-resolve real Package nodes for bare package imports
-        ep_to_real_pkg: dict[str, str] = {}
+        ep_to_real_pkg: dict[str, tuple[str, str]] = {}
         if pkg_rewire:
             real_pkgs = await self.execute(
                 "UNWIND $pairs AS p "
                 f"MATCH (pkg:{NodeLabel.PACKAGE} {{project_name: p.target_project, name: p.pkg_name}}) "
-                "RETURN p.ep_uid AS ep_uid, pkg.uid AS real_uid",
+                "RETURN p.ep_uid AS ep_uid, pkg.uid AS real_uid, p.proj AS proj",
                 {"pairs": pkg_rewire},
             )
-            ep_to_real_pkg = {m["ep_uid"]: m["real_uid"] for m in real_pkgs}
+            ep_to_real_pkg = {m["ep_uid"]: (m["real_uid"], m["proj"]) for m in real_pkgs}
 
         return matched_eps, sym_to_real, ep_to_real_pkg
 
@@ -4242,7 +4313,15 @@ class GraphClient:
         in a sibling project, then rewires IMPORTS edges from ExternalSymbol stubs
         to the real entity. Orphaned stubs (no remaining inbound edges) are deleted.
 
-        Returns the total number of imports rewired.
+        Returns a **debug figure, not a contract**: this backend counts one per resolved
+        symbol *candidate*, while SQLite counts one per importer edge it actually
+        rewrote. They disagree whenever a candidate has no importer -- a stub minted by
+        `from pkg import x` has no edge to the package itself, so the package rewrite
+        matches nothing and still had a candidate. Counting real rewrites here would need
+        `execute_write` to return a row count, or a pre-count query per candidate in a
+        pass that already does one write each; neither is worth it for a `logger.debug`
+        line, which is its only consumer (`orchestrator.py`). The conformance suite
+        therefore compares the resulting *graph*, not this number.
         """
         if len(project_names) < 2:
             return 0
@@ -4279,26 +4358,34 @@ class GraphClient:
         # it is one extra parallel edge per re-index, forever. Exactly the shape measured
         # in resolve_doc_links (DOCUMENTS 213 -> 432 over three no-op runs); the SQLite
         # port already used INSERT OR IGNORE, so this was also a silent backend divergence.
+        # `src.project_name = $proj` scopes each rewrite to the project whose stub this
+        # is. Without it the statement re-points EVERY module importing that uid, in any
+        # project -- and it was correct only because the uid is `{project}:ext/{name}`, so
+        # no other project's module could be holding an edge to it. That is a property of
+        # the naming convention, not of this query, and ATL-088 proposes to remove it:
+        # under a global `ext/{name}` uid the unscoped form silently re-points sibling
+        # repos' imports onto one project's package. Stated here rather than left resting
+        # on the uid shape, so the resolver stays correct whichever way that lands.
         rewired = 0
-        for es_uid, real_uid in sym_to_real.items():
+        for es_uid, (real_uid, proj) in sym_to_real.items():
             await self.execute_write(
-                f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
+                f"MATCH (src:{NodeLabel.MODULE} {{project_name: $proj}})-[r:{RelType.IMPORTS}]->"
                 f"(es:{NodeLabel.EXTERNAL_SYMBOL} {{uid: $es_uid}}) "
                 f"MATCH (real:{NodeLabel.ENTITY} {{uid: $real_uid}}) "
                 f"MERGE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
-                {"es_uid": es_uid, "real_uid": real_uid},
+                {"es_uid": es_uid, "real_uid": real_uid, "proj": proj},
             )
             rewired += 1
 
-        for ep_uid, real_uid in ep_to_real_pkg.items():
+        for ep_uid, (real_uid, proj) in ep_to_real_pkg.items():
             await self.execute_write(
-                f"MATCH (src:{NodeLabel.MODULE})-[r:{RelType.IMPORTS}]->"
+                f"MATCH (src:{NodeLabel.MODULE} {{project_name: $proj}})-[r:{RelType.IMPORTS}]->"
                 f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $ep_uid}}) "
                 f"MATCH (real {{uid: $real_uid}}) "
                 f"MERGE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
-                {"ep_uid": ep_uid, "real_uid": real_uid},
+                {"ep_uid": ep_uid, "real_uid": real_uid, "proj": proj},
             )
 
         # Delete orphaned stubs

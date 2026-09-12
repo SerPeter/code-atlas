@@ -613,6 +613,51 @@ def _best_similarity_per_uid(records: list[dict[str, Any]]) -> list[dict[str, An
     return list(best.values())
 
 
+async def _rewire_stub_importers(conn: Any, *, stub_uid: str, real_uid: str, project: str) -> int:
+    """Re-point *project*'s importers of *stub_uid* at *real_uid*. Returns how many moved.
+
+    ``COALESCE(n.project_name, ?)``, not a plain join: scoping to the owning project is
+    the ATL-088 P2 fix, but an inner join would also drop importers whose node row is
+    missing, and those were previously rewired and cleaned up. An importer with no node
+    belongs to no project, so it cannot be the sibling this predicate guards against --
+    dropping it strands the stub and leaves an edge pointing at a deleted node.
+    """
+    cur = await conn.execute(
+        "SELECT e.from_uid FROM edges e LEFT JOIN nodes n ON n.uid = e.from_uid "
+        "WHERE e.to_uid = ? AND e.rel_type = 'IMPORTS' AND COALESCE(n.project_name, ?) = ?",
+        (stub_uid, project, project),
+    )
+    importers = await cur.fetchall()
+    await cur.close()
+    for (src_uid,) in importers:
+        await conn.execute(
+            "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'IMPORTS', '{}')",
+            (src_uid, real_uid),
+        )
+        await conn.execute(
+            "DELETE FROM edges WHERE from_uid = ? AND to_uid = ? AND rel_type = 'IMPORTS'",
+            (src_uid, stub_uid),
+        )
+    return len(importers)
+
+
+async def _delete_stub_if_unimported(conn: Any, uid: str) -> None:
+    """Drop an external stub only when nothing still imports it, taking its edges along.
+
+    The mirror of Memgraph's ``WHERE NOT ()-[:IMPORTS]->(es) DETACH DELETE es``. An
+    unguarded delete was safe only while every importer of the uid got rewired; once the
+    rewrite is scoped to the stub's own project (ATL-088 P2), a deliberately-spared
+    sibling importer is left pointing at a node that no longer exists -- and the edge row
+    outlives it forever, because nothing sweeps for a dangling edge.
+    """
+    cur = await conn.execute("SELECT 1 FROM edges WHERE to_uid = ? AND rel_type = 'IMPORTS' LIMIT 1", (uid,))
+    still_imported = await cur.fetchone()
+    await cur.close()
+    if still_imported is None:
+        await conn.execute("DELETE FROM edges WHERE from_uid = ? OR to_uid = ?", (uid, uid))
+        await conn.execute("DELETE FROM nodes WHERE uid = ?", (uid,))
+
+
 class SqliteGraphClient:
     """Async SQLite-backed graph store — drop-in fallback for :class:`~code_atlas.graph.client.GraphClient`.
 
@@ -2579,6 +2624,69 @@ class SqliteGraphClient:
         await conn.commit()
         logger.debug("Resolved {} member DEFINES edges ({} fell back to module)", len(type_edges), len(module_edges))
 
+    async def get_package_dependents(
+        self,
+        name: str = "",
+        *,
+        min_projects: int = 1,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Mirror of ``GraphClient.get_package_dependents`` -- see that docstring.
+
+        One caveat is specific to this backend and belongs in front of the caller rather
+        than here: the embedded graph is one ``.atlas/graph.sqlite3`` per checkout, so
+        "across all my repos" reaches only the projects in *this* database. On a monorepo
+        that is its sub-projects; on a single repo it is one row. The Memgraph backend is
+        the one that spans checkouts.
+        """
+        conn = await self._get_conn()
+        where = "WHERE n.labels = 'ExternalPackage'"
+        params: list[Any] = []
+        if name:
+            where += " AND n.name = ?"
+            params.append(name)
+        cur = await conn.execute(
+            "SELECT n.name AS package, n.project_name AS project, "
+            # UNION, not two counts added: a module that does both `import pathlib` and
+            # `from pathlib import Path` is one importer. The second arm is the one that
+            # matters -- a from-import attaches to the ExternalSymbol, so counting only
+            # direct edges reports 0 for a package with dozens of users.
+            "  (SELECT count(*) FROM ("
+            "     SELECT e.from_uid FROM edges e "
+            "       WHERE e.to_uid = n.uid AND e.rel_type = 'IMPORTS' "
+            "     UNION "
+            "     SELECT i.from_uid FROM edges c JOIN edges i ON i.to_uid = c.to_uid "
+            "       WHERE c.from_uid = n.uid AND c.rel_type = 'CONTAINS' AND i.rel_type = 'IMPORTS'"
+            "  )) AS import_sites, "
+            "  (SELECT json_extract(d.props_json, '$.version') FROM edges d "
+            "     WHERE d.to_uid = n.uid AND d.rel_type = 'DEPENDS_ON' AND d.from_uid = n.project_name "
+            "     LIMIT 1) AS version "
+            f"FROM nodes n {where}",
+            params,
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for package, project, import_sites, version in rows:
+            grouped.setdefault(package, []).append(
+                {"project": project, "version": version, "import_sites": import_sites}
+            )
+        # Ordered on the typed mapping rather than on the result rows: those hold a
+        # str/int/list union, so a key function over them cannot be checked.
+        ranked = sorted(
+            ((pkg, projects) for pkg, projects in grouped.items() if len(projects) >= min_projects),
+            key=lambda item: (-len(item[1]), item[0]),
+        )
+        return [
+            {
+                "package": pkg,
+                "project_count": len(projects),
+                "projects": sorted(projects, key=lambda p: (-(p["import_sites"] or 0), p["project"] or "")),
+            }
+            for pkg, projects in ranked[:limit]
+        ]
+
     async def update_external_package_versions(self, project_name: str, versions: dict[str, str]) -> None:
         """Mirror of ``GraphClient.update_external_package_versions`` — the version lives
         on ``Project -[DEPENDS_ON]-> ExternalPackage`` (v18), not on the package node.
@@ -2690,7 +2798,11 @@ class SqliteGraphClient:
             await conn.commit()
         return written
 
-    async def resolve_cross_project_imports(self, project_names: list[str]) -> int:  # noqa: PLR0915
+    async def resolve_cross_project_imports(self, project_names: list[str]) -> int:
+        # The int is a debug figure and deliberately not compared with Memgraph's --
+        # this backend counts importer edges actually rewritten, Memgraph counts resolved
+        # candidates. See GraphClient.resolve_cross_project_imports for why neither is
+        # worth changing. The conformance suite compares the resulting graph instead.
         """Simplified port of ``GraphClient.resolve_cross_project_imports`` —
         per-stub rewiring rather than the bulk read-then-write-phase split.
         """
@@ -2726,15 +2838,22 @@ class SqliteGraphClient:
             if target_project is None or target_project == proj:
                 continue
 
+            # `name` off the row, not derived from the uid. `es_uid.rsplit("/", 1)[-1]`
+            # on `app:ext/shared.thing` yields `shared.thing`, while resolve_imports
+            # stores `to_name.rsplit(".", 1)[-1]` -> `thing` -- so the lookup below
+            # searched for a node nothing ever names and this arm never matched once.
+            # An ExternalSymbol only exists when `to_name != top_level`, i.e. the name is
+            # always dotted, so it was unreachable for every input it can receive: on this
+            # backend `from sibling_pkg import thing` was never rewired to the real entity.
+            # Memgraph carries `es.name` off the node and does not have the bug.
             cur = await conn.execute(
-                "SELECT uid FROM nodes WHERE labels = 'ExternalSymbol' AND project_name = ? "
+                "SELECT uid, name FROM nodes WHERE labels = 'ExternalSymbol' AND project_name = ? "
                 "AND json_extract(props_json, '$.package') = ?",
                 (proj, name),
             )
             ext_syms = await cur.fetchall()
             await cur.close()
-            for (es_uid,) in ext_syms:
-                es_name = es_uid.rsplit("/", 1)[-1]
+            for es_uid, es_name in ext_syms:
                 cur = await conn.execute(
                     "SELECT uid FROM nodes WHERE project_name = ? AND name = ? "
                     "AND labels NOT IN ('ExternalPackage', 'ExternalSymbol', 'EnvVar', 'ResourceFile', "
@@ -2745,23 +2864,8 @@ class SqliteGraphClient:
                 await cur.close()
                 if real is None:
                     continue
-                cur = await conn.execute(
-                    "SELECT from_uid FROM edges WHERE to_uid = ? AND rel_type = 'IMPORTS'", (es_uid,)
-                )
-                importers = await cur.fetchall()
-                await cur.close()
-                for (src_uid,) in importers:
-                    await conn.execute(
-                        "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) "
-                        "VALUES (?, ?, 'IMPORTS', '{}')",
-                        (src_uid, real[0]),
-                    )
-                    await conn.execute(
-                        "DELETE FROM edges WHERE from_uid = ? AND to_uid = ? AND rel_type = 'IMPORTS'",
-                        (src_uid, es_uid),
-                    )
-                    rewired += 1
-                await conn.execute("DELETE FROM nodes WHERE uid = ?", (es_uid,))
+                rewired += await _rewire_stub_importers(conn, stub_uid=es_uid, real_uid=real[0], project=proj)
+                await _delete_stub_if_unimported(conn, es_uid)
 
             cur = await conn.execute(
                 "SELECT uid FROM nodes WHERE labels = 'Package' AND project_name = ? AND name = ?",
@@ -2770,22 +2874,7 @@ class SqliteGraphClient:
             real_pkg = await cur.fetchone()
             await cur.close()
             if real_pkg is not None:
-                cur = await conn.execute(
-                    "SELECT from_uid FROM edges WHERE to_uid = ? AND rel_type = 'IMPORTS'", (ep_uid,)
-                )
-                importers = await cur.fetchall()
-                await cur.close()
-                for (src_uid,) in importers:
-                    await conn.execute(
-                        "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) "
-                        "VALUES (?, ?, 'IMPORTS', '{}')",
-                        (src_uid, real_pkg[0]),
-                    )
-                    await conn.execute(
-                        "DELETE FROM edges WHERE from_uid = ? AND to_uid = ? AND rel_type = 'IMPORTS'",
-                        (src_uid, ep_uid),
-                    )
-                    rewired += 1
+                rewired += await _rewire_stub_importers(conn, stub_uid=ep_uid, real_uid=real_pkg[0], project=proj)
 
             # DEPENDS_ON is excluded from the "is anything still pointing at this stub"
             # count: since v18 the stub's own project points at it with the manifest

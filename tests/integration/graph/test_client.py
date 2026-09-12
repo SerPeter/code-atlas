@@ -2857,6 +2857,55 @@ async def test_v18_migration_keeps_the_version_of_an_orphaned_package(graph_clie
     assert kept[0]["version"] == "2.31.0"
 
 
+async def test_the_rewrite_only_touches_its_own_projects_importers(graph_client: GraphClient):
+    """A stub's rewrite must re-point only the importers of the project that owns it.
+
+    This pins an invariant rather than reproducing a reachable bug, and the distinction is
+    the point. The rewrite statements are anchored on the stub uid alone, so they are
+    correct today only because the uid is ``{project}:ext/{name}`` -- no other project's
+    module can be holding an edge to it. That is a property of the naming convention, not
+    of the query, and ATL-088 proposes to replace the uid with a global ``ext/{name}``,
+    at which point one project's resolution silently re-points every sibling repo's
+    imports onto its own package.
+
+    So the cross-project edge is constructed by hand: it is not reachable through
+    ``resolve_imports`` today, and a test that waited for it to be reachable would only
+    start failing after the change that makes it a data-corruption bug.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "shared")
+    await graph_client.merge_package_node("test_lib", "shared", "shared", "shared/__init__.py")
+
+    # A module in a THIRD project, pointed at test_app's stub.
+    entities, other_mod = _setup_module_node("test_other", "src/other.py")
+    await graph_client.upsert_file_entities("test_other", "src/other.py", entities, [])
+    await graph_client.merge_project_node("test_other")
+    stub_uid = "test_app:ext/shared"
+    await graph_client.execute_write(
+        f"MATCH (src:{NodeLabel.MODULE} {{uid: $src}}) "
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $ep}}) "
+        f"MERGE (src)-[:{RelType.IMPORTS}]->(ep)",
+        {"src": other_mod, "ep": stub_uid},
+    )
+
+    async def _targets(project: str) -> set[str]:
+        rows = await graph_client.execute(
+            f"MATCH (:{NodeLabel.MODULE} {{project_name: $p}})-[:{RelType.IMPORTS}]->(t) RETURN collect(t.uid) AS uids",
+            {"p": project},
+        )
+        return set(rows[0]["uids"]) if rows else set()
+
+    assert stub_uid in await _targets("test_other"), "the fixture never built the cross-project edge"
+
+    await graph_client.resolve_cross_project_imports(["test_app", "test_lib", "test_other"])
+
+    real_pkg = "test_lib:shared"
+    assert real_pkg in await _targets("test_app"), "the owning project's import was not rewired"
+    assert await _targets("test_other") == {stub_uid}, (
+        "a sibling project's import was re-pointed by another project's resolution"
+    )
+
+
 async def test_resolve_cross_project_imports_is_idempotent(graph_client: GraphClient):
     """Running the rewire twice must not leave two parallel IMPORTS edges.
 

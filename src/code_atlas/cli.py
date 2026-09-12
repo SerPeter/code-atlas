@@ -384,6 +384,16 @@ def search(
 
 
 @app.command()
+def deps(
+    package: str = typer.Argument("", help="Package name; omit to list every package."),
+    shared: bool = typer.Option(False, "--shared", help="Only packages used by 2+ projects."),
+    limit: int = typer.Option(50, min=1, max=1000, help="Max packages to show."),
+) -> None:
+    """Show which indexed projects depend on an external package."""
+    asyncio.run(_run_deps(package, shared, limit))
+
+
+@app.command()
 def status() -> None:
     """Show index status and health."""
     asyncio.run(_run_status())
@@ -1340,6 +1350,62 @@ async def _run_search(
             logger.warning("Index is stale (last indexed: {})", commit_str)
             if info.changed_files:
                 logger.warning("  {} file(s) changed since last index", len(info.changed_files))
+
+
+async def _run_deps(package: str, shared: bool, limit: int) -> None:
+    """Async implementation of the ``atlas deps`` command.
+
+    Reads across every project in the graph, which on Memgraph spans every repo indexed
+    into it and on the embedded backend spans only this checkout's projects -- one
+    ``.atlas/graph.sqlite3`` per repo. Said out loud below rather than silently returning
+    less, because "nothing else depends on this" and "nothing else is in this database"
+    look identical in the output.
+    """
+    from code_atlas.backends import connected
+    from code_atlas.backends.sqlite_graph import SqliteGraphClient
+
+    settings = _load_settings()
+    async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
+        embedded = isinstance(backends.graph, SqliteGraphClient)
+        # limit+1 to detect truncation: printing a 50-row slice of 550 packages with
+        # no notice reads as "these are all of them".
+        rows = await backends.graph.get_package_dependents(package, min_projects=2 if shared else 1, limit=limit + 1)
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+
+        if _output.json:
+            _json_output(
+                {
+                    "packages": rows,
+                    "count": len(rows),
+                    "truncated": truncated,
+                    "scope": "checkout" if embedded else "all indexed projects",
+                }
+            )
+            return
+
+        if not rows:
+            scope = "this checkout" if embedded else "any indexed project"
+            what = f"'{package}'" if package else "any external package"
+            # `--shared` is a FILTER, so an empty result under it is not a statement
+            # about the graph: a package used by exactly one project is absent here
+            # and present without the flag. "No dependency found" would be false.
+            qualifier = " by 2 or more projects" if shared else ""
+            typer.echo(f"No dependency on {what}{qualifier} found in {scope}.")
+            return
+
+        for row in rows:
+            typer.echo(f"{row['package']}  ({row['project_count']} project(s))")
+            for p in row["projects"]:
+                version = p["version"] or "-"
+                typer.echo(f"    {p['project']:<38} {version:<14} {p['import_sites']} import(s)")
+
+        if truncated:
+            typer.echo(f"\n... more packages not shown; raise --limit (currently {limit}).")
+        if embedded:
+            typer.echo(
+                "\nNote: the embedded backend holds one database per checkout, so this spans this repo's projects only."
+            )
 
 
 async def _run_status() -> None:

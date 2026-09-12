@@ -2042,6 +2042,57 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
 
     @mcp.tool(
         description=(
+            "Which indexed projects depend on an external package, and at which version. "
+            "Omit `package` to list every package, or set `min_projects=2` for only those "
+            "shared across projects. `version` is what the project's manifest pins and is "
+            "null for anything undeclared (the standard library, and every Go/Java/PHP "
+            "coordinate); `import_sites` counts what actually imports it, including "
+            "`from pkg import thing`. Scope is every project in the graph: on the shared "
+            "Memgraph backend that spans every indexed repo, on the embedded SQLite "
+            "backend only the current checkout's projects. "
+            "Returns: {results: [{package, project_count, projects: [{project, version, "
+            "import_sites}]}], count, truncated, query_ms}."
+        ),
+    )
+    async def cross_repo_dependencies(
+        package: Annotated[
+            str, Field("", description="Exact package name, e.g. 'numpy'. Omit to list every package.")
+        ] = "",
+        min_projects: Annotated[
+            int, Field(1, description="Only packages used by at least this many projects. 2 = shared only.", ge=1)
+        ] = 1,
+        limit: Annotated[int, Field(50, description="Max packages to return.", ge=1, le=100)] = 50,
+        offset: Annotated[int, Field(0, description="Skip this many packages (for paging beyond limit).", ge=0)] = 0,
+        ctx: Context = None,  # ty: ignore[invalid-parameter-default]
+    ) -> dict[str, Any]:
+        try:
+            app = await _ensure_root(ctx)
+        except IndexNotReadyError as exc:
+            return _error(str(exc), code="INDEX_REQUIRED")
+        t0 = time.monotonic()
+        clamped = _clamp_limit(limit)
+
+        try:
+            # offset+limit+1: the backend has no offset of its own, and the +1 buys
+            # exactly one fact -- whether a further page exists. Announcing `has_more`
+            # with no `offset` to act on it was the defect; the two ship together.
+            rows = await app.graph.get_package_dependents(
+                package, min_projects=min_projects, limit=offset + clamped + 1
+            )
+        except QueryTimeoutError as exc:
+            return _error(str(exc), code="QUERY_TIMEOUT")
+
+        page = rows[offset : offset + clamped]
+        return _result(
+            page,
+            limit=clamped,
+            query_ms=(time.monotonic() - t0) * 1000,
+            has_more=len(rows) > offset + clamped,
+            remedy="raise `limit` (max 100), page with `offset`, or name a `package`",
+        )
+
+    @mcp.tool(
+        description=(
             "Analyze repository structure, centrality, dependencies, patterns, quality, dead code, "
             "complexity hotspots, communities, git-derived signals, or a whole-module skeleton. "
             "Returns: {analysis, project, ...analysis-specific keys, query_ms}."

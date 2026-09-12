@@ -60,6 +60,8 @@ _COMPARED: frozenset[str] = frozenset(
         "get_node_exact_matches",
         "get_node_partial_matches",
         "graph_search",
+        "get_package_dependents",
+        "resolve_cross_project_imports",
         "get_callers",
         "get_callees",
         "get_dead_code_candidates",
@@ -140,7 +142,6 @@ _NOT_COMPARED: dict[str, str] = {
     "resolve_anchors": "resolution pass",
     "resolve_doc_links": "resolution pass",
     "resolve_citations": "resolution pass",
-    "resolve_cross_project_imports": "resolution pass",
     "resolve_warehouse_objects": "resolution pass; its FEEDS output is compared by its own integration test",
     "resolve_protocol_conformance": "returns 0 unconditionally on SQLite — a known, recorded gap",
     "build_resolution_lookup": "internal to resolve_calls",
@@ -726,6 +727,161 @@ class TestTheDefectsThatMotivatedThis:
         assert before == family, "count_embeddings_by_project did not see every seeded project"
         assert cleared == 2, "the clear must reach the project and its '{name}/' children, and stop there"
         assert set(after) == {"codeXatlas/sub", "unrelated"}
+
+    @staticmethod
+    async def _seed_dependency(client: Any, project: str, package: str, version: str | None) -> None:
+        """A module in *project* importing *package*, plus the manifest pin if there is one.
+
+        Both halves matter and they come from different writers:
+        `resolve_imports` mints the ExternalPackage from the import, and
+        `update_external_package_versions` MATCHes it to hang the version edge. Seeding
+        only the first gives a null version; seeding only the second writes nothing at all.
+        """
+        entities = [_entity("mod", f"{project}:mod", label=NodeLabel.MODULE, kind="module")]
+        await client.upsert_file_entities(project, "mod.py", entities, [])
+        await client.merge_project_node(project)
+        await client.resolve_imports(
+            project,
+            [ParsedRelationship(from_qualified_name=f"{project}:mod", rel_type=RelType.IMPORTS, to_name=package)],
+        )
+        if version is not None:
+            await client.update_external_package_versions(project, {package: version})
+
+    async def test_package_dependents_agree(self, both):
+        """ATL-088 P1. The cross-repo dependency read must not be a Memgraph-only answer.
+
+        Compared as an ordered structure rather than through `_uids`: the value here IS
+        the grouping -- which projects, at which version, with how many import sites --
+        and a set of uids would compare none of it.
+
+        Two projects, one pinned and one not, because the null-version row is the half a
+        plain (non-OPTIONAL) join would silently drop, and the two backends reach it by
+        completely different routes -- a Cypher OPTIONAL MATCH versus a SQL correlated
+        subquery.
+        """
+        mg, lite = both
+        for client in (mg, lite):
+            await self._seed_dependency(client, "dep_a", "sharedpkg", "1.2.3")
+            await self._seed_dependency(client, "dep_b", "sharedpkg", None)
+
+        a = await mg.get_package_dependents("sharedpkg")
+        b = await lite.get_package_dependents("sharedpkg")
+
+        assert a, "the fixture seeded nothing, so this comparison asserts nothing"
+        assert a[0]["project_count"] == 2
+        assert {p["version"] for p in a[0]["projects"]} == {"1.2.3", None}, (
+            "the unpinned project was dropped, so the join is not OPTIONAL"
+        )
+        assert a == b, "backends disagree about who depends on a package"
+
+    @staticmethod
+    async def _seed_sibling_import(client: Any, *, importer: str, owner: str) -> None:
+        """*owner* really defines `shared.thing`; *importer* imports it as an external stub.
+
+        Both import shapes, because they take different arms of the resolver: the bare
+        `import shared` goes to the ExternalPackage, `from shared import thing` to an
+        ExternalSymbol the package CONTAINS.
+        """
+        await client.upsert_file_entities(
+            owner,
+            "shared.py",
+            [_entity("thing", f"{owner}:shared.thing", label=NodeLabel.CALLABLE, kind="function")],
+            [],
+        )
+        await client.merge_package_node(owner, "shared", "shared", "shared/__init__.py")
+        await client.merge_project_node(owner)
+        await client.upsert_file_entities(
+            importer, "m.py", [_entity("m", f"{importer}:m", label=NodeLabel.MODULE, kind="module")], []
+        )
+        await client.merge_project_node(importer)
+        await client.resolve_imports(
+            importer,
+            [
+                ParsedRelationship(
+                    from_qualified_name=f"{importer}:m", rel_type=RelType.IMPORTS, to_name="shared.thing"
+                ),
+                ParsedRelationship(from_qualified_name=f"{importer}:m", rel_type=RelType.IMPORTS, to_name="shared"),
+            ],
+        )
+
+    async def test_a_sibling_symbol_import_is_rewired_on_both_backends(self, both):
+        """`from shared import thing` must reach the real entity on either backend.
+
+        SQLite derived the symbol's name by splitting its uid on "/", which yields the
+        dotted `shared.thing`, while the writer stores `thing`. The lookup matched nothing,
+        so the arm was unreachable for every input it can receive and a sibling symbol
+        import was silently never rewired on the embedded backend.
+
+        Asserted through `get_package_dependents` because it is the one observable both
+        backends share: an un-rewired symbol stub keeps the package alive through its
+        CONTAINS edge, so the package's delete stays guarded and the dependency is still
+        reported. A clean rewire removes both.
+        """
+        mg, lite = both
+        for client, label in ((mg, "memgraph"), (lite, "sqlite")):
+            await self._seed_sibling_import(client, importer="imp_a", owner="own_b")
+            assert await client.get_package_dependents("shared"), (
+                f"{label}: the fixture minted no stub, so the transition below proves nothing"
+            )
+            await client.resolve_cross_project_imports(["imp_a", "own_b"])
+
+        # The returned int is deliberately NOT compared: Memgraph counts resolved
+        # candidates, SQLite counts importer edges actually rewritten, and they disagree
+        # whenever a candidate has no importer. It feeds one logger.debug line and nothing
+        # branches on it. What has to agree is the graph.
+        assert await mg.get_package_dependents("shared") == await lite.get_package_dependents("shared")
+        for client, label in ((mg, "memgraph"), (lite, "sqlite")):
+            assert not await client.get_package_dependents("shared"), (
+                f"{label}: the stub survived, so a sibling symbol import was left unrewired"
+            )
+
+    async def test_a_from_import_counts_as_an_importer(self, both):
+        """`from pkg import thing` attaches IMPORTS to the ExternalSymbol, not the package.
+
+        Counting only edges landing on the package reported **0 importers for pathlib in
+        a project with 65** -- the node existed solely because something imported out of
+        it. Both backends reach the symbol by different routes (a CONTAINS hop in Cypher,
+        a self-join plus UNION in SQL), so the agreement is the assertion.
+        """
+        mg, lite = both
+        for client in (mg, lite):
+            entities = [_entity("mod", "sym_proj:mod", label=NodeLabel.MODULE, kind="module")]
+            await client.upsert_file_entities("sym_proj", "mod.py", entities, [])
+            await client.merge_project_node("sym_proj")
+            await client.resolve_imports(
+                "sym_proj",
+                [
+                    ParsedRelationship(
+                        from_qualified_name="sym_proj:mod", rel_type=RelType.IMPORTS, to_name="frompkg.thing"
+                    )
+                ],
+            )
+
+        a = await mg.get_package_dependents("frompkg")
+        b = await lite.get_package_dependents("frompkg")
+        assert a, "the from-import never minted an ExternalPackage, so this proves nothing"
+        assert a[0]["projects"][0]["import_sites"] == 1, (
+            "a from-import was not counted; only bare `import pkg` edges are being seen"
+        )
+        assert a == b
+
+    async def test_package_dependents_min_projects_filters_identically(self, both):
+        """The filter is what makes "shared across repos" answerable, so it is compared
+        against a package that really is shared rather than against two empty lists."""
+        mg, lite = both
+        for client in (mg, lite):
+            await self._seed_dependency(client, "dep_a", "sharedpkg", "1.2.3")
+            await self._seed_dependency(client, "dep_b", "sharedpkg", None)
+            await self._seed_dependency(client, "dep_a", "lonelypkg", None)
+
+        for client in (mg, lite):
+            shared = {r["package"] for r in await client.get_package_dependents(min_projects=2)}
+            assert "sharedpkg" in shared
+            assert "lonelypkg" not in shared, "a single-project package passed a min_projects=2 filter"
+
+        assert await mg.get_package_dependents(min_projects=2) == await lite.get_package_dependents(min_projects=2)
+        assert await mg.get_package_dependents(min_projects=99) == []
+        assert await lite.get_package_dependents(min_projects=99) == []
 
     async def test_like_metacharacters_are_not_wildcards(self, both):
         """`_` matched any character, so searching `weird_name` also returned
