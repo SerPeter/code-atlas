@@ -35,6 +35,7 @@ from code_atlas.schema import (
     CUSTOM_COMPONENT_PREFIX,
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
+    IMPORT_ATOMIC_NAME,
     PROVENANCE_DECLARED,
     PROVENANCE_STDLIB,
     PROVENANCE_UNDECLARED,
@@ -2798,8 +2799,10 @@ class GraphClient:
                 import_edges.append(edge)
                 continue
 
-            # External import — derive top-level package
-            top_level = to_name.split(".")[0]
+            # External import — derive top-level package. A parser that marked the name
+            # atomic (a container image reference) has already given us the package name;
+            # see schema.IMPORT_ATOMIC_NAME for why that is a parser's call and not ours.
+            top_level = to_name if rel.properties.get(IMPORT_ATOMIC_NAME) else to_name.split(".")[0]
             if not top_level:
                 logger.debug("Skipping malformed import name {!r} from {}", to_name, from_uid)
                 continue

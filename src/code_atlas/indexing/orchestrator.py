@@ -14,18 +14,20 @@ import time
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
-from importlib.metadata import packages_distributions
+from importlib.metadata import distributions, packages_distributions
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
 
 import pathspec
+import yaml
 from loguru import logger
 
 from code_atlas.events import EmbedDirty, EntityRef, Event, EventBus, FileChanged, Significance, Topic
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
+from code_atlas.schema import split_image_reference
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, EmbedPolicy
 from code_atlas.settings import EmbeddingSettings, derive_project_name, extraction_key, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
@@ -1331,6 +1333,16 @@ async def _check_model_lock(
 #                     name; the key is already the name code writes, even for
 #                     renamed ``{ package = "..." }`` dependencies)
 #   Gemfile           verbatim — a gem name is the usual ``require`` path
+#   Dockerfile        the image repository, tag and digest stripped
+#   compose.yaml      the image repository, tag and digest stripped
+#
+# The two container manifests are the one case where the manifest and the code
+# agree on a name by construction rather than by convention: the same
+# ``schema.split_image_reference`` produces the ExternalPackage name (from the
+# Dockerfile/compose/k8s *parsers*) and the version (from the manifest parsers
+# here). They are also the reason ``IMPORT_ATOMIC_NAME`` exists — a registry
+# hostname is not a module path, so the dot split that serves Python must not
+# run on ``ghcr.io/acme/api``.
 #
 # For go.mod, pom.xml, build.gradle(.kts) and composer.json the two namespaces
 # CANNOT be reconciled from the manifest alone: the import root is a hosting
@@ -1353,6 +1365,42 @@ _GEM_RE = re.compile(r"""^\s*gem\s+['"]([^'"]+)['"](.*)$""")
 _GEM_CONSTRAINT_RE = re.compile(r"""\s*,\s*['"]([^'"]+)['"]""")
 _POM_PROPERTY_RE = re.compile(r"\$\{([^}]+)\}")
 _COMPOSER_PLATFORM_RE = re.compile(r"^(php|hhvm|composer|(ext|lib)-.+|(php|composer)-.+)$")
+
+
+def _record_version(versions: dict[str, str], collapsed: set[str], name: str, constraint: str) -> None:
+    """Merge one ``name -> constraint`` claim, treating an empty constraint as no opinion.
+
+    A declaration with no version (``dependencies = ["loguru"]``, ``FROM nginx``) is still
+    a declaration: it is what makes ``provenance`` read ``declared`` rather than
+    ``undeclared``, and ``atlas deps`` renders the empty version as ``-``. Before ATL-191
+    P2 those were dropped entirely, so a dependency the project names in plain sight
+    ranked as though nobody had asked for it.
+
+    Which also means an empty constraint must not *conflict* with a real one — it carries
+    no claim to disagree with. Two non-empty constraints that differ still collapse the
+    name, because there is one node and picking a winner would be a coin flip.
+    """
+    existing = versions.get(name)
+    if existing is None or (not existing and constraint):
+        versions[name] = constraint
+    elif constraint and existing != constraint:
+        collapsed.add(name)
+
+
+@functools.cache
+def _installed_distributions() -> frozenset[str]:
+    """Normalised names of every distribution installed in *atlas's own* environment.
+
+    Used only to decide whether an extra or a dependency-group counts as declared. See
+    :func:`_optional_declarations` for why that gate switches itself off when the
+    environment plainly is not the indexed project's.
+    """
+    installed: set[str] = set()
+    for dist in distributions():
+        name = dist.metadata["Name"] if dist.metadata else None
+        if name:
+            installed.add(_normalise_distribution(name))
+    return frozenset(installed)
 
 
 def _nested_table(data: Any, *keys: str) -> dict[Any, Any]:
@@ -1395,8 +1443,8 @@ def _distribution_import_names() -> dict[str, str]:
       the same repo; that is a gap in coverage, not a disagreement about a fact.
     """
     by_distribution: dict[str, set[str]] = {}
-    for import_name, distributions in packages_distributions().items():
-        for distribution in distributions:
+    for import_name, providers in packages_distributions().items():
+        for distribution in providers:
             by_distribution.setdefault(_normalise_distribution(distribution), set()).add(import_name)
     resolved: dict[str, str] = {}
     for distribution, import_names in by_distribution.items():
@@ -1413,8 +1461,49 @@ def _normalise_distribution(name: str) -> str:
     return name.lower().replace("-", "_").replace(".", "_")
 
 
+def _optional_declarations(data: dict[Any, Any]) -> list[str]:
+    """Every ``[project.optional-dependencies]`` and ``[dependency-groups]`` entry that counts.
+
+    "Counts" means the distribution is installed (ATL-191 P2): an extra nobody selected is
+    a version this project *would* pin, not one it depends on.
+
+    The gate switches itself off when **none** of the core ``[project].dependencies`` are
+    installed either. "Installed" can only ever mean *in atlas's own environment*, and
+    when atlas indexes somebody else's repo that environment is not the project's — the
+    gate would then have no evidence at all and would demote every extra on a fact about
+    the wrong machine. A gate with no evidence must not filter. The same reasoning is
+    already written down for :func:`_distribution_import_names`: a miss, never a wrong
+    edge.
+
+    ``{include-group = "..."}`` entries are skipped rather than followed: the group they
+    name is in this same table and is already being read, so following it would double
+    every entry and recurse on a cyclic file.
+    """
+    core = [d for d in _nested_table(data, "project").get("dependencies", []) if isinstance(d, str)]
+    optional: list[str] = []
+    for extra in _nested_table(data, "project", "optional-dependencies").values():
+        optional += [d for d in extra if isinstance(d, str)] if isinstance(extra, list) else []
+    for group in _nested_table(data, "dependency-groups").values():
+        optional += [d for d in group if isinstance(d, str)] if isinstance(group, list) else []
+
+    installed = _installed_distributions()
+
+    def _name(declaration: str) -> str:
+        match = _PEP508_RE.match(declaration.strip())
+        return _normalise_distribution(match.group(1)) if match else ""
+
+    if core and not any(_name(d) in installed for d in core):
+        logger.debug("Extras gate off: none of this project's {} core dependencies are installed here", len(core))
+        return optional
+    return [d for d in optional if _name(d) in installed]
+
+
 def _parse_pyproject_deps(text: str) -> dict[str, str]:
-    """PEP 621 ``[project].dependencies`` → import name → PEP 508 constraint.
+    """PEP 621 dependencies → import name → PEP 508 constraint.
+
+    Reads ``[project].dependencies`` unconditionally, plus the
+    ``[project.optional-dependencies]`` and ``[dependency-groups]`` entries
+    :func:`_optional_declarations` admits.
 
     The key really is the import name, which the declaration is not: see
     :func:`_distribution_import_names`. Two distributions that resolve to the same import
@@ -1422,23 +1511,27 @@ def _parse_pyproject_deps(text: str) -> dict[str, str]:
     dropped unless they agree on the constraint — the same rule
     :func:`_parse_dependency_versions` applies across manifests, for the same reason.
     There is one node per name, so picking a winner would be a coin flip.
+
+    A project's own name is skipped. ``all-languages = ["code-atlas-mcp[go,rust,...]"]``
+    is an extra recursively selecting its siblings, not a dependency on anything external,
+    and its "constraint" is the extras list.
     """
-    deps = _nested_table(tomllib.loads(text), "project").get("dependencies", [])
+    data = tomllib.loads(text)
+    own_name = _nested_table(data, "project").get("name")
+    own = _normalise_distribution(own_name) if isinstance(own_name, str) else ""
+    core = [d for d in _nested_table(data, "project").get("dependencies", []) if isinstance(d, str)]
     aliases = _distribution_import_names()
     versions: dict[str, str] = {}
     collapsed: set[str] = set()
-    for dep in deps:
-        if not isinstance(dep, str):
-            continue
+    for dep in core + _optional_declarations(data):
         match = _PEP508_RE.match(dep.strip())
-        if match:
-            pkg_name = _normalise_distribution(match.group(1))
-            pkg_name = aliases.get(pkg_name, pkg_name)
-            constraint = match.group(2).strip().rstrip(";").strip()
-            if constraint:
-                if versions.get(pkg_name, constraint) != constraint:
-                    collapsed.add(pkg_name)
-                versions[pkg_name] = constraint
+        if match is None:
+            continue
+        distribution = _normalise_distribution(match.group(1))
+        if distribution == own:
+            continue
+        pkg_name = aliases.get(distribution, distribution)
+        _record_version(versions, collapsed, pkg_name, match.group(2).strip().rstrip(";").strip())
     for name in collapsed:
         del versions[name]
     if collapsed:
@@ -1593,6 +1686,74 @@ def _parse_gemfile_deps(text: str) -> dict[str, str]:
     return versions
 
 
+def _parse_dockerfile_deps(text: str) -> dict[str, str]:
+    """``FROM`` instructions → image repository → tag or digest.
+
+    A base image is a declaration with a pin, and until ATL-191 P2 it was the largest
+    single reason the ``undeclared`` provenance tier looked wrong: the image node existed
+    (the Dockerfile parser writes the IMPORTS edge) and nothing ever wrote the
+    ``DEPENDS_ON`` edge that would have called it declared.
+
+    Three things are not dependencies and are skipped. A reference to an **earlier
+    stage** (``FROM builder``, by alias or by index) is internal to this file — the
+    Dockerfile parser resolves it as an edge between two stages, and Docker only permits
+    references to stages declared above, so the alias set only ever grows. **``scratch``**
+    is the empty base, a keyword rather than an image. And a **templated** reference
+    (``FROM $BASE``) names nothing resolvable; :func:`~code_atlas.schema.split_image_reference`
+    rejects it.
+
+    ``--platform=`` and any other flag between ``FROM`` and the reference are dropped,
+    as is the ``AS <alias>`` tail.
+    """
+    versions: dict[str, str] = {}
+    earlier_aliases: set[str] = set()
+    stage_count = 0
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line.lower().startswith("from "):
+            continue
+        tokens = [t for t in line.split()[1:] if not t.startswith("--")]
+        if not tokens:
+            continue
+        reference = tokens[0]
+        # Checked against the stages *above* this one, before this stage's own alias
+        # joins the set: `FROM x AS x` refers to the image, not to itself.
+        is_earlier_stage = reference.lower() in earlier_aliases or (
+            reference.isdigit() and int(reference) < stage_count
+        )
+        if len(tokens) >= 3 and tokens[1].lower() == "as":
+            earlier_aliases.add(tokens[2].lower())
+        stage_count += 1
+        if is_earlier_stage or reference.lower() == "scratch":
+            continue
+        split = split_image_reference(reference)
+        if split is not None:
+            versions.setdefault(split[0], split[1])
+    return versions
+
+
+def _parse_compose_deps(text: str) -> dict[str, str]:
+    """Compose ``services.*.image`` → image repository → tag or digest.
+
+    A service with a ``build:`` block is included too. Its ``image:`` is the *output*
+    tag rather than an input, but the compose parser mints the same ExternalPackage for
+    it either way, and leaving it out would park a node this project demonstrably names
+    in the ``undeclared`` tier. Excluding it would also make the manifest disagree with
+    the parser about the same line.
+    """
+    data = yaml.safe_load(text)
+    services = _nested_table(data, "services")
+    versions: dict[str, str] = {}
+    for spec in services.values():
+        image = spec.get("image") if isinstance(spec, dict) else None
+        if not isinstance(image, str):
+            continue
+        split = split_image_reference(image)
+        if split is not None:
+            versions.setdefault(split[0], split[1])
+    return versions
+
+
 # The dispatch table: adding an ecosystem is an entry here plus its parser.
 _MANIFEST_PARSERS: dict[str, ManifestParser] = {
     "pyproject.toml": _parse_pyproject_deps,
@@ -1604,6 +1765,11 @@ _MANIFEST_PARSERS: dict[str, ManifestParser] = {
     "build.gradle.kts": _parse_gradle_deps,
     "composer.json": _parse_composer_json_deps,
     "Gemfile": _parse_gemfile_deps,
+    "Dockerfile": _parse_dockerfile_deps,
+    "docker-compose.yml": _parse_compose_deps,
+    "docker-compose.yaml": _parse_compose_deps,
+    "compose.yml": _parse_compose_deps,
+    "compose.yaml": _parse_compose_deps,
 }
 
 
@@ -1638,9 +1804,7 @@ def _parse_dependency_versions(project_root: Path) -> dict[str, str]:
             logger.debug("Skipping unparsable manifest {}: {}", manifest, exc)
             continue
         for name, constraint in parsed.items():
-            if versions.get(name, constraint) != constraint:
-                conflicting.add(name)
-            versions[name] = constraint
+            _record_version(versions, conflicting, name, constraint)
     for name in conflicting:
         del versions[name]
     if conflicting:

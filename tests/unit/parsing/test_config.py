@@ -23,7 +23,7 @@ from code_atlas.parsing.languages.config import (
     _Out,
     _parse_config,
 )
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType
 
 PROJECT = "test_project"
 
@@ -1006,3 +1006,41 @@ def test_dotted_directory_does_not_collide_with_real_nesting() -> None:
     assert dotted.entities[0].qualified_name == f"{PROJECT}:charts.app_v2.pod_yaml"
     assert nested.entities[0].qualified_name == f"{PROJECT}:charts.app.v2.pod_yaml"
     assert {e.qualified_name for e in dotted.entities}.isdisjoint({e.qualified_name for e in nested.entities})
+
+
+def test_a_compose_image_is_marked_atomic():
+    """ATL-191 P2, matching containerfile.py: a registry hostname is not a module path.
+
+    `depends_on` is the control -- a sibling service name resolved inside this file,
+    which must not carry the marker.
+    """
+    parsed = _parse(
+        "services:\n  api:\n    image: ghcr.io/acme/api:1.2.3\n    depends_on: [db]\n  db:\n    image: postgres:17\n",
+        "docker-compose.yml",
+    )
+
+    api = {
+        r.to_name: (r.rel_type, r.properties) for r in parsed.relationships if r.from_qualified_name.endswith(".api")
+    }
+    assert api["ghcr.io/acme/api"] == (RelType.IMPORTS, {IMPORT_ATOMIC_NAME: True})
+    assert api["db"] == (RelType.USES_TYPE, {}), "a sibling service reference is internal to this file"
+
+
+def test_a_kubernetes_container_image_is_marked_atomic():
+    parsed = _parse(
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: web\n"
+        "spec:\n"
+        "  template:\n"
+        "    spec:\n"
+        "      containers:\n"
+        "        - name: api\n"
+        "          image: ghcr.io/acme/api:1.2.3\n",
+        "k8s/deploy.yaml",
+    )
+
+    images = [r for r in parsed.relationships if r.to_name == "ghcr.io/acme/api"]
+    assert len(images) == 1
+    assert images[0].properties == {IMPORT_ATOMIC_NAME: True}

@@ -1682,10 +1682,205 @@ dev = ["pytest>=8.0"]
             "yaml": "~=6.0",
             "dotenv": "==1.0.1",
             "requests": "[socks]>=2.31",
+            # ATL-191 P2. An unpinned dependency is still declared -- that is what makes
+            # its provenance `declared` rather than `undeclared` -- and carries no version.
+            "loguru": "",
+            # ...and [dependency-groups] is read now, gated on the distribution being
+            # installed. pytest is, in the environment running this.
+            "pytest": ">=8.0",
         }
-        # Unpinned deps carry no constraint, and [dependency-groups] is not read.
-        assert "loguru" not in result
-        assert "pytest" not in result
+
+    def test_extras_and_groups_count_only_when_installed(self, tmp_path: Path, monkeypatch):
+        """ATL-191 P2. An extra nobody selected is a version this project *would* pin.
+
+        The gate is a fact about atlas's own environment, so the synthetic set here is
+        what makes the test about the rule rather than about the machine.
+        """
+        from code_atlas.indexing import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_installed_distributions", lambda: frozenset({"httpx", "rich", "pytest"}))
+        _write(
+            tmp_path,
+            "pyproject.toml",
+            """
+[project]
+name = "demo"
+dependencies = ["httpx>=0.28"]
+
+[project.optional-dependencies]
+pretty = ["rich~=13.0"]
+excel = ["openpyxl~=3.1"]
+
+[dependency-groups]
+dev = ["pytest~=9.0", "mutmut~=3.0"]
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {"httpx": ">=0.28", "rich": "~=13.0", "pytest": "~=9.0"}
+        assert "openpyxl" not in result, "an extra that is not installed was not selected"
+        assert "mutmut" not in result, "same rule for a dependency-group"
+
+    def test_the_installed_gate_switches_off_for_a_foreign_project(self, tmp_path: Path, monkeypatch):
+        """Indexing somebody else's repo, atlas's environment is not that project's.
+
+        The gate can then only ever demote a genuinely declared dependency on evidence
+        about the wrong machine, so it must not run. Detected by the project's *core*
+        dependencies -- mandatory by definition -- being absent too.
+        """
+        from code_atlas.indexing import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_installed_distributions", lambda: frozenset({"httpx", "pytest"}))
+        _write(
+            tmp_path,
+            "pyproject.toml",
+            """
+[project]
+name = "someone-elses-app"
+dependencies = ["django>=5.0"]
+
+[project.optional-dependencies]
+async = ["celery~=5.4"]
+
+[dependency-groups]
+dev = ["gunicorn~=23.0"]
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {"django": ">=5.0", "celery": "~=5.4", "gunicorn": "~=23.0"}
+
+    def test_a_project_does_not_declare_itself(self, tmp_path: Path, monkeypatch):
+        """`all-languages = ["demo[go,rust]"]` selects sibling extras, it is not a dependency."""
+        from code_atlas.indexing import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_installed_distributions", lambda: frozenset({"httpx", "demo"}))
+        _write(
+            tmp_path,
+            "pyproject.toml",
+            """
+[project]
+name = "demo"
+dependencies = ["httpx>=0.28"]
+
+[project.optional-dependencies]
+go = ["tree-sitter-go~=0.25"]
+everything = ["demo[go]"]
+""",
+        )
+
+        assert _parse_dependency_versions(tmp_path) == {"httpx": ">=0.28"}
+
+    def test_dockerfile(self, tmp_path: Path):
+        """ATL-191 P2. A base image is a declaration and its tag is the version."""
+        _write(
+            tmp_path,
+            "Dockerfile",
+            """
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM python:3.14-slim AS builder
+RUN pip install uv
+
+FROM ghcr.io/astral-sh/uv:0.5.11 AS tools
+
+FROM builder AS runtime
+COPY --from=tools /uv /usr/local/bin/uv
+
+FROM scratch AS export
+
+FROM 0
+
+FROM redis@sha256:0123456789abcdef
+
+FROM $BASE_IMAGE
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "python": "3.14-slim",
+            "ghcr.io/astral-sh/uv": "0.5.11",
+            "redis": "sha256:0123456789abcdef",
+        }
+        assert "builder" not in result, "a reference to an earlier stage is internal to the file"
+        assert "scratch" not in result, "the empty base is a keyword, not an image"
+        assert "0" not in result, "a numeric reference is a stage index"
+
+    def test_a_registry_hostname_is_not_truncated(self, tmp_path: Path):
+        """The manifest key has to equal the ExternalPackage name the parsers mint.
+
+        Both come from `schema.split_image_reference`; a second implementation drifting
+        by one character silently stops writing dependency edges for every image. Before
+        ATL-191 P2 the *node* was the wrong one -- `resolve_imports` applied the Python
+        dotted-prefix rule to a registry hostname and produced `ghcr`.
+        """
+        from code_atlas.schema import split_image_reference
+
+        _write(tmp_path, "Dockerfile", "FROM ghcr.io/huggingface/text-embeddings-inference:cpu-1.8\n")
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {"ghcr.io/huggingface/text-embeddings-inference": "cpu-1.8"}
+        assert split_image_reference("ghcr.io/huggingface/text-embeddings-inference:cpu-1.8") == (
+            "ghcr.io/huggingface/text-embeddings-inference",
+            "cpu-1.8",
+        )
+
+    def test_compose(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "docker-compose.yml",
+            """
+services:
+  graph:
+    image: memgraph/memgraph-mage:3.12.0
+    ports: ["7687:7687"]
+  queue:
+    image: valkey/valkey:8-alpine
+  queue-test:
+    image: valkey/valkey:8-alpine
+  registry:
+    image: localhost:5000/internal/app:2.1
+  app:
+    build: .
+    image: acme/app:dev
+  templated:
+    image: ${BASE}:latest
+  nothing: {}
+""",
+        )
+
+        result = _parse_dependency_versions(tmp_path)
+
+        assert result == {
+            "memgraph/memgraph-mage": "3.12.0",
+            "valkey/valkey": "8-alpine",
+            "localhost:5000/internal/app": "2.1",
+            "acme/app": "dev",
+        }, "a colon before the last slash is a registry port, not a tag"
+        assert not any("BASE" in name for name in result), "a templated reference names nothing resolvable"
+
+    def test_an_untagged_image_is_still_declared(self, tmp_path: Path):
+        """No invented `latest`. The edge is what makes provenance `declared`; the
+        version is separately unknown, and `atlas deps` renders it as `-`."""
+        _write(tmp_path, "Dockerfile", "FROM nginx\n")
+
+        assert _parse_dependency_versions(tmp_path) == {"nginx": ""}
+
+    def test_an_unconstrained_declaration_does_not_conflict_with_a_pinned_one(self, tmp_path: Path):
+        """An empty constraint carries no claim, so it cannot disagree with one.
+
+        Without this the cross-manifest collapse would drop a name declared unpinned in
+        one ecosystem and pinned in another -- losing both the version and the
+        declaration, which is strictly worse than either input.
+        """
+        _write(tmp_path, "pyproject.toml", '[project]\nname = "api"\ndependencies = ["redis"]\n')
+        _write(tmp_path, "package.json", '{"dependencies": {"redis": "^4.6.0"}}')
+
+        assert _parse_dependency_versions(tmp_path) == {"redis": "^4.6.0"}
 
     def test_package_json(self, tmp_path: Path):
         _write(

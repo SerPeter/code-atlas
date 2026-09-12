@@ -12,12 +12,15 @@ wired up with:
 - ``stage -IMPORTS-> ExternalPackage`` for a base image or a
   ``COPY --from=<image>``. Parsers never emit ExternalPackage/ExternalSymbol
   nodes themselves: ``resolve_imports`` mints them, keyed
-  ``{project}:ext/{top_level}`` where ``top_level`` is the part of ``to_name``
-  before the first dot. So ``to_name`` carries the image *repository* with tag
-  and digest stripped — a tag would leave ``ext/python:3`` as the package name.
-  Registry-qualified images inherit the same dot split that Go import paths
-  already live with (``ghcr.io/astral-sh/uv`` → package ``ext/ghcr``, symbol
-  ``ext/ghcr.io/astral-sh/uv``).
+  ``{project}:ext/{top_level}``. ``to_name`` carries the image *repository* with
+  tag and digest stripped — a tag would leave ``ext/python:3`` as the package
+  name — and the rel sets ``IMPORT_ATOMIC_NAME`` so the resolver takes that name
+  whole instead of the part before the first dot (ATL-191 P2). A registry
+  hostname is not a module path: without the marker ``ghcr.io/astral-sh/uv``
+  became package ``ext/ghcr`` plus a symbol, filing every image on that registry
+  under one node. The tag itself reaches the graph as the version on
+  ``Project -[DEPENDS_ON]-> ExternalPackage``, written by this file's manifest
+  parser in ``indexing/orchestrator.py``.
 
 COPY/ADD build-context sources are recorded on the stage as a ``copy_sources``
 property rather than as edges, for two reasons. The build context is chosen by
@@ -68,7 +71,7 @@ from code_atlas.parsing.ast import (
     node_text,
     register_language,
 )
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType, split_image_reference
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -145,21 +148,15 @@ def _image_spec(from_node: Node) -> str:
 
 
 def _repository(image_ref: str) -> str | None:
-    """Strip tag and digest from an image reference, leaving the repository.
+    """The repository half of an image reference — ``nginx:1.27-alpine`` -> ``nginx``.
 
-    ``nginx:1.27-alpine`` -> ``nginx``; ``ghcr.io/x/y@sha256:...`` -> ``ghcr.io/x/y``.
-    A colon before a ``/`` is a registry port, not a tag, so
-    ``localhost:5000/app`` survives intact. Returns None for anything
-    interpolating a build ARG — an ExternalPackage named ``$BASE_IMAGE`` is
-    worse than no edge at all.
+    :func:`~code_atlas.schema.split_image_reference` owns the rule; the tag it also
+    returns is not wanted here, because a tag in ``to_name`` would leave ``ext/python:3``
+    as the package name. The tag reaches the graph as the ``DEPENDS_ON`` version instead,
+    from the Dockerfile manifest parser, which joins on exactly this name.
     """
-    if "$" in image_ref:
-        return None
-    ref = image_ref.split("@", 1)[0]
-    head, sep, tail = ref.rpartition(":")
-    if sep and "/" not in tail:
-        ref = head
-    return ref or None
+    split = split_image_reference(image_ref)
+    return split[0] if split is not None else None
 
 
 def _copy_from_ref(node: Node) -> str | None:
@@ -177,8 +174,10 @@ def _copy_from_ref(node: Node) -> str | None:
     return None
 
 
-def _dependency_target(ref: str, before: int, keys_by_name: dict[str, int], stage_qns: list[str]) -> str | None:
-    """Resolve a ``FROM``/``--from=`` reference into an IMPORTS ``to_name``.
+def _dependency_target(
+    ref: str, before: int, keys_by_name: dict[str, int], stage_qns: list[str]
+) -> tuple[str, bool] | None:
+    """Resolve a ``FROM``/``--from=`` reference into ``(to_name, is_image)``.
 
     An earlier stage — by case-insensitive alias or by numeric index — resolves
     to that stage's unprefixed qualified_name, which resolve_imports matches
@@ -186,15 +185,22 @@ def _dependency_target(ref: str, before: int, keys_by_name: dict[str, int], stag
     name. Docker only allows references to stages declared *earlier*, and stage
     names never carry a tag, so ``base:latest`` is an image even when a stage
     called ``base`` exists.
+
+    The flag is returned rather than re-derived by the caller because the two cases
+    are indistinguishable as strings — both are dotted — and only an image may be
+    marked atomic. Marking a stage qualified_name atomic would be harmless today
+    (it resolves internally and never reaches the mint site) and wrong the moment a
+    stage fails to resolve.
     """
     if ref.isdigit():
         index = int(ref)
         # An out-of-range index is a broken file, not an image called "7".
-        return stage_qns[index] if index < before else None
+        return (stage_qns[index], False) if index < before else None
     index = keys_by_name.get(ref.lower(), -1)
     if 0 <= index < before:
-        return stage_qns[index]
-    return _repository(ref)
+        return (stage_qns[index], False)
+    repository = _repository(ref)
+    return (repository, True) if repository is not None else None
 
 
 def _context_path(raw: str) -> str | None:
@@ -303,8 +309,13 @@ def _parse_containerfile(path: str, source: bytes, root: Node, project_name: str
             ParsedRelationship(from_qualified_name=module_uid, rel_type=RelType.DEFINES, to_name=stage_uid)
         )
         relationships.extend(
-            ParsedRelationship(from_qualified_name=stage_uid, rel_type=RelType.IMPORTS, to_name=target)
-            for target in dict.fromkeys(t for t in targets if t is not None)
+            ParsedRelationship(
+                from_qualified_name=stage_uid,
+                rel_type=RelType.IMPORTS,
+                to_name=target,
+                properties={IMPORT_ATOMIC_NAME: True} if is_image else {},
+            )
+            for target, is_image in dict.fromkeys(t for t in targets if t is not None)
         )
 
     return ParsedFile(file_path=norm_path, language=language, entities=entities, relationships=relationships)

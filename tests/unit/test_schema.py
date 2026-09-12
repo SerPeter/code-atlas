@@ -5,6 +5,8 @@ No infrastructure required — these test pure functions and data structures.
 
 from __future__ import annotations
 
+import pytest
+
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
@@ -31,6 +33,7 @@ from code_atlas.schema import (
     generate_unique_constraint_ddl,
     generate_vector_index_ddl,
     primary_label_expr,
+    split_image_reference,
 )
 
 
@@ -264,3 +267,51 @@ class TestSchemaVersion:
 
     def test_schema_version_is_int(self):
         assert isinstance(SCHEMA_VERSION, int)
+
+
+class TestImageReferences:
+    """`split_image_reference` is the join between an ExternalPackage name and its version.
+
+    The parsers (Dockerfile, compose, k8s) take the repository half as the node name; the
+    manifest parsers in `indexing/orchestrator.py` take the version half and MATCH on the
+    first. So a disagreement of one character between two implementations of this rule
+    would not raise anything -- it would quietly stop writing dependency edges for every
+    container image, which is how they all read `undeclared` before ATL-191 P2.
+    """
+
+    @pytest.mark.parametrize(
+        ("reference", "expected"),
+        [
+            ("python:3.14-slim", ("python", "3.14-slim")),
+            ("nginx", ("nginx", "")),
+            ("memgraph/memgraph-mage:3.12.0", ("memgraph/memgraph-mage", "3.12.0")),
+            # The defect this exists for: a registry hostname is not a module path.
+            (
+                "ghcr.io/huggingface/text-embeddings-inference:cpu-1.8",
+                ("ghcr.io/huggingface/text-embeddings-inference", "cpu-1.8"),
+            ),
+            # A colon *before* the last slash is a port, not a tag.
+            ("localhost:5000/internal/app:2.1", ("localhost:5000/internal/app", "2.1")),
+            ("localhost:5000/internal/app", ("localhost:5000/internal/app", "")),
+            # A digest is the stronger pin, and wins over a tag stated alongside it.
+            ("redis@sha256:abc123", ("redis", "sha256:abc123")),
+            ("redis:7@sha256:abc123", ("redis", "sha256:abc123")),
+            ("  alpine:3.20  ", ("alpine", "3.20")),
+        ],
+    )
+    def test_a_reference_splits_into_a_name_and_a_version(self, reference, expected):
+        assert split_image_reference(reference) == expected
+
+    @pytest.mark.parametrize(
+        "reference",
+        ["", "   ", "$BASE_IMAGE", "${REGISTRY}/app:1.0", "{{ .Values.image }}", ":3.14"],
+    )
+    def test_an_unresolvable_reference_names_nothing(self, reference):
+        """An ExternalPackage called `$BASE_IMAGE` is worse than no edge at all -- it is a
+        node nobody can ever join to, in a tier that reads as a real dependency."""
+        assert split_image_reference(reference) is None
+
+    def test_an_untagged_image_yields_an_empty_version_not_latest(self):
+        """`latest` is a real tag with real semantics. The file did not say it, and a
+        DEPENDS_ON edge with no version still records the declaration."""
+        assert split_image_reference("nginx") == ("nginx", "")

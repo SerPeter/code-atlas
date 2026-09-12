@@ -33,7 +33,7 @@ import pytest
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.graph.client import EmbedChunkWrite
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -883,6 +883,64 @@ class TestTheDefectsThatMotivatedThis:
         tallies = [await client.classify_external_package_provenance("prov_a") for client in (mg, lite)]
         assert tallies[0] == tallies[1], f"backends disagree on provenance: {tallies}"
         assert tallies[0] == {"declared": 1, "stdlib": 1, "undeclared": 1}, tallies[0]
+
+    async def test_an_atomic_name_is_not_split_on_its_first_dot(self, both):
+        """ATL-191 P2. A registry hostname is not a module path.
+
+        `resolve_imports` derives an ExternalPackage by taking the part before the first
+        dot, which is right for `os.path` and wrong for
+        `ghcr.io/huggingface/text-embeddings-inference`: that indexed as a package called
+        **`ghcr`** with the real name demoted to a sibling ExternalSymbol, so every image
+        on a registry collected into one node and the manifest's tag joined against
+        nothing.
+
+        A parser that knows its name is opaque sets `IMPORT_ATOMIC_NAME`; nothing about
+        the string could tell the resolver. Both halves are asserted, because the
+        interesting failure is silent: the whole name appearing *as a symbol under a
+        truncated package* still produces a node with the right text in it.
+        """
+        mg, lite = both
+        image = "ghcr.io/huggingface/text-embeddings-inference"
+        for client in (mg, lite):
+            await client.upsert_file_entities(
+                "atomic_proj",
+                "Dockerfile",
+                [_entity("stage", "atomic_proj:Dockerfile.builder", label=NodeLabel.TYPE_DEF, kind="docker_stage")],
+                [],
+            )
+            await client.merge_project_node("atomic_proj")
+            await client.resolve_imports(
+                "atomic_proj",
+                [
+                    ParsedRelationship(
+                        from_qualified_name="atomic_proj:Dockerfile.builder",
+                        rel_type=RelType.IMPORTS,
+                        to_name=image,
+                        properties={IMPORT_ATOMIC_NAME: True},
+                    ),
+                    # The control: the same resolver, one rel apart, must still split a
+                    # real dotted module path.
+                    ParsedRelationship(
+                        from_qualified_name="atomic_proj:Dockerfile.builder",
+                        rel_type=RelType.IMPORTS,
+                        to_name="os.path",
+                    ),
+                ],
+            )
+            await client.update_external_package_versions("atomic_proj", {image: "cpu-1.8"})
+
+        for client, label in ((mg, "memgraph"), (lite, "sqlite")):
+            packages = {r["package"] for r in await client.get_package_dependents()}
+            assert image in packages, f"{label}: the image name was truncated at its first dot"
+            assert "ghcr" not in packages, f"{label}: a registry hostname became a package"
+            assert "os" in packages, f"{label}: the marker leaked onto an ordinary dotted import"
+
+        a = await mg.get_package_dependents(image)
+        b = await lite.get_package_dependents(image)
+        assert a[0]["projects"][0]["version"] == "cpu-1.8", (
+            "the manifest key no longer equals the minted node name, so the tag joined against nothing"
+        )
+        assert a == b, "backends disagree about an atomic external name"
 
     async def test_classifying_twice_changes_nothing(self, both):
         """It runs at the end of every index, so a second pass must not drift.

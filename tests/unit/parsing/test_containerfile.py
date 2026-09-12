@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("tree_sitter_containerfile", reason="tree-sitter-containerfile not installed")
 
 from code_atlas.parsing.ast import ParsedFile, get_language_for_file, parse_file
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType
 
 PROJECT = "test_project"
 
@@ -360,3 +360,25 @@ def test_undecodable_bytes_do_not_crash():
     result = parse_file("Dockerfile", b"\x00\x01 junk \xff\nFROM alpine\n", PROJECT)
     assert result is not None
     assert [e.name for e in _stages(result)] == ["stage0"]
+
+
+def test_an_image_is_marked_atomic_and_a_stage_reference_is_not():
+    """ATL-191 P2. `resolve_imports` derives a package by taking the part before the
+    first dot, which is a Python module rule; applied to `ghcr.io/astral-sh/uv` it filed
+    every image on the registry under one `ext/ghcr` node and demoted the real name to a
+    sibling symbol. Nothing about the *string* distinguishes the two cases, so the parser
+    that emitted it says which it is.
+
+    The stage reference is the control: it is dotted too, and marking it would be inert
+    today (it resolves internally and never reaches the mint site) and wrong the first
+    time a stage fails to resolve.
+    """
+    parsed = _parse("FROM ghcr.io/astral-sh/uv:0.5 AS tools\nFROM alpine AS app\nCOPY --from=tools /uv /uv\n")
+
+    tools = _rels_from(parsed, "Dockerfile.tools", RelType.IMPORTS)
+    assert [r.to_name for r in tools] == ["ghcr.io/astral-sh/uv"]
+    assert tools[0].properties == {IMPORT_ATOMIC_NAME: True}
+
+    app = {r.to_name: r.properties for r in _rels_from(parsed, "Dockerfile.app", RelType.IMPORTS)}
+    assert app["alpine"] == {IMPORT_ATOMIC_NAME: True}
+    assert app["Dockerfile.tools"] == {}, "an intra-file stage reference is not an external name"

@@ -137,7 +137,7 @@ from code_atlas.parsing.languages.salesforce import (
     xml_tag,
     xml_text,
 )
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType, split_image_reference
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -238,20 +238,16 @@ def _join_relative(base_dir: PurePosixPath, rel: str) -> str | None:
 
 
 def _image_package(image: str) -> str | None:
-    """Strip tag and digest from a container image reference.
+    """The ExternalPackage name for a container image reference, or None if templated.
 
-    ``ghcr.io/acme/api:1.2.3`` -> ``ghcr.io/acme/api``. Returns ``None`` when the
-    reference is templated (``${TAG}``, ``{{ .Values.image }}``) and therefore
-    names nothing resolvable.
+    Thin wrapper over :func:`~code_atlas.schema.split_image_reference`, which owns the
+    rule so that the manifest parser writing the version joins on the same string. The
+    result is emitted with :data:`~code_atlas.schema.IMPORT_ATOMIC_NAME` set, because a
+    registry hostname is not a module path: without it ``resolve_imports`` would take the
+    part before the first dot and file every image on that registry under ``ghcr``.
     """
-    ref = image.strip()
-    if not ref or "${" in ref or "{{" in ref:
-        return None
-    ref = ref.split("@", 1)[0]
-    # A colon after the last slash is a tag; before it, it is a registry port.
-    head, sep, tail = ref.rpartition("/")
-    tail = tail.split(":", 1)[0]
-    return f"{head}{sep}{tail}" if tail else None
+    split = split_image_reference(image)
+    return split[0] if split is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -325,13 +321,25 @@ class _Out:
         )
         return qn
 
-    def rel(self, from_uid: str, rel_type: RelType, to_name: str) -> None:
-        """Append a relationship, ignoring exact duplicates."""
+    def rel(self, from_uid: str, rel_type: RelType, to_name: str, properties: dict[str, Any] | None = None) -> None:
+        """Append a relationship, ignoring exact duplicates.
+
+        Deduping stays on the ``(from, type, to)`` triple: *properties* qualify how the
+        name should be read, not which edge it is, so two rels differing only there are
+        the same edge and the first one's properties stand.
+        """
         key = (from_uid, rel_type.value, to_name)
         if key in self.seen_rels:
             return
         self.seen_rels.add(key)
-        self.relationships.append(ParsedRelationship(from_qualified_name=from_uid, rel_type=rel_type, to_name=to_name))
+        self.relationships.append(
+            ParsedRelationship(
+                from_qualified_name=from_uid,
+                rel_type=rel_type,
+                to_name=to_name,
+                properties=dict(properties) if properties else {},
+            )
+        )
 
     def lines(self, start: yaml.Node, end: yaml.Node | None = None) -> tuple[int, int]:
         """1-based inclusive line span covering *start* through *end*."""
@@ -816,7 +824,7 @@ def _extract_k8s(
     for image in images:
         package = _image_package(image)
         if package is not None:
-            out.rel(uid, RelType.IMPORTS, package)
+            out.rel(uid, RelType.IMPORTS, package, {IMPORT_ATOMIC_NAME: True})
 
     return _K8sResource(
         uid=uid,
@@ -910,7 +918,7 @@ def _extract_compose(out: _Out, doc: _Doc, module_uid: str) -> None:
             # With `build:` also present, `image:` is the *output* tag rather
             # than an input, but it is still the name other manifests reference.
             if package is not None:
-                out.rel(uid, RelType.IMPORTS, package)
+                out.rel(uid, RelType.IMPORTS, package, {IMPORT_ATOMIC_NAME: True})
         target = _compose_build_target(base_dir, spec.get("build"))
         if target is not None:
             out.rel(uid, RelType.IMPORTS, _module_qualified_name(target))

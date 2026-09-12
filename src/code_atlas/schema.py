@@ -333,6 +333,66 @@ module exists to prevent.
 """
 
 
+def split_image_reference(reference: str) -> tuple[str, str] | None:
+    """Split a container image reference into ``(repository, version)``.
+
+    ``ghcr.io/acme/api:1.2.3`` -> ``("ghcr.io/acme/api", "1.2.3")``;
+    ``python:3.14-slim`` -> ``("python", "3.14-slim")``;
+    ``redis@sha256:ab...`` -> ``("redis", "sha256:ab...")``;
+    ``nginx`` -> ``("nginx", "")``.
+
+    A colon *after* the last slash is a tag; before it, it is a registry port, so
+    ``localhost:5000/app`` keeps its port and has no version. A digest wins over a tag
+    when both are present: it is the stronger pin, and it is what the build actually
+    resolved to. An untagged image yields an empty version rather than an invented
+    ``latest`` -- the file did not say ``latest``, and a DEPENDS_ON edge with no version
+    still records the declaration.
+
+    Returns ``None`` for a templated reference (``${TAG}``, ``{{ .Values.image }}``,
+    ``$BASE_IMAGE``): those name nothing resolvable, and an ExternalPackage called
+    ``$BASE_IMAGE`` is worse than no edge at all.
+
+    One copy on purpose. The repository half becomes an ExternalPackage *name* (via the
+    parsers, which mark it :data:`IMPORT_ATOMIC_NAME`) and the version half becomes the
+    ``DEPENDS_ON`` version (via the manifest parsers in ``indexing/orchestrator.py``).
+    Those two join on the name, so a second implementation drifting by one character
+    silently stops writing dependency edges for every image.
+    """
+    ref = reference.strip()
+    if not ref or "${" in ref or "{{" in ref or "$" in ref:
+        return None
+    body, _, digest = ref.partition("@")
+    head, slash, tail = body.rpartition("/")
+    name, _, tag = tail.partition(":")
+    if not name:
+        return None
+    return f"{head}{slash}{name}", digest or tag
+
+
+IMPORT_ATOMIC_NAME = "atomic_name"
+"""`ParsedRelationship.properties` key: `to_name` is already the package name (ATL-191 P2).
+
+`resolve_imports` derives an `ExternalPackage` from an unresolved import by taking the part
+before the first dot, because for the languages that rule was written for -- Python, Java,
+Go -- a dotted import name is a *module path* whose first segment is the distribution.
+
+A container image reference is not a module path. Applying the rule to
+`ghcr.io/huggingface/text-embeddings-inference` truncates a registry hostname and produces a
+package called `ghcr`, which then collects every unrelated image on that registry, and a
+sibling `ExternalSymbol` carrying the real name. A parser that knows its `to_name` is an
+opaque identifier sets this, and the resolver uses the name whole.
+
+It is a parser-side marker rather than a resolver-side heuristic on purpose: nothing about
+the *string* distinguishes `ghcr.io/acme/api` from `os.path`, and a resolver guessing from
+shape would have to be re-guessed for every ecosystem added later. The parser already knows
+which it emitted.
+
+Go module paths (`github.com/spf13/cobra`) have exactly the same defect and deliberately do
+not set this yet -- adopting it would change the uid of every Go external package, which is
+a migration, not a fix. See the manifest-parsing header in `indexing/orchestrator.py`.
+"""
+
+
 PROVENANCE_DECLARED = "declared"
 PROVENANCE_STDLIB = "stdlib"
 PROVENANCE_UNDECLARED = "undeclared"
@@ -363,11 +423,16 @@ All three are read off the graph with no new parsing and no new pass over source
 
 The ordering of the tuple is the ranking order and is load-bearing; it is not alphabetical.
 
-Two known imprecisions, both narrowing rather than wrong. A dependency declared only in
-`[project.optional-dependencies]` or `[dependency-groups]` reads as transitive until those
-are parsed (ATL-191 P2). And a non-Python ecosystem reaches `transitive` by absence rather
-than by evidence -- 427 of 557 names on the reference graph are Ruby require paths, GitHub
-Actions or docker images, which no manifest parser here claims.
+Since ATL-191 P2, `declared` also covers `[project.optional-dependencies]` and
+`[dependency-groups]` (gated on the distribution actually being installed, since an extra
+nobody selected is not a dependency of this checkout), and container images declared by a
+`Dockerfile` or a compose file, which carry their tag as the version.
+
+One imprecision remains, narrowing rather than wrong: a non-Python ecosystem with no
+manifest parser here reaches `undeclared` by absence rather than by evidence. Ruby `require`
+paths, Go module paths and GitHub Actions `uses:` references are all in that set -- the
+Actions in particular are declared, and pinned, in `.github/workflows/`, which is not a
+root manifest and so is not probed.
 """
 
 

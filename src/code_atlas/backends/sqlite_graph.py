@@ -104,6 +104,7 @@ from code_atlas.schema import (
     COMPOSITE_INDICES,
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
+    IMPORT_ATOMIC_NAME,
     LABEL_PROPERTY_INDICES,
     PROVENANCE_DECLARED,
     PROVENANCE_STDLIB,
@@ -1928,7 +1929,9 @@ class SqliteGraphClient:
                 import_edges.append((from_uid, folded_uid, is_type_only))
                 continue
 
-            top_level = to_name.split(".")[0]
+            # Mirror of GraphClient.resolve_imports: an atomic name is the package
+            # name whole, rather than the part before the first dot.
+            top_level = to_name if rel.properties.get(IMPORT_ATOMIC_NAME) else to_name.split(".")[0]
             if not top_level:
                 continue
             pkg_uid = f"{project_name}:ext/{top_level}"
