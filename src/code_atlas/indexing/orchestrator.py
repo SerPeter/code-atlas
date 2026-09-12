@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import time
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
+from importlib.metadata import packages_distributions
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
@@ -1363,19 +1365,84 @@ def _nested_table(data: Any, *keys: str) -> dict[Any, Any]:
     return node if isinstance(node, dict) else {}
 
 
+@functools.cache
+def _distribution_import_names() -> dict[str, str]:
+    """Normalised distribution name -> its import name, for distributions where they differ.
+
+    `ExternalPackage` nodes are keyed by the **import** name -- `resolve_imports` mints
+    them from `to_name.split(".")[0]` -- while a manifest declares the **distribution**
+    name. For most packages those are the same string and nothing is needed. For the rest
+    (`pyyaml` imports as `yaml`, `gitpython` as `git`, `python-dotenv` as `dotenv`) the
+    manifest key matched no node, so the pinned version was silently dropped: measured on
+    this repo, 3 of 23 declared dependencies.
+
+    Derived from installed package metadata rather than a hand-written table. A table of
+    every divergent distribution on PyPI is one that will always be missing an entry, and
+    the heuristics that look plausible are actively dangerous -- "strip a leading py"
+    turns `pytest` into `test`, which is a real and different distribution, so a wrong
+    version would land on a node that exists.
+
+    Three rules keep it from ever guessing:
+
+    * **Only divergent distributions.** If the distribution name is itself one of its
+      import names, it is absent here and the caller's own value stands.
+    * **Only unambiguous ones.** `pywin32` ships 30-odd top-level modules and is skipped
+      entirely rather than having one picked. Private (`_`-prefixed) names are ignored
+      first, which is what makes `pyyaml -> yaml` unambiguous despite `_yaml`.
+    * **Only what is installed.** An uninstalled distribution is simply absent, and the
+      caller degrades to the behaviour it had before this existed -- a miss, never a
+      wrong edge. This does mean two machines can write different DEPENDS_ON edges for
+      the same repo; that is a gap in coverage, not a disagreement about a fact.
+    """
+    by_distribution: dict[str, set[str]] = {}
+    for import_name, distributions in packages_distributions().items():
+        for distribution in distributions:
+            by_distribution.setdefault(_normalise_distribution(distribution), set()).add(import_name)
+    resolved: dict[str, str] = {}
+    for distribution, import_names in by_distribution.items():
+        if distribution in {_normalise_distribution(n) for n in import_names}:
+            continue  # not divergent
+        public = sorted(n for n in import_names if not n.startswith("_"))
+        if len(public) == 1:
+            resolved[distribution] = public[0]
+    return resolved
+
+
+def _normalise_distribution(name: str) -> str:
+    """PEP 503-ish fold: distribution names are case- and separator-insensitive."""
+    return name.lower().replace("-", "_").replace(".", "_")
+
+
 def _parse_pyproject_deps(text: str) -> dict[str, str]:
-    """PEP 621 ``[project].dependencies`` → import name → PEP 508 constraint."""
+    """PEP 621 ``[project].dependencies`` → import name → PEP 508 constraint.
+
+    The key really is the import name, which the declaration is not: see
+    :func:`_distribution_import_names`. Two distributions that resolve to the same import
+    name (the nine ``opentelemetry-*`` packages all import as ``opentelemetry``) are
+    dropped unless they agree on the constraint — the same rule
+    :func:`_parse_dependency_versions` applies across manifests, for the same reason.
+    There is one node per name, so picking a winner would be a coin flip.
+    """
     deps = _nested_table(tomllib.loads(text), "project").get("dependencies", [])
+    aliases = _distribution_import_names()
     versions: dict[str, str] = {}
+    collapsed: set[str] = set()
     for dep in deps:
         if not isinstance(dep, str):
             continue
         match = _PEP508_RE.match(dep.strip())
         if match:
-            pkg_name = match.group(1).lower().replace("-", "_")
+            pkg_name = _normalise_distribution(match.group(1))
+            pkg_name = aliases.get(pkg_name, pkg_name)
             constraint = match.group(2).strip().rstrip(";").strip()
             if constraint:
+                if versions.get(pkg_name, constraint) != constraint:
+                    collapsed.add(pkg_name)
                 versions[pkg_name] = constraint
+    for name in collapsed:
+        del versions[name]
+    if collapsed:
+        logger.debug("Dropped {} dependency name(s) whose distributions disagree on a constraint", len(collapsed))
     return versions
 
 

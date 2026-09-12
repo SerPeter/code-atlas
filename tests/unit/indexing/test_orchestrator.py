@@ -1573,6 +1573,82 @@ def manifest_registry():
 class TestDependencyManifests:
     """One realistic sample per supported manifest format, parsed through the registry."""
 
+    def test_a_distributions_import_name_is_used_when_they_differ(self, monkeypatch):
+        """The three rules, against a synthetic metadata table rather than this venv.
+
+        Asserting on real installed packages would make the test a description of the
+        machine; the rules are what matter, and each of them exists to stop a guess.
+        """
+        from code_atlas.indexing import orchestrator
+
+        monkeypatch.setattr(
+            orchestrator,
+            "packages_distributions",
+            lambda: {
+                "yaml": ["PyYAML"],
+                "_yaml": ["PyYAML"],  # private, ignored so PyYAML stays unambiguous
+                "dotenv": ["python-dotenv"],
+                "requests": ["requests"],  # not divergent
+                "win32api": ["pywin32"],  # ambiguous: two public names, no winner
+                "win32con": ["pywin32"],
+            },
+        )
+        orchestrator._distribution_import_names.cache_clear()
+        try:
+            mapping = orchestrator._distribution_import_names()
+        finally:
+            orchestrator._distribution_import_names.cache_clear()
+
+        assert mapping["pyyaml"] == "yaml", "a private `_`-prefixed sibling must not make it ambiguous"
+        assert mapping["python_dotenv"] == "dotenv", "the separator fold is part of the key"
+        assert "requests" not in mapping, "a distribution that imports as itself needs no entry"
+        assert "pywin32" not in mapping, "two public import names is ambiguous — skip, never pick"
+
+    def test_an_uninstalled_distribution_keeps_its_declared_name(self, tmp_path, monkeypatch):
+        """Absent metadata degrades to the old behaviour — a miss, never a wrong edge.
+
+        This is the case where atlas indexes a repo whose dependencies are not installed
+        in atlas's own environment, which is the normal case for anything but this repo.
+        """
+        from code_atlas.indexing import orchestrator
+
+        monkeypatch.setattr(orchestrator, "packages_distributions", dict)
+        orchestrator._distribution_import_names.cache_clear()
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "x"\ndependencies = ["PyYAML~=6.0"]\n', encoding="utf-8"
+        )
+        try:
+            result = _parse_dependency_versions(tmp_path)
+        finally:
+            orchestrator._distribution_import_names.cache_clear()
+
+        assert result == {"pyyaml": "~=6.0"}
+
+    def test_two_distributions_sharing_an_import_name_are_dropped(self, tmp_path, monkeypatch):
+        """The nine `opentelemetry-*` packages all import as `opentelemetry`.
+
+        One node, two constraints, no way to choose — the same rule
+        `_parse_dependency_versions` already applies across manifests.
+        """
+        from code_atlas.indexing import orchestrator
+
+        monkeypatch.setattr(
+            orchestrator,
+            "packages_distributions",
+            lambda: {"opentelemetry": ["opentelemetry-api", "opentelemetry-sdk"]},
+        )
+        orchestrator._distribution_import_names.cache_clear()
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "x"\ndependencies = ["opentelemetry-api~=1.30", "opentelemetry-sdk~=1.29"]\n',
+            encoding="utf-8",
+        )
+        try:
+            result = _parse_dependency_versions(tmp_path)
+        finally:
+            orchestrator._distribution_import_names.cache_clear()
+
+        assert result == {}, "disagreeing constraints on one node must drop it, not pick one"
+
     def test_pyproject_toml(self, tmp_path: Path):
         _write(
             tmp_path,
@@ -1596,10 +1672,15 @@ dev = ["pytest>=8.0"]
 
         result = _parse_dependency_versions(tmp_path)
 
+        # `pyyaml` -> `yaml` and `python-dotenv` -> `dotenv`: ExternalPackage nodes are
+        # keyed by the IMPORT name, so the distribution names this manifest declares
+        # matched no node and their versions were silently dropped. Both are runtime
+        # dependencies of code-atlas itself, so the metadata backing the mapping is
+        # always present when this test runs.
         assert result == {
             "pydantic": ">=2.0",
-            "pyyaml": "~=6.0",
-            "python_dotenv": "==1.0.1",
+            "yaml": "~=6.0",
+            "dotenv": "==1.0.1",
             "requests": "[socks]>=2.31",
         }
         # Unpinned deps carry no constraint, and [dependency-groups] is not read.
