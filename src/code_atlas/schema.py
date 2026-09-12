@@ -333,6 +333,44 @@ module exists to prevent.
 """
 
 
+PROVENANCE_DECLARED = "declared"
+PROVENANCE_STDLIB = "stdlib"
+PROVENANCE_UNDECLARED = "undeclared"
+EXTERNAL_PROVENANCE: tuple[str, ...] = (PROVENANCE_DECLARED, PROVENANCE_STDLIB, PROVENANCE_UNDECLARED)
+"""Where an `ExternalPackage` came from, most deliberate first (ATL-191).
+
+Ranking wants to know how much a package was *chosen*. A name in a manifest is a decision
+somebody made; the standard library is a given; anything else arrived because something
+else needed it. `[search.importance]` turns that into a multiplier, so dilution is handled
+by ranking rather than by refusing to index — which is what the original design did, and
+why it capped the graph at bare names.
+
+All three are read off the graph with no new parsing and no new pass over source:
+
+* **declared** -- a `Project -[DEPENDS_ON]-> ExternalPackage` edge exists. That edge is
+  written from a manifest and from nothing else, so its presence *is* the declaration.
+* **stdlib** -- the name is in :data:`STDLIB_MODULE_NAMES`. Python-shaped, like everything
+  else keyed on that set.
+* **undeclared** -- neither. Imported by this project's code, declared by nobody in it.
+
+  Named for what the check tests, not for a mechanism it cannot see. "Transitive" would
+  be a claim about *why* the package is here, and on the reference graph that claim is
+  mostly false: the tier's largest members are `valkey/valkey`, `memgraph/memgraph-mage`,
+  `ghcr`, `actions/setup-python` and `astral-sh/setup-uv` -- docker images and GitHub
+  Actions, which arrived through no dependency resolver at all. Splitting a genuine
+  transitive dependency from a foreign-ecosystem name needs ecosystem identity on the
+  node, which does not exist yet.
+
+The ordering of the tuple is the ranking order and is load-bearing; it is not alphabetical.
+
+Two known imprecisions, both narrowing rather than wrong. A dependency declared only in
+`[project.optional-dependencies]` or `[dependency-groups]` reads as transitive until those
+are parsed (ATL-191 P2). And a non-Python ecosystem reaches `transitive` by absence rather
+than by evidence -- 427 of 557 names on the reference graph are Ruby require paths, GitHub
+Actions or docker images, which no manifest parser here claims.
+"""
+
+
 _GRANT_ONLY_KINDS: frozenset[str] = frozenset({"permission_set", "profile"})
 """Entity kinds whose edges say "who may see this", not "what depends on this".
 

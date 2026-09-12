@@ -2382,6 +2382,11 @@ async def _index_project_inner(  # noqa: PLR0915
     dep_versions = _parse_dependency_versions(project_root)
     if dep_versions:
         await graph.update_external_package_versions(project_name, dep_versions)
+    # After the versions, never before: "declared" IS the DEPENDS_ON edge written above,
+    # so classifying first would mark everything transitive and never revisit it.
+    provenance = await graph.classify_external_package_provenance(project_name)
+    if provenance:
+        logger.debug("External package provenance for {}: {}", project_name, provenance)
 
     # 8. Update Project metadata
     entity_count = await graph.count_entities(project_name)

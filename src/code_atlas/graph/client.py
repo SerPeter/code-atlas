@@ -35,6 +35,9 @@ from code_atlas.schema import (
     CUSTOM_COMPONENT_PREFIX,
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
+    PROVENANCE_DECLARED,
+    PROVENANCE_STDLIB,
+    PROVENANCE_UNDECLARED,
     RESOURCE_FILE_PREFIX,
     SCHEMA_VERSION,
     STDLIB_MODULE_NAMES,
@@ -4151,6 +4154,34 @@ class GraphClient:
             "SET d.version = item.version",
             {"project": project_name, "items": params},
         )
+
+    async def classify_external_package_provenance(self, project_name: str) -> dict[str, int]:
+        """Stamp ``provenance`` on every ExternalPackage in *project_name*. Returns the tally.
+
+        Run after ``update_external_package_versions``, because "declared" means the
+        DEPENDS_ON edge that call writes -- classifying first would mark every package
+        transitive and then never revisit it.
+
+        One statement rather than three: the classification is a CASE over data already on
+        the node and its edges, so there is nothing to fetch and nothing to decide in
+        Python. Re-running is idempotent -- SET replaces, and a package whose manifest
+        entry disappeared is re-stamped rather than keeping a stale `declared`.
+        """
+        await self.execute_write(
+            f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) "
+            f"OPTIONAL MATCH (:{NodeLabel.PROJECT} {{uid: $p}})-[d:{RelType.DEPENDS_ON}]->(ep) "
+            "SET ep.provenance = CASE "
+            f"  WHEN d IS NOT NULL THEN '{PROVENANCE_DECLARED}' "
+            f"  WHEN ep.name IN $stdlib THEN '{PROVENANCE_STDLIB}' "
+            f"  ELSE '{PROVENANCE_UNDECLARED}' END",
+            {"p": project_name, "stdlib": sorted(STDLIB_MODULE_NAMES)},
+        )
+        records = await self.execute(
+            f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) "
+            "RETURN ep.provenance AS provenance, count(ep) AS n",
+            {"p": project_name},
+        )
+        return {r["provenance"]: r["n"] for r in records if r["provenance"]}
 
     async def get_package_dependents(
         self,

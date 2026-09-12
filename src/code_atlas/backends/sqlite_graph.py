@@ -105,6 +105,9 @@ from code_atlas.schema import (
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
     LABEL_PROPERTY_INDICES,
+    PROVENANCE_DECLARED,
+    PROVENANCE_STDLIB,
+    PROVENANCE_UNDECLARED,
     STDLIB_MODULE_NAMES,
     TEXT_INDICES,
     NodeLabel,
@@ -2624,6 +2627,38 @@ class SqliteGraphClient:
             )
         await conn.commit()
         logger.debug("Resolved {} member DEFINES edges ({} fell back to module)", len(type_edges), len(module_edges))
+
+    async def classify_external_package_provenance(self, project_name: str) -> dict[str, int]:
+        """Mirror of ``GraphClient.classify_external_package_provenance`` -- see that docstring."""
+        conn = await self._get_conn()
+        placeholders = ",".join("?" * len(STDLIB_MODULE_NAMES))
+        stdlib = sorted(STDLIB_MODULE_NAMES)
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_set(COALESCE(props_json, '{}'), '$.provenance', "
+            "  CASE "
+            "    WHEN EXISTS (SELECT 1 FROM edges e WHERE e.to_uid = nodes.uid "
+            "                 AND e.rel_type = 'DEPENDS_ON' AND e.from_uid = ?) THEN ? "
+            f"    WHEN name IN ({placeholders}) THEN ? "
+            "    ELSE ? END) "
+            "WHERE labels = 'ExternalPackage' AND project_name = ?",
+            [
+                project_name,
+                PROVENANCE_DECLARED,
+                *stdlib,
+                PROVENANCE_STDLIB,
+                PROVENANCE_UNDECLARED,
+                project_name,
+            ],
+        )
+        await conn.commit()
+        cur = await conn.execute(
+            "SELECT json_extract(props_json, '$.provenance') AS provenance, count(*) AS n "
+            "FROM nodes WHERE labels = 'ExternalPackage' AND project_name = ? GROUP BY provenance",
+            (project_name,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return {provenance: n for provenance, n in rows if provenance}
 
     async def get_package_dependents(
         self,

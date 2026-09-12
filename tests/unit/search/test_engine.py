@@ -1249,3 +1249,65 @@ class TestImportanceFactor:
         results = [self._result(rrf_score=0.02), replace(self._result(rrf_score=0.01), uid="p:y")]
         baseline = [r.ranked_score for r in _boost_results(results)]
         assert [r.ranked_score for r in _boost_results(results, importance=ImportanceSettings())] == baseline
+
+
+class TestProvenanceRanking:
+    """ATL-191 P1. A dependency somebody declared outranks the standard library, and both
+    outrank a name nothing in the project declared.
+
+    Built in rather than configured: the epic's whole premise is that indexing more of the
+    external world is survivable *because* ranking absorbs the dilution, and a weight that
+    defaults to doing nothing would not absorb any.
+    """
+
+    @staticmethod
+    def _result(uid: str, provenance: str, score: float = 0.01) -> SearchResult:
+        return SearchResult(
+            uid=uid,
+            name=uid,
+            qualified_name=f"ext/{uid}",
+            kind="package",
+            file_path="",
+            line_start=None,
+            line_end=None,
+            signature="",
+            docstring="",
+            labels=["ExternalPackage"],
+            rrf_score=score,
+            provenance=provenance,
+        )
+
+    def test_declared_outranks_stdlib_outranks_undeclared(self):
+        """Equal RRF scores, so the ordering is the multiplier and nothing else."""
+        results = [
+            self._result("undeclared_pkg", "undeclared"),
+            self._result("stdlib_pkg", "stdlib"),
+            self._result("declared_pkg", "declared"),
+        ]
+
+        ranked = _boost_results(results)
+
+        assert [r.uid for r in ranked] == ["declared_pkg", "stdlib_pkg", "undeclared_pkg"]
+
+    def test_a_node_without_provenance_is_untouched(self):
+        """Everything that is not an ExternalPackage carries no provenance, so the factor
+        must be exactly 1.0 for it -- otherwise this changes the ranking of the whole graph."""
+        plain = self._result("some_function", "")
+        ranked = _boost_results([plain])
+
+        # ExternalPackage has no label-boost entry either, so the only factors in play are
+        # visibility (1.0 for public) and provenance.
+        assert ranked[0].ranked_score == pytest.approx(plain.rrf_score)
+
+    def test_a_strong_undeclared_hit_still_beats_a_weak_declared_one(self):
+        """The weight is a multiplier, not a sort key. A 0.70 demotion must not override a
+        result that won the fusion outright -- that would be a filter wearing a factor's
+        clothes."""
+        results = [
+            self._result("weak_declared", "declared", score=0.001),
+            self._result("strong_undeclared", "undeclared", score=0.10),
+        ]
+
+        ranked = _boost_results(results)
+
+        assert ranked[0].uid == "strong_undeclared"

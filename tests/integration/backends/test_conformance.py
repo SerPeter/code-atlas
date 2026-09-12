@@ -61,6 +61,7 @@ _COMPARED: frozenset[str] = frozenset(
         "get_node_partial_matches",
         "graph_search",
         "get_package_dependents",
+        "classify_external_package_provenance",
         "resolve_cross_project_imports",
         "get_callers",
         "get_callees",
@@ -864,6 +865,41 @@ class TestTheDefectsThatMotivatedThis:
             "a from-import was not counted; only bare `import pkg` edges are being seen"
         )
         assert a == b
+
+    async def test_provenance_is_classified_identically(self, both):
+        """ATL-191 P1. Declared beats stdlib beats undeclared, and both backends must agree.
+
+        All three tiers come off data already in the graph: `declared` IS the DEPENDS_ON
+        edge a manifest writes, `stdlib` is a name lookup, `undeclared` is neither. So the
+        seeding below is the whole input -- one package with a manifest pin, one stdlib
+        name, one imported and declared by nobody.
+        """
+        mg, lite = both
+        for client in (mg, lite):
+            await self._seed_dependency(client, "prov_a", "loguru", "0.7")
+            await self._seed_dependency(client, "prov_a", "json", None)
+            await self._seed_dependency(client, "prov_a", "somethingvendored", None)
+
+        tallies = [await client.classify_external_package_provenance("prov_a") for client in (mg, lite)]
+        assert tallies[0] == tallies[1], f"backends disagree on provenance: {tallies}"
+        assert tallies[0] == {"declared": 1, "stdlib": 1, "undeclared": 1}, tallies[0]
+
+    async def test_classifying_twice_changes_nothing(self, both):
+        """It runs at the end of every index, so a second pass must not drift.
+
+        SET rather than merge is what makes that true, and it is also what lets a package
+        whose manifest entry disappeared stop reading as `declared` on the next index.
+        That second half is not asserted here: removing a DEPENDS_ON edge has no portable
+        API across the two backends, and a test that reached for Cypher would silently
+        pass by doing nothing on SQLite.
+        """
+        mg, lite = both
+        for client in (mg, lite):
+            await self._seed_dependency(client, "prov_b", "loguru", "0.7")
+            await self._seed_dependency(client, "prov_b", "json", None)
+            first = await client.classify_external_package_provenance("prov_b")
+            assert await client.classify_external_package_provenance("prov_b") == first
+            assert first == {"declared": 1, "stdlib": 1}, first
 
     async def test_stdlib_is_flagged_and_filtered_identically(self, both):
         """`ext/json` and `ext/litellm` are the same kind of node, and on a real corpus the

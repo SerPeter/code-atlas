@@ -107,6 +107,10 @@ class SearchResult:
     # number beside it — `atlas search fetch` printed 0.0078 at rank 5 and 0.0076 at
     # rank 4, which reads as a broken ranker rather than a deliberate demotion.
     ranked_score: float = 0.0
+    # How deliberate an external dependency is: "declared" (somebody put it in a
+    # manifest), "stdlib", or "undeclared". Empty for every node that is not an
+    # ExternalPackage, which is what makes the boost below a no-op for all of them.
+    provenance: str = ""
     # Stamped at index time by the supersession sweep, never traversed per query.
     # A note whose author explicitly replaced it must not read as current guidance,
     # and the successor's uid travels with the hit so the reader can follow it.
@@ -764,6 +768,25 @@ _VIS_BOOST: dict[str, float] = {"public": 1.0, "protected": 0.97, "internal": 0.
 
 # "blended" (default): knowledge participates in every query, ranked slightly
 # below code unless the caller asks for knowledge mode explicitly (Q7).
+# How much a dependency was *chosen*, as a ranking multiplier (ATL-191). A name in a
+# manifest is a decision; the standard library is a given; anything else arrived because
+# something else needed it. Values sit in the same band as the label boosts below so the
+# two compose without one drowning the other.
+#
+# Built in rather than configuration, like _VIS_BOOST and the label table: the point is to
+# make indexing more of the external world survivable, and a default that does nothing
+# would leave the dilution it exists to answer. `[search.importance]` can still override
+# any of it per project.
+#
+# Anything without the property -- every node that is not an ExternalPackage -- scores
+# 1.0, so this is inert outside the one label it was written for.
+_PROVENANCE_BOOST: dict[str, float] = {
+    "declared": 1.15,
+    "stdlib": 0.85,
+    "undeclared": 0.70,
+}
+
+
 _LABEL_BOOST_BLENDED: dict[str, float] = {
     "Callable": 1.15,
     "TypeDef": 1.15,
@@ -902,7 +925,7 @@ def _boost_results(
     secondary_projects: frozenset[str] | None = None,
     importance: ImportanceSettings | None = None,
 ) -> list[SearchResult]:
-    """Re-rank by RRF score * visibility * label * project-scope * supersession * importance."""
+    """Re-rank by RRF score * visibility * label * project-scope * supersession * provenance * importance."""
     boost_table = label_boost if label_boost is not None else _LABEL_BOOST_BLENDED
     # None and "configured but empty" are the same no-op; skipping keeps the default
     # configuration's ranking byte-identical to what it was before importance existed.
@@ -921,6 +944,7 @@ def _boost_results(
             * max((boost_table.get(lbl, 1.0) for lbl in result.labels), default=1.0)
             * _project_boost(result)
             * (_SUPERSEDED_PENALTY if result.superseded_by else 1.0)
+            * _PROVENANCE_BOOST.get(result.provenance, 1.0)
             * (importance_factor(result, importance) if use_importance and importance else 1.0)
         )
 
@@ -1090,6 +1114,7 @@ async def hybrid_search(  # noqa: PLR0912, PLR0915
                 rrf_score=rrf_score,
                 sources=uid_ranks.get(uid, {}),
                 visibility=props_by_uid.get(uid, {}).get("visibility", "public"),
+                provenance=props_by_uid.get(uid, {}).get("provenance", "") or "",
                 source=props_by_uid.get(uid, {}).get("source", "") or "",
                 superseded_by=props_by_uid.get(uid, {}).get("superseded_by", "") or "",
                 contradicts_with=tuple(props_by_uid.get(uid, {}).get("contradicts_with") or ()),
