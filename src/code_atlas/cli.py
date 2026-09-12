@@ -307,6 +307,13 @@ def index(
         "--co-change-threshold",
         help="Minimum shared commits for a CO_CHANGES_WITH edge (used with --with-git-signals).",
     ),
+    git_signals_max_commits: int = typer.Option(
+        -1,
+        "--git-signals-max-commits",
+        min=-1,
+        help="How many commits back to mine (used with --with-git-signals). 0 mines all of history; "
+        "-1 uses [index] git_signals_max_commits, default 25.",
+    ),
     watch: bool = typer.Option(
         False,
         "--watch",
@@ -352,6 +359,7 @@ def index(
             no_git_check=no_git_check,
             with_git_signals=with_git_signals,
             co_change_threshold=co_change_threshold,
+            git_signals_max_commits=git_signals_max_commits,
             watch=watch,
             force=force,
             force_drop_embeddings=force_drop_embeddings,
@@ -431,16 +439,27 @@ def mine_git_history(
     co_change_threshold: int = typer.Option(
         3, "--co-change-threshold", help="Minimum shared commits for a CO_CHANGES_WITH edge."
     ),
+    max_commits: int = typer.Option(
+        -1,
+        "--max-commits",
+        min=-1,
+        help="How many commits back to mine. 0 mines all of history; -1 uses "
+        "[index] git_signals_max_commits, default 25.",
+    ),
     no_git_check: bool = typer.Option(False, "--no-git-check", help="Allow running outside a git repository."),
 ) -> None:
     """Mine git history for hotspot/bus-factor/co-change signals (see find_hotspots).
 
-    One-shot batch job over the full commit history — not part of the
-    continuous indexing pipeline. Re-run periodically (e.g. from CI) to
-    refresh the mined signals; results are written onto existing Module/
-    DocFile nodes, so index the project first.
+    One-shot batch job — not part of the continuous indexing pipeline. Re-run
+    periodically (e.g. from CI) to refresh the mined signals; results are
+    written onto existing Module/DocFile nodes, so index the project first.
+
+    Mines the last 25 commits by default rather than all of history: each commit
+    costs one `git diff` subprocess, so an unbounded walk grows with the repo
+    forever. The counts therefore describe that window. `--max-commits 0`
+    restores the full walk.
     """
-    asyncio.run(_run_mine_git_history(path, co_change_threshold, no_git_check=no_git_check))
+    asyncio.run(_run_mine_git_history(path, co_change_threshold, max_commits, no_git_check=no_git_check))
 
 
 @app.command()
@@ -772,6 +791,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     no_git_check: bool = False,
     with_git_signals: bool = False,
     co_change_threshold: int = 3,
+    git_signals_max_commits: int = -1,
     watch: bool = False,
     force: bool = False,
     force_drop_embeddings: bool = False,
@@ -1001,7 +1021,13 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             incomplete = any(not r.drained for r in results)
 
             git_signals_stats = (
-                await _mine_and_write_git_signals(project_root, project_name, graph, co_change_threshold)
+                await _mine_and_write_git_signals(
+                    project_root,
+                    project_name,
+                    graph,
+                    co_change_threshold,
+                    _git_signals_window(git_signals_max_commits, settings),
+                )
                 if with_git_signals
                 else None
             )
@@ -1038,7 +1064,13 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             incomplete = not result.drained
 
             git_signals_stats = (
-                await _mine_and_write_git_signals(project_root, project_name, graph, co_change_threshold)
+                await _mine_and_write_git_signals(
+                    project_root,
+                    project_name,
+                    graph,
+                    co_change_threshold,
+                    _git_signals_window(git_signals_max_commits, settings),
+                )
                 if with_git_signals
                 else None
             )
@@ -1518,7 +1550,17 @@ async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_check: bool) -> None:
+def _git_signals_window(max_commits: int, settings: AtlasSettings) -> int:
+    """Resolve the CLI's ``-1`` sentinel against ``[index] git_signals_max_commits``.
+
+    ``-1`` rather than ``None`` because typer renders the default in ``--help``, and
+    "-1 uses the config value" reads better there than an absent option. 0 is a real
+    value meaning "all of history", so it cannot double as the sentinel.
+    """
+    return settings.index.git_signals_max_commits if max_commits < 0 else max_commits
+
+
+async def _run_mine_git_history(path: str, co_change_threshold: int, max_commits: int, *, no_git_check: bool) -> None:
     """Async implementation of the ``atlas mine-git-history`` command."""
     from git.exc import InvalidGitRepositoryError, NoSuchPathError
 
@@ -1534,7 +1576,11 @@ async def _run_mine_git_history(path: str, co_change_threshold: int, *, no_git_c
         graph = backends.graph
         _echo(f"Mining git history for '{project_name}'...")
         try:
-            result = mine_git_signals(project_root, co_change_threshold=co_change_threshold)
+            result = mine_git_signals(
+                project_root,
+                co_change_threshold=co_change_threshold,
+                max_commits=_git_signals_window(max_commits, settings),
+            )
         except (InvalidGitRepositoryError, NoSuchPathError) as exc:
             logger.error("Not a git repository: {} — {}", project_root, exc)
             raise typer.Exit(code=1) from exc
@@ -1562,7 +1608,7 @@ def _git_signals_summary_line(stats: dict[str, int], co_change_threshold: int) -
 
 
 async def _mine_and_write_git_signals(
-    project_root: Path, project_name: str, graph: GraphBackend, co_change_threshold: int
+    project_root: Path, project_name: str, graph: GraphBackend, co_change_threshold: int, max_commits: int
 ) -> dict[str, int]:
     """Mine git history and write the resulting signals, for ``atlas index --with-git-signals``.
 
@@ -1576,7 +1622,7 @@ async def _mine_and_write_git_signals(
 
     _echo(f"Mining git history for '{project_name}'...")
     try:
-        result = mine_git_signals(project_root, co_change_threshold=co_change_threshold)
+        result = mine_git_signals(project_root, co_change_threshold=co_change_threshold, max_commits=max_commits)
     except (InvalidGitRepositoryError, NoSuchPathError) as exc:
         logger.error("Not a git repository: {} — {}", project_root, exc)
         raise typer.Exit(code=1) from exc

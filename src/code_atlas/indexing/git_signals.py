@@ -32,6 +32,19 @@ if TYPE_CHECKING:
 # Co-change pairs sharing fewer commits than this are dropped as graph noise.
 DEFAULT_CO_CHANGE_THRESHOLD = 3
 
+# How many commits back to mine. Every commit costs one `git diff` subprocess --
+# `commit.stats` shells out per commit -- so an unbounded walk is O(history) in
+# process spawns and grows for the life of the repo. At 544 commits that is ~24s
+# on a healthy machine and minutes on one where process creation is slow (a
+# virus scanner hooking CreateProcess takes spawn from 44ms to 2s, which took
+# this past pytest's 300s timeout).
+#
+# Bounding it also sharpens the signal rather than merely cheapening it: a file
+# touched 200 times five years ago is not a current hotspot, and
+# `days_since_last_commit` was already a recency measure sitting beside two
+# all-time ones. 0 restores the full walk.
+DEFAULT_MAX_COMMITS = 25
+
 
 @dataclass(frozen=True)
 class FileSignal:
@@ -55,15 +68,34 @@ class GitSignalsResult:
     commits_scanned: int
 
 
-def mine_git_signals(repo_root: Path, *, co_change_threshold: int = DEFAULT_CO_CHANGE_THRESHOLD) -> GitSignalsResult:
-    """Mine per-file commit/author/co-change signals from *repo_root*'s full git history.
+def mine_git_signals(
+    repo_root: Path,
+    *,
+    co_change_threshold: int = DEFAULT_CO_CHANGE_THRESHOLD,
+    max_commits: int = DEFAULT_MAX_COMMITS,
+) -> GitSignalsResult:
+    """Mine per-file commit/author/co-change signals from *repo_root*'s recent git history.
 
     Uses GitPython's structured ``commit.stats.files`` (insertions/deletions per
     path) and ``commit.author`` instead of hand-parsing ``git log --numstat``
-    text. Per file: total commit count (hotspot proxy), distinct author count
+    text. Per file: commit count (hotspot proxy), distinct author count
     (bus-factor proxy), and days since the most recent commit touching it.
     Co-change pairs are file pairs that appear together in the same commit at
     least *co_change_threshold* times.
+
+    **The window is the last *max_commits* commits, not all of history** (0 for
+    all of it). So ``commit_count`` and ``author_count`` describe recent
+    activity, which is what a hotspot and a bus factor are asking about anyway,
+    and they no longer grow monotonically for the life of the repo.
+
+    The bound is applied by ``git rev-list --max-count``, not by slicing after
+    the walk: the cost being bounded is one ``git diff`` subprocess per commit
+    that ``commit.stats`` spawns, and a slice would pay all of it first.
+
+    Re-running is idempotent — ``write_git_file_signals`` SETs rather than
+    accumulates, so a second pass over the same window writes the same numbers.
+    Nothing here merges with previously written signals, which is why the window
+    can shrink or grow between runs without corrupting a total.
     """
     repo = Repo(str(repo_root))
 
@@ -74,7 +106,10 @@ def mine_git_signals(repo_root: Path, *, co_change_threshold: int = DEFAULT_CO_C
     commits_scanned = 0
 
     try:
-        commits = list(repo.iter_commits())
+        # max_count is omitted rather than passed as 0 — `rev-list --max-count=0`
+        # yields nothing, which is the opposite of what 0 means here.
+        kwargs = {"max_count": max_commits} if max_commits > 0 else {}
+        commits = list(repo.iter_commits(**kwargs))
     except ValueError:
         # Unborn HEAD — a freshly `git init`'d repo with zero commits yet.
         commits = []

@@ -592,6 +592,13 @@ class IndexSettings(StrictSection):
     delta_threshold: float = Field(
         default=0.3, description="If more than this fraction of files changed, fall back to full re-index."
     )
+    git_signals_max_commits: int = Field(
+        default=25,
+        ge=0,
+        description="How many commits back `--with-git-signals` mines. Each commit costs one `git diff` "
+        "subprocess, so an unbounded walk grows with the repo forever. The mined counts describe this "
+        "window, not all of history. 0 mines everything.",
+    )
     stale_mode: Literal["warn", "lock", "ignore"] = Field(
         default="warn",
         description="Stale index behavior: 'warn' (annotate), 'lock' (refuse), 'ignore' (skip).",
