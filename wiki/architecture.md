@@ -243,6 +243,11 @@ nodes.
 `Project -> ExternalPackage` carrying the manifest-declared `version` on the edge. Match the target label; a query that
 does not will mix them.
 
+The second shape is also what `provenance` is read from (ADR-0054): the edge is written from a manifest and from nothing
+else, so its presence _is_ the declaration, and `ExternalPackage` nodes are ranked `declared` > `stdlib` > `undeclared`
+on that basis. A `Dockerfile` or compose file counts as a manifest, so an image carries its tag as the version — and
+those names are minted whole (`ghcr.io/acme/api`, not `ghcr`) because the parser marks them atomic.
+
 **Documentation (2):** DOCUMENTS, MOTIVATED_BY — links between docs/ADRs and code entities.
 
 **Similarity (1):** SIMILAR_TO — computed via embedding cosine similarity (weighted edge).
