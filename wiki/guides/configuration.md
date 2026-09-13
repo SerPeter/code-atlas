@@ -9,9 +9,9 @@ Create an `atlas.toml` in your project root to customize Code Atlas behavior:
 include_paths = ["services/auth", "services/billing", "libs/shared"]
 exclude_patterns = ["*.generated.ts", "testdata/"]
 
-[libraries]
+[libraries]                          # see "Indexing external libraries" below
+stubs = true                         # read installed packages' public entrypoints
 full_index = ["my_company_shared_lib"]
-stub_index = ["fastapi", "sqlalchemy"]
 
 [monorepo]
 auto_detect = true
@@ -28,6 +28,62 @@ test_filter = true  # exclude test files from results by default
 [detectors]
 enabled = ["decorator_routing", "event_handlers", "test_mapping", "class_overrides", "di_injection", "cli_commands"]
 ```
+
+## Indexing external libraries
+
+An `ExternalPackage` is otherwise a bare name: `from pathlib import Path` puts a node called `Path` in the graph that
+says nothing about what `Path` is. Stub indexing reads each installed package's **public entrypoints** — the names its
+top-level module exports, with signatures and docstrings where they can be read — so an agent can see what a library
+offers without the graph absorbing the library itself.
+
+```toml
+[libraries]
+stubs = true          # default. Read public entrypoints of installed external packages
+stub_index = []       # default: every package that resolves. Non-empty restricts to those names
+full_index = []       # import names whose *whole module tree* is read, not just the entrypoint
+embed_stubs = true    # default. Give stub symbols vectors
+introspect = false    # default. Import each package and read signatures with inspect
+```
+
+### What it costs
+
+The entrypoint of a package is around 1 KB; its whole tree can be 25 MB. Measured on this repo's own environment,
+reading entrypoints for 96 packages is ~180 files and about 6 seconds, and it produces roughly 3,300 symbols. Reading
+every tree instead would be 3,287 files and 37 MB, two-thirds of it `litellm` alone. That difference is why `full_index`
+is an explicit list rather than a default.
+
+The cost is paid once per dependency version. Each package records the version its stub was read from, and an index
+skips one whose installed version has not moved — the check happens _before_ anything is read. Standard library modules
+use the interpreter version, which is exactly what changes when they do.
+
+### What resolves, and what does not
+
+Only packages installed in **atlas's own environment** can be stubbed. Indexing somebody else's repo, most imports
+resolve to nothing; those keep the provenance weight they already have (see
+[ADR-0054](../adr/0054-an-external-name-is-weighted-by-how-deliberately-it-was-chosen.md)) and gain no signatures. Names
+from other ecosystems — Ruby `require` paths, GitHub Actions, container images — never resolve at all.
+
+Resolution prefers a hand-written type stub over source: a bundled `.pyi`, then a `-stubs` distribution, then the
+package's own `__init__`. A `py.typed` marker is _not_ a separate case; it says the source is annotated, which is a
+statement about type checkers rather than a different file to read.
+
+### `introspect`, and why it is off
+
+A static read finds every public entrypoint **name**, but only some of their signatures. The rest are unreachable by
+construction:
+
+| pattern                      | example                | static                                                 |
+| ---------------------------- | ---------------------- | ------------------------------------------------------ |
+| `from .x import *`           | `asyncio`, `sqlite3`   | reached — the star targets are scanned                 |
+| re-export via `__all__`      | `pydantic`, `mcp`      | reached — one hop to the defining module               |
+| lazy `__getattr__` (PEP 562) | `litestar`             | **no** — the name-to-module map is computed at runtime |
+| compiled extension           | `orjson`, numpy ufuncs | **no** — there is no Python source                     |
+| runtime-generated class      | metaclass output       | **no** — it does not exist until import runs           |
+
+`introspect = true` imports each package and reads signatures off the live objects, which reaches all three. It also
+runs that package's import-time code inside the indexer, and in the wild that means network calls, CUDA initialisation
+and thread spawning. Turn it on only for an environment whose dependencies you trust. A package that raises on import is
+skipped and keeps its static read.
 
 ## .atlasignore
 
