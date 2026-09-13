@@ -4900,6 +4900,10 @@ class SqliteGraphClient:
         return None
 
     async def get_callers(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
+        """Mirror of ``GraphClient.get_callers``. The ORDER BY is the conformance
+        requirement (ATL-192): a BFS returns its reachable set in traversal order, which
+        is not the order Memgraph's expansion produces, so an unordered LIMIT makes the
+        two backends disagree about *which* callers a truncated answer contains."""
         conn = await self._get_conn()
         if not await self._label_matches(conn, uid, label):
             return []
@@ -4909,7 +4913,8 @@ class SqliteGraphClient:
         uids = list(reached)
         placeholders = ",".join("?" * len(uids))
         cur = await conn.execute(
-            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE uid IN ({placeholders}) AND labels = 'Callable' LIMIT ?",
+            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE uid IN ({placeholders}) "
+            f"AND labels = 'Callable' ORDER BY COALESCE(qualified_name, ''), uid LIMIT ?",
             [*uids, limit],
         )
         rows = await cur.fetchall()
@@ -4917,6 +4922,7 @@ class SqliteGraphClient:
         return [_row_to_node(r) for r in rows]
 
     async def get_callees(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
+        """Mirror of ``GraphClient.get_callees`` — see ``get_callers`` for the ORDER BY."""
         conn = await self._get_conn()
         if not await self._label_matches(conn, uid, label):
             return []
@@ -4926,7 +4932,8 @@ class SqliteGraphClient:
         uids = list(reached)
         placeholders = ",".join("?" * len(uids))
         cur = await conn.execute(
-            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE uid IN ({placeholders}) AND labels = 'Callable' LIMIT ?",
+            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE uid IN ({placeholders}) "
+            f"AND labels = 'Callable' ORDER BY COALESCE(qualified_name, ''), uid LIMIT ?",
             [*uids, limit],
         )
         rows = await cur.fetchall()
@@ -4960,6 +4967,11 @@ class SqliteGraphClient:
     # -- get_node cascade / status queries (server/mcp.py, cli.py) ------------
 
     async def get_node_exact_matches(self, name: str, label: str, limit: int) -> list[dict[str, Any]]:
+        """Mirror of ``GraphClient.get_node_exact_matches``.
+
+        Only the second branch is ordered (ATL-192), matching the Cypher: ``uid`` is the
+        primary key, so its LIMIT can never cut anything.
+        """
         conn = await self._get_conn()
         label_clause = " AND labels = ?" if label else ""
         label_params = [label] if label else []
@@ -4971,7 +4983,9 @@ class SqliteGraphClient:
         await cur.close()
         results.extend({"n": _row_to_node(r)} for r in rows)
         cur = await conn.execute(
-            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE name = ?{label_clause} LIMIT ?", [name, *label_params, limit]
+            f"SELECT {_NODE_COLUMNS} FROM nodes WHERE name = ?{label_clause} "
+            f"ORDER BY COALESCE(qualified_name, ''), uid LIMIT ?",
+            [name, *label_params, limit],
         )
         rows = await cur.fetchall()
         await cur.close()
@@ -4979,6 +4993,11 @@ class SqliteGraphClient:
         return results
 
     async def get_node_partial_matches(self, name: str, label: str, limit: int) -> list[dict[str, Any]]:
+        """Mirror of ``GraphClient.get_node_partial_matches``.
+
+        ``score`` ranks the three branches against each other; the ORDER BY ranks within
+        one, which is what each branch's LIMIT actually cuts on (ATL-192).
+        """
         conn = await self._get_conn()
         label_clause = " AND labels = ?" if label else ""
         label_params = [label] if label else []
@@ -4986,7 +5005,8 @@ class SqliteGraphClient:
 
         async def _branch(where: str, params: list[Any], score: int) -> None:
             cur = await conn.execute(
-                f"SELECT {_NODE_COLUMNS} FROM nodes WHERE {where}{label_clause} LIMIT ?",
+                f"SELECT {_NODE_COLUMNS} FROM nodes WHERE {where}{label_clause} "
+                f"ORDER BY COALESCE(qualified_name, ''), uid LIMIT ?",
                 [*params, *label_params, limit],
             )
             rows = await cur.fetchall()

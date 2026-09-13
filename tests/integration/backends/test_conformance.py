@@ -320,6 +320,79 @@ async def _seed(client: Any) -> None:
     await client.upsert_file_entities(PROJECT, "mod.py", entities, rels)
 
 
+LIMITED_PROJECT = "limitedproj"
+
+
+def _limited_corpus() -> tuple[list[ParsedEntity], list[ParsedRelationship]]:
+    """A corpus where every limited query's LIMIT actually binds.
+
+    Three shapes, because the four methods cut on three different things:
+
+    * **20 callers into one target, 20 callees out of it** -- `get_callers`/`get_callees`.
+      Memgraph expands a variable-length CALLS pattern; SQLite runs a BFS and then selects
+      the reached uids. Those produce genuinely different natural orders, which is what
+      makes an unordered LIMIT diverge rather than merely be arbitrary.
+    * **12 entities sharing the name `dupe`** -- `get_node_exact_matches`' second branch
+      matches on `name`, so it needs duplicates to have anything to cut. One function name
+      appearing in twelve modules is ordinary.
+    * The caller/callee names all contain `edge`, so `get_node_partial_matches`' CONTAINS
+      branch matches 40 and truncates.
+
+    Lowercase throughout, for the reason `_order_corpus` documents: SQLite's LIKE is
+    case-insensitive over ASCII and Cypher's CONTAINS is not, a pre-existing divergence
+    that would make this red for an unrelated reason.
+    """
+    target_qn = f"{LIMITED_PROJECT}:mod.edge_target"
+    entities = [
+        _entity("mod", f"{LIMITED_PROJECT}:mod", label=NodeLabel.MODULE, kind="module"),
+        _entity("edge_target", target_qn),
+        *(_entity(f"edge_caller_{i:02d}", f"{LIMITED_PROJECT}:mod.edge_caller_{i:02d}") for i in range(20)),
+        *(_entity(f"edge_callee_{i:02d}", f"{LIMITED_PROJECT}:mod.edge_callee_{i:02d}") for i in range(20)),
+        *(_entity("dupe", f"{LIMITED_PROJECT}:pkg{i:02d}.dupe") for i in range(12)),
+    ]
+    rels = [
+        *(
+            ParsedRelationship(
+                from_qualified_name=f"{LIMITED_PROJECT}:mod.edge_caller_{i:02d}",
+                rel_type=RelType.CALLS,
+                to_name="edge_target",
+            )
+            for i in range(20)
+        ),
+        *(
+            ParsedRelationship(from_qualified_name=target_qn, rel_type=RelType.CALLS, to_name=f"edge_callee_{i:02d}")
+            for i in range(20)
+        ),
+    ]
+    return entities, rels
+
+
+@pytest.fixture
+async def limited_both(graph_client, tmp_path: Path):
+    """Both backends holding `_limited_corpus`, seeded in OPPOSITE orders.
+
+    The reversal is the whole point, and ATL-186 proved it: its first ordering test
+    passed *without* the fix, because both backends were seeded identically and storage
+    order coincided. Agreement is only evidence when the write paths disagree.
+
+    `resolve_calls` has to run: `upsert_file_entities` materialises DEFINES and nothing
+    else, so a seeded CALLS rel is not yet an edge and `get_callers` would compare two
+    empty lists.
+    """
+    sqlite = SqliteGraphClient(tmp_path / "limited.sqlite3")
+    entities, rels = _limited_corpus()
+    await graph_client.ensure_schema()
+    await graph_client.upsert_file_entities(LIMITED_PROJECT, "mod.py", entities, rels)
+    await graph_client.resolve_calls(LIMITED_PROJECT, rels)
+    await sqlite.ensure_schema()
+    await sqlite.upsert_file_entities(LIMITED_PROJECT, "mod.py", list(reversed(entities)), rels)
+    await sqlite.resolve_calls(LIMITED_PROJECT, list(reversed(rels)))
+    try:
+        yield graph_client, sqlite
+    finally:
+        await sqlite.close()
+
+
 ORDER_PROJECT = "orderproj"
 
 
@@ -1123,6 +1196,41 @@ class TestTheDefectsThatMotivatedThis:
         b = _uids(await lite.graph_search("weird_name", project=PROJECT, limit=20))
         assert a == b
         assert f"{PROJECT}:mod.weirdXname" not in b
+
+    async def test_every_limited_query_cuts_the_same_rows(self, limited_both):
+        """ATL-192. ATL-186 ordered `graph_search`; these four kept the same defect.
+
+        An unordered LIMIT returns whichever rows the storage engine reaches first. With
+        the two backends seeded in opposite orders that is a different set on each, so
+        this comparison is what the defect looks like from outside -- and the assertion
+        on length is what keeps it from passing vacuously if the corpus ever shrinks.
+        """
+        mg, lite = limited_both
+        target = f"{LIMITED_PROJECT}:mod.edge_target"
+        limit = 5
+
+        cases = {
+            "get_callers": (lambda c: c.get_callers(target, "", 1, limit), limit),
+            "get_callees": (lambda c: c.get_callees(target, "", 1, limit), limit),
+            "get_node_exact_matches": (lambda c: c.get_node_exact_matches("dupe", "", limit), limit),
+            "get_node_partial_matches": (lambda c: c.get_node_partial_matches("edge", "", limit), limit),
+        }
+        for name, (call, expected) in cases.items():
+            a = _ranked_uids(await call(mg))
+            b = _ranked_uids(await call(lite))
+            assert len(a) >= expected, f"{name}: the LIMIT never bound, so this compared nothing ({len(a)})"
+            assert a == b, f"{name}: backends cut different rows\n  memgraph={a}\n  sqlite  ={b}"
+
+    async def test_a_limited_query_is_stable_across_repeated_calls(self, limited_both):
+        """Storage order is reproducible within one process, which is how this stayed
+        invisible -- stability alone proves nothing. It is asserted anyway because a
+        *non*-deterministic order would make the comparison above flaky rather than red,
+        and those two failures want telling apart."""
+        target = f"{LIMITED_PROJECT}:mod.edge_target"
+        for client in self._both(limited_both):
+            first = _ranked_uids(await client.get_callers(target, "", 1, 5))
+            for _ in range(3):
+                assert _ranked_uids(await client.get_callers(target, "", 1, 5)) == first
 
     async def test_graph_search_returns_the_same_order_from_both_backends(self, ordered_both):
         """ATL-186: every stage truncates at `limit * 3`, so *which* rows survive is part

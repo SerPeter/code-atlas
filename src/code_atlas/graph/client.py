@@ -555,6 +555,14 @@ def _assert_valid_label(label: str) -> None:
 # true ones ("Research" over ``hybrid_search`` for query "search"), and its SQLite mirror
 # needs ``length(CAST(x AS BLOB))`` because Memgraph ``size()`` counts UTF-8 *bytes*
 # while SQLite ``length()`` counts code points -- a divergence no ASCII fixture can see.
+# The tie-break for any query that cuts with a LIMIT (ATL-192). `qualified_name` is stable
+# across rewrites and meaningful to a reader; `uid` is unique, so the pair is a total order
+# and the cut is reproducible. Without it the surviving rows are whichever the storage
+# engine reached first, which differs between the two backends and changes when a node is
+# rewritten -- invisible until somebody compares two answers.
+_LIMITED_QUERY_ORDER = "ORDER BY coalesce(n.qualified_name, ''), n.uid"
+
+
 _GRAPH_SEARCH_ORDER = (
     "ORDER BY CASE WHEN coalesce(n.name,'') CONTAINS $query THEN 0 ELSE 1 END, coalesce(n.name,''), n.uid"
 )
@@ -6329,7 +6337,8 @@ class GraphClient:
         records = await self.execute(
             f"MATCH (caller:Callable)-[:{RelType.CALLS}*1..{call_depth}]->"
             f"(n{label_clause} {{uid: $uid}}) "
-            f"RETURN DISTINCT caller AS n LIMIT {limit}",
+            f"WITH DISTINCT caller AS n "
+            f"RETURN n {_LIMITED_QUERY_ORDER} LIMIT {limit}",
             {"uid": uid},
         )
         return [r["n"] for r in records]
@@ -6339,7 +6348,8 @@ class GraphClient:
         label_clause = f":{label}" if label else ""
         records = await self.execute(
             f"MATCH (n{label_clause} {{uid: $uid}})-[:{RelType.CALLS}*1..{call_depth}]->"
-            f"(callee:Callable) RETURN DISTINCT callee AS n LIMIT {limit}",
+            f"(callee:Callable) WITH DISTINCT callee AS n "
+            f"RETURN n {_LIMITED_QUERY_ORDER} LIMIT {limit}",
             {"uid": uid},
         )
         return [r["n"] for r in records]
@@ -6376,27 +6386,37 @@ class GraphClient:
     # -- get_node cascade / status queries (server/mcp.py, cli.py) ------------
 
     async def get_node_exact_matches(self, name: str, label: str, limit: int) -> list[dict[str, Any]]:
-        """Exact match cascade (uid + exact name) — ``get_node`` stage A."""
+        """Exact match cascade (uid + exact name) — ``get_node`` stage A.
+
+        Only the second branch is ordered. The first matches on ``uid``, which carries a
+        unique constraint, so at most one row exists and its LIMIT can never cut anything;
+        ordering it would be noise that reads as though it mattered.
+        """
         label_filter = f":{label}" if label else ""
         return await self.execute(
             f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {limit} "
             f"UNION ALL "
-            f"MATCH (n{label_filter}) WHERE n.name = $name RETURN n LIMIT {limit}",
+            f"MATCH (n{label_filter}) WHERE n.name = $name "
+            f"RETURN n {_LIMITED_QUERY_ORDER} LIMIT {limit}",
             {"name": name},
         )
 
     async def get_node_partial_matches(self, name: str, label: str, limit: int) -> list[dict[str, Any]]:
-        """Partial match cascade (suffix > prefix > contains) — ``get_node`` stage B."""
+        """Partial match cascade (suffix > prefix > contains) — ``get_node`` stage B.
+
+        ``_match_score`` ranks the three branches against each other; the ORDER BY ranks
+        *within* one, which is what the per-branch LIMIT actually cuts on.
+        """
         label_filter = f":{label}" if label else ""
         return await self.execute(
             f"MATCH (n{label_filter}) WHERE n.qualified_name ENDS WITH $suffix "
-            f"RETURN n, 3 AS _match_score LIMIT {limit} "
+            f"RETURN n, 3 AS _match_score {_LIMITED_QUERY_ORDER} LIMIT {limit} "
             f"UNION ALL "
             f"MATCH (n{label_filter}) WHERE n.qualified_name STARTS WITH $prefix "
-            f"RETURN n, 2 AS _match_score LIMIT {limit} "
+            f"RETURN n, 2 AS _match_score {_LIMITED_QUERY_ORDER} LIMIT {limit} "
             f"UNION ALL "
             f"MATCH (n{label_filter}) WHERE n.qualified_name CONTAINS $name OR n.name CONTAINS $name "
-            f"RETURN n, 1 AS _match_score LIMIT {limit}",
+            f"RETURN n, 1 AS _match_score {_LIMITED_QUERY_ORDER} LIMIT {limit}",
             {"name": name, "suffix": f".{name}", "prefix": f"{name}."},
         )
 
