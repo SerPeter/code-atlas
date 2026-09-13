@@ -41,21 +41,66 @@ def _model() -> str:
     return f"conformance-{time.time_ns()}"
 
 
+def _wait_spy(limiter, waits: list[int]):
+    """Record each `wait_ms` the limiter computes, without changing what it does.
+
+    Both implementations already produce the number: the Lua script returns
+    `[wait_ms, level, cap, refill]`, and `SqliteRateLimiter._try_acquire` returns
+    `(wait_ms, scale)`. Wrapping each one is asymmetric code reading a symmetric fact --
+    the wrapper passes the real result straight through, so both limiters still block for
+    exactly as long as they would have.
+    """
+    if isinstance(limiter, RateLimiter):
+        inner = limiter._acquire_script
+
+        async def spy(**kwargs):
+            result = await inner(**kwargs)
+            waits.append(int(result[0]))
+            return result
+    else:
+        inner = limiter._try_acquire
+
+        async def spy(tokens: int):
+            wait_ms, scale = await inner(tokens)
+            waits.append(int(wait_ms))
+            return wait_ms, scale
+
+    return spy
+
+
 async def _admissions(limiter, *, calls: int, tokens: int = 0) -> list[bool]:
     """Whether each of *calls* acquires was admitted without blocking.
 
-    A blocking `acquire()` sleeps until it fits, so it cannot be observed from the
-    outside. Timing each call and thresholding it is the observation available, and the
-    threshold is generous: the question is "did this one wait at all", and a bucket that
-    refuses admission waits at least a bucket-window fraction, orders of magnitude above
-    scheduler noise.
+    Read from the limiter's own arithmetic, not inferred from elapsed time (ATL-193).
+
+    This used to time each call and threshold it at 50 ms, on the reasoning that a
+    refused bucket waits "orders of magnitude above scheduler noise". True of scheduler
+    noise; false of a cold Valkey round trip, and false again of a shared CI runner under
+    load. It failed 2 of 12 CI runs and blocked a release, in both directions:
+
+        valkey=[False, True, True, True, False, False]   <- cold round trip on call 1
+        sqlite=[True,  True, True, True, False, False]
+
+    `acquire()` loops -- it sleeps and retries until it fits -- so a single call can
+    compute several waits. The one that answers "was this admitted" is the **first**.
     """
-    out: list[bool] = []
-    for _ in range(calls):
-        start = time.monotonic()
-        await limiter.acquire(tokens=tokens)
-        out.append((time.monotonic() - start) < 0.05)
-    return out
+    waits: list[int] = []
+    spy = _wait_spy(limiter, waits)
+    attr = "_acquire_script" if isinstance(limiter, RateLimiter) else "_try_acquire"
+    original = getattr(limiter, attr)
+    setattr(limiter, attr, spy)
+    try:
+        out: list[bool] = []
+        for _ in range(calls):
+            waits.clear()
+            await limiter.acquire(tokens=tokens)
+            # No wait at all means the limiter returned early -- degraded, or inside a
+            # failure cooldown. That is not an admission, and the caller's `_degraded`
+            # guard is what reports it.
+            out.append(bool(waits) and waits[0] <= 0)
+        return out
+    finally:
+        setattr(limiter, attr, original)
 
 
 class TestAdmissionPattern:
