@@ -227,6 +227,18 @@ if TYPE_CHECKING:
 
         async def update_external_package_versions(self, project_name: str, versions: dict[str, str]) -> None: ...
 
+        async def upsert_external_stubs(
+            self,
+            project_name: str,
+            package: str,
+            symbols: list[dict[str, Any]],
+            *,
+            version: str = "",
+            source: str = "",
+        ) -> int: ...
+
+        async def get_stubbed_package_versions(self, project_name: str) -> dict[str, str]: ...
+
         async def classify_external_package_provenance(self, project_name: str) -> dict[str, int]: ...
 
         async def get_package_dependents(

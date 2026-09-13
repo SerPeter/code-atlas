@@ -4158,6 +4158,71 @@ class GraphClient:
             {"project": project_name, "items": params},
         )
 
+    async def upsert_external_stubs(
+        self,
+        project_name: str,
+        package: str,
+        symbols: list[dict[str, Any]],
+        *,
+        version: str = "",
+        source: str = "",
+    ) -> int:
+        """Attach a package's public entrypoints to its ExternalPackage. Returns rows written.
+
+        The stub is **not a new node type** -- it is a signature on the `ExternalSymbol`
+        the resolver already mints for an imported name, plus a node for each entrypoint
+        nothing has imported yet. That is what makes "what can I call on this" answerable
+        without a second model to keep in sync, and it means a symbol the project actually
+        imports and one it merely could both answer a search the same way.
+
+        `MERGE` rather than `CREATE`: `resolve_imports` has usually created the node for an
+        imported name already, and the stub pass is filling it in. Properties are SET
+        unconditionally so a re-read after a dependency upgrade replaces a stale signature
+        rather than accumulating beside it.
+
+        `stub_version` on the package is the invalidation key. The source is in
+        site-packages, not the repo, so no `file_hash` gate covers it -- without this a stub
+        parsed from numpy 2.4 would persist silently across an upgrade to 2.5. `stub_source`
+        records which shape was read (`bundled-pyi`, `source`, ...) so a graph can be asked
+        what its coverage actually rests on.
+        """
+        if not symbols:
+            return 0
+        pkg_uid = f"{project_name}:ext/{package}"
+        await self.execute_write(
+            f"UNWIND $symbols AS sym "
+            f"MERGE (n:{NodeLabel.EXTERNAL_SYMBOL}:{NodeLabel.ENTITY} {{uid: sym.uid}}) "
+            f"ON CREATE SET n.project_name = $proj, n.qualified_name = sym.qualified_name, "
+            f"n.name = sym.name, n.package = $pkg "
+            f"SET n.kind = sym.kind, n.signature = sym.signature, n.docstring = sym.docstring, "
+            f"n.stub = true "
+            f"WITH n "
+            f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $pkg_uid}}) "
+            f"MERGE (p)-[:{RelType.CONTAINS}]->(n)",
+            {"symbols": symbols, "proj": project_name, "pkg": package, "pkg_uid": pkg_uid},
+        )
+        await self.execute_write(
+            f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $pkg_uid}}) "
+            "SET p.stub_version = $version, p.stub_source = $source, p.stub_symbols = $count",
+            {"pkg_uid": pkg_uid, "version": version, "source": source, "count": len(symbols)},
+        )
+        return len(symbols)
+
+    async def get_stubbed_package_versions(self, project_name: str) -> dict[str, str]:
+        """Package name -> the distribution version its stub was read from.
+
+        The caller skips a package whose installed version still matches, which is what
+        keeps the stub pass off the critical path of an ordinary re-index: reading 30
+        packages costs ~6s, and almost none of them changed.
+        """
+        records = await self.execute(
+            f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $proj}}) "
+            "WHERE ep.stub_version IS NOT NULL "
+            "RETURN ep.name AS name, ep.stub_version AS version",
+            {"proj": project_name},
+        )
+        return {r["name"]: r["version"] for r in records}
+
     async def classify_external_package_provenance(self, project_name: str) -> dict[str, int]:
         """Stamp ``provenance`` on every ExternalPackage in *project_name*. Returns the tally.
 

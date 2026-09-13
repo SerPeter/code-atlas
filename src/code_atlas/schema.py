@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 18
+SCHEMA_VERSION: int = 19
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -256,6 +256,13 @@ _EMBEDDABLE_LABELS: frozenset[NodeLabel] = _EMBED_CHUNK_LABELS | frozenset(
         NodeLabel.MODULE,
         NodeLabel.DOC_SECTION,
         NodeLabel.NOTE,
+        # Since v19 (ATL-191 P5). A stub-indexed ExternalSymbol carries the signature and
+        # docstring of a library entrypoint, which is what makes "how do I set a timeout"
+        # reach `httpx.Client.request` rather than only the repo's own wrapper. Gated by
+        # `[libraries] embed_stubs`, so a symbol with no stub read stays a bare name with
+        # nothing to embed. A library's public API also changes far less often than the
+        # code calling it, so these vectors are re-bought rarely.
+        NodeLabel.EXTERNAL_SYMBOL,
     }
 )
 

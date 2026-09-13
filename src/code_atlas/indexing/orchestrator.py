@@ -25,6 +25,7 @@ from loguru import logger
 
 from code_atlas.events import EmbedDirty, EntityRef, Event, EventBus, FileChanged, Significance, Topic
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
+from code_atlas.indexing.stubs import read_package_stubs
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
 from code_atlas.schema import split_image_reference
@@ -2376,6 +2377,61 @@ def _record_index_metrics(span: Any, mode: str, files: int, entities: int, durat
     m.index_duration.record(duration)
 
 
+async def _index_external_stubs(settings: AtlasSettings, graph: GraphClient, project_name: str) -> int:
+    """Give every resolvable ExternalPackage its public API surface (ATL-191 P3-P5).
+
+    Runs after provenance so the whole external picture is settled in one place, and after
+    the graph already holds the package nodes -- the stub pass fills nodes in, it never
+    decides which packages exist. A name nothing imported is not stubbed, because there is
+    nothing to hang it on.
+
+    **Skipped when the installed version has not moved.** Reading 30 packages costs several
+    seconds and almost none of them change between indexes; `stub_version` on the package
+    node is what makes an ordinary re-index pay nothing. It also means a dependency upgrade
+    *does* re-read, which is the case a `file_hash` gate cannot cover -- the source is in
+    site-packages, not the repo.
+
+    Failures are logged and swallowed. This is enrichment on top of a graph that is already
+    complete and correct; a library whose entrypoint will not parse must not fail an index.
+    """
+    if not settings.libraries.stubs:
+        return 0
+    packages = await graph.get_package_dependents(limit=10_000)
+    names = [p["package"] for p in packages if p["package"]]
+    if not names:
+        return 0
+
+    known = await graph.get_stubbed_package_versions(project_name)
+    results = read_package_stubs(names, settings.libraries, known)
+    written = 0
+    for name, result in results.items():
+        symbols = [
+            {
+                "uid": f"{project_name}:ext/{name}.{symbol.name}",
+                "qualified_name": f"ext/{name}.{symbol.name}",
+                "name": symbol.name,
+                "kind": symbol.kind,
+                "signature": symbol.signature,
+                "docstring": symbol.docstring,
+            }
+            for symbol in result.symbols
+        ]
+        try:
+            written += await graph.upsert_external_stubs(
+                project_name, name, symbols, version=result.target.version, source=result.target.kind
+            )
+        except Exception as exc:
+            logger.warning("Stub write failed for '{}': {}", name, exc)
+    if written:
+        logger.info(
+            "Stub-indexed {} entrypoint(s) across {} external package(s) for '{}'",
+            written,
+            len(results),
+            project_name,
+        )
+    return written
+
+
 async def index_project(
     settings: AtlasSettings,
     graph: GraphClient,
@@ -2551,6 +2607,9 @@ async def _index_project_inner(  # noqa: PLR0915
     provenance = await graph.classify_external_package_provenance(project_name)
     if provenance:
         logger.debug("External package provenance for {}: {}", project_name, provenance)
+
+    # 7b. Read the public entrypoints of the external packages that resolve here.
+    await _index_external_stubs(settings, graph, project_name)
 
     # 8. Update Project metadata
     entity_count = await graph.count_entities(project_name)

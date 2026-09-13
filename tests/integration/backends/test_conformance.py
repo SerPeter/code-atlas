@@ -62,6 +62,8 @@ _COMPARED: frozenset[str] = frozenset(
         "graph_search",
         "get_package_dependents",
         "classify_external_package_provenance",
+        "upsert_external_stubs",
+        "get_stubbed_package_versions",
         "resolve_cross_project_imports",
         "get_callers",
         "get_callees",
@@ -941,6 +943,102 @@ class TestTheDefectsThatMotivatedThis:
             "the manifest key no longer equals the minted node name, so the tag joined against nothing"
         )
         assert a == b, "backends disagree about an atomic external name"
+
+    async def test_stub_symbols_are_written_identically(self, both):
+        """ATL-191 P4. A stub is a signature on the ExternalSymbol the resolver already
+        mints, not a new node type -- so the write has to survive meeting one that exists.
+
+        Both halves are seeded: `pkgstub.known` is already in the graph because something
+        imported it, and `pkgstub.unknown` is an entrypoint nobody has called yet. The
+        first is the interesting one, because the two backends reach it by different
+        routes -- a Cypher MERGE whose ON CREATE half must not fire again, and a SQLite
+        upsert into a row that already exists.
+        """
+        mg, lite = both
+        symbols = [
+            {
+                "uid": "stub_proj:ext/pkgstub.known",
+                "qualified_name": "ext/pkgstub.known",
+                "name": "known",
+                "kind": "function",
+                "signature": "def known(a: int) -> str",
+                "docstring": "Already imported.",
+            },
+            {
+                "uid": "stub_proj:ext/pkgstub.unknown",
+                "qualified_name": "ext/pkgstub.unknown",
+                "name": "unknown",
+                "kind": "class",
+                "signature": "",
+                "docstring": "Never imported, but part of the public API.",
+            },
+        ]
+        for client in (mg, lite):
+            await self._seed_dependency(client, "stub_proj", "pkgstub", "1.0")
+            await client.resolve_imports(
+                "stub_proj",
+                [
+                    ParsedRelationship(
+                        from_qualified_name="stub_proj:mod", rel_type=RelType.IMPORTS, to_name="pkgstub.known"
+                    )
+                ],
+            )
+            written = await client.upsert_external_stubs(
+                "stub_proj", "pkgstub", symbols, version="1.0", source="bundled-pyi"
+            )
+            assert written == 2
+
+        for client, label in ((mg, "memgraph"), (lite, "sqlite")):
+            known = await client.get_entity_by_uid("stub_proj:ext/pkgstub.known")
+            assert known is not None, f"{label}: the stub write lost a node the resolver had minted"
+            assert known["signature"] == "def known(a: int) -> str", f"{label}: no signature"
+            assert known["package"] == "pkgstub", f"{label}: the upsert lost the package link"
+            versions = await client.get_stubbed_package_versions("stub_proj")
+            assert versions == {"pkgstub": "1.0"}, f"{label}: {versions}"
+
+        a = await mg.get_entity_by_uid("stub_proj:ext/pkgstub.unknown")
+        b = await lite.get_entity_by_uid("stub_proj:ext/pkgstub.unknown")
+        assert a is not None, "memgraph: an entrypoint nobody imported was not created"
+        assert b is not None, "sqlite: an entrypoint nobody imported was not created"
+        assert a["docstring"] == b["docstring"]
+        assert a["kind"] == b["kind"] == "class"
+
+    async def test_a_re_read_replaces_a_stale_signature(self, both):
+        """The invalidation key is the package's `stub_version`, because the source is in
+        site-packages and no `file_hash` gate covers it. A signature parsed from numpy 2.4
+        must not survive an upgrade to 2.5 -- SET, never accumulate."""
+        mg, lite = both
+        old = [
+            {
+                "uid": "stub_v:ext/movingpkg.api",
+                "qualified_name": "ext/movingpkg.api",
+                "name": "api",
+                "kind": "function",
+                "signature": "def api() -> None",
+                "docstring": "v1",
+            }
+        ]
+        new = [{**old[0], "signature": "def api(added: bool) -> None", "docstring": "v2"}]
+        for client in (mg, lite):
+            await self._seed_dependency(client, "stub_v", "movingpkg", "2.4")
+            await client.upsert_external_stubs("stub_v", "movingpkg", old, version="2.4", source="source")
+            await client.upsert_external_stubs("stub_v", "movingpkg", new, version="2.5", source="source")
+
+        for client, label in ((mg, "movingpkg/memgraph"), (lite, "movingpkg/sqlite")):
+            node = await client.get_entity_by_uid("stub_v:ext/movingpkg.api")
+            assert node is not None
+            assert node["signature"] == "def api(added: bool) -> None", f"{label}: stale signature survived"
+            assert await client.get_stubbed_package_versions("stub_v") == {"movingpkg": "2.5"}, label
+
+    async def test_stubbing_a_package_with_no_symbols_writes_nothing(self, both):
+        """`urllib`'s entrypoint is empty and several ecosystems' names resolve to nothing
+        at all. An empty write must not stamp a `stub_version`, or the package would be
+        recorded as read and never retried."""
+        mg, lite = both
+        for client in (mg, lite):
+            await self._seed_dependency(client, "stub_empty", "emptypkg", None)
+            assert await client.upsert_external_stubs("stub_empty", "emptypkg", [], version="1.0") == 0
+            assert await client.get_stubbed_package_versions("stub_empty") == {}
 
     async def test_classifying_twice_changes_nothing(self, both):
         """It runs at the end of every index, so a second pass must not drift.

@@ -2732,6 +2732,79 @@ class SqliteGraphClient:
             for pkg, projects in ranked[:limit]
         ]
 
+    async def upsert_external_stubs(
+        self,
+        project_name: str,
+        package: str,
+        symbols: list[dict[str, Any]],
+        *,
+        version: str = "",
+        source: str = "",
+    ) -> int:
+        """Mirror of ``GraphClient.upsert_external_stubs`` -- see that docstring.
+
+        Two differences, both forced by the unified table. Signature, docstring and the
+        `stub` marker live in ``props_json`` rather than as columns, so the upsert uses
+        ``json_patch`` to merge them into whatever ``resolve_imports`` already wrote. That
+        is defensive rather than load-bearing today -- ``package`` is currently the only
+        property on the row and this write restates it -- but a replace would destroy any
+        property a later pass adds, silently and only for the embedded backend.
+        And the CONTAINS edge is a plain ``INSERT OR IGNORE`` selected out of ``nodes``,
+        which reproduces the Cypher's ``MATCH`` on the package: nothing here has foreign
+        keys, so an unconditional insert would hang symbols off a package uid that may
+        not exist.
+        """
+        if not symbols:
+            return 0
+        conn = await self._get_conn()
+        pkg_uid = f"{project_name}:ext/{package}"
+        await conn.executemany(
+            f"INSERT INTO nodes({_NODE_COLUMNS}) "
+            "VALUES (?, 'ExternalSymbol', ?, ?, NULL, ?, ?, NULL, ?) "
+            "ON CONFLICT(uid) DO UPDATE SET kind = excluded.kind, "
+            "props_json = json_patch(nodes.props_json, excluded.props_json)",
+            [
+                (
+                    sym["uid"],
+                    project_name,
+                    sym["qualified_name"],
+                    sym["name"],
+                    sym["kind"],
+                    _dumps(
+                        {
+                            "package": package,
+                            "signature": sym["signature"],
+                            "docstring": sym["docstring"],
+                            "stub": True,
+                        }
+                    ),
+                )
+                for sym in symbols
+            ],
+        )
+        await conn.executemany(
+            "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) "
+            "SELECT ?, ?, 'CONTAINS', '{}' FROM nodes WHERE uid = ? AND labels = 'ExternalPackage'",
+            [(pkg_uid, sym["uid"], pkg_uid) for sym in symbols],
+        )
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ? AND labels = 'ExternalPackage'",
+            (_dumps({"stub_version": version, "stub_source": source, "stub_symbols": len(symbols)}), pkg_uid),
+        )
+        await conn.commit()
+        return len(symbols)
+
+    async def get_stubbed_package_versions(self, project_name: str) -> dict[str, str]:
+        """Mirror of ``GraphClient.get_stubbed_package_versions`` -- see that docstring."""
+        conn = await self._get_conn()
+        cur = await conn.execute(
+            "SELECT name, json_extract(props_json, '$.stub_version') AS version FROM nodes "
+            "WHERE labels = 'ExternalPackage' AND project_name = ? "
+            "AND json_extract(props_json, '$.stub_version') IS NOT NULL",
+            (project_name,),
+        )
+        return {row[0]: row[1] for row in await cur.fetchall()}
+
     async def update_external_package_versions(self, project_name: str, versions: dict[str, str]) -> None:
         """Mirror of ``GraphClient.update_external_package_versions`` — the version lives
         on ``Project -[DEPENDS_ON]-> ExternalPackage`` (v18), not on the package node.

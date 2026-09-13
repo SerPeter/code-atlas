@@ -280,10 +280,46 @@ class ScopeSettings(StrictSection):
 
 
 class LibrarySettings(StrictSection):
-    """Library and dependency indexing settings."""
+    """How much of an installed external package to index (ATL-191).
 
-    full_index: list[str] = Field(default_factory=list, description="Libraries to fully parse and index.")
-    stub_index: list[str] = Field(default_factory=list, description="Libraries to index at type-stub level only.")
+    An `ExternalPackage` is otherwise a bare name: `from pathlib import Path` mints a node
+    called `Path` that says nothing about what `Path` is. Stub indexing reads the package's
+    *public entrypoints* -- the names its top-level module exports, with signatures where
+    they can be read -- so an agent can see what a library offers without the graph
+    absorbing the library itself.
+
+    Only packages installed in **atlas's own environment** can be stubbed at all. Indexing
+    somebody else's repo, most imports resolve to nothing and simply keep the provenance
+    weight they already had (ADR-0054). That is a coverage gap, not an error.
+    """
+
+    stubs: bool = Field(
+        default=True,
+        description="Read the public entrypoints of installed external packages. Off leaves every "
+        "ExternalPackage a bare name.",
+    )
+    stub_index: list[str] = Field(
+        default_factory=list,
+        description="Restrict stub indexing to these import names. Empty (the default) means every "
+        "package that resolves.",
+    )
+    full_index: list[str] = Field(
+        default_factory=list,
+        description="Import names whose whole module tree is read rather than just the entrypoint — for "
+        "libraries where the internals matter, typically an in-house one. Expensive: the entrypoint of "
+        "every package here is ~1 KB, its tree can be 25 MB.",
+    )
+    embed_stubs: bool = Field(
+        default=True,
+        description="Give stub symbols vectors. Costs more upfront, but a library's public API changes "
+        "far less often than the code that calls it, so the vectors are re-bought rarely.",
+    )
+    introspect: bool = Field(
+        default=False,
+        description="Import each package and read signatures with inspect. Reaches compiled extensions "
+        "and runtime-generated APIs that no static read can see — and runs that package's import-time "
+        "code inside the indexer. Off by default for that reason.",
+    )
 
 
 class MonorepoSettings(StrictSection):
