@@ -2,6 +2,74 @@
 
 <!-- version list -->
 
+## v0.13.0 (2026-09-13)
+
+### Bug Fixes
+
+- **graph**: Order every graph-search stage deterministically
+  ([`6f03a96`](https://github.com/SerPeter/code-atlas/commit/6f03a96cc4ef6e64f6701e70d6b5b57ee0494709))
+
+- **graph**: Order every limited query deterministically
+  ([`eb6e12d`](https://github.com/SerPeter/code-atlas/commit/eb6e12d97fdd43968711391e1f82d245486ac5a4))
+
+- **indexing**: Match manifest dependencies by import name
+  ([`4ae160d`](https://github.com/SerPeter/code-atlas/commit/4ae160db9f7ede353fab71300c908e74dde99ca1))
+
+- **search**: Delete the vector floor, which paid more than a rank-1 hit
+  ([`f5ac532`](https://github.com/SerPeter/code-atlas/commit/f5ac53245082fc543b8d135ebd325f32b87cfd71))
+
+### Documentation
+
+- Document atlas deps and correct the MCP tool count
+  ([`084c5f3`](https://github.com/SerPeter/code-atlas/commit/084c5f3f82ede95ff821c9bcd3419514a979c7d5))
+
+- Stop describing the vector floor as live
+  ([`15d3602`](https://github.com/SerPeter/code-atlas/commit/15d36028822fd1b096fd73a4f0b38cd655015da4))
+
+- **adr**: Record that a stub is a signature on the node that already exists
+  ([`c2de001`](https://github.com/SerPeter/code-atlas/commit/c2de0016195fa0119bfff2a67346b03dc9a4359d))
+
+- **adr**: Record that an external name is weighted by how deliberately it was chosen
+  ([`deac61a`](https://github.com/SerPeter/code-atlas/commit/deac61a8572d0e57ee449dbb3cd8ab1e05ca4bb4))
+
+- **adr**: Record that declaring a backend is selecting it
+  ([`688af09`](https://github.com/SerPeter/code-atlas/commit/688af09a890e403421c1ed71ddf6ddcb535922a3))
+
+- **adr**: Record that RRF rank space has no epsilon
+  ([`fc956ba`](https://github.com/SerPeter/code-atlas/commit/fc956ba19f8139607e4700ca507060f068a61346))
+
+- **adr**: Record the resolver's matching ladder and what a grant means
+  ([`f6a7593`](https://github.com/SerPeter/code-atlas/commit/f6a75932b85a9d66434a6ba939929d95ada4b1f4))
+
+### Features
+
+- **graph**: Answer which projects depend on an external package
+  ([`4a6c030`](https://github.com/SerPeter/code-atlas/commit/4a6c03013d703ce852e4e2b08b81fc7615fa614f))
+
+- **indexing**: Bound git history mining to a recent window
+  ([`5f8ba24`](https://github.com/SerPeter/code-atlas/commit/5f8ba24478f9bb73f4f086e791b7dc41ba3d9e15))
+
+- **indexing**: Count container images and optional dependencies as declared
+  ([`57a8f1d`](https://github.com/SerPeter/code-atlas/commit/57a8f1d8f366c269f84ee376fb3f9f844e1acb9b))
+
+- **indexing**: Stub-index the public entrypoints of external packages
+  ([`d127e11`](https://github.com/SerPeter/code-atlas/commit/d127e11cd8e6a7bbf4d9079efa0ebbbdcc9a4021))
+
+- **search**: Distinguish stdlib from real dependencies
+  ([`87a7715`](https://github.com/SerPeter/code-atlas/commit/87a7715b1e78598e623651ccd4f377ffe638b611))
+
+- **search**: Weight external packages by how deliberately they were chosen
+  ([`55347ad`](https://github.com/SerPeter/code-atlas/commit/55347ad057df447d5ccdc3dc09b1e0945a059ccb))
+
+- **settings**: Declaring a backend is selecting it
+  ([`26b9ece`](https://github.com/SerPeter/code-atlas/commit/26b9ecea4bb13358d05daf9fd2ab9a897880ce65))
+
+### Testing
+
+- **search**: Observe rate-limit admission without a wall clock
+  ([`3f0e631`](https://github.com/SerPeter/code-atlas/commit/3f0e631f5de9405195bceefaf0b2605b05100ed2))
+
+
 ## v0.12.0 (2026-09-07)
 
 ### Bug Fixes
