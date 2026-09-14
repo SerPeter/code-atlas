@@ -23,7 +23,13 @@ from loguru import logger
 from tree_sitter import Language, Parser, Query
 
 from code_atlas.chunking import repair_fences, split_embed_text
-from code_atlas.schema import NodeLabel, RelType, Visibility
+from code_atlas.schema import (
+    IMPORT_ECOSYSTEM,
+    NodeLabel,
+    RelType,
+    Visibility,
+    ecosystem_for_language,
+)
 from code_atlas.telemetry import get_metrics
 
 if TYPE_CHECKING:
@@ -1127,6 +1133,27 @@ def split_oversized_doc_sections(
     return out_entities, [*relationships, *extra_rels]
 
 
+def _stamp_ecosystem(relationships: list[ParsedRelationship], language: str) -> list[ParsedRelationship]:
+    """Tag every IMPORTS rel with the ecosystem of the language that produced it (ATL-194).
+
+    Central rather than per-parser: a language's imports belong to its own registry by
+    default, so 25 registered languages would otherwise each repeat the same line. A rel
+    that already carries :data:`~code_atlas.schema.IMPORT_ECOSYSTEM` is left alone -- that
+    is a parser saying it emitted an import from *somewhere else*, which only the config
+    parsers do (a compose image is `docker`, a workflow `uses:` is `actions`).
+
+    Only IMPORTS. Every other relationship resolves inside the project, and an ecosystem
+    on one would be a property nothing reads that looks like it means something.
+    """
+    ecosystem = ecosystem_for_language(language)
+    return [
+        replace(rel, properties={**rel.properties, IMPORT_ECOSYSTEM: ecosystem})
+        if rel.rel_type == RelType.IMPORTS and IMPORT_ECOSYSTEM not in rel.properties
+        else rel
+        for rel in relationships
+    ]
+
+
 def parse_file(
     path: str,
     source: bytes,
@@ -1238,7 +1265,7 @@ def parse_file(
 
     # Before hashing: a part is a node in its own right, so each needs its own
     # content_hash, and the CONTAINS edges the split adds must reach the returned list.
-    relationships = result.relationships
+    relationships = _stamp_ecosystem(result.relationships, lang_config.name)
     entities, relationships = split_oversized_doc_sections(entities, relationships, max_chars=max_doc_section_chars)
 
     # Post-parse pass: compute content hashes and truncate source

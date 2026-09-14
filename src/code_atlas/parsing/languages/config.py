@@ -137,7 +137,15 @@ from code_atlas.parsing.languages.salesforce import (
     xml_tag,
     xml_text,
 )
-from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType, split_image_reference
+from code_atlas.schema import (
+    ECOSYSTEM_ACTIONS,
+    ECOSYSTEM_DOCKER,
+    IMPORT_ATOMIC_NAME,
+    IMPORT_ECOSYSTEM,
+    NodeLabel,
+    RelType,
+    split_image_reference,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -235,6 +243,12 @@ def _join_relative(base_dir: PurePosixPath, rel: str) -> str | None:
             continue
         parts.append(segment)
     return "/".join(parts) if parts else None
+
+
+# A YAML file has no ecosystem of its own; these imports name artifacts from two that
+# are nothing to do with it, so both are stated rather than inherited (ATL-194).
+_IMAGE_PROPERTIES = {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_DOCKER}
+_ACTION_PROPERTIES = {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_ACTIONS}
 
 
 def _image_package(image: str) -> str | None:
@@ -824,7 +838,7 @@ def _extract_k8s(
     for image in images:
         package = _image_package(image)
         if package is not None:
-            out.rel(uid, RelType.IMPORTS, package, {IMPORT_ATOMIC_NAME: True})
+            out.rel(uid, RelType.IMPORTS, package, _IMAGE_PROPERTIES)
 
     return _K8sResource(
         uid=uid,
@@ -918,7 +932,7 @@ def _extract_compose(out: _Out, doc: _Doc, module_uid: str) -> None:
             # With `build:` also present, `image:` is the *output* tag rather
             # than an input, but it is still the name other manifests reference.
             if package is not None:
-                out.rel(uid, RelType.IMPORTS, package, {IMPORT_ATOMIC_NAME: True})
+                out.rel(uid, RelType.IMPORTS, package, _IMAGE_PROPERTIES)
         target = _compose_build_target(base_dir, spec.get("build"))
         if target is not None:
             out.rel(uid, RelType.IMPORTS, _module_qualified_name(target))
@@ -977,7 +991,9 @@ def _extract_workflow(out: _Out, doc: _Doc, module_uid: str) -> None:
         for need in _as_str_list(spec.get("needs")):
             out.rel(uid, RelType.CALLS, need)
         for action in _workflow_action_refs(spec):
-            out.rel(uid, RelType.IMPORTS, action)
+            # `actions/checkout` is a repository reference, not a module path, so it is
+            # atomic for the same reason an image is -- and it belongs to no language.
+            out.rel(uid, RelType.IMPORTS, action, _ACTION_PROPERTIES)
 
 
 # ---------------------------------------------------------------------------

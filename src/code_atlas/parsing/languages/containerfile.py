@@ -71,7 +71,14 @@ from code_atlas.parsing.ast import (
     node_text,
     register_language,
 )
-from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType, split_image_reference
+from code_atlas.schema import (
+    ECOSYSTEM_DOCKER,
+    IMPORT_ATOMIC_NAME,
+    IMPORT_ECOSYSTEM,
+    NodeLabel,
+    RelType,
+    split_image_reference,
+)
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -82,6 +89,13 @@ _EXTENSIONS = frozenset({".dockerfile", ".containerfile"})
 _FILENAMES = frozenset({"dockerfile", "containerfile"})
 
 _STAGE_KIND = "docker_stage"
+
+# An image is atomic (a registry hostname is not a module path) and belongs to the
+# docker ecosystem rather than to `containerfile`, which is a file format, not a
+# registry. A reference to an earlier *stage* carries neither marker; `parse_file`
+# still stamps it with the language default, which is inert because it resolves
+# inside this file and never reaches the mint site.
+_IMAGE_PROPERTIES = {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_DOCKER}
 
 _COPY_INSTRUCTIONS = frozenset({"copy_instruction", "add_instruction"})
 
@@ -313,7 +327,7 @@ def _parse_containerfile(path: str, source: bytes, root: Node, project_name: str
                 from_qualified_name=stage_uid,
                 rel_type=RelType.IMPORTS,
                 to_name=target,
-                properties={IMPORT_ATOMIC_NAME: True} if is_image else {},
+                properties=_IMAGE_PROPERTIES if is_image else {},
             )
             for target, is_image in dict.fromkeys(t for t in targets if t is not None)
         )
