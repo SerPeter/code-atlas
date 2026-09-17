@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.14.1 (2026-09-17)
+
+### Bug Fixes
+
+- **hooks**: Run installed hooks as the uv tool's atlas-hook script
+  ([#16](https://github.com/SerPeter/code-atlas/pull/16),
+  [`eae0874`](https://github.com/SerPeter/code-atlas/commit/eae087439c590c745e177f50c6005b0716f2b510))
+
+
 ## v0.14.0 (2026-09-17)
 
 ### Bug Fixes
