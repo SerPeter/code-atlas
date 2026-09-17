@@ -22,7 +22,8 @@ Every path fails open: an error, an unreachable graph, or an unindexed project p
 nothing and the tool call proceeds. This module keeps stdlib-only imports at the top because
 it runs on every matched tool call -- ``code_atlas.graph.client`` alone takes ~4s to import.
 
-Run as ``python -m code_atlas.hooks <event> [--strict]``; ``atlas hooks install`` writes it.
+Run as ``atlas-hook <event> [--strict]`` (or ``python -m code_atlas.hooks``); ``atlas hooks install``
+writes it.
 """
 
 from __future__ import annotations
@@ -773,30 +774,56 @@ def on_pre_tool(payload: dict[str, Any], *, strict: bool) -> None:
 _MODULE = "code_atlas.hooks"
 
 
+_SCRIPT = "atlas-hook"
+"""The console script that runs :func:`main` -- see ``[project.scripts]``."""
+
 _DISTRIBUTION = "code-atlas-mcp"
 
 
-def hook_python(explicit: str | None = None) -> tuple[str, str]:
-    """The interpreter the hooks should run under, and why that one.
+def _quoted(path: str | Path) -> str:
+    # Forward slashes, because Claude Code runs hooks through Git Bash on Windows, which eats
+    # backslashes; quoted, because a user profile path can contain spaces.
+    return '"' + str(path).replace("\\", "/") + '"'
 
-    Not simply the interpreter running ``atlas hooks install``: run from a checkout's
-    development venv, that pins every Claude Code session on the machine to a venv that
-    ``uv sync`` rewrites and whose executables a running hook locks. The uv tool install is
-    the one meant to serve other sessions, so it wins when it exists. Order: *explicit*, then
-    the ``code-atlas-mcp`` uv tool environment, then the current interpreter.
+
+def _module_launcher(python: str) -> str:
+    return f"{_quoted(python)} -m {_MODULE}"
+
+
+def hook_launcher(python: str | None = None) -> tuple[str, str]:
+    """The command prefix the hooks run with, and why that one.
+
+    Pinned by absolute path, never a bare ``atlas-hook``: a checkout's development venv installs
+    its own copy of the script, and it comes first on PATH whenever Claude Code starts from an
+    activated venv -- which ties every session to a venv that ``uv sync`` rewrites and whose
+    executables a running hook locks. The uv tool install is the one meant to serve other
+    sessions, so it wins when it exists. Order:
+
+    1. ``--python`` -- ``"<python>" -m code_atlas.hooks`` under that interpreter.
+    2. The uv tool install's ``atlas-hook`` script, read from its receipt.
+    3. The uv tool install's interpreter, for an install that predates ``atlas-hook``.
+    4. The current interpreter.
     """
-    if explicit:
-        return explicit, "--python"
-    tool = uv_tool_python()
-    if tool is not None:
-        return str(tool), "the code-atlas uv tool install"
+    if python:
+        return _module_launcher(python), "--python"
+    env = uv_tool_env()
+    if env is not None:
+        script = _tool_entrypoint(env, _SCRIPT)
+        if script is not None:
+            return _quoted(script), "the code-atlas uv tool install"
+        for candidate in (env / "Scripts" / "python.exe", env / "bin" / "python"):
+            if candidate.is_file():
+                return (
+                    _module_launcher(str(candidate)),
+                    f"the code-atlas uv tool install, which predates {_SCRIPT} -- reinstall it for the short command",
+                )
     if (Path(sys.prefix).parent / "pyproject.toml").is_file():
-        return sys.executable, "the current interpreter -- a project's development venv"
-    return sys.executable, "the current interpreter"
+        return _module_launcher(sys.executable), "the current interpreter -- a project's development venv"
+    return _module_launcher(sys.executable), "the current interpreter"
 
 
-def uv_tool_python() -> Path | None:
-    """The Python of the ``code-atlas-mcp`` uv tool environment, if one is installed."""
+def uv_tool_env() -> Path | None:
+    """The ``code-atlas-mcp`` uv tool environment, if one is installed."""
     import shutil
     import subprocess
 
@@ -808,21 +835,30 @@ def uv_tool_python() -> Path | None:
     if not tool_dir:
         return None
     env = Path(tool_dir) / _DISTRIBUTION
-    for candidate in (env / "Scripts" / "python.exe", env / "bin" / "python"):
-        if candidate.is_file():
-            return candidate
+    return env if env.is_dir() else None
+
+
+def _tool_entrypoint(env: Path, name: str) -> Path | None:
+    """Where uv installed the tool's *name* script, per the environment's ``uv-receipt.toml``.
+
+    The receipt rather than a guess at uv's bin directory: it names the exact file uv wrote for
+    this tool, so a same-named script from some other install on PATH can never be picked up.
+    """
+    import tomllib
+
+    try:
+        receipt = tomllib.loads((env / "uv-receipt.toml").read_text(encoding="utf-8"))
+    except OSError, tomllib.TOMLDecodeError:
+        return None
+    for entry in receipt.get("tool", {}).get("entrypoints", []):
+        if entry.get("name") == name and (path := entry.get("install-path")) and Path(path).is_file():
+            return Path(path)
     return None
 
 
-def hook_config(*, strict: bool, python: str | None = None) -> dict[str, list[dict[str, Any]]]:
-    """The ``hooks`` entries to merge, keyed by event.
-
-    The interpreter is pinned by absolute path (see :func:`hook_python` for which one): ``atlas``
-    on PATH may be a different install, and ``python -m`` skips the CLI's own import cost. Forward
-    slashes, because Claude Code runs hooks through Git Bash on Windows, which eats backslashes.
-    """
-    exe = (python or sys.executable).replace("\\", "/")
-    base = f'"{exe}" -m {_MODULE}'
+def hook_config(*, strict: bool, launcher: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    """The ``hooks`` entries to merge, keyed by event. *launcher* comes from :func:`hook_launcher`."""
+    base = launcher or _module_launcher(sys.executable)
 
     def entry(matcher: str, args: str) -> dict[str, Any]:
         # A ceiling, not a budget: headroom for `[health] connect_timeout_s` at its maximum on a
@@ -839,8 +875,13 @@ def hook_config(*, strict: bool, python: str | None = None) -> dict[str, list[di
     return config
 
 
+_OUR_COMMAND = re.compile(rf"{re.escape(_MODULE)}|[\\/\"]{re.escape(_SCRIPT)}(?:\.exe)?\"?\s")
+
+
 def _is_ours(group: dict[str, Any]) -> bool:
-    return any(_MODULE in str(h.get("command", "")) for h in group.get("hooks") or [])
+    # Both shapes: `"<python>" -m code_atlas.hooks` (every install before atlas-hook, and
+    # --python) and `"<bin>/atlas-hook.exe"`, so re-installing replaces rather than duplicates.
+    return any(_OUR_COMMAND.search(str(h.get("command", ""))) for h in group.get("hooks") or [])
 
 
 def merge_settings(settings: dict[str, Any], config: dict[str, list[dict[str, Any]]] | None) -> dict[str, Any]:
@@ -885,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
     global _hook_output
     args = sys.argv[1:] if argv is None else argv
     if not args:
-        sys.stderr.write("usage: python -m code_atlas.hooks {session-start|subagent-start|pre-tool|post-tool}\n")
+        sys.stderr.write("usage: atlas-hook {session-start|subagent-start|pre-tool|post-tool} [--strict]\n")
         return 2
     try:
         warnings.simplefilter("ignore")  # stderr from a hook is noise in the transcript, never context
