@@ -28,6 +28,7 @@ import pytest_asyncio
 
 from code_atlas.graph.client import GraphClient
 from code_atlas.indexing.orchestrator import index_project
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import AtlasSettings, BackendSettings, MemgraphSettings, RedisSettings
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
@@ -654,7 +655,7 @@ async def indexed_corpus(corpus_root, _infra_endpoints) -> AsyncIterator[tuple[G
         ),
         embeddings=NO_EMBED,
     )
-    from code_atlas.events import EventBus
+    from code_atlas.events import EventBus, redis_client
 
     # Both scoped to blocks: the skip below, ensure_schema and the whole index_project
     # run all sit between construction and the old try/finally, so any of them raising
@@ -665,7 +666,8 @@ async def indexed_corpus(corpus_root, _infra_endpoints) -> AsyncIterator[tuple[G
         except Exception:
             pytest.skip("Memgraph not available")
 
-        async with EventBus(settings.redis, project_name=project) as bus:
+        async with redis_client(settings.redis) as redis:
+            bus = EventBus(redis, settings.redis, project_name=project)
             await client.ensure_schema()
             await index_project(
                 settings,
@@ -674,6 +676,7 @@ async def indexed_corpus(corpus_root, _infra_endpoints) -> AsyncIterator[tuple[G
                 project_name=project,
                 project_root=corpus_root,
                 drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+                limiter=unpaced(),
             )
             try:
                 yield client, project

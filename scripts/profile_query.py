@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, Sp
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
     from typing import Any
+
+    from code_atlas.events import EventBus
 
 
 @dataclass
@@ -96,7 +99,7 @@ import asyncio  # noqa: E402
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from code_atlas.events import EventBus  # noqa: E402
+from code_atlas.backends import use_queue  # noqa: E402
 from code_atlas.graph.client import GraphClient  # noqa: E402
 from code_atlas.search.embeddings import EmbedClient  # noqa: E402
 from code_atlas.search.engine import SearchType, expand_context, hybrid_search  # noqa: E402
@@ -507,10 +510,11 @@ async def main() -> None:
     graph = GraphClient(settings)
     # health_check needs a bus now that it no longer builds one; this script owns it and
     # closes it alongside the graph.
-    bus = EventBus(settings.redis)
+    queue = AsyncExitStack()
+    bus, limiter = await queue.enter_async_context(use_queue(settings))
     embed: EmbedClient | None = None
     if use_vector and settings.embeddings.enabled:
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=limiter)
 
     try:
         if not await graph.ping():
@@ -530,7 +534,7 @@ async def main() -> None:
         if embed is not None:
             sample_vector = await embed.embed_one("parse file")
 
-        queries = _build_queries(graph, embed, bus, settings, sample_uid, sample_vector)
+        queries = _build_queries(graph, embed, bus, settings, sample_uid, sample_vector)  # ty: ignore[invalid-argument-type]
 
         if warmup:
             print("Warmup pass...")
@@ -547,7 +551,7 @@ async def main() -> None:
 
     finally:
         await graph.close()
-        await bus.close()
+        await queue.aclose()
 
 
 if __name__ == "__main__":

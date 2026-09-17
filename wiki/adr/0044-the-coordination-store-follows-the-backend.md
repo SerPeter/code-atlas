@@ -8,7 +8,8 @@ kind: decision
 
 ## Status
 
-Accepted (2026-09-03)
+Accepted (2026-09-03). Amended 2026-09-17: the limiter is built once per process by the composition root and injected
+(ADR-0038 decision 6); see the amended consequence below.
 
 ## Context
 
@@ -34,7 +35,9 @@ Two things could be wrong here and only one of them is the interesting one.
 
 `SqliteRateLimiter` holds the same two token buckets and the same AIMD scale factor in a SQLite file under
 `sqlite_data_dir`, using WAL plus `BEGIN IMMEDIATE` where the Valkey side uses a Lua script's atomicity.
-`make_rate_limiter(settings, ...)` picks on `backend.queue`, the same key `create_event_bus` uses.
+`create_rate_limiter(settings, connections)` in `code_atlas.backends` picks on `backend.queue`, the same key
+`create_event_bus` uses, and builds the network limiters over the connections the bus uses. _(Amended 2026-09-17: this
+was `make_rate_limiter`, called by each `EmbedClient`.)_
 
 **2. Deleting the limiter on the embedded path was rejected.**
 
@@ -75,8 +78,10 @@ unreachable agree about everything.
 
 ## Consequences
 
-- `EmbedClient(embed_settings, atlas_settings)` replaces `EmbedClient(embed_settings, redis_settings)`. Which store
-  paces a client is a backend decision now, not a Redis detail.
+- `EmbedClient(embed_settings, atlas_settings)` replaced `EmbedClient(embed_settings, redis_settings)`. Which store
+  paces a client is a backend decision now, not a Redis detail. _(Amended 2026-09-17: now
+  `EmbedClient(embed_settings, limiter=backends.limiter)`. The limiter is per process and keyed per call by the client's
+  `RateBudget`; the limiter argument is required, and no pacing is `limiter=unpaced()`, spelled out.)_
 - One more SQLite file (`ratelimit.sqlite3`) in `sqlite_data_dir`. Deliberately not `queue.sqlite3`: the limiter's
   writes are tiny and constant, and sharing a file with the hot event queue would put them behind its write lock for no
   gain.

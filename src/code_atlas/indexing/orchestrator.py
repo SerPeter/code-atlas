@@ -51,6 +51,7 @@ if TYPE_CHECKING:
         def progress_at(self) -> float: ...
 
     from code_atlas.graph.client import GraphClient
+    from code_atlas.search.ratelimit import Limiter
     from code_atlas.settings import AtlasSettings, MonorepoSettings
 
     type ManifestParser = Callable[[str], dict[str, str]]
@@ -2445,6 +2446,7 @@ async def index_project(
     project_name: str | None = None,
     project_root: Path | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
+    limiter: Limiter,
 ) -> IndexResult:
     """Run a full or delta index of the project through the event pipeline.
 
@@ -2469,25 +2471,21 @@ async def index_project(
     """
     project_name = project_name or derive_project_name(Path(settings.project_root))
     with _tracer.start_as_current_span("index_project", attributes={"project_name": project_name}) as idx_span:
-        # An entry point, so an owner: the EmbedClient below holds a redis pool through
-        # its rate limiter, and the inner returns from several places. Registering it on
-        # a stack here closes it on every one of them.
-        async with contextlib.AsyncExitStack() as stack:
-            return await _index_project_inner(
-                settings,
-                graph,
-                bus,
-                scope_paths=scope_paths,
-                full_reindex=full_reindex,
-                reset=reset,
-                reset_embeddings=reset_embeddings,
-                drain_timeout_s=drain_timeout_s,
-                project_name=project_name,
-                project_root=project_root,
-                span=idx_span,
-                on_drain_progress=on_drain_progress,
-                stack=stack,
-            )
+        return await _index_project_inner(
+            settings,
+            graph,
+            bus,
+            scope_paths=scope_paths,
+            full_reindex=full_reindex,
+            reset=reset,
+            reset_embeddings=reset_embeddings,
+            drain_timeout_s=drain_timeout_s,
+            project_name=project_name,
+            project_root=project_root,
+            span=idx_span,
+            on_drain_progress=on_drain_progress,
+            limiter=limiter,
+        )
 
 
 async def _index_project_inner(  # noqa: PLR0915
@@ -2504,7 +2502,7 @@ async def _index_project_inner(  # noqa: PLR0915
     project_root: Path | None = None,
     span: Any = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
-    stack: contextlib.AsyncExitStack,
+    limiter: Limiter,
 ) -> IndexResult:
     """Inner implementation of index_project with active span."""
     start = time.monotonic()
@@ -2522,7 +2520,7 @@ async def _index_project_inner(  # noqa: PLR0915
     # 2. Embedding setup + model lock check (skipped in lightweight mode)
     embed: EmbedClient | None = None
     if settings.embeddings.enabled:
-        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings))
+        embed = EmbedClient(settings.embeddings, limiter=limiter)
 
     if reset:
         # The flush is here and not under --full because the streams are shared: an
@@ -2678,6 +2676,7 @@ async def index_monorepo(
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
+    limiter: Limiter,
 ) -> list[IndexResult]:
     """Index a monorepo: detect sub-projects, index each, resolve cross-project imports.
 
@@ -2692,21 +2691,19 @@ async def index_monorepo(
     with ``(project_name, current_1based, total)``.
     """
     with _tracer.start_as_current_span("index_monorepo"):
-        # The other entry point -- same ownership, see index_project.
-        async with contextlib.AsyncExitStack() as stack:
-            return await _index_monorepo_inner(
-                settings,
-                graph,
-                bus,
-                scope_projects=scope_projects,
-                full_reindex=full_reindex,
-                reset=reset,
-                reset_embeddings=reset_embeddings,
-                drain_timeout_s=drain_timeout_s,
-                on_progress=on_progress,
-                on_drain_progress=on_drain_progress,
-                stack=stack,
-            )
+        return await _index_monorepo_inner(
+            settings,
+            graph,
+            bus,
+            scope_projects=scope_projects,
+            full_reindex=full_reindex,
+            reset=reset,
+            reset_embeddings=reset_embeddings,
+            drain_timeout_s=drain_timeout_s,
+            on_progress=on_progress,
+            on_drain_progress=on_drain_progress,
+            limiter=limiter,
+        )
 
 
 @dataclass
@@ -2795,7 +2792,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     drain_timeout_s: float = 600.0,
     on_progress: Callable[[str, int, int], None] | None = None,
     on_drain_progress: Callable[[int, int, int], None] | None = None,
-    stack: contextlib.AsyncExitStack,
+    limiter: Limiter,
 ) -> list[IndexResult]:
     """Inner implementation of index_monorepo.
 
@@ -2816,6 +2813,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
             reset=reset,
             reset_embeddings=reset_embeddings,
             drain_timeout_s=drain_timeout_s,
+            limiter=limiter,
         )
         return [result]
 
@@ -2857,7 +2855,7 @@ async def _index_monorepo_inner(  # noqa: PLR0912, PLR0915
     embed: EmbedClient | None = None
     cleared_by_lock = False
     if settings.embeddings.enabled:
-        embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings))
+        embed = EmbedClient(settings.embeddings, limiter=limiter)
         dimension = await _resolve_dimension(embed, settings.embeddings.dimension)
         # Destruction is the opt-in, not enumeration -- see _index_project_inner.
         cleared_by_lock = await _check_model_lock(

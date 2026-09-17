@@ -133,6 +133,7 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
                 backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                 full_reindex=True,
                 project_name=project,
+                limiter=backends.limiter,
             )
 
             entities_before = await backends.graph.count_entities(project)
@@ -161,6 +162,7 @@ async def _sweep_point(tmp_path: Path, ballast: int) -> dict[str, object]:
                     backends.graph,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                     backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                     project_name=project,
+                    limiter=backends.limiter,
                 )
             scans = await analyse_scans(conn, statements)
             # A control, captured separately so it stays out of the measured window.

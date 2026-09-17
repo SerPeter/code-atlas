@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Self, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import orjson
 import redis.asyncio as aioredis
@@ -145,6 +145,23 @@ class StreamGroupInfo(TypedDict):
     lag: int | None
 
 
+class ConsumerGroupMissingError(RuntimeError):
+    """A read named a consumer group that does not exist — never created, or deleted since.
+
+    Valkey answers ``NOGROUP``; the SQL buses check their ``groups`` table. All three raise
+    this, so a consumer's read fails the same way on every backend: ``TierConsumer.run``
+    raises, the daemon's supervisor logs the crash and restarts it, and ``run`` re-creates
+    the group with ``ensure_group``. Returning an empty batch instead would leave a consumer
+    polling a group nobody will ever publish to, silently, until the process restarts —
+    which is what ``atlas project rm`` did to an idle daemon on Postgres.
+    """
+
+    def __init__(self, topic: Topic, group: str) -> None:
+        super().__init__(f"consumer group {group!r} does not exist on stream {topic.value!r}")
+        self.topic = topic
+        self.group = group
+
+
 class IndexerBusyError(RuntimeError):
     """Another process holds the indexer lease for this project."""
 
@@ -257,26 +274,37 @@ async def hold_indexer_lease(
 # ---------------------------------------------------------------------------
 
 
+def redis_client(settings: RedisSettings) -> aioredis.Redis:
+    """The Valkey client for *settings*. Connects on first command, not here.
+
+    One per process, built by the composition root (``code_atlas.backends``) and shared by
+    the event bus and the rate limiter; whoever calls this closes it.
+    """
+    url = f"redis://{settings.host}:{settings.port}/{settings.db}"
+    if settings.password:
+        url = f"redis://:{settings.password}@{settings.host}:{settings.port}/{settings.db}"
+    # health_check_interval defaults to 0 -- no checking at all. The daemon and each
+    # MCP server hold this connection for days, so a Valkey restart or an idle
+    # timeout would otherwise surface as a failed publish on next use rather than a
+    # transparent reconnect. 30s is well inside any sensible idle timeout and costs
+    # one PING per idle connection per interval.
+    #
+    # This is the layer that owns connection *liveness*; the composition root owns when a
+    # connection exists at all. A DI container would give you neither.
+    return aioredis.from_url(url, decode_responses=False, health_check_interval=30)
+
+
 class EventBus:
     """Thin async wrapper over Redis Streams for pipeline events.
 
     Implements "dumb pipes, smart endpoints": the bus only routes messages,
     consumers implement their own batching and dedup.
+
+    It is handed the process's Valkey client and never closes it (ADR-0038).
     """
 
-    def __init__(self, settings: RedisSettings, *, project_name: str = "") -> None:
-        url = f"redis://{settings.host}:{settings.port}/{settings.db}"
-        if settings.password:
-            url = f"redis://:{settings.password}@{settings.host}:{settings.port}/{settings.db}"
-        # health_check_interval defaults to 0 -- no checking at all. The daemon and each
-        # MCP server hold this connection for days, so a Valkey restart or an idle
-        # timeout would otherwise surface as a failed publish on next use rather than a
-        # transparent reconnect. 30s is well inside any sensible idle timeout and costs
-        # one PING per idle connection per interval.
-        #
-        # This is the layer that owns connection *liveness*; the scope below owns when a
-        # connection exists at all. A DI container would give you neither.
-        self._redis = aioredis.from_url(url, decode_responses=False, health_check_interval=30)
+    def __init__(self, redis: aioredis.Redis, settings: RedisSettings, *, project_name: str = "") -> None:
+        self._redis = redis
         self._prefix = settings.stream_prefix
         self._project = project_name
         self._maxlen: int | None = settings.stream_maxlen if settings.stream_maxlen > 0 else None
@@ -347,13 +375,7 @@ class EventBus:
         with _tracer.start_as_current_span(
             "eventbus.read_batch", attributes={"topic": topic.value, "group": group, "consumer": consumer}
         ):
-            result: Any = await self._redis.xreadgroup(
-                group,
-                consumer,
-                {self._stream_key(topic): ">"},
-                count=count,
-                block=block_ms,
-            )
+            result: Any = await self._xreadgroup(topic, group, consumer, ">", count=count, block=block_ms)
             if not result:
                 return []
             # result shape: [[stream_key, [(msg_id, fields), ...]]]
@@ -377,15 +399,23 @@ class EventBus:
         with _tracer.start_as_current_span(
             "eventbus.read_pending", attributes={"topic": topic.value, "group": group, "consumer": consumer}
         ):
-            result: Any = await self._redis.xreadgroup(
-                group,
-                consumer,
-                {self._stream_key(topic): "0"},
-                count=count,
-            )
+            result: Any = await self._xreadgroup(topic, group, consumer, "0", count=count)
             if not result:
                 return []
             return result[0][1]
+
+    async def _xreadgroup(
+        self, topic: Topic, group: str, consumer: str, start: str, *, count: int, block: int | None = None
+    ) -> Any:
+        """``XREADGROUP``, with ``NOGROUP`` raised as :class:`ConsumerGroupMissingError`."""
+        try:
+            return await self._redis.xreadgroup(
+                group, consumer, {self._stream_key(topic): start}, count=count, block=block
+            )
+        except aioredis.ResponseError as exc:
+            if "NOGROUP" in str(exc):
+                raise ConsumerGroupMissingError(topic, group) from exc
+            raise
 
     async def reclaim_abandoned(
         self,
@@ -555,13 +585,18 @@ class EventBus:
         pipe = self._redis.pipeline(transaction=False)
         for topic, _group in queries:
             pipe.xinfo_groups(self._stream_key(topic))
-        results = await pipe.execute()
+        # raise_on_error=False: a stream nothing has published to yet answers XINFO with
+        # "no such key", and by default the pipeline re-raises the first such error for
+        # the whole batch. The single query reads that as an empty group; so must this.
+        results = await pipe.execute(raise_on_error=False)
 
         out: list[StreamGroupInfo] = []
         for (_topic, group), raw in zip(queries, results, strict=True):
-            if isinstance(raw, Exception):
+            if isinstance(raw, aioredis.ResponseError):
                 out.append({"pending": 0, "lag": 0})
                 continue
+            if isinstance(raw, Exception):
+                raise raw
             found = False
             for g in raw:
                 name = g.get(b"name", g.get("name", b""))
@@ -589,20 +624,17 @@ class EventBus:
             pipe.xtrim(self._stream_key(topic), 0, approximate=False)
         await pipe.execute()
 
-    async def close(self) -> None:
-        """Close the connection pool."""
-        await self._redis.aclose()
+    async def delete_project_queue(self) -> int | None:
+        """Delete this project's streams — messages, consumer groups, pending entries. Returns
+        how many streams existed.
 
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        """Close on the way out, including on an exception.
-
-        The point is that closing stops being something each caller has to remember at
-        every exit path. It was forgotten on four of them at once -- all four infra
-        fixtures called `pytest.skip()` between constructing a client and closing it, so
-        every skipped run abandoned a live connection and the resulting ResourceWarning
-        was blamed on whichever unrelated test the GC happened to interrupt.
+        The exact keys this bus writes, not a ``{prefix}:{project}:*`` scan: the embedding
+        rate limiter's shared keys live under the same prefix as ``{prefix}:rl:{model}:*``,
+        so a pattern for a project named ``rl`` would take every model's budget with it.
+        The lease key is left alone: whoever removes a project holds it and releases it by
+        compare-and-delete, and any other lease expires on its TTL.
         """
-        await self.close()
+        if not self._project:
+            msg = "delete_project_queue needs a project: an unnamed bus writes streams every project shares"
+            raise ValueError(msg)
+        return int(await self._redis.delete(*(self._stream_key(topic) for topic in Topic)))

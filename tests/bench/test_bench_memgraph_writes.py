@@ -35,6 +35,7 @@ from code_atlas.graph.client import (
     _HASHED_ENTITY_LABELS,
     _INDEXED_FILE_LABELS,
 )
+from code_atlas.search.ratelimit import unpaced
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -99,7 +100,13 @@ async def indexed(graph_client: GraphClient, event_bus: EventBus, tmp_path: Path
     cap.clear()
     with stub_provider(graph_client.dimension):
         await index_project(
-            settings, graph_client, event_bus, full_reindex=True, project_name=_PROJECT, drain_timeout_s=180.0
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            project_name=_PROJECT,
+            drain_timeout_s=180.0,
+            limiter=unpaced(),
         )
     return graph_client
 

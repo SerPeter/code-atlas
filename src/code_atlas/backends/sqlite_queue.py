@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Self
 
 import aiosqlite
 
-from code_atlas.events import Event, StreamGroupInfo, Topic, encode_event
+from code_atlas.events import ConsumerGroupMissingError, Event, StreamGroupInfo, Topic, encode_event
 from code_atlas.telemetry import get_tracer
 
 # Same span names the Valkey ``EventBus`` emits (``events.py``), deliberately: a trace
@@ -167,6 +167,9 @@ class SqliteEventBus:
         """Atomically select undelivered messages for (topic, group) and record delivery."""
         conn = await self._get_conn()
         async with self._claim_lock:
+            # Checked before claiming, not after: without it an unregistered group would be
+            # handed every message and recorded as its deliveries, a group no ensure_group made.
+            await self._require_group(conn, topic, group)
             cur = await conn.execute(
                 """
                 SELECT m.id, m.payload FROM messages m
@@ -249,7 +252,22 @@ class SqliteEventBus:
             )
             rows = await cur.fetchall()
             await cur.close()
+            if not rows:
+                await self._require_group(conn, topic, group)
             return [(f"{row[0]}-0".encode(), {b"data": row[1]}) for row in rows]
+
+    @staticmethod
+    async def _require_group(conn: aiosqlite.Connection, topic: Topic, group: str) -> None:
+        """Raise :class:`ConsumerGroupMissingError` unless *group* was registered by ``ensure_group``.
+
+        The same answer Valkey gives (``NOGROUP``), because this bus has the same registry:
+        the ``groups`` table.
+        """
+        cur = await conn.execute("SELECT 1 FROM groups WHERE topic = ? AND grp = ?", (topic.value, group))
+        exists = await cur.fetchone()
+        await cur.close()
+        if exists is None:
+            raise ConsumerGroupMissingError(topic, group)
 
     async def ack(self, topic: Topic, group: str, *msg_ids: bytes) -> int:
         """Acknowledge messages after successful processing. Returns the count acked."""
@@ -434,6 +452,18 @@ class SqliteEventBus:
         await conn.execute("DELETE FROM deliveries")
         await conn.execute("DELETE FROM messages")
         await conn.commit()
+
+    async def delete_project_queue(self) -> int | None:
+        """Leave the queue untouched and return ``None``: this file cannot be split by project.
+
+        The embedded queue is one file per data directory, and its tables have no project
+        column. Every project indexed from that checkout shares it -- a monorepo's root and
+        all its sub-projects publish into the same streams under the root's lease -- so no
+        subset of its rows belongs to one project. And the file of any *other* checkout's
+        project is that checkout's ``.atlas/queue.sqlite3``, not this one. Deleting rows
+        here would destroy work queued for projects that are not being removed.
+        """
+        return None
 
     async def close(self) -> None:
         """Close the database connection."""

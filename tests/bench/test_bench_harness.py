@@ -71,6 +71,7 @@ async def _run(root: Path, db_dir: Path, project: str) -> BenchReport:
                 backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                 full_reindex=True,
                 project_name=project,
+                limiter=backends.limiter,
             )
             total_s = time.perf_counter() - started
     return cap.report(total_s=total_s, corpus="harness", backend="sqlite")

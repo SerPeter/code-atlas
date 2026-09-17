@@ -33,6 +33,7 @@ from code_atlas.telemetry import set_backlog
 
 if TYPE_CHECKING:
     from code_atlas.graph.client import GraphClient
+    from code_atlas.search.ratelimit import Limiter
     from code_atlas.settings import AtlasSettings, ExtraVaultSettings
 
 
@@ -104,6 +105,7 @@ class DaemonManager:
         graph: GraphClient,
         bus: EventBus,
         *,
+        limiter: Limiter,
         include_watcher: bool = True,
         catchup: bool = True,
         first_index_ready: asyncio.Event | None = None,
@@ -123,6 +125,9 @@ class DaemonManager:
             Full atlas settings (redis, embeddings, watcher, scope, …).
         graph:
             An already-connected :class:`GraphClient`.
+        limiter:
+            The process's embedding rate limiter (``Backends.limiter``). Caller-owned like
+            the bus. Required: no pacing is ``unpaced()``, asked for by name.
         include_watcher:
             If ``False``, only start the tier consumers (no filesystem watcher).
         catchup:
@@ -161,7 +166,7 @@ class DaemonManager:
 
         embed: EmbedClient | None = None
         if settings.embeddings.enabled:
-            embed = EmbedClient(settings.embeddings, settings)
+            embed = EmbedClient(settings.embeddings, limiter=limiter)
             self._embed = embed
 
         consumers: list[ASTConsumer | EmbedConsumer] = [
@@ -217,7 +222,7 @@ class DaemonManager:
         # pipeline uses the same consumer names, so the two must never coexist
         # in this process.
         if catchup:
-            await self._catchup(settings, graph, bus, first_index_ready)
+            await self._catchup(settings, graph, bus, limiter, first_index_ready)
         elif first_index_ready is not None:
             first_index_ready.set()
 
@@ -288,6 +293,7 @@ class DaemonManager:
         settings: AtlasSettings,
         graph: GraphClient,
         bus: EventBus,
+        limiter: Limiter,
         first_index_ready: asyncio.Event | None = None,
     ) -> None:
         """One delta index pass so changes made while the daemon was down get indexed.
@@ -310,9 +316,13 @@ class DaemonManager:
             wait_s = min(settings.index.lease_wait_s, _CATCHUP_LEASE_WAIT_S)
             async with hold_indexer_lease(bus, wait_s=wait_s):
                 if detect_sub_projects(settings.project_root, settings.monorepo):
-                    await index_monorepo(settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s)
+                    await index_monorepo(
+                        settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s, limiter=limiter
+                    )
                 else:
-                    await index_project(settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s)
+                    await index_project(
+                        settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s, limiter=limiter
+                    )
         except IndexerBusyError as exc:
             logger.info(
                 "Skipping startup catch-up — another indexer still holds the lease after "
@@ -398,12 +408,9 @@ class DaemonManager:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-        # The embed client, unlike the bus, IS ours -- start() constructed it, and it
-        # holds a redis pool through its rate limiter. Closed after the consumers stop
-        # so nothing is mid-embed, and cleared so a restart builds a fresh one.
-        if self._embed is not None:
-            await self._embed.close()
-            self._embed = None
+        # Cleared so a restart builds a fresh embed client. Nothing to close: it holds no
+        # connection, and the limiter it paced through is the caller's, like the bus.
+        self._embed = None
 
         # The bus is deliberately not closed: it is the caller's, and closing it here
         # once meant a restart_daemon() left the MCP server holding a dead connection.
@@ -435,8 +442,9 @@ class DaemonManager:
     async def _run_consumer(self, consumer: ASTConsumer | EmbedConsumer) -> None:
         """Run a consumer under supervision: crash → log + backoff restart.
 
-        ``run()`` re-runs ``ensure_group()`` at its top, so a Valkey restart
-        that lost the consumer group (NOGROUP) heals on the first restart.
+        ``run()`` re-runs ``ensure_group()`` at its top, so a lost consumer group heals on the
+        first restart: every bus raises ``ConsumerGroupMissingError`` for it (Valkey after a
+        restart that lost it, any bus after ``atlas project rm``).
         """
         backoff = _RESTART_BACKOFF_S
         while not consumer.stopped:

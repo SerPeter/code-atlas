@@ -9,11 +9,13 @@ an MCP session issue double the configured rate.
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 
 import pytest
 import redis.asyncio as aioredis
 
-from code_atlas.search.ratelimit import ConcurrencyGate, RateLimiter
+from code_atlas.events import redis_client
+from code_atlas.search.ratelimit import ConcurrencyGate, RateBudget, RateLimiter
 
 pytestmark = pytest.mark.integration
 
@@ -41,6 +43,13 @@ async def _server_now_ms(r) -> int:
     return secs * 1000 + micros // 1000
 
 
+@asynccontextmanager
+async def _limiter(redis_settings):
+    """One process's limiter: its own Valkey client, which the limiter only borrows."""
+    async with redis_client(redis_settings) as client:
+        yield RateLimiter(client, stream_prefix=redis_settings.stream_prefix)
+
+
 @pytest.fixture
 async def clean_keys(settings):
     """Drop limiter state before and after — buckets persist across tests otherwise."""
@@ -54,23 +63,24 @@ async def clean_keys(settings):
 
 async def test_unlimited_never_blocks(settings, clean_keys):
     """rpm/tpm of 0 mean unlimited: the buckets are skipped entirely."""
-    async with RateLimiter(settings.redis, model=clean_keys, rpm=0, tpm=0) as lim:
+    budget = RateBudget(model=clean_keys, rpm=0, tpm=0)
+    async with _limiter(settings.redis) as lim:
         start = time.monotonic()
         for _ in range(20):
-            await lim.acquire(tokens=10_000)
+            await lim.acquire(budget, tokens=10_000)
         assert time.monotonic() - start < 1.0
 
 
 async def test_drained_bucket_makes_the_caller_wait(settings, clean_keys):
     """A bucket with no budget left must delay the call rather than let it through."""
     req_key, _, _ = _keys(settings, clean_keys)
-    async with RateLimiter(settings.redis, model=clean_keys, rpm=120, tpm=0) as lim:
+    async with _limiter(settings.redis) as lim:
         r = await _raw(settings)
         # Simulate a drained request bucket: 120/min refills 1 token per 500ms.
         await r.hset(req_key, mapping={"t": "0", "ts": str(await _server_now_ms(r))})
 
         start = time.monotonic()
-        await lim.acquire()
+        await lim.acquire(RateBudget(model=clean_keys, rpm=120, tpm=0))
         waited = time.monotonic() - start
         assert waited >= 0.3, f"expected to wait for refill, returned in {waited:.3f}s"
         await r.aclose()
@@ -82,13 +92,11 @@ async def test_budget_is_shared_between_limiters(settings, clean_keys):
     This is the property the whole design exists for: without it, N daemons issue N
     times the configured rate and the limit is decorative.
     """
-    async with (
-        RateLimiter(settings.redis, model=clean_keys, rpm=10, tpm=0) as a,
-        RateLimiter(settings.redis, model=clean_keys, rpm=10, tpm=0) as b,
-    ):
+    budget_a, budget_b = RateBudget(model=clean_keys, rpm=10, tpm=0), RateBudget(model=clean_keys, rpm=10, tpm=0)
+    async with _limiter(settings.redis) as a, _limiter(settings.redis) as b:
         # Capacity is 10; spend it all through `a`.
         for _ in range(10):
-            await a.acquire()
+            await a.acquire(budget_a)
 
         r = await _raw(settings)
         req_key = _keys(settings, clean_keys)[0]
@@ -97,7 +105,7 @@ async def test_budget_is_shared_between_limiters(settings, clean_keys):
 
         # b must observe a's spend, not start from a full bucket of its own.
         start = time.monotonic()
-        await b.acquire()
+        await b.acquire(budget_b)
         assert time.monotonic() - start >= 1.0, "second limiter did not see the first's spend"
         await r.aclose()
 
@@ -105,24 +113,23 @@ async def test_budget_is_shared_between_limiters(settings, clean_keys):
 async def test_penalize_is_visible_to_another_limiter(settings, clean_keys):
     """One process's 429 has to slow every process, or the others keep pushing at the
     rate that just failed."""
-    async with (
-        RateLimiter(settings.redis, model=clean_keys, rpm=600, tpm=0) as a,
-        RateLimiter(settings.redis, model=clean_keys, rpm=600, tpm=0) as b,
-    ):
-        scale = await a.penalize()
+    budget_a, budget_b = RateBudget(model=clean_keys, rpm=600, tpm=0), RateBudget(model=clean_keys, rpm=600, tpm=0)
+    async with _limiter(settings.redis) as a, _limiter(settings.redis) as b:
+        scale = await a.penalize(budget_a)
         assert scale == pytest.approx(0.5)
 
-        await b.acquire()  # b reads the shared factor on its next acquire
-        assert b.scale == pytest.approx(0.5)
+        await b.acquire(budget_b)  # b reads the shared factor on its next acquire
+        assert budget_b.scale == pytest.approx(0.5)
 
 
 async def test_penalty_cooldown_collapses_a_burst(settings, clean_keys):
     """A saturated batch produces one 429 per chunk. Those are one overload, not N, and
     must not compound into a collapse to the floor."""
-    async with RateLimiter(settings.redis, model=clean_keys, rpm=600, tpm=0) as lim:
-        first = await lim.penalize()
-        second = await lim.penalize()
-        third = await lim.penalize()
+    budget = RateBudget(model=clean_keys, rpm=600, tpm=0)
+    async with _limiter(settings.redis) as lim:
+        first = await lim.penalize(budget)
+        second = await lim.penalize(budget)
+        third = await lim.penalize(budget)
         assert first == pytest.approx(0.5)
         assert second == pytest.approx(0.5), "burst penalties compounded despite the cooldown"
         assert third == pytest.approx(0.5)
@@ -132,9 +139,9 @@ async def test_penalize_damps_the_concurrency_gate(settings, clean_keys):
     """When no rate limit is configured — the case for most models — the gate is the
     only thing AIMD can move."""
     gate = ConcurrencyGate(8)
-    async with RateLimiter(settings.redis, model=clean_keys, rpm=0, tpm=0, gate=gate) as lim:
+    async with _limiter(settings.redis) as lim:
         assert gate.limit == 8
-        await lim.penalize()
+        await lim.penalize(RateBudget(model=clean_keys, rpm=0, tpm=0, gate=gate))
         assert gate.limit == 4
 
 
@@ -143,22 +150,23 @@ async def test_unreachable_valkey_degrades_instead_of_failing(settings, clean_ke
     from code_atlas.settings import RedisSettings
 
     dead = RedisSettings(host="127.0.0.1", port=1)  # nothing listens here
-    async with RateLimiter(dead, model=clean_keys, rpm=10, tpm=10) as lim:
+    budget = RateBudget(model=clean_keys, rpm=10, tpm=10)
+    async with _limiter(dead) as lim:
         start = time.monotonic()
-        await lim.acquire(tokens=5)  # must return, not raise, not hang
+        await lim.acquire(budget, tokens=5)  # must return, not raise, not hang
         assert time.monotonic() - start < 5.0
-        assert await lim.penalize() == pytest.approx(0.5), "local backoff should still apply"
+        assert await lim.penalize(budget) == pytest.approx(0.5), "local backoff should still apply"
 
 
 async def test_token_budget_is_metered_separately(settings, clean_keys):
     """A tokens-per-minute limit must bind even when the request count is well inside
     its own budget — a single call can carry thousands of tokens."""
     _, tok_key, _ = _keys(settings, clean_keys)
-    async with RateLimiter(settings.redis, model=clean_keys, rpm=0, tpm=6000) as lim:
+    async with _limiter(settings.redis) as lim:
         r = await _raw(settings)
         await r.hset(tok_key, mapping={"t": "0", "ts": str(await _server_now_ms(r))})
 
         start = time.monotonic()
-        await lim.acquire(tokens=100)  # 6000/min = 100 tokens per second
+        await lim.acquire(RateBudget(model=clean_keys, rpm=0, tpm=6000), tokens=100)  # 6000/min = 100 tokens per second
         assert time.monotonic() - start >= 0.5
         await r.aclose()

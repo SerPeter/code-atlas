@@ -25,9 +25,11 @@ from typing import TYPE_CHECKING
 import pytest
 from typer.testing import CliRunner
 
-from code_atlas.backends import create_event_bus, create_graph_client
+from code_atlas.backends import QueueConnections, create_event_bus, create_graph_client
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
+from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.cli import app
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.server.mcp import AppContext, create_mcp_server
 from code_atlas.settings import AtlasSettings, BackendSettings, EmbeddingSettings, derive_project_name
 from tests.unit.server.test_mcp import _invoke_tool
@@ -170,7 +172,8 @@ async def app_ctx(embedded_settings: AtlasSettings) -> AsyncIterator[AppContext]
     await graph.ping()
     # A real embedded bus, not a mock: this fixture exists to prove the sqlite backends
     # work as a pair, and a mocked half would be exactly the wrong thing to assert on.
-    bus = await create_event_bus(embedded_settings)
+    bus = await create_event_bus(embedded_settings, QueueConnections(embedded_settings))
+    assert isinstance(bus, SqliteEventBus)
     try:
         yield AppContext(
             bus=bus,  # ty: ignore[invalid-argument-type]
@@ -178,6 +181,7 @@ async def app_ctx(embedded_settings: AtlasSettings) -> AsyncIterator[AppContext]
             settings=embedded_settings,
             embed=None,
             vector_enabled=False,
+            limiter=unpaced(),
         )
     finally:
         await bus.close()

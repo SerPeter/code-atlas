@@ -6,6 +6,7 @@ import pytest
 
 from code_atlas.schema import SCHEMA_VERSION, NodeLabel, RelType
 from code_atlas.search.embeddings import EmbedClient
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.server.mcp import AppContext
 from tests.unit.server.test_mcp import _invoke_tool
 
@@ -19,8 +20,8 @@ pytestmark = pytest.mark.integration
 @pytest.fixture
 async def app_ctx(graph_client, event_bus, settings):
     """Create an AppContext for testing tools directly."""
-    embed = EmbedClient(settings.embeddings)
-    return AppContext(graph=graph_client, bus=event_bus, settings=settings, embed=embed)
+    embed = EmbedClient(settings.embeddings, limiter=unpaced())
+    return AppContext(graph=graph_client, bus=event_bus, settings=settings, embed=embed, limiter=unpaced())
 
 
 @pytest.fixture

@@ -101,6 +101,7 @@ async def _index(root: Path, db_dir: Path, project: str, *, max_source_chars: in
                 backends.bus,  # ty: ignore[invalid-argument-type]
                 full_reindex=True,
                 project_name=project,
+                limiter=backends.limiter,
             )
             profile = await profile_corpus(backends.graph, project)
     return profile.labels

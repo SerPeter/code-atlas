@@ -17,6 +17,7 @@ import pytest
 
 from code_atlas.indexing.consumers import ASTConsumer
 from code_atlas.indexing.orchestrator import index_project
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import AtlasSettings
 from tests.conftest import NO_EMBED
 
@@ -47,7 +48,9 @@ async def test_full_index_throughput(
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
     ):
         start = time.perf_counter()
-        result = await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
+        result = await index_project(
+            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0, limiter=unpaced()
+        )
         elapsed = time.perf_counter() - start
 
     fps = result.files_scanned / elapsed if elapsed > 0 else 0
@@ -78,7 +81,9 @@ async def test_delta_index_throughput(
     with (
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
     ):
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
+        await index_project(
+            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0, limiter=unpaced()
+        )
 
     # Modify 10% of files
     py_paths = [p for p in rel_paths if p.endswith(".py") and "__init__" not in p]
@@ -93,7 +98,7 @@ async def test_delta_index_throughput(
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
     ):
         start = time.perf_counter()
-        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=120.0)
+        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=120.0, limiter=unpaced())
         elapsed = time.perf_counter() - start
 
     report = {
@@ -136,7 +141,9 @@ async def test_indexing_a_medium_project_stays_inside_its_budget(
         patch("code_atlas.indexing.orchestrator.EmbedClient", return_value=mock_embed),
     ):
         start = time.perf_counter()
-        result = await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=budget_s)
+        result = await index_project(
+            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=budget_s, limiter=unpaced()
+        )
         elapsed = time.perf_counter() - start
 
     report = {
@@ -283,16 +290,20 @@ async def test_a_noop_full_recheck_barely_writes_relationships(
     root, _rel_paths = bench_small
     settings = AtlasSettings(project_root=root, embeddings=NO_EMBED)
 
-    await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
+    await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0, limiter=unpaced())
 
     with _measure_recheck(monkeypatch, graph_client, stored_fingerprints=False) as before:
         start = time.perf_counter()
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
+        await index_project(
+            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0, limiter=unpaced()
+        )
         before_s = time.perf_counter() - start
 
     with _measure_recheck(monkeypatch, graph_client, stored_fingerprints=True) as after:
         start = time.perf_counter()
-        result = await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0)
+        result = await index_project(
+            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=120.0, limiter=unpaced()
+        )
         after_s = time.perf_counter() - start
 
     report = {

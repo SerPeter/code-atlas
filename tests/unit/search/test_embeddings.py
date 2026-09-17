@@ -21,6 +21,7 @@ from code_atlas.indexing.consumers import (
 )
 from code_atlas.parsing.ast import parse_file
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, build_embed_text, hash_text
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import EmbeddingSettings
 
 # ---------------------------------------------------------------------------
@@ -196,41 +197,41 @@ class FakeEmbeddingResponse:
 
 class TestEmbedClient:
     def test_model_string_with_base_url(self):
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
         assert client._model == "openai/nomic-ai/nomic-embed-code"
         assert client._api_base == "http://localhost:8080"
         assert client._api_key == "unused"
 
     def test_model_string_already_prefixed(self):
-        client = EmbedClient(_make_settings(model="openai/my-model"))
+        client = EmbedClient(_make_settings(model="openai/my-model"), limiter=unpaced())
         assert client._model == "openai/my-model"
 
     def test_model_string_cloud_provider(self):
-        client = EmbedClient(_make_settings(provider="litellm", base_url=""))
+        client = EmbedClient(_make_settings(provider="litellm", base_url=""), limiter=unpaced())
         assert client._model == "nomic-ai/nomic-embed-code"
         assert client._api_base is None
         assert client._api_key is None
 
     def test_model_string_ollama_provider(self):
-        client = EmbedClient(_make_settings(provider="ollama", base_url="http://localhost:11434"))
+        client = EmbedClient(_make_settings(provider="ollama", base_url="http://localhost:11434"), limiter=unpaced())
         assert client._model == "nomic-ai/nomic-embed-code"
         assert client._api_base == "http://localhost:11434"
         assert client._api_key is None
 
     def test_dimensions_forwarded_for_litellm_provider(self):
-        client = EmbedClient(_make_settings(provider="litellm", base_url="", dimension=1536))
+        client = EmbedClient(_make_settings(provider="litellm", base_url="", dimension=1536), limiter=unpaced())
         assert client._build_kwargs(["hello"])["dimensions"] == 1536
 
     def test_dimensions_omitted_when_unset(self):
-        client = EmbedClient(_make_settings(provider="litellm", base_url="", dimension=None))
+        client = EmbedClient(_make_settings(provider="litellm", base_url="", dimension=None), limiter=unpaced())
         assert "dimensions" not in client._build_kwargs(["hello"])
 
     def test_dimensions_not_forwarded_for_tei_provider(self):
-        client = EmbedClient(_make_settings(provider="tei", dimension=768))
+        client = EmbedClient(_make_settings(provider="tei", dimension=768), limiter=unpaced())
         assert "dimensions" not in client._build_kwargs(["hello"])
 
     async def test_embed_one(self):
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1, 0.2, 0.3])])
 
         patch_target = "code_atlas.search.embeddings.litellm.aembedding"
@@ -240,7 +241,7 @@ class TestEmbedClient:
         assert result == [0.1, 0.2, 0.3]
 
     async def test_embed_batch_single_chunk(self):
-        client = EmbedClient(_make_settings(batch_size=32))
+        client = EmbedClient(_make_settings(batch_size=32), limiter=unpaced())
         texts = ["text1", "text2", "text3"]
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[float(i)]) for i in range(3)])
 
@@ -253,7 +254,7 @@ class TestEmbedClient:
         mock_embed.assert_called_once()
 
     async def test_embed_batch_multiple_chunks(self):
-        client = EmbedClient(_make_settings(batch_size=3))
+        client = EmbedClient(_make_settings(batch_size=3), limiter=unpaced())
         texts = [f"text{i}" for i in range(10)]
 
         call_count = 0
@@ -272,12 +273,12 @@ class TestEmbedClient:
         assert call_count == 4
 
     async def test_embed_batch_empty(self):
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
         result = await client.embed_batch([])
         assert result == []
 
     async def test_embed_error_propagation(self):
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
 
         with (
             patch(
@@ -297,7 +298,7 @@ class TestEmbedClient:
         predicate -- the parts actually under test -- are untouched by dropping it.
         """
         no_retry_backoff(EmbedClient._embed_call)
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1, 0.2, 0.3])])
 
         call_count = 0
@@ -317,7 +318,7 @@ class TestEmbedClient:
 
     async def test_embed_non_retryable_error_fails_immediately(self):
         """A non-retryable error (e.g. bad request) is not retried."""
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
 
         call_count = 0
 
@@ -336,7 +337,7 @@ class TestEmbedClient:
 
     async def test_concurrent_ordering_preserved(self):
         """Results maintain correct ordering despite concurrent execution with varying delays."""
-        client = EmbedClient(_make_settings(batch_size=2, max_concurrency=4))
+        client = EmbedClient(_make_settings(batch_size=2, max_concurrency=4), limiter=unpaced())
         texts = [f"text{i}" for i in range(6)]
 
         # Simulate varying response times — later chunks respond faster
@@ -357,7 +358,7 @@ class TestEmbedClient:
 
     async def test_concurrent_partial_failure(self):
         """When one chunk fails during concurrent execution, the error propagates."""
-        client = EmbedClient(_make_settings(batch_size=2, max_concurrency=4))
+        client = EmbedClient(_make_settings(batch_size=2, max_concurrency=4), limiter=unpaced())
         texts = [f"text{i}" for i in range(6)]
 
         call_count = 0
@@ -378,7 +379,7 @@ class TestEmbedClient:
 
     async def test_concurrency_limited_by_semaphore(self):
         """Semaphore limits the number of concurrent API calls to max_concurrency."""
-        client = EmbedClient(_make_settings(batch_size=1, max_concurrency=2))
+        client = EmbedClient(_make_settings(batch_size=1, max_concurrency=2), limiter=unpaced())
         texts = [f"text{i}" for i in range(5)]
 
         peak_concurrent = 0
@@ -400,7 +401,7 @@ class TestEmbedClient:
         assert peak_concurrent <= 2, f"Peak concurrent calls ({peak_concurrent}) exceeded max_concurrency (2)"
 
     async def test_health_check_success(self):
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
         fake_response = FakeEmbeddingResponse(data=[FakeEmbeddingItem(embedding=[0.1])])
 
         patch_target = "code_atlas.search.embeddings.litellm.aembedding"
@@ -408,7 +409,7 @@ class TestEmbedClient:
             assert await client.health_check() is True
 
     async def test_health_check_failure(self):
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
 
         with patch(
             "code_atlas.search.embeddings.litellm.aembedding",
@@ -646,14 +647,14 @@ class TestSplitEmbedText:
 class TestEmbedClientSplitText:
     def test_unmapped_model_has_no_limit_without_an_override(self):
         """This is the production failure: no cap, no chunking, no truncation."""
-        client = EmbedClient(_make_settings(model="nomic-ai/nomic-embed-code"))
+        client = EmbedClient(_make_settings(model="nomic-ai/nomic-embed-code"), limiter=unpaced())
         assert client._max_input_tokens is None
         chunks, hard, _dropped = client.split_text("word " * 20_000)
         assert len(chunks) == 1
         assert hard is False
 
     def test_explicit_max_input_tokens_restores_the_cap(self):
-        client = EmbedClient(_make_settings(max_input_tokens=2048, truncate_ratio=1.0))
+        client = EmbedClient(_make_settings(max_input_tokens=2048, truncate_ratio=1.0), limiter=unpaced())
         assert client._max_input_tokens == 2048
         chunks, _, _dropped = client.split_text("word " * 20_000)
         assert len(chunks) > 1
@@ -662,21 +663,22 @@ class TestEmbedClientSplitText:
     def test_override_beats_the_registry(self):
         """A registry answer of 8191 must not override a deliberate 512."""
         client = EmbedClient(
-            _make_settings(provider="litellm", base_url="", model="text-embedding-3-small", max_input_tokens=512)
+            _make_settings(provider="litellm", base_url="", model="text-embedding-3-small", max_input_tokens=512),
+            limiter=unpaced(),
         )
         assert client._max_input_tokens == int(512 * 0.9)
 
     def test_truncate_ratio_applies_to_the_override(self):
-        client = EmbedClient(_make_settings(max_input_tokens=1000, truncate_ratio=0.9))
+        client = EmbedClient(_make_settings(max_input_tokens=1000, truncate_ratio=0.9), limiter=unpaced())
         assert client._max_input_tokens == 900
 
     def test_max_chunks_setting_bounds_the_split(self):
-        client = EmbedClient(_make_settings(max_input_tokens=64, truncate_ratio=1.0, max_chunks=2))
+        client = EmbedClient(_make_settings(max_input_tokens=64, truncate_ratio=1.0, max_chunks=2), limiter=unpaced())
         chunks, _, _dropped = client.split_text("word " * 5_000)
         assert len(chunks) == 2
 
     def test_count_tokens_falls_back_when_no_tokenizer_is_reachable(self):
-        client = EmbedClient(_make_settings())
+        client = EmbedClient(_make_settings(), limiter=unpaced())
         with patch("code_atlas.search.embeddings.litellm.encode", side_effect=Exception("not mapped")):
             first = client.count_tokens("x" * 300)
             assert first == 300 // CHARS_PER_TOKEN_FALLBACK + 1

@@ -29,6 +29,7 @@ from code_atlas.schema import (
     Visibility,
 )
 from code_atlas.search.embeddings import EmbedClient
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.server.mcp import (
     AppContext,
     IndexNotReadyError,
@@ -280,8 +281,8 @@ class TestVectorSearchMock:
     async def test_vector_search_embed_error(self, settings):
         """Vector search returns EMBED_ERROR when TEI is unavailable."""
         async with GraphClient(settings) as graph:
-            embed = EmbedClient(settings.embeddings)
-            app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+            embed = EmbedClient(settings.embeddings, limiter=unpaced())
+            app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
             patch_target = "code_atlas.search.embeddings.litellm.aembedding"
             with patch(patch_target, new_callable=AsyncMock, side_effect=Exception("down")):
@@ -292,8 +293,8 @@ class TestVectorSearchMock:
         """Vector search with mocked embedding client."""
         mock_vector = [0.1] * (settings.embeddings.dimension or 768)
         async with GraphClient(settings) as graph:
-            embed = EmbedClient(settings.embeddings)
-            app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+            embed = EmbedClient(settings.embeddings, limiter=unpaced())
+            app_ctx = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
             with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=mock_vector) as mock_embed:
                 result = await _invoke_tool(app_ctx, "vector_search", query="test query")
@@ -314,8 +315,8 @@ class TestSearchLabelValidation:
         """An unwhitelisted label must be refused before any graph call (injection guard)."""
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock()
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "text_search", query="x", label=_MALICIOUS_LABEL)
         assert "error" in result
@@ -325,8 +326,10 @@ class TestSearchLabelValidation:
     async def test_vector_search_rejects_malicious_label(self, settings):
         graph = AsyncMock(spec=GraphClient)
         graph.vector_search = AsyncMock()
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, vector_enabled=True)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(
+            bus=AsyncMock(), graph=graph, settings=settings, embed=embed, vector_enabled=True, limiter=unpaced()
+        )
 
         result = await _invoke_tool(app, "vector_search", query="x", label=_MALICIOUS_LABEL)
         assert "error" in result
@@ -337,8 +340,8 @@ class TestSearchLabelValidation:
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock(return_value=[])
         graph.batch_call_stats = AsyncMock(return_value={})
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "text_search", query="x", label="Callable")
         assert "error" not in result
@@ -358,8 +361,8 @@ class TestDefaultScopeProjects:
 
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(side_effect=RuntimeError("db down"))
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         root_name = derive_project_name(settings.project_root)
         result = await _default_scope_projects(app)
@@ -378,8 +381,8 @@ class TestDefaultScopeProjects:
         ]
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=rows)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _default_scope_projects(app)
         assert set(result) == {root_name, f"{root_name}/sub"}
@@ -390,8 +393,8 @@ class TestDefaultScopeProjects:
         root_name = derive_project_name(settings.project_root)
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=[{"n": {"name": root_name}}])
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _default_scope_projects(app)
         assert result == [root_name]
@@ -413,8 +416,8 @@ class TestDefaultScopeProjects:
         ]
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=rows)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _default_scope_projects(app)
         assert result == [root_name, f"{root_name}/sub", "global-vault"]
@@ -430,8 +433,8 @@ class TestDefaultScopeProjects:
         ]
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(side_effect=RuntimeError("db down"))
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _default_scope_projects(app)
         assert result == [root_name, "global-vault"]
@@ -446,8 +449,8 @@ class TestHybridSearchValidation:
     async def test_invalid_search_types_returns_error(self, settings):
         """An unknown channel name must return a clean error envelope, not raise ValueError."""
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "hybrid_search", query="foo", search_types="bogus_channel")
         assert "error" in result
@@ -456,8 +459,8 @@ class TestHybridSearchValidation:
     async def test_non_object_weights_returns_error(self, settings):
         """Valid JSON that isn't an object (e.g. a list) must be rejected cleanly."""
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "hybrid_search", query="foo", weights="[1, 2, 3]")
         assert "error" in result
@@ -476,8 +479,8 @@ class TestResolveHybridScopeZeroMatch:
         "" — hybrid_search treats "" exactly like an unset scope (no filter)."""
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "libs-shared"}}])
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         resolved = await _resolve_hybrid_scope(app, "totally-nonexistent-*")
         assert resolved is None
@@ -487,8 +490,8 @@ class TestResolveHybridScopeZeroMatch:
         graph.get_project_status = AsyncMock(
             return_value=[{"n": {"name": "libs-shared"}}, {"n": {"name": "libs-other"}}]
         )
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         resolved = await _resolve_hybrid_scope(app, "libs-*")
         assert resolved == "libs-shared,libs-other"
@@ -500,8 +503,8 @@ class TestHybridSearchZeroMatchScope:
         and must NOT fall through to an unrestricted, unfiltered search."""
         graph = AsyncMock(spec=GraphClient)
         graph.get_project_status = AsyncMock(return_value=[{"n": {"name": "libs-shared"}}])
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         with patch("code_atlas.server.mcp._hybrid_search", new_callable=AsyncMock) as fake_search:
             result = await _invoke_tool(app, "hybrid_search", query="foo", scope="totally-nonexistent-*")
@@ -537,8 +540,8 @@ class TestTruncatedField:
 
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock(side_effect=_fake_text_search)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["count"] == 20
@@ -557,8 +560,8 @@ class TestTruncatedField:
 
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock(side_effect=_fake_text_search)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["count"] == 5
@@ -572,8 +575,10 @@ class TestTruncatedField:
 
         graph = AsyncMock(spec=GraphClient)
         graph.vector_search = AsyncMock(side_effect=_fake_vector_search)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, vector_enabled=True)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(
+            bus=AsyncMock(), graph=graph, settings=settings, embed=embed, vector_enabled=True, limiter=unpaced()
+        )
 
         with patch.object(embed, "embed_one", new_callable=AsyncMock, return_value=[0.1] * 768):
             result = await _invoke_tool(app, "vector_search", query="e", limit=20)
@@ -609,8 +614,8 @@ class TestTruncatedField:
             return available[:limit]
 
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
             result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
@@ -646,8 +651,8 @@ class TestTruncatedField:
             return available[:limit]
 
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         with patch("code_atlas.server.mcp._hybrid_search", side_effect=_fake_hybrid_search):
             result = await _invoke_tool(app, "hybrid_search", query="e", limit=20)
@@ -669,8 +674,8 @@ class TestTruncatedField:
 
         graph = AsyncMock(spec=GraphClient)
         graph.text_search = AsyncMock(side_effect=_fake_text_search)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "text_search", query="e", limit=20)
         assert result["truncated"]["cut"] is None, "a fetch-bounded count must not be reported as `cut`"
@@ -747,8 +752,8 @@ class TestCypherQueryWriteKeywordGuard:
         """A literal value equal to a write keyword (e.g. 'set') must not trigger rejection."""
         graph = AsyncMock(spec=GraphClient)
         graph.execute = AsyncMock(return_value=[{"name": "set"}])
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "cypher_query", query="MATCH (n) WHERE n.name = 'set' RETURN n.name AS name")
         assert "error" not in result
@@ -756,8 +761,8 @@ class TestCypherQueryWriteKeywordGuard:
 
     async def test_still_rejects_unquoted_write_keyword(self, settings):
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())
 
         result = await _invoke_tool(app, "cypher_query", query="MATCH (n) WHERE n.name = 'x' SET n.name = 'y'")
         assert result["code"] == "WRITE_REJECTED"
@@ -774,8 +779,8 @@ class TestCypherQueryWriteKeywordGuard:
 class TestCypherToolsSqliteBackendGuard:
     async def test_cypher_query_returns_unsupported_backend_error(self, settings, tmp_path):
         async with SqliteGraphClient(tmp_path / "graph.sqlite3") as graph:
-            embed = EmbedClient(settings.embeddings)
-            app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
+            embed = EmbedClient(settings.embeddings, limiter=unpaced())
+            app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())  # ty: ignore[invalid-argument-type]
 
             result = await _invoke_tool(app, "cypher_query", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
@@ -784,8 +789,8 @@ class TestCypherToolsSqliteBackendGuard:
 
     async def test_validate_cypher_skips_explain_with_info_issue_not_crash(self, settings, tmp_path):
         async with SqliteGraphClient(tmp_path / "graph.sqlite3") as graph:
-            embed = EmbedClient(settings.embeddings)
-            app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed)  # ty: ignore[invalid-argument-type]
+            embed = EmbedClient(settings.embeddings, limiter=unpaced())
+            app = AppContext(bus=AsyncMock(), graph=graph, settings=settings, embed=embed, limiter=unpaced())  # ty: ignore[invalid-argument-type]
 
             result = await _invoke_tool(app, "validate_cypher", query="MATCH (n:Callable) RETURN n LIMIT 10")
 
@@ -857,8 +862,10 @@ class TestWithStaleness:
         mock_graph = AsyncMock()
         mock_graph.get_project_git_hash = AsyncMock(return_value="abc123")
 
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
 
         # Patch checker.check to return a known StalenessInfo
         with patch.object(
@@ -873,9 +880,11 @@ class TestWithStaleness:
         from code_atlas.indexing.orchestrator import StalenessChecker
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
 
         result = {"results": []}
         annotated = await _with_staleness(app, result, scope="other_project")
@@ -887,9 +896,11 @@ class TestWithStaleness:
         from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
 
         # Simulate never-indexed: stale=True but no last_indexed_commit
         with patch.object(
@@ -908,9 +919,11 @@ class TestWithStaleness:
 
         lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
 
         with patch.object(
             checker,
@@ -929,9 +942,11 @@ class TestWithStaleness:
 
         lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker)
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=lock_settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
 
         with patch.object(
             checker,
@@ -957,8 +972,15 @@ class TestWithStaleness:
 
         lock_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="lock"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
-        app = AppContext(bus=AsyncMock(), graph=AsyncMock(), settings=lock_settings, embed=embed, staleness=checker)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(
+            bus=AsyncMock(),
+            graph=AsyncMock(),
+            settings=lock_settings,
+            embed=embed,
+            staleness=checker,
+            limiter=unpaced(),
+        )
 
         async def _slow_check(*_args, **_kwargs):
             await asyncio.sleep(60)
@@ -985,9 +1007,16 @@ class TestWithStaleness:
 
         ignore_settings = AtlasSettings(project_root=settings.project_root, index=IndexSettings(stale_mode="ignore"))
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=ignore_settings, embed=embed, staleness=checker)
+        app = AppContext(
+            bus=AsyncMock(),
+            graph=mock_graph,
+            settings=ignore_settings,
+            embed=embed,
+            staleness=checker,
+            limiter=unpaced(),
+        )
 
         with patch.object(checker, "check", new_callable=AsyncMock) as mock_check:
             result = {"results": []}
@@ -1009,9 +1038,11 @@ class TestWithStaleness:
         from code_atlas.indexing.orchestrator import StalenessChecker
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
 
         async def _slow_check(*_args, **_kwargs):
             await asyncio.sleep(60)
@@ -1031,9 +1062,11 @@ class TestWithStaleness:
         from code_atlas.indexing.orchestrator import StalenessChecker
 
         checker = StalenessChecker(settings.project_root, project_name="myproject")
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker)
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
 
         with patch.object(checker, "check", side_effect=QueryTimeoutError(5.0, "get_project_git_hash")):
             result = {"results": [{"uid": "test:foo"}]}
@@ -1088,9 +1121,11 @@ class TestFileUriToPath:
 class TestMaybeUpdateRoot:
     async def test_skips_when_checked(self, settings):
         """roots_checked=True → no-op, no session access."""
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, roots_checked=True)
+        app = AppContext(
+            bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, roots_checked=True, limiter=unpaced()
+        )
         ctx = MagicMock()
         await _maybe_update_root(app, ctx)
         # Should not have touched session at all
@@ -1099,9 +1134,9 @@ class TestMaybeUpdateRoot:
 
     async def test_handles_timeout(self, settings):
         """list_roots() times out → keeps current root."""
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
-        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed)
+        app = AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, limiter=unpaced())
         ctx = MagicMock()
         # Simulate a timeout on list_roots
         ctx.session.list_roots = AsyncMock(side_effect=TimeoutError)
@@ -1115,7 +1150,7 @@ class TestMaybeUpdateRoot:
         new_root.mkdir()
         (new_root / ".git").mkdir()  # a real project root (git repo) — eligible to switch
 
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
         mock_graph.get_embedding_config = AsyncMock(return_value=None)
         old_daemon = AsyncMock()
@@ -1127,6 +1162,7 @@ class TestMaybeUpdateRoot:
             embed=embed,
             daemon=old_daemon,
             resolved_root=settings.project_root,
+            limiter=unpaced(),
         )
 
         # Mock list_roots to return a different root
@@ -1155,7 +1191,7 @@ class TestMaybeUpdateRoot:
         bare_root = tmp_path / "not_a_project"
         bare_root.mkdir()  # no .git, no atlas.toml
 
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         mock_graph = AsyncMock()
         old_daemon = AsyncMock()
         old_daemon.stop = AsyncMock()
@@ -1166,6 +1202,7 @@ class TestMaybeUpdateRoot:
             embed=embed,
             daemon=old_daemon,
             resolved_root=settings.project_root,
+            limiter=unpaced(),
         )
 
         mock_root = MagicMock()
@@ -1223,8 +1260,8 @@ class TestQueryTimeout:
         mock_graph.get_project_dependency_edges = AsyncMock(
             side_effect=QueryTimeoutError(10.0, "get_project_dependency_edges")
         )
-        embed = EmbedClient(settings.embeddings)
-        return AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        return AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=embed, limiter=unpaced())
 
     async def test_get_node_timeout(self, timeout_app):
         result = await _invoke_tool(timeout_app, "get_node", name="Foo")
@@ -1423,7 +1460,7 @@ def _stub_backends(monkeypatch, graph):
 
     @contextlib.asynccontextmanager
     async def fake_scope(_settings, **_kw):
-        yield Backends(graph=graph, bus=AsyncMock())
+        yield Backends(graph=graph, limiter=AsyncMock(), bus=AsyncMock())
 
     monkeypatch.setattr("code_atlas.server.mcp.use_backends", fake_scope)
 
@@ -1509,7 +1546,7 @@ class TestEnsureRootGate:
         """A tool call against a fresh backend blocks until first_index_ready fires,
         then proceeds normally — mirrors what every gated @mcp.tool call does."""
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         ready = asyncio.Event()
         app = AppContext(
             bus=AsyncMock(),
@@ -1518,6 +1555,7 @@ class TestEnsureRootGate:
             embed=embed,
             needs_first_index=True,
             first_index_ready=ready,
+            limiter=unpaced(),
         )
         ctx = _FakeCtx(app)
 
@@ -1531,11 +1569,11 @@ class TestEnsureRootGate:
         assert result is app
 
     async def test_never_unblocked_raises_index_not_ready_within_bounded_time(self, settings, monkeypatch):
-        """Simulates daemon.start() returning False (queue unreachable, catch-up
+        """Simulates daemon.start(limiter=unpaced()) returning False (queue unreachable, catch-up
         never runs) — the gate must fail fast with a bounded wait, never hang."""
         monkeypatch.setattr("code_atlas.server.mcp._INDEX_READY_TIMEOUT_S", 0.05)
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         app = AppContext(
             bus=AsyncMock(),
             graph=graph,
@@ -1543,6 +1581,7 @@ class TestEnsureRootGate:
             embed=embed,
             needs_first_index=True,
             first_index_ready=asyncio.Event(),
+            limiter=unpaced(),
         )
         ctx = _FakeCtx(app)
 
@@ -1553,7 +1592,7 @@ class TestEnsureRootGate:
         """health_check/index_status pass require_index=False — must return
         immediately even though first_index_ready is never set."""
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         app = AppContext(
             bus=AsyncMock(),
             graph=graph,
@@ -1561,6 +1600,7 @@ class TestEnsureRootGate:
             embed=embed,
             needs_first_index=True,
             first_index_ready=asyncio.Event(),
+            limiter=unpaced(),
         )
         ctx = _FakeCtx(app)
 
@@ -1575,7 +1615,7 @@ class TestGatedToolsSurfaceIndexRequired:
     async def test_get_node_surfaces_index_required(self, settings, monkeypatch):
         monkeypatch.setattr("code_atlas.server.mcp._INDEX_READY_TIMEOUT_S", 0.05)
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         app = AppContext(
             bus=AsyncMock(),
             graph=graph,
@@ -1583,6 +1623,7 @@ class TestGatedToolsSurfaceIndexRequired:
             embed=embed,
             needs_first_index=True,
             first_index_ready=asyncio.Event(),
+            limiter=unpaced(),
         )
 
         result = await asyncio.wait_for(_invoke_tool(app, "get_node", name="Foo"), timeout=2.0)
@@ -1597,7 +1638,7 @@ class TestGatedToolsSurfaceIndexRequired:
             elapsed_ms=1.0,
         )
         graph = AsyncMock(spec=GraphClient)
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
         daemon = AsyncMock()
         app = AppContext(
             bus=AsyncMock(),
@@ -1607,6 +1648,7 @@ class TestGatedToolsSurfaceIndexRequired:
             daemon=daemon,
             needs_first_index=True,
             first_index_ready=asyncio.Event(),  # never set
+            limiter=unpaced(),
         )
 
         with patch("code_atlas.server.mcp.run_health_checks", new_callable=AsyncMock, return_value=report):
@@ -1638,7 +1680,13 @@ class TestSummarizeModule:
                 "docs": [],
             }
         )
-        return AppContext(bus=AsyncMock(), graph=mock_graph, settings=settings, embed=EmbedClient(settings.embeddings))
+        return AppContext(
+            bus=AsyncMock(),
+            graph=mock_graph,
+            settings=settings,
+            embed=EmbedClient(settings.embeddings, limiter=unpaced()),
+            limiter=unpaced(),
+        )
 
     async def test_shortcut_delegates_with_analysis_preset(self, summary_app):
         result = await _invoke_tool(summary_app, "summarize_module", path="pkg", project="proj")
@@ -1773,6 +1821,7 @@ class TestNoIndexMode:
             settings,
             None,  # ty: ignore[invalid-argument-type]
             None,  # ty: ignore[invalid-argument-type]
+            limiter=unpaced(),
             catchup=True,
             auto_index=auto_index,
             first_index_ready=ready,
@@ -1796,6 +1845,7 @@ class TestNoIndexMode:
             settings,
             None,  # ty: ignore[invalid-argument-type]
             None,  # ty: ignore[invalid-argument-type]
+            limiter=unpaced(),
             catchup=True,
             auto_index=auto_index,
             first_index_ready=ready,
@@ -1821,6 +1871,7 @@ class TestNoIndexMode:
             settings,
             None,  # ty: ignore[invalid-argument-type]
             None,  # ty: ignore[invalid-argument-type]
+            limiter=unpaced(),
             catchup=True,
             auto_index=auto_index,
             first_index_ready=ready,

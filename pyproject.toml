@@ -61,6 +61,7 @@ dependencies = [
     "orjson>=3.10",
     "pyyaml~=6.0",            # YAML frontmatter parsing for the knowledge vault
     "gitpython~=3.1",         # git history mining (find_hotspots) — shells out to the same git binary
+    "asyncpg~=0.31",          # async Postgres driver (asyncio transports, so it runs on Windows' Proactor loop) — Postgres queue backend (ADR-0056)
 ]
 
 [project.optional-dependencies]

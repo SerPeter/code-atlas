@@ -364,12 +364,23 @@ class TestAsyncContextManager:
         assert bus._conn is None, "a BaseException must not leak the connection either"
 
     def test_every_client_supports_the_protocol(self) -> None:
-        """Derived from the classes, not a hand-written list -- a fifth backend that
-        forgets the protocol should fail here rather than leak in production."""
+        """Every class that owns a connection or a file handle can be closed by `async with`;
+        a fifth backend that forgets the protocol should fail here rather than leak."""
+        from code_atlas.backends.postgres_queue import PostgresConnections
         from code_atlas.backends.sqlite_graph import SqliteGraphClient
-        from code_atlas.events import EventBus
         from code_atlas.graph.client import GraphClient
+        from code_atlas.search.ratelimit import SqliteRateLimiter
 
-        for cls in (GraphClient, SqliteGraphClient, EventBus, SqliteEventBus):
+        for cls in (GraphClient, SqliteGraphClient, SqliteEventBus, SqliteRateLimiter, PostgresConnections):
             assert hasattr(cls, "__aenter__"), f"{cls.__name__} cannot be used with async with"
             assert hasattr(cls, "__aexit__"), f"{cls.__name__} cannot be used with async with"
+
+    def test_network_buses_and_limiters_cannot_close_what_they_borrow(self) -> None:
+        """They are handed the process's connection (ADR-0038); a close() on one of them
+        would end the connection its sibling is still using."""
+        from code_atlas.backends.postgres_queue import PostgresEventBus
+        from code_atlas.events import EventBus
+        from code_atlas.search.ratelimit import PostgresRateLimiter, RateLimiter
+
+        for cls in (EventBus, PostgresEventBus, RateLimiter, PostgresRateLimiter):
+            assert not hasattr(cls, "close"), f"{cls.__name__} closes a connection it does not own"

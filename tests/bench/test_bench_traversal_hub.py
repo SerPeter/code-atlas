@@ -46,6 +46,7 @@ import pytest
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.bench import capture, stub_provider
 from code_atlas.graph.client import QueryTimeoutError
+from code_atlas.search.ratelimit import unpaced
 from tests.bench.conftest import write_bench_result
 
 if TYPE_CHECKING:
@@ -202,7 +203,13 @@ async def _index_memgraph(root: Path, project: str, graph_client: GraphClient, e
     start = time.perf_counter()
     with stub_provider(graph_client.dimension):
         await index_project(
-            settings, graph_client, event_bus, full_reindex=True, project_name=project, drain_timeout_s=600.0
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            project_name=project,
+            drain_timeout_s=600.0,
+            limiter=unpaced(),
         )
     return time.perf_counter() - start
 
@@ -233,6 +240,7 @@ async def _index_sqlite(root: Path, project: str, data_dir: Path) -> tuple[Atlas
                 backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                 full_reindex=True,
                 project_name=project,
+                limiter=backends.limiter,
             )
     return settings, time.perf_counter() - start
 

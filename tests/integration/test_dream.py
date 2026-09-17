@@ -11,6 +11,7 @@ import pytest
 
 from code_atlas.dream import VaultRoot, build_dream_report
 from code_atlas.indexing.orchestrator import index_project
+from code_atlas.search.ratelimit import unpaced
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,7 +57,13 @@ async def test_build_dream_report_end_to_end(
     _write(vault_dir, "inbox/draft-one.md", "---\nid: draft-one\nkind: draft\n---\n\n# Draft\n\nJust a draft.\n")
 
     result = await index_project(
-        settings, graph_client, event_bus, project_name="test-vault", project_root=vault_dir, drain_timeout_s=60.0
+        settings,
+        graph_client,
+        event_bus,
+        project_name="test-vault",
+        project_root=vault_dir,
+        drain_timeout_s=60.0,
+        limiter=unpaced(),
     )
     assert result.drained, "indexing the test vault did not drain"
 

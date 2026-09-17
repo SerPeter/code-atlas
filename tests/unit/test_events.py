@@ -44,7 +44,7 @@ class FakePipeline:
     def xinfo_groups(self, key: str) -> None:
         self._commands.append(("xinfo_groups", key))
 
-    async def execute(self) -> list[Any]:
+    async def execute(self, raise_on_error: bool = True) -> list[Any]:
         out: list[Any] = []
         for cmd, key in self._commands:
             if cmd == "xadd":
@@ -86,9 +86,7 @@ class FakeRedis:
 
 
 def _make_bus(fake: FakeRedis, *, stream_maxlen: int = 1_000_000) -> EventBus:
-    bus = EventBus(RedisSettings(stream_maxlen=stream_maxlen))
-    bus._redis = fake  # ty: ignore[invalid-assignment]  # a deliberate fake in place of the real client
-    return bus
+    return EventBus(fake, RedisSettings(stream_maxlen=stream_maxlen))  # ty: ignore[invalid-argument-type]  # a deliberate fake in place of the real client
 
 
 def _event(path: str = "a.py") -> FileChanged:

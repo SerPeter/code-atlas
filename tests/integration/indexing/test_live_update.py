@@ -28,6 +28,7 @@ from code_atlas.events import EmbedDirty, Topic, decode_event
 from code_atlas.indexing.consumers import ASTConsumer
 from code_atlas.indexing.orchestrator import FileScope, detect_sub_projects, index_project
 from code_atlas.indexing.watcher import FileWatcher
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import derive_project_name
 
 if TYPE_CHECKING:
@@ -89,7 +90,7 @@ async def test_live_update_body_only_edit_reaches_graph_and_embed_stream(  # noq
     project_name = derive_project_name(settings.project_root)
     (settings.project_root / "live.py").write_text(_BODY_V1, encoding="utf-8")
 
-    result = await index_project(settings, graph_client, event_bus, drain_timeout_s=120.0)
+    result = await index_project(settings, graph_client, event_bus, drain_timeout_s=120.0, limiter=unpaced())
     assert result.files_published >= 1
     assert result.drained is True
     assert result.entities_total >= 1

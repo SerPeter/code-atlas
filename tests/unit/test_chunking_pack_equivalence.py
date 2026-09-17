@@ -26,6 +26,7 @@ import random
 import pytest
 
 from code_atlas.chunking import _SEAM_SLACK, _pack
+from code_atlas.search.ratelimit import unpaced
 
 tiktoken = pytest.importorskip("tiktoken")
 _ENC = tiktoken.get_encoding("cl100k_base")
@@ -175,7 +176,8 @@ class TestTokenCache:
         from code_atlas.settings import EmbeddingSettings
 
         return EmbedClient(
-            EmbeddingSettings(provider="litellm", model="text-embedding-3-small", dimension=32, max_input_tokens=2000)
+            EmbeddingSettings(provider="litellm", model="text-embedding-3-small", dimension=32, max_input_tokens=2000),
+            limiter=unpaced(),
         )
 
     def test_a_repeated_text_is_encoded_once(self):

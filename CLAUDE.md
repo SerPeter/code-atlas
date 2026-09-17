@@ -33,7 +33,8 @@ uv run pre-commit run --all-files  # Run all hooks manually
 
 # Infrastructure
 docker compose up -d             # Start Memgraph + Valkey (production index: 7687/6379)
-docker compose --profile test up -d  # Optional integration-test fast path (memgraph-test :7688, valkey-test :6380, see Testing)
+docker compose --profile test up -d  # Optional integration-test fast path (memgraph-test :7688, valkey-test :6380, postgres-test :5434, see Testing)
+docker compose --profile postgres up -d  # Opt-in Postgres queue backend (:5432) — select with [backend.queue.postgres] (ADR-0056)
 docker compose --profile tei up -d  # Include local embeddings (TEI)
 docker compose --profile telemetry up -d  # Victoria stack + OTel Collector + Grafana (:3000)
 docker compose down              # Stop services
@@ -52,7 +53,7 @@ atlas mcp --no-index             # Query-only: no watcher/pipeline (2nd+ session
 atlas ui                         # Web UI; takes the first free port from 8420 up
 atlas daemon start               # Start indexing daemon (watcher + pipeline)
 atlas dream                      # Knowledge-vault lint report (inbox, orphans, dangling links, duplicates) + wiki/HOME.md
-atlas project rm <name>          # Delete a project's graph data (e.g. a stale worktree project)
+atlas project rm <name>          # Delete a project's graph and queue data (e.g. a stale worktree project)
 atlas deps [<package>]           # Which projects depend on an external package, and at which version
 atlas deps --shared              # ...only packages used by 2+ projects
 atlas bench                      # Index a corpus and report per-stage cost (throwaway SQLite db by default)
@@ -185,9 +186,14 @@ structural fallback, so they are precisely "data no dialect could read". A recog
   Pure graph work; it never re-bills anything, which `--reset-embeddings` would.
 
 **Pacing follows the backend (ADR-0044):** a declared `[backend.queue.sqlite]` gets a `SqliteRateLimiter` holding the
-same buckets and AIMD factor in `ratelimit.sqlite3`; Valkey and an undeclared queue get the Valkey one. The two are
+same buckets and AIMD factor in `ratelimit.sqlite3`; a declared `[backend.queue.postgres]` gets `PostgresRateLimiter`;
+Valkey and an undeclared queue get the Valkey one. The three are
 hand-written mirrors (Lua cannot call Python) and are pinned together by
 `tests/integration/search/test_ratelimit_conformance.py` — edit both, or that test fails.
+The limiter is built once per process by `use_backends` (`Backends.limiter`) over the bus's own connection — one
+Valkey client, or one asyncpg pool plus one LISTEN connection — and injected (ADR-0038 decision 6). `limiter` is a
+**required** argument of `EmbedClient`, `index_project`, `index_monorepo` and `DaemonManager.start`; no pacing is
+`limiter=unpaced()`, spelled out (the health probe and fixture-based tests).
 
 **The SQLite side tables are keys, not copies (ADR-0045, ADR-0046).** Both are keyed by `nodes.rowid`,
 so neither survives a `VACUUM` — nothing runs one. The FTS document is deleted by rowid because `uid` is an
@@ -358,6 +364,13 @@ was asked for.
 memgraph = false
 sqlite = {}
 ```
+
+**Postgres is a third queue backend (ADR-0056)** — `[backend.queue.postgres]` (asyncpg; tables in the `atlas_queue`
+schema, shared by every project in the database). It is never part of `auto`: only declaring it selects it. It also
+gets its own rate limiter, `PostgresRateLimiter`, a third mirror pinned by `test_ratelimit_conformance.py`; the shared
+bus scenarios are in `tests/integration/backends/test_queue_conformance.py`. Its tests use a separate, lazy
+`pg_settings` fixture (`ATLAS_TEST_POSTGRES_PORT` for an existing instance), which truncates only a database named
+`atlas_test*`. The graph axis on Postgres (AGE + pgvector + pg_search) is a recorded direction, not built.
 
 `settings.memgraph` / `settings.redis` still exist as read accessors and return defaults when the section is
 absent — `auto` has to probe an address for a backend it may not end up using. Only the file shape moved;

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -759,6 +759,20 @@ class RedisSettings(StrictSection):
     )
 
 
+class PostgresSettings(StrictSection):
+    """Postgres connection settings for the queue backend (ADR-0056).
+
+    One database serves every project: rows are keyed by project, the way Valkey keys
+    are prefixed by it. The tables live in their own ``atlas_queue`` schema.
+    """
+
+    host: str = Field(default="localhost", description="Postgres host.")
+    port: int = Field(default=5432, description="Postgres port.")
+    user: str = Field(default="atlas", description="Postgres user.")
+    password: SecretStr = Field(default=SecretStr(""), description="Postgres password.")
+    database: str = Field(default="atlas", description="Postgres database name.")
+
+
 def _one_of(configured: dict[str, object], axis: str, example: str) -> None:
     """Reject two backends on one axis, rather than inventing a precedence rule.
 
@@ -852,10 +866,11 @@ class QueueBackendSettings(StrictSection):
 
     valkey: RedisSettings | None = Field(default=None, description="Use Valkey/Redis, with these settings.")
     sqlite: SqliteBackendSettings | None = Field(default=None, description="Use the embedded SQLite queue.")
+    postgres: PostgresSettings | None = Field(default=None, description="Use Postgres, with these settings.")
 
     @model_validator(mode="after")
     def _reject_two_backends(self) -> QueueBackendSettings:
-        _one_of({"valkey": self.valkey, "sqlite": self.sqlite}, "queue", "valkey")
+        _one_of({"valkey": self.valkey, "sqlite": self.sqlite, "postgres": self.postgres}, "queue", "valkey")
         return self
 
 
@@ -889,12 +904,17 @@ class BackendSettings(StrictSection):
         return "auto"
 
     @property
-    def queue_choice(self) -> Literal["valkey", "sqlite", "auto"]:
-        """Which event queue to build. ``"auto"`` means probe-then-fall-back."""
+    def queue_choice(self) -> Literal["valkey", "sqlite", "postgres", "auto"]:
+        """Which event queue to build. ``"auto"`` means probe-then-fall-back.
+
+        ``"auto"`` never probes Postgres: it is selected only by declaring it.
+        """
         if self.queue.valkey is not None:
             return "valkey"
         if self.queue.sqlite is not None:
             return "sqlite"
+        if self.queue.postgres is not None:
+            return "postgres"
         return "auto"
 
 
