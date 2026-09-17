@@ -20,7 +20,9 @@ from code_atlas.graph.client import (
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship, parse_file
 from code_atlas.schema import (
     _ENTITY_LABELS,
+    ECOSYSTEM_PYPI,
     GLOBAL_PROJECT,
+    IMPORT_ECOSYSTEM,
     SCHEMA_VERSION,
     NodeLabel,
     RelType,
@@ -2401,7 +2403,12 @@ async def test_resolve_imports_external(graph_client: GraphClient):
     await graph_client.upsert_file_entities(project, fp, entities, [])
 
     import_rels = [
-        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="loguru.logger"),
+        ParsedRelationship(
+            from_qualified_name=mod_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="loguru.logger",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
     ]
     await graph_client.resolve_imports(project, import_rels)
 
@@ -2476,7 +2483,12 @@ async def test_resolve_imports_internal(graph_client: GraphClient):
     await graph_client.upsert_file_entities(project, fp_app, app_entities, [])
 
     import_rels = [
-        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="src.utils.helper"),
+        ParsedRelationship(
+            from_qualified_name=app_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="src.utils.helper",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
     ]
     await graph_client.resolve_imports(project, import_rels)
 
@@ -2522,8 +2534,18 @@ async def test_resolve_imports_mixed(graph_client: GraphClient):
     await graph_client.upsert_file_entities(project, fp_app, app_entities, [])
 
     import_rels = [
-        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="src.utils"),
-        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="pydantic.BaseModel"),
+        ParsedRelationship(
+            from_qualified_name=app_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="src.utils",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
+        ParsedRelationship(
+            from_qualified_name=app_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="pydantic.BaseModel",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
     ]
     await graph_client.resolve_imports(project, import_rels)
 
@@ -2554,7 +2576,12 @@ async def test_resolve_imports_idempotent(graph_client: GraphClient):
     await graph_client.upsert_file_entities(project, fp, entities, [])
 
     import_rels = [
-        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="requests.get"),
+        ParsedRelationship(
+            from_qualified_name=mod_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="requests.get",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
     ]
 
     # Run twice
@@ -2583,7 +2610,12 @@ async def test_resolve_imports_bare_package(graph_client: GraphClient):
     await graph_client.upsert_file_entities(project, fp, entities, [])
 
     import_rels = [
-        ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name="os"),
+        ParsedRelationship(
+            from_qualified_name=mod_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="os",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
     ]
     await graph_client.resolve_imports(project, import_rels)
 
@@ -2619,7 +2651,15 @@ async def _seed_importer(graph_client: GraphClient, project: str, *packages: str
     await graph_client.merge_project_node(project)
     await graph_client.resolve_imports(
         project,
-        [ParsedRelationship(from_qualified_name=mod_uid, rel_type=RelType.IMPORTS, to_name=pkg) for pkg in packages],
+        [
+            ParsedRelationship(
+                from_qualified_name=mod_uid,
+                rel_type=RelType.IMPORTS,
+                to_name=pkg,
+                properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+            )
+            for pkg in packages
+        ],
     )
 
 
@@ -2651,7 +2691,9 @@ async def test_a_manifest_version_lands_on_the_dependency_edge(graph_client: Gra
     project = "test_imp_ver"
     await _seed_importer(graph_client, project, "loguru", "pydantic")
 
-    await graph_client.update_external_package_versions(project, {"loguru": "~=0.7", "pydantic": ">=2.0,<3.0"})
+    await graph_client.update_external_package_versions(
+        project, {"pypi/loguru": "~=0.7", "pypi/pydantic": ">=2.0,<3.0"}
+    )
 
     assert await _dependency_versions(graph_client, project) == {"loguru": "~=0.7", "pydantic": ">=2.0,<3.0"}
 
@@ -2669,8 +2711,8 @@ async def test_two_projects_keep_their_own_versions_of_one_package(graph_client:
     await _seed_importer(graph_client, "test_app", "requests")
     await _seed_importer(graph_client, "test_lib", "requests")
 
-    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
-    await graph_client.update_external_package_versions("test_lib", {"requests": "2.28.0"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/requests": "2.31.0"})
+    await graph_client.update_external_package_versions("test_lib", {"pypi/requests": "2.28.0"})
 
     assert await _dependency_versions(graph_client, "test_app") == {"requests": "2.31.0"}
     assert await _dependency_versions(graph_client, "test_lib") == {"requests": "2.28.0"}
@@ -2685,7 +2727,7 @@ async def test_the_version_is_not_left_on_the_package_node(graph_client: GraphCl
     await graph_client.ensure_schema()
     await _seed_importer(graph_client, "test_app", "requests")
 
-    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/requests": "2.31.0"})
 
     records = await graph_client.execute(
         f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $p}}) RETURN ep.version AS version",
@@ -2704,8 +2746,8 @@ async def test_a_package_dropped_from_the_manifest_loses_its_edge(graph_client: 
     await graph_client.ensure_schema()
     await _seed_importer(graph_client, "test_app", "requests", "loguru")
 
-    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0", "loguru": "0.7.2"})
-    await graph_client.update_external_package_versions("test_app", {"loguru": "0.7.2"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/requests": "2.31.0", "pypi/loguru": "0.7.2"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/loguru": "0.7.2"})
 
     assert await _dependency_versions(graph_client, "test_app") == {"loguru": "0.7.2"}
 
@@ -2726,7 +2768,7 @@ async def test_a_version_write_leaves_project_to_project_edges_intact(graph_clie
         f"CREATE (a)-[:{RelType.DEPENDS_ON}]->(b)"
     )
 
-    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/requests": "2.31.0"})
 
     assert await graph_client.get_project_dependency_edges() == [{"from_proj": "test_app", "to_proj": "test_lib"}]
 
@@ -2742,7 +2784,9 @@ async def test_a_manifest_coordinate_nothing_imports_writes_no_edge(graph_client
     await graph_client.ensure_schema()
     await _seed_importer(graph_client, "test_app", "requests")
 
-    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0", "never-imported": "9.9.9"})
+    await graph_client.update_external_package_versions(
+        "test_app", {"pypi/requests": "2.31.0", "pypi/never-imported": "9.9.9"}
+    )
 
     assert await _dependency_versions(graph_client, "test_app") == {"requests": "2.31.0"}
     counts = await graph_client.execute(
@@ -2752,24 +2796,25 @@ async def test_a_manifest_coordinate_nothing_imports_writes_no_edge(graph_client
 
 
 async def test_the_dependency_report_reads_the_version_off_the_edge(graph_client: GraphClient):
-    """``analyze_repo(analysis="structure")`` must be unchanged in output shape.
+    """``analyze_repo(analysis="structure")`` builds its rows straight from these keys.
 
-    Its ``external_dependencies`` rows are built straight from these keys, so a read
+    Its ``external_dependencies`` rows carry exactly these keys (``ecosystem`` since
+    ATL-194, because a name alone no longer identifies a package), so a read
     that quietly returned ``None`` for every version would pass every pre-existing
     assertion about the report — not one of them looks at the value.
     """
     await graph_client.ensure_schema()
     await _seed_importer(graph_client, "test_app", "requests", "loguru")
-    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/requests": "2.31.0"})
 
     rows = (await graph_client.get_structure_overview("test_app", "", 20))["external_deps"]
 
     by_name = {r["package"]: dict(r) for r in rows}
-    assert by_name["requests"] == {"package": "requests", "version": "2.31.0", "imported_by": 1}
+    assert by_name["requests"] == {"package": "requests", "ecosystem": "pypi", "version": "2.31.0", "imported_by": 1}
     # An imported-but-undeclared package still appears, unversioned. A plain MATCH would
     # shrink the report to only the packages someone pinned, which is the minority on
     # any Go/Java/PHP project.
-    assert by_name["loguru"] == {"package": "loguru", "version": None, "imported_by": 1}
+    assert by_name["loguru"] == {"package": "loguru", "ecosystem": "pypi", "version": None, "imported_by": 1}
 
 
 async def test_another_projects_pin_does_not_leak_into_this_ones_report(graph_client: GraphClient):
@@ -2788,16 +2833,18 @@ async def test_another_projects_pin_does_not_leak_into_this_ones_report(graph_cl
     await graph_client.ensure_schema()
     await _seed_importer(graph_client, "test_app", "requests")
     await graph_client.merge_project_node("test_lib")
-    await graph_client.update_external_package_versions("test_app", {"requests": "2.31.0"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/requests": "2.31.0"})
     await graph_client.execute_write(
         f"MATCH (p:{NodeLabel.PROJECT} {{uid: 'test_lib'}}), "
-        f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) "
+        f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/pypi/requests'}}) "
         f"CREATE (p)-[:{RelType.DEPENDS_ON} {{version: '2.28.0'}}]->(ep)"
     )
 
     rows = (await graph_client.get_structure_overview("test_app", "", 20))["external_deps"]
 
-    assert [dict(r) for r in rows] == [{"package": "requests", "version": "2.31.0", "imported_by": 1}]
+    assert [dict(r) for r in rows] == [
+        {"package": "requests", "ecosystem": "pypi", "version": "2.31.0", "imported_by": 1}
+    ]
 
 
 async def test_v18_migration_moves_node_versions_onto_the_dependency_edge(graph_client: GraphClient):
@@ -2814,17 +2861,49 @@ async def test_v18_migration_moves_node_versions_onto_the_dependency_edge(graph_
     await _seed_importer(graph_client, "test_app", "requests")
     # The pre-v18 shape, written the way v17 wrote it.
     await graph_client.execute_write(
-        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) SET ep.version = '2.31.0'"
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/pypi/requests'}}) SET ep.version = '2.31.0'"
+    )
+    await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 17")
+
+    # Driven directly rather than through ensure_schema: a v17 graph now runs v18 and then
+    # v20, and v20 deletes every external node so it can be re-minted under its ecosystem
+    # (ATL-194). Through ensure_schema the edges v18 writes are gone before the assertions,
+    # with both migrations behaving exactly as designed. The composed outcome is asserted
+    # by test_v20_drops_the_external_nodes_for_re_minting.
+    await graph_client._migrate_v18_versions_moved_to_dependency_edge()
+
+    assert await _dependency_versions(graph_client, "test_app") == {"requests": "2.31.0"}
+    left = await graph_client.execute(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/pypi/requests'}}) RETURN ep.version AS version"
+    )
+    assert left[0]["version"] is None, "the stale node property is the one a not-yet-updated reader would pick"
+
+
+async def test_v20_drops_the_external_nodes_for_re_minting(graph_client: GraphClient):
+    """The composed outcome a real v17 graph gets: v18 moves the versions, then v20 deletes
+    the external nodes entirely so they can be re-minted under their ecosystem (ATL-194).
+
+    v18's work being discarded is not waste worth avoiding -- it is one cheap SET on nodes
+    that are about to go, and keeping the ladder's steps independent is worth more than
+    skipping it. What matters is that the DETACH takes the edges with the nodes, so nothing
+    is left pointing at a uid that no longer exists.
+    """
+    await graph_client.ensure_schema()
+    await _seed_importer(graph_client, "test_app", "requests")
+    await graph_client.execute_write(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/pypi/requests'}}) SET ep.version = '2.31.0'"
     )
     await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 17")
 
     await graph_client.ensure_schema()
 
-    assert await _dependency_versions(graph_client, "test_app") == {"requests": "2.31.0"}
-    left = await graph_client.execute(
-        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) RETURN ep.version AS version"
+    gone = await graph_client.execute(
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/pypi/requests'}}) RETURN ep.uid AS uid"
     )
-    assert left[0]["version"] is None, "the stale node property is the one a not-yet-updated reader would pick"
+    assert gone == [], "the external node survived v20"
+    assert await _dependency_versions(graph_client, "test_app") == {}, (
+        "a DEPENDS_ON edge outlived the node it pointed at"
+    )
     assert await graph_client.get_schema_version() == SCHEMA_VERSION
 
 
@@ -2839,16 +2918,21 @@ async def test_v18_migration_keeps_the_version_of_an_orphaned_package(graph_clie
     await graph_client.ensure_schema()
     await _seed_importer(graph_client, "test_app", "requests")
     await graph_client.execute_write(
-        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) SET ep.version = '2.31.0'"
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/pypi/requests'}}) SET ep.version = '2.31.0'"
     )
     await graph_client.execute_write(f"MATCH (p:{NodeLabel.PROJECT} {{uid: 'test_app'}}) DETACH DELETE p")
     await graph_client.execute_write(f"MATCH (sv:{NodeLabel.SCHEMA_VERSION}) SET sv.version = 17")
 
-    await graph_client.ensure_schema()
+    # Driven directly rather than through ensure_schema: a v17 graph now runs v18 and then
+    # v20, and v20 deletes every external node so it can be re-minted under its ecosystem
+    # (ATL-194). Through ensure_schema the edges v18 writes are gone before the assertions,
+    # with both migrations behaving exactly as designed. The composed outcome is asserted
+    # by test_v20_drops_the_external_nodes_for_re_minting.
+    await graph_client._migrate_v18_versions_moved_to_dependency_edge()
 
     assert await _dependency_versions(graph_client, "test_app") == {}
     kept = await graph_client.execute(
-        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/requests'}}) RETURN ep.version AS version"
+        f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: 'test_app:ext/pypi/requests'}}) RETURN ep.version AS version"
     )
     assert kept[0]["version"] == "2.31.0"
 
@@ -2876,7 +2960,7 @@ async def test_the_rewrite_only_touches_its_own_projects_importers(graph_client:
     entities, other_mod = _setup_module_node("test_other", "src/other.py")
     await graph_client.upsert_file_entities("test_other", "src/other.py", entities, [])
     await graph_client.merge_project_node("test_other")
-    stub_uid = "test_app:ext/shared"
+    stub_uid = "test_app:ext/pypi/shared"
     await graph_client.execute_write(
         f"MATCH (src:{NodeLabel.MODULE} {{uid: $src}}) "
         f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $ep}}) "
@@ -2956,7 +3040,7 @@ async def test_a_rewired_cross_project_stub_takes_its_version_edge_with_it(graph
     # The sibling's real Package is what makes the stub resolvable -- the cross-project
     # pass matches ExternalPackage.name against Package nodes.
     await graph_client.merge_package_node("test_lib", "shared", "shared", "shared/__init__.py")
-    await graph_client.update_external_package_versions("test_app", {"shared": "1.0.0"})
+    await graph_client.update_external_package_versions("test_app", {"pypi/shared": "1.0.0"})
     assert await _dependency_versions(graph_client, "test_app") == {"shared": "1.0.0"}
 
     # Asserting the rewire structurally, not by the return value: Memgraph's
@@ -3020,6 +3104,7 @@ async def test_resolve_imports_prefix_fallback_reexport(graph_client: GraphClien
             from_qualified_name=f"{project}:pkg.app",
             rel_type=RelType.IMPORTS,
             to_name="pkg.utils.reexported_helper",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
         ),
     ]
     await graph_client.resolve_imports(project, import_rels)
@@ -3070,6 +3155,7 @@ async def test_resolve_imports_prefix_fallback_python_only(graph_client: GraphCl
             from_qualified_name=f"{project}:src.App",
             rel_type=RelType.IMPORTS,
             to_name="System.Collections.Generic",
+            properties={IMPORT_ECOSYSTEM: "nuget"},
         ),
     ]
     await graph_client.resolve_imports(project, import_rels)
@@ -3085,7 +3171,7 @@ async def test_resolve_imports_prefix_fallback_python_only(graph_client: GraphCl
         "RETURN s.qualified_name AS qn",
         {"u": f"{project}:src.App"},
     )
-    assert [r["qn"] for r in ext] == ["ext/System.Collections.Generic"]
+    assert [r["qn"] for r in ext] == ["ext/nuget/System.Collections.Generic"]
 
 
 async def test_resolve_imports_from_package_node(graph_client: GraphClient):
@@ -3121,7 +3207,12 @@ async def test_resolve_imports_from_package_node(graph_client: GraphClient):
         await graph_client.upsert_file_entities(project, f"pkg/{mod_name}.py", entities, [])
 
     import_rels = [
-        ParsedRelationship(from_qualified_name=f"{project}:pkg", rel_type=RelType.IMPORTS, to_name="pkg.mod"),
+        ParsedRelationship(
+            from_qualified_name=f"{project}:pkg",
+            rel_type=RelType.IMPORTS,
+            to_name="pkg.mod",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
         ParsedRelationship(
             from_qualified_name=f"{project}:pkg",
             rel_type=RelType.IMPORTS,
@@ -3201,8 +3292,18 @@ async def test_cross_project_resolution_rewires_all_symbols(graph_client: GraphC
     app_entities, app_uid = _setup_module_node(proj_app, fp_app)
     await graph_client.upsert_file_entities(proj_app, fp_app, app_entities, [])
     import_rels = [
-        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="libpkg.func_one"),
-        ParsedRelationship(from_qualified_name=app_uid, rel_type=RelType.IMPORTS, to_name="libpkg.func_two"),
+        ParsedRelationship(
+            from_qualified_name=app_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="libpkg.func_one",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
+        ParsedRelationship(
+            from_qualified_name=app_uid,
+            rel_type=RelType.IMPORTS,
+            to_name="libpkg.func_two",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+        ),
     ]
     await graph_client.resolve_imports(proj_app, import_rels)
 
@@ -3329,6 +3430,7 @@ async def test_resolve_calls_via_import(graph_client: GraphClient):
             from_qualified_name=f"{project}:src.app",
             rel_type=RelType.IMPORTS,
             to_name="src.utils.helper",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
         ),
     ]
     await graph_client.resolve_imports(project, import_rels)
@@ -3618,6 +3720,7 @@ async def test_resolve_calls_constructor_via_import(graph_client: GraphClient):
             from_qualified_name=f"{project}:src.app",
             rel_type=RelType.IMPORTS,
             to_name="src.widget.Widget",
+            properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
         ),
     ]
     await graph_client.resolve_imports(project, import_rels)
@@ -5721,6 +5824,7 @@ async def test_config_ref_targets_are_never_treated_as_import_targets(graph_clie
                 from_qualified_name=reader.qualified_name,
                 rel_type=RelType.IMPORTS,
                 to_name="res/data/fixtures.json",
+                properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
             )
         ],
     )
@@ -7455,6 +7559,7 @@ async def _seed_import_scope(graph_client: GraphClient, project: str) -> None:
                 from_qualified_name=f"{project}:src.app",
                 rel_type=RelType.IMPORTS,
                 to_name="src.utils.helper",
+                properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
             )
         ],
     )
@@ -7568,7 +7673,9 @@ async def _seed_warehouse_import(client, project: str, table: str, warehouse_obj
                 from_qualified_name=table_uid,
                 rel_type=RelType.IMPORTS,
                 to_name=f"warehouse.{warehouse_object}",
-                properties={"via": "partition"},
+                # `parse_file` stamps this on real TMDL/SQL output (ATL-194); without it
+                # the stub mints under `ext/unknown/` and the resolver matches nothing.
+                properties={"via": "partition", IMPORT_ECOSYSTEM: "warehouse"},
             )
         ],
     )
@@ -7608,7 +7715,7 @@ async def _feeds_count(client, model_uid: str, table_uid: str) -> int:
 
 async def _warehouse_stubs(client) -> list[str]:
     rows = await client.execute(
-        f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL}) WHERE es.qualified_name STARTS WITH 'ext/warehouse.' "
+        f"MATCH (es:{NodeLabel.EXTERNAL_SYMBOL}) WHERE es.qualified_name STARTS WITH 'ext/warehouse/warehouse.' "
         "RETURN es.qualified_name AS qn ORDER BY qn"
     )
     return [r["qn"] for r in rows]
@@ -7624,7 +7731,7 @@ async def test_the_seeded_stub_has_the_shape_the_resolver_looks_for(graph_client
     """
     await graph_client.ensure_schema()
     await _seed_warehouse_import(graph_client, "bi", "Orders", "fct_orders")
-    assert await _warehouse_stubs(graph_client) == ["ext/warehouse.fct_orders"]
+    assert await _warehouse_stubs(graph_client) == ["ext/warehouse/warehouse.fct_orders"]
 
 
 async def test_a_dbt_model_feeds_the_bi_table_that_reads_it(graph_client: GraphClient):
@@ -7670,7 +7777,7 @@ async def test_an_unmatched_warehouse_object_keeps_its_stub(graph_client: GraphC
     await _seed_warehouse_import(graph_client, "bi", "Manual", "hand_built_thing")
 
     assert await graph_client.resolve_warehouse_objects(["bi"]) == 0
-    assert await _warehouse_stubs(graph_client) == ["ext/warehouse.hand_built_thing"]
+    assert await _warehouse_stubs(graph_client) == ["ext/warehouse/warehouse.hand_built_thing"]
 
 
 async def test_resolve_warehouse_objects_is_idempotent(graph_client: GraphClient):
@@ -7699,4 +7806,4 @@ async def test_a_stub_two_tables_read_survives_a_partial_match(graph_client: Gra
     await graph_client.resolve_warehouse_objects(["bi", "transform"])
 
     assert await _feeds_count(graph_client, model_uid, resolved) == 1
-    assert await _warehouse_stubs(graph_client) == ["ext/warehouse.no_such_model"]
+    assert await _warehouse_stubs(graph_client) == ["ext/warehouse/warehouse.no_such_model"]

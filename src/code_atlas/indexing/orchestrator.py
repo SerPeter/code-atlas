@@ -28,7 +28,12 @@ from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsume
 from code_atlas.indexing.stubs import read_package_stubs
 from code_atlas.parsing.ast import get_language_for_file
 from code_atlas.parsing.languages.python import module_qualified_name
-from code_atlas.schema import split_image_reference
+from code_atlas.schema import (
+    ECOSYSTEM_DOCKER,
+    ECOSYSTEM_PYPI,
+    external_qualified_name,
+    split_image_reference,
+)
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, EmbedPolicy
 from code_atlas.settings import EmbeddingSettings, derive_project_name, extraction_key, resolve_git_dir
 from code_atlas.telemetry import get_metrics, get_tracer
@@ -1757,46 +1762,57 @@ def _parse_compose_deps(text: str) -> dict[str, str]:
 
 
 # The dispatch table: adding an ecosystem is an entry here plus its parser.
-_MANIFEST_PARSERS: dict[str, ManifestParser] = {
-    "pyproject.toml": _parse_pyproject_deps,
-    "package.json": _parse_package_json_deps,
-    "Cargo.toml": _parse_cargo_toml_deps,
-    "go.mod": _parse_go_mod_deps,
-    "pom.xml": _parse_pom_xml_deps,
-    "build.gradle": _parse_gradle_deps,
-    "build.gradle.kts": _parse_gradle_deps,
-    "composer.json": _parse_composer_json_deps,
-    "Gemfile": _parse_gemfile_deps,
-    "Dockerfile": _parse_dockerfile_deps,
-    "docker-compose.yml": _parse_compose_deps,
-    "docker-compose.yaml": _parse_compose_deps,
-    "compose.yml": _parse_compose_deps,
-    "compose.yaml": _parse_compose_deps,
+_MANIFEST_PARSERS: dict[str, tuple[ManifestParser, str]] = {
+    "pyproject.toml": (_parse_pyproject_deps, ECOSYSTEM_PYPI),
+    "package.json": (_parse_package_json_deps, "npm"),
+    "Cargo.toml": (_parse_cargo_toml_deps, "crates"),
+    "go.mod": (_parse_go_mod_deps, "go"),
+    "pom.xml": (_parse_pom_xml_deps, "maven"),
+    "build.gradle": (_parse_gradle_deps, "maven"),
+    "build.gradle.kts": (_parse_gradle_deps, "maven"),
+    "composer.json": (_parse_composer_json_deps, "packagist"),
+    "Gemfile": (_parse_gemfile_deps, "rubygems"),
+    "Dockerfile": (_parse_dockerfile_deps, ECOSYSTEM_DOCKER),
+    "docker-compose.yml": (_parse_compose_deps, ECOSYSTEM_DOCKER),
+    "docker-compose.yaml": (_parse_compose_deps, ECOSYSTEM_DOCKER),
+    "compose.yml": (_parse_compose_deps, ECOSYSTEM_DOCKER),
+    "compose.yaml": (_parse_compose_deps, ECOSYSTEM_DOCKER),
 }
+"""Filename -> (parser, the ecosystem whose names it declares).
+
+The ecosystem is the table's business, not each parser's: a `Gemfile` declares gems and
+nothing else, and threading the constant through nine parsers would be nine chances to
+pass the wrong one. Each parser still returns bare names; `_parse_dependency_versions`
+qualifies them.
+"""
 
 
-def register_manifest_parser(filename: str, parser: ManifestParser) -> None:
+def register_manifest_parser(filename: str, parser: ManifestParser, ecosystem: str) -> None:
     """Register a dependency-manifest parser under its exact filename.
 
-    Extension point for ecosystems outside the built-in table; the parser takes
-    the manifest text and returns import-space name → version constraint.
+    Extension point for ecosystems outside the built-in table; the parser takes the
+    manifest text and returns import-space name → version constraint, and *ecosystem*
+    says which registry those names live in (ATL-194) — it has to match what the language's
+    parser stamps on an import, or the declaration joins to no node.
     """
-    _MANIFEST_PARSERS[filename] = parser
-    logger.debug("Registered manifest parser: {}", filename)
+    _MANIFEST_PARSERS[filename] = (parser, ecosystem)
+    logger.debug("Registered manifest parser: {} ({})", filename, ecosystem)
 
 
 def _parse_dependency_versions(project_root: Path) -> dict[str, str]:
     """Extract package name → version constraint from every known manifest in *project_root*.
 
-    Unknown filenames are simply never probed. A manifest that fails to parse is
-    skipped, not fatal. A key claimed with different constraints by two
-    manifests (a polyglot root declaring the same name in two ecosystems) is
-    dropped — there is one language-blind ExternalPackage node per name, so
-    picking a winner would be a coin flip.
+    Keys are ``{ecosystem}/{name}`` (ATL-194), matching the tail of the node's
+    ``qualified_name`` so a caller addresses it as ``{project}:ext/{key}``.
+
+    Unknown filenames are simply never probed. A manifest that fails to parse is skipped,
+    not fatal. A key claimed with different constraints by two manifests is still dropped
+    — but that now means *the same ecosystem* claiming a name twice, which really is
+    unanswerable. Two ecosystems naming the same package no longer collide at all.
     """
     versions: dict[str, str] = {}
     conflicting: set[str] = set()
-    for filename, parser in _MANIFEST_PARSERS.items():
+    for filename, (parser, ecosystem) in _MANIFEST_PARSERS.items():
         manifest = project_root / filename
         if not manifest.is_file():
             continue
@@ -1806,7 +1822,12 @@ def _parse_dependency_versions(project_root: Path) -> dict[str, str]:
             logger.debug("Skipping unparsable manifest {}: {}", manifest, exc)
             continue
         for name, constraint in parsed.items():
-            _record_version(versions, conflicting, name, constraint)
+            # Keyed `{ecosystem}/{name}`, which is exactly the tail of the node's
+            # qualified_name -- so the caller's `{project}:ext/{key}` still addresses it
+            # with no further work. It is also what makes the collapse below correct
+            # rather than lossy: before ATL-194 a `redis` in pyproject and a `redis:7` in
+            # a compose file were one key with two constraints, and BOTH were dropped.
+            _record_version(versions, conflicting, f"{ecosystem}/{name}", constraint)
     for name in conflicting:
         del versions[name]
     if conflicting:
@@ -2398,18 +2419,26 @@ async def _index_external_stubs(settings: AtlasSettings, graph: GraphClient, pro
     if not settings.libraries.stubs:
         return 0
     packages = await graph.get_package_dependents(limit=10_000)
-    names = [p["package"] for p in packages if p["package"]]
+    # Only the Python ecosystem can be stubbed from this process: `find_spec` searches
+    # *this* interpreter's path, so a gem, a crate or an image resolves to nothing no
+    # matter what. Before ATL-194 that was discovered one failed `find_spec` at a time;
+    # the ecosystem makes it a filter (85 rubygems and 4 docker names skipped here).
+    names = [p["package"] for p in packages if p["package"] and p.get("ecosystem") == ECOSYSTEM_PYPI]
     if not names:
         return 0
 
-    known = await graph.get_stubbed_package_versions(project_name)
+    # `known` is keyed `{ecosystem}/{name}`; the stub reader speaks bare import names.
+    stubbed = await graph.get_stubbed_package_versions(project_name)
+    prefix = f"{ECOSYSTEM_PYPI}/"
+    known = {q.removeprefix(prefix): v for q, v in stubbed.items() if q.startswith(prefix)}
     results = read_package_stubs(names, settings.libraries, known)
     written = 0
     for name, result in results.items():
+        qualified = external_qualified_name(ECOSYSTEM_PYPI, name).removeprefix("ext/")
         symbols = [
             {
-                "uid": f"{project_name}:ext/{name}.{symbol.name}",
-                "qualified_name": f"ext/{name}.{symbol.name}",
+                "uid": f"{project_name}:ext/{qualified}.{symbol.name}",
+                "qualified_name": f"ext/{qualified}.{symbol.name}",
                 "name": symbol.name,
                 "kind": symbol.kind,
                 "signature": symbol.signature,
@@ -2419,7 +2448,7 @@ async def _index_external_stubs(settings: AtlasSettings, graph: GraphClient, pro
         ]
         try:
             written += await graph.upsert_external_stubs(
-                project_name, name, symbols, version=result.target.version, source=result.target.kind
+                project_name, qualified, symbols, version=result.target.version, source=result.target.kind
             )
         except Exception as exc:
             logger.warning("Stub write failed for '{}': {}", name, exc)

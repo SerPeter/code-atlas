@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 19
+SCHEMA_VERSION: int = 20
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -394,6 +394,7 @@ a Kubernetes container image are `docker`, a workflow `uses:` is `actions`, all 
 file whose own ecosystem is nothing in particular.
 """
 
+ECOSYSTEM_PYPI = "pypi"
 ECOSYSTEM_DOCKER = "docker"
 ECOSYSTEM_ACTIONS = "actions"
 ECOSYSTEM_UNKNOWN = "unknown"
@@ -584,7 +585,7 @@ majority — 94 of 132 references in the measured corpus.
 # re-parse of every project. Deliberately NOT SCHEMA_VERSION either: an extraction change
 # and a schema change are different events, and coupling them makes each pay the other's
 # cost, most sharply the vector-index drop and rebuild every schema migration performs.
-EXTRACTION_EPOCH: int = 10
+EXTRACTION_EPOCH: int = 11
 
 
 # ---------------------------------------------------------------------------

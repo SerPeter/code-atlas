@@ -8,7 +8,7 @@ every embedded deployment.
 Every fixture seeds through `resolve_imports`, never by writing an ExternalSymbol by hand.
 That is deliberate: the first version of the Memgraph tests hand-built the stub with
 `qualified_name = "warehouse.<obj>"`, passed, and matched nothing against a real index —
-because `resolve_imports` mints external stubs under `ext/`. The fixtures and the code
+because `resolve_imports` mints external stubs under `ext/{ecosystem}/` (ATL-194). The fixtures and the code
 agreed about a shape neither the parser nor the graph ever produces.
 """
 
@@ -20,7 +20,7 @@ import pytest
 
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
-from code_atlas.schema import NodeLabel, RelType, Visibility
+from code_atlas.schema import IMPORT_ECOSYSTEM, NodeLabel, RelType, Visibility
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -53,7 +53,10 @@ async def _seed_warehouse_import(client: SqliteGraphClient, project: str, table:
                 from_qualified_name=uid,
                 rel_type=RelType.IMPORTS,
                 to_name=f"warehouse.{obj}",
-                properties={"via": "partition"},
+                # `parse_file` stamps this on real TMDL/SQL output (ATL-194); a fixture
+                # that omits it mints `ext/unknown/...` and matches nothing, which is the
+                # same class of agreed-on-a-wrong-shape this module's docstring warns about.
+                properties={"via": "partition", IMPORT_ECOSYSTEM: "warehouse"},
             )
         ],
     )
@@ -88,7 +91,7 @@ async def _stubs(client: SqliteGraphClient) -> list[str]:
         for r in await _rows(
             client,
             "SELECT qualified_name FROM nodes WHERE labels = 'ExternalSymbol' "
-            "AND qualified_name LIKE 'ext/warehouse.%' ORDER BY qualified_name",
+            "AND qualified_name LIKE 'ext/warehouse/warehouse.%' ORDER BY qualified_name",
         )
     ]
 
@@ -104,7 +107,7 @@ async def test_the_seeded_stub_has_the_shape_the_resolver_looks_for(client):
     """A guard on the fixtures, not the resolver: everything below is worth its runtime
     only if the stub it seeds is the one a real index produces."""
     await _seed_warehouse_import(client, "bi", "Orders", "fct_orders")
-    assert await _stubs(client) == ["ext/warehouse.fct_orders"]
+    assert await _stubs(client) == ["ext/warehouse/warehouse.fct_orders"]
 
 
 async def test_a_dbt_model_feeds_the_bi_table_that_reads_it(client):
@@ -168,7 +171,7 @@ async def test_grading_writes_confidence_onto_the_surviving_edge(client):
 async def test_an_unmatched_object_keeps_its_stub(client):
     await _seed_warehouse_import(client, "bi", "Manual", "hand_built_thing")
     assert await client.resolve_warehouse_objects(["bi"]) == 0
-    assert await _stubs(client) == ["ext/warehouse.hand_built_thing"]
+    assert await _stubs(client) == ["ext/warehouse/warehouse.hand_built_thing"]
 
 
 async def test_it_is_idempotent(client):
@@ -190,7 +193,7 @@ async def test_a_stub_two_tables_read_survives_a_partial_match(client):
     await client.resolve_warehouse_objects(["bi", "transform"])
 
     assert await _feeds(client) == [(model, resolved)]
-    assert await _stubs(client) == ["ext/warehouse.no_such_model"]
+    assert await _stubs(client) == ["ext/warehouse/warehouse.no_such_model"]
 
 
 async def test_a_snapshot_produces_a_warehouse_object_too(client):

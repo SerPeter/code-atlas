@@ -1195,7 +1195,9 @@ class MapViewService:
                     continue
                 nodes_all[key] = {
                     "uid": str(row.get("uid") or ""),
-                    "name": str(row.get("name") or "") or ext_qn.removeprefix("ext/"),
+                    # The qualified tail (`pypi/redis`), not the bare name: since ATL-194 one
+                    # name from two ecosystems is two nodes, and the map must tell them apart.
+                    "name": ext_qn.removeprefix("ext/"),
                     "qn": ext_qn,
                     "file_path": "",
                     "project": project,

@@ -1439,7 +1439,10 @@ async def _run_deps(package: str, shared: bool, limit: int, no_stdlib: bool) -> 
         stdlib_shown = sum(1 for r in rows if r["stdlib"])
         for row in rows:
             marker = "  [stdlib]" if row["stdlib"] else ""
-            typer.echo(f"{row['package']}{marker}  ({row['project_count']} project(s))")
+            # The ecosystem is printed because it is half the identity (ATL-194): without
+            # it, `redis` the client and `redis` the image are two identical-looking rows.
+            ecosystem = f" [{row['ecosystem']}]" if row.get("ecosystem") else ""
+            typer.echo(f"{row['package']}{ecosystem}{marker}  ({row['project_count']} project(s))")
             for p in row["projects"]:
                 version = p["version"] or "-"
                 typer.echo(f"    {p['project']:<38} {version:<14} {p['import_sites']} import(s)")
