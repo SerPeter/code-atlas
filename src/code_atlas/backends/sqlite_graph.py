@@ -77,6 +77,7 @@ from code_atlas.graph.client import (
     _call_edge_weight,
     _CallEdgeFacts,
     _CallLookup,
+    _checked_edge_weight,
     _citation_key,
     _CitationLookup,
     _combine_call_edge_facts,
@@ -313,7 +314,7 @@ def _props_weight(props: dict[str, Any]) -> float:
     value = props.get("weight")
     if isinstance(value, bool) or not isinstance(value, int | float):
         return _DEFAULT_EDGE_WEIGHT
-    return float(value)
+    return _checked_edge_weight(float(value))
 
 
 def _prefix_clause(column: str, path: str) -> tuple[str, list[Any]]:
@@ -3945,15 +3946,15 @@ class SqliteGraphClient:
         shortest path, so keeping the best-scoring prefix per node at its
         min-depth level is a correct DP over shortest paths.
         """
-        if from_uid == to_uid:
-            return None
         type_placeholders = ",".join("?" * len(edge_types))
         parent: dict[str, tuple[str, str, dict[str, Any]]] = {}
         best: dict[str, float] = {from_uid: 1.0}
         visited = {from_uid}
         frontier = [from_uid]
         for _ in range(max_depth):
-            if not frontier or to_uid in visited:
+            # `to_uid in parent`, not `in visited`: from == to is visited before any hop, and
+            # a trace from a node to itself is its shortest cycle, as on Memgraph.
+            if not frontier or to_uid in parent:
                 break
             f_placeholders = ",".join("?" * len(frontier))
             cur = await conn.execute(
@@ -3965,7 +3966,7 @@ class SqliteGraphClient:
             await cur.close()
             level_best: dict[str, float] = {}
             for f_uid, t_uid, rel_type, props_json in rows:
-                if t_uid in visited:
+                if t_uid in visited and t_uid != to_uid:
                     continue
                 props = json.loads(props_json) if props_json else {}
                 score = best[f_uid] * _props_weight(props)
@@ -3981,7 +3982,7 @@ class SqliteGraphClient:
             return None
         path: list[tuple[str, str, str, dict[str, Any]]] = []
         cur_node = to_uid
-        while cur_node != from_uid:
+        while not path or cur_node != from_uid:
             p_uid, rel_type, props = parent[cur_node]
             path.append((p_uid, cur_node, rel_type, props))
             cur_node = p_uid
@@ -4040,6 +4041,10 @@ class SqliteGraphClient:
                 hop["weight"] = props["weight"]
             if "from_test" in props:
                 hop["from_test"] = props["from_test"]
+            if props.get("line") is not None:
+                hop["at_line"] = props["line"]
+                if props.get("site_count", 1) > 1:
+                    hop["site_count"] = props["site_count"]
             path_weight *= _props_weight(props)
             hops.append(hop)
         return {
@@ -4062,6 +4067,7 @@ class SqliteGraphClient:
         *,
         resolved_only: bool = False,
         production_only: bool = False,
+        include_start: bool = False,
     ) -> dict[str, tuple[int, float]]:
         """BFS from *uid* following ``src_col -> dst_col`` edges.
 
@@ -4078,6 +4084,9 @@ class SqliteGraphClient:
         only traverses edges not tagged ``from_test``. Those two filtered passes
         back ``compute_blast_radius``'s ``ambiguous_only``/``test_only`` flags
         and ignore the returned weights.
+
+        *include_start* reports *uid* itself when a cycle through it fits *max_depth*:
+        a recursive function is its own caller. Blast radius leaves it out.
         """
         type_placeholders = ",".join("?" * len(edge_types))
         filter_clause = ""
@@ -4106,9 +4115,9 @@ class SqliteGraphClient:
             await cur.close()
             next_frontier: dict[str, float] = {}
             for src, dst, edge_weight in rows:
-                if dst == uid:
+                if dst == uid and not include_start:
                     continue
-                score = frontier[src] * float(edge_weight)
+                score = frontier[src] * _checked_edge_weight(float(edge_weight))
                 prior = reached.get(dst)
                 if prior is None:
                     reached[dst] = (depth, score)
@@ -4907,7 +4916,7 @@ class SqliteGraphClient:
         conn = await self._get_conn()
         if not await self._label_matches(conn, uid, label):
             return []
-        reached = await self._bfs_reachable(conn, uid, "to_uid", "from_uid", ("CALLS",), call_depth)
+        reached = await self._bfs_reachable(conn, uid, "to_uid", "from_uid", ("CALLS",), call_depth, include_start=True)
         if not reached:
             return []
         uids = list(reached)
@@ -4926,7 +4935,7 @@ class SqliteGraphClient:
         conn = await self._get_conn()
         if not await self._label_matches(conn, uid, label):
             return []
-        reached = await self._bfs_reachable(conn, uid, "from_uid", "to_uid", ("CALLS",), call_depth)
+        reached = await self._bfs_reachable(conn, uid, "from_uid", "to_uid", ("CALLS",), call_depth, include_start=True)
         if not reached:
             return []
         uids = list(reached)

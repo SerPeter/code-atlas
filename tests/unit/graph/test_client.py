@@ -14,6 +14,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from tenacity import wait_none
 
 from code_atlas.graph.client import (
@@ -25,12 +27,14 @@ from code_atlas.graph.client import (
     _TYPE_REF_FACTS,
     _TYPE_REF_RANK,
     _UID_ROUTED_REL_TYPES,
+    _UNVERIFIED_STRATEGIES,
     GraphClient,
     QueryTimeoutError,
     _active_tx_var,
     _call_edge_weight,
     _CallEdgeFacts,
     _CallLookup,
+    _checked_edge_weight,
     _combine_call_edge_facts,
     _direct_call_lines,
     _format_path_hops,
@@ -521,6 +525,27 @@ class TestCallEdgeWeight:
             for from_test in (False, True):
                 assert _call_edge_weight(count, from_test=from_test) > 0.0
 
+    @given(
+        candidate_count=st.integers(min_value=-(10**12), max_value=10**12),
+        from_test=st.booleans(),
+        strategy=st.one_of(st.sampled_from(sorted(_UNVERIFIED_STRATEGIES)), st.text(max_size=20)),
+    )
+    def test_weight_is_always_in_the_range_traversals_require(self, candidate_count, from_test, strategy):
+        """(0, 1] for every input: WSHORTEST ranks by -log(weight), and blast radius and trace
+        are exact only while no weight exceeds 1 (a cycle then never raises a product)."""
+        weight = _call_edge_weight(candidate_count, from_test, strategy)
+        assert 0.0 < weight <= 1.0
+
+    @pytest.mark.parametrize("bad", [0.0, -0.5, 1.0000001, 2.0, float("nan"), float("inf"), float("-inf")])
+    def test_a_weight_outside_the_range_is_refused_not_clamped(self, bad):
+        with pytest.raises(ValueError, match=r"outside \(0, 1\]"):
+            _checked_edge_weight(bad)
+
+    def test_every_constant_weight_is_in_range(self):
+        for _confidence, weight in _TYPE_REF_FACTS.values():
+            assert _checked_edge_weight(weight) == weight
+        assert _checked_edge_weight(_INFERRED_IMPLEMENTS_WEIGHT) == _INFERRED_IMPLEMENTS_WEIGHT
+
 
 class TestCombineCallEdgeFacts:
     """_combine_call_edge_facts (client.py) — N call sites collapse to one edge.
@@ -926,7 +951,11 @@ class TestResolveCallsEdgeProperties:
 
 
 class TestWeightAwareTraversalQueries:
-    """trace_path_between / compute_blast_radius Cypher — the weight-aware parts."""
+    """trace_path_between / compute_blast_radius Cypher — the weight-aware parts.
+
+    Query text only. Whether these shapes return what the all-paths queries they replaced
+    did is pinned against Memgraph in tests/integration/graph/test_traversal_equivalence.py.
+    """
 
     async def test_trace_path_breaks_equal_hop_ties_by_path_weight(self, tmp_path: Path):
         client = _client_with_fake_execute(tmp_path)
@@ -935,9 +964,12 @@ class TestWeightAwareTraversalQueries:
         await client.trace_path_between("p:a", "p:b", 4, ("CALLS", "IMPORTS"))
 
         query = client.execute.call_args_list[1][0][0]
-        assert "coalesce(r.weight, 1.0)" in query
-        assert "AS path_weight" in query
-        assert "ORDER BY hops, path_weight DESC" in query
+        # Hop count first, from a BFS bounded by max_depth ...
+        assert "[:CALLS|IMPORTS *BFS ..4]" in query
+        # ... then the best weight among paths of exactly that length.
+        assert "*WSHORTEST h (r, n | CASE WHEN assert(coalesce(r.weight, 1.0) > 0" in query
+        assert "coalesce(r.weight, 1.0)) AS path_weight" in query
+        assert "*1.." not in query
 
     async def test_trace_path_reports_no_path_weight_when_no_path_exists(self, tmp_path: Path):
         client = _client_with_fake_execute(tmp_path)
@@ -953,50 +985,70 @@ class TestWeightAwareTraversalQueries:
         client.execute.side_effect = [
             [
                 {
-                    "uid": "p:x",
-                    "name": "x",
-                    "qn": "m.x",
-                    "label": "Callable",
-                    "file_path": "m.py",
-                    "min_depth": 1,
-                    "confidence_score": 0.25,
+                    "reached": [
+                        {
+                            "uid": "p:x",
+                            "name": "x",
+                            "qn": "m.x",
+                            "label": "Callable",
+                            "file_path": "m.py",
+                            "kind": "function",
+                            "min_depth": 1,
+                        }
+                    ],
+                    "resolved": [],
+                    "production": [],
+                    "scores": [["p:x", 0.25]],
+                    "typed": [["p:x", "CALLS"]],
+                    "direct": [["p:x", "CALLS", 12]],
+                    "returns": [],
                 }
-            ],
-            [],
-            [],
+            ]
         ]
 
         results = await client.compute_blast_radius("p:a", "in", ("CALLS",), 3)
 
-        all_query, resolved_query, production_query = (c[0][0] for c in client.execute.call_args_list)
-        assert "max(reduce(w = 1.0" in all_query
-        assert "coalesce(r.weight, 1.0)" in all_query
-        assert "AS confidence_score" in all_query
+        (query,) = (c[0][0] for c in client.execute.call_args_list)
+        assert "*WSHORTEST 3 (r, n | CASE WHEN assert(coalesce(r.weight, 1.0) > 0" in query
         # coalesce, not a bare equality: an absent confidence means STRUCTURAL (ADR-0028),
         # and since blast_radius widened past CALLS most hops legitimately carry none. A
         # bare `r.confidence = 'resolved'` marked every one of them ambiguous.
-        assert "coalesce(r.confidence, 'resolved') = 'resolved'" in resolved_query
-        assert "NOT coalesce(r.from_test, false)" in production_query
+        assert "*BFS ..3 (r, n | coalesce(r.confidence, 'resolved') = 'resolved')" in query
+        assert "*BFS ..3 (r, n | NOT coalesce(r.from_test, false))" in query
+        # One expansion per edge type for `via`, never one per first-hop edge.
+        assert "UNWIND $types AS t" in query
+        assert "(r, n, p | size(relationships(p)) > 1 OR type(r) = t)" in query
+        assert "*1.." not in query
         assert results[0]["confidence_score"] == 0.25
         assert results[0]["ambiguous_only"] is True
         assert results[0]["test_only"] is True
+        assert results[0]["via"] == ["CALLS"]
+        assert results[0]["at_lines"] == [12]
 
     async def test_blast_radius_clears_the_flags_when_a_clean_path_exists(self, tmp_path: Path):
         client = _client_with_fake_execute(tmp_path)
         client.execute.side_effect = [
             [
                 {
-                    "uid": "p:x",
-                    "name": "x",
-                    "qn": "m.x",
-                    "label": "Callable",
-                    "file_path": "m.py",
-                    "min_depth": 1,
-                    "confidence_score": 1.0,
+                    "reached": [
+                        {
+                            "uid": "p:x",
+                            "name": "x",
+                            "qn": "m.x",
+                            "label": "Callable",
+                            "file_path": "m.py",
+                            "kind": "function",
+                            "min_depth": 2,
+                        }
+                    ],
+                    "resolved": ["p:x"],
+                    "production": ["p:x"],
+                    "scores": [["p:x", 1.0]],
+                    "typed": [["p:x", "CALLS"]],
+                    "direct": [["p:x", "CALLS", 12]],
+                    "returns": [],
                 }
-            ],
-            [{"uid": "p:x"}],
-            [{"uid": "p:x"}],
+            ]
         ]
 
         results = await client.compute_blast_radius("p:a", "in", ("CALLS",), 3)
@@ -1004,6 +1056,8 @@ class TestWeightAwareTraversalQueries:
         assert results[0]["ambiguous_only"] is False
         assert results[0]["test_only"] is False
         assert results[0]["confidence_score"] == 1.0
+        # Deeper than one hop, the first hop's line belongs to another file.
+        assert "at_lines" not in results[0]
 
 
 class TestCrossLanguageCandidateHygiene:
