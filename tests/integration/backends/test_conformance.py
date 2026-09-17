@@ -69,6 +69,7 @@ _COMPARED: frozenset[str] = frozenset(
         "get_callees",
         "get_dead_code_candidates",
         "compute_blast_radius",
+        "trace_path_between",
         "get_project_file_paths",
         "read_embed_hashes",
         "find_embeddings_by_hash",
@@ -183,7 +184,6 @@ _NOT_COMPARED: dict[str, str] = {
     "get_quality_data": "not yet compared",
     "get_patterns_data": "not yet compared",
     "get_git_signals_data": "not yet compared",
-    "trace_path_between": "not yet compared",
     "get_project_status": "not yet compared",
     "get_project_git_hash": "not yet compared",
     "get_project_extraction_key": "not yet compared",
@@ -1321,6 +1321,98 @@ class TestTheDefectsThatMotivatedThis:
         assert a == b, f"only in memgraph: {a - b}; only in sqlite: {b - a}"
         assert not any("registered" in k for k in b), "a decorated callable is registered, not dead"
         assert any("orphan" in k for k in b), "an unreferenced function must still be reported"
+
+
+CYCLE_PROJECT = "cycleproj"
+
+
+def _cycle_corpus() -> tuple[list[ParsedEntity], list[ParsedRelationship]]:
+    """Recursion and mutual recursion: the shapes where "is X its own caller?" and "trace
+    X to X" have an answer. `ping`/`pong` call each other, `a -> b -> c -> a` is a
+    three-cycle with an exit to `d`, and `lone` has no edges at all. `rec` calls itself, but
+    `resolve_calls` never resolves a call to its own caller, so no self-loop exists on
+    either backend -- it is kept to pin that both agree it is not its own caller."""
+    names = ("rec", "ping", "pong", "a", "b", "c", "d", "lone")
+    entities = [
+        _entity("mod", f"{CYCLE_PROJECT}:mod", label=NodeLabel.MODULE, kind="module"),
+        *(_entity(n, f"{CYCLE_PROJECT}:mod.{n}") for n in names),
+    ]
+    calls = [("rec", "rec", 4), ("ping", "pong", 5), ("pong", "ping", 6), ("a", "b", 7), ("b", "c", 8)]
+    calls += [("c", "a", 9), ("a", "d", 10)]
+    rels = [
+        ParsedRelationship(
+            from_qualified_name=f"{CYCLE_PROJECT}:mod.{src}",
+            rel_type=RelType.CALLS,
+            to_name=dst,
+            properties={"line": line},
+        )
+        for src, dst, line in calls
+    ]
+    return entities, rels
+
+
+@pytest.fixture
+async def cycle_both(graph_client, tmp_path: Path):
+    """Both backends holding `_cycle_corpus`, CALLS resolved."""
+    sqlite = SqliteGraphClient(tmp_path / "cycle.sqlite3")
+    entities, rels = _cycle_corpus()
+    for client in (graph_client, sqlite):
+        await client.ensure_schema()
+        await client.upsert_file_entities(CYCLE_PROJECT, "mod.py", entities, rels)
+        await client.resolve_calls(CYCLE_PROJECT, rels)
+    try:
+        yield graph_client, sqlite
+    finally:
+        await sqlite.close()
+
+
+class TestCyclesAgree:
+    """A recursive function IS its own caller and callee when the cycle fits the depth, and
+    a trace from a node to itself returns its shortest cycle. SQLite used to say neither."""
+
+    @staticmethod
+    def _uid(name: str) -> str:
+        return f"{CYCLE_PROJECT}:mod.{name}"
+
+    async def test_trace_path_between(self, cycle_both):
+        mg, lite = cycle_both
+        found = 0
+        pairs = [("rec", "rec"), ("ping", "ping"), ("pong", "ping"), ("a", "a"), ("a", "c"), ("c", "d")]
+        pairs += [("d", "a"), ("lone", "lone"), ("a", "missing")]
+        for src, dst in pairs:
+            for depth in (1, 2, 3, 4):
+                a = await mg.trace_path_between(self._uid(src), self._uid(dst), depth, ("CALLS",))
+                b = await lite.trace_path_between(self._uid(src), self._uid(dst), depth, ("CALLS",))
+                assert a == b, f"trace {src} -> {dst} depth={depth}\n  memgraph={a}\n  sqlite  ={b}"
+                found += bool(a["found"])
+        assert found >= 12, f"only {found} traces found a path, so the comparison says little"
+        ping = await lite.trace_path_between(self._uid("ping"), self._uid("ping"), 2, ("CALLS",))
+        assert ping["found"], "mutual recursion is a two-hop cycle"
+        assert [h["at_line"] for h in ping["hops"]] == [5, 6]
+        three = await lite.trace_path_between(self._uid("a"), self._uid("a"), 3, ("CALLS",))
+        assert three["hop_count"] == 3
+        assert not (await lite.trace_path_between(self._uid("a"), self._uid("a"), 2, ("CALLS",)))["found"]
+
+    async def test_callers_and_callees_include_the_recursive_function(self, cycle_both):
+        mg, lite = cycle_both
+        for name in ("rec", "ping", "a", "d", "lone"):
+            for depth in (1, 2, 3):
+                for method in ("get_callers", "get_callees"):
+                    a = _ranked_uids(await getattr(mg, method)(self._uid(name), "", depth, 20))
+                    b = _ranked_uids(await getattr(lite, method)(self._uid(name), "", depth, 20))
+                    assert a == b, f"{method}({name}, depth={depth})\n  memgraph={a}\n  sqlite  ={b}"
+        assert self._uid("a") in _ranked_uids(await lite.get_callers(self._uid("a"), "", 3, 20))
+        assert self._uid("ping") not in _ranked_uids(await lite.get_callees(self._uid("ping"), "", 1, 20))
+        assert self._uid("ping") in _ranked_uids(await lite.get_callees(self._uid("ping"), "", 2, 20))
+
+    async def test_blast_radius_never_reports_the_entity_itself(self, cycle_both):
+        mg, lite = cycle_both
+        for name in ("rec", "ping", "a"):
+            for direction in ("out", "in"):
+                a = _uids(await mg.compute_blast_radius(self._uid(name), direction, ("CALLS",), 3))
+                b = _uids(await lite.compute_blast_radius(self._uid(name), direction, ("CALLS",), 3))
+                assert a == b, f"{name} {direction}: only in memgraph: {a - b}; only in sqlite: {b - a}"
+                assert self._uid(name) not in b
 
 
 class TestOutOfScopeRefuses:

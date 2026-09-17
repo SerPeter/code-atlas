@@ -597,6 +597,13 @@ def _build_graph_search_query(
     )
 
 
+def _without_embedding(props: dict[str, Any]) -> dict[str, Any]:
+    """A node map as ``n {.*, embedding: null}`` returns it, minus that null key."""
+    node = {k: v for k, v in props.items() if k != "embedding"}
+    node["_labels"] = sorted(node.get("_labels") or [])
+    return node
+
+
 def _format_path_hops(path_nodes: list[Any], path_rels: list[Any]) -> list[dict[str, Any]]:
     """Render a Cypher path's nodes/relationships into per-hop dicts for ``trace_path_between``.
 
@@ -1573,6 +1580,33 @@ _MIN_CALL_WEIGHT = 1e-6
 # written before this change).
 _DEFAULT_EDGE_WEIGHT = 1.0
 
+
+def _checked_edge_weight(weight: float) -> float:
+    """*weight*, if it is in (0, 1]; raise otherwise. Every written ``weight`` passes here.
+
+    The traversals depend on the range, not just on a sign. ``trace_path_between`` and
+    ``compute_blast_radius`` find the best weight product with ``*WSHORTEST`` over
+    ``-log(weight)``, which needs ``weight > 0``; and they are exact only because no
+    weight exceeds 1, so a cycle can never raise a product and the best path is a simple
+    one. A clamp would hide the writer that broke that, so this refuses instead. NaN
+    fails the comparison and is refused too.
+    """
+    if not 0.0 < weight <= 1.0:
+        msg = f"edge weight {weight!r} is outside (0, 1]; traversals rank by it and require that range"
+        raise ValueError(msg)
+    return weight
+
+
+# The WSHORTEST cost of one hop. `assert` makes a stored weight outside (0, 1] fail the
+# query instead of mis-ranking: a weight of 0 costs +inf and is silently kept, one above 1
+# costs less than nothing. Evaluated only for the edges the expansion relaxes -- exactly the
+# ones whose weight can change the answer -- so it adds a comparison per edge and no scan.
+_WEIGHT_COST_LAMBDA = (
+    f"(r, n | CASE WHEN assert(coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}) > 0 "
+    f"AND coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}) <= 1, 'edge weight outside (0, 1]') "
+    f"THEN -log(coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT})) END)"
+)
+
 # How far vector search will re-ask when a polluted index crowds live rows out of the
 # page. Bounded rather than open-ended: each escalation is another index scan, and an
 # index that is mostly tombstones is a re-index problem, not something to page through.
@@ -1722,9 +1756,9 @@ def _test_callable_uids(lk: _CallLookup, patterns: list[str]) -> frozenset[str]:
 # "at best an even split between the name and something outside the graph", and that is as
 # true of a type annotation as of a receiver.
 _TYPE_REF_FACTS: dict[str, tuple[str, float]] = {
-    "import": ("resolved", _CALL_WEIGHT_BASE),
-    "same_file": ("resolved", _CALL_WEIGHT_BASE),
-    "project_unique": ("ambiguous", _CALL_WEIGHT_BASE * _CALL_WEIGHT_UNVERIFIED_DAMPING),
+    "import": ("resolved", _checked_edge_weight(_CALL_WEIGHT_BASE)),
+    "same_file": ("resolved", _checked_edge_weight(_CALL_WEIGHT_BASE)),
+    "project_unique": ("ambiguous", _checked_edge_weight(_CALL_WEIGHT_BASE * _CALL_WEIGHT_UNVERIFIED_DAMPING)),
 }
 # Strongest first — one (source, target) pair can be resolved by several rels, and the best
 # evidence should describe the single stored edge (mirrors _combine_call_edge_facts).
@@ -1735,7 +1769,7 @@ _TYPE_REF_RANK = ("import", "same_file", "project_unique")
 # best evidence available and may not claim to be a fact. ADR-0025 measured it at 20 of 20
 # here, which argues this tier is too harsh; used anyway rather than minting a third,
 # unmeasured tier. Retune when there is evidence about what ranks well.
-_INFERRED_IMPLEMENTS_WEIGHT = _CALL_WEIGHT_BASE * _CALL_WEIGHT_UNVERIFIED_DAMPING
+_INFERRED_IMPLEMENTS_WEIGHT = _checked_edge_weight(_CALL_WEIGHT_BASE * _CALL_WEIGHT_UNVERIFIED_DAMPING)
 
 # Callable/TypeDef kinds that denote *invocable code*, i.e. entities for which
 # "nothing calls this" is evidence rather than a tautology.
@@ -1795,7 +1829,7 @@ def _call_edge_weight(candidate_count: int, from_test: bool, strategy: str = "")
         weight *= _CALL_WEIGHT_UNVERIFIED_DAMPING
     if from_test:
         weight *= _CALL_WEIGHT_TEST_DAMPING
-    return max(weight, _MIN_CALL_WEIGHT)
+    return _checked_edge_weight(max(weight, _MIN_CALL_WEIGHT))
 
 
 class _CallEdgeFacts(NamedTuple):
@@ -1821,11 +1855,12 @@ class _CallEdgeFacts(NamedTuple):
 def _direct_call_lines(row: dict[str, Any]) -> dict[str, Any]:
     """``at_lines`` for a DIRECT dependent, or nothing at all.
 
-    The collected lines come from the path's first relationship — the hop incident to the
-    queried entity. At ``min_depth`` 1 that edge starts at the affected entity, so its
-    lines are that entity's own call sites and pointing a reader there is correct. Deeper,
-    the same edge belongs to some intermediate hop and its line numbers name a DIFFERENT
-    file, so reporting them would be actively misleading rather than merely imprecise.
+    ``via_lines`` must hold only the lines of edges joining the queried entity and this
+    one directly: those are the dependent's own call sites, and pointing a reader there is
+    correct. A line from any longer route belongs to some intermediate hop and names a
+    DIFFERENT file. That held for dependents found only at depth >= 2, but a direct
+    dependent that was ALSO reachable the long way once collected the long routes' first-hop
+    lines too, so ``at_lines`` pointed into other callers' files.
 
     Omitted entirely rather than emitted as null: an absent key reads as "not applicable",
     a null reads as "we looked and there is none".
@@ -5662,6 +5697,13 @@ class GraphClient:
         ambiguous or test-provenance edges. Edges with no ``weight`` property
         (IMPORTS, USES_TYPE, CALLS written before the amendment) count as
         ``_DEFAULT_EDGE_WEIGHT``, i.e. they neither help nor hurt.
+
+        Two native expansions instead of enumerating every path: ``*BFS`` finds the
+        hop count ``h``, then ``*WSHORTEST h`` over ``-log(weight)`` picks the
+        best-weight path. Bounding the weighted search by ``h`` is what makes it
+        the tie-break rather than a different question -- no path is shorter than
+        ``h``, so every path it may consider has exactly ``h`` hops. Weights are
+        strictly positive (``_MIN_CALL_WEIGHT``), so the logarithm is defined.
         """
         params: dict[str, Any] = {"from_uid": from_uid, "to_uid": to_uid}
         exist_raw = await self.execute(
@@ -5681,13 +5723,45 @@ class GraphClient:
             }
 
         rel_pattern = "|".join(edge_types)
-        records = await self.execute(
-            f"MATCH p=(a {{uid: $from_uid}})-[:{rel_pattern}*1..{max_depth}]->(b {{uid: $to_uid}}) "
-            "RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels, length(p) AS hops, "
-            f"reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT})) AS path_weight "
-            "ORDER BY hops, path_weight DESC LIMIT 1",
-            params,
-        )
+        weight_expr = f"reduce(w = 1.0, r IN rels | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}))"
+        cost = _WEIGHT_COST_LAMBDA
+        if from_uid != to_uid:
+            query = (
+                f"MATCH (a {{uid: $from_uid}}), (b {{uid: $to_uid}}) "
+                f"MATCH hop=(a)-[:{rel_pattern} *BFS ..{max_depth}]->(b) "
+                "WITH a, b, size(relationships(hop)) AS h "
+                f"MATCH p=(a)-[:{rel_pattern} *WSHORTEST h {cost} total]->(b) "
+                "WITH nodes(p) AS path_nodes, relationships(p) AS rels "
+                f"RETURN path_nodes, rels AS path_rels, size(rels) AS hops, {weight_expr} AS path_weight "
+                "ORDER BY hops, path_weight DESC LIMIT 1"
+            )
+        else:
+            # A path from a node to itself is a cycle, and neither expansion returns its
+            # own start. So: every first hop `a -> x`, the shortest way back from x, and
+            # the best-weight return of exactly that length.
+            back = (
+                f"OPTIONAL MATCH ret=(x)-[:{rel_pattern} *BFS ..{max_depth - 1}]->(a) "
+                "WITH a, first, x, CASE WHEN x = a THEN 0 WHEN ret IS NULL THEN null "
+                "ELSE size(relationships(ret)) END AS rest "
+                if max_depth > 1
+                else "WITH a, first, x, CASE WHEN x = a THEN 0 END AS rest "
+            )
+            query = (
+                f"MATCH (a {{uid: $from_uid}})-[first:{rel_pattern}]->(x) "
+                f"{back}"
+                "WITH a, first, x, rest WHERE rest IS NOT NULL "
+                "WITH a, collect({first: first, x: x, rest: rest}) AS firsts, min(rest) AS shortest "
+                "UNWIND [f IN firsts WHERE f.rest = shortest] AS f "
+                "WITH a, f.first AS first, f.x AS x, f.rest AS rest, "
+                "CASE WHEN f.rest = 0 THEN 1 ELSE f.rest END AS bound "
+                f"OPTIONAL MATCH tail=(x)-[:{rel_pattern} *WSHORTEST bound {cost} total]->(a) "
+                "WITH a, first, rest, tail WHERE rest = 0 OR tail IS NOT NULL "
+                "WITH CASE WHEN rest = 0 THEN [a, a] ELSE [a] + nodes(tail) END AS path_nodes, "
+                "CASE WHEN rest = 0 THEN [first] ELSE [first] + relationships(tail) END AS rels "
+                f"RETURN path_nodes, rels AS path_rels, size(rels) AS hops, {weight_expr} AS path_weight "
+                "ORDER BY hops, path_weight DESC LIMIT 1"
+            )
+        records = await self.execute(query, params)
         if not records:
             return {
                 "from_exists": True,
@@ -5732,72 +5806,115 @@ class GraphClient:
           same second-traversal pattern as ``ambiguous_only`` rather than from
           the entity's own file path, so it reflects how the entity is reached
           rather than where it happens to live.
+        - ``via`` — every edge type the dependency lands on *uid* through: the type
+          of the hop incident to *uid* on any path of at most *max_depth* hops.
+        - ``at_lines`` (direct dependents only) — see ``_direct_call_lines``.
+
+        One round trip of native expansions, never an enumeration of paths (which grew
+        as fan-out ** depth): ``*BFS`` for reachability and ``min_depth``, ``*BFS`` with a
+        filter lambda for the two flags, ``*WSHORTEST max_depth`` over ``-log(weight)``
+        for the best product within the hop budget, and for ``via`` one ``*BFS`` per edge
+        type whose path lambda pins the first hop's type (plus the shortest way back to
+        *uid*, for paths that leave it again). Each answers exactly what the all-paths
+        aggregates did, because every stored weight is in (0, 1]: a cycle never raises a
+        product, so the best path, like the shortest, is a simple one. ``tests/integration/graph/
+        test_traversal_equivalence.py`` holds the all-paths queries as the reference.
         """
-        rel_pattern = "|".join(edge_types)
-        pattern = (
-            f"-[:{rel_pattern}*1..{max_depth}]->" if direction_kind == "out" else f"<-[:{rel_pattern}*1..{max_depth}]-"
+        rel = "|".join(edge_types)
+        out = direction_kind == "out"
+
+        def expand(spec: str) -> str:
+            return f"-[:{rel} {spec}]->" if out else f"<-[:{rel} {spec}]-"
+
+        def against(spec: str) -> str:
+            return f"<-[:{rel} {spec}]-" if out else f"-[:{rel} {spec}]->"
+
+        first_hop = f"-[e:{rel}]->" if out else f"<-[e:{rel}]-"
+        weight = f"coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT})"
+        # coalesce, because an absent confidence means STRUCTURAL (ADR-0028): DEFINES and
+        # IMPORTS are facts, not guesses, so a bare edge counts as resolved.
+        resolved = "coalesce(r.confidence, 'resolved') = 'resolved'"
+        # A path back to `start` and out again is a path too, and its first hop counts for
+        # `via`. A breadth-first expansion never revisits its own start, so those are found
+        # separately: the shortest way back through each first-hop type (the reverse
+        # expansion below, then the closing edge), plus the target's own min_depth.
+        returns = (
+            "CALL { WITH start "
+            f"MATCH q=(start){against(f'*BFS ..{max_depth - 1}')}(y) MATCH (start){first_hop}(y) "
+            "RETURN collect([type(e), size(relationships(q)) + 1]) AS returns } "
+            if max_depth > 1
+            else "WITH *, [] AS returns "
         )
-        all_raw = await self.execute(
-            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
-            "WHERE affected.uid <> $uid "
-            "RETURN affected.uid AS uid, affected.name AS name, affected.qualified_name AS qn, "
-            f"{primary_label_expr('affected')} AS label, affected.file_path AS file_path, "
-            "affected.kind AS kind, "
-            "min(length(p)) AS min_depth, "
-            f"max(reduce(w = 1.0, r IN relationships(p) | w * coalesce(r.weight, {_DEFAULT_EDGE_WEIGHT}))) "
-            "AS confidence_score, "
-            # The hop incident to `start` — how the dependency actually lands on it.
-            # relationships(p) runs in path order from start, so [0] is that edge in
-            # both directions.
-            "collect(DISTINCT type(relationships(p)[0])) AS via, "
-            # Only meaningful at depth 1, where the edge incident to `start` IS the
-            # affected entity's own call site; deeper, it is a line in some intermediate
-            # hop and would name the wrong file. Filtered to direct dependents below.
-            "collect(DISTINCT relationships(p)[0].line) AS via_lines",
-            {"uid": uid},
+        records = await self.execute(
+            "MATCH (start {uid: $uid}) "
+            "CALL { WITH start "
+            f"MATCH p=(start){expand(f'*BFS ..{max_depth}')}(a) WHERE a <> start "
+            "RETURN collect({uid: a.uid, name: a.name, qn: a.qualified_name, "
+            f"label: {primary_label_expr('a')}, file_path: a.file_path, kind: a.kind, "
+            "min_depth: size(relationships(p))}) AS reached } "
+            "CALL { WITH start "
+            f"MATCH (start){expand(f'*BFS ..{max_depth} (r, n | {resolved})')}(a) "
+            "WHERE a <> start RETURN collect(a.uid) AS resolved } "
+            "CALL { WITH start "
+            f"MATCH (start){expand(f'*BFS ..{max_depth} (r, n | NOT coalesce(r.from_test, false))')}(a) "
+            "WHERE a <> start RETURN collect(a.uid) AS production } "
+            "CALL { WITH start "
+            f"MATCH p=(start){expand(f'*WSHORTEST {max_depth} {_WEIGHT_COST_LAMBDA} cost')}(a) WHERE a <> start "
+            f"RETURN collect([a.uid, reduce(w = 1.0, r IN relationships(p) | w * {weight})]) AS scores }} "
+            # One expansion per edge TYPE, not per first-hop edge: the lambda pins the first
+            # relationship's type, so a node is reached iff some path starting with that type
+            # reaches it. The cost is bounded by len(edge_types), not by start's degree.
+            "CALL { WITH start UNWIND $types AS t "
+            f"MATCH (start){expand(f'*BFS ..{max_depth} (r, n, p | size(relationships(p)) > 1 OR type(r) = t)')}(a) "
+            "WHERE a <> start RETURN collect([a.uid, t]) AS typed } "
+            f"CALL {{ WITH start MATCH (start){first_hop}(a) RETURN collect([a.uid, type(e), e.line]) AS direct }} "
+            f"{returns}"
+            "RETURN reached, resolved, production, scores, typed, direct, returns",
+            {"uid": uid, "types": list(edge_types)},
         )
-        resolved_raw = await self.execute(
-            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
-            # coalesce, because an absent confidence means STRUCTURAL (ADR-0028): DEFINES
-            # and IMPORTS are facts, not guesses. Resolvers that guess now say so, so a
-            # bare edge is exactly the one that should count as resolved.
-            "WHERE affected.uid <> $uid "
-            "AND all(r IN relationships(p) WHERE coalesce(r.confidence, 'resolved') = 'resolved') "
-            "RETURN DISTINCT affected.uid AS uid",
-            {"uid": uid},
-        )
-        # Same shape as resolved_raw (all(...) rather than none(...) so both
-        # passes use the one predicate form already proven against Memgraph).
-        production_raw = await self.execute(
-            f"MATCH p=(start {{uid: $uid}}){pattern}(affected) "
-            "WHERE affected.uid <> $uid AND all(r IN relationships(p) WHERE NOT coalesce(r.from_test, false)) "
-            "RETURN DISTINCT affected.uid AS uid",
-            {"uid": uid},
-        )
-        resolved_uids = {r["uid"] for r in resolved_raw}
-        production_uids = {r["uid"] for r in production_raw}
-        return [
-            {
-                "uid": r["uid"],
-                "name": r["name"],
-                "qualified_name": r["qn"],
-                "label": r["label"],
-                "file_path": r["file_path"],
-                # Ranking needs it: `blast_radius` demotes grant-only kinds so a
-                # permission set cannot fill a limited answer ahead of code. `.get`,
-                # matching `via` below -- a row that predates the column ranks as
-                # ordinary code rather than raising.
-                "kind": r.get("kind"),
-                "min_depth": r["min_depth"],
-                "direction": direction_kind,
-                "via": sorted(r.get("via") or []),
-                "ambiguous_only": r["uid"] not in resolved_uids,
-                "confidence_score": r["confidence_score"],
-                "test_only": r["uid"] not in production_uids,
-                **_direct_call_lines(r),
-            }
-            for r in all_raw
-        ]
+        if not records:
+            return []
+        record = records[0]
+        resolved_uids = set(record["resolved"])
+        production_uids = set(record["production"])
+        scores = dict(record["scores"])
+        via: dict[str, set[str]] = defaultdict(set)
+        for a_uid, rel_type in record["typed"]:
+            via[a_uid].add(rel_type)
+        # Only the edges joining `start` and the dependent directly -- see _direct_call_lines.
+        direct_lines: dict[str, list[Any]] = defaultdict(list)
+        shortest_return: dict[str, int] = {}
+        for a_uid, rel_type, line in record["direct"]:
+            if a_uid == uid:
+                shortest_return[rel_type] = 1  # a self-loop is a return of length one
+            else:
+                direct_lines[a_uid].append(line)
+        for rel_type, length in record["returns"]:
+            shortest_return[rel_type] = min(length, shortest_return.get(rel_type, length))
+        results: list[dict[str, Any]] = []
+        for r in record["reached"]:
+            min_depth = r["min_depth"]
+            types = via[r["uid"]] | {t for t, length in shortest_return.items() if length + min_depth <= max_depth}
+            results.append(
+                {
+                    "uid": r["uid"],
+                    "name": r["name"],
+                    "qualified_name": r["qn"],
+                    "label": r["label"],
+                    "file_path": r["file_path"],
+                    # Ranking needs it: `blast_radius` demotes grant-only kinds so a
+                    # permission set cannot fill a limited answer ahead of code.
+                    "kind": r["kind"],
+                    "min_depth": min_depth,
+                    "direction": direction_kind,
+                    "via": sorted(types),
+                    "ambiguous_only": r["uid"] not in resolved_uids,
+                    "confidence_score": scores[r["uid"]],
+                    "test_only": r["uid"] not in production_uids,
+                    **_direct_call_lines({"min_depth": min_depth, "via_lines": direct_lines[r["uid"]]}),
+                }
+            )
+        return results
 
     async def get_structure_overview(self, project: str, path: str, limit: int) -> dict[str, list[dict[str, Any]]]:
         """Entity counts, package breakdown, largest modules, external deps —
@@ -6333,26 +6450,45 @@ class GraphClient:
 
     async def get_callers(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
         """Callables reaching *uid* via 1..call_depth CALLS hops — ``expand_context``'s callers."""
-        label_clause = f":{label}" if label else ""
-        records = await self.execute(
-            f"MATCH (caller:Callable)-[:{RelType.CALLS}*1..{call_depth}]->"
-            f"(n{label_clause} {{uid: $uid}}) "
-            f"WITH DISTINCT caller AS n "
-            f"RETURN n {_LIMITED_QUERY_ORDER} LIMIT {limit}",
-            {"uid": uid},
-        )
-        return [r["n"] for r in records]
+        return await self._call_neighbours(uid, label, call_depth, limit, callers=True)
 
     async def get_callees(self, uid: str, label: str, call_depth: int, limit: int) -> list[dict[str, Any]]:
         """Callables reached from *uid* via 1..call_depth CALLS hops — ``expand_context``'s callees."""
+        return await self._call_neighbours(uid, label, call_depth, limit, callers=False)
+
+    async def _call_neighbours(
+        self, uid: str, label: str, call_depth: int, limit: int, *, callers: bool
+    ) -> list[dict[str, Any]]:
+        """One ``*BFS`` from *uid*, so each reachable node is expanded once instead of once per path.
+
+        A breadth-first expansion never returns its own start, but *uid* is its own caller
+        (callee) when a cycle of at most *call_depth* hops runs through it: an edge out of
+        (into) *uid* landing on a node the expansion reached in fewer than *call_depth*
+        hops, or on *uid* itself.
+        """
         label_clause = f":{label}" if label else ""
+        if callers:
+            expand, close = f"<-[:{RelType.CALLS} *BFS ..{call_depth}]-", f"-[:{RelType.CALLS}]->"
+        else:
+            expand, close = f"-[:{RelType.CALLS} *BFS ..{call_depth}]->", f"<-[:{RelType.CALLS}]-"
         records = await self.execute(
-            f"MATCH (n{label_clause} {{uid: $uid}})-[:{RelType.CALLS}*1..{call_depth}]->"
-            f"(callee:Callable) WITH DISTINCT callee AS n "
-            f"RETURN n {_LIMITED_QUERY_ORDER} LIMIT {limit}",
+            f"MATCH (n{label_clause} {{uid: $uid}}) "
+            f"OPTIONAL MATCH p=(n){expand}(m) "
+            "WITH n, collect(m) AS reached, "
+            f"collect(CASE WHEN size(relationships(p)) < {call_depth} THEN m END) AS near "
+            f"OPTIONAL MATCH (n){close}(x) WHERE x = n OR x IN near "
+            "WITH n, reached, count(x) > 0 AS cyclic "
+            "UNWIND reached + CASE WHEN cyclic THEN [n] ELSE [] END AS m "
+            "WITH m AS n WHERE n:Callable "
+            f"WITH n {_LIMITED_QUERY_ORDER} LIMIT {limit} "
+            # A map, not the node: the node carries its embedding, ~10 KB of floats per
+            # row that no consumer reads, and decoding it was ~90% of this query's time.
+            # `embedding: null` overrides the key inside the server, so the vector is never
+            # sent. The shape matches SQLite's `_row_to_node` (properties plus `_labels`).
+            "RETURN n {.*, embedding: null, _labels: labels(n)} AS n",
             {"uid": uid},
         )
-        return [r["n"] for r in records]
+        return [_without_embedding(r["n"]) for r in records]
 
     async def get_linked_docs(self, uid: str, label: str, limit: int) -> list[dict[str, Any]]:
         """DocFile/DocSection/Note entities documenting *uid* — ``expand_context``'s docs.
