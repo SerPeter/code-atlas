@@ -132,6 +132,80 @@ a sub-directory is not read.
 
 ## Agent Integration
 
+### Claude Code Hooks
+
+Agents reach for Grep, Read and subagents before an MCP tool, whatever the instructions say: the built-in tools are
+always loaded, MCP tools are often deferred, and the built-in Explore and Plan subagents never read `CLAUDE.md`. The
+hooks put the routing where the decision is made:
+
+```bash
+atlas hooks install              # ~/.claude/settings.json, every project
+atlas hooks install --strict     # ...and block once before a graph-answerable grep or an exploration subagent
+atlas hooks install --scope local  # .claude/settings.local.json in this repo only
+atlas hooks uninstall
+```
+
+| Hook                           | What the agent sees                                                                                                                                                                                                                                                           |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SessionStart`                 | A five-line "which tool for which question" card — only when this repo is indexed and code-atlas is usable. Plus a health notice, shown to you and relayed by the agent, whenever a check is not OK: graph, schema, queue, embedding provider, or this repo not being indexed |
+| `SubagentStart`                | The same card, inside every subagent (the only way to reach Explore/Plan)                                                                                                                                                                                                     |
+| `PostToolUse` Grep/Bash        | After a symbol-shaped grep the graph can answer: one line with the definition and dependent count                                                                                                                                                                             |
+| `PreToolUse` (`--strict` only) | Denies the first such grep, and the first Explore/general-purpose/Plan subagent or workflow, per agent                                                                                                                                                                        |
+
+Grep output is never replaced: grep is exhaustive over literal text and the graph is not, so a substitution would turn
+an index gap into a confident wrong answer. Strict blocks fire once per kind per agent — re-issuing the call is allowed
+— and stop entirely once that agent has used any code-atlas tool. Every path fails open: a hook error never blocks a
+tool call, an unhealthy graph produces the notice and no hints or blocks, and a repo where `~/.claude.json` disables or
+does not configure the code-atlas server gets nothing at all. A server configured where the hook cannot see it (a
+plugin, managed settings, `--mcp-config`) needs `ATLAS_HOOKS_MCP=1`. A linked worktree whose own project is not indexed
+uses the main checkout's index, and says so.
+
+The health notice and `atlas health` reach their conclusions through the same code — `code_atlas.health_verdicts` — so
+they report the same status, message and fix for the same situation; a parity test pins that. They differ only in how
+they reach a backend: the hook uses bare TCP connects and its own queries, because importing `atlas health`'s clients
+costs ~4 s and a session-start hook delays the first reply. Like the rest of Atlas it reads no `.env`: it sees the
+environment Claude Code was started with. It adds one check `atlas health` does not have: whether _this_ repository is
+indexed. The indexer lease and staleness checks stay `atlas health`-only.
+
+The embedding check is `atlas health`'s own — one real embedding call, which proves config, model and credentials
+together. It costs ~5–6 s (litellm's import plus the round trip), so the hook caches a **success** for 24 h, keyed by
+provider, model, endpoint and a hash of the credential environment variables. A failure is never cached: a broken key is
+re-checked, and reported, every session until fixed. A call that outlasts `check_timeout_s` is reported as slow, not as
+a bad key. A background `asyncRewake` hook was tried and dropped: its exit-2 result on `SessionStart` never reached the
+model.
+
+How long anything waits before calling a backend down is one setting, shared by the hook, `atlas health`, `atlas doctor`
+and the MCP `health_check` tool. It is per machine, so it goes in `atlas.local.toml` (or
+`ATLAS_HEALTH__CONNECT_TIMEOUT_S`):
+
+```toml
+# atlas.local.toml
+[health]
+connect_timeout_s = 1.0 # Memgraph / Valkey reachability. Raise (e.g. 5) for a remote backend.
+check_timeout_s = 3.0   # atlas health's queries, staleness check and embedding-provider round trip
+```
+
+Every backend, and every address of each (`localhost` is both `::1` and `127.0.0.1`), is probed at once, so a down
+backend costs at most one `connect_timeout_s` however many are down. `atlas health` runs its Memgraph, Valkey, lease and
+embedding checks concurrently too. Measured on Windows with the default 1.0: ~0.9 s healthy, ~1.5 s with Memgraph down,
+~1.6 s with Memgraph and Valkey both down, ~2.6 s with both down at 5.
+
+The hooks run `python -m code_atlas.hooks` with the interpreter that ran `atlas hooks install`, pinned by absolute path;
+re-run it after moving the install. A symbol lookup costs ~0.5 s and happens only for identifier-shaped searches;
+everything else exits in ~0.13 s.
+
+**Measuring whether it works.** Claude Code's own OpenTelemetry export already records every tool call, so there is
+nothing to add to the hooks. With `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_LOGS_EXPORTER=otlp` and
+`OTEL_LOG_TOOL_DETAILS=1` pointed at the `telemetry` compose profile, VictoriaLogs answers:
+
+```text
+# tool mix, including code-atlas calls (tool_name "mcp_tool", server in tool_parameters)
+_time:7d event.name:tool_result | stats by (tool_name) count() as n | sort by (n desc)
+
+# strict-mode blocks
+_time:7d event.name:tool_decision decision:reject source:hook | stats by (tool_name) count()
+```
+
 ### Guidelines for Agent Instructions
 
 Copy the following into your project's `CLAUDE.md`, `.cursorrules`, or agent instructions file so your AI agent follows

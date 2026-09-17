@@ -724,6 +724,32 @@ class WatcherSettings(StrictSection):
     cooldown_s: float = Field(default=10.0, description="Per-file cooldown after processing (seconds). 0 disables.")
 
 
+class HealthSettings(StrictSection):
+    """How long a health check waits before calling something down.
+
+    Used by ``atlas health`` / ``atlas doctor``, the MCP ``health_check`` tool and the Claude Code
+    session-start hook. Per machine -- whether a backend is local is not a fact about the
+    codebase -- so it belongs in ``atlas.local.toml`` or ``ATLAS_HEALTH__*``.
+    """
+
+    connect_timeout_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=30.0,
+        description="How long to wait for Memgraph or Valkey to answer before reporting it unreachable. "
+        "The session-start hook pays this per connection attempt (a host that resolves to IPv6 and IPv4 "
+        "gets two) before the first reply, whenever a backend is down. 1.0 suits backends on this machine; "
+        "raise it (e.g. 5) for a remote backend that would otherwise be reported down while merely slow.",
+    )
+    check_timeout_s: float = Field(
+        default=3.0,
+        gt=0.0,
+        le=120.0,
+        description="How long `atlas health` waits for each remaining check once a backend answers: schema "
+        "and project-status queries, the staleness check, and the embedding provider's round trip.",
+    )
+
+
 class McpSettings(StrictSection):
     """MCP server settings."""
 
@@ -1058,6 +1084,7 @@ class AtlasSettings(BaseSettings):
     knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)
     detectors: DetectorSettings = Field(default_factory=DetectorSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
+    health: HealthSettings = Field(default_factory=HealthSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
     @cached_property

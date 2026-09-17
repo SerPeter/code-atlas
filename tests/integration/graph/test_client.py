@@ -310,13 +310,13 @@ def _index_env(settings: AtlasSettings, *, dimension: int) -> dict[str, str]:
     """Pin every setting ``atlas index`` would otherwise resolve for itself.
 
     ``_run_index`` builds its own ``AtlasSettings`` from the target path rather than
-    taking a fixture's, and importing ``code_atlas.cli`` runs ``load_dotenv`` — so this
-    repo's own ``.env`` is in ``os.environ`` by the time it does. ``_export_atlas_env``
-    already overwrites the Memgraph and Valkey halves of that (7687/6379 → the test
-    containers); they are repeated here so the safety does not depend on which fixture
-    ran first. Nothing overwrites the ``[embeddings]`` half, and that one is not merely
-    untidy: unpinned it resolves to a real paid provider and a dimension of its own,
-    which is both a billed call and the wrong number for the thing under test.
+    taking a fixture's, so whatever ``ATLAS_*`` the developer's shell exports reaches it.
+    ``_export_atlas_env`` already overwrites the Memgraph and Valkey halves of that
+    (7687/6379 → the test containers); they are repeated here so the safety does not
+    depend on which fixture ran first. Nothing overwrites the ``[embeddings]`` half, and
+    that one is not merely untidy: unpinned it can resolve to a real paid provider and a
+    dimension of its own, which is both a billed call and the wrong number for the thing
+    under test.
     """
     return {
         "ATLAS_BACKEND__GRAPH__MEMGRAPH__HOST": settings.memgraph.host,
@@ -346,11 +346,7 @@ async def _atlas_index(root: Path, env: dict[str, str], *args: str) -> Result:
     sink is a Rich console built at import, pointing at the real stderr).
 
     The ``code_atlas.cli`` import is local rather than module-level so a run that
-    deselects these tests never pays for it — but note that it permanently adds this
-    repo's ``.env`` keys to ``os.environ`` for the rest of the session. Nothing else in
-    this file reads settings it does not pin, and a full ``tests/integration`` run
-    already imports the CLI at collection; a test added below that builds a bare
-    ``AtlasSettings`` would be the first thing to notice.
+    deselects these tests never pays for it.
     """
     from typer.testing import CliRunner
 

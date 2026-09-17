@@ -5,19 +5,24 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import TYPE_CHECKING
-
-from dotenv import find_dotenv
 
 from code_atlas.backends.postgres_queue import PostgresEventBus
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.backends.sqlite_queue import SqliteEventBus
+from code_atlas.health_verdicts import (
+    CheckResult,
+    CheckStatus,
+    embeddings_verdict,
+    memgraph_verdict,
+    schema_verdict,
+    valkey_verdict,
+)
 from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import SCHEMA_VERSION
 from code_atlas.search.embeddings import EmbedClient
 from code_atlas.search.ratelimit import unpaced
-from code_atlas.settings import _find_atlas_toml, derive_project_name, find_git_root
+from code_atlas.settings import HealthSettings, _find_atlas_toml, derive_project_name, find_git_root
 
 if TYPE_CHECKING:
     from code_atlas.events import EventBus
@@ -25,7 +30,8 @@ if TYPE_CHECKING:
     from code_atlas.indexing.daemon import DaemonManager
     from code_atlas.settings import AtlasSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
 
-_CHECK_TIMEOUT = 3.0  # seconds per individual check
+# Defaults for callers that run one check directly; run_health_checks passes [health].
+_DEFAULTS = HealthSettings()
 
 
 # ---------------------------------------------------------------------------
@@ -33,21 +39,8 @@ _CHECK_TIMEOUT = 3.0  # seconds per individual check
 # ---------------------------------------------------------------------------
 
 
-class CheckStatus(StrEnum):
-    OK = "ok"
-    WARN = "warn"
-    FAIL = "fail"
-
-
-@dataclass(frozen=True)
-class CheckResult:
-    """Result of a single health check."""
-
-    name: str
-    status: CheckStatus
-    message: str
-    detail: str = ""
-    suggestion: str = ""
+# CheckStatus and CheckResult live in code_atlas.health_verdicts, beside the verdicts that
+# produce them; importing them from here keeps working because this module is where callers look.
 
 
 @dataclass(frozen=True)
@@ -80,193 +73,88 @@ class HealthReport:
 async def check_memgraph(
     graph: GraphClient | SqliteGraphClient | None,
     mg_settings: MemgraphSettings,
+    *,
+    timeout_s: float = _DEFAULTS.connect_timeout_s,
+    chosen: bool = False,
 ) -> CheckResult:
     """Verify connectivity of the active graph backend, honestly naming which one it is.
 
     *graph* may be a real ``GraphClient`` (Memgraph) or the ``SqliteGraphClient``
-    embedded fallback — whichever ``create_graph_client`` actually returned. The
-    reported message always names the real backend instead of assuming Memgraph.
+    embedded fallback — whichever ``create_graph_client`` actually returned. *chosen*
+    is whether the config declared that backend. The verdict is
+    :func:`~code_atlas.health_verdicts.memgraph_verdict`, shared with the session-start hook.
     """
-    name = "memgraph"
     addr = f"{mg_settings.host}:{mg_settings.port}"
     if graph is None:
         return CheckResult(
-            name, CheckStatus.FAIL, f"No client ({addr})", suggestion="Check Memgraph connection settings."
+            "memgraph", CheckStatus.FAIL, f"No client ({addr})", suggestion="Check Memgraph connection settings."
         )
-
     embedded = isinstance(graph, SqliteGraphClient)
-    backend = "SQLite (embedded)" if embedded else f"Memgraph ({addr})"
-
     try:
-        ok = await asyncio.wait_for(graph.ping(), timeout=_CHECK_TIMEOUT)
-        if ok and embedded:
-            # WARN, not OK. An undeclared graph backend falls back here whenever Memgraph is
-            # unreachable, so this is the *default* outcome on a machine without Docker
-            # running — and ADR-0015 calls SQLite explicitly not a parity replacement.
-            # Reporting an unqualified OK meant a fully-degraded install looked healthy,
-            # which is the one thing a health check must never do.
-            return CheckResult(
-                name,
-                CheckStatus.WARN,
-                f"Connected — {backend}, NOT Memgraph",
-                detail=(
-                    "The embedded fallback is active. Community detection is unavailable and "
-                    "some analyses differ from Memgraph; see the README."
-                ),
-                suggestion=f"Start Memgraph ({addr}) with: docker compose up -d memgraph",
-            )
-        if ok:
-            return CheckResult(name, CheckStatus.OK, f"Connected — {backend}")
-        return CheckResult(
-            name, CheckStatus.FAIL, f"Ping failed — {backend}", suggestion="docker compose up -d memgraph"
-        )
+        ok = await asyncio.wait_for(graph.ping(), timeout=timeout_s)
     except Exception as exc:
-        return CheckResult(
-            name,
-            CheckStatus.FAIL,
-            f"Unreachable — {backend}",
-            detail=str(exc),
-            suggestion="docker compose up -d memgraph",
-        )
+        return memgraph_verdict(addr, reachable=False, embedded=embedded, detail=str(exc))
+    detail = "" if ok else "ping returned false"
+    return memgraph_verdict(addr, reachable=bool(ok), embedded=embedded, chosen=chosen, detail=detail)
 
 
-async def check_schema(graph: GraphClient) -> CheckResult:
+async def check_schema(graph: GraphClient, *, timeout_s: float = _DEFAULTS.check_timeout_s) -> CheckResult:
     """Verify graph schema version matches the code."""
-    name = "schema"
     try:
-        stored = await asyncio.wait_for(graph.get_schema_version(), timeout=_CHECK_TIMEOUT)
+        stored = await asyncio.wait_for(graph.get_schema_version(), timeout=timeout_s)
     except Exception as exc:
-        return CheckResult(name, CheckStatus.FAIL, "Cannot read schema version", detail=str(exc))
-
-    if stored is None:
-        return CheckResult(
-            name,
-            CheckStatus.WARN,
-            "No schema version found",
-            detail="Database may be empty.",
-            suggestion="Run 'atlas index' to initialize the schema.",
-        )
-    if stored == SCHEMA_VERSION:
-        return CheckResult(name, CheckStatus.OK, f"Version {stored} (current)")
-    if stored < SCHEMA_VERSION:
-        return CheckResult(
-            name,
-            CheckStatus.WARN,
-            f"Version {stored} (expected {SCHEMA_VERSION})",
-            detail="Schema is outdated.",
-            suggestion="Run 'atlas index' to migrate the schema.",
-        )
-    # stored > SCHEMA_VERSION
-    return CheckResult(
-        name,
-        CheckStatus.FAIL,
-        f"Version {stored} > code {SCHEMA_VERSION}",
-        detail="Database schema is newer than the installed code.",
-        suggestion="Update your Code Atlas installation.",
-    )
+        return schema_verdict(None, SCHEMA_VERSION, error=str(exc))
+    return schema_verdict(stored, SCHEMA_VERSION)
 
 
 async def check_embeddings(
     embed: EmbedClient | None,
     embed_settings: EmbeddingSettings,
+    *,
+    timeout_s: float = _DEFAULTS.check_timeout_s,
 ) -> CheckResult:
-    """Verify the embedding service is reachable."""
-    name = "embeddings"
-    if not embed_settings.enabled:
-        return CheckResult(name, CheckStatus.OK, "Disabled (lightweight mode)")
-
-    # Provider-aware display and suggestions
-    if embed_settings.provider == "tei":
-        info = f"tei @ {embed_settings.base_url}"
-        suggestion = "docker compose --profile tei up -d"
-    elif embed_settings.provider == "ollama":
-        info = f"ollama @ {embed_settings.base_url}"
-        suggestion = "Start Ollama and pull the model: ollama pull " + embed_settings.model
-    else:
-        info = f"{embed_settings.provider} ({embed_settings.model})"
-        suggestion = "Check your API key in .env (e.g. OPENAI_API_KEY) and network connectivity."
-
-    if embed is None:
-        return CheckResult(name, CheckStatus.WARN, f"No client ({info})", suggestion="Check embedding settings.")
-
+    """Verify the embedding provider answers: config, model and credentials in one real call."""
+    if not embed_settings.enabled or embed is None:
+        return embeddings_verdict(embed_settings, ok=None if embed_settings.enabled else True)
     try:
-        ok = await asyncio.wait_for(embed.health_check(), timeout=_CHECK_TIMEOUT)
-        if ok:
-            return CheckResult(name, CheckStatus.OK, f"Responding ({info})")
-        return CheckResult(name, CheckStatus.WARN, f"Unreachable ({info})", suggestion=suggestion)
+        ok = await asyncio.wait_for(embed.health_check(), timeout=timeout_s)
+    except TimeoutError:
+        return embeddings_verdict(embed_settings, ok=False, timed_out=True)
     except Exception as exc:
-        return CheckResult(name, CheckStatus.WARN, f"Unreachable ({info})", detail=str(exc), suggestion=suggestion)
+        return embeddings_verdict(embed_settings, ok=False, detail=str(exc))
+    return embeddings_verdict(embed_settings, ok=bool(ok))
 
 
 async def check_valkey(
     bus: EventBus | SqliteEventBus | PostgresEventBus | None,
     redis_settings: RedisSettings,
+    *,
+    timeout_s: float = _DEFAULTS.connect_timeout_s,
+    chosen: bool = False,
 ) -> CheckResult:
     """Verify connectivity of the active queue backend, honestly naming which one it is.
 
     *bus* may be a real ``EventBus`` (Valkey), a ``PostgresEventBus``, or the
-    ``SqliteEventBus`` embedded fallback — whichever ``create_event_bus`` actually returned (or the daemon's
-    live bus, when one is running). The reported message always names the real
-    backend instead of assuming Valkey. Ownership (construction/closing) is the
-    caller's responsibility — mirrors ``check_memgraph``.
+    ``SqliteEventBus`` embedded fallback — whichever ``create_event_bus`` actually returned (or
+    the daemon's live bus, when one is running). Ownership (construction/closing) is the
+    caller's responsibility — mirrors ``check_memgraph``, as does the shared verdict.
     """
-    name = "valkey"
     addr = f"{redis_settings.host}:{redis_settings.port}"
     if bus is None:
         return CheckResult(
-            name, CheckStatus.WARN, f"No client ({addr})", suggestion="Check Valkey connection settings."
+            "valkey", CheckStatus.WARN, f"No client ({addr})", suggestion="Check Valkey connection settings."
         )
-
-    is_sqlite = isinstance(bus, SqliteEventBus)
-    if isinstance(bus, PostgresEventBus):
-        backend = f"Postgres ({bus.address})"
-        indexing_disabled = "auto-indexing disabled — file changes will NOT be indexed until Postgres is reachable"
-        start_hint = "Check [backend.queue.postgres] and that the Postgres server is running."
-    elif is_sqlite:
-        backend = "SQLite (embedded)"
-        indexing_disabled = (
-            "auto-indexing disabled — file changes will NOT be indexed until the embedded queue is available"
-        )
-        start_hint = "docker compose up -d valkey"
-    else:
-        backend = f"Valkey ({addr})"
-        indexing_disabled = "auto-indexing disabled — file changes will NOT be indexed until Valkey is reachable"
-        start_hint = "docker compose up -d valkey"
+    embedded = isinstance(bus, SqliteEventBus)
+    postgres = bus.address if isinstance(bus, PostgresEventBus) else None
     try:
-        ok = await asyncio.wait_for(bus.ping(), timeout=_CHECK_TIMEOUT)
-        if ok and is_sqlite:
-            # Same reasoning as check_memgraph: ADR-0015 calls the embedded path "not a
-            # parity replacement for the Memgraph+Valkey path", and names a concrete gap
-            # — blocking reads are emulated by short polling, since SQLite has no
-            # server-side blocking. The queue works, so this stays WARN rather than FAIL,
-            # but a plain OK would let a fallback nobody chose read as the supported
-            # configuration.
-            return CheckResult(
-                name,
-                CheckStatus.WARN,
-                f"Connected — {backend}, NOT Valkey",
-                detail="Blocking reads are emulated by polling; throughput is lower than the Valkey path.",
-                suggestion=f"Start Valkey ({addr}) with: docker compose up -d valkey",
-            )
-        if ok:
-            return CheckResult(name, CheckStatus.OK, f"Connected — {backend}")
-        return CheckResult(
-            name,
-            CheckStatus.WARN,
-            f"Ping failed — {backend} — {indexing_disabled}",
-            suggestion=start_hint,
-        )
+        ok = await asyncio.wait_for(bus.ping(), timeout=timeout_s)
     except Exception as exc:
-        return CheckResult(
-            name,
-            CheckStatus.WARN,
-            f"Unreachable — {backend} — {indexing_disabled}",
-            detail=str(exc),
-            suggestion=start_hint,
-        )
+        return valkey_verdict(addr, reachable=False, embedded=embedded, postgres=postgres, detail=str(exc))
+    detail = "" if ok else "ping returned false"
+    return valkey_verdict(addr, reachable=bool(ok), embedded=embedded, postgres=postgres, chosen=chosen, detail=detail)
 
 
-async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> CheckResult:
+async def check_config(settings: AtlasSettings) -> CheckResult:
     """Verify project root, git repo, and loaded config files."""
     name = "config"
     root = settings.project_root
@@ -279,16 +167,9 @@ async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> Che
             suggestion="Set project_root in atlas.toml or pass a valid path.",
         )
 
-    # Build detail string showing which config files were loaded
+    # Which config file was loaded. No .env: Atlas reads none -- the environment is the caller's.
     config_match = _find_atlas_toml()
-    # Callers that know the path pass it (the CLI captures it at load time). The MCP
-    # server has no such handle — cli.py loads the .env before handing off, so re-resolve
-    # it here rather than reporting "not found" for a file that is demonstrably loaded.
-    resolved_dotenv = dotenv_path or find_dotenv(usecwd=True)
-    detail_parts: list[str] = []
-    detail_parts.append(f"config: {config_match.path if config_match else 'not found'}")
-    detail_parts.append(f".env: {resolved_dotenv or 'not found'}")
-    detail = " | ".join(detail_parts)
+    detail = f"config: {config_match.path if config_match else 'not found'}"
 
     git_root = find_git_root(root)
     if git_root is None:
@@ -304,7 +185,11 @@ async def check_config(settings: AtlasSettings, *, dotenv_path: str = "") -> Che
 
 
 async def check_embedding_model(
-    graph: GraphClient, embed_settings: EmbeddingSettings, project: str = ""
+    graph: GraphClient,
+    embed_settings: EmbeddingSettings,
+    project: str = "",
+    *,
+    timeout_s: float = _DEFAULTS.check_timeout_s,
 ) -> CheckResult:
     """Check whether *project*'s embedding model matches the configured one.
 
@@ -317,11 +202,9 @@ async def check_embedding_model(
     if not embed_settings.enabled:
         return CheckResult(name, CheckStatus.OK, "Skipped (embeddings disabled)")
     try:
-        stored = await asyncio.wait_for(graph.get_embedding_config(), timeout=_CHECK_TIMEOUT)
+        stored = await asyncio.wait_for(graph.get_embedding_config(), timeout=timeout_s)
         project_model = (
-            await asyncio.wait_for(graph.get_project_embedding_model(project), timeout=_CHECK_TIMEOUT)
-            if project
-            else None
+            await asyncio.wait_for(graph.get_project_embedding_model(project), timeout=timeout_s) if project else None
         )
     except Exception as exc:
         return CheckResult(name, CheckStatus.WARN, "Cannot read embedding config", detail=str(exc))
@@ -344,9 +227,10 @@ async def check_embedding_model(
 
 async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResult:
     """Check indexed project status."""
+    timeout_s = settings.health.check_timeout_s
     name = "index"
     try:
-        projects = await asyncio.wait_for(graph.get_project_status(), timeout=_CHECK_TIMEOUT)
+        projects = await asyncio.wait_for(graph.get_project_status(), timeout=timeout_s)
     except Exception as exc:
         return CheckResult(name, CheckStatus.WARN, "Cannot read projects", detail=str(exc))
 
@@ -370,7 +254,7 @@ async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResul
 
     checker = StalenessChecker(settings.project_root)
     try:
-        info = await asyncio.wait_for(checker.check(graph, include_changed=False), timeout=_CHECK_TIMEOUT)
+        info = await asyncio.wait_for(checker.check(graph, include_changed=False), timeout=timeout_s)
     except Exception:
         return CheckResult(name, CheckStatus.OK, f"{len(project_names)} project(s) indexed", detail=detail)
 
@@ -387,7 +271,9 @@ async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResul
     return CheckResult(name, CheckStatus.OK, f"{len(project_names)} project(s) up to date", detail=detail)
 
 
-async def check_indexer_lease(bus: EventBus | SqliteEventBus | PostgresEventBus | None) -> CheckResult | None:
+async def check_indexer_lease(
+    bus: EventBus | SqliteEventBus | PostgresEventBus | None, *, timeout_s: float = _DEFAULTS.connect_timeout_s
+) -> CheckResult | None:
     """Report a foreign indexer holding the lease.
 
     Without this a second indexer is invisible: Redis identifies a consumer by name only,
@@ -400,7 +286,7 @@ async def check_indexer_lease(bus: EventBus | SqliteEventBus | PostgresEventBus 
     if bus is None:
         return None
     try:
-        holder = await bus.read_indexer_lease()
+        holder = await asyncio.wait_for(bus.read_indexer_lease(), timeout=timeout_s)
     except Exception:
         return None
     if not holder:
@@ -452,7 +338,6 @@ async def run_health_checks(
     bus: EventBus | SqliteEventBus | PostgresEventBus,
     embed: EmbedClient | None = None,
     daemon: DaemonManager | None = None,
-    dotenv_path: str = "",
 ) -> HealthReport:
     """Run all health checks and return an aggregated report.
 
@@ -482,16 +367,28 @@ async def run_health_checks(
     mode_res = CheckResult("mode", CheckStatus.OK, mode_label)
 
     # Phase 1: independent checks
-    config_res, mg_res, embed_res, valkey_res = await asyncio.gather(
-        check_config(settings, dotenv_path=dotenv_path),
-        check_memgraph(graph, settings.memgraph),
-        check_embeddings(embed, settings.embeddings),
-        check_valkey(bus, settings.redis),
+    # The lease read belongs here too: it only needs the bus, and run after this phase it waited,
+    # unbounded, on a Valkey that check_valkey had already found down.
+    config_res, mg_res, embed_res, valkey_res, lease_res = await asyncio.gather(
+        check_config(settings),
+        check_memgraph(
+            graph,
+            settings.memgraph,
+            timeout_s=settings.health.connect_timeout_s,
+            chosen=settings.backend.graph_choice == "sqlite",
+        ),
+        check_embeddings(embed, settings.embeddings, timeout_s=settings.health.check_timeout_s),
+        check_valkey(
+            bus,
+            settings.redis,
+            timeout_s=settings.health.connect_timeout_s,
+            chosen=settings.backend.queue_choice == "sqlite",
+        ),
+        check_indexer_lease(bus, timeout_s=settings.health.connect_timeout_s),
     )
 
     results = [mode_res, config_res, mg_res, embed_res, valkey_res]
 
-    lease_res = await check_indexer_lease(bus)
     if lease_res is not None:
         results.append(lease_res)
 
@@ -506,11 +403,12 @@ async def run_health_checks(
         # (same "deferred retyping" convention as the ~10 construction call sites elsewhere) —
         # they only call methods both backends implement, so the SqliteGraphClient case is safe.
         schema_res, model_res, index_res = await asyncio.gather(
-            check_schema(graph),  # ty: ignore[invalid-argument-type]
+            check_schema(graph, timeout_s=settings.health.check_timeout_s),  # ty: ignore[invalid-argument-type]
             check_embedding_model(
                 graph,  # ty: ignore[invalid-argument-type]
                 settings.embeddings,
                 derive_project_name(settings.project_root),
+                timeout_s=settings.health.check_timeout_s,
             ),
             check_index(graph, settings),  # ty: ignore[invalid-argument-type]
         )
