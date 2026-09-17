@@ -81,6 +81,9 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          # Restore only: CI's lint job owns this key (see ci.yml), and a release job's
+          # cache holds different packages under the same key.
+          save-cache: false
 
       # Both python-semantic-release actions are `using: docker` with
       # `image: src/**/Dockerfile` -- GitHub *builds the image from source on every run*,
@@ -158,6 +161,9 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          # Restore only: CI's lint job owns this key (see ci.yml), and a release job's
+          # cache holds different packages under the same key.
+          save-cache: false
 
       - uses: actions/setup-python@v6
         with:

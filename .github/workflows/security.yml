@@ -40,7 +40,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@v7
         with:
-          enable-cache: true
+          # No cache: this job only runs `uv export`, so its cache is near-empty, yet it
+          # shares CI's key and could save that empty cache before CI saves the real one.
+          enable-cache: false
 
       - name: Install pip-audit
         run: pip install pip-audit
