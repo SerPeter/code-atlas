@@ -87,6 +87,7 @@ def indexed(tmp_path_factory: pytest.TempPathFactory):
                     backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                     full_reindex=True,
                     project_name="bench-arms",
+                    limiter=backends.limiter,
                 )
         return settings
 
@@ -187,6 +188,7 @@ class TestABrokenIndexIsNotAFastOne:
                     backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                     full_reindex=True,
                     project_name="bench-broken",
+                    limiter=backends.limiter,
                 )
 
         async with use_backends(settings, with_bus=False) as backends:

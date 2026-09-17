@@ -801,7 +801,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     skip_confirm: bool = False,
 ) -> None:
     """Async implementation of the ``atlas index`` command."""
-    from code_atlas.backends import create_event_bus, create_graph_client, graph_backend_label, queue_backend_label
+    from code_atlas.backends import create_graph_client, graph_backend_label, queue_backend_label, use_queue
     from code_atlas.graph.client import EmbeddingsPresentError
     from code_atlas.indexing.orchestrator import (
         EmbeddingDimensionMismatchError,
@@ -840,8 +840,11 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         # Registered first so it runs last. This used to sit after a `raise typer.Exit`
         # and never ran on any path.
         stack.callback(shutdown_telemetry)
-        bus = await create_event_bus(settings)
-        await stack.enter_async_context(bus)
+        # The bus and the limiter over one connection: the dimension probe below is paced
+        # by the same limiter the index then uses.
+        queue_bus, limiter = await stack.enter_async_context(use_queue(settings))
+        assert queue_bus is not None  # with_bus defaults to True
+        bus = queue_bus
         try:
             await bus.ping()
         except Exception as exc:
@@ -853,17 +856,13 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         if settings.embeddings.enabled and settings.embeddings.dimension is None:
             from code_atlas.search.embeddings import EmbedClient as _EmbedClient
 
-            # A block, not the command's stack: the probe is used once and its redis
-            # pool should go with it rather than outlive the whole index run.
-            async with _EmbedClient(settings.embeddings, settings) as _probe:
-                try:
-                    resolved_dim = await _probe.detect_dimension()
-                except Exception:
-                    logger.warning(
-                        "Embedding service unreachable — running in lightweight mode. Vector search disabled."
-                    )
-                    settings.embeddings.enabled = False
-                    resolved_dim = None
+            _probe = _EmbedClient(settings.embeddings, limiter=limiter)
+            try:
+                resolved_dim = await _probe.detect_dimension()
+            except Exception:
+                logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
+                settings.embeddings.enabled = False
+                resolved_dim = None
             if resolved_dim is not None:
                 settings.embeddings.dimension = resolved_dim
                 logger.debug("Auto-detected embedding dimension: {}", resolved_dim)
@@ -1010,6 +1009,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                 settings,
                 graph,
                 bus,
+                limiter=limiter,
                 projects=projects,
                 full_reindex=full_reindex,
                 reset=reset,
@@ -1057,6 +1057,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
                 settings,
                 graph,
                 bus,
+                limiter=limiter,
                 scope=scope,
                 full_reindex=full_reindex,
                 reset=reset,
@@ -1103,7 +1104,7 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             # released it would let every MCP server in the worktree start its own
             # catch-up against the same graph, which is the collision this whole
             # mechanism exists to prevent.
-            await _watch_after_index(settings, graph, bus, owner)
+            await _watch_after_index(settings, graph, bus, limiter, owner)
 
     # An undrained pass is a hard failure for a one-shot run, and only a warning under
     # --watch: there the consumers stay up and keep draining, which is the entire
@@ -1117,6 +1118,7 @@ async def _index_monorepo_with_progress(
     graph: Any,
     bus: Any,
     *,
+    limiter: Any,
     projects: list[str] | None,
     full_reindex: bool,
     reset: bool = False,
@@ -1172,6 +1174,7 @@ async def _index_monorepo_with_progress(
             reset=reset,
             reset_embeddings=reset_embeddings,
             drain_timeout_s=settings.index.drain_timeout_s,
+            limiter=limiter,
             on_progress=on_progress,
             on_drain_progress=on_drain,
         )
@@ -1184,6 +1187,7 @@ async def _index_single_with_spinner(
     graph: Any,
     bus: Any,
     *,
+    limiter: Any,
     scope: list[str] | None,
     full_reindex: bool,
     reset: bool = False,
@@ -1221,13 +1225,14 @@ async def _index_single_with_spinner(
             reset=reset,
             reset_embeddings=reset_embeddings,
             drain_timeout_s=settings.index.drain_timeout_s,
+            limiter=limiter,
             on_drain_progress=on_drain,
         )
 
     return result  # noqa: RET504
 
 
-async def _watch_after_index(settings: Any, graph: Any, bus: Any, lease_owner: str) -> None:
+async def _watch_after_index(settings: Any, graph: Any, bus: Any, limiter: Any, lease_owner: str) -> None:
     """Keep watching after the index pass, holding the lease, until interrupted.
 
     Exists so a checkout can have one persistent indexer that is not an MCP server.
@@ -1245,7 +1250,9 @@ async def _watch_after_index(settings: Any, graph: Any, bus: Any, lease_owner: s
     from code_atlas.indexing.daemon import DaemonManager
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph, bus, include_watcher=True, catchup=False, lease_owner=lease_owner)
+    started = await daemon.start(
+        settings, graph, bus, limiter=limiter, include_watcher=True, catchup=False, lease_owner=lease_owner
+    )
     if not started:
         logger.error("Cannot watch — the event queue backend is unreachable")
         raise typer.Exit(code=1)
@@ -1339,7 +1346,7 @@ async def _run_search(
                 )
 
             if not model_mismatch and (search_types is None or SearchType.VECTOR in search_types):
-                embed = await stack.enter_async_context(EmbedClient(settings.embeddings, settings))
+                embed = EmbedClient(settings.embeddings, limiter=backends.limiter)
 
         results = await hybrid_search(
             graph=graph,
@@ -1516,7 +1523,7 @@ def project_rm(
     name: str = typer.Argument(..., help="Project name to remove (as shown by 'atlas status')."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ) -> None:
-    """Delete a project's graph data (nodes, relationships, embeddings).
+    """Delete a project's graph data (nodes, relationships, embeddings) and its queue data.
 
     Mainly for worktree-project cleanup: a linked worktree indexes as its own
     'base@branch' project, and the daemon auto-GCs these once the checkout is
@@ -1526,9 +1533,23 @@ def project_rm(
     asyncio.run(_run_project_rm(name, skip_confirm=yes))
 
 
+async def _queue_owner(graph: Any, name: str) -> str:
+    """The project whose streams and indexer lease cover *name*.
+
+    A monorepo sub-project ``root/sub`` is indexed by its root's run, under the root's lease
+    and into the root's streams. A worktree branch can contain ``/`` too
+    (``base@feature/x``), so the prefix only counts when the graph knows it as a project.
+    """
+    root, sep, _sub = name.rpartition("/")
+    if sep and await graph.get_project_status(root):
+        return root
+    return name
+
+
 async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
     """Async implementation of the ``atlas project rm`` command."""
-    from code_atlas.backends import connected
+    from code_atlas.backends import connected, queue_backend_label, use_queue
+    from code_atlas.events import IndexerBusyError, hold_indexer_lease
 
     settings = _load_settings()
     async with connected(settings, with_bus=False, on_unreachable=_unreachable_backend) as backends:
@@ -1549,10 +1570,33 @@ async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
             skip_confirm=skip_confirm,
         )
 
-        await graph.delete_project_data(name)
+        owner = await _queue_owner(graph, name)
+        async with use_queue(settings, project_name=owner) as (bus, _limiter):
+            assert bus is not None  # with_bus defaults to True
+            # The same guard `atlas index` takes before it writes: an indexer holding this
+            # project's lease would re-create what is being deleted, or write into a half-
+            # removed project. Waiting is the index command's answer to a live holder too.
+            try:
+                async with hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s):
+                    await graph.delete_project_data(name)
+                    queue_removed = await bus.delete_project_queue() if owner == name else 0
+            except IndexerBusyError as exc:
+                logger.error("{} — nothing was removed", exc)
+                raise typer.Exit(code=1) from exc
+            queue_label = queue_backend_label(bus, settings)
+
         _echo(f"Removed project '{name}'.")
+        if owner != name:
+            _echo(f"  Queue data kept: '{name}' is indexed through '{owner}', whose streams it shares.")
+        elif queue_removed is None:
+            _echo(
+                f"  Queue data kept: {queue_label} has no per-project data — every project indexed "
+                "from this checkout shares it. Delete that file to drop it."
+            )
+        else:
+            _echo(f"  Removed its queue data from {queue_label} ({queue_removed} item(s)).")
         if _output.json:
-            _json_output({"removed": name})
+            _json_output({"removed": name, "queue_removed": queue_removed})
 
 
 # ---------------------------------------------------------------------------
@@ -1911,6 +1955,7 @@ async def _run_bench(
                     bus,  # ty: ignore[invalid-argument-type]
                     full_reindex=True,
                     project_name=project_name,
+                    limiter=backends.limiter,
                 )
                 total_s = time.perf_counter() - started
                 # Profiled inside the scope, while the graph is still open. A corpus
@@ -2123,7 +2168,7 @@ async def _run_watch(path: str, *, debounce: float | None, max_wait: float | Non
                 raise typer.Exit(code=1) from exc
 
             daemon = DaemonManager()
-            started = await daemon.start(settings, graph, bus)  # ty: ignore[invalid-argument-type]
+            started = await daemon.start(settings, graph, bus, limiter=backends.limiter)  # ty: ignore[invalid-argument-type]
             if not started:
                 logger.error("A reachable queue backend is required for watch mode")
                 raise typer.Exit(code=1)
@@ -2189,7 +2234,13 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
                 raise typer.Exit(code=1) from exc
 
             daemon = DaemonManager()
-            started = await daemon.start(settings, graph, bus, include_watcher=True)  # ty: ignore[invalid-argument-type]
+            started = await daemon.start(
+                settings,
+                graph,  # ty: ignore[invalid-argument-type]
+                bus,  # ty: ignore[invalid-argument-type]
+                limiter=backends.limiter,
+                include_watcher=True,
+            )
             if not started:
                 logger.error("A reachable queue backend is required for daemon mode")
                 raise typer.Exit(code=1)

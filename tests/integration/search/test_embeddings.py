@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from code_atlas.search.embeddings import EmbedClient
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import AtlasSettings
 from tests.conftest import TEST_DRAIN_TIMEOUT_S
 
@@ -236,7 +237,7 @@ class TestTEIIntegration:
 
     async def test_dimension_auto_detected(self, tei_settings):
         """EmbedClient.detect_dimension() returns the correct dim from TEI."""
-        client = EmbedClient(tei_settings.embeddings)
+        client = EmbedClient(tei_settings.embeddings, limiter=unpaced())
         dim = await client.detect_dimension()
         # TaylorAI/gte-tiny is 384-dim
         assert dim == 384
@@ -253,7 +254,9 @@ class TestTEIIntegration:
             embeddings=tei_settings.embeddings,
         )
         await tei_graph_client.ensure_schema()
-        await index_project(settings, tei_graph_client, tei_event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings, tei_graph_client, tei_event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         # Check that at least one entity has a non-null embedding
         records = await tei_graph_client.execute(
@@ -283,10 +286,12 @@ class TestTEIIntegration:
             embeddings=tei_settings.embeddings,
         )
         await tei_graph_client.ensure_schema()
-        await index_project(settings, tei_graph_client, tei_event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings, tei_graph_client, tei_event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         # Perform a vector search
-        client = EmbedClient(tei_settings.embeddings)
+        client = EmbedClient(tei_settings.embeddings, limiter=unpaced())
         query_vec = await client.embed_one("add two numbers")
         results = await tei_graph_client.vector_search(query_vec, limit=5)
         assert len(results) > 0, "Vector search should return at least one result"

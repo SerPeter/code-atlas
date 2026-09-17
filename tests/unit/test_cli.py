@@ -582,7 +582,7 @@ class TestDestructiveIndexFlags:
                 return 0
 
         async def fake_single_with_spinner(
-            settings, graph, bus, *, scope, full_reindex, reset=False, reset_embeddings=False
+            settings, graph, bus, *, limiter, scope, full_reindex, reset=False, reset_embeddings=False
         ):
             from code_atlas.indexing.orchestrator import IndexResult
 
@@ -591,7 +591,7 @@ class TestDestructiveIndexFlags:
             return IndexResult(files_scanned=0, files_published=0, entities_total=0, duration_s=0.0)
 
         async def fake_monorepo_with_progress(
-            settings, graph, bus, *, projects, full_reindex, reset=False, reset_embeddings=False
+            settings, graph, bus, *, limiter, projects, full_reindex, reset=False, reset_embeddings=False
         ):
             captured["dispatch"] = "monorepo"
             captured["flags"] = (full_reindex, reset, reset_embeddings)
@@ -812,8 +812,47 @@ class TestDreamCommand:
         mock_graph.__aexit__.assert_awaited_once()
 
 
+class _FakeQueueBus:
+    """Just the lease and the queue removal `atlas project rm` uses, with no network behind it."""
+
+    def __init__(self, *, holder: str | None = None, removed: int | None = 3) -> None:
+        self.holder = holder
+        self.removed = removed
+        self.deletions = 0
+
+    async def acquire_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        if self.holder is not None:
+            return False
+        self.holder = owner
+        return True
+
+    async def read_indexer_lease(self) -> str | None:
+        return self.holder
+
+    async def renew_indexer_lease(self, owner: str, ttl_ms: int) -> bool:
+        return self.holder == owner
+
+    async def release_indexer_lease(self, owner: str) -> bool:
+        if self.holder != owner:
+            return False
+        self.holder = None
+        return True
+
+    async def delete_project_queue(self) -> int | None:
+        self.deletions += 1
+        return self.removed
+
+
 class TestProjectRm:
-    """`atlas project rm` deletes a project's graph data, with a confirmation gate."""
+    """`atlas project rm` deletes a project's graph and queue data, with a confirmation gate."""
+
+    @staticmethod
+    def _patch_bus(monkeypatch, bus: _FakeQueueBus | None = None) -> tuple[_FakeQueueBus, AsyncMock]:
+        """Every test here: an undeclared queue would otherwise probe a real Valkey on 6379."""
+        bus = bus or _FakeQueueBus()
+        factory = AsyncMock(return_value=bus)
+        monkeypatch.setattr("code_atlas.backends.create_event_bus", factory)
+        return bus, factory
 
     def _mock_graph(self, *, found: bool = True):
         mock_graph = AsyncMock()
@@ -840,6 +879,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
 
         await cli._run_project_rm("myproject", skip_confirm=True)
 
@@ -861,6 +901,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
 
         with pytest.raises(typer.Exit):
             await cli._run_project_rm("ghost", skip_confirm=True)
@@ -877,6 +918,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
         # CliRunner feeds stdin without making it a TTY, so without this the command
         # would take the "nobody is there to answer" branch and this test would pass
         # having never reached the prompt it is named after.
@@ -897,6 +939,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
         monkeypatch.setattr(cli, "_is_interactive", lambda: True)
 
         result = runner.invoke(app, ["project", "rm", "myproject"], input="y\n")
@@ -922,6 +965,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
         monkeypatch.setattr(cli.typer, "confirm", _unexpected_confirm)
 
         with pytest.raises(typer.Exit):
@@ -944,6 +988,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
         monkeypatch.setattr(cli.typer, "confirm", _unexpected_confirm)
 
         await cli._run_project_rm("myproject", skip_confirm=True)
@@ -968,6 +1013,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
 
         result = runner.invoke(app, ["project", "rm", "myproject", "--yes"])
 
@@ -992,6 +1038,7 @@ class TestProjectRm:
 
         monkeypatch.setattr(cli, "_load_settings", lambda: settings)
         monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch)
         monkeypatch.setattr(cli, "_is_interactive", lambda: False)
         _forbid_prompt(monkeypatch, "there is nobody present to answer")
 
@@ -999,6 +1046,105 @@ class TestProjectRm:
 
         assert result.exit_code == 1, result.output
         mock_graph.delete_project_data.assert_not_awaited()
+
+    async def test_it_removes_the_queue_data_under_the_projects_own_lease(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        bus, factory = self._patch_bus(monkeypatch)
+
+        await cli._run_project_rm("myproject", skip_confirm=True)
+
+        assert factory.await_args_list[-1].kwargs["project_name"] == "myproject", (
+            "the bus must be the removed project's"
+        )
+        mock_graph.delete_project_data.assert_awaited_once_with("myproject")
+        assert bus.deletions == 1
+        assert bus.holder is None, "the lease taken for the removal was not released"
+
+    async def test_a_live_lease_stops_the_removal(self, tmp_path, monkeypatch) -> None:
+        """An indexer mid-run would re-create what is being deleted, or write into half of it."""
+        import pytest
+        import typer
+
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        settings.index.lease_wait_s = 0
+        mock_graph = self._mock_graph()
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        bus, _factory = self._patch_bus(monkeypatch, _FakeQueueBus(holder="other-host:4242:abcd"))
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await cli._run_project_rm("myproject", skip_confirm=True)
+
+        assert excinfo.value.exit_code == 1
+        mock_graph.delete_project_data.assert_not_awaited()
+        assert bus.deletions == 0
+        assert bus.holder == "other-host:4242:abcd", "a live holder's lease must be left alone"
+
+    async def test_a_sub_project_is_guarded_by_its_roots_lease_and_keeps_its_queue(self, tmp_path, monkeypatch) -> None:
+        """`root/sub` is indexed by the root's run, into the root's streams: removing the sub-project
+        must wait for that lease, and must not empty streams the root still uses."""
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        bus, factory = self._patch_bus(monkeypatch)
+
+        await cli._run_project_rm("root/sub", skip_confirm=True)
+
+        assert factory.await_args_list[-1].kwargs["project_name"] == "root"
+        mock_graph.delete_project_data.assert_awaited_once_with("root/sub")
+        assert bus.deletions == 0
+
+    async def test_a_slash_in_a_worktree_branch_is_not_a_sub_project(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+        mock_graph.get_project_status = AsyncMock(
+            side_effect=lambda name=None: [{"n": {"name": name}}] if name == "base@feature/x" else []
+        )
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        bus, factory = self._patch_bus(monkeypatch)
+
+        await cli._run_project_rm("base@feature/x", skip_confirm=True)
+
+        assert factory.await_args_list[-1].kwargs["project_name"] == "base@feature/x"
+        assert bus.deletions == 1
+
+    def test_a_backend_without_per_project_queue_data_says_it_kept_it(self, tmp_path, monkeypatch) -> None:
+        from code_atlas import cli
+        from code_atlas.settings import AtlasSettings
+
+        _reset_output()
+        settings = AtlasSettings(project_root=tmp_path)
+        mock_graph = self._mock_graph()
+        monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+        monkeypatch.setattr("code_atlas.backends.GraphClient", lambda s: mock_graph)
+        self._patch_bus(monkeypatch, _FakeQueueBus(removed=None))
+
+        result = runner.invoke(app, ["project", "rm", "myproject", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert "Queue data kept" in result.output
+        mock_graph.delete_project_data.assert_awaited_once_with("myproject")
 
 
 class TestIndexExitCode:

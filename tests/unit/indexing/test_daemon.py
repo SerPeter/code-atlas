@@ -11,6 +11,7 @@ import typer
 
 from code_atlas.indexing import daemon as daemon_module
 from code_atlas.indexing.daemon import DaemonManager
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import AtlasSettings, ExtraVaultSettings, GraphBackendSettings, MemgraphSettings
 
 if TYPE_CHECKING:
@@ -301,6 +302,7 @@ class TestStartupCatchup:
             object(),  # ty: ignore[invalid-argument-type]
             FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
+            limiter=unpaced(),
         )
         assert started is True
         await asyncio.sleep(0.05)
@@ -326,6 +328,7 @@ class TestStartupCatchup:
             object(),  # ty: ignore[invalid-argument-type]
             FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
+            limiter=unpaced(),
         )
         assert started is True
         await asyncio.sleep(0.05)
@@ -342,6 +345,7 @@ class TestStartupCatchup:
             FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=False,
+            limiter=unpaced(),
         )
         assert started is True
         await asyncio.sleep(0.05)
@@ -358,6 +362,7 @@ class TestStartupCatchup:
             object(),  # ty: ignore[invalid-argument-type]
             FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
+            limiter=unpaced(),
         )
         assert started is True
 
@@ -373,6 +378,7 @@ class TestStartupCatchup:
             object(),  # ty: ignore[invalid-argument-type]
             FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
+            limiter=unpaced(),
         )
         assert started is True
         await asyncio.sleep(0.05)
@@ -390,6 +396,7 @@ class TestStartupCatchup:
             object(),  # ty: ignore[invalid-argument-type]
             FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
+            limiter=unpaced(),
         )
         assert started is True
         await asyncio.sleep(0.05)
@@ -430,6 +437,7 @@ class TestStartupCatchup:
                 object(),  # ty: ignore[invalid-argument-type]
                 BusyFakeBus(settings),  # ty: ignore[invalid-argument-type]
                 include_watcher=False,
+                limiter=unpaced(),
             ),  # type: ignore[arg-type]
             timeout=5.0,
         )
@@ -478,6 +486,7 @@ class TestStartupCatchup:
             object(),  # ty: ignore[invalid-argument-type]
             FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
+            limiter=unpaced(),
         )
         await manager.stop()
 
@@ -557,6 +566,7 @@ class TestWatcherScopeScan:
             FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
             include_watcher=True,
             catchup=False,
+            limiter=unpaced(),
         )
         assert started is True
         await asyncio.sleep(0.05)
@@ -632,6 +642,7 @@ class TestVaultTaskSpawning:
             FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=True,
+            limiter=unpaced(),
         )
         assert started is True
         await asyncio.sleep(0.05)
@@ -657,6 +668,7 @@ class TestVaultTaskSpawning:
             FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=True,
+            limiter=unpaced(),
         )
         assert started is True
         assert manager._vault_watchers == []
@@ -707,6 +719,7 @@ class TestVaultStartupIsolation:
             FakeBus(settings),  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             catchup=True,
+            limiter=unpaced(),
         )
         assert started is True
 

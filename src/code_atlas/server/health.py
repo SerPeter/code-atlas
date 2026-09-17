@@ -10,11 +10,13 @@ from typing import TYPE_CHECKING
 
 from dotenv import find_dotenv
 
+from code_atlas.backends.postgres_queue import PostgresEventBus
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.backends.sqlite_queue import SqliteEventBus
 from code_atlas.indexing.orchestrator import StalenessChecker
 from code_atlas.schema import SCHEMA_VERSION
 from code_atlas.search.embeddings import EmbedClient
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import _find_atlas_toml, derive_project_name, find_git_root
 
 if TYPE_CHECKING:
@@ -197,13 +199,13 @@ async def check_embeddings(
 
 
 async def check_valkey(
-    bus: EventBus | SqliteEventBus | None,
+    bus: EventBus | SqliteEventBus | PostgresEventBus | None,
     redis_settings: RedisSettings,
 ) -> CheckResult:
     """Verify connectivity of the active queue backend, honestly naming which one it is.
 
-    *bus* may be a real ``EventBus`` (Valkey) or the ``SqliteEventBus`` embedded
-    fallback — whichever ``create_event_bus`` actually returned (or the daemon's
+    *bus* may be a real ``EventBus`` (Valkey), a ``PostgresEventBus``, or the
+    ``SqliteEventBus`` embedded fallback — whichever ``create_event_bus`` actually returned (or the daemon's
     live bus, when one is running). The reported message always names the real
     backend instead of assuming Valkey. Ownership (construction/closing) is the
     caller's responsibility — mirrors ``check_memgraph``.
@@ -216,12 +218,20 @@ async def check_valkey(
         )
 
     is_sqlite = isinstance(bus, SqliteEventBus)
-    backend = "SQLite (embedded)" if is_sqlite else f"Valkey ({addr})"
-    indexing_disabled = (
-        "auto-indexing disabled — file changes will NOT be indexed until the embedded queue is available"
-        if is_sqlite
-        else "auto-indexing disabled — file changes will NOT be indexed until Valkey is reachable"
-    )
+    if isinstance(bus, PostgresEventBus):
+        backend = f"Postgres ({bus.address})"
+        indexing_disabled = "auto-indexing disabled — file changes will NOT be indexed until Postgres is reachable"
+        start_hint = "Check [backend.queue.postgres] and that the Postgres server is running."
+    elif is_sqlite:
+        backend = "SQLite (embedded)"
+        indexing_disabled = (
+            "auto-indexing disabled — file changes will NOT be indexed until the embedded queue is available"
+        )
+        start_hint = "docker compose up -d valkey"
+    else:
+        backend = f"Valkey ({addr})"
+        indexing_disabled = "auto-indexing disabled — file changes will NOT be indexed until Valkey is reachable"
+        start_hint = "docker compose up -d valkey"
     try:
         ok = await asyncio.wait_for(bus.ping(), timeout=_CHECK_TIMEOUT)
         if ok and is_sqlite:
@@ -244,7 +254,7 @@ async def check_valkey(
             name,
             CheckStatus.WARN,
             f"Ping failed — {backend} — {indexing_disabled}",
-            suggestion="docker compose up -d valkey",
+            suggestion=start_hint,
         )
     except Exception as exc:
         return CheckResult(
@@ -252,7 +262,7 @@ async def check_valkey(
             CheckStatus.WARN,
             f"Unreachable — {backend} — {indexing_disabled}",
             detail=str(exc),
-            suggestion="docker compose up -d valkey",
+            suggestion=start_hint,
         )
 
 
@@ -377,7 +387,7 @@ async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResul
     return CheckResult(name, CheckStatus.OK, f"{len(project_names)} project(s) up to date", detail=detail)
 
 
-async def check_indexer_lease(bus: EventBus | SqliteEventBus | None) -> CheckResult | None:
+async def check_indexer_lease(bus: EventBus | SqliteEventBus | PostgresEventBus | None) -> CheckResult | None:
     """Report a foreign indexer holding the lease.
 
     Without this a second indexer is invisible: Redis identifies a consumer by name only,
@@ -439,7 +449,7 @@ async def run_health_checks(
     settings: AtlasSettings,
     *,
     graph: GraphClient | SqliteGraphClient,
-    bus: EventBus | SqliteEventBus,
+    bus: EventBus | SqliteEventBus | PostgresEventBus,
     embed: EmbedClient | None = None,
     daemon: DaemonManager | None = None,
     dotenv_path: str = "",
@@ -462,10 +472,10 @@ async def run_health_checks(
     t0 = time.monotonic()
 
     if embed is None and settings.embeddings.enabled:
-        # No redis_settings on purpose: a health probe must answer "is the provider
+        # No limiter on purpose: a health probe must answer "is the provider
         # reachable" immediately. Handing it the rate limiter would let a drained
         # bucket block the check and report the provider down when it is merely busy.
-        embed = EmbedClient(settings.embeddings)
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
 
     # Mode indicator
     mode_label = "full" if settings.embeddings.enabled else "lightweight (no embeddings)"

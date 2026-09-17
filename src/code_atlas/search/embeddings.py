@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any
 
 import litellm
 import pathspec
@@ -18,12 +18,13 @@ from loguru import logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from code_atlas.chunking import CHARS_PER_TOKEN_FALLBACK, SplitResult, split_embed_text
-from code_atlas.search.ratelimit import ConcurrencyGate, RateLimiter, SqliteRateLimiter, make_rate_limiter
+from code_atlas.search.ratelimit import ConcurrencyGate, RateBudget
 from code_atlas.settings import _PROVIDER_DEFAULTS
 from code_atlas.telemetry import get_tracer
 
 if TYPE_CHECKING:
-    from code_atlas.settings import AtlasSettings, EmbeddingSettings
+    from code_atlas.search.ratelimit import Limiter
+    from code_atlas.settings import EmbeddingSettings
 
 _tracer = get_tracer(__name__)
 
@@ -59,9 +60,13 @@ class EmbedClient:
     Routes to any OpenAI-compatible endpoint. When ``base_url`` is set
     (e.g. self-hosted TEI), the model is prefixed with ``openai/`` so
     litellm treats it as an OpenAI-compatible API.
+
+    Holds no connection. *limiter* is the process's rate limiter, handed down from the
+    composition root (``Backends.limiter``) and never closed here. It is required: a caller
+    that must not be paced passes ``unpaced()`` by name, as the health probe does.
     """
 
-    def __init__(self, settings: EmbeddingSettings, atlas_settings: AtlasSettings | None = None) -> None:
+    def __init__(self, settings: EmbeddingSettings, *, limiter: Limiter) -> None:
         self._settings = settings
         # batch_size and max_concurrency are guaranteed non-None after the
         # _apply_provider_defaults model validator runs on EmbeddingSettings.
@@ -115,36 +120,17 @@ class EmbedClient:
         self._gate = ConcurrencyGate(self._max_concurrency)
         self._rpm = self._resolve_rate_limit(settings.rpm, "rpm")
         self._tpm = self._resolve_rate_limit(settings.tpm, "tpm")
-        # Whole settings rather than `settings.redis`, because which coordination store
-        # paces this client is a *backend* choice now, not a Redis detail. An embedded
-        # deployment used to build a Valkey limiter regardless and pay a connect timeout
-        # per batch for a host it had already been told was not there.
-        self._limiter: RateLimiter | SqliteRateLimiter | None = None
-        if atlas_settings is not None:
-            self._limiter = make_rate_limiter(
-                atlas_settings, model=self._model, rpm=self._rpm, tpm=self._tpm, gate=self._gate
-            )
-            logger.debug(
-                "Embedding rate limits for '{}': rpm={} tpm={} (0 = unlimited)",
-                self._model,
-                self._rpm,
-                self._tpm,
-            )
-
-    async def close(self) -> None:
-        """Release the rate limiter's connection pool or SQLite handle.
-
-        Only a client given *atlas_settings* has a limiter -- pass none and this is a
-        no-op -- so every call site can close unconditionally.
-        """
-        if self._limiter is not None:
-            await self._limiter.close()
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        await self.close()
+        # The limiter is the process's (its store is a backend choice, ADR-0044); the
+        # budget -- model, limits, gate -- is this client's own.
+        self._limiter = limiter
+        self._budget = RateBudget(model=self._model, rpm=self._rpm, tpm=self._tpm, gate=self._gate)
+        logger.debug(
+            "Embedding rate limits for '{}': rpm={} tpm={} (0 = unlimited) via {}",
+            self._model,
+            self._rpm,
+            self._tpm,
+            type(limiter).__name__,
+        )
 
     @property
     def batch_size(self) -> int:
@@ -335,8 +321,7 @@ class EmbedClient:
             # a single 429 damps the whole fleet's buckets and concurrency before the
             # retry above sleeps. Without it the sibling processes keep pushing at the
             # rate that just failed, and the backoff here is wasted.
-            if self._limiter is not None:
-                await self._limiter.penalize()
+            await self._limiter.penalize(self._budget)
             raise
 
     def _build_kwargs(self, chunk: list[str]) -> dict[str, Any]:
@@ -381,8 +366,7 @@ class EmbedClient:
                 # hold; taking rate budget first would debit it and then block on the gate,
                 # leaving the scarcer resource reserved and unused.
                 async with self._gate:
-                    if self._limiter is not None:
-                        await self._limiter.acquire(tokens=chunk_tokens)
+                    await self._limiter.acquire(self._budget, tokens=chunk_tokens)
                     try:
                         kwargs = self._build_kwargs(chunk)
                         response = await self._embed_call(kwargs)

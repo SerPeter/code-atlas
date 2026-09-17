@@ -23,6 +23,7 @@ import pytest
 
 from code_atlas.graph.client import GraphClient
 from code_atlas.schema import generate_drop_text_index_ddl, generate_drop_vector_index_ddl
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import AtlasSettings, BackendSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
 from tests.conftest import _GUARD_OK, _assert_disposable_db  # noqa: F401 — _GUARD_OK re-exported, see docstring
 
@@ -130,7 +131,7 @@ async def tei_settings(tmp_path, _infra_endpoints: InfraEndpoints, _tei_endpoint
 
     tei_url = f"http://{_tei_endpoint.host}:{_tei_endpoint.port}"
     probe_settings = EmbeddingSettings(enabled=True, base_url=tei_url)
-    dimension = await EmbedClient(probe_settings).detect_dimension()
+    dimension = await EmbedClient(probe_settings, limiter=unpaced()).detect_dimension()
 
     return AtlasSettings(
         project_root=tmp_path,
@@ -188,11 +189,12 @@ async def tei_graph_client(tei_settings) -> AsyncIterator[GraphClient]:
 @pytest.fixture
 async def tei_event_bus(tei_settings) -> AsyncIterator:
     """EventBus wired to TEI-configured settings."""
-    from code_atlas.events import EventBus
+    from code_atlas.events import EventBus, redis_client
 
     # Scoped to a block -- see the graph fixture; an abandoned redis Connection produces
     # the same misdirected ResourceWarning.
-    async with EventBus(tei_settings.redis) as bus:
+    async with redis_client(tei_settings.redis) as redis:
+        bus = EventBus(redis, tei_settings.redis)
         try:
             await bus.ping()
         except Exception:

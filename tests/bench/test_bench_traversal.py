@@ -80,6 +80,7 @@ async def _point(tmp_path: Path, size: int) -> dict[str, object]:
                 backends.bus,  # ty: ignore[invalid-argument-type]  # index_project accepts either backend
                 full_reindex=True,
                 project_name=project,
+                limiter=backends.limiter,
             )
 
             graph = backends.graph

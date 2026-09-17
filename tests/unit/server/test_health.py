@@ -301,6 +301,29 @@ async def test_check_valkey_none():
     assert "No client" in result.message
 
 
+async def test_check_valkey_names_postgres_when_that_is_the_queue():
+    """A Postgres queue reports itself, its address, and never its password."""
+    from pydantic import SecretStr
+
+    from code_atlas.backends.postgres_queue import PostgresConnections, PostgresEventBus
+    from code_atlas.settings import PostgresSettings
+
+    bus = PostgresEventBus(PostgresConnections(PostgresSettings(host="pg.local", password=SecretStr("s3cret"))))
+    bus.ping = AsyncMock(return_value=True)
+
+    ok = await check_valkey(bus, RedisSettings())
+    assert ok.status == CheckStatus.OK
+    assert "Postgres (pg.local:5432/atlas)" in ok.message
+    assert "Valkey" not in ok.message
+
+    bus.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
+    down = await check_valkey(bus, RedisSettings())
+    assert down.status == CheckStatus.WARN
+    assert "Postgres" in down.message
+    assert "valkey" not in down.suggestion.lower()
+    assert "s3cret" not in down.message + down.detail + down.suggestion
+
+
 async def test_check_valkey_warns_when_the_sqlite_fallback_is_active(tmp_path):
     """The embedded queue must not report an unqualified OK either (ATL-112).
 

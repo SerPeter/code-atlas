@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from code_atlas.search.ratelimit import unpaced
 from tests.conftest import NO_EMBED, TEST_DRAIN_TIMEOUT_S
 
 if TYPE_CHECKING:
@@ -73,7 +74,9 @@ class TestIndexMonorepoIntegration:
         settings = AtlasSettings(project_root=monorepo_dir, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        results = await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        results = await index_monorepo(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         # Should have indexed at least the two sub-projects
         assert len(results) >= 2
@@ -95,7 +98,12 @@ class TestIndexMonorepoIntegration:
         await graph_client.ensure_schema()
 
         await index_monorepo(
-            settings, graph_client, event_bus, scope_projects=["auth"], drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            settings,
+            graph_client,
+            event_bus,
+            scope_projects=["auth"],
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
         )
 
         # Should only have indexed auth (prefixed) + possibly root
@@ -128,14 +136,14 @@ class TestIndexMonorepoIntegration:
 
         settings = AtlasSettings(project_root=monorepo_dir, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
-        await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         # Modify one file in the shared sub-project and commit
         _write(monorepo_dir, "libs/shared/shared/utils.py", "def validate_v2():\n    return False\n")
         _git(monorepo_dir, "add", ".")
         _git(monorepo_dir, "commit", "-m", "modify shared utils")
 
-        await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         root_name = monorepo_dir.resolve().name
         shared = f"{root_name}/shared"

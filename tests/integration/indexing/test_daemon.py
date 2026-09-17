@@ -14,6 +14,7 @@ import pytest
 from code_atlas.events import FileChanged, Topic
 from code_atlas.indexing.daemon import DaemonManager
 from code_atlas.indexing.orchestrator import index_project
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import ExtraVaultSettings, derive_project_name
 
 if TYPE_CHECKING:
@@ -75,7 +76,9 @@ async def test_consumer_restarts_after_group_destroyed(
     await graph_client.ensure_schema()
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=False)
+    started = await daemon.start(
+        settings, graph_client, event_bus, include_watcher=False, catchup=False, limiter=unpaced()
+    )
     assert started is True
     try:
         bus = daemon._bus
@@ -136,13 +139,15 @@ async def test_daemon_start_runs_catchup_delta(
     # under the delta threshold)
     for i in range(5):
         _write_python_file(settings.project_root, f"mod_{i}.py", f"def fn_{i}():\n    return {i}\n")
-    await index_project(settings, graph_client, event_bus, drain_timeout_s=60.0)
+    await index_project(settings, graph_client, event_bus, drain_timeout_s=60.0, limiter=unpaced())
 
     # Edit while nothing is running — no watcher, no daemon, no consumers
     _write_python_file(settings.project_root, "added_later.py", "def beta():\n    return 42\n")
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=True)
+    started = await daemon.start(
+        settings, graph_client, event_bus, include_watcher=False, catchup=True, limiter=unpaced()
+    )
     assert started is True
     try:
         # Catch-up is awaited inside start(): the new file's entities must
@@ -183,7 +188,9 @@ async def test_daemon_indexes_extra_vault(
     settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=True)
+    started = await daemon.start(
+        settings, graph_client, event_bus, include_watcher=False, catchup=True, limiter=unpaced()
+    )
     assert started is True
     try:
         rows = await _wait_for_rows(
@@ -217,7 +224,9 @@ async def test_daemon_live_watches_extra_vault(
     settings.knowledge.extra_vaults = [ExtraVaultSettings(path=str(vault_dir), project_name="test-vault")]
 
     daemon = DaemonManager()
-    started = await daemon.start(settings, graph_client, event_bus, include_watcher=False, catchup=True)
+    started = await daemon.start(
+        settings, graph_client, event_bus, include_watcher=False, catchup=True, limiter=unpaced()
+    )
     assert started is True
     try:
         assert len(daemon._vault_watchers) == 1

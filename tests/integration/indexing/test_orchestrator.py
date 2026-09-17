@@ -21,6 +21,7 @@ from code_atlas.schema import (
     generate_clear_file_hashes_ddl,
 )
 from code_atlas.search.embeddings import DEFAULT_EXCLUDE_KINDS, EmbedPolicy
+from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import (
     AtlasSettings,
     EmbeddingSettings,
@@ -127,7 +128,9 @@ class TestIndexProjectIntegration:
         settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert result.files_scanned >= 2
         assert result.entities_total > 0
@@ -137,7 +140,7 @@ class TestIndexProjectIntegration:
         settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         # Project node exists
         projects = await graph_client.execute(f"MATCH (p:{NodeLabel.PROJECT}) RETURN p.name AS name")
@@ -159,12 +162,19 @@ class TestIndexProjectIntegration:
         await graph_client.ensure_schema()
 
         # First index
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r1 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r1.entities_total > 0
 
         # Full reindex — should work cleanly
         r2 = await index_project(
-            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
         )
         assert r2.entities_total > 0
 
@@ -176,7 +186,9 @@ class TestIndexProjectIntegration:
         settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         # Should still complete and index the good file
         assert result.files_scanned >= 2
@@ -220,13 +232,15 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
         project = derive_project_name(git_project)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert await _citation_edges(graph_client, project) == []
 
         _write(git_project, "wiki/adr/0014-calls.md", "# ADR-0014: CALLS Edge Confidence\n\nBody.\n")
         _git(git_project, "add", ".")
         _git(git_project, "commit", "-m", "write the adr")
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert r2.files_published == 1, "only the ADR should be republished"
         assert await _citation_edges(graph_client, project) == [("wiki/adr/0014-calls.md", "resolve", "ADR-14")]
@@ -237,12 +251,16 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
 
         # First index — full mode
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r1 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r1.mode == "full"
         assert r1.entities_total > 0
 
         # Re-index without changes — delta mode, 0 published
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r2.mode == "delta"
         assert r2.files_published == 0
         assert r2.entities_total == r1.entities_total
@@ -253,7 +271,9 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
 
         # First index
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r1 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r1.mode == "full"
 
         # Modify one file and commit
@@ -262,7 +282,9 @@ class TestDeltaIndexIntegration:
         _git(git_project, "commit", "-m", "modify app")
 
         # Delta re-index
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r2.mode == "delta"
         assert r2.delta_stats is not None
         assert r2.delta_stats.files_modified >= 1
@@ -274,7 +296,7 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
 
         # First index
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         # Add new file and commit
         _write(git_project, "src/new_module.py", "NEW_CONST = 99\n")
@@ -282,7 +304,9 @@ class TestDeltaIndexIntegration:
         _git(git_project, "commit", "-m", "add new module")
 
         # Delta re-index
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r2.mode == "delta"
         assert r2.delta_stats is not None
         assert r2.delta_stats.files_added >= 1
@@ -293,7 +317,9 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
 
         # First index
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r1 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         e1 = r1.entities_total
 
         # Delete a file and commit
@@ -302,7 +328,9 @@ class TestDeltaIndexIntegration:
         _git(git_project, "commit", "-m", "remove utils")
 
         # Delta re-index
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r2.mode == "delta"
         assert r2.delta_stats is not None
         assert r2.delta_stats.files_deleted >= 1
@@ -320,7 +348,9 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
         project_name = derive_project_name(git_project)
 
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r1 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r1.entities_total > 0
 
         # Delete every source file and commit — the next scan finds nothing.
@@ -329,7 +359,9 @@ class TestDeltaIndexIntegration:
         _git(git_project, "add", ".")
         _git(git_project, "commit", "-m", "remove all sources")
 
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert r2.files_scanned == 0
         assert r2.mode == "delta"
@@ -358,7 +390,9 @@ class TestDeltaIndexIntegration:
         settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r1 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r1.entities_total > 0
 
         # Remove every source file from disk WITHOUT staging/committing —
@@ -366,7 +400,9 @@ class TestDeltaIndexIntegration:
         for f in (git_project / "src").iterdir():
             f.unlink()
 
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert r2.files_scanned == 0
         # No reconciliation happened — entities must be untouched, not wiped.
@@ -381,7 +417,7 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
 
         # First index
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         # Modify a file and commit
         _write(git_project, "src/app.py", 'def hello():\n    return "changed"\n')
@@ -389,7 +425,9 @@ class TestDeltaIndexIntegration:
         _git(git_project, "commit", "-m", "change")
 
         # Re-index with threshold=0.0 — should fall back to full
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r2.mode == "full"
 
     async def test_delta_index_preserves_unchanged(self, git_project, graph_client, event_bus):
@@ -398,10 +436,14 @@ class TestDeltaIndexIntegration:
         await graph_client.ensure_schema()
 
         # First index
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r1 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         # Re-index without changes
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         assert r2.mode == "delta"
         assert r2.entities_total == r1.entities_total
 
@@ -410,10 +452,15 @@ class TestDeltaIndexIntegration:
         settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         r2 = await index_project(
-            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
         )
         assert r2.mode == "full"
 
@@ -442,13 +489,15 @@ class TestPipelineDurabilityIntegration:
         # The pipeline's drain settle window (_DRAIN_SETTLE_S, shrunk to 0.1s for this
         # suite) still makes draining within 0.01s impossible -- a 10x margin, not the
         # 200x the unpatched 2.0s gave. Raise drain_timeout_s here if that ever tightens.
-        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=0.01)
+        r1 = await index_project(settings, graph_client, event_bus, drain_timeout_s=0.01, limiter=unpaced())
 
         assert r1.drained is False
         assert await graph_client.get_project_git_hash(project_name) is None
 
         # A follow-up run with a normal timeout processes the files, THEN advances git_hash
-        r2 = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        r2 = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert r2.drained is True
         assert r2.entities_total > 0
@@ -476,7 +525,9 @@ class TestPipelineDurabilityIntegration:
         key = event_bus._stream_key(Topic.FILE_CHANGED)
 
         try:
-            await index_project(settings, graph_client, event_bus, reset=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+            await index_project(
+                settings, graph_client, event_bus, reset=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+            )
 
             groups = await event_bus._redis.xinfo_groups(key)
             names = set()
@@ -516,7 +567,12 @@ class TestIndexMonorepoScopingIntegration:
         root_name = tmp_path.resolve().name
 
         await index_monorepo(
-            settings, graph_client, event_bus, scope_projects=["auth"], drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            settings,
+            graph_client,
+            event_bus,
+            scope_projects=["auth"],
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
         )
 
         # The excluded 'shared' sub-project must never be published under the
@@ -547,7 +603,7 @@ class TestIndexMonorepoScopingIntegration:
         await graph_client.ensure_schema()
         root_name = tmp_path.resolve().name
 
-        await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_monorepo(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         root_packages = await graph_client.execute(
             f"MATCH (p:{NodeLabel.PACKAGE} {{project_name: $pn}}) RETURN p.file_path AS fp",
@@ -576,7 +632,7 @@ class TestStalenessCheckIntegration:
         """After indexing, the checker reports not stale."""
         settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         checker = StalenessChecker(git_project)
         info = await checker.check(graph_client)
@@ -589,7 +645,7 @@ class TestStalenessCheckIntegration:
         """A new commit after indexing makes the checker report stale."""
         settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         # Make a new commit
         _write(git_project, "src/new.py", "x = 1\n")
@@ -661,7 +717,7 @@ class TestManifestVersionsIntegration:
         settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         versions = await self._external_versions(graph_client, tmp_path)
         assert versions.get("react") == "^18.3.1"
@@ -688,7 +744,7 @@ class TestManifestVersionsIntegration:
         settings = AtlasSettings(project_root=tmp_path, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         versions = await self._external_versions(graph_client, tmp_path)
         assert "github" in versions, "the collapsed aggregate node should still be created by import resolution"
@@ -717,7 +773,7 @@ class TestEmbeddingReconciliation:
         settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         missing = await graph_client.find_unembedded_entities(project)
         assert missing, "embeddings were disabled, so every embeddable entity should be reported"
@@ -743,7 +799,7 @@ class TestEmbeddingReconciliation:
         settings = AtlasSettings(project_root=project_dir, embeddings=NO_EMBED)
         project = derive_project_name(project_dir)
         await graph_client.ensure_schema()
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         unembedded = {uid for uid, _, _, _ in await graph_client.find_unembedded_entities(project)}
         assert unembedded
@@ -969,14 +1025,19 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         embedded = (await graph_client.count_embeddings_by_project()).get(project, 0)
         assert embedded > 0, "the first index has to buy vectors, or a free re-check proves nothing"
 
         provider.calls = 0
         parse_calls.clear()
         result = await index_project(
-            settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
         )
 
         assert result.mode == "full"
@@ -992,14 +1053,21 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         await _mark_module(graph_client, project, "src/app.py")
         before = await _blast_radius(graph_client, project)
         assert before["nodes"] > 0
         assert before["relationships"] > 0
 
         parse_calls.clear()
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
+        )
 
         after = await _blast_radius(graph_client, project)
         assert parse_calls
@@ -1023,12 +1091,19 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert await _entities_for_file(graph_client, project, "src/utils.py")
 
         (project_dir / "src" / "utils.py").unlink()
         parse_calls.clear()
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
+        )
 
         assert not await _entities_for_file(graph_client, project, "src/utils.py")
         # The surviving files are untouched — this reconciles the deletion, it does not
@@ -1041,13 +1116,13 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         await _mark_module(graph_client, project, "src/app.py")
         before = await _blast_radius(graph_client, project)
 
         parse_calls.clear()
         result = await index_project(
-            settings, graph_client, event_bus, reset=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            settings, graph_client, event_bus, reset=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
         )
 
         after = await _blast_radius(graph_client, project)
@@ -1079,7 +1154,7 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         baseline = await _file_hashes(graph_client, project)
         assert baseline, "the ordinary path has to store hashes first"
         assert all(baseline.values())
@@ -1088,7 +1163,14 @@ class TestReindexScopeIsNotDestruction:
         assert not any((await _file_hashes(graph_client, project)).values())
 
         parse_calls.clear()
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
+        )
 
         assert parse_calls
         assert await _file_hashes(graph_client, project) == baseline
@@ -1129,13 +1211,15 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(tmp_path)
 
-        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         before = await _content_hashes(graph_client, project)
         assert set(before) == {"widened", "untouched"}
 
         provider.texts.clear()
         parse_calls.clear()
-        await index_project(wide, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            wide, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert "src/mod.py" in parse_calls
         after = await _content_hashes(graph_client, project)
@@ -1166,11 +1250,13 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(tmp_path)
 
-        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert len(await _entity_source(graph_client, project, "big")) == 80
 
         parse_calls.clear()
-        await index_project(wide, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            wide, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert "src/big.py" in parse_calls, "the file has to be re-parsed, or this pins the wrong thing"
         assert len(await _entity_source(graph_client, project, "big")) == 80
@@ -1195,7 +1281,7 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         before = await _blast_radius(graph_client, project)
         before_searchable = await _searchable_vectors(graph_client, project)
         hashes = await _file_hashes(graph_client, project)
@@ -1206,7 +1292,12 @@ class TestReindexScopeIsNotDestruction:
         # zero never exists anywhere a test can see it.
         parse_calls.clear()
         await index_project(
-            lightweight, graph_client, event_bus, reset_embeddings=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+            lightweight,
+            graph_client,
+            event_bus,
+            reset_embeddings=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
         )
 
         cleared = await _blast_radius(graph_client, project)
@@ -1218,7 +1309,7 @@ class TestReindexScopeIsNotDestruction:
         # The next ordinary index re-embeds off the surviving graph. The gate still holds,
         # so nothing is re-parsed and only the provider is paid.
         provider.calls = 0
-        await index_project(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         assert parse_calls == []
         assert provider.calls > 0
@@ -1248,7 +1339,9 @@ class TestReindexScopeIsNotDestruction:
         await graph_client.ensure_schema()
         root = derive_project_name(tmp_path)
 
-        await index_monorepo(embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_monorepo(
+            embedding, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         before = await graph_client.count_embeddings_by_project()
         assert before.get(f"{root}/auth", 0) > 0
         assert before.get(f"{root}/shared", 0) > 0
@@ -1263,6 +1356,7 @@ class TestReindexScopeIsNotDestruction:
             project_name=f"{root}/auth",
             project_root=tmp_path / "services" / "auth",
             drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
         )
 
         after = await graph_client.count_embeddings_by_project()
@@ -1300,9 +1394,11 @@ class TestTheExtractionKeyGatesEnumeration:
         settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         parse_calls.clear()
-        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert result.mode == "delta"
         assert parse_calls == []
@@ -1321,11 +1417,13 @@ class TestTheExtractionKeyGatesEnumeration:
         settings = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
         await graph_client.ensure_schema()
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         parse_calls.clear()
 
         monkeypatch.setattr(schema, "EXTRACTION_EPOCH", schema.EXTRACTION_EPOCH + 1)
-        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert result.mode == "full"
         assert {"src/app.py", "src/utils.py"} <= set(parse_calls)
@@ -1334,7 +1432,9 @@ class TestTheExtractionKeyGatesEnumeration:
         # before the key existed: those hashes were computed keyless, so the first run
         # afterwards re-reads everything and the run that re-checked also re-keyed.
         parse_calls.clear()
-        again = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        again = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert again.mode == "delta"
         assert parse_calls == []
@@ -1357,14 +1457,16 @@ class TestTheExtractionKeyGatesEnumeration:
         await graph_client.ensure_schema()
         project = derive_project_name(git_project)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         embedded = (await graph_client.count_embeddings_by_project()).get(project, 0)
         assert embedded > 0, "the first index has to buy vectors, or a free re-check proves nothing"
 
         provider.calls = 0
         parse_calls.clear()
         monkeypatch.setattr(schema, "EXTRACTION_EPOCH", schema.EXTRACTION_EPOCH + 1)
-        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert result.mode == "full"
         # Non-vacuous: a run that skipped every file would report zero calls too, for
@@ -1392,9 +1494,11 @@ class TestTheExtractionKeyGatesEnumeration:
             project_root=git_project, index=IndexSettings(max_source_chars=48_000), embeddings=NO_EMBED
         )
 
-        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(narrow, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         parse_calls.clear()
-        result = await index_project(wide, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            wide, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert result.mode == "full"
         assert {"src/app.py", "src/utils.py"} <= set(parse_calls)
@@ -1411,9 +1515,11 @@ class TestTheExtractionKeyGatesEnumeration:
         before = AtlasSettings(project_root=git_project, embeddings=NO_EMBED)
         after = AtlasSettings(project_root=git_project, search=SearchSettings(rrf_k=99), embeddings=NO_EMBED)
 
-        await index_project(before, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(before, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         parse_calls.clear()
-        result = await index_project(after, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            after, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert result.mode == "delta"
         assert parse_calls == []
@@ -1441,16 +1547,20 @@ class TestTheExtractionKeyGatesEnumeration:
         await graph_client.ensure_schema()
         project = derive_project_name(git_project)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert await graph_client.get_project_extraction_key(project) is not None
-        assert (await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)).mode == (
-            "delta"
-        ), "without this the assertion below would pass for the wrong reason"
+        assert (
+            await index_project(
+                settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+            )
+        ).mode == ("delta"), "without this the assertion below would pass for the wrong reason"
 
         await graph_client.execute_write(
             f"MATCH (p:{NodeLabel.PROJECT} {{uid: $uid}}) REMOVE p.extraction_key", {"uid": project}
         )
-        result = await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        result = await index_project(
+            settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
 
         assert result.mode == "full"
         assert result.files_published == 3
@@ -1618,14 +1728,19 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert await _mark_rels(graph_client, project) > 0, "the first index has to write edges"
         before = await _rel_census(graph_client, project)
 
         parse_calls.clear()
         with _RelWriteSpy(graph_client) as spy:
             result = await index_project(
-                settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+                settings,
+                graph_client,
+                event_bus,
+                full_reindex=True,
+                drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+                limiter=unpaced(),
             )
 
         assert result.mode == "full"
@@ -1651,7 +1766,7 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         await _mark_rels(graph_client, project)
 
         _write(
@@ -1663,7 +1778,12 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         parse_calls.clear()
         with _RelWriteSpy(graph_client) as spy:
             await index_project(
-                settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S
+                settings,
+                graph_client,
+                event_bus,
+                full_reindex=True,
+                drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+                limiter=unpaced(),
             )
 
         assert {"alpha.py", "beta.py"} <= set(parse_calls)
@@ -1699,12 +1819,19 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         await graph_client.ensure_schema()
         project = derive_project_name(tmp_path)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert await _calls(graph_client, project) == [], "precondition: nothing defines compute yet"
         await _mark_rels(graph_client, project, "caller.py")
 
         _write(tmp_path, "helper_lib.py", "def compute():\n    return 1\n")
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
+        )
 
         # The skip really did fire for the caller — otherwise the buffer is not under
         # test. Named by rel type rather than asserted empty: the CALLS edge below is
@@ -1744,12 +1871,19 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         await graph_client.ensure_schema()
         project = derive_project_name(tmp_path)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert await _overrides(graph_client, project) == 1, "precondition: the detector fired"
 
         _write(tmp_path, "base_mod.py", "class Base:\n    def other(self):\n        return 1\n")
         parse_calls.clear()
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
+        )
 
         assert "child_mod.py" in parse_calls, "the untouched file has to be re-parsed, or this pins nothing"
         assert await _overrides(graph_client, project) == 0, "a detector edge that stopped firing survived the re-check"
@@ -1775,12 +1909,26 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
+        await index_project(
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
+        )
         settled = await _rel_census(graph_client, project)
         assert settled.get(RelType.DOCUMENTS.value, 0) > 0, "precondition: a doc edge exists to duplicate"
 
-        await index_project(settings, graph_client, event_bus, full_reindex=True, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            settings,
+            graph_client,
+            event_bus,
+            full_reindex=True,
+            drain_timeout_s=TEST_DRAIN_TIMEOUT_S,
+            limiter=unpaced(),
+        )
 
         assert await _rel_census(graph_client, project) == settled
 
@@ -1814,7 +1962,7 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         # read an empty list as "nothing was parsed".
         real_flush = ASTConsumer._flush_deferred_resolution
         monkeypatch.setattr(ASTConsumer, "_flush_deferred_resolution", _never_flushes)
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         monkeypatch.setattr(ASTConsumer, "_flush_deferred_resolution", real_flush)
 
         assert set(files) <= set(parse_calls), "precondition: the interrupted run did parse and upsert"
@@ -1825,7 +1973,7 @@ class TestTheRelationshipRewriteIsSkippedWhenNothingMoved:
         # Recovery, on the ordinary path: both gates being open is what makes the next
         # run re-read the files AND rewrite their relationships rather than trust either.
         parse_calls.clear()
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         assert set(files) <= set(parse_calls)
         assert await _calls(graph_client, project) == [("run", "widen")]
@@ -1872,7 +2020,7 @@ class TestTheEmbeddingPolicy:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         by_kind = await _vectors_by_kind(graph_client, project)
         assert by_kind.get("config_setting", 0) == 0
@@ -1885,7 +2033,7 @@ class TestTheEmbeddingPolicy:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         records = await graph_client.execute(
             f"MATCH (n:{NodeLabel.ENTITY}) WHERE n.project_name = $p AND n.kind = 'config_setting' "
@@ -1901,11 +2049,11 @@ class TestTheEmbeddingPolicy:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
         assert await graph_client.find_unembedded_entities(project, exclude_kinds=DEFAULT_EXCLUDE_KINDS) == []
 
         provider.calls = 0
-        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(settings, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         assert provider.calls == 0, "an unchanged tree under an unchanged policy must cost nothing"
 
@@ -1923,12 +2071,14 @@ class TestTheEmbeddingPolicy:
         await graph_client.ensure_schema()
         project = derive_project_name(project_dir)
 
-        await index_project(permissive, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(
+            permissive, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced()
+        )
         before = await _vectors_by_kind(graph_client, project)
         assert before.get("config_setting", 0) == 3, f"precondition: the blob was embedded, got {before}"
 
         provider.calls = 0
-        await index_project(default, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S)
+        await index_project(default, graph_client, event_bus, drain_timeout_s=TEST_DRAIN_TIMEOUT_S, limiter=unpaced())
 
         after = await _vectors_by_kind(graph_client, project)
         assert after.get("config_setting", 0) == 0

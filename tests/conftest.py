@@ -16,16 +16,26 @@ that touches no graph code should not pay for.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import pytest
+from pydantic import SecretStr
 
 from code_atlas.schema import GLOBAL_PROJECT, generate_drop_text_index_ddl, generate_drop_vector_index_ddl
-from code_atlas.settings import AtlasSettings, BackendSettings, EmbeddingSettings, MemgraphSettings, RedisSettings
+from code_atlas.settings import (
+    AtlasSettings,
+    BackendSettings,
+    EmbeddingSettings,
+    MemgraphSettings,
+    PostgresSettings,
+    RedisSettings,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -161,6 +171,115 @@ def _infra_endpoints() -> Iterator[InfraEndpoints]:
 
 
 # ---------------------------------------------------------------------------
+# Postgres (queue backend) — separate and lazy
+# ---------------------------------------------------------------------------
+#
+# Not part of `_infra_endpoints`: that fixture backs every integration test, and folding
+# Postgres into it would start a third container for all of them. Only a test that asks
+# for `pg_settings` pays for this one.
+
+_PG_TEST_DATABASE = "atlas_test"
+
+
+@pytest.fixture(scope="session")
+def _postgres_endpoint() -> Iterator[PostgresSettings]:
+    """Provision an ISOLATED Postgres for the queue-backend tests.
+
+    1. ``ATLAS_TEST_POSTGRES_PORT`` points at an existing isolated instance (the compose
+       fast path: ``docker compose --profile test up -d postgres-test`` → :5434).
+    2. Default — a session-scoped ``postgres:18-alpine`` testcontainer on a random port.
+    3. Skip with instructions if Docker is unavailable.
+    """
+    port_env = os.environ.get("ATLAS_TEST_POSTGRES_PORT")
+    if port_env:
+        yield PostgresSettings(
+            host="localhost", port=int(port_env), user="atlas", password=SecretStr("atlas"), database=_PG_TEST_DATABASE
+        )
+        return
+
+    hint = "docker compose --profile test up -d postgres-test && ATLAS_TEST_POSTGRES_PORT=5434 uv run pytest ..."
+    try:
+        from testcontainers.core.container import DockerContainer
+        from testcontainers.core.wait_strategies import ExecWaitStrategy
+    except ImportError:
+        pytest.skip(f"testcontainers not installed (uv sync --group dev). Alternatively: {hint}")
+
+    os.environ.setdefault("TC_HOST", "localhost")
+    pg = (
+        DockerContainer("postgres:18-alpine")
+        .with_env("POSTGRES_USER", "atlas")
+        .with_env("POSTGRES_PASSWORD", "atlas")
+        .with_env("POSTGRES_DB", _PG_TEST_DATABASE)
+        .with_exposed_ports(5432)
+        # -h 127.0.0.1, not the socket: the image's init phase runs a socket-only server
+        # that answers pg_isready and then restarts, so a socket probe reports ready early.
+        .waiting_for(
+            ExecWaitStrategy(
+                ["pg_isready", "-U", "atlas", "-d", _PG_TEST_DATABASE, "-h", "127.0.0.1"]
+            ).with_startup_timeout(60)
+        )
+    )
+    try:
+        pg.start()
+    except Exception:
+        with contextlib.suppress(Exception):
+            pg.stop()
+        pytest.skip(f"Docker unavailable — Postgres tests start a testcontainer by default. Or: {hint}")
+
+    yield PostgresSettings(
+        host=pg.get_container_host_ip(),
+        port=int(pg.get_exposed_port(5432)),
+        user="atlas",
+        password=SecretStr("atlas"),
+        database=_PG_TEST_DATABASE,
+    )
+    pg.stop()
+
+
+async def _empty_postgres_queue(pg: PostgresSettings) -> None:
+    import asyncpg
+
+    from code_atlas.backends.postgres_queue import SCHEMA, connect_kwargs, ensure_queue_schema
+
+    conn = await asyncpg.connect(**connect_kwargs(pg))
+    try:
+        await ensure_queue_schema(conn)
+        await conn.execute(
+            f"TRUNCATE {SCHEMA}.messages, {SCHEMA}.groups, {SCHEMA}.deliveries, {SCHEMA}.consumers, "
+            f"{SCHEMA}.leases, {SCHEMA}.rate_bucket, {SCHEMA}.rate_scale"
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.fixture
+def pg_settings(_postgres_endpoint: PostgresSettings) -> PostgresSettings:
+    """Postgres settings with an empty ``atlas_queue`` schema.
+
+    The wipe guard for this backend is the database name: tables are only truncated in a
+    database whose name starts with ``atlas_test``. A production queue database named
+    otherwise aborts the session instead of being emptied.
+
+    Synchronous on purpose, with the cleanup on its own loop in a worker thread: a
+    parametrized fixture reaches this one through ``request.getfixturevalue``, and an async
+    fixture cannot be set up from inside another one's running loop.
+    """
+    if not _postgres_endpoint.database.startswith(_PG_TEST_DATABASE):
+        pytest.exit(
+            f"REFUSING to truncate atlas_queue in Postgres database {_postgres_endpoint.database!r} at "
+            f"{_postgres_endpoint.host}:{_postgres_endpoint.port} — only databases named "
+            f"{_PG_TEST_DATABASE}* are treated as disposable.",
+            returncode=1,
+        )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            pool.submit(asyncio.run, _empty_postgres_queue(_postgres_endpoint)).result()
+        except OSError as exc:
+            pytest.skip(f"Postgres not available: {exc}")
+    return _postgres_endpoint
+
+
+# ---------------------------------------------------------------------------
 # Production-data guard
 # ---------------------------------------------------------------------------
 
@@ -288,11 +407,13 @@ async def event_bus(settings) -> AsyncIterator:
     Flushes all pipeline streams before each test to prevent cross-test
     contamination (same pattern as graph_client wiping nodes).
     """
-    from code_atlas.events import EventBus, Topic
+    from code_atlas.events import EventBus, Topic, redis_client
 
     # Scoped to a block -- see the graph fixture; an abandoned redis Connection produces
-    # the same misdirected ResourceWarning.
-    async with EventBus(settings.redis) as bus:
+    # the same misdirected ResourceWarning. The client is the thing with a lifecycle; the
+    # bus only borrows it, as in production.
+    async with redis_client(settings.redis) as redis:
+        bus = EventBus(redis, settings.redis)
         try:
             await bus.ping()
         except Exception:

@@ -404,6 +404,25 @@ class TestBackendConfigDiscovery:
         with pytest.raises(ValidationError, match="exactly one may be"):
             AtlasSettings(project_root=clean_env)
 
+    def test_declaring_postgres_selects_it_and_conflicts_with_another_queue(self, clean_env):
+        """Postgres is a third queue backend, reachable only by declaring it (ADR-0056)."""
+        from pydantic import ValidationError
+
+        (clean_env / "atlas.toml").write_text(
+            '[backend.queue.postgres]\nhost = "pg"\npassword = "s3cret"\n', encoding="utf-8"
+        )
+        settings = AtlasSettings(project_root=clean_env)
+
+        assert settings.backend.queue_choice == "postgres"
+        pg = settings.backend.queue.postgres
+        assert pg is not None
+        assert (pg.host, pg.port, pg.user, pg.database) == ("pg", 5432, "atlas", "atlas")
+        assert "s3cret" not in repr(pg), "the password must not leak through a settings repr"
+
+        (clean_env / "atlas.toml").write_text("[backend.queue.postgres]\n[backend.queue.valkey]\n", encoding="utf-8")
+        with pytest.raises(ValidationError, match="exactly one may be"):
+            AtlasSettings(project_root=clean_env)
+
     def test_a_local_file_can_undeclare_what_the_shared_file_declared(self, clean_env):
         """`atlas.local.toml` merges per key, so declaring sqlite locally would leave the
         committed memgraph section in place and trip the two-backends error. TOML has no

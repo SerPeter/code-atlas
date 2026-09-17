@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted (2026-08-30)
+Accepted (2026-08-30). Amended 2026-09-17: the composition root owns one connection per queue service, and the event bus
+and rate limiter borrow it (decision 6). Decision 2 and the ownership paragraph below are updated to match.
 
 ## Context
 
@@ -25,10 +26,12 @@ place: those objects were downstream of genuinely leaked clients.
 
 1. **One composition root.** `backends.use_backends()` opens the connections a process needs and closes them on the way
    out. `connected()` adds the reachability check eight commands were each writing by hand.
-2. **Every client is an async context manager.** `GraphClient`, `EventBus`, `SqliteGraphClient`, `SqliteEventBus`,
-   `EmbedClient` and `RateLimiter` all carry `__aenter__`/`__aexit__` over their existing `close()`. A caller that holds
-   one for a scope uses `async with`; a caller that holds one across several return paths registers it on an
-   `AsyncExitStack`.
+2. **Every client that owns a connection is an async context manager.** `GraphClient`, `SqliteGraphClient`,
+   `SqliteEventBus`, `SqliteRateLimiter` and `PostgresConnections` carry `__aenter__`/`__aexit__` over `close()`, and so
+   does the Valkey client the root builds. A caller that holds one for a scope uses `async with`; a caller that holds
+   one across several return paths registers it on an `AsyncExitStack`. _(Amended 2026-09-17: `EventBus`,
+   `PostgresEventBus`, `RateLimiter`, `PostgresRateLimiter` and `EmbedClient` own no connection any more and have no
+   `close()` — see decision 6.)_
 3. **Close what it opened, never what it was handed.** `use_backends` given a live client reuses it untouched. This is
    what lets the MCP server hand its graph to the daemon without either of them guessing who closes it.
 4. **A `finally` is not a substitute.** The guard is the block, and the block starts at the constructor. Anything
@@ -38,11 +41,18 @@ place: those objects were downstream of genuinely leaked clients.
    the class that needs them, never global: the only one is `TestUiInstances`, whose subject is a socket deliberately
    kept bound and handed to uvicorn. A global ignore cannot tell that from a real leak, which is exactly how the
    previous leaks survived.
+6. **One connection per service, borrowed by the bus and the limiter** _(added 2026-09-17)_. `use_backends` (and
+   `use_queue`, its queue half, for `atlas index`, which needs the queue before the graph) builds `QueueConnections`: at
+   most one Valkey client, or one asyncpg pool plus one LISTEN connection. `create_event_bus` and `create_rate_limiter`
+   hand those to the bus and to `Backends.limiter`, which never create or close a connection. Every `EmbedClient` used
+   to build its own limiter and every limiter its own client or pool, so a process's connection count followed the
+   number of embedding clients rather than the work. `EmbedClient` now receives the limiter as a required argument and
+   keeps only a `RateBudget` of its own (model, rpm/tpm, concurrency gate); a caller that must not be paced passes
+   `unpaced()` by name, as the health probe does.
 
-Ownership is deliberately _not_ uniform where lifetimes differ: the CLI's embedding-dimension probe takes a block
-because it is used once; the daemon closes the `EmbedClient` it constructed but never the bus it was handed; the MCP
-lifespan closes whatever `AppContext` currently holds rather than registering on its stack, because a root switch
-replaces that object and a stack would close the original twice and the replacement never.
+Ownership is deliberately _not_ uniform where lifetimes differ. _(Amended 2026-09-17: the embedding client no longer
+holds a connection, so the dimension probe, the daemon and the MCP root switch simply drop it; the limiter it paced
+through stays with the backends, like the bus.)_ The daemon never closes the bus or the limiter it was handed.
 
 ## Consequences
 

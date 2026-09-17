@@ -13,7 +13,7 @@ import asyncio
 import pytest
 
 from code_atlas.search.embeddings import EmbedClient
-from code_atlas.search.ratelimit import ConcurrencyGate
+from code_atlas.search.ratelimit import ConcurrencyGate, unpaced
 from code_atlas.settings import EmbeddingSettings
 
 
@@ -84,7 +84,7 @@ class TestRateLimitResolution:
     """rpm/tpm resolve as: explicit config, then litellm's registry, then provider default."""
 
     def _client(self, **kw) -> EmbedClient:
-        return EmbedClient(EmbeddingSettings(**kw))
+        return EmbedClient(EmbeddingSettings(**kw), limiter=unpaced())
 
     def test_explicit_config_wins(self):
         c = self._client(provider="litellm", model="gemini/gemini-embedding-001", rpm=42, tpm=99)
@@ -114,11 +114,13 @@ class TestRateLimitResolution:
         c = self._client(provider="tei", model="nomic-ai/nomic-embed-code")
         assert (c._rpm, c._tpm) == (0, 0)
 
-    def test_no_limiter_without_redis_settings(self):
-        """The limiter is opt-in per call site — health checks construct the client
-        without one so a drained bucket cannot make the provider look unreachable."""
+    def test_the_limiter_is_required_and_no_pacing_is_asked_for_by_name(self):
+        """A forgotten limiter used to mean an unpaced client, silently -- the ADR-0044 failure.
+        Now there is no default: omitting it is a TypeError, and unpaced is spelled out."""
+        with pytest.raises(TypeError):
+            EmbedClient(EmbeddingSettings(provider="tei", model="nomic-ai/nomic-embed-code"))  # ty: ignore[missing-argument]
         c = self._client(provider="tei", model="nomic-ai/nomic-embed-code")
-        assert c._limiter is None
+        assert c._limiter is unpaced()
 
     def test_gate_is_per_client_not_per_call(self):
         """The bug this replaced: embed_batch built a fresh Semaphore(max_concurrency)
@@ -132,14 +134,16 @@ class TestTokenCounting:
     """The tokens-per-minute budget needs a count per chunk, not a guess."""
 
     def test_truncate_returns_counts_alongside_texts(self):
-        c = EmbedClient(EmbeddingSettings(provider="litellm", model="gemini/gemini-embedding-001"))
+        c = EmbedClient(EmbeddingSettings(provider="litellm", model="gemini/gemini-embedding-001"), limiter=unpaced())
         texts, counts = c._truncate_texts(["hello world", "a somewhat longer piece of text here"])
         assert len(texts) == len(counts) == 2
         assert all(n > 0 for n in counts)
         assert counts[1] > counts[0]
 
     def test_counts_fall_back_when_model_limit_unknown(self):
-        c = EmbedClient(EmbeddingSettings(provider="litellm", model="not-a-real-vendor/not-a-real-model"))
+        c = EmbedClient(
+            EmbeddingSettings(provider="litellm", model="not-a-real-vendor/not-a-real-model"), limiter=unpaced()
+        )
         assert c._max_input_tokens is None
         texts, counts = c._truncate_texts(["x" * 400])
         assert texts == ["x" * 400]

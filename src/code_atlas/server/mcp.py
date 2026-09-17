@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from code_atlas.events import EventBus
+    from code_atlas.search.ratelimit import Limiter
 
 _tracer = get_tracer(__name__)
 
@@ -158,6 +159,10 @@ class AppContext:
     bus: EventBus
     settings: AtlasSettings
     embed: EmbedClient | None
+    #: The process's embedding rate limiter, from the same `use_backends` scope as `bus`.
+    #: Every embed client built here -- the query client, the daemon's, a root switch's
+    #: replacement -- paces through it rather than opening a connection of its own.
+    limiter: Limiter
     staleness: StalenessChecker | None = None
     daemon: DaemonManager = field(default_factory=DaemonManager)
     resolved_root: Path | None = field(default=None, repr=False)
@@ -222,15 +227,13 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
     app.resolved_root = new_root
     app.staleness = StalenessChecker(new_root)
 
-    # Re-check embedding model match for new root. The outgoing client is closed
-    # first: this runs on every root switch, and each one used to strand a redis pool.
-    if app.embed is not None:
-        await app.embed.close()
+    # Re-check embedding model match for new root. The backends -- and so the limiter --
+    # stay the process's; only the embed client, which holds no connection, is rebuilt.
     if not app.settings.embeddings.enabled:
         app.embed = None
         app.vector_enabled = False
     else:
-        app.embed = EmbedClient(app.settings.embeddings, app.settings)
+        app.embed = EmbedClient(app.settings.embeddings, limiter=app.limiter)
         app.vector_enabled = True
         # Per project, not database-wide: comparing against the database default
         # disabled vector search for every project that was not the last one to
@@ -245,7 +248,7 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
             )
             app.vector_enabled = False
 
-    started = await app.daemon.start(app.settings, app.graph, app.bus)
+    started = await app.daemon.start(app.settings, app.graph, app.bus, limiter=app.limiter)
     if started:
         logger.info("Daemon restarted for new root: {}", new_root)
     else:
@@ -829,9 +832,7 @@ def create_mcp_server(  # noqa: PLR0915
                     vector_enabled = False
 
             # Implicit degradation: probe TEI, fall back to lightweight if unreachable.
-            # Kept only once the probe passes -- on the failure path it is closed here,
-            # so lightweight mode does not hold an idle Valkey pool for the process.
-            candidate = EmbedClient(settings.embeddings, settings)
+            candidate = EmbedClient(settings.embeddings, limiter=backends.limiter)
             tei_ok = False
             with contextlib.suppress(Exception):
                 tei_ok = await candidate.health_check()
@@ -839,7 +840,6 @@ def create_mcp_server(  # noqa: PLR0915
                 embed = candidate
             else:
                 logger.warning("Embedding service unreachable — running in lightweight mode. Vector search disabled.")
-                await candidate.close()
                 embed = None
                 vector_enabled = False
         staleness = StalenessChecker(settings.project_root)
@@ -854,6 +854,7 @@ def create_mcp_server(  # noqa: PLR0915
             settings=settings,
             embed=embed,
             staleness=staleness,
+            limiter=backends.limiter,
             daemon=daemon,
             resolved_root=settings.project_root,
             vector_enabled=vector_enabled,
@@ -887,6 +888,7 @@ def create_mcp_server(  # noqa: PLR0915
             settings,
             graph,
             bus,
+            limiter=backends.limiter,
             catchup=catchup,
             auto_index=auto_index,
             first_index_ready=first_index_ready,
@@ -900,11 +902,6 @@ def create_mcp_server(  # noqa: PLR0915
                 with contextlib.suppress(asyncio.CancelledError):
                     await daemon_start_task
             await app_ctx.daemon.stop()
-            # Whatever the context currently holds, which is not necessarily the client
-            # built above: _maybe_update_root swaps it on every root switch. That is why
-            # this is not a stack registration.
-            if app_ctx.embed is not None:
-                await app_ctx.embed.close()
             await stack.aclose()
             shutdown_telemetry()
             logger.info("MCP server shut down")
@@ -1079,6 +1076,7 @@ def _spawn_indexing(
     graph: GraphClient,
     bus: EventBus,
     *,
+    limiter: Limiter,
     catchup: bool,
     auto_index: bool,
     first_index_ready: asyncio.Event,
@@ -1099,7 +1097,7 @@ def _spawn_indexing(
         return None
 
     task = asyncio.get_running_loop().create_task(
-        daemon.start(settings, graph, bus, catchup=catchup, first_index_ready=first_index_ready)
+        daemon.start(settings, graph, bus, limiter=limiter, catchup=catchup, first_index_ready=first_index_ready)
     )
 
     def _on_daemon_started(finished: asyncio.Task) -> None:

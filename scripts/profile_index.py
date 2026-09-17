@@ -482,7 +482,9 @@ async def main():
     patch_all()
 
     # Import after patching so the wrappers are in place
-    from code_atlas.events import EventBus
+    from contextlib import AsyncExitStack
+
+    from code_atlas.backends import use_queue
     from code_atlas.graph.client import GraphClient
     from code_atlas.indexing.orchestrator import index_project
     from code_atlas.settings import AtlasSettings
@@ -496,7 +498,9 @@ async def main():
     print()
 
     graph = GraphClient(settings)
-    bus = EventBus(settings.redis, project_name="")
+    # The composition root builds the bus and the rate limiter over one Valkey client.
+    queue = AsyncExitStack()
+    bus, limiter = await queue.enter_async_context(use_queue(settings))
 
     try:
         await graph.ensure_schema()
@@ -505,9 +509,10 @@ async def main():
         result = await index_project(
             settings,
             graph,
-            bus,
+            bus,  # ty: ignore[invalid-argument-type]
             full_reindex=full_reindex,
             drain_timeout_s=120.0,
+            limiter=limiter,
         )
         wall_time = time.monotonic() - _t0_ref
 
@@ -520,7 +525,7 @@ async def main():
         print_report(wall_time)
 
     finally:
-        await bus.close()
+        await queue.aclose()
         await graph.close()
 
 

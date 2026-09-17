@@ -120,6 +120,57 @@ services:
       timeout: 5s
       retries: 5
 
+  # Queue-backend tests (ADR-0056): ATLAS_TEST_POSTGRES_PORT=5434. Host port 5434, not
+  # 5433 — 5433 is a common second-Postgres port and collides with other local stacks.
+  postgres-test:
+    profiles: [test]
+    image: postgres:18-alpine
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: atlas
+      POSTGRES_DB: atlas_test # the fixtures only truncate a database named atlas_test*
+    tmpfs:
+      - /var/lib/postgresql
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "atlas", "-d", "atlas_test", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Postgres — opt-in queue backend (ADR-0056): docker compose --profile postgres up -d
+  # Select it with [backend.queue.postgres] in atlas.local.toml; it is never probed for.
+  # ---------------------------------------------------------------------------
+  postgres:
+    profiles: [postgres]
+    image: postgres:18-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atlas}
+      POSTGRES_DB: atlas
+    volumes:
+      # postgres:18 images keep PGDATA under a major-version subdirectory of this mount.
+      - postgres-data:/var/lib/postgresql
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "atlas", "-d", "atlas", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # ---------------------------------------------------------------------------
   # TEI — text embeddings inference (self-hosted embeddings)
   # Optional: docker compose --profile tei up -d
@@ -252,6 +303,7 @@ services:
 volumes:
   memgraph-data:
   valkey-data:
+  postgres-data:
   tei-models:
   victoria-metrics-data:
   victoria-logs-data:
