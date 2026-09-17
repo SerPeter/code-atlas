@@ -2287,18 +2287,31 @@ def hooks_install(
         "workflow, per agent that has not used code-atlas yet. Each fires once, then allows.",
     ),
     scope: str = typer.Option("user", "--scope", help=_HOOKS_SCOPE_HELP),
+    python: str | None = typer.Option(
+        None,
+        "--python",
+        help="Interpreter the hooks run under. Default: the code-atlas uv tool install when there is one, "
+        "else the interpreter running this command.",
+    ),
 ) -> None:
     """Install (or replace) the code-atlas hooks in a Claude Code settings file."""
     from code_atlas import hooks
 
     path = _hooks_settings_path(scope)
+    interpreter, why = hooks.hook_python(python)
+    config = hooks.hook_config(strict=strict, python=interpreter)
     try:
-        hooks.write_settings(path, hooks.hook_config(strict=strict))
+        hooks.write_settings(path, config)
     except ValueError as exc:
         logger.error("{}", exc)
         raise typer.Exit(code=1) from None
-    events = ", ".join(hooks.hook_config(strict=strict))
-    typer.echo(f"Installed code-atlas hooks ({events}) in {path}{' -- strict' if strict else ''}.")
+    typer.echo(f"Installed code-atlas hooks ({', '.join(config)}) in {path}{' -- strict' if strict else ''}.")
+    typer.echo(f"They run under {interpreter} ({why}).")
+    if why.endswith("development venv"):
+        typer.echo(
+            "Warning: every Claude Code session will now depend on this venv, which `uv sync` rewrites. "
+            "Install the tool (`uv tool install code-atlas-mcp`) and re-run, or pass --python."
+        )
     typer.echo("They take effect in new Claude Code sessions.")
 
 

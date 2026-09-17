@@ -649,6 +649,8 @@ def test_merge_keeps_foreign_hooks_and_replaces_ours() -> None:
 
 def test_cli_install_and_uninstall(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    tool_python = tmp_path / "tools" / "code-atlas-mcp" / "Scripts" / "python.exe"
+    monkeypatch.setattr(hooks, "uv_tool_python", lambda: tool_python)
     settings = tmp_path / ".claude" / "settings.json"
     settings.parent.mkdir()
     settings.write_text('{"env": {"A": "1"}}', encoding="utf-8")
@@ -659,11 +661,43 @@ def test_cli_install_and_uninstall(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     data = json.loads(settings.read_text(encoding="utf-8"))
     assert data["env"] == {"A": "1"}
     assert set(data["hooks"]) == {"SessionStart", "SubagentStart", "PostToolUse", "PreToolUse"}
+    commands = {h["command"] for groups in data["hooks"].values() for g in groups for h in g["hooks"]}
+    assert all(c.startswith(f'"{tool_python.as_posix()}"') for c in commands), "hooks run under the uv tool install"
     assert (tmp_path / ".claude" / "settings.json.atlas-bak").exists()
+
+    result = runner.invoke(app, ["hooks", "install", "--python", "C:/elsewhere/python.exe"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    commands = {h["command"] for groups in data["hooks"].values() for g in groups for h in g["hooks"]}
+    assert all(c.startswith('"C:/elsewhere/python.exe"') for c in commands), "--python wins"
 
     result = runner.invoke(app, ["hooks", "uninstall"])
     assert result.exit_code == 0, result.output
     assert json.loads(settings.read_text(encoding="utf-8")) == {"env": {"A": "1"}}
+
+
+def test_hook_python_prefers_the_uv_tool_over_a_development_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinning the venv `atlas hooks install` ran from tied every Claude Code session to a checkout's
+    development venv, which `uv sync` rewrites and a running hook locks."""
+    dev = tmp_path / "checkout"
+    (dev / ".venv").mkdir(parents=True)
+    (dev / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    monkeypatch.setattr("sys.prefix", str(dev / ".venv"))
+    monkeypatch.setattr("sys.executable", str(dev / ".venv" / "Scripts" / "python.exe"))
+
+    tool = tmp_path / "uv-tools" / "code-atlas-mcp" / "Scripts" / "python.exe"
+    tool.parent.mkdir(parents=True)
+    tool.write_text("", encoding="utf-8")
+    monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "uv-tools"))
+    assert hooks.hook_python() == (str(tool), "the code-atlas uv tool install")
+    assert hooks.hook_python("C:/py/python.exe") == ("C:/py/python.exe", "--python")
+
+    tool.unlink()
+    python, why = hooks.hook_python()
+    assert python == str(dev / ".venv" / "Scripts" / "python.exe")
+    assert why.endswith("development venv"), "no tool: the venv is used, and named as one"
 
 
 def test_install_refuses_a_settings_file_it_cannot_read(tmp_path: Path) -> None:

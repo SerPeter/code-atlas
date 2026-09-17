@@ -773,12 +773,53 @@ def on_pre_tool(payload: dict[str, Any], *, strict: bool) -> None:
 _MODULE = "code_atlas.hooks"
 
 
+_DISTRIBUTION = "code-atlas-mcp"
+
+
+def hook_python(explicit: str | None = None) -> tuple[str, str]:
+    """The interpreter the hooks should run under, and why that one.
+
+    Not simply the interpreter running ``atlas hooks install``: run from a checkout's
+    development venv, that pins every Claude Code session on the machine to a venv that
+    ``uv sync`` rewrites and whose executables a running hook locks. The uv tool install is
+    the one meant to serve other sessions, so it wins when it exists. Order: *explicit*, then
+    the ``code-atlas-mcp`` uv tool environment, then the current interpreter.
+    """
+    if explicit:
+        return explicit, "--python"
+    tool = uv_tool_python()
+    if tool is not None:
+        return str(tool), "the code-atlas uv tool install"
+    if (Path(sys.prefix).parent / "pyproject.toml").is_file():
+        return sys.executable, "the current interpreter -- a project's development venv"
+    return sys.executable, "the current interpreter"
+
+
+def uv_tool_python() -> Path | None:
+    """The Python of the ``code-atlas-mcp`` uv tool environment, if one is installed."""
+    import shutil
+    import subprocess
+
+    tool_dir = os.environ.get("UV_TOOL_DIR")
+    if not tool_dir and (uv := shutil.which("uv")):
+        with suppress(OSError, subprocess.SubprocessError):
+            done = subprocess.run([uv, "tool", "dir"], capture_output=True, text=True, timeout=10, check=True)
+            tool_dir = done.stdout.strip()
+    if not tool_dir:
+        return None
+    env = Path(tool_dir) / _DISTRIBUTION
+    for candidate in (env / "Scripts" / "python.exe", env / "bin" / "python"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def hook_config(*, strict: bool, python: str | None = None) -> dict[str, list[dict[str, Any]]]:
     """The ``hooks`` entries to merge, keyed by event.
 
-    The interpreter is pinned by absolute path: ``atlas`` on PATH may be a different install,
-    and ``python -m`` skips the CLI's own import cost. Forward slashes, because Claude Code runs
-    hooks through Git Bash on Windows, which eats backslashes.
+    The interpreter is pinned by absolute path (see :func:`hook_python` for which one): ``atlas``
+    on PATH may be a different install, and ``python -m`` skips the CLI's own import cost. Forward
+    slashes, because Claude Code runs hooks through Git Bash on Windows, which eats backslashes.
     """
     exe = (python or sys.executable).replace("\\", "/")
     base = f'"{exe}" -m {_MODULE}'

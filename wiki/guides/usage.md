@@ -190,9 +190,13 @@ backend costs at most one `connect_timeout_s` however many are down. `atlas heal
 embedding checks concurrently too. Measured on Windows with the default 1.0: ~0.9 s healthy, ~1.5 s with Memgraph down,
 ~1.6 s with Memgraph and Valkey both down, ~2.6 s with both down at 5.
 
-The hooks run `python -m code_atlas.hooks` with the interpreter that ran `atlas hooks install`, pinned by absolute path;
-re-run it after moving the install. A symbol lookup costs ~0.5 s and happens only for identifier-shaped searches;
-everything else exits in ~0.13 s.
+The hooks run `python -m code_atlas.hooks`, pinned by absolute path to the **uv tool install** of code-atlas when there
+is one (`uv tool install code-atlas-mcp`), else to the interpreter running `atlas hooks install`; `--python` overrides
+both. Installing from a checkout's development venv would tie every Claude Code session to a venv that `uv sync`
+rewrites, so the command warns when that is the only choice. Point the MCP server at the same install — an absolute path
+to its `atlas` rather than a bare `atlas`, which resolves to whichever venv is active when Claude Code starts. Re-run
+after moving the install. A symbol lookup costs ~0.5 s and happens only for identifier-shaped searches; everything else
+exits in ~0.13 s.
 
 **Measuring whether it works.** Claude Code's own OpenTelemetry export already records every tool call, so there is
 nothing to add to the hooks. With `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_LOGS_EXPORTER=otlp` and
