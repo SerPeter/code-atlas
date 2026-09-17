@@ -2,6 +2,40 @@
 
 <!-- version list -->
 
+## v0.14.0 (2026-09-17)
+
+### Bug Fixes
+
+- **hooks**: Run installed hooks under the uv tool install, not the installing venv
+  ([#15](https://github.com/SerPeter/code-atlas/pull/15),
+  [`b86347b`](https://github.com/SerPeter/code-atlas/commit/b86347bc92f21d96fed35c034ba32dc18cadc6a0))
+
+### Chores
+
+- Drop dependabot config - Renovate updates this repo fleet-wide
+  ([`70786b0`](https://github.com/SerPeter/code-atlas/commit/70786b03cc6b15848fdc48cf640a72087a329851))
+
+### Features
+
+- **backends**: Add a Postgres queue backend with one connection per service
+  ([#12](https://github.com/SerPeter/code-atlas/pull/12),
+  [`7ce4bd6`](https://github.com/SerPeter/code-atlas/commit/7ce4bd694955c0b85c9eea903b8015d7a1a59fe2))
+
+- **graph**: Give external nodes an ecosystem identity
+  ([#14](https://github.com/SerPeter/code-atlas/pull/14),
+  [`37da654`](https://github.com/SerPeter/code-atlas/commit/37da654f3b09258307268855725c2a9b0a4cb351))
+
+- **hooks**: Route code lookups to the graph via Claude Code hooks, with shared health verdicts
+  ([#13](https://github.com/SerPeter/code-atlas/pull/13),
+  [`08fae9f`](https://github.com/SerPeter/code-atlas/commit/08fae9f1a6ff1d876690e1bfd5b9a39c1503e219))
+
+### Performance Improvements
+
+- **graph**: Traverse with native BFS instead of enumerating every path
+  ([#11](https://github.com/SerPeter/code-atlas/pull/11),
+  [`ade7e2e`](https://github.com/SerPeter/code-atlas/commit/ade7e2e4d01ae30c1e99baddb589c55c4658f529))
+
+
 ## v0.13.0 (2026-09-13)
 
 ### Bug Fixes
