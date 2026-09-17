@@ -1622,7 +1622,7 @@ class TestDependencyManifests:
         finally:
             orchestrator._distribution_import_names.cache_clear()
 
-        assert result == {"pyyaml": "~=6.0"}
+        assert result == {"pypi/pyyaml": "~=6.0"}
 
     def test_two_distributions_sharing_an_import_name_are_dropped(self, tmp_path, monkeypatch):
         """The nine `opentelemetry-*` packages all import as `opentelemetry`.
@@ -1678,16 +1678,16 @@ dev = ["pytest>=8.0"]
         # dependencies of code-atlas itself, so the metadata backing the mapping is
         # always present when this test runs.
         assert result == {
-            "pydantic": ">=2.0",
-            "yaml": "~=6.0",
-            "dotenv": "==1.0.1",
-            "requests": "[socks]>=2.31",
+            "pypi/pydantic": ">=2.0",
+            "pypi/yaml": "~=6.0",
+            "pypi/dotenv": "==1.0.1",
+            "pypi/requests": "[socks]>=2.31",
             # ATL-191 P2. An unpinned dependency is still declared -- that is what makes
             # its provenance `declared` rather than `undeclared` -- and carries no version.
-            "loguru": "",
+            "pypi/loguru": "",
             # ...and [dependency-groups] is read now, gated on the distribution being
             # installed. pytest is, in the environment running this.
-            "pytest": ">=8.0",
+            "pypi/pytest": ">=8.0",
         }
 
     def test_extras_and_groups_count_only_when_installed(self, tmp_path: Path, monkeypatch):
@@ -1718,7 +1718,7 @@ dev = ["pytest~=9.0", "mutmut~=3.0"]
 
         result = _parse_dependency_versions(tmp_path)
 
-        assert result == {"httpx": ">=0.28", "rich": "~=13.0", "pytest": "~=9.0"}
+        assert result == {"pypi/httpx": ">=0.28", "pypi/rich": "~=13.0", "pypi/pytest": "~=9.0"}
         assert "openpyxl" not in result, "an extra that is not installed was not selected"
         assert "mutmut" not in result, "same rule for a dependency-group"
 
@@ -1750,7 +1750,7 @@ dev = ["gunicorn~=23.0"]
 
         result = _parse_dependency_versions(tmp_path)
 
-        assert result == {"django": ">=5.0", "celery": "~=5.4", "gunicorn": "~=23.0"}
+        assert result == {"pypi/django": ">=5.0", "pypi/celery": "~=5.4", "pypi/gunicorn": "~=23.0"}
 
     def test_a_project_does_not_declare_itself(self, tmp_path: Path, monkeypatch):
         """`all-languages = ["demo[go,rust]"]` selects sibling extras, it is not a dependency."""
@@ -1771,7 +1771,7 @@ everything = ["demo[go]"]
 """,
         )
 
-        assert _parse_dependency_versions(tmp_path) == {"httpx": ">=0.28"}
+        assert _parse_dependency_versions(tmp_path) == {"pypi/httpx": ">=0.28"}
 
     def test_dockerfile(self, tmp_path: Path):
         """ATL-191 P2. A base image is a declaration and its tag is the version."""
@@ -1801,9 +1801,9 @@ FROM $BASE_IMAGE
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "python": "3.14-slim",
-            "ghcr.io/astral-sh/uv": "0.5.11",
-            "redis": "sha256:0123456789abcdef",
+            "docker/python": "3.14-slim",
+            "docker/ghcr.io/astral-sh/uv": "0.5.11",
+            "docker/redis": "sha256:0123456789abcdef",
         }
         assert "builder" not in result, "a reference to an earlier stage is internal to the file"
         assert "scratch" not in result, "the empty base is a keyword, not an image"
@@ -1823,7 +1823,7 @@ FROM $BASE_IMAGE
 
         result = _parse_dependency_versions(tmp_path)
 
-        assert result == {"ghcr.io/huggingface/text-embeddings-inference": "cpu-1.8"}
+        assert result == {"docker/ghcr.io/huggingface/text-embeddings-inference": "cpu-1.8"}
         assert split_image_reference("ghcr.io/huggingface/text-embeddings-inference:cpu-1.8") == (
             "ghcr.io/huggingface/text-embeddings-inference",
             "cpu-1.8",
@@ -1856,10 +1856,10 @@ services:
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "memgraph/memgraph-mage": "3.12.0",
-            "valkey/valkey": "8-alpine",
-            "localhost:5000/internal/app": "2.1",
-            "acme/app": "dev",
+            "docker/memgraph/memgraph-mage": "3.12.0",
+            "docker/valkey/valkey": "8-alpine",
+            "docker/localhost:5000/internal/app": "2.1",
+            "docker/acme/app": "dev",
         }, "a colon before the last slash is a registry port, not a tag"
         assert not any("BASE" in name for name in result), "a templated reference names nothing resolvable"
 
@@ -1868,19 +1868,32 @@ services:
         version is separately unknown, and `atlas deps` renders it as `-`."""
         _write(tmp_path, "Dockerfile", "FROM nginx\n")
 
-        assert _parse_dependency_versions(tmp_path) == {"nginx": ""}
+        assert _parse_dependency_versions(tmp_path) == {"docker/nginx": ""}
 
     def test_an_unconstrained_declaration_does_not_conflict_with_a_pinned_one(self, tmp_path: Path):
         """An empty constraint carries no claim, so it cannot disagree with one.
 
-        Without this the cross-manifest collapse would drop a name declared unpinned in
-        one ecosystem and pinned in another -- losing both the version and the
-        declaration, which is strictly worse than either input.
-        """
-        _write(tmp_path, "pyproject.toml", '[project]\nname = "api"\ndependencies = ["redis"]\n')
-        _write(tmp_path, "package.json", '{"dependencies": {"redis": "^4.6.0"}}')
+        One ecosystem, one name, declared twice: unpinned in the core list and pinned in
+        an extra. Without this rule the collapse drops the name and loses both the version
+        *and* the declaration, which is strictly worse than either input.
 
-        assert _parse_dependency_versions(tmp_path) == {"redis": "^4.6.0"}
+        Two ecosystems sharing a name is no longer the way to reach this -- since ATL-194
+        they are different keys and cannot collide at all.
+        """
+        _write(
+            tmp_path,
+            "pyproject.toml",
+            """
+[project]
+name = "api"
+dependencies = ["redis"]
+
+[project.optional-dependencies]
+cache = ["redis>=5.0"]
+""",
+        )
+
+        assert _parse_dependency_versions(tmp_path) == {"pypi/redis": ">=5.0"}
 
     def test_package_json(self, tmp_path: Path):
         _write(
@@ -1909,11 +1922,11 @@ services:
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "react": "^18.3.1",  # runtime range wins over the devDependencies echo
-            "@tanstack/react-query": "^5.36.0",
-            "lodash.debounce": "^4.0.8",
-            "typescript": "~5.4.5",
-            "react-dom": ">=18",
+            "npm/react": "^18.3.1",  # runtime range wins over the devDependencies echo
+            "npm/@tanstack/react-query": "^5.36.0",
+            "npm/lodash.debounce": "^4.0.8",
+            "npm/typescript": "~5.4.5",
+            "npm/react-dom": ">=18",
         }
 
     def test_cargo_toml(self, tmp_path: Path):
@@ -1943,11 +1956,11 @@ cc = "1.0"
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "serde": "1.0",
-            "serde_json": "1.0",
-            "tracing_subscriber": "0.3",  # crate name, not the dashed package name
-            "criterion": "0.5",
-            "cc": "1.0",
+            "crates/serde": "1.0",
+            "crates/serde_json": "1.0",
+            "crates/tracing_subscriber": "0.3",  # crate name, not the dashed package name
+            "crates/criterion": "0.5",
+            "crates/cc": "1.0",
         }
         # Path dependencies declare no version requirement.
         assert "local_lib" not in result
@@ -1979,9 +1992,9 @@ cc = "1.0"
         # Keys are module paths verbatim — see the module-level note on why a Go
         # import root ("github") is not a usable ExternalPackage key.
         assert result == {
-            "github.com/spf13/cobra": "v1.8.0",
-            "golang.org/x/text": "v0.14.0",
-            "github.com/stretchr/testify": "v1.9.0",
+            "go/github.com/spf13/cobra": "v1.8.0",
+            "go/golang.org/x/text": "v0.14.0",
+            "go/github.com/stretchr/testify": "v1.9.0",
         }
         assert "github.com/bad/pkg" not in result
         assert "github.com/example/other" not in result
@@ -2023,8 +2036,8 @@ cc = "1.0"
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "org.slf4j:slf4j-api": "2.0.13",
-            "org.junit.jupiter:junit-jupiter": "5.10.2",  # ${junit.version} resolved
+            "maven/org.slf4j:slf4j-api": "2.0.13",
+            "maven/org.junit.jupiter:junit-jupiter": "5.10.2",  # ${junit.version} resolved
         }
         # Version inherited from a parent pom / dependencyManagement we cannot see.
         assert "com.google.guava:guava" not in result
@@ -2056,9 +2069,9 @@ dependencies {
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "com.google.guava:guava": "33.1.0-jre",
-            "junit:junit": "4.13.2",
-            "org.postgresql:postgresql": "42.7.3",
+            "maven/com.google.guava:guava": "33.1.0-jre",
+            "maven/junit:junit": "4.13.2",
+            "maven/org.postgresql:postgresql": "42.7.3",
         }
         # An interpolated version is a variable name, not a version.
         assert "org.slf4j:slf4j-api" not in result
@@ -2080,9 +2093,9 @@ dependencies {
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "org.springframework.boot:spring-boot-dependencies": "3.2.5",
-            "io.ktor:ktor-client-core": "2.3.11",
-            "org.jetbrains.kotlin:kotlin-test": "1.9.23",
+            "maven/org.springframework.boot:spring-boot-dependencies": "3.2.5",
+            "maven/io.ktor:ktor-client-core": "2.3.11",
+            "maven/org.jetbrains.kotlin:kotlin-test": "1.9.23",
         }
 
     def test_composer_json(self, tmp_path: Path):
@@ -2108,9 +2121,9 @@ dependencies {
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "monolog/monolog": "^3.6",
-            "symfony/console": "^7.0",
-            "phpunit/phpunit": "^11.0",
+            "packagist/monolog/monolog": "^3.6",
+            "packagist/symfony/console": "^7.0",
+            "packagist/phpunit/phpunit": "^11.0",
         }
         # Platform requirements are not packages.
         assert "php" not in result
@@ -2139,10 +2152,10 @@ end
         result = _parse_dependency_versions(tmp_path)
 
         assert result == {
-            "rails": "~> 7.1.3",
-            "puma": ">= 6.0, < 7.0",
-            "pg": "~> 1.5",
-            "rspec": "~> 3.13",
+            "rubygems/rails": "~> 7.1.3",
+            "rubygems/puma": ">= 6.0, < 7.0",
+            "rubygems/pg": "~> 1.5",
+            "rubygems/rspec": "~> 3.13",
         }
         # Gems declared without a requirement contribute nothing.
         assert "nokogiri" not in result
@@ -2166,16 +2179,22 @@ end
 
         result = _parse_dependency_versions(tmp_path)
 
-        assert result == {"fastapi": ">=0.111", "react": "^18.3.1"}
+        assert result == {"pypi/fastapi": ">=0.111", "npm/react": "^18.3.1"}
 
-    def test_conflicting_name_across_manifests_is_dropped(self, tmp_path: Path):
-        """One ExternalPackage node per name — two ecosystems disagreeing means no answer."""
+    def test_two_ecosystems_naming_one_package_no_longer_collide(self, tmp_path: Path):
+        """ATL-194 inverted this. It used to assert that `redis` was DROPPED.
+
+        There was one ExternalPackage node per name, so a Python `redis>=5.0` and an npm
+        `redis@^4.6.0` were two claims on one node and neither could be believed. Now the
+        node is keyed by ecosystem too, so they are simply two different packages that
+        happen to share a word -- which is what they always were.
+        """
         _write(tmp_path, "pyproject.toml", '[project]\nname = "api"\ndependencies = ["redis>=5.0", "httpx>=0.27"]\n')
         _write(tmp_path, "package.json", '{"dependencies": {"redis": "^4.6.0"}}')
 
         result = _parse_dependency_versions(tmp_path)
 
-        assert result == {"httpx": ">=0.27"}
+        assert result == {"pypi/redis": ">=5.0", "pypi/httpx": ">=0.27", "npm/redis": "^4.6.0"}
 
     def test_malformed_manifest_does_not_break_siblings(self, tmp_path: Path):
         _write(tmp_path, "package.json", "{ this is not json")
@@ -2183,7 +2202,7 @@ end
         _write(tmp_path, "Cargo.toml", "[dependencies\nbroken =")
         _write(tmp_path, "pyproject.toml", '[project]\nname = "api"\ndependencies = ["httpx>=0.27"]\n')
 
-        assert _parse_dependency_versions(tmp_path) == {"httpx": ">=0.27"}
+        assert _parse_dependency_versions(tmp_path) == {"pypi/httpx": ">=0.27"}
 
     def test_register_manifest_parser_extends_the_table(self, tmp_path: Path, manifest_registry):
         _write(tmp_path, "deps.txt", "leftpad 1.0.0\n")
@@ -2198,10 +2217,10 @@ end
                     versions[name] = constraint
             return versions
 
-        register_manifest_parser("deps.txt", _parse_deps_txt)
+        register_manifest_parser("deps.txt", _parse_deps_txt, "txt")
 
         assert "deps.txt" in manifest_registry
-        assert _parse_dependency_versions(tmp_path) == {"leftpad": "1.0.0"}
+        assert _parse_dependency_versions(tmp_path) == {"txt/leftpad": "1.0.0"}
 
 
 # ---------------------------------------------------------------------------

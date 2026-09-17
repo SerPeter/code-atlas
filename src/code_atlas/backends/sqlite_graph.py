@@ -103,9 +103,11 @@ from code_atlas.schema import (
     _REFERENCE_COUNTED_LABELS,
     _TEXT_SEARCHABLE_LABELS,
     COMPOSITE_INDICES,
+    ECOSYSTEM_UNKNOWN,
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
     IMPORT_ATOMIC_NAME,
+    IMPORT_ECOSYSTEM,
     LABEL_PROPERTY_INDICES,
     PROVENANCE_DECLARED,
     PROVENANCE_STDLIB,
@@ -114,6 +116,7 @@ from code_atlas.schema import (
     TEXT_INDICES,
     NodeLabel,
     build_vector_index_specs,
+    external_qualified_name,
 )
 from code_atlas.search.engine import matches_test_pattern
 
@@ -355,7 +358,7 @@ def _ascii_fold(value: str) -> str:
     return value.translate(_ASCII_FOLD)
 
 
-_WAREHOUSE_PREFIX = "ext/warehouse."
+_WAREHOUSE_PREFIX = "ext/warehouse/warehouse."
 """Mirror of ``GraphClient._WAREHOUSE_PREFIX``; see that constant for why it is ``ext/``."""
 
 _WAREHOUSE_PRODUCER_KINDS: frozenset[str] = frozenset({"dbt_model", "dbt_snapshot"})
@@ -839,6 +842,35 @@ class SqliteGraphClient:
             "environment-variable and referenced-file nodes"
         )
 
+    async def _migrate_v20_drop_external_nodes(self, conn: SqlConnection) -> None:
+        """Mirror of ``GraphClient._migrate_v20_drop_external_nodes`` -- see that docstring
+        for why an external node is deleted rather than rewritten.
+
+        The edge sweep is explicit here. Memgraph's ``DETACH DELETE`` takes the
+        relationships with the node; this table has no foreign keys, so an untouched
+        ``edges`` row would keep pointing at a uid that no longer exists -- and
+        ``get_package_dependents`` joins through exactly those rows, so the orphans would
+        read as real dependencies until something else cleaned them up.
+        """
+        cur = await conn.execute("SELECT uid FROM nodes WHERE labels IN ('ExternalPackage', 'ExternalSymbol')")
+        uids = [row[0] for row in await cur.fetchall()]
+        await cur.close()
+        if uids:
+            marks = ",".join("?" * len(uids))
+            await conn.execute(f"DELETE FROM edges WHERE from_uid IN ({marks})", uids)
+            await conn.execute(f"DELETE FROM edges WHERE to_uid IN ({marks})", uids)
+            await conn.execute(f"DELETE FROM nodes WHERE uid IN ({marks})", uids)
+        await conn.execute(
+            "UPDATE nodes SET props_json = json_remove(props_json, '$.git_hash') "
+            "WHERE json_extract(props_json, '$.git_hash') IS NOT NULL"
+        )
+        await conn.commit()
+        logger.info(
+            "SQLite schema v20: dropped {} external node(s) so they can be re-minted under "
+            "their ecosystem — run 'atlas index' to rebuild them",
+            len(uids),
+        )
+
     async def _migrate_v18_versions_moved_to_dependency_edge(self, conn: SqlConnection) -> None:
         """Mirror of ``GraphClient._migrate_v18_versions_moved_to_dependency_edge``.
 
@@ -1039,6 +1071,8 @@ class SqliteGraphClient:
             # SQLite graph keeps the version on the node while reading it off the edge.
             if stored < 18:
                 await self._migrate_v18_versions_moved_to_dependency_edge(conn)
+            if stored < 20:
+                await self._migrate_v20_drop_external_nodes(conn)
             await self._set_schema_version(conn, SCHEMA_VERSION)
         else:
             msg = (
@@ -1910,8 +1944,9 @@ class SqliteGraphClient:
         folded_map = build_case_folded_map((qn, uid) for qn, uid in rows)
 
         import_edges: list[tuple[str, str, bool]] = []
-        ext_packages: dict[str, dict[str, str]] = {}
-        ext_symbols: dict[str, dict[str, str]] = {}
+        # Keyed by (ecosystem, name) since ATL-194: one name from two ecosystems is two nodes.
+        ext_packages: dict[tuple[str, str], dict[str, str]] = {}
+        ext_symbols: dict[tuple[str, str], dict[str, str]] = {}
         inexact: list[ParsedRelationship] = []
 
         for rel in import_rels:
@@ -1935,34 +1970,55 @@ class SqliteGraphClient:
             top_level = to_name if rel.properties.get(IMPORT_ATOMIC_NAME) else to_name.split(".")[0]
             if not top_level:
                 continue
-            pkg_uid = f"{project_name}:ext/{top_level}"
-            ext_packages.setdefault(top_level, {"uid": pkg_uid, "name": top_level, "qn": f"ext/{top_level}"})
+            # The ecosystem is part of the identity (ATL-194) -- see the Cypher's comment.
+            ecosystem = rel.properties.get(IMPORT_ECOSYSTEM) or ECOSYSTEM_UNKNOWN
+            pkg_qn = external_qualified_name(ecosystem, top_level)
+            pkg_uid = f"{project_name}:{pkg_qn}"
+            ext_packages.setdefault(
+                (ecosystem, top_level),
+                {"uid": pkg_uid, "name": top_level, "qn": pkg_qn, "ecosystem": ecosystem},
+            )
 
             if to_name == top_level:
                 import_edges.append((from_uid, pkg_uid, is_type_only))
             else:
-                sym_uid = f"{project_name}:ext/{to_name}"
+                sym_qn = external_qualified_name(ecosystem, to_name)
+                sym_uid = f"{project_name}:{sym_qn}"
                 sym_name = to_name.rsplit(".", 1)[-1]
                 ext_symbols.setdefault(
-                    to_name, {"uid": sym_uid, "name": sym_name, "qn": f"ext/{to_name}", "package": top_level}
+                    (ecosystem, to_name),
+                    {
+                        "uid": sym_uid,
+                        "name": sym_name,
+                        "qn": sym_qn,
+                        "package": top_level,
+                        "ecosystem": ecosystem,
+                        "pkg_uid": pkg_uid,
+                    },
                 )
                 import_edges.append((from_uid, sym_uid, is_type_only))
 
         for pkg in ext_packages.values():
             await conn.execute(
                 f"INSERT INTO nodes({_NODE_COLUMNS}) "
-                "VALUES (?, 'ExternalPackage', ?, ?, NULL, ?, NULL, NULL, '{}') ON CONFLICT(uid) DO NOTHING",
-                (pkg["uid"], project_name, pkg["qn"], pkg["name"]),
+                "VALUES (?, 'ExternalPackage', ?, ?, NULL, ?, NULL, NULL, ?) ON CONFLICT(uid) DO NOTHING",
+                (pkg["uid"], project_name, pkg["qn"], pkg["name"], _dumps({"ecosystem": pkg["ecosystem"]})),
             )
         for sym in ext_symbols.values():
             await conn.execute(
                 f"INSERT INTO nodes({_NODE_COLUMNS}) "
                 "VALUES (?, 'ExternalSymbol', ?, ?, NULL, ?, NULL, NULL, ?) ON CONFLICT(uid) DO NOTHING",
-                (sym["uid"], project_name, sym["qn"], sym["name"], _dumps({"package": sym["package"]})),
+                (
+                    sym["uid"],
+                    project_name,
+                    sym["qn"],
+                    sym["name"],
+                    _dumps({"package": sym["package"], "ecosystem": sym["ecosystem"]}),
+                ),
             )
             await conn.execute(
                 "INSERT OR IGNORE INTO edges(from_uid, to_uid, rel_type, props_json) VALUES (?, ?, 'CONTAINS', '{}')",
-                (f"{project_name}:ext/{sym['package']}", sym["uid"]),
+                (sym["pkg_uid"], sym["uid"]),
             )
         for from_uid, to_uid, type_only in import_edges:
             props = _dumps({"type_only": True}) if type_only else "{}"
@@ -2687,7 +2743,8 @@ class SqliteGraphClient:
             where += " AND n.name = ?"
             params.append(name)
         cur = await conn.execute(
-            "SELECT n.name AS package, n.project_name AS project, "
+            "SELECT n.name AS package, json_extract(n.props_json, '$.ecosystem') AS ecosystem, "
+            "n.project_name AS project, "
             # UNION, not two counts added: a module that does both `import pathlib` and
             # `from pathlib import Path` is one importer. The second arm is the one that
             # matters -- a from-import attaches to the ExternalSymbol, so counting only
@@ -2708,29 +2765,33 @@ class SqliteGraphClient:
         rows = await cur.fetchall()
         await cur.close()
 
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for package, project, import_sites, version in rows:
-            grouped.setdefault(package, []).append(
+        # Grouped by (name, ecosystem) since ATL-194: `redis` the Python client and `redis`
+        # the container image are two packages, and folding them would sum their importers
+        # and let one ecosystem's version answer for the other.
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for package, ecosystem, project, import_sites, version in rows:
+            grouped.setdefault((package, ecosystem or ""), []).append(
                 {"project": project, "version": version, "import_sites": import_sites}
             )
         # Ordered on the typed mapping rather than on the result rows: those hold a
         # str/int/list union, so a key function over them cannot be checked.
         ranked = sorted(
             (
-                (pkg, projects)
-                for pkg, projects in grouped.items()
-                if len(projects) >= min_projects and not (exclude_stdlib and pkg in STDLIB_MODULE_NAMES)
+                (key, projects)
+                for key, projects in grouped.items()
+                if len(projects) >= min_projects and not (exclude_stdlib and key[0] in STDLIB_MODULE_NAMES)
             ),
-            key=lambda item: (-len(item[1]), item[0]),
+            key=lambda item: (-len(item[1]), item[0][0], item[0][1]),
         )
         return [
             {
                 "package": pkg,
+                "ecosystem": ecosystem,
                 "stdlib": pkg in STDLIB_MODULE_NAMES,
                 "project_count": len(projects),
                 "projects": sorted(projects, key=lambda p: (-(p["import_sites"] or 0), p["project"] or "")),
             }
-            for pkg, projects in ranked[:limit]
+            for (pkg, ecosystem), projects in ranked[:limit]
         ]
 
     async def upsert_external_stubs(
@@ -2759,6 +2820,7 @@ class SqliteGraphClient:
             return 0
         conn = await self._get_conn()
         pkg_uid = f"{project_name}:ext/{package}"
+        bare = package.partition("/")[2] or package
         await conn.executemany(
             f"INSERT INTO nodes({_NODE_COLUMNS}) "
             "VALUES (?, 'ExternalSymbol', ?, ?, NULL, ?, ?, NULL, ?) "
@@ -2773,7 +2835,7 @@ class SqliteGraphClient:
                     sym["kind"],
                     _dumps(
                         {
-                            "package": package,
+                            "package": bare,
                             "signature": sym["signature"],
                             "docstring": sym["docstring"],
                             "stub": True,
@@ -2799,12 +2861,12 @@ class SqliteGraphClient:
         """Mirror of ``GraphClient.get_stubbed_package_versions`` -- see that docstring."""
         conn = await self._get_conn()
         cur = await conn.execute(
-            "SELECT name, json_extract(props_json, '$.stub_version') AS version FROM nodes "
+            "SELECT qualified_name, json_extract(props_json, '$.stub_version') AS version FROM nodes "
             "WHERE labels = 'ExternalPackage' AND project_name = ? "
             "AND json_extract(props_json, '$.stub_version') IS NOT NULL",
             (project_name,),
         )
-        return {row[0]: row[1] for row in await cur.fetchall()}
+        return {row[0].removeprefix("ext/"): row[1] for row in await cur.fetchall()}
 
     async def update_external_package_versions(self, project_name: str, versions: dict[str, str]) -> None:
         """Mirror of ``GraphClient.update_external_package_versions`` — the version lives
@@ -4226,15 +4288,20 @@ class SqliteGraphClient:
         # that true, so dropping the from_uid predicate — the obvious "simplification"
         # once the node is globalized — would inflate every imported_by count.
         cur = await conn.execute(
-            "SELECT ep.name, json_extract(dep.props_json, '$.version'), COUNT(src.uid) AS imported_by FROM nodes ep "
+            "SELECT ep.name, json_extract(ep.props_json, '$.ecosystem'), "
+            "json_extract(dep.props_json, '$.version'), COUNT(src.uid) AS imported_by FROM nodes ep "
             "LEFT JOIN edges e ON e.to_uid = ep.uid AND e.rel_type = 'IMPORTS' "
             "LEFT JOIN nodes src ON src.uid = e.from_uid "
             "LEFT JOIN edges dep ON dep.to_uid = ep.uid AND dep.rel_type = 'DEPENDS_ON' AND dep.from_uid = ? "
             f"WHERE ep.labels = 'ExternalPackage' AND ep.project_name = ? {ext_where} "
-            "GROUP BY ep.name ORDER BY imported_by DESC LIMIT ?",
+            # Grouped by the ecosystem too (ATL-194): `redis` the Python client and `redis`
+            # the image are two packages, and folding them would sum their importers.
+            "GROUP BY ep.name, json_extract(ep.props_json, '$.ecosystem') ORDER BY imported_by DESC LIMIT ?",
             [project, project, *ext_extra, limit],
         )
-        ext_raw = [{"package": r[0], "version": r[1], "imported_by": r[2]} for r in await cur.fetchall()]
+        ext_raw = [
+            {"package": r[0], "ecosystem": r[1], "version": r[2], "imported_by": r[3]} for r in await cur.fetchall()
+        ]
         await cur.close()
 
         return {"counts": counts_raw, "packages": pkg_raw, "largest_modules": largest_raw, "external_deps": ext_raw}
@@ -4350,26 +4417,28 @@ class SqliteGraphClient:
 
         clause, extra = _prefix_clause("src.file_path", path)
         cur = await conn.execute(
-            "SELECT ep.name, COUNT(*) AS cnt FROM edges e "
+            "SELECT ep.name, json_extract(ep.props_json, '$.ecosystem'), COUNT(*) AS cnt FROM edges e "
             "JOIN nodes src ON src.uid = e.from_uid AND src.project_name = ? "
             "JOIN nodes ep ON ep.uid = e.to_uid AND ep.labels = 'ExternalPackage' "
             f"WHERE e.rel_type = 'IMPORTS'{clause} "
-            "GROUP BY ep.name",
+            # Grouped by the ecosystem too (ATL-194), matching Memgraph's per-node rows.
+            "GROUP BY 1, 2",
             [project, *extra],
         )
-        ext_pkg_raw = [{"package": r[0], "cnt": r[1]} for r in await cur.fetchall()]
+        ext_pkg_raw = [{"package": r[0], "ecosystem": r[1], "cnt": r[2]} for r in await cur.fetchall()]
         await cur.close()
 
         clause, extra = _prefix_clause("src.file_path", path)
         cur = await conn.execute(
-            "SELECT json_extract(es.props_json, '$.package'), COUNT(*) AS cnt FROM edges e "
+            "SELECT json_extract(es.props_json, '$.package'), json_extract(es.props_json, '$.ecosystem'), "
+            "COUNT(*) AS cnt FROM edges e "
             "JOIN nodes src ON src.uid = e.from_uid AND src.project_name = ? "
             "JOIN nodes es ON es.uid = e.to_uid AND es.labels = 'ExternalSymbol' "
             f"WHERE e.rel_type = 'IMPORTS'{clause} "
-            "GROUP BY 1",
+            "GROUP BY 1, 2",
             [project, *extra],
         )
-        ext_sym_raw = [{"package": r[0], "cnt": r[1]} for r in await cur.fetchall()]
+        ext_sym_raw = [{"package": r[0], "ecosystem": r[1], "cnt": r[2]} for r in await cur.fetchall()]
         await cur.close()
 
         return {"ext_packages": ext_pkg_raw, "ext_symbols": ext_sym_raw}

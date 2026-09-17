@@ -33,9 +33,12 @@ from code_atlas.schema import (
     _TEXT_SEARCHABLE_LABELS,
     COMPONENT_ALIAS_PREFIXES,
     CUSTOM_COMPONENT_PREFIX,
+    ECOSYSTEM_PYPI,
+    ECOSYSTEM_UNKNOWN,
     FILE_HASH_LABELS,
     GLOBAL_PROJECT,
     IMPORT_ATOMIC_NAME,
+    IMPORT_ECOSYSTEM,
     PROVENANCE_DECLARED,
     PROVENANCE_STDLIB,
     PROVENANCE_UNDECLARED,
@@ -48,6 +51,7 @@ from code_atlas.schema import (
     RelType,
     TypeDefKind,
     env_var_uid,
+    external_qualified_name,
     generate_composite_index_ddl,
     generate_drop_redundant_marker_ddl,
     generate_drop_text_index_ddl,
@@ -291,8 +295,14 @@ def build_case_folded_map(pairs: Iterable[tuple[str, str]]) -> dict[str, str | N
     return folded
 
 
-_WAREHOUSE_PREFIX = "ext/warehouse."
+_WAREHOUSE_PREFIX = "ext/warehouse/warehouse."
 """How a warehouse-object stub's ``qualified_name`` actually reads once minted.
+
+Two `warehouse` segments, and both earn their place. The first is the **ecosystem**
+(ATL-194), which every external node now carries; the second is the namespace the SQL and
+TMDL parsers emit as part of ``to_name`` (``warehouse.fct_orders``), which predates it.
+They are not redundant -- an ecosystem segment is generated, a name segment is parsed --
+but they do look it, which is why this says so.
 
 NOT ``powerbi.WAREHOUSE_PREFIX``, and the difference cost a round of green-but-meaningless
 tests: the parser emits an import target of ``warehouse.<obj>``, and ``resolve_imports``
@@ -2801,8 +2811,8 @@ class GraphClient:
 
         # 2. Classify imports as internal or external
         import_edges: list[dict[str, Any]] = []  # [{from_uid, to_uid, type_only?}]
-        ext_packages: dict[str, dict[str, str]] = {}  # top_level → {uid, name, qn, project_name}
-        ext_symbols: dict[str, dict[str, str]] = {}  # dotted_path → {uid, name, qn, package, project_name}
+        ext_packages: dict[tuple[str, str], dict[str, str]] = {}  # (ecosystem, top_level) → node props
+        ext_symbols: dict[tuple[str, str], dict[str, str]] = {}  # (ecosystem, dotted_path) → node props
         inexact: list[ParsedRelationship] = []
 
         for rel in import_rels:
@@ -2849,14 +2859,23 @@ class GraphClient:
             if not top_level:
                 logger.debug("Skipping malformed import name {!r} from {}", to_name, from_uid)
                 continue
-            pkg_uid = f"{project_name}:ext/{top_level}"
+            # The ecosystem is part of the identity (ATL-194). `redis` the Python client
+            # and `redis` the server image are unrelated artifacts with unrelated versions,
+            # and one node could hold only one of their answers. Anything reaching here
+            # without the property is pre-ATL-194 parser output being replayed; `unknown`
+            # keeps it addressable rather than dropping it.
+            ecosystem = rel.properties.get(IMPORT_ECOSYSTEM) or ECOSYSTEM_UNKNOWN
+            pkg_qn = external_qualified_name(ecosystem, top_level)
+            pkg_uid = f"{project_name}:{pkg_qn}"
+            pkg_key = (ecosystem, top_level)
 
-            if top_level not in ext_packages:
-                ext_packages[top_level] = {
+            if pkg_key not in ext_packages:
+                ext_packages[pkg_key] = {
                     "uid": pkg_uid,
                     "project_name": project_name,
                     "name": top_level,
-                    "qualified_name": f"ext/{top_level}",
+                    "qualified_name": pkg_qn,
+                    "ecosystem": ecosystem,
                 }
 
             if to_name == top_level:
@@ -2868,15 +2887,18 @@ class GraphClient:
                 uid_label[pkg_uid] = NodeLabel.EXTERNAL_PACKAGE
             else:
                 # Symbol import (e.g. `from loguru import logger`) → ExternalSymbol
-                sym_uid = f"{project_name}:ext/{to_name}"
+                sym_qn = external_qualified_name(ecosystem, to_name)
+                sym_uid = f"{project_name}:{sym_qn}"
                 sym_name = to_name.rsplit(".", 1)[-1]
-                if to_name not in ext_symbols:
-                    ext_symbols[to_name] = {
+                if (ecosystem, to_name) not in ext_symbols:
+                    ext_symbols[(ecosystem, to_name)] = {
                         "uid": sym_uid,
                         "project_name": project_name,
                         "name": sym_name,
-                        "qualified_name": f"ext/{to_name}",
+                        "qualified_name": sym_qn,
                         "package": top_level,
+                        "ecosystem": ecosystem,
+                        "pkg_uid": pkg_uid,
                     }
                 edge = {"from_uid": from_uid, "to_uid": sym_uid}
                 if is_type_only:
@@ -2890,7 +2912,8 @@ class GraphClient:
                 f"UNWIND $packages AS pkg "
                 f"MERGE (n:{NodeLabel.EXTERNAL_PACKAGE}:{NodeLabel.ENTITY} {{uid: pkg.uid}}) "
                 f"ON CREATE SET n.project_name = pkg.project_name, n.name = pkg.name, "
-                f"n.qualified_name = pkg.qualified_name",
+                f"n.qualified_name = pkg.qualified_name "
+                f"SET n.ecosystem = pkg.ecosystem",
                 {"packages": list(ext_packages.values())},
             )
 
@@ -2900,14 +2923,13 @@ class GraphClient:
                 f"UNWIND $symbols AS sym "
                 f"MERGE (n:{NodeLabel.EXTERNAL_SYMBOL}:{NodeLabel.ENTITY} {{uid: sym.uid}}) "
                 f"ON CREATE SET n.project_name = sym.project_name, n.name = sym.name, "
-                f"n.qualified_name = sym.qualified_name, n.package = sym.package",
+                f"n.qualified_name = sym.qualified_name, n.package = sym.package "
+                f"SET n.ecosystem = sym.ecosystem",
                 {"symbols": list(ext_symbols.values())},
             )
 
         # 5. CONTAINS edges (ExternalPackage → ExternalSymbol)
-        contains_edges = [
-            {"pkg_uid": f"{project_name}:ext/{sym['package']}", "sym_uid": sym["uid"]} for sym in ext_symbols.values()
-        ]
+        contains_edges = [{"pkg_uid": sym["pkg_uid"], "sym_uid": sym["uid"]} for sym in ext_symbols.values()]
         if contains_edges:
             await self.execute_write(
                 f"UNWIND $edges AS e "
@@ -3683,9 +3705,10 @@ class GraphClient:
                 f"MATCH (a:{NodeLabel.TYPE_DEF} {{uid: r.from_uid}}) "
                 f"WHERE NOT (a)-[:{RelType.INHERITS}]->({{name: r.to_name}}) "
                 f"MERGE (b:{NodeLabel.EXTERNAL_SYMBOL}:{NodeLabel.ENTITY} "
-                f"{{uid: r.project + ':ext/builtins.' + r.to_name}}) "
+                f"{{uid: r.project + ':{external_qualified_name(ECOSYSTEM_PYPI, 'builtins.')}' + r.to_name}}) "
                 f"ON CREATE SET b.project_name = r.project, b.name = r.to_name, "
-                f"b.qualified_name = 'builtins.' + r.to_name "
+                f"b.qualified_name = '{external_qualified_name(ECOSYSTEM_PYPI, 'builtins.')}' + r.to_name, "
+                f"b.ecosystem = '{ECOSYSTEM_PYPI}' "
                 f"MERGE (a)-[:{RelType.INHERITS}]->(b)",
                 {"rels": builtin_params},
             )
@@ -4231,7 +4254,11 @@ class GraphClient:
         """
         if not symbols:
             return 0
+        # *package* arrives ecosystem-qualified (`pypi/httpx`) because that is what
+        # addresses the node. The `package` PROPERTY stays the bare import name, which is
+        # what `resolve_imports` writes and what every symbol-to-package read matches on.
         pkg_uid = f"{project_name}:ext/{package}"
+        bare = package.partition("/")[2] or package
         await self.execute_write(
             f"UNWIND $symbols AS sym "
             f"MERGE (n:{NodeLabel.EXTERNAL_SYMBOL}:{NodeLabel.ENTITY} {{uid: sym.uid}}) "
@@ -4242,7 +4269,7 @@ class GraphClient:
             f"WITH n "
             f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $pkg_uid}}) "
             f"MERGE (p)-[:{RelType.CONTAINS}]->(n)",
-            {"symbols": symbols, "proj": project_name, "pkg": package, "pkg_uid": pkg_uid},
+            {"symbols": symbols, "proj": project_name, "pkg": bare, "pkg_uid": pkg_uid},
         )
         await self.execute_write(
             f"MATCH (p:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $pkg_uid}}) "
@@ -4252,7 +4279,11 @@ class GraphClient:
         return len(symbols)
 
     async def get_stubbed_package_versions(self, project_name: str) -> dict[str, str]:
-        """Package name -> the distribution version its stub was read from.
+        """``{ecosystem}/{name}`` -> the distribution version its stub was read from.
+
+        Keyed by the qualified name's tail rather than the bare name (ATL-194), so it
+        addresses the same node the caller writes with ``{project}:ext/{key}`` and two
+        ecosystems sharing a name cannot mark each other as already read.
 
         The caller skips a package whose installed version still matches, which is what
         keeps the stub pass off the critical path of an ordinary re-index: reading 30
@@ -4261,10 +4292,10 @@ class GraphClient:
         records = await self.execute(
             f"MATCH (ep:{NodeLabel.EXTERNAL_PACKAGE} {{project_name: $proj}}) "
             "WHERE ep.stub_version IS NOT NULL "
-            "RETURN ep.name AS name, ep.stub_version AS version",
+            "RETURN ep.qualified_name AS qn, ep.stub_version AS version",
             {"proj": project_name},
         )
-        return {r["name"]: r["version"] for r in records}
+        return {r["qn"].removeprefix("ext/"): r["version"] for r in records}
 
     async def classify_external_package_provenance(self, project_name: str) -> dict[str, int]:
         """Stamp ``provenance`` on every ExternalPackage in *project_name*. Returns the tally.
@@ -4350,12 +4381,14 @@ class GraphClient:
             f"<-[:{RelType.IMPORTS}]-(via) "
             "WITH ep, directs, collect(DISTINCT via.uid) AS vias "
             f"OPTIONAL MATCH (:{NodeLabel.PROJECT} {{uid: ep.project_name}})-[dep:{RelType.DEPENDS_ON}]->(ep) "
-            "WITH ep.name AS package, ep.project_name AS project, dep.version AS version, "
+            "WITH ep.name AS package, ep.ecosystem AS ecosystem, ep.project_name AS project, dep.version AS version, "
             "size(directs + [u IN vias WHERE NOT u IN directs]) AS import_sites "
-            "WITH package, collect({project: project, version: version, import_sites: import_sites}) AS projects "
+            # Grouped by (name, ecosystem) since ATL-194 -- see the SQLite mirror's comment.
+            "WITH package, ecosystem, "
+            "collect({project: project, version: version, import_sites: import_sites}) AS projects "
             "WHERE size(projects) >= $min_projects AND NOT package IN $stdlib "
-            "RETURN package, projects, size(projects) AS project_count "
-            "ORDER BY project_count DESC, package ASC "
+            "RETURN package, ecosystem, projects, size(projects) AS project_count "
+            "ORDER BY project_count DESC, package ASC, ecosystem ASC "
             "LIMIT $limit",
             {
                 "name": name,
@@ -4368,6 +4401,7 @@ class GraphClient:
         return [
             {
                 "package": r["package"],
+                "ecosystem": r["ecosystem"] or "",
                 "stdlib": r["package"] in STDLIB_MODULE_NAMES,
                 "project_count": r["project_count"],
                 "projects": sorted(
@@ -5961,7 +5995,7 @@ class GraphClient:
             # report to only the packages someone pinned. A missing edge yields a null
             # version, which is exactly what a missing ep.version yielded before.
             "OPTIONAL MATCH (:Project {uid: $project})-[dep:DEPENDS_ON]->(ep) "
-            "RETURN ep.name AS package, dep.version AS version, count(src) AS imported_by "
+            "RETURN ep.name AS package, ep.ecosystem AS ecosystem, dep.version AS version, count(src) AS imported_by "
             f"ORDER BY imported_by DESC LIMIT {limit}",
             params,
         )
@@ -6040,13 +6074,13 @@ class GraphClient:
         ext_pkg_raw = await self.execute(
             "MATCH (src {project_name: $project})-[:IMPORTS]->(ep:ExternalPackage) "
             f"WHERE true{pa_src} "
-            "RETURN ep.name AS package, count(src) AS cnt",
+            "RETURN ep.name AS package, ep.ecosystem AS ecosystem, count(src) AS cnt",
             params,
         )
         ext_sym_raw = await self.execute(
             "MATCH (src {project_name: $project})-[:IMPORTS]->(es:ExternalSymbol) "
             f"WHERE true{pa_src} "
-            "RETURN es.package AS package, count(src) AS cnt",
+            "RETURN es.package AS package, es.ecosystem AS ecosystem, count(src) AS cnt",
             params,
         )
         return {"ext_packages": ext_pkg_raw, "ext_symbols": ext_sym_raw}
@@ -7456,6 +7490,7 @@ class GraphClient:
             (16, self._migrate_v16_clear_for_nested_frontmatter),
             (17, self._migrate_v17_clear_for_doc_section_splitting),
             (18, self._migrate_v18_versions_moved_to_dependency_edge),
+            (20, self._migrate_v20_drop_external_nodes),
         )
         for threshold, migrate in migrations:
             if stored < threshold:
@@ -7527,6 +7562,41 @@ class GraphClient:
         logger.info(
             "Schema v17: cleared the stored git_hash — run 'atlas index' so oversized doc "
             "sections split into parts and oversized entities get their overflow vectors"
+        )
+
+    async def _migrate_v20_drop_external_nodes(self) -> None:
+        """v20: every external node's uid gained its ecosystem (ATL-194).
+
+        ``ext/redis`` became ``ext/pypi/redis`` or ``ext/docker/redis``, and which one it
+        is cannot be worked out from the graph. The ecosystem is a *parser*-side fact --
+        the language that emitted the import -- and by the time a node exists, that is
+        gone: an ``ExternalPackage`` records a name, not who named it.
+
+        So this **deletes rather than rewrites**, which is safe for exactly one reason:
+        every external node is derived. ``resolve_imports`` mints them from parsed
+        relationships on every index, ``update_external_package_versions`` rewrites the
+        DEPENDS_ON edges from the manifests, and the stub pass re-reads its entrypoints.
+        Nothing here is a source of truth, so dropping it costs one re-parse and no facts.
+
+        A rewrite was the plan and was wrong. Inferring the ecosystem in Cypher would mean
+        guessing from importer file extensions -- and a guess that lands in a *uid* is
+        permanent, silently splitting or merging nodes with nothing to notice.
+
+        The ``EXTRACTION_EPOCH`` bump beside this is what makes it work rather than what
+        makes it tidy. Deleting the nodes is useless on its own: the file-hash gate would
+        find every file unchanged and re-parse nothing, so the imports would never be
+        replayed and the packages would simply be gone. The epoch invalidates that gate;
+        the ``git_hash`` clear makes the run enumerate the files in the first place.
+        """
+        deleted = await self.execute(
+            f"MATCH (n) WHERE n:{NodeLabel.EXTERNAL_PACKAGE} OR n:{NodeLabel.EXTERNAL_SYMBOL} "
+            "WITH n, count(n) AS _ DETACH DELETE n RETURN count(_) AS n"
+        )
+        await self.execute_write(f"MATCH (p:{NodeLabel.PROJECT}) REMOVE p.git_hash")
+        logger.info(
+            "Schema v20: dropped {} external node(s) so they can be re-minted under their "
+            "ecosystem — run 'atlas index' to rebuild them",
+            deleted[0]["n"] if deleted else 0,
         )
 
     async def _migrate_v18_versions_moved_to_dependency_edge(self) -> None:

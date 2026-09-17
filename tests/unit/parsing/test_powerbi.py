@@ -31,7 +31,7 @@ from code_atlas.parsing.languages.powerbi import (
     unquote,
     warehouse_objects,
 )
-from code_atlas.schema import NodeLabel, RelType
+from code_atlas.schema import IMPORT_ECOSYSTEM, NodeLabel, RelType
 
 PATH = "Contoso.SemanticModel/definition/tables/Sales.tmdl"
 
@@ -839,10 +839,12 @@ class TestWarehouseObjects:
         )
         imports = [r for r in _parse(text).relationships if r.rel_type == RelType.IMPORTS]
         assert [r.to_name for r in imports] == ["warehouse.fct_orders"]
-        # No properties, deliberately: `resolve_imports` builds its edge from from_uid and
-        # to_uid alone and drops whatever a parser attached, so anything set here would be
-        # informative-looking and never stored. Pinned in test_sqlite_warehouse.py.
-        assert imports[0].properties == {}
+        # The edge itself still carries nothing a parser chose: `resolve_imports` builds it
+        # from from_uid/to_uid alone. Properties on the *rel* are resolution inputs, not
+        # edge data -- `ecosystem` decides which node the name mints (ATL-194), and TMDL
+        # maps to `warehouse` so a partition and the SQL that defines the table land on one
+        # node. Pinned in test_sqlite_warehouse.py.
+        assert imports[0].properties == {IMPORT_ECOSYSTEM: "warehouse"}
 
     def test_a_direct_lake_partition_is_not_missed(self):
         """Direct Lake gives `source` children instead of an expression and names its object

@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("tree_sitter_containerfile", reason="tree-sitter-containerfile not installed")
 
 from code_atlas.parsing.ast import ParsedFile, get_language_for_file, parse_file
-from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType
+from code_atlas.schema import ECOSYSTEM_DOCKER, IMPORT_ATOMIC_NAME, IMPORT_ECOSYSTEM, NodeLabel, RelType
 
 PROJECT = "test_project"
 
@@ -377,8 +377,11 @@ def test_an_image_is_marked_atomic_and_a_stage_reference_is_not():
 
     tools = _rels_from(parsed, "Dockerfile.tools", RelType.IMPORTS)
     assert [r.to_name for r in tools] == ["ghcr.io/astral-sh/uv"]
-    assert tools[0].properties == {IMPORT_ATOMIC_NAME: True}
+    assert tools[0].properties == {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_DOCKER}
 
     app = {r.to_name: r.properties for r in _rels_from(parsed, "Dockerfile.app", RelType.IMPORTS)}
-    assert app["alpine"] == {IMPORT_ATOMIC_NAME: True}
-    assert app["Dockerfile.tools"] == {}, "an intra-file stage reference is not an external name"
+    assert app["alpine"] == {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_DOCKER}
+    # The stage reference carries no atomic marker and keeps the *language* default
+    # rather than docker -- inert, because it resolves inside the file and never
+    # reaches the mint site (ATL-194).
+    assert app["Dockerfile.tools"] == {IMPORT_ECOSYSTEM: "containerfile"}

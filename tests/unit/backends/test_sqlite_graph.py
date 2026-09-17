@@ -12,7 +12,15 @@ import pytest
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
 from code_atlas.parsing.detectors import PropertyEnrichment
-from code_atlas.schema import GLOBAL_PROJECT, SCHEMA_VERSION, NodeLabel, RelType, Visibility
+from code_atlas.schema import (
+    ECOSYSTEM_PYPI,
+    GLOBAL_PROJECT,
+    IMPORT_ECOSYSTEM,
+    SCHEMA_VERSION,
+    NodeLabel,
+    RelType,
+    Visibility,
+)
 from code_atlas.server.analysis import _analyze_communities
 
 if TYPE_CHECKING:
@@ -1517,7 +1525,14 @@ async def _seed_importer(client: SqliteGraphClient, project: str, *packages: str
     await client.resolve_imports(
         project,
         [
-            ParsedRelationship(from_qualified_name=f"{project}:app", rel_type=RelType.IMPORTS, to_name=pkg)
+            # `parse_file` stamps the ecosystem on real output (ATL-194); a rel without it
+            # mints `ext/unknown/<pkg>` and every uid below would address nothing.
+            ParsedRelationship(
+                from_qualified_name=f"{project}:app",
+                rel_type=RelType.IMPORTS,
+                to_name=pkg,
+                properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+            )
             for pkg in packages
         ],
     )
@@ -1539,8 +1554,8 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         await _seed_importer(client, "app", "requests")
         await _seed_importer(client, "lib", "requests")
 
-        await client.update_external_package_versions("app", {"requests": "2.31.0"})
-        await client.update_external_package_versions("lib", {"requests": "2.28.0"})
+        await client.update_external_package_versions("app", {"pypi/requests": "2.31.0"})
+        await client.update_external_package_versions("lib", {"pypi/requests": "2.28.0"})
 
         assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
         assert await _dependency_versions(client, "lib") == {"requests": "2.28.0"}
@@ -1554,9 +1569,9 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         await client.ensure_schema()
         await _seed_importer(client, "app", "requests")
 
-        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+        await client.update_external_package_versions("app", {"pypi/requests": "2.31.0"})
 
-        props = json.loads((await _node_row(client, "app:ext/requests"))[4])
+        props = json.loads((await _node_row(client, "app:ext/pypi/requests"))[4])
         assert "version" not in props
 
     async def test_a_package_dropped_from_the_manifest_loses_its_edge(self, client: SqliteGraphClient) -> None:
@@ -1569,8 +1584,8 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         await client.ensure_schema()
         await _seed_importer(client, "app", "requests", "loguru")
 
-        await client.update_external_package_versions("app", {"requests": "2.31.0", "loguru": "0.7.2"})
-        await client.update_external_package_versions("app", {"loguru": "0.7.2"})
+        await client.update_external_package_versions("app", {"pypi/requests": "2.31.0", "pypi/loguru": "0.7.2"})
+        await client.update_external_package_versions("app", {"pypi/loguru": "0.7.2"})
 
         assert await _dependency_versions(client, "app") == {"loguru": "0.7.2"}
 
@@ -1587,7 +1602,7 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         await client.merge_project_node("lib")
         await _insert_edge(client, "app", "lib", "DEPENDS_ON")
 
-        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+        await client.update_external_package_versions("app", {"pypi/requests": "2.31.0"})
 
         assert await client.get_project_dependency_edges() == [{"from_proj": "app", "to_proj": "lib"}]
 
@@ -1603,7 +1618,9 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         await client.ensure_schema()
         await _seed_importer(client, "app", "requests")
 
-        await client.update_external_package_versions("app", {"requests": "2.31.0", "never-imported": "9.9.9"})
+        await client.update_external_package_versions(
+            "app", {"pypi/requests": "2.31.0", "pypi/never-imported": "9.9.9"}
+        )
 
         assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
         assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE rel_type = 'DEPENDS_ON'") == 1
@@ -1617,16 +1634,26 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         """
         await client.ensure_schema()
         await _seed_importer(client, "app", "requests", "loguru")
-        await client.update_external_package_versions("app", {"requests": "2.31.0"})
+        await client.update_external_package_versions("app", {"pypi/requests": "2.31.0"})
 
         rows = (await client.get_structure_overview("app", "", 20))["external_deps"]
 
         by_name = {r["package"]: r for r in rows}
-        assert by_name["requests"] == {"package": "requests", "version": "2.31.0", "imported_by": 1}
+        assert by_name["requests"] == {
+            "package": "requests",
+            "ecosystem": ECOSYSTEM_PYPI,
+            "version": "2.31.0",
+            "imported_by": 1,
+        }
         # An imported-but-undeclared package still appears, unversioned — a plain join
         # would shrink the report to only the packages someone happened to pin, which is
         # most of them on any Go/Java/PHP project.
-        assert by_name["loguru"] == {"package": "loguru", "version": None, "imported_by": 1}
+        assert by_name["loguru"] == {
+            "package": "loguru",
+            "ecosystem": ECOSYSTEM_PYPI,
+            "version": None,
+            "imported_by": 1,
+        }
 
     async def test_another_projects_pin_does_not_leak_into_this_ones_report(self, client: SqliteGraphClient) -> None:
         """The report's join must be pinned to the reading project's own edge.
@@ -1645,12 +1672,12 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         await client.ensure_schema()
         await _seed_importer(client, "app", "requests")
         await client.merge_project_node("lib")
-        await client.update_external_package_versions("app", {"requests": "2.31.0"})
-        await _insert_edge(client, "lib", "app:ext/requests", "DEPENDS_ON", {"version": "2.28.0"})
+        await client.update_external_package_versions("app", {"pypi/requests": "2.31.0"})
+        await _insert_edge(client, "lib", "app:ext/pypi/requests", "DEPENDS_ON", {"version": "2.28.0"})
 
         rows = (await client.get_structure_overview("app", "", 20))["external_deps"]
 
-        assert rows == [{"package": "requests", "version": "2.31.0", "imported_by": 1}]
+        assert rows == [{"package": "requests", "ecosystem": ECOSYSTEM_PYPI, "version": "2.31.0", "imported_by": 1}]
 
     async def test_a_rewired_cross_project_stub_leaves_no_dangling_version_edge(
         self, client: SqliteGraphClient
@@ -1669,16 +1696,28 @@ class TestExternalPackageVersionsLiveOnTheDependencyEdge:
         # The sibling project's real Package is what makes the stub resolvable — the
         # cross-project pass matches ExternalPackage.name against Package nodes.
         await client.merge_package_node("lib", "shared", "shared", "shared/")
-        await client.update_external_package_versions("app", {"shared": "1.0.0"})
+        await client.update_external_package_versions("app", {"pypi/shared": "1.0.0"})
 
         assert await client.resolve_cross_project_imports(["app", "lib"]) == 1
 
-        assert await _node_row(client, "app:ext/shared") is None, "the rewired stub survived its own version edge"
-        assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE to_uid = ?", ("app:ext/shared",)) == 0
+        assert await _node_row(client, "app:ext/pypi/shared") is None, "the rewired stub survived its own version edge"
+        assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE to_uid = ?", ("app:ext/pypi/shared",)) == 0
 
 
 class TestV18VersionsMigrateOntoTheDependencyEdge:
-    """A graph indexed before v18 keeps every version it had."""
+    """A graph indexed before v18 keeps every version it had.
+
+    These drive ``_migrate_v18_versions_moved_to_dependency_edge`` **directly** rather than
+    through ``ensure_schema``, which they used to. Since ATL-194 a v17 graph runs v18 and
+    then v20, and v20 deletes every external node so they can be re-minted under their
+    ecosystem — so the edges v18 had just written were gone before the assertions ran, and
+    the tests failed while both migrations were behaving exactly as designed.
+
+    Calling v18 directly keeps its own guarantee pinned: a version cannot be re-derived
+    from source text, so the move has to be a move. The composed v17 → v20 outcome is a
+    different claim and is asserted by ``test_v20_drops_the_external_nodes_for_re_minting``
+    below.
+    """
 
     @staticmethod
     async def _seed_v17(client: SqliteGraphClient, project: str, package: str, version: str) -> None:
@@ -1687,7 +1726,7 @@ class TestV18VersionsMigrateOntoTheDependencyEdge:
         conn = await client._get_conn()
         await conn.execute(
             "UPDATE nodes SET props_json = json_patch(props_json, ?) WHERE uid = ?",
-            (json.dumps({"version": version}), f"{project}:ext/{package}"),
+            (json.dumps({"version": version}), f"{project}:ext/pypi/{package}"),
         )
         await client._set_schema_version(conn, 17)
         await conn.commit()
@@ -1705,13 +1744,12 @@ class TestV18VersionsMigrateOntoTheDependencyEdge:
         await client.ensure_schema()
         await self._seed_v17(client, "app", "requests", "2.31.0")
 
-        await client.ensure_schema()
+        await client._migrate_v18_versions_moved_to_dependency_edge(await client._get_conn())
 
         assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
-        assert "version" not in json.loads((await _node_row(client, "app:ext/requests"))[4]), (
+        assert "version" not in json.loads((await _node_row(client, "app:ext/pypi/requests"))[4]), (
             "the stale node property is the one a not-yet-updated reader would pick"
         )
-        assert await client.get_schema_version() == SCHEMA_VERSION
 
     async def test_a_package_whose_project_node_is_gone_keeps_its_version(self, client: SqliteGraphClient) -> None:
         """An orphan gets no edge, so removing its property turns "moved" into "dropped".
@@ -1728,10 +1766,10 @@ class TestV18VersionsMigrateOntoTheDependencyEdge:
         await conn.execute("DELETE FROM nodes WHERE uid = ? AND labels = 'Project'", ("app",))
         await conn.commit()
 
-        await client.ensure_schema()
+        await client._migrate_v18_versions_moved_to_dependency_edge(conn)
 
         assert await _dependency_versions(client, "app") == {}
-        props = json.loads((await _node_row(client, "app:ext/requests"))[4])
+        props = json.loads((await _node_row(client, "app:ext/pypi/requests"))[4])
         assert props["version"] == "2.31.0"
 
     async def test_a_half_applied_migration_converges_on_the_second_pass(self, client: SqliteGraphClient) -> None:
@@ -1746,9 +1784,30 @@ class TestV18VersionsMigrateOntoTheDependencyEdge:
         """
         await client.ensure_schema()
         await self._seed_v17(client, "app", "requests", "2.31.0")
-        await _insert_edge(client, "app", "app:ext/requests", "DEPENDS_ON", {"version": "0.0.1-interrupted"})
+        await _insert_edge(client, "app", "app:ext/pypi/requests", "DEPENDS_ON", {"version": "0.0.1-interrupted"})
 
-        await client.ensure_schema()
+        await client._migrate_v18_versions_moved_to_dependency_edge(await client._get_conn())
 
         assert await _dependency_versions(client, "app") == {"requests": "2.31.0"}
         assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE rel_type = 'DEPENDS_ON'") == 1
+
+    async def test_v20_drops_the_external_nodes_for_re_minting(self, client: SqliteGraphClient) -> None:
+        """The composed outcome a real v17 graph gets: v18 moves the versions, then v20
+        deletes the external nodes entirely so they can be re-minted under their ecosystem.
+
+        v18's work being discarded is not waste worth avoiding — it is one cheap UPDATE on
+        rows that are about to go, and keeping the ladder's steps independent is worth more
+        than skipping it. What matters is that nothing is left dangling: this backend has no
+        foreign keys, so an untouched `edges` row would keep pointing at a deleted uid and
+        `get_package_dependents` would join straight through it.
+        """
+        await client.ensure_schema()
+        await self._seed_v17(client, "app", "requests", "2.31.0")
+
+        await client.ensure_schema()
+
+        assert await _node_row(client, "app:ext/pypi/requests") is None, "the external node survived v20"
+        assert await _scalar(client, "SELECT COUNT(*) FROM edges WHERE rel_type = 'DEPENDS_ON'") == 0, (
+            "a DEPENDS_ON edge outlived the node it pointed at"
+        )
+        assert await client.get_schema_version() == SCHEMA_VERSION

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 # Schema version — bump on every schema change that requires migration.
-SCHEMA_VERSION: int = 19
+SCHEMA_VERSION: int = 20
 
 # Sentinel ``project_name`` for nodes that are shared across every project.
 #
@@ -376,6 +376,88 @@ def split_image_reference(reference: str) -> tuple[str, str] | None:
     return f"{head}{slash}{name}", digest or tag
 
 
+IMPORT_ECOSYSTEM = "ecosystem"
+"""`ParsedRelationship.properties` key: which packaging ecosystem this import names (ATL-194).
+
+`resolve_imports` mints one `ExternalPackage` per *name*, so a name claimed by two
+ecosystems was one node. `redis` is the worked example: the Python client
+(`dependencies = ["redis"]`) and the server image (`image: redis:7`) are unrelated
+artifacts with unrelated versions, and both minted `ext/redis`. The manifest merge then
+saw two version claims for one node and dropped both -- honest, and useless.
+
+The ecosystem is a *parser*-side fact for the reason `IMPORT_ATOMIC_NAME` is: the resolver
+sees a string, and nothing about `redis` says which one it is. Unlike the atomic-name
+marker this one is stamped centrally, by `parse_file`, from the language that produced the
+file -- so a language gets its ecosystem for free and only a parser emitting imports from
+*another* ecosystem has to say so. `config.py` is the whole of that: a compose `image:` and
+a Kubernetes container image are `docker`, a workflow `uses:` is `actions`, all from a YAML
+file whose own ecosystem is nothing in particular.
+"""
+
+ECOSYSTEM_PYPI = "pypi"
+ECOSYSTEM_DOCKER = "docker"
+ECOSYSTEM_ACTIONS = "actions"
+ECOSYSTEM_UNKNOWN = "unknown"
+
+LANGUAGE_ECOSYSTEM: dict[str, str] = {
+    "python": "pypi",
+    "typescript": "npm",
+    "tsx": "npm",
+    "javascript": "npm",
+    "rust": "crates",
+    "go": "go",
+    "java": "maven",
+    "csharp": "nuget",
+    "php": "packagist",
+    "ruby": "rubygems",
+    "apex": "salesforce",
+    "salesforce": "salesforce",
+    "sql": "warehouse",
+    # A TMDL partition references the same warehouse tables a SQL file defines, and the
+    # two have to land on one node or the whole point of the shared `warehouse.` namespace
+    # is lost. So TMDL's ecosystem is where its imports *point*, not what it is written in.
+    "tmdl": "warehouse",
+}
+"""Language name -> the registry its imports name, where one exists.
+
+Only languages whose import statements resolve against a *package registry* get an entry.
+A language absent here falls back to its own name (`cpp`, `hcl`, `shell`), which is
+honest: a C++ `#include` names a header on a path, not a package anybody publishes, and
+inventing a registry for it would claim a fact.
+
+`sql` maps to `warehouse` because that is what its externals already were -- a schema-wide
+table reference, minted `ext/warehouse.<name>` since long before this existed.
+"""
+
+
+def ecosystem_for_language(language: str) -> str:
+    """The ecosystem a language's imports belong to. Never empty."""
+    return LANGUAGE_ECOSYSTEM.get(language) or language or ECOSYSTEM_UNKNOWN
+
+
+def external_qualified_name(ecosystem: str, name: str) -> str:
+    """`ext/{ecosystem}/{name}` -- the qualified_name of an external node (ATL-194).
+
+    The separator is `/` and the ecosystem segment can never contain one, so a name that
+    *does* (`ghcr.io/acme/api`, `actions/checkout`, `localhost:5000/app`) survives whole:
+    split once, from the left.
+    """
+    return f"ext/{ecosystem}/{name}"
+
+
+def split_external_qualified_name(qualified_name: str) -> tuple[str, str] | None:
+    """Inverse of :func:`external_qualified_name`, or None if this is not an external name.
+
+    Returns None for a pre-ATL-194 `ext/{name}` too, which is what lets a reader tell a
+    migrated node from one it has not reached yet.
+    """
+    rest = qualified_name.removeprefix("ext/")
+    if rest == qualified_name:
+        return None
+    ecosystem, separator, name = rest.partition("/")
+    return (ecosystem, name) if separator and name else None
+
+
 IMPORT_ATOMIC_NAME = "atomic_name"
 """`ParsedRelationship.properties` key: `to_name` is already the package name (ATL-191 P2).
 
@@ -503,7 +585,7 @@ majority — 94 of 132 references in the measured corpus.
 # re-parse of every project. Deliberately NOT SCHEMA_VERSION either: an extraction change
 # and a schema change are different events, and coupling them makes each pay the other's
 # cost, most sharply the vector-index drop and rebuild every schema migration performs.
-EXTRACTION_EPOCH: int = 10
+EXTRACTION_EPOCH: int = 11
 
 
 # ---------------------------------------------------------------------------

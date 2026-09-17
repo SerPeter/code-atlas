@@ -23,7 +23,14 @@ from code_atlas.parsing.languages.config import (
     _Out,
     _parse_config,
 )
-from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType
+from code_atlas.schema import (
+    ECOSYSTEM_ACTIONS,
+    ECOSYSTEM_DOCKER,
+    IMPORT_ATOMIC_NAME,
+    IMPORT_ECOSYSTEM,
+    NodeLabel,
+    RelType,
+)
 
 PROJECT = "test_project"
 
@@ -1022,7 +1029,10 @@ def test_a_compose_image_is_marked_atomic():
     api = {
         r.to_name: (r.rel_type, r.properties) for r in parsed.relationships if r.from_qualified_name.endswith(".api")
     }
-    assert api["ghcr.io/acme/api"] == (RelType.IMPORTS, {IMPORT_ATOMIC_NAME: True})
+    assert api["ghcr.io/acme/api"] == (
+        RelType.IMPORTS,
+        {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_DOCKER},
+    ), "an image is atomic, and it belongs to docker rather than to the YAML that names it"
     assert api["db"] == (RelType.USES_TYPE, {}), "a sibling service reference is internal to this file"
 
 
@@ -1043,4 +1053,18 @@ def test_a_kubernetes_container_image_is_marked_atomic():
 
     images = [r for r in parsed.relationships if r.to_name == "ghcr.io/acme/api"]
     assert len(images) == 1
-    assert images[0].properties == {IMPORT_ATOMIC_NAME: True}
+    assert images[0].properties == {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_DOCKER}
+
+
+def test_a_workflow_action_belongs_to_the_actions_ecosystem():
+    """ATL-194. `actions/checkout` is a repository reference, in a YAML file, naming an
+    artifact from neither YAML's world nor any language's. It is atomic for the same
+    reason an image is, and its ecosystem has to be stated rather than inherited."""
+    parsed = _parse(
+        "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n",
+        ".github/workflows/ci.yml",
+    )
+
+    uses = [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+    assert [r.to_name for r in uses] == ["actions/checkout"]
+    assert uses[0].properties == {IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_ACTIONS}

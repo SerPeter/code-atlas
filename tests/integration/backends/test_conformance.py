@@ -33,7 +33,14 @@ import pytest
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.graph.client import EmbedChunkWrite
 from code_atlas.parsing.ast import ParsedEntity, ParsedRelationship
-from code_atlas.schema import IMPORT_ATOMIC_NAME, NodeLabel, RelType
+from code_atlas.schema import (
+    ECOSYSTEM_DOCKER,
+    ECOSYSTEM_PYPI,
+    IMPORT_ATOMIC_NAME,
+    IMPORT_ECOSYSTEM,
+    NodeLabel,
+    RelType,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -61,6 +68,7 @@ _COMPARED: frozenset[str] = frozenset(
         "get_node_partial_matches",
         "graph_search",
         "get_package_dependents",
+        "get_dependency_external_counts",
         "classify_external_package_provenance",
         "upsert_external_stubs",
         "get_stubbed_package_versions",
@@ -175,7 +183,6 @@ _NOT_COMPARED: dict[str, str] = {
     "get_linked_docs": "not yet compared",
     "get_module_import_edges": "not yet compared",
     "get_project_dependency_edges": "not yet compared",
-    "get_dependency_external_counts": "not yet compared",
     "get_diagram_packages": "not yet compared",
     "get_diagram_inheritance": "not yet compared",
     "get_diagram_module_detail": "not yet compared",
@@ -751,13 +758,18 @@ class TestSharedSurfaceAgrees:
             await client.resolve_imports(
                 PROJECT,
                 [
-                    ParsedRelationship(from_qualified_name=f"{PROJECT}:mod", rel_type=RelType.IMPORTS, to_name=name)
+                    ParsedRelationship(
+                        from_qualified_name=f"{PROJECT}:mod",
+                        rel_type=RelType.IMPORTS,
+                        to_name=name,
+                        properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+                    )
                     for name in ("requests", "loguru")
                 ],
             )
             # Only one of the two is declared: an imported-but-unpinned package must
             # still be reported, unversioned, by both.
-            await client.update_external_package_versions(PROJECT, {"requests": "2.31.0"})
+            await client.update_external_package_versions(PROJECT, {"pypi/requests": "2.31.0"})
 
         a = {
             r["package"]: (r["version"], r["imported_by"])
@@ -769,6 +781,64 @@ class TestSharedSurfaceAgrees:
         }
         assert a == {"requests": ("2.31.0", 1), "loguru": (None, 1)}
         assert a == b, f"only in memgraph: {a.items() - b.items()}; only in sqlite: {b.items() - a.items()}"
+
+    async def test_one_name_from_two_ecosystems_is_two_packages(self, both, tmp_path: Path):
+        """ATL-194's headline, end to end from real files rather than hand-built rels.
+
+        A compose file pulls the ``redis`` image and a Python module imports the
+        ``redis`` client. The ecosystem comes from the parsers (the compose parser
+        marks its image ``docker``, the Python import is stamped ``pypi``) and the
+        versions from the manifests, so this fails if any link in that chain drops it:
+        before ATL-194 both landed on one ``ext/redis``, and the two disagreeing
+        versions made ``_parse_dependency_versions`` discard both.
+
+        Every read that reports a package is checked, because each groups on its own:
+        the cross-project dependents, the structure overview and the dependency counts.
+        """
+        from code_atlas.indexing.orchestrator import _parse_dependency_versions
+        from code_atlas.parsing.ast import parse_file
+
+        project = "eco_proj"
+        (tmp_path / "compose.yaml").write_text("services:\n  cache:\n    image: redis:7\n", encoding="utf-8")
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "app"\ndependencies = ["redis~=7.1"]\n', encoding="utf-8"
+        )
+        sources = {"compose.yaml": b"services:\n  cache:\n    image: redis:7\n", "app.py": b"import redis\n"}
+        parsed_files = {path: parse_file(path, source, project) for path, source in sources.items()}
+        imports: list[ParsedRelationship] = []
+        for path, parsed in parsed_files.items():
+            assert parsed is not None, f"{path} did not parse"
+            imports += [r for r in parsed.relationships if r.rel_type == RelType.IMPORTS]
+        versions = _parse_dependency_versions(tmp_path)
+        assert versions == {"docker/redis": "7", "pypi/redis": "~=7.1"}, versions
+
+        mg, lite = both
+        for client in (mg, lite):
+            await client.merge_project_node(project)
+            # The importing entities have to exist: the dependency counts only count an
+            # importer that belongs to the project.
+            for path, parsed in parsed_files.items():
+                assert parsed is not None
+                await client.upsert_file_entities(project, path, parsed.entities, parsed.relationships)
+            await client.resolve_imports(project, imports)
+            await client.update_external_package_versions(project, versions)
+
+        for client, label in ((mg, "memgraph"), (lite, "sqlite")):
+            dependents = {
+                (r["package"], r["ecosystem"]): [p["version"] for p in r["projects"]]
+                for r in await client.get_package_dependents("redis")
+            }
+            assert dependents == {("redis", "docker"): ["7"], ("redis", "pypi"): ["~=7.1"]}, (label, dependents)
+
+            overview = {
+                (r["package"], r["ecosystem"]): r["version"]
+                for r in (await client.get_structure_overview(project, "", 20))["external_deps"]
+            }
+            assert overview == {("redis", "docker"): "7", ("redis", "pypi"): "~=7.1"}, (label, overview)
+
+            counts = await client.get_dependency_external_counts(project, "")
+            by_key = {(r["package"], r["ecosystem"]): r["cnt"] for r in counts["ext_packages"]}
+            assert by_key == {("redis", "docker"): 1, ("redis", "pypi"): 1}, (label, by_key)
 
 
 class TestTheDefectsThatMotivatedThis:
@@ -818,10 +888,17 @@ class TestTheDefectsThatMotivatedThis:
         await client.merge_project_node(project)
         await client.resolve_imports(
             project,
-            [ParsedRelationship(from_qualified_name=f"{project}:mod", rel_type=RelType.IMPORTS, to_name=package)],
+            [
+                ParsedRelationship(
+                    from_qualified_name=f"{project}:mod",
+                    rel_type=RelType.IMPORTS,
+                    to_name=package,
+                    properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+                )
+            ],
         )
         if version is not None:
-            await client.update_external_package_versions(project, {package: version})
+            await client.update_external_package_versions(project, {f"{ECOSYSTEM_PYPI}/{package}": version})
 
     async def test_package_dependents_agree(self, both):
         """ATL-088 P1. The cross-repo dependency read must not be a Memgraph-only answer.
@@ -874,9 +951,17 @@ class TestTheDefectsThatMotivatedThis:
             importer,
             [
                 ParsedRelationship(
-                    from_qualified_name=f"{importer}:m", rel_type=RelType.IMPORTS, to_name="shared.thing"
+                    from_qualified_name=f"{importer}:m",
+                    rel_type=RelType.IMPORTS,
+                    to_name="shared.thing",
+                    properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
                 ),
-                ParsedRelationship(from_qualified_name=f"{importer}:m", rel_type=RelType.IMPORTS, to_name="shared"),
+                ParsedRelationship(
+                    from_qualified_name=f"{importer}:m",
+                    rel_type=RelType.IMPORTS,
+                    to_name="shared",
+                    properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
+                ),
             ],
         )
 
@@ -928,7 +1013,10 @@ class TestTheDefectsThatMotivatedThis:
                 "sym_proj",
                 [
                     ParsedRelationship(
-                        from_qualified_name="sym_proj:mod", rel_type=RelType.IMPORTS, to_name="frompkg.thing"
+                        from_qualified_name="sym_proj:mod",
+                        rel_type=RelType.IMPORTS,
+                        to_name="frompkg.thing",
+                        properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
                     )
                 ],
             )
@@ -991,7 +1079,7 @@ class TestTheDefectsThatMotivatedThis:
                         from_qualified_name="atomic_proj:Dockerfile.builder",
                         rel_type=RelType.IMPORTS,
                         to_name=image,
-                        properties={IMPORT_ATOMIC_NAME: True},
+                        properties={IMPORT_ATOMIC_NAME: True, IMPORT_ECOSYSTEM: ECOSYSTEM_DOCKER},
                     ),
                     # The control: the same resolver, one rel apart, must still split a
                     # real dotted module path.
@@ -999,10 +1087,11 @@ class TestTheDefectsThatMotivatedThis:
                         from_qualified_name="atomic_proj:Dockerfile.builder",
                         rel_type=RelType.IMPORTS,
                         to_name="os.path",
+                        properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
                     ),
                 ],
             )
-            await client.update_external_package_versions("atomic_proj", {image: "cpu-1.8"})
+            await client.update_external_package_versions("atomic_proj", {f"{ECOSYSTEM_DOCKER}/{image}": "cpu-1.8"})
 
         for client, label in ((mg, "memgraph"), (lite, "sqlite")):
             packages = {r["package"] for r in await client.get_package_dependents()}
@@ -1030,16 +1119,16 @@ class TestTheDefectsThatMotivatedThis:
         mg, lite = both
         symbols = [
             {
-                "uid": "stub_proj:ext/pkgstub.known",
-                "qualified_name": "ext/pkgstub.known",
+                "uid": "stub_proj:ext/pypi/pkgstub.known",
+                "qualified_name": "ext/pypi/pkgstub.known",
                 "name": "known",
                 "kind": "function",
                 "signature": "def known(a: int) -> str",
                 "docstring": "Already imported.",
             },
             {
-                "uid": "stub_proj:ext/pkgstub.unknown",
-                "qualified_name": "ext/pkgstub.unknown",
+                "uid": "stub_proj:ext/pypi/pkgstub.unknown",
+                "qualified_name": "ext/pypi/pkgstub.unknown",
                 "name": "unknown",
                 "kind": "class",
                 "signature": "",
@@ -1052,25 +1141,28 @@ class TestTheDefectsThatMotivatedThis:
                 "stub_proj",
                 [
                     ParsedRelationship(
-                        from_qualified_name="stub_proj:mod", rel_type=RelType.IMPORTS, to_name="pkgstub.known"
+                        from_qualified_name="stub_proj:mod",
+                        rel_type=RelType.IMPORTS,
+                        to_name="pkgstub.known",
+                        properties={IMPORT_ECOSYSTEM: ECOSYSTEM_PYPI},
                     )
                 ],
             )
             written = await client.upsert_external_stubs(
-                "stub_proj", "pkgstub", symbols, version="1.0", source="bundled-pyi"
+                "stub_proj", "pypi/pkgstub", symbols, version="1.0", source="bundled-pyi"
             )
             assert written == 2
 
         for client, label in ((mg, "memgraph"), (lite, "sqlite")):
-            known = await client.get_entity_by_uid("stub_proj:ext/pkgstub.known")
+            known = await client.get_entity_by_uid("stub_proj:ext/pypi/pkgstub.known")
             assert known is not None, f"{label}: the stub write lost a node the resolver had minted"
             assert known["signature"] == "def known(a: int) -> str", f"{label}: no signature"
             assert known["package"] == "pkgstub", f"{label}: the upsert lost the package link"
             versions = await client.get_stubbed_package_versions("stub_proj")
-            assert versions == {"pkgstub": "1.0"}, f"{label}: {versions}"
+            assert versions == {"pypi/pkgstub": "1.0"}, f"{label}: {versions}"
 
-        a = await mg.get_entity_by_uid("stub_proj:ext/pkgstub.unknown")
-        b = await lite.get_entity_by_uid("stub_proj:ext/pkgstub.unknown")
+        a = await mg.get_entity_by_uid("stub_proj:ext/pypi/pkgstub.unknown")
+        b = await lite.get_entity_by_uid("stub_proj:ext/pypi/pkgstub.unknown")
         assert a is not None, "memgraph: an entrypoint nobody imported was not created"
         assert b is not None, "sqlite: an entrypoint nobody imported was not created"
         assert a["docstring"] == b["docstring"]
@@ -1083,8 +1175,8 @@ class TestTheDefectsThatMotivatedThis:
         mg, lite = both
         old = [
             {
-                "uid": "stub_v:ext/movingpkg.api",
-                "qualified_name": "ext/movingpkg.api",
+                "uid": "stub_v:ext/pypi/movingpkg.api",
+                "qualified_name": "ext/pypi/movingpkg.api",
                 "name": "api",
                 "kind": "function",
                 "signature": "def api() -> None",
@@ -1094,14 +1186,14 @@ class TestTheDefectsThatMotivatedThis:
         new = [{**old[0], "signature": "def api(added: bool) -> None", "docstring": "v2"}]
         for client in (mg, lite):
             await self._seed_dependency(client, "stub_v", "movingpkg", "2.4")
-            await client.upsert_external_stubs("stub_v", "movingpkg", old, version="2.4", source="source")
-            await client.upsert_external_stubs("stub_v", "movingpkg", new, version="2.5", source="source")
+            await client.upsert_external_stubs("stub_v", "pypi/movingpkg", old, version="2.4", source="source")
+            await client.upsert_external_stubs("stub_v", "pypi/movingpkg", new, version="2.5", source="source")
 
         for client, label in ((mg, "movingpkg/memgraph"), (lite, "movingpkg/sqlite")):
-            node = await client.get_entity_by_uid("stub_v:ext/movingpkg.api")
+            node = await client.get_entity_by_uid("stub_v:ext/pypi/movingpkg.api")
             assert node is not None
             assert node["signature"] == "def api(added: bool) -> None", f"{label}: stale signature survived"
-            assert await client.get_stubbed_package_versions("stub_v") == {"movingpkg": "2.5"}, label
+            assert await client.get_stubbed_package_versions("stub_v") == {"pypi/movingpkg": "2.5"}, label
 
     async def test_stubbing_a_package_with_no_symbols_writes_nothing(self, both):
         """`urllib`'s entrypoint is empty and several ecosystems' names resolve to nothing
@@ -1110,7 +1202,7 @@ class TestTheDefectsThatMotivatedThis:
         mg, lite = both
         for client in (mg, lite):
             await self._seed_dependency(client, "stub_empty", "emptypkg", None)
-            assert await client.upsert_external_stubs("stub_empty", "emptypkg", [], version="1.0") == 0
+            assert await client.upsert_external_stubs("stub_empty", "pypi/emptypkg", [], version="1.0") == 0
             assert await client.get_stubbed_package_versions("stub_empty") == {}
 
     async def test_classifying_twice_changes_nothing(self, both):

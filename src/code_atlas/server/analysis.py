@@ -477,7 +477,12 @@ async def _analyze_structure(
             for r in largest_modules_raw
         ],
         "external_dependencies": [
-            {"package": r["package"], "version": r["version"], "imported_by": r["imported_by"]}
+            {
+                "package": r["package"],
+                "ecosystem": r.get("ecosystem") or "",
+                "version": r["version"],
+                "imported_by": r["imported_by"],
+            }
             for r in external_deps_raw
         ],
         "query_ms": round(elapsed, 1),
@@ -606,16 +611,17 @@ async def _analyze_dependencies(
     circular = _detect_circular(edge_weights)[:10]
 
     # External package import counts — not test_patterns-filtered: aggregated purely
-    # by imported package name with no per-importer identity to filter on.
+    # by imported package with no per-importer identity to filter on. Keyed by
+    # (package, ecosystem) since ATL-194: `redis` the client and `redis` the image are
+    # two dependencies, and summing them would report one that nothing imports.
     ext_data = await graph.get_dependency_external_counts(project, path)
-    ext_counts: dict[str, int] = {}
-    for r in ext_data["ext_packages"]:
-        ext_counts[r["package"]] = ext_counts.get(r["package"], 0) + r["cnt"]
-    for r in ext_data["ext_symbols"]:
+    ext_counts: dict[tuple[str, str], int] = {}
+    for r in [*ext_data["ext_packages"], *ext_data["ext_symbols"]]:
         if r["package"]:
-            ext_counts[r["package"]] = ext_counts.get(r["package"], 0) + r["cnt"]
+            key = (r["package"], r.get("ecosystem") or "")
+            ext_counts[key] = ext_counts.get(key, 0) + r["cnt"]
     external_imports = sorted(
-        [{"package": k, "import_count": v} for k, v in ext_counts.items()],
+        [{"package": pkg, "ecosystem": eco, "import_count": v} for (pkg, eco), v in ext_counts.items()],
         key=lambda x: x["import_count"],
         reverse=True,
     )[:limit]
