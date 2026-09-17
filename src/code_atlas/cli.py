@@ -2274,7 +2274,7 @@ def _hooks_settings_path(scope: str) -> Path:
 
 _HOOKS_SCOPE_HELP = (
     "'user' (~/.claude/settings.json, every project) or 'local' (.claude/settings.local.json in this repo). "
-    "There is no committed 'project' scope: the command pins this machine's interpreter path."
+    "There is no committed 'project' scope: the command pins a path on this machine."
 )
 
 
@@ -2290,23 +2290,23 @@ def hooks_install(
     python: str | None = typer.Option(
         None,
         "--python",
-        help="Interpreter the hooks run under. Default: the code-atlas uv tool install when there is one, "
-        "else the interpreter running this command.",
+        help="Run the hooks as `<python> -m code_atlas.hooks` under this interpreter. Default: the code-atlas "
+        "uv tool install's `atlas-hook` when there is one, else the interpreter running this command.",
     ),
 ) -> None:
     """Install (or replace) the code-atlas hooks in a Claude Code settings file."""
     from code_atlas import hooks
 
     path = _hooks_settings_path(scope)
-    interpreter, why = hooks.hook_python(python)
-    config = hooks.hook_config(strict=strict, python=interpreter)
+    launcher, why = hooks.hook_launcher(python)
+    config = hooks.hook_config(strict=strict, launcher=launcher)
     try:
         hooks.write_settings(path, config)
     except ValueError as exc:
         logger.error("{}", exc)
         raise typer.Exit(code=1) from None
     typer.echo(f"Installed code-atlas hooks ({', '.join(config)}) in {path}{' -- strict' if strict else ''}.")
-    typer.echo(f"They run under {interpreter} ({why}).")
+    typer.echo(f"They run as {launcher} ({why}).")
     if why.endswith("development venv"):
         typer.echo(
             "Warning: every Claude Code session will now depend on this venv, which `uv sync` rewrites. "

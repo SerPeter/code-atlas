@@ -190,9 +190,14 @@ backend costs at most one `connect_timeout_s` however many are down. `atlas heal
 embedding checks concurrently too. Measured on Windows with the default 1.0: ~0.9 s healthy, ~1.5 s with Memgraph down,
 ~1.6 s with Memgraph and Valkey both down, ~2.6 s with both down at 5.
 
-The hooks run `python -m code_atlas.hooks`, pinned by absolute path to the **uv tool install** of code-atlas when there
-is one (`uv tool install code-atlas-mcp`), else to the interpreter running `atlas hooks install`; `--python` overrides
-both. Installing from a checkout's development venv would tie every Claude Code session to a venv that `uv sync`
+The hooks run as the **uv tool install's `atlas-hook`** (`uv tool install code-atlas-mcp`), by absolute path, e.g.
+`"C:/Users/me/.local/bin/atlas-hook.exe" pre-tool --strict`. `atlas-hook` is its own script rather than an `atlas`
+subcommand because it runs on every matched tool call and imports only the hook module (~240 ms, against ~460 ms for the
+CLI). The path is absolute because a checkout's development venv installs its own `atlas-hook`, which comes first on
+PATH when Claude Code starts from an activated venv. A tool installed before `atlas-hook` existed gets
+`"<its python>" -m code_atlas.hooks` and a note to reinstall; with no tool install it is the interpreter running
+`atlas hooks install`, and `--python` forces the `-m` form under a given interpreter. Re-installing replaces entries of
+either form. Installing from a checkout's development venv would tie every Claude Code session to a venv that `uv sync`
 rewrites, so the command warns when that is the only choice. Point the MCP server at the same install — an absolute path
 to its `atlas` rather than a bare `atlas`, which resolves to whichever venv is active when Claude Code starts. Re-run
 after moving the install. A symbol lookup costs ~0.5 s and happens only for identifier-shaped searches; everything else

@@ -629,16 +629,38 @@ async def test_sqlite_context_and_lookup(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _tool_env(tmp_path: Path, *, with_script: bool) -> tuple[Path, Path]:
+    """A fake `code-atlas-mcp` uv tool environment: its interpreter, and a receipt naming the scripts
+    uv installed into a separate bin directory, the way a real `uv tool install` lays them out."""
+    env = tmp_path / "uv-tools" / "code-atlas-mcp"
+    python = env / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    bin_dir = tmp_path / "bin with space"
+    bin_dir.mkdir()
+    entrypoints = [("atlas", bin_dir / "atlas.exe")]
+    if with_script:
+        entrypoints.append(("atlas-hook", bin_dir / "atlas-hook.exe"))
+    lines = ["[tool]", "entrypoints = ["]
+    for name, path in entrypoints:
+        path.write_text("", encoding="utf-8")
+        lines.append(f'    {{ name = "{name}", install-path = "{path.as_posix()}", from = "code-atlas-mcp" }},')
+    lines.append("]")
+    (env / "uv-receipt.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return python, bin_dir / "atlas-hook.exe"
+
+
 def test_merge_keeps_foreign_hooks_and_replaces_ours() -> None:
     foreign = {"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}
     settings: dict[str, Any] = {"model": "x", "hooks": {"PreToolUse": [foreign]}}
+    script = '"C:/Users/me/.local/bin/atlas-hook.exe"'
 
-    hooks.merge_settings(settings, hooks.hook_config(strict=True, python="C:\\py\\python.exe"))
-    hooks.merge_settings(settings, hooks.hook_config(strict=True, python="C:\\py\\python.exe"))
+    hooks.merge_settings(settings, hooks.hook_config(strict=True, launcher=script))
+    hooks.merge_settings(settings, hooks.hook_config(strict=True, launcher=script))
     pre: list[dict[str, Any]] = settings["hooks"]["PreToolUse"]
     assert pre[0] == foreign
     assert len(pre) == 2, "re-installing replaces, never duplicates"
-    assert pre[1]["hooks"][0]["command"] == '"C:/py/python.exe" -m code_atlas.hooks pre-tool --strict'
+    assert pre[1]["hooks"][0]["command"] == f"{script} pre-tool --strict"
 
     hooks.merge_settings(settings, hooks.hook_config(strict=False))
     assert settings["hooks"]["PreToolUse"] == [foreign], "dropping --strict removes the blocking hook"
@@ -647,10 +669,34 @@ def test_merge_keeps_foreign_hooks_and_replaces_ours() -> None:
     assert settings == {"model": "x", "hooks": {"PreToolUse": [foreign]}}
 
 
+def test_an_upgrade_replaces_the_old_module_form() -> None:
+    """Every install before `atlas-hook` wrote `"<python>" -m code_atlas.hooks`. Re-installing must
+    recognise those entries as ours, or an upgrade leaves every hook running twice."""
+    old = hooks.hook_config(strict=True, launcher='"C:/tools/code-atlas-mcp/Scripts/python.exe" -m code_atlas.hooks')
+    settings: dict[str, Any] = {"hooks": old}
+
+    hooks.merge_settings(settings, hooks.hook_config(strict=True, launcher='"C:/bin/atlas-hook.exe"'))
+
+    commands = [h["command"] for groups in settings["hooks"].values() for g in groups for h in g["hooks"]]
+    assert len(commands) == 4, commands
+    assert all(c.startswith('"C:/bin/atlas-hook.exe" ') for c in commands), commands
+
+
+def test_is_ours_is_not_fooled_by_a_similar_name() -> None:
+    def group(command: str) -> dict[str, Any]:
+        return {"hooks": [{"type": "command", "command": command}]}
+
+    assert hooks._is_ours(group('"C:/bin/atlas-hook.exe" post-tool'))
+    assert hooks._is_ours(group('"/home/me/.local/bin/atlas-hook" post-tool'))
+    assert hooks._is_ours(group('"C:/py/python.exe" -m code_atlas.hooks post-tool'))
+    assert not hooks._is_ours(group('"C:/bin/atlas-hooks-extra.exe" post-tool'))
+    assert not hooks._is_ours(group("rtk hook claude"))
+
+
 def test_cli_install_and_uninstall(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-    tool_python = tmp_path / "tools" / "code-atlas-mcp" / "Scripts" / "python.exe"
-    monkeypatch.setattr(hooks, "uv_tool_python", lambda: tool_python)
+    _python, script = _tool_env(tmp_path, with_script=True)
+    monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "uv-tools"))
     settings = tmp_path / ".claude" / "settings.json"
     settings.parent.mkdir()
     settings.write_text('{"env": {"A": "1"}}', encoding="utf-8")
@@ -662,21 +708,22 @@ def test_cli_install_and_uninstall(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert data["env"] == {"A": "1"}
     assert set(data["hooks"]) == {"SessionStart", "SubagentStart", "PostToolUse", "PreToolUse"}
     commands = {h["command"] for groups in data["hooks"].values() for g in groups for h in g["hooks"]}
-    assert all(c.startswith(f'"{tool_python.as_posix()}"') for c in commands), "hooks run under the uv tool install"
+    assert all(c.startswith(f'"{script.as_posix()}" ') for c in commands), "hooks run as the tool's atlas-hook"
     assert (tmp_path / ".claude" / "settings.json.atlas-bak").exists()
 
     result = runner.invoke(app, ["hooks", "install", "--python", "C:/elsewhere/python.exe"])
     assert result.exit_code == 0, result.output
     data = json.loads(settings.read_text(encoding="utf-8"))
     commands = {h["command"] for groups in data["hooks"].values() for g in groups for h in g["hooks"]}
-    assert all(c.startswith('"C:/elsewhere/python.exe"') for c in commands), "--python wins"
+    assert len(commands) == 3, "the atlas-hook entries were replaced, not kept alongside"
+    assert all(c.startswith('"C:/elsewhere/python.exe" -m code_atlas.hooks ') for c in commands), "--python wins"
 
     result = runner.invoke(app, ["hooks", "uninstall"])
     assert result.exit_code == 0, result.output
     assert json.loads(settings.read_text(encoding="utf-8")) == {"env": {"A": "1"}}
 
 
-def test_hook_python_prefers_the_uv_tool_over_a_development_venv(
+def test_hook_launcher_prefers_the_uv_tool_over_a_development_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Pinning the venv `atlas hooks install` ran from tied every Claude Code session to a checkout's
@@ -686,17 +733,21 @@ def test_hook_python_prefers_the_uv_tool_over_a_development_venv(
     (dev / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
     monkeypatch.setattr("sys.prefix", str(dev / ".venv"))
     monkeypatch.setattr("sys.executable", str(dev / ".venv" / "Scripts" / "python.exe"))
-
-    tool = tmp_path / "uv-tools" / "code-atlas-mcp" / "Scripts" / "python.exe"
-    tool.parent.mkdir(parents=True)
-    tool.write_text("", encoding="utf-8")
     monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "uv-tools"))
-    assert hooks.hook_python() == (str(tool), "the code-atlas uv tool install")
-    assert hooks.hook_python("C:/py/python.exe") == ("C:/py/python.exe", "--python")
 
-    tool.unlink()
-    python, why = hooks.hook_python()
-    assert python == str(dev / ".venv" / "Scripts" / "python.exe")
+    python, script = _tool_env(tmp_path, with_script=True)
+    assert hooks.hook_launcher() == (f'"{script.as_posix()}"', "the code-atlas uv tool install")
+    assert hooks.hook_launcher("C:\\py\\python.exe") == ('"C:/py/python.exe" -m code_atlas.hooks', "--python")
+
+    # A tool installed before atlas-hook existed: its interpreter, and a nudge to reinstall.
+    script.unlink()
+    launcher, why = hooks.hook_launcher()
+    assert launcher == f'"{python.as_posix()}" -m code_atlas.hooks'
+    assert "reinstall" in why
+
+    python.unlink()
+    launcher, why = hooks.hook_launcher()
+    assert launcher == f'"{(dev / ".venv" / "Scripts" / "python.exe").as_posix()}" -m code_atlas.hooks'
     assert why.endswith("development venv"), "no tool: the venv is used, and named as one"
 
 

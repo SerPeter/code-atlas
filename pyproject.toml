@@ -111,6 +111,9 @@ all-languages = ["code-atlas-mcp[typescript,go,rust,java,csharp,cpp,ruby,php,ter
 
 [project.scripts]
 atlas = "code_atlas.cli:app"
+# The hook runner, separate from `atlas` because it runs on every matched tool call: it imports
+# only code_atlas.hooks (~240 ms) where the CLI costs ~460 ms before doing anything.
+atlas-hook = "code_atlas.hooks:main"
 
 [project.urls]
 Homepage = "https://github.com/SerPeter/code-atlas"
