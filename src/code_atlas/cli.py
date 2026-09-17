@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import typer
-from dotenv import find_dotenv, load_dotenv
 from loguru import logger
 from rich.console import Console
 
@@ -21,8 +20,6 @@ if TYPE_CHECKING:
     from code_atlas.indexing.orchestrator import IndexResult
     from code_atlas.settings import AtlasSettings
 
-_dotenv_path = find_dotenv(usecwd=True)  # '' when not found
-load_dotenv(_dotenv_path)  # Load .env into os.environ (ATLAS_* + provider API keys)
 
 app = typer.Typer(
     name="atlas",
@@ -175,6 +172,9 @@ app.add_typer(daemon_app)
 
 project_app = typer.Typer(name="project", help="Manage indexed projects.")
 app.add_typer(project_app)
+
+hooks_app = typer.Typer(name="hooks", help="Install Claude Code hooks that route code lookups to the graph.")
+app.add_typer(hooks_app)
 
 
 # ---------------------------------------------------------------------------
@@ -2049,7 +2049,7 @@ async def _run_health() -> None:
     settings = _load_settings()
     async with use_backends(settings) as backends:
         assert backends.bus is not None
-        report = await run_health_checks(settings, graph=backends.graph, bus=backends.bus, dotenv_path=_dotenv_path)
+        report = await run_health_checks(settings, graph=backends.graph, bus=backends.bus)
     _print_report(report, detailed=False)
     raise typer.Exit(code=0 if report.ok else 1)
 
@@ -2061,7 +2061,7 @@ async def _run_doctor() -> None:
     settings = _load_settings()
     async with use_backends(settings) as backends:
         assert backends.bus is not None
-        report = await run_health_checks(settings, graph=backends.graph, bus=backends.bus, dotenv_path=_dotenv_path)
+        report = await run_health_checks(settings, graph=backends.graph, bus=backends.bus)
     _print_report(report, detailed=True)
     raise typer.Exit(code=0 if report.ok else 1)
 
@@ -2252,6 +2252,68 @@ async def _run_daemon(*, no_embed: bool = False) -> None:
             finally:
                 await daemon.stop()
                 logger.info("Daemon stopped")
+
+
+def _hooks_settings_path(scope: str) -> Path:
+    if scope == "user":
+        return Path.home() / ".claude" / "settings.json"
+    if scope == "local":
+        from code_atlas.settings import find_git_root
+
+        root = find_git_root()
+        if root is None:
+            logger.error("--scope local needs a git repository")
+            raise typer.Exit(code=1)
+        return root / ".claude" / "settings.local.json"
+    logger.error("Unknown scope {!r}: use 'user' or 'local'", scope)
+    raise typer.Exit(code=1)
+
+
+_HOOKS_SCOPE_HELP = (
+    "'user' (~/.claude/settings.json, every project) or 'local' (.claude/settings.local.json in this repo). "
+    "There is no committed 'project' scope: the command pins this machine's interpreter path."
+)
+
+
+@hooks_app.command("install")
+def hooks_install(
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Also deny the first graph-answerable symbol search, and the first exploration subagent or "
+        "workflow, per agent that has not used code-atlas yet. Each fires once, then allows.",
+    ),
+    scope: str = typer.Option("user", "--scope", help=_HOOKS_SCOPE_HELP),
+) -> None:
+    """Install (or replace) the code-atlas hooks in a Claude Code settings file."""
+    from code_atlas import hooks
+
+    path = _hooks_settings_path(scope)
+    try:
+        hooks.write_settings(path, hooks.hook_config(strict=strict))
+    except ValueError as exc:
+        logger.error("{}", exc)
+        raise typer.Exit(code=1) from None
+    events = ", ".join(hooks.hook_config(strict=strict))
+    typer.echo(f"Installed code-atlas hooks ({events}) in {path}{' -- strict' if strict else ''}.")
+    typer.echo("They take effect in new Claude Code sessions.")
+
+
+@hooks_app.command("uninstall")
+def hooks_uninstall(scope: str = typer.Option("user", "--scope", help=_HOOKS_SCOPE_HELP)) -> None:
+    """Remove every code-atlas hook from a Claude Code settings file, leaving other hooks alone."""
+    from code_atlas import hooks
+
+    path = _hooks_settings_path(scope)
+    if not path.exists():
+        typer.echo(f"{path} does not exist; nothing to remove.")
+        return
+    try:
+        hooks.write_settings(path, None)
+    except ValueError as exc:
+        logger.error("{}", exc)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"Removed code-atlas hooks from {path}.")
 
 
 @daemon_app.command("start")

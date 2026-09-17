@@ -65,6 +65,9 @@ ignore = [
     "B008",     # function call in defaults — standard Typer pattern
     "PLC0415",  # non-top-level imports — intentional lazy loading
 ]
+"src/code_atlas/hooks.py" = [
+    "PLC0415",  # non-top-level imports — it runs on every matched tool call; settings and drivers load only when used
+]
 "tests/**/*.py" = [
     "ARG",      # unused arguments are common in fixtures
     "SLF001",   # private member access is fine in tests

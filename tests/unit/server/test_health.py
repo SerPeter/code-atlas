@@ -168,6 +168,70 @@ async def test_check_memgraph_failure():
     assert "Unreachable" in result.message
 
 
+async def test_connect_timeout_comes_from_health_settings(tmp_path):
+    """A backend slower than `[health] connect_timeout_s` is down; raising the setting makes it up."""
+    import asyncio
+
+    from code_atlas.settings import HealthSettings
+
+    async def slow_ping() -> bool:
+        await asyncio.sleep(0.2)
+        return True
+
+    (tmp_path / ".git").mkdir()
+    settings = AtlasSettings(project_root=tmp_path, health=HealthSettings(connect_timeout_s=0.05))
+    graph, bus, embed = AsyncMock(), AsyncMock(), AsyncMock()
+    graph.ping, bus.ping = slow_ping, slow_ping
+    bus.read_indexer_lease.return_value = None
+    report = await run_health_checks(settings, graph=graph, bus=bus, embed=embed)
+    by_name = {c.name: c.status for c in report.checks}
+    assert (by_name["memgraph"], by_name["valkey"]) == (CheckStatus.FAIL, CheckStatus.WARN)
+
+    # The same slow backend, given the time a remote one needs.
+    assert (await check_memgraph(graph, MemgraphSettings(), timeout_s=2.0)).status == CheckStatus.OK
+    assert (await check_valkey(bus, RedisSettings(), timeout_s=2.0)).status == CheckStatus.OK
+
+
+async def test_a_hung_valkey_costs_one_connect_timeout_not_two(tmp_path):
+    """Valkey reads run beside the other connect checks, bounded -- not queued after them, unbounded."""
+    import asyncio
+    import time
+
+    from code_atlas.settings import HealthSettings
+
+    async def hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    (tmp_path / ".git").mkdir()
+    settings = AtlasSettings(project_root=tmp_path, health=HealthSettings(connect_timeout_s=0.3))
+    graph, bus, embed = AsyncMock(), AsyncMock(), AsyncMock()
+    graph.ping = AsyncMock(side_effect=ConnectionRefusedError("refused"))
+    bus.ping, bus.read_indexer_lease = hang, hang
+
+    t0 = time.perf_counter()
+    report = await run_health_checks(settings, graph=graph, bus=bus, embed=embed)
+    elapsed = time.perf_counter() - t0
+
+    assert {c.name: c.status for c in report.checks}["valkey"] == CheckStatus.WARN
+    assert elapsed < 0.55, f"{elapsed:.2f}s: the lease read waited behind the ping, or was never bounded"
+
+
+async def test_a_slow_embedding_provider_is_not_called_broken():
+    import asyncio
+
+    async def slow() -> bool:
+        await asyncio.sleep(1)
+        return True
+
+    embed = AsyncMock()
+    embed.health_check = slow
+    settings = EmbeddingSettings(enabled=True, provider="litellm", model="m")
+    result = await check_embeddings(embed, settings, timeout_s=0.05)
+    assert result.status == CheckStatus.WARN
+    assert "timeout" in result.message
+    assert "API key" not in result.suggestion
+
+
 async def test_check_memgraph_none():
     mg_settings = MemgraphSettings()
     result = await check_memgraph(None, mg_settings)
@@ -362,26 +426,6 @@ async def test_check_config_no_git(tmp_path):
     result = await check_config(settings)
     assert result.status == CheckStatus.WARN
     assert "No git repo" in result.message
-
-
-async def test_check_config_resolves_dotenv_when_caller_passes_none(tmp_path):
-    """The MCP server has no dotenv handle to pass — cli.py loads the file before
-    handing off. Reporting 'not found' for a loaded .env sent a past debugging
-    session chasing a phantom stale process.
-    """
-    (tmp_path / ".git").mkdir()
-    settings = AtlasSettings(project_root=tmp_path)
-    with patch("code_atlas.server.health.find_dotenv", return_value="/somewhere/.env"):
-        result = await check_config(settings)
-    assert ".env: /somewhere/.env" in result.detail
-
-
-async def test_check_config_reports_missing_dotenv(tmp_path):
-    (tmp_path / ".git").mkdir()
-    settings = AtlasSettings(project_root=tmp_path)
-    with patch("code_atlas.server.health.find_dotenv", return_value=""):
-        result = await check_config(settings)
-    assert ".env: not found" in result.detail
 
 
 # ---------------------------------------------------------------------------

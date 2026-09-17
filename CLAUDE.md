@@ -338,7 +338,10 @@ in a sub-directory is not read, and `cli._warn_shadowed_config` says so when one
   (`exclude`, `include`, `exclude_kinds`) — those describe the codebase, not the machine, and belong in the
   committed `atlas.toml`
 - Environment variables: `ATLAS_*` prefix with double-underscore nesting (e.g. `ATLAS_EMBEDDINGS__MODEL`).
-  Atlas never reads `.env` itself — export from `.envrc` (direnv) if you want that
+  Atlas never reads `.env` itself — providing the environment is the caller's job. Developing this repo:
+  `. scripts/activate.ps1` activates the venv and loads the gitignored `.env` into that PowerShell session (a
+  worktree uses the main checkout's). Claude Code's MCP server and hooks only see it when `claude` was started from
+  such a session
 - `.atlasignore` — gitignore-style exclusion patterns for indexing
 
 **Declaring a backend is selecting it (ATL-187).** There is no separate selector: `[backend.graph.memgraph]`
