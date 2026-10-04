@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -111,6 +110,20 @@ class FakeBus:
 
     async def read_indexer_lease(self) -> str | None:
         return self._lease_holder
+
+    yield_requester: str | None = None
+
+    async def request_indexer_yield(self, requester: str, ttl_ms: int) -> None:
+        self.yield_requester = requester
+
+    async def clear_indexer_yield(self, requester: str) -> bool:
+        if self.yield_requester != requester:
+            return False
+        self.yield_requester = None
+        return True
+
+    async def read_indexer_yield(self) -> str | None:
+        return self.yield_requester
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +401,15 @@ class TestStartupCatchup:
 
         await manager.stop()
 
-    async def test_catchup_holds_and_releases_lease(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
-        """A successful catch-up must not leave the lease held afterwards."""
+    async def test_catchup_runs_under_the_session_lease(self, tmp_path: Path, patched_daemon: dict[str, Any]) -> None:
+        """The winner keeps the lease after catch-up -- it indexes for its whole life -- and
+        releases it on stop() so a standby session takes over at once, not a TTL later."""
         manager = DaemonManager()
+        bus = FakeBus(_make_settings(tmp_path))
         started = await manager.start(
             _make_settings(tmp_path),
             object(),  # ty: ignore[invalid-argument-type]
-            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
+            bus,  # ty: ignore[invalid-argument-type]
             include_watcher=False,
             limiter=unpaced(),
         )
@@ -402,97 +417,168 @@ class TestStartupCatchup:
         await asyncio.sleep(0.05)
 
         assert "catchup-project" in patched_daemon["order"]
-        assert manager.bus._lease_holder is None  # ty: ignore[unresolved-attribute]
+        assert bus._lease_holder is not None
+        assert manager.standby is False
 
         await manager.stop()
+        assert bus._lease_holder is None
 
-    async def test_catchup_skips_when_lease_held_by_another_process(
-        self, tmp_path: Path, patched_daemon: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A foreign indexer lease (peer daemon or a running CLI index) must stop this
-        catch-up rather than race it straight into Memgraph -- the exact multi-session
-        collision the lease exists to prevent (see hold_indexer_lease's docstring)."""
 
-        class BusyFakeBus(FakeBus):
-            def __init__(self, settings: object, *, project_name: str = "") -> None:
-                super().__init__(settings, project_name=project_name)
-                self._lease_holder = "peer-host:999:deadbeef"
+async def _until(predicate: Any, timeout: float = 5.0) -> None:
+    """Poll *predicate* until true; fail loudly rather than sit out the suite timeout."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.01)
 
-        # Zero, so the skip is immediate. With the default this test waited out the whole
-        # lease budget -- it still passed, and the unit suite silently went from ~60s to
-        # ~620s. A test that waits for a timeout is not testing the timeout; the bound
-        # itself is asserted separately below.
-        settings = _make_settings(tmp_path)
-        settings.index.lease_wait_s = 0
 
+class TestLeaseElection:
+    """One process per checkout indexes it: whoever holds the indexer lease.
+
+    Every MCP session starts with indexing on, so without this each one ran its own
+    watcher and startup scan over the same tree -- three of them sat at 99% CPU for days.
+    """
+
+    @pytest.fixture
+    def state(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        state: dict[str, Any] = {"order": [], "consumers": [], "fail_build": False}
+
+        def make_consumer(bus: object, graph: object, settings: object, **kw: Any) -> FakeConsumer:
+            if state["fail_build"]:
+                raise RuntimeError("cannot build consumer")
+            consumer = FakeConsumer(name="ast-0")
+            state["consumers"].append(consumer)
+            return consumer
+
+        async def fake_index_project(*_args: object, **_kwargs: object) -> None:
+            state["order"].append("catchup")
+
+        monkeypatch.setattr(daemon_module, "ASTConsumer", make_consumer)
+        monkeypatch.setattr(daemon_module, "index_project", fake_index_project)
+        monkeypatch.setattr(daemon_module, "detect_sub_projects", lambda root, mono: [])
+        monkeypatch.setattr(daemon_module, "_STANDBY_POLL_S", 0.01)
+        monkeypatch.setattr(daemon_module, "_HOLDER_TICK_S", 0.01)
+        return state
+
+    @staticmethod
+    async def _start(tmp_path: Path, bus: FakeBus, **kw: Any) -> DaemonManager:
         manager = DaemonManager()
-        # Bounded at 5s, not left to the suite's 300s cap. `start()` is the call that
-        # blocks, and this file's other eleven timeouts are all on the things its author
-        # expected to block -- consumer/watcher readiness, task completion. So when
-        # catch-up gained a lease wait, this test quietly took the entire budget and
-        # still passed. A tight bound turns that into a failure in seconds.
         started = await asyncio.wait_for(
             manager.start(
-                settings,
+                _make_settings(tmp_path),
                 object(),  # ty: ignore[invalid-argument-type]
-                BusyFakeBus(settings),  # ty: ignore[invalid-argument-type]
+                bus,  # ty: ignore[invalid-argument-type]
                 include_watcher=False,
                 limiter=unpaced(),
-            ),  # type: ignore[arg-type]
+                **kw,
+            ),
             timeout=5.0,
         )
         assert started is True
+        return manager
+
+    async def test_a_held_lease_means_standby_and_nothing_runs(self, tmp_path: Path, state: dict[str, Any]) -> None:
+        bus = FakeBus(object())
+        bus._lease_holder = "peer-host:999:deadbeef"
+        ready = asyncio.Event()
+
+        manager = await self._start(tmp_path, bus, first_index_ready=ready)
         await asyncio.sleep(0.05)
 
-        order = patched_daemon["order"]
-        assert "catchup-project" not in order
-        assert "catchup-monorepo" not in order
-        # Live-event consumption still starts -- it'll pick up work once the peer
-        # holding the lease finishes, via the stream rather than this inline pass.
-        assert "consumer-run" in order
+        assert manager.standby is True
+        assert state["order"] == []
+        assert state["consumers"] == []
+        assert ready.is_set(), "tool calls must not wait for an index this process will not run"
+        assert "peer-host:999:deadbeef" in manager.status()["disabled_reason"]
+        await manager.stop()
+        assert bus._lease_holder == "peer-host:999:deadbeef", "a standby must never release someone else's lease"
 
-    async def test_the_catchup_wait_is_bounded_far_below_the_cli_budget(
-        self, tmp_path: Path, patched_daemon: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    async def test_standby_takes_over_when_the_holder_goes(self, tmp_path: Path, state: dict[str, Any]) -> None:
+        bus = FakeBus(object())
+        bus._lease_holder = "peer-host:999:deadbeef"
+        manager = await self._start(tmp_path, bus)
+
+        bus._lease_holder = None  # the holder exited, or its TTL ran out
+        await _until(lambda: state["consumers"] and state["consumers"][0].running.is_set())
+
+        assert manager.standby is False
+        assert state["order"] == ["catchup"], "a takeover catches up on what nobody indexed meanwhile"
+        assert bus._lease_holder == manager._owner
+        await manager.stop()
+
+    async def test_holder_yields_to_a_one_shot_index(self, tmp_path: Path, state: dict[str, Any]) -> None:
+        bus = FakeBus(object())
+        manager = await self._start(tmp_path, bus)
+        await _until(lambda: state["consumers"] and state["consumers"][0].running.is_set())
+
+        bus.yield_requester = "cli-host:1:cafe"
+        await _until(lambda: manager.standby and bus._lease_holder is None)
+
+        assert state["consumers"][0].stopped, "the stack stops before the lease is let go"
+        await asyncio.sleep(0.05)
+        assert bus._lease_holder is None, "nobody may retake the lease while the yield request stands"
+
+        bus.yield_requester = None  # the one-shot index finished and withdrew it
+        await _until(lambda: not manager.standby and len(state["consumers"]) == 2)
+        await manager.stop()
+
+    async def test_holder_steps_down_when_the_lease_passes_to_another(
+        self, tmp_path: Path, state: dict[str, Any]
     ) -> None:
-        """`start()` does not return until catch-up finishes, so whatever it waits for,
-        the caller waits for too -- for the MCP server that is first_index_ready staying
-        clear the whole time.
+        bus = FakeBus(object())
+        manager = await self._start(tmp_path, bus)
+        await _until(lambda: state["consumers"] and state["consumers"][0].running.is_set())
 
-        The only reason to wait at all is a holder that is already dead, and its lease
-        expires within the 60s TTL. Anything past that is a live indexer doing the same
-        work, so waiting longer buys nothing and costs startup. Asserted against the
-        constant rather than a sleep, because a test that actually waits 90s is how the
-        suite grew tenfold in the first place.
-        """
-        from code_atlas.events import INDEXER_LEASE_TTL_MS
-        from code_atlas.indexing.daemon import _CATCHUP_LEASE_WAIT_S
+        bus._lease_holder = "forcer:2:beef"  # `atlas index --force`, or a stall past the TTL
+        await _until(lambda: manager.standby)
 
-        settings = _make_settings(tmp_path)
-        assert _CATCHUP_LEASE_WAIT_S > INDEXER_LEASE_TTL_MS / 1000, "must outlast a dead holder's lease"
-        assert settings.index.lease_wait_s > _CATCHUP_LEASE_WAIT_S, "must be far below the foreground budget"
-
-        captured: dict[str, float] = {}
-
-        @contextlib.asynccontextmanager
-        async def spy_lease(_bus, *, wait_s: float = 0.0, **_kw):
-            captured["wait_s"] = wait_s
-            yield "owner"
-
-        monkeypatch.setattr("code_atlas.indexing.daemon.hold_indexer_lease", spy_lease)
-
-        manager = DaemonManager()
-        await manager.start(
-            settings,
-            object(),  # ty: ignore[invalid-argument-type]
-            FakeBus(settings),  # ty: ignore[invalid-argument-type]
-            include_watcher=False,
-            limiter=unpaced(),
-        )
+        assert state["consumers"][0].stopped
+        assert bus._lease_holder == "forcer:2:beef", "stepping down must not free the new holder's lease"
         await manager.stop()
 
-        assert captured["wait_s"] == _CATCHUP_LEASE_WAIT_S
+    async def test_a_vanished_lease_is_reacquired_not_abandoned(self, tmp_path: Path, state: dict[str, Any]) -> None:
+        bus = FakeBus(object())
+        manager = await self._start(tmp_path, bus)
+        owner = manager._owner
+
+        bus._lease_holder = None  # a queue backend restart lost the key
+        await _until(lambda: bus._lease_holder == owner)
+
+        assert manager.standby is False
+        assert not state["consumers"][0].stopped
+        await manager.stop()
+
+    async def test_a_failed_takeover_releases_the_lease(self, tmp_path: Path, state: dict[str, Any]) -> None:
+        bus = FakeBus(object())
+        bus._lease_holder = "peer-host:999:deadbeef"
+        manager = await self._start(tmp_path, bus)
+
+        state["fail_build"] = True
+        bus._lease_holder = None
+        await _until(lambda: manager._activation is not None)
+        await _until(lambda: manager.standby)
+
+        # Held by a process indexing nothing, the lease would starve every other session.
+        assert bus._lease_holder in (None, manager._owner)
+        state["fail_build"] = False
+        await _until(lambda: state["consumers"] and state["consumers"][0].running.is_set())
+        await manager.stop()
+
+    async def test_a_lease_the_caller_holds_is_neither_elected_nor_released(
+        self, tmp_path: Path, state: dict[str, Any]
+    ) -> None:
+        """`atlas index --watch` takes the lease itself and renews it for the session."""
+        bus = FakeBus(object())
+        bus._lease_holder = "watch-host:3:f00d"
+        manager = await self._start(tmp_path, bus, lease_owner="watch-host:3:f00d", catchup=False)
+        await _until(lambda: state["consumers"] and state["consumers"][0].running.is_set())
+
+        assert manager.standby is False
+        bus.yield_requester = "cli-host:1:cafe"
+        await asyncio.sleep(0.05)
+        assert not state["consumers"][0].stopped
 
         await manager.stop()
+        assert bus._lease_holder == "watch-host:3:f00d"
 
 
 # ---------------------------------------------------------------------------

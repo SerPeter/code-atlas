@@ -258,7 +258,7 @@ def init_telemetry(
 
     *role* names the entry point (``mcp``, ``daemon``, ``index``, ``watch``, ``search``,
     ``web``). *indexing* is separate from it on purpose: an MCP server started without
-    ``--no-index`` runs the watcher and pipeline itself, so role alone cannot answer
+    ``--no-index`` may run the watcher and pipeline itself, so role alone cannot answer
     "who is actually indexing this checkout" — the question you ask first when nothing
     is being indexed, or when two things are.
     """

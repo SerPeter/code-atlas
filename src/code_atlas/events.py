@@ -179,41 +179,60 @@ def new_lease_owner() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
-async def _await_indexer_lease(bus: Any, owner: str, ttl_ms: int, wait_s: float) -> bool:
+async def _await_indexer_lease(bus: Any, owner: str, ttl_ms: int, wait_s: float, *, request_yield: bool) -> bool:
     """Poll for the lease until *wait_s* elapses. ``True`` if it was acquired.
 
     Retries are spaced by a jittered interval so that several waiters do not converge
     on the same instant. ``wait_s <= 0`` collapses to exactly one attempt, which is the
     original fail-fast behaviour.
+
+    *request_yield* asks the holder to step down while waiting, renewed every poll so a
+    killed requester's request expires within one TTL. An MCP session or daemon holds the
+    lease for its whole life, so a one-shot ``atlas index`` that only waited would wait
+    out its entire budget. A holder that predates yield requests ignores it, and the wait
+    is then exactly what it was.
     """
     deadline = time.monotonic() + wait_s
     announced = False
-    while True:
-        if await bus.acquire_indexer_lease(owner, ttl_ms):
-            if announced:
-                logger.info("Indexer lease acquired after waiting")
-            return True
+    try:
+        while True:
+            if await bus.acquire_indexer_lease(owner, ttl_ms):
+                if announced:
+                    logger.info("Indexer lease acquired after waiting")
+                return True
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
 
-        if not announced:
-            announced = True
-            holder = await bus.read_indexer_lease()
-            logger.info(
-                "Waiting up to {:.0f}s for the indexer lease held by {}",
-                wait_s,
-                holder or "another process",
-            )
+            if request_yield:
+                await bus.request_indexer_yield(owner, ttl_ms)
+            if not announced:
+                announced = True
+                holder = await bus.read_indexer_lease()
+                logger.info(
+                    "Waiting up to {:.0f}s for the indexer lease held by {}{}",
+                    wait_s,
+                    holder or "another process",
+                    " (asked it to yield)" if request_yield else "",
+                )
 
-        delay = _LEASE_POLL_S * random.uniform(1 - _LEASE_POLL_JITTER, 1 + _LEASE_POLL_JITTER)
-        await asyncio.sleep(min(delay, remaining))
+            delay = _LEASE_POLL_S * random.uniform(1 - _LEASE_POLL_JITTER, 1 + _LEASE_POLL_JITTER)
+            await asyncio.sleep(min(delay, remaining))
+    finally:
+        if announced and request_yield:
+            with contextlib.suppress(Exception):
+                await bus.clear_indexer_yield(owner)
 
 
 @asynccontextmanager
 async def hold_indexer_lease(
-    bus: Any, *, ttl_ms: int = INDEXER_LEASE_TTL_MS, wait_s: float = 0.0, force: bool = False
+    bus: Any,
+    *,
+    ttl_ms: int = INDEXER_LEASE_TTL_MS,
+    wait_s: float = 0.0,
+    force: bool = False,
+    request_yield: bool = False,
 ) -> AsyncGenerator[str]:
     """Hold the project's indexer lease for the duration of the block.
 
@@ -228,6 +247,9 @@ async def hold_indexer_lease(
     unnoticed, and nothing re-triggered the catch-up. The index simply sat idle. Waiting
     is correct either way — if the holder finishes normally the deferred pass is a cheap
     no-op behind the hash gate, and if it dies the waiter picks the work up.
+
+    *request_yield* asks a session holding the lease to step down instead of only
+    waiting for it (see ``_await_indexer_lease``). For foreground commands a human ran.
 
     *force* takes the lease regardless of who holds it. It exists for the one case the
     TTL handles badly -- a holder that is already gone but whose lease has not expired --
@@ -248,7 +270,7 @@ async def hold_indexer_lease(
                 "two indexers are now writing the same nodes",
                 displaced,
             )
-    elif not await _await_indexer_lease(bus, owner, ttl_ms, wait_s):
+    elif not await _await_indexer_lease(bus, owner, ttl_ms, wait_s, request_yield=request_yield):
         holder = await bus.read_indexer_lease()
         raise IndexerBusyError(holder or "unknown")
 
@@ -543,6 +565,31 @@ class EventBus:
     async def read_indexer_lease(self) -> str | None:
         """Current lease holder, for diagnostics. ``None`` when the lease is free."""
         raw = await self._redis.get(self._lease_key())
+        return raw.decode() if raw else None
+
+    # A one-shot `atlas index` asking the session that holds the lease to step down. A
+    # separate key, not a lease write: the holder must stop its own watcher and consumers
+    # before it lets go, or the two would write the same nodes in the gap.
+
+    def _yield_key(self) -> str:
+        return f"{self._prefix}:{self._project}:indexer-yield" if self._project else f"{self._prefix}:indexer-yield"
+
+    async def request_indexer_yield(self, requester: str, ttl_ms: int) -> None:
+        """Ask the lease holder to step down. Expires on its own if the requester dies."""
+        await self._redis.set(self._yield_key(), requester.encode(), px=ttl_ms)
+
+    async def clear_indexer_yield(self, requester: str) -> bool:
+        """Withdraw *requester*'s request (compare-and-delete, like the lease release)."""
+        script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+        return bool(
+            await self._redis.eval(  # ty: ignore[invalid-await]  # stub widened to Awaitable[str] | str
+                script, 1, self._yield_key(), requester.encode()
+            )
+        )
+
+    async def read_indexer_yield(self) -> str | None:
+        """Who is asking the lease holder to step down, or ``None``."""
+        raw = await self._redis.get(self._yield_key())
         return raw.decode() if raw else None
 
     async def stream_group_info(self, topic: Topic, group: str) -> StreamGroupInfo:

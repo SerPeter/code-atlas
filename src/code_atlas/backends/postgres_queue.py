@@ -19,6 +19,7 @@ locks:
   Ack deletes the row. No foreign key to ``messages``, so trimming never cascades.
 - ``consumers``  — registrations with ``seen_at``, for ``consumer_registrations``' idle.
 - ``leases``     — the indexer lease, one row per project.
+- ``yield_requests`` — a one-shot index asking the lease holder to step down.
 - ``rate_bucket`` / ``rate_scale`` — the embedding rate limiter's shared state
   (``search/ratelimit.py``).
 - ``meta``       — ``schema_version``, so a process refuses a schema newer than its code
@@ -112,6 +113,13 @@ _DDL = (
     f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.leases (
         project    text PRIMARY KEY,
         owner      text NOT NULL,
+        expires_at timestamptz NOT NULL
+    )""",
+    # Added without a QUEUE_SCHEMA_VERSION bump: a new table changes no existing shape,
+    # and a bump would make every older process refuse a database it can still use.
+    f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.yield_requests (
+        project    text PRIMARY KEY,
+        requester  text NOT NULL,
         expires_at timestamptz NOT NULL
     )""",
     f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.rate_bucket (
@@ -823,6 +831,36 @@ class PostgresEventBus:
             self._project,
         )
 
+    async def request_indexer_yield(self, requester: str, ttl_ms: int) -> None:
+        """Ask the lease holder to step down. See ``EventBus`` for why this is not a lease write."""
+        pool = await self._get_pool()
+        await pool.execute(
+            f"""
+            INSERT INTO {SCHEMA}.yield_requests (project, requester, expires_at)
+            VALUES ($1, $2, clock_timestamp() + make_interval(secs => $3::double precision / 1000))
+            ON CONFLICT (project) DO UPDATE SET requester = excluded.requester, expires_at = excluded.expires_at
+            """,
+            self._project,
+            requester,
+            float(ttl_ms),
+        )
+
+    async def clear_indexer_yield(self, requester: str) -> bool:
+        """Withdraw *requester*'s request (compare-and-delete)."""
+        pool = await self._get_pool()
+        status = await pool.execute(
+            f"DELETE FROM {SCHEMA}.yield_requests WHERE project = $1 AND requester = $2", self._project, requester
+        )
+        return _rowcount(status) > 0
+
+    async def read_indexer_yield(self) -> str | None:
+        """Who is asking the lease holder to step down, or ``None``."""
+        pool = await self._get_pool()
+        return await pool.fetchval(
+            f"SELECT requester FROM {SCHEMA}.yield_requests WHERE project = $1 AND expires_at > clock_timestamp()",
+            self._project,
+        )
+
     # -- backlog ---------------------------------------------------------------
 
     async def stream_group_info(self, topic: Topic, group: str) -> StreamGroupInfo:
@@ -870,7 +908,7 @@ class PostgresEventBus:
         await pool.execute(f"DELETE FROM {SCHEMA}.messages WHERE project = $1", self._project)
 
     async def delete_project_queue(self) -> int | None:
-        """Delete this project's messages, groups, deliveries, registrations and expired lease.
+        """Delete this project's messages, groups, deliveries, registrations, expired lease and yield request.
 
         Returns the number of rows removed. One transaction, keyed by project, so no other
         project's rows and none of the rate limiter's shared rows are reachable from it. A
@@ -883,8 +921,10 @@ class PostgresEventBus:
             for table in ("messages", "groups", "deliveries", "consumers"):
                 status = await conn.execute(f"DELETE FROM {SCHEMA}.{table} WHERE project = $1", self._project)
                 removed += _rowcount(status)
-            status = await conn.execute(
-                f"DELETE FROM {SCHEMA}.leases WHERE project = $1 AND expires_at <= clock_timestamp()", self._project
-            )
-            removed += _rowcount(status)
+            for table in ("leases", "yield_requests"):
+                status = await conn.execute(
+                    f"DELETE FROM {SCHEMA}.{table} WHERE project = $1 AND expires_at <= clock_timestamp()",
+                    self._project,
+                )
+                removed += _rowcount(status)
         return removed

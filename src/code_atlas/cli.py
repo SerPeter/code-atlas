@@ -318,8 +318,8 @@ def index(
         False,
         "--watch",
         help="Stay running after the index and keep watching the files, holding the indexer "
-        "lease. Lets a checkout have one persistent indexer that is not an MCP server, so "
-        "every 'atlas mcp' there can run --no-index.",
+        "lease. Lets a checkout have one persistent indexer that is not an MCP server; every "
+        "'atlas mcp' there then stands by and only queries.",
     ),
     force: bool = typer.Option(
         False,
@@ -671,10 +671,9 @@ def mcp(
         None,
         "--index/--no-index",
         help="Whether this server also watches and indexes the checkout. Overrides "
-        "mcp.auto_index; omit to use it. --no-index serves queries only (no watcher, "
-        "no pipeline, no startup catch-up) — for the second and later agent sessions "
-        "sharing one worktree, since indexing is per-worktree. Exactly one indexer "
-        "must still cover that checkout.",
+        "mcp.auto_index; omit to use it. Not needed for extra sessions on one checkout: "
+        "only the holder of its indexer lease indexes, and the rest stand by. --no-index "
+        "is for a server that must never index (no watcher, no pipeline, no catch-up).",
     ),
 ) -> None:
     """Start the MCP server for AI agent connections."""
@@ -987,12 +986,13 @@ async def _run_index(  # noqa: PLR0912, PLR0915
         # nodes is how one run got split across two code versions, and how Memgraph's MVCC
         # conflicts turned into dropped files. Waiting is visible (a log line names the
         # holder) and interruptible; refusing outright made a concurrent daemon catch-up
-        # into an exit code 1 for a human who only had to wait.
+        # into an exit code 1 for a human who only had to wait. A session that indexes
+        # this checkout holds the lease for its whole life, so it is asked to yield.
         from code_atlas.events import IndexerBusyError, hold_indexer_lease
 
         try:
             owner = await stack.enter_async_context(
-                hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s, force=force)
+                hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s, force=force, request_yield=True)
             )
         except IndexerBusyError as exc:
             logger.error("{}", exc)
@@ -1236,9 +1236,9 @@ async def _watch_after_index(settings: Any, graph: Any, bus: Any, limiter: Any, 
     """Keep watching after the index pass, holding the lease, until interrupted.
 
     Exists so a checkout can have one persistent indexer that is not an MCP server.
-    Every `atlas mcp` in that worktree can then run --no-index and simply query, which
-    is both cheaper and the only way to stop N agent sessions each running their own
-    watcher over the same files.
+    Every `atlas mcp` in that worktree then finds the lease held and stands by, querying
+    only. It does not yield to a one-shot `atlas index`: it is a foreground run somebody
+    started on purpose, and that index waits for it like any other.
 
     ``catchup=False`` because the pass that just ran *was* the catch-up, and it honoured
     --full/--reset/--reset-embeddings/--scope/--project, which the daemon's own generic
@@ -1580,7 +1580,7 @@ async def _run_project_rm(name: str, *, skip_confirm: bool) -> None:
             # project's lease would re-create what is being deleted, or write into a half-
             # removed project. Waiting is the index command's answer to a live holder too.
             try:
-                async with hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s):
+                async with hold_indexer_lease(bus, wait_s=settings.index.lease_wait_s, request_yield=True):
                     await graph.delete_project_data(name)
                     queue_removed = await bus.delete_project_queue() if owner == name else 0
             except IndexerBusyError as exc:

@@ -759,11 +759,11 @@ class McpSettings(StrictSection):
     strict: bool = Field(default=False, description="Refuse to start if embedding model mismatch.")
     auto_index: bool = Field(
         default=True,
-        description="Run the watcher, pipeline and startup catch-up in the MCP server process. "
-        "Set false (or pass --no-index) for the second and later sessions sharing one worktree: "
-        "indexing is per-worktree, not per-session, so the extra servers only add lease contention "
-        "and duplicate watchers. Exactly one indexer per worktree is still required -- a daemon, or "
-        "one MCP server with this left on -- or nothing will index that checkout at all.",
+        description="Let this MCP server index the checkout. Several sessions can leave it on: "
+        "only the one holding the checkout's indexer lease runs the watcher, pipeline and catch-up, "
+        "and the others stand by and take over if it exits. Set false (or pass --no-index) for a "
+        "server that must never index -- something else then has to, a daemon or `atlas index "
+        "--watch`, or nothing will index that checkout at all.",
     )
 
 

@@ -751,10 +751,9 @@ def create_mcp_server(  # noqa: PLR0915
     Set False to skip it (faster startup at the cost of missing offline edits).
 
     *auto_index* False is the stronger form: no watcher, no consumers, no catch-up
-    — the server only reads. Indexing is per-worktree, not per-session, so when
-    several agent sessions share one checkout the extra servers contribute nothing
-    but lease contention and duplicate watchers over the same files. Exactly one
-    indexer per worktree is still required; this flag is for the others.
+    — the server only reads, and never takes over. Several sessions on one checkout
+    do not need it: only the holder of the indexer lease indexes, and the others
+    stand by (see ``DaemonManager.start``).
     """
 
     @asynccontextmanager
@@ -1106,6 +1105,8 @@ def _spawn_indexing(
         exc = finished.exception()
         if exc is not None:
             logger.exception("Daemon startup failed", exc_info=exc)
+        elif finished.result() and daemon.standby:
+            logger.info("Standing by for the indexer lease ({})", daemon.disabled_reason)
         elif finished.result():
             logger.info("Auto-indexing active (watching {})", settings.project_root)
         else:

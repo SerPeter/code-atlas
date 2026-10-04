@@ -49,7 +49,7 @@ atlas index --watch --force      # ...taking the lease from a holder that is gon
 atlas search "query"             # Hybrid search
 atlas status                     # Check index status
 atlas mcp                        # Start MCP server
-atlas mcp --no-index             # Query-only: no watcher/pipeline (2nd+ session in a worktree)
+atlas mcp --no-index             # Never index (extra sessions need nothing: the lease holder indexes)
 atlas ui                         # Web UI; takes the first free port from 8420 up
 atlas daemon start               # Start indexing daemon (watcher + pipeline)
 atlas dream                      # Knowledge-vault lint report (inbox, orphans, dangling links, duplicates) + wiki/HOME.md
