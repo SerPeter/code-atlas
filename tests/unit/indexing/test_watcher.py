@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from watchfiles import Change
 
 from code_atlas.events import FileChanged
-from code_atlas.indexing.orchestrator import DetectedProject
+from code_atlas.indexing.orchestrator import DetectedProject, FileScope
 from code_atlas.indexing.watcher import FileWatcher
-from code_atlas.settings import WatcherSettings
+from code_atlas.settings import AtlasSettings, WatcherSettings
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from code_atlas.events import Topic
 
 
@@ -38,6 +37,9 @@ class StubScope:
                 return False
         return True
 
+    def is_dir_excluded(self, rel_dir: str) -> bool:
+        return any(pat.endswith("/") and f"{rel_dir}/".startswith(pat) for pat in self._excluded)
+
 
 class ExtensionStubScope:
     """FileScope substitute that mimics the real include-spec: only files
@@ -50,6 +52,9 @@ class ExtensionStubScope:
 
     def is_included(self, rel_path: str) -> bool:
         return rel_path.endswith(self._ext)
+
+    def is_dir_excluded(self, rel_dir: str) -> bool:
+        return False
 
 
 class RecordingBus:
@@ -546,3 +551,61 @@ class TestDirectoryRenameExpansion:
 
         assert {ev.path for _, ev in bus.published} == {"solo.py"}
         assert watcher._known_files == set()
+
+
+class TestExcludedDirectoryAdd:
+    """A directory the scope excludes must never be walked. ``uv sync`` into an excluded
+    ``.venv`` creates thousands of directories, each reporting its own ``added``; walking
+    each one re-walked the same ~200k files per watcher and pinned three processes at 99%
+    CPU for days. These assert on what was *walked*, not what was published: the per-file
+    filter already dropped those files, so the published set was right all along.
+    """
+
+    @staticmethod
+    def _walk_recorder(monkeypatch) -> list[str]:
+        import code_atlas.indexing.watcher as watcher_module
+
+        visited: list[str] = []
+        real_walk = os.walk
+
+        def recording_walk(path):
+            for entry in real_walk(path):
+                visited.append(Path(entry[0]).as_posix())
+                yield entry
+
+        monkeypatch.setattr(watcher_module.os, "walk", recording_walk)
+        return visited
+
+    @staticmethod
+    def _real_scope_watcher(root: Path, bus: RecordingBus) -> FileWatcher:
+        scope = FileScope(root, AtlasSettings(project_root=root))
+        settings = WatcherSettings(debounce_s=0.05, max_wait_s=5.0)
+        return FileWatcher(root, bus, scope, settings)  # ty: ignore[invalid-argument-type]
+
+    async def test_added_dir_under_excluded_parent_is_not_walked(self, tmp_path: Path, monkeypatch) -> None:
+        pkg = tmp_path / ".venv" / "lib" / "site-packages" / "pkg"
+        pkg.mkdir(parents=True)
+        (pkg / "mod.py").write_text("a = 1\n")
+        visited = self._walk_recorder(monkeypatch)
+        bus = RecordingBus()
+        watcher = self._real_scope_watcher(tmp_path, bus)
+
+        await watcher._on_change({(Change.added, str(tmp_path / ".venv")), (Change.added, str(pkg))})
+
+        assert visited == []
+        assert watcher._pending == {}
+
+    async def test_walk_prunes_excluded_child_of_included_dir(self, tmp_path: Path, monkeypatch) -> None:
+        app = tmp_path / "app"
+        (app / "node_modules" / "dep").mkdir(parents=True)
+        (app / "node_modules" / "dep" / "index.js").write_text("x = 1\n")
+        (app / "main.py").write_text("a = 1\n")
+        visited = self._walk_recorder(monkeypatch)
+        bus = RecordingBus()
+        watcher = self._real_scope_watcher(tmp_path, bus)
+
+        await watcher._on_change({(Change.added, str(app))})
+        await watcher._flush()
+
+        assert visited == [app.as_posix()]
+        assert {ev.path for _, ev in bus.published} == {"app/main.py"}

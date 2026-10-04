@@ -181,12 +181,17 @@ class FileWatcher:
         that changed inside a directory; the expansion exists only for the case where
         the directory itself is the whole event, so the files under it never get one.
 
+        An ``added`` directory the scope excludes is not walked at all. Every directory
+        created under one -- a worktree in ``.claude/``, each ``site-packages/<pkg>`` a
+        ``uv sync`` writes -- reports its own ``added``, so walking them walks the same
+        ~200k-file ``.venv`` over and over: three watchers sat at 99% CPU for days doing it.
+
         Returns the number of individual file changes queued.
         """
         if change == Change.deleted:
             affected = self._expand_directory_delete(rel_path)
             change_type = "deleted"
-        elif change == Change.added and Path(abs_path).is_dir():
+        elif change == Change.added and not self._scope.is_dir_excluded(rel_path) and Path(abs_path).is_dir():
             affected = await self._expand_directory_add(Path(abs_path))
             change_type = "created"
         else:
@@ -221,10 +226,19 @@ class FileWatcher:
         return discovered
 
     def _walk_dir_for_included_files(self, abs_dir: Path) -> list[str]:
-        """Blocking os.walk scan -- must only be called via ``asyncio.to_thread``."""
+        """Blocking os.walk scan -- must only be called via ``asyncio.to_thread``.
+
+        Prunes excluded and symlinked directories the same way ``FileScope.scan`` does.
+        """
         discovered: list[str] = []
-        for dirpath, _dirnames, filenames in os.walk(abs_dir):
+        for dirpath, dirnames, filenames in os.walk(abs_dir):
             cur_rel = Path(dirpath).relative_to(self._root).as_posix()
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not self._scope.is_dir_excluded(f"{cur_rel}/{d}" if cur_rel else d)
+                and not Path(dirpath, d).is_symlink()
+            ]
             for fname in filenames:
                 f_rel = f"{cur_rel}/{fname}" if cur_rel else fname
                 if self._scope.is_included(f_rel):

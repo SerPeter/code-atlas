@@ -554,7 +554,7 @@ class FileScope:
             dirnames[:] = [
                 d
                 for d in dirnames
-                if not self._is_dir_excluded(f"{rel_dir}/{d}" if rel_dir else d) and not Path(dirpath, d).is_symlink()
+                if not self.is_dir_excluded(f"{rel_dir}/{d}" if rel_dir else d) and not Path(dirpath, d).is_symlink()
             ]
 
             for fname in filenames:
@@ -660,7 +660,7 @@ class FileScope:
         paths = settings.scope.paths if scope_paths is None else scope_paths
         return [p.replace("\\", "/").rstrip("/") for p in paths]
 
-    def _is_dir_excluded(self, rel_dir: str) -> bool:
+    def is_dir_excluded(self, rel_dir: str) -> bool:
         """Check whether a directory should be pruned from the walk."""
         dir_pattern = f"{rel_dir}/"
         if self._exclude_spec.match_file(dir_pattern):
@@ -683,7 +683,7 @@ class FileScope:
         """Discover and cache *rel_dir*'s own ``.gitignore``, if not already checked.
 
         Populated lazily on first access (from ``scan()``'s walk, or directly
-        from ``is_included()``/``_is_dir_excluded()``) so callers that never
+        from ``is_included()``/``is_dir_excluded()``) so callers that never
         call ``scan()`` — e.g. the file watcher, which queries ``is_included()``
         one path at a time — still see nested ``.gitignore`` exclusions.
         """
