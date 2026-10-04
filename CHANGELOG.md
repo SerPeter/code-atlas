@@ -2,6 +2,44 @@
 
 <!-- version list -->
 
+## v0.15.0 (2026-10-04)
+
+### Bug Fixes
+
+- **deps**: Bump pyjwt to 2.15.1 and urllib3 to 2.8.0
+  ([#22](https://github.com/SerPeter/code-atlas/pull/22),
+  [`df71338`](https://github.com/SerPeter/code-atlas/commit/df7133836da228feace97ce3cec88a45a1278c49))
+
+- **watcher**: Never walk a directory the scope excludes
+  ([#20](https://github.com/SerPeter/code-atlas/pull/20),
+  [`c1c8310`](https://github.com/SerPeter/code-atlas/commit/c1c8310b90dee694667e2d17bbd6aa08a3d8fdc9))
+
+### Chores
+
+- **deps**: Extend the shared Renovate preset
+  ([#18](https://github.com/SerPeter/code-atlas/pull/18),
+  [`e7da8cc`](https://github.com/SerPeter/code-atlas/commit/e7da8ccaa948702a08787536db1a42caac8a185d))
+
+### Continuous Integration
+
+- Give the shared uv cache a single writer ([#17](https://github.com/SerPeter/code-atlas/pull/17),
+  [`38b381d`](https://github.com/SerPeter/code-atlas/commit/38b381d3dd7f1e35545a61882b86dc5302a1ce78))
+
+- **security**: Audit pinned versions instead of reinstalling them
+  ([#22](https://github.com/SerPeter/code-atlas/pull/22),
+  [`df71338`](https://github.com/SerPeter/code-atlas/commit/df7133836da228feace97ce3cec88a45a1278c49))
+
+- **security**: Make the audit run again, and fix what it finds
+  ([#22](https://github.com/SerPeter/code-atlas/pull/22),
+  [`df71338`](https://github.com/SerPeter/code-atlas/commit/df7133836da228feace97ce3cec88a45a1278c49))
+
+### Features
+
+- **indexing**: One indexer per checkout, elected by the indexer lease
+  ([#21](https://github.com/SerPeter/code-atlas/pull/21),
+  [`7736f82`](https://github.com/SerPeter/code-atlas/commit/7736f822e75d13f2ccb296a0178c5ed928df94d6))
+
+
 ## v0.14.1 (2026-09-17)
 
 ### Bug Fixes
