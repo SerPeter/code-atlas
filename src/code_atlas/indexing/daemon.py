@@ -8,6 +8,8 @@ and AST/Embed consumers.  Used by both the CLI (``atlas watch``,
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from code_atlas.events import EventBus, IndexerBusyError, Topic, hold_indexer_lease
+from code_atlas.events import INDEXER_LEASE_TTL_MS, EventBus, Topic, new_lease_owner
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
     FileScope,
@@ -50,15 +52,17 @@ _RESTART_BACKOFF_MAX_S = 60.0
 # How long a run must survive before its next crash is treated as unrelated.
 _RESTART_HEALTHY_S = 60.0
 
-# Startup catch-up waits for the indexer lease, but on a much shorter leash than a
-# foreground `atlas index`. The reason to wait at all is a holder that is already dead:
-# its lease expires within INDEXER_LEASE_TTL_MS (60s), so a little over a minute covers
-# the entire case. A holder still there after that is alive and doing the same work, and
-# waiting longer buys nothing -- while `start()` does not return until catch-up finishes,
-# which for the MCP server means first_index_ready stays clear that whole time.
-#
-# index.lease_wait_s still applies as a ceiling, so setting it to 0 restores fail-fast.
-_CATCHUP_LEASE_WAIT_S = 90.0
+# Exactly one process per checkout indexes it: whoever holds the indexer lease. Every other
+# session stands by, query-only, and re-tries the lease on this interval, jittered so
+# sessions an agent client spawned together do not retry in lockstep. A holder that is
+# killed stops renewing, so its lease expires within INDEXER_LEASE_TTL_MS and the next
+# standby poll after that takes over.
+_STANDBY_POLL_S = 15.0
+_STANDBY_POLL_JITTER = 0.5
+
+# How often the holder renews its lease and checks whether a one-shot `atlas index` has
+# asked it to yield. Well inside the TTL, and short because whoever asked is waiting.
+_HOLDER_TICK_S = 5.0
 
 
 @dataclass
@@ -73,10 +77,30 @@ class DaemonManager:
     _embed: EmbedClient | None = field(default=None, repr=False)
     _crash_counts: dict[str, int] = field(default_factory=dict, repr=False)
     _last_crash: dict[str, str] = field(default_factory=dict, repr=False)
-    #: Why this manager was never started, if it deliberately wasn't. Without it the
+    #: Why this manager is not indexing, if it deliberately isn't. Without it the
     #: pipeline health check reports "0 task(s) running" as OK, which reads identically
     #: to a pipeline that died on startup.
     disabled_reason: str = ""
+    # What start() was given, kept so a standby session can build the same stack when it
+    # takes the lease over.
+    _settings: AtlasSettings | None = field(default=None, repr=False)
+    _graph: GraphClient | None = field(default=None, repr=False)
+    _limiter: Limiter | None = field(default=None, repr=False)
+    _include_watcher: bool = field(default=True, repr=False)
+    _catchup_enabled: bool = field(default=True, repr=False)
+    #: This process's identity on the indexer lease.
+    _owner: str | None = field(default=None, repr=False)
+    #: The caller took the lease and renews it (`atlas index --watch`), so this manager
+    #: neither elects, yields nor releases.
+    _lease_is_callers: bool = field(default=False, repr=False)
+    _active: bool = field(default=False, repr=False)
+    _elector: asyncio.Task[None] | None = field(default=None, repr=False)
+    _activation: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    @property
+    def standby(self) -> bool:
+        """True while another process holds this checkout's indexer lease and this one waits."""
+        return self._elector is not None and not self._active
 
     @property
     def bus(self) -> EventBus | None:
@@ -97,6 +121,7 @@ class DaemonManager:
             "crash_counts": dict(self._crash_counts),
             "last_crash": dict(self._last_crash),
             "disabled_reason": self.disabled_reason,
+            "standby": self.standby,
         }
 
     async def start(
@@ -111,13 +136,22 @@ class DaemonManager:
         first_index_ready: asyncio.Event | None = None,
         lease_owner: str | None = None,
     ) -> bool:
-        """Try to start watcher + pipeline.
+        """Start watcher + pipeline if this process wins the checkout's indexer lease.
 
         Returns ``False`` if the queue backend is unreachable (graceful degradation).
         Both *graph* and *bus* are caller-owned and shared — **not** closed by this
         manager. It used to build its own bus while being handed a graph, which left
         ownership split down the middle of one object: the caller closed half of what
         this used and the manager closed the other, and neither could see the whole.
+
+        Every MCP session starts with indexing on, and nobody can pass ``--no-index`` to
+        each one, so which process indexes a checkout is decided here: the one that holds
+        the indexer lease. The winner keeps it for as long as it runs, renewing it, and
+        steps down when a one-shot ``atlas index`` asks it to yield. A loser runs nothing
+        -- no scan, no watcher, no consumers, no catch-up -- and re-tries the lease every
+        ``_STANDBY_POLL_S``, taking over when the holder exits or dies. Before this, each
+        session ran its own watcher over the same tree, and three of them sat at 99% CPU
+        re-walking the same excluded ``.venv``.
 
         Parameters
         ----------
@@ -132,19 +166,18 @@ class DaemonManager:
             If ``False``, only start the tier consumers (no filesystem watcher).
         catchup:
             If ``True``, run one delta index pass before consuming so edits
-            made while the daemon was down are indexed. Failures are logged
-            and non-fatal.
+            made while no process was indexing are indexed — at startup and again on
+            every takeover. Failures are logged and non-fatal.
         first_index_ready:
             Set once startup catch-up has run (success or swallowed failure)
-            or is skipped — lets a caller (MCP's first-index readiness gate)
-            block tool calls against a genuinely fresh backend without hanging
-            forever. ``None`` (default) means no one is waiting on it.
+            or is skipped, and at once when this process stands by — lets a caller (MCP's
+            first-index readiness gate) block tool calls against a genuinely fresh
+            backend without hanging forever. ``None`` (default) means no one is waiting.
         lease_owner:
-            The indexer lease this process already holds, if any. Consumers stand
-            down for a *foreign* lease; without this they would stand down for
-            their own caller's, which is what ``atlas index --watch`` does — it
-            keeps its lease for the whole session rather than releasing it after
-            the pass.
+            The indexer lease the caller already holds and renews, which is what
+            ``atlas index --watch`` does. The stack then starts under it unconditionally:
+            no election, no yielding, and the lease is the caller's to release. Consumers
+            are told it too, or they would stand down for their own caller's lease.
         """
         try:
             await bus.ping()
@@ -156,6 +189,47 @@ class DaemonManager:
             return False
 
         self._bus = bus
+        self._settings, self._graph, self._limiter = settings, graph, limiter
+        self._include_watcher, self._catchup_enabled = include_watcher, catchup
+
+        if lease_owner is not None:
+            self._owner, self._lease_is_callers, self._active = lease_owner, True, True
+            await self._activate(first_index_ready)
+            return True
+
+        self._owner = new_lease_owner()
+        won = await self._try_acquire()
+        self._active = won
+        self._elector = asyncio.get_running_loop().create_task(self._elect())
+        if not won:
+            await self._enter_standby()
+            if first_index_ready is not None:
+                first_index_ready.set()
+            return True
+
+        activation = self._spawn_activation(first_index_ready)
+        try:
+            await asyncio.wait({activation})
+        except asyncio.CancelledError:
+            activation.cancel()
+            raise
+        finally:
+            if first_index_ready is not None:
+                first_index_ready.set()
+        if not activation.cancelled() and activation.exception() is not None:
+            # Same contract as before the election: a stack that fails to start fails
+            # start(), and the lease is not left held by a process that indexes nothing.
+            await self.stop()
+            activation.result()
+        return True
+
+    async def _activate(self, first_index_ready: asyncio.Event | None) -> None:
+        """Build and start the watcher + pipeline, under a lease this process holds."""
+        settings, graph, bus, limiter = self._settings, self._graph, self._bus, self._limiter
+        assert settings is not None
+        assert graph is not None
+        assert bus is not None
+        assert limiter is not None
 
         try:
             removed = await gc_vanished_worktree_projects(graph)
@@ -176,7 +250,7 @@ class DaemonManager:
                 settings,
                 cooldown_s=settings.watcher.cooldown_s,
                 defer_to_lease=True,
-                lease_owner=lease_owner,
+                lease_owner=self._owner,
             ),
         ]
         if embed is not None:
@@ -186,13 +260,13 @@ class DaemonManager:
                     graph,
                     embed,
                     defer_to_lease=True,
-                    lease_owner=lease_owner,
+                    lease_owner=self._owner,
                     embedding_policy=EmbedPolicy.from_settings(settings.embeddings),
                 )
             )
         self._consumers = consumers
 
-        if include_watcher:
+        if self._include_watcher:
             scope = FileScope(settings.project_root, settings)
             # FileScope only discovers nested .gitignore files as a side effect
             # of scan() (recorded while walking) — without it, the watcher
@@ -221,7 +295,7 @@ class DaemonManager:
         # Catch-up must finish BEFORE the daemon's consumers start: its inline
         # pipeline uses the same consumer names, so the two must never coexist
         # in this process.
-        if catchup:
+        if self._catchup_enabled:
             await self._catchup(settings, graph, bus, limiter, first_index_ready)
         elif first_index_ready is not None:
             first_index_ready.set()
@@ -238,11 +312,99 @@ class DaemonManager:
         # watcher) — vaults have always indexed regardless of that flag.
         for vault in settings.knowledge.extra_vaults:
             try:
-                await self._start_vault(vault, settings, graph, bus, catchup=catchup)
+                await self._start_vault(vault, settings, graph, bus, catchup=self._catchup_enabled)
             except Exception:
                 logger.exception("Failed to start extra vault '{}' — continuing without it", vault.project_name)
 
-        return True
+    def _spawn_activation(self, first_index_ready: asyncio.Event | None) -> asyncio.Task[None]:
+        """Start the stack as a task, so the elector can cancel it on a yield mid catch-up."""
+        self._active = True
+        self.disabled_reason = ""
+        self._activation = asyncio.get_running_loop().create_task(self._activate(first_index_ready))
+        return self._activation
+
+    async def _try_acquire(self) -> bool:
+        """Take the lease, unless a one-shot index is waiting for exactly that."""
+        bus, owner = self._bus, self._owner
+        assert bus is not None
+        assert owner is not None
+        if await bus.read_indexer_yield():
+            return False
+        return await bus.acquire_indexer_lease(owner, INDEXER_LEASE_TTL_MS)
+
+    async def _elect(self) -> None:
+        """Keep the lease while indexing; take it over while standing by. Runs until stop()."""
+        while True:
+            try:
+                if self._active:
+                    await asyncio.sleep(_HOLDER_TICK_S)
+                    reason = await self._reason_to_step_down()
+                    if reason:
+                        logger.info("Stepping down as this checkout's indexer: {}", reason)
+                        await self._step_down()
+                else:
+                    jitter = random.uniform(1 - _STANDBY_POLL_JITTER, 1 + _STANDBY_POLL_JITTER)
+                    await asyncio.sleep(_STANDBY_POLL_S * jitter)
+                    if await self._try_acquire():
+                        assert self._settings is not None
+                        logger.info("Took over the indexer lease — now indexing {}", self._settings.project_root)
+                        self._spawn_activation(None)
+                    else:
+                        await self._enter_standby(announce=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Indexer lease check failed — retrying")
+
+    async def _reason_to_step_down(self) -> str:
+        """Renew the lease and say why this process should stop indexing, or ``""``."""
+        bus, owner = self._bus, self._owner
+        assert bus is not None
+        assert owner is not None
+        activation = self._activation
+        if activation is not None and activation.done() and not activation.cancelled():
+            exc = activation.exception()
+            if exc is not None:
+                logger.opt(exception=exc).error("Indexer takeover failed to start the watcher and pipeline")
+                return "its watcher and pipeline failed to start"
+        requester = await bus.read_indexer_yield()
+        if requester:
+            return f"{requester} asked it to yield"
+        if await bus.renew_indexer_lease(owner, INDEXER_LEASE_TTL_MS):
+            return ""
+        if await bus.acquire_indexer_lease(owner, INDEXER_LEASE_TTL_MS):
+            logger.warning("The indexer lease had vanished (queue backend restarted?) — re-acquired it")
+            return ""
+        holder = await bus.read_indexer_lease()
+        return f"the lease passed to {holder or 'another process'}"
+
+    async def _step_down(self) -> None:
+        """Stop the stack, then release the lease — in that order, so no two indexers overlap."""
+        self._active = False
+        activation, self._activation = self._activation, None
+        if activation is not None and not activation.done():
+            activation.cancel()
+            await asyncio.gather(activation, return_exceptions=True)
+        await self._stop_stack()
+        if self._bus is not None and self._owner is not None:
+            await self._bus.release_indexer_lease(self._owner)
+        await self._enter_standby()
+
+    async def _enter_standby(self, *, announce: bool = True) -> None:
+        """Record who indexes this checkout instead, for the health check and the log."""
+        assert self._bus is not None
+        assert self._settings is not None
+        try:
+            holder = await self._bus.read_indexer_lease()
+        except Exception:
+            holder = None
+        self.disabled_reason = f"standby — {holder or 'another process'} holds the indexer lease"
+        if announce:
+            logger.info(
+                "Standing by: {} indexes {} — this session is query-only until that lease frees",
+                holder or "another process",
+                self._settings.project_root,
+            )
 
     async def _start_vault(
         self,
@@ -296,40 +458,28 @@ class DaemonManager:
         limiter: Limiter,
         first_index_ready: asyncio.Event | None = None,
     ) -> None:
-        """One delta index pass so changes made while the daemon was down get indexed.
+        """One delta index pass so changes made while nothing was indexing get indexed.
 
-        Takes the indexer lease for the duration of the pass, same as the CLI's own
-        ``atlas index`` — without it, every MCP server session's auto-started catchup
-        races every other session's (and any concurrent CLI run's) directly against
-        Memgraph. ``defer_to_lease`` on the persistent consumers only protects the
-        live-event path; this inline pass calls the same orchestrator functions the
-        CLI does and was never gated the same way. Multiple sessions racing here is
-        exactly the "two processes writing the same nodes" scenario the lease exists
-        to prevent (see ``hold_indexer_lease``'s docstring) — it surfaced as Memgraph
-        MVCC conflicts and a 60s write timeout that killed an indexing run outright.
+        Runs under the indexer lease this process already holds for the whole session,
+        so it takes no lease of its own. Without one, every MCP session's catch-up raced
+        every other session's (and any concurrent CLI run's) directly against Memgraph --
+        exactly the "two processes writing the same nodes" scenario the lease exists to
+        prevent (see ``hold_indexer_lease``'s docstring), which surfaced as Memgraph MVCC
+        conflicts and a 60s write timeout that killed an indexing run outright.
 
         *first_index_ready* (if given) is set in the ``finally`` block regardless of
-        outcome — both success and the swallowed-failure/busy path below must unblock
-        a caller waiting on it (MCP's first-index readiness gate), never hang forever.
+        outcome — both success and the swallowed-failure path below must unblock a
+        caller waiting on it (MCP's first-index readiness gate), never hang forever.
         """
         try:
-            wait_s = min(settings.index.lease_wait_s, _CATCHUP_LEASE_WAIT_S)
-            async with hold_indexer_lease(bus, wait_s=wait_s):
-                if detect_sub_projects(settings.project_root, settings.monorepo):
-                    await index_monorepo(
-                        settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s, limiter=limiter
-                    )
-                else:
-                    await index_project(
-                        settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s, limiter=limiter
-                    )
-        except IndexerBusyError as exc:
-            logger.info(
-                "Skipping startup catch-up — another indexer still holds the lease after "
-                "waiting {:.0f}s ({}); live events will still be consumed once it finishes",
-                wait_s,
-                exc.holder,
-            )
+            if detect_sub_projects(settings.project_root, settings.monorepo):
+                await index_monorepo(
+                    settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s, limiter=limiter
+                )
+            else:
+                await index_project(
+                    settings, graph, bus, drain_timeout_s=settings.index.drain_timeout_s, limiter=limiter
+                )
         except Exception:
             logger.exception("Startup catch-up index failed — continuing with live events only")
         finally:
@@ -337,8 +487,10 @@ class DaemonManager:
                 first_index_ready.set()
 
     async def wait(self) -> None:
-        """Block until all background tasks finish (or are cancelled)."""
-        if self._tasks:
+        """Block until stop(): through standby and takeovers, or until the stack's tasks end."""
+        if self._elector is not None:
+            await asyncio.gather(self._elector, return_exceptions=True)
+        elif self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
     def _start_backlog_sampler(self) -> None:
@@ -388,7 +540,32 @@ class DaemonManager:
         return counts
 
     async def stop(self) -> None:
-        """Graceful shutdown: stop watcher, consumers, close connections."""
+        """Graceful shutdown: stop the elector and the stack, then release the lease."""
+        elector, self._elector = self._elector, None
+        if elector is not None:
+            elector.cancel()
+            await asyncio.gather(elector, return_exceptions=True)
+        activation, self._activation = self._activation, None
+        if activation is not None and not activation.done():
+            activation.cancel()
+            await asyncio.gather(activation, return_exceptions=True)
+
+        await self._stop_stack()
+
+        if self._active and not self._lease_is_callers and self._bus is not None and self._owner is not None:
+            # Released at once rather than left to expire, so a standby session takes
+            # over on its next poll instead of a minute later. The bus may already be
+            # gone on a shutdown, and the TTL covers that.
+            with contextlib.suppress(Exception):
+                await self._bus.release_indexer_lease(self._owner)
+        self._active = False
+
+        # The bus is deliberately not closed: it is the caller's, and closing it here
+        # once meant a restart_daemon() left the MCP server holding a dead connection.
+        logger.debug("DaemonManager stopped")
+
+    async def _stop_stack(self) -> None:
+        """Stop watcher, vault watchers and consumers, and forget them, so a takeover rebuilds."""
         if self._watcher is not None:
             self._watcher.stop()
 
@@ -407,14 +584,13 @@ class DaemonManager:
                 task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._watcher = None
+        self._vault_watchers = []
+        self._consumers = []
 
         # Cleared so a restart builds a fresh embed client. Nothing to close: it holds no
         # connection, and the limiter it paced through is the caller's, like the bus.
         self._embed = None
-
-        # The bus is deliberately not closed: it is the caller's, and closing it here
-        # once meant a restart_daemon() left the MCP server holding a dead connection.
-        logger.debug("DaemonManager stopped")
 
     async def _run_watcher(self) -> None:
         """Run the file watcher under supervision: crash → log + backoff restart."""

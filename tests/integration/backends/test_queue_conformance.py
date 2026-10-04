@@ -232,6 +232,42 @@ async def test_lease_is_exclusive_across_two_clients(make_bus) -> None:
     assert await first.read_indexer_lease() is None
 
 
+async def test_a_yield_request_is_seen_by_the_holder_and_only_its_requester_withdraws_it(make_bus) -> None:
+    """The lease holder polls for this to know a one-shot `atlas index` is waiting on it,
+    and standby sessions poll it so they do not take the lease the requester is owed."""
+    holder, cli = make_bus("test-main"), make_bus("test-main")
+    try:
+        await holder.ping()
+    except Exception as exc:
+        pytest.skip(f"queue backend not available: {exc}")
+
+    assert await holder.read_indexer_yield() is None
+    assert await holder.acquire_indexer_lease("session", 60_000) is True
+
+    await cli.request_indexer_yield("cli", 60_000)
+    assert await holder.read_indexer_yield() == "cli"
+    assert await holder.read_indexer_lease() == "session", "a request is not a lease write"
+
+    assert await holder.clear_indexer_yield("someone-else") is False
+    assert await holder.read_indexer_yield() == "cli"
+    assert await cli.clear_indexer_yield("cli") is True
+    assert await holder.read_indexer_yield() is None
+    assert await holder.release_indexer_lease("session") is True
+
+
+async def test_a_dead_requesters_yield_request_expires(make_bus) -> None:
+    bus = make_bus("test-main")
+    try:
+        await bus.ping()
+    except Exception as exc:
+        pytest.skip(f"queue backend not available: {exc}")
+
+    await bus.request_indexer_yield("killed-cli", 200)
+    assert await bus.read_indexer_yield() == "killed-cli"
+    await asyncio.sleep(0.4)
+    assert await bus.read_indexer_yield() is None, "a stale request would keep every standby out forever"
+
+
 async def test_an_expired_lease_passes_on(make_bus) -> None:
     first, second = make_bus("test-main"), make_bus("test-main")
     try:

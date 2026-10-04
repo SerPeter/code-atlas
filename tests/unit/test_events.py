@@ -326,6 +326,72 @@ class TestIndexerLeaseWaiting:
         assert clock.now <= 1000.5
 
 
+class FakeYieldBus(FakeLeaseBus):
+    """Records yield requests, and whether the last one is still standing."""
+
+    def __init__(self, busy_for: float = 0) -> None:
+        super().__init__(busy_for=busy_for)
+        self.requests: list[str] = []
+        self.standing: str | None = None
+
+    async def request_indexer_yield(self, requester: str, ttl_ms: int) -> None:
+        self.requests.append(requester)
+        self.standing = requester
+
+    async def clear_indexer_yield(self, requester: str) -> bool:
+        cleared = self.standing == requester
+        self.standing = None if cleared else self.standing
+        return cleared
+
+
+class TestIndexerYieldRequest:
+    """A session that indexes a checkout holds the lease for its whole life, so a one-shot
+    `atlas index` that only waited would wait out its whole budget. It asks instead."""
+
+    async def test_a_waiter_asks_the_holder_to_yield_and_withdraws_once_it_has_the_lease(self, clock) -> None:
+        from code_atlas.events import hold_indexer_lease
+
+        bus = FakeYieldBus(busy_for=3)
+
+        async with hold_indexer_lease(bus, wait_s=600, request_yield=True) as owner:
+            assert bus.standing is None, "a request left standing would keep every standby session out"
+
+        assert bus.requests == [owner] * 3, "renewed on every poll, so it cannot expire mid-wait"
+
+    async def test_giving_up_withdraws_the_request(self, clock) -> None:
+        from code_atlas.events import IndexerBusyError, hold_indexer_lease
+
+        bus = FakeYieldBus(busy_for=float("inf"))
+
+        with pytest.raises(IndexerBusyError):
+            async with hold_indexer_lease(bus, wait_s=30, request_yield=True):
+                pass
+
+        assert bus.requests
+        assert bus.standing is None
+
+    async def test_no_request_unless_asked(self, clock) -> None:
+        """The daemon's own lease use must never evict a peer."""
+        from code_atlas.events import hold_indexer_lease
+
+        bus = FakeYieldBus(busy_for=2)
+
+        async with hold_indexer_lease(bus, wait_s=600):
+            pass
+
+        assert bus.requests == []
+
+    async def test_a_free_lease_never_asks(self, clock) -> None:
+        from code_atlas.events import hold_indexer_lease
+
+        bus = FakeYieldBus(busy_for=0)
+
+        async with hold_indexer_lease(bus, wait_s=600, request_yield=True):
+            pass
+
+        assert bus.requests == []
+
+
 class TestForcedLease:
     """--force exists for the case the TTL handles badly: a holder that is already gone
     but whose 60s lease has not run out yet. It genuinely allows two indexers to write

@@ -407,6 +407,35 @@ class SqliteEventBus:
         await cur.close()
         return row[0] if row else None
 
+    # A yield request is a second row of the same table. See EventBus for what it is for.
+    _YIELD_NAME = "indexer-yield"
+
+    async def request_indexer_yield(self, requester: str, ttl_ms: int) -> None:
+        conn = await self._get_conn()
+        await conn.execute(
+            "INSERT INTO leases(name, owner, expires_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at",
+            (self._YIELD_NAME, requester, time.time() + ttl_ms / 1000.0),
+        )
+        await conn.commit()
+
+    async def clear_indexer_yield(self, requester: str) -> bool:
+        conn = await self._get_conn()
+        cur = await conn.execute("DELETE FROM leases WHERE name = ? AND owner = ?", (self._YIELD_NAME, requester))
+        await conn.commit()
+        changed = cur.rowcount
+        await cur.close()
+        return changed > 0
+
+    async def read_indexer_yield(self) -> str | None:
+        conn = await self._get_conn()
+        cur = await conn.execute(
+            "SELECT owner FROM leases WHERE name = ? AND expires_at > ?", (self._YIELD_NAME, time.time())
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else None
+
     async def stream_group_info(self, topic: Topic, group: str) -> StreamGroupInfo:
         """Return pending + lag counts for a consumer group.
 
