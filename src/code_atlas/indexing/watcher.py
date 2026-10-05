@@ -34,6 +34,15 @@ _CHANGE_TYPE_MAP: dict[Change, str] = {
     Change.deleted: "deleted",
 }
 
+# The tree watch's Rust side yields an empty batch after this long without changes. That
+# first yield is the only outside proof the watch is armed -- ``awatch`` builds its
+# ``RustNotify`` inside the generator -- so this bounds how long a re-arm keeps the old
+# watch running alongside the new one.
+_TREE_RUST_TIMEOUT_MS = 1000
+# A top-level directory can vanish between listing it and arming a watch on it, which
+# raises FileNotFoundError; each attempt re-lists.
+_ARM_ATTEMPTS = 3
+
 
 class FileWatcher:
     """Async filesystem watcher that produces FileChanged events.
@@ -41,6 +50,15 @@ class FileWatcher:
     Uses ``watchfiles.awatch`` (Rust-backed) for efficient cross-platform
     filesystem monitoring, with a hybrid debounce strategy to coalesce
     rapid changes (e.g. branch switch, rebase, bulk save).
+
+    Two OS watches, because neither watchfiles nor the OS can exclude a subtree from a
+    recursive one: a non-recursive watch on the root (top-level files, and top-level
+    directories appearing or going away) and one recursive watch over the top-level
+    directories the scope can include anything from (``FileScope.is_watch_root``). A write
+    under ``.venv/`` or ``.claude/`` therefore never becomes an event at all, where one
+    recursive root watch delivered every such file to Python to be rejected -- 5,000 files
+    written under ``.claude/`` cost 5,105 events and half a second of event loop. Excludes
+    deeper than the top level still arrive and are filtered by :meth:`_on_change`.
 
     Parameters
     ----------
@@ -89,20 +107,30 @@ class FileWatcher:
         self._debounce_task: asyncio.Task[None] | None = None
         self._max_wait_task: asyncio.Task[None] | None = None
 
+        # The recursive tree watch: which top-level directories it covers, and its task
+        self._tree_dirs: list[str] = []
+        self._tree_stop: asyncio.Event | None = None
+        self._tree_task: asyncio.Task[None] | None = None
+        self._rearm_lock = asyncio.Lock()
+        self._tree_failure: BaseException | None = None
+
     async def run(self) -> None:
         """Watch for filesystem changes until :meth:`stop` is called."""
         logger.info("Watching {} (debounce={}s, max_wait={}s)", self._root, self._debounce_s, self._max_wait_s)
 
-        async for changes in awatch(
-            self._root,
-            debounce=200,
-            step=100,
-            stop_event=self._stop_event,
-            watch_filter=None,
-        ):
-            if self._stop_event.is_set():
-                break
-            await self._on_change(changes)
+        root_task = asyncio.get_running_loop().create_task(self._watch_root())
+        try:
+            await self._rearm_tree()
+            await root_task
+        finally:
+            if not root_task.done():
+                root_task.cancel()
+                await asyncio.gather(root_task, return_exceptions=True)
+            async with self._rearm_lock:
+                await self._stop_tree()
+
+        if self._tree_failure is not None:
+            raise self._tree_failure
 
         # Drain any remaining pending changes on shutdown
         if self._pending:
@@ -110,9 +138,112 @@ class FileWatcher:
 
         logger.info("Watcher stopped")
 
+    async def _watch_root(self) -> None:
+        """Non-recursive watch on the root: top-level files, and the tree watch's topology."""
+        async for changes in awatch(
+            self._root,
+            debounce=200,
+            step=100,
+            stop_event=self._stop_event,
+            watch_filter=None,
+            recursive=False,
+        ):
+            if self._stop_event.is_set():
+                break
+            # Re-arm BEFORE _on_change expands a new directory: the walk then finds what
+            # was already inside it, and the new watch everything written after.
+            if any(change in (Change.added, Change.deleted) for change, _ in changes):
+                await self._rearm_tree()
+            await self._on_change(changes)
+
+    async def _watch_tree(self, dirs: list[str], stop: asyncio.Event, armed: asyncio.Event) -> None:
+        """Recursive watch over *dirs*; sets *armed* once the OS watch exists."""
+        try:
+            async for changes in awatch(
+                *(self._root / d for d in dirs),
+                debounce=200,
+                step=100,
+                stop_event=stop,
+                watch_filter=None,
+                yield_on_timeout=True,
+                rust_timeout=_TREE_RUST_TIMEOUT_MS,
+            ):
+                armed.set()
+                if stop.is_set() or self._stop_event.is_set():
+                    break
+                if changes:
+                    await self._on_change(changes)
+        except Exception as exc:
+            if not armed.is_set():
+                raise  # the arming loop in _rearm_tree retries
+            # A watch that dies after arming would leave every included directory unwatched
+            # while the watcher looked alive -- stop it, and let run() raise, as an awatch
+            # failure did when there was only one watch.
+            logger.exception("Tree watch on {} failed", dirs)
+            self._tree_failure = exc
+            self.stop()
+
+    def _list_top_level_dirs(self) -> tuple[list[str], list[str]]:
+        """Return (watched, skipped) top-level directory names, each sorted."""
+        try:
+            names = sorted(e.name for e in os.scandir(self._root) if e.is_dir(follow_symlinks=False))
+        except OSError:
+            return [], []
+        watched = [n for n in names if self._scope.is_watch_root(n)]
+        return watched, [n for n in names if n not in watched]
+
+    async def _rearm_tree(self) -> None:
+        """Point the tree watch at the current set of top-level directories, if it changed.
+
+        The new watch is armed before the old one stops, so a re-arm can deliver a change
+        twice (``_pending`` and the hash gate absorb that) but never miss one.
+        """
+        loop = asyncio.get_running_loop()
+        async with self._rearm_lock:
+            for _ in range(_ARM_ATTEMPTS):
+                if self._stop_event.is_set():
+                    return
+                dirs, skipped = self._list_top_level_dirs()
+                if dirs == self._tree_dirs:
+                    return
+
+                stop = asyncio.Event()
+                task: asyncio.Task[None] | None = None
+                if dirs:
+                    armed = asyncio.Event()
+                    task = loop.create_task(self._watch_tree(dirs, stop, armed))
+                    armed_wait = loop.create_task(armed.wait())
+                    try:
+                        await asyncio.wait({task, armed_wait}, return_when=asyncio.FIRST_COMPLETED)
+                    except BaseException:
+                        stop.set()
+                        raise
+                    finally:
+                        armed_wait.cancel()
+                    if not armed.is_set():
+                        exc = None if task.cancelled() else task.exception()
+                        logger.warning("Tree watch on {} did not start ({!r}) -- re-listing", dirs, exc)
+                        continue
+
+                await self._stop_tree()
+                self._tree_dirs, self._tree_stop, self._tree_task = dirs, stop, task
+                logger.debug("Tree watch on {} top-level dir(s) {}; skipped {}", len(dirs), dirs, skipped)
+                return
+            logger.error("Tree watch could not start after {} attempts; keeping {}", _ARM_ATTEMPTS, self._tree_dirs)
+
+    async def _stop_tree(self) -> None:
+        """Stop the current tree watch and wait for its thread to exit."""
+        if self._tree_stop is not None:
+            self._tree_stop.set()
+        if self._tree_task is not None:
+            await asyncio.gather(self._tree_task, return_exceptions=True)
+        self._tree_dirs, self._tree_stop, self._tree_task = [], None, None
+
     def stop(self) -> None:
         """Signal the watcher to stop and cancel pending timers."""
         self._stop_event.set()
+        if self._tree_stop is not None:
+            self._tree_stop.set()
         if self._debounce_task is not None:
             self._debounce_task.cancel()
             self._debounce_task = None

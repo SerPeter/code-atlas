@@ -563,6 +563,45 @@ class TestScanFiles:
 # ---------------------------------------------------------------------------
 
 
+class TestIsWatchRoot:
+    """The top-level directories the watcher's recursive OS watch covers (ATL-195)."""
+
+    def test_every_exclude_source_is_honored(self, tmp_path):
+        for d in (".claude", ".venv", "custom", "gitignored", "atlasignored", "src"):
+            (tmp_path / d).mkdir()
+        _write(tmp_path, ".gitignore", "gitignored/\n")
+        _write(tmp_path, ".atlasignore", "/atlasignored/\n")
+
+        scope = FileScope(tmp_path, _make_settings(tmp_path, extend_exclude=["custom/"]))
+
+        assert scope.is_watch_root("src") is True
+        for d in (".claude", ".venv", "custom", "gitignored", "atlasignored"):
+            assert scope.is_watch_root(d) is False, d
+
+    def test_scope_paths_keep_only_directories_they_reach_into(self, tmp_path):
+        scope = FileScope(tmp_path, _make_settings(tmp_path, paths=["src/pkg", "lib"]))
+
+        assert scope.is_watch_root("src") is True
+        assert scope.is_watch_root("lib") is True
+        assert scope.is_watch_root("srcx") is False
+        assert scope.is_watch_root("docs") is False
+
+    def test_empty_scope_paths_restrict_nothing(self, tmp_path):
+        scope = FileScope(tmp_path, _make_settings(tmp_path, paths=[]))
+
+        assert scope.is_watch_root("docs") is True
+
+    @needs_symlinks
+    def test_symlinked_directory_is_not_watched(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+
+        scope = FileScope(tmp_path, _make_settings(tmp_path))
+
+        assert scope.is_watch_root("real") is True
+        assert scope.is_watch_root("link") is False
+
+
 class TestSubProjectScopeTranslation:
     def test_ancestor_path_covers_whole_sub_project(self):
         # global "training" covers sub-project "training/core" entirely

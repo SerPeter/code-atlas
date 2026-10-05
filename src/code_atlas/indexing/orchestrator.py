@@ -679,6 +679,18 @@ class FileScope:
 
         return False
 
+    def is_watch_root(self, name: str) -> bool:
+        """Whether top-level directory *name* can hold anything in scope, so the watcher must watch it.
+
+        The watcher's recursive OS watch covers only these directories: anything under one
+        that fails is never seen at all, rather than reported file by file and then rejected
+        by :meth:`is_included`. Same pruning as :meth:`scan` -- excluded or symlinked -- plus
+        the scope paths, since a directory no scope path reaches into can include nothing.
+        """
+        if self.is_dir_excluded(name) or (self._root / name).is_symlink():
+            return False
+        return not self._include_prefixes or any(p == name or p.startswith(name + "/") for p in self._include_prefixes)
+
     def _check_nested_gitignore(self, rel_dir: str) -> None:
         """Discover and cache *rel_dir*'s own ``.gitignore``, if not already checked.
 
