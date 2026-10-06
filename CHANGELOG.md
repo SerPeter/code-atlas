@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.15.1 (2026-10-06)
+
+### Performance Improvements
+
+- **watcher**: Keep excluded top-level directories out of the OS watch
+  ([#23](https://github.com/SerPeter/code-atlas/pull/23),
+  [`d1733dd`](https://github.com/SerPeter/code-atlas/commit/d1733dda1074587d3ba1d2c93b321e5013653ac4))
+
+
 ## v0.15.0 (2026-10-04)
 
 ### Bug Fixes
