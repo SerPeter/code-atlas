@@ -54,6 +54,23 @@ NO_EMBED = EmbeddingSettings(enabled=False)
 that don't need real or mocked embeddings."""
 
 
+@pytest.fixture(autouse=True)
+def _no_claude_session(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Detach every test from the Claude Code session that may be running pytest.
+
+    The hooks record where a session works under its ``CLAUDE_PID``, and the MCP server
+    follows that record. Run from inside a session, a test would inherit both: a hook test
+    would write its tmp-path cwd into the real session's record, and an MCP test would
+    re-root onto wherever the developer's session happens to be.
+    """
+    from code_atlas import hooks
+
+    for var in ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID"):
+        monkeypatch.delenv(var, raising=False)
+    state = tmp_path_factory.mktemp("hook-state")
+    monkeypatch.setattr(hooks, "_state_dir", lambda: state)
+
+
 # ---------------------------------------------------------------------------
 # Infrastructure endpoint discovery
 # ---------------------------------------------------------------------------

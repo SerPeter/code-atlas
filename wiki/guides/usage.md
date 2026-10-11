@@ -151,6 +151,19 @@ atlas hooks uninstall
 | `SubagentStart`                | The same card, inside every subagent (the only way to reach Explore/Plan)                                                                                                                                                                                                     |
 | `PostToolUse` Grep/Bash        | After a symbol-shaped grep the graph can answer: one line with the definition and dependent count                                                                                                                                                                             |
 | `PreToolUse` (`--strict` only) | Denies the first such grep, and the first Explore/general-purpose/Plan subagent or workflow, per agent                                                                                                                                                                        |
+| `CwdChanged`, every hook       | Nothing. They record where the main conversation works, so `atlas mcp` can follow it into a worktree                                                                                                                                                                          |
+
+**`atlas mcp` follows the session into a worktree.** Claude Code tells an MCP server nothing when a session enters a
+worktree: roots/list keeps naming the launch directory and the server's cwd never moves. The hooks see every move, so
+they record the main conversation's cwd per Claude Code process (`CLAUDE_PID`, so `/clear` does not lose it; a
+subagent's cwd never counts), and the server re-reads it on each tool call and every 5 s. The rule is the git root of
+that cwd: a `cd` inside the checkout stays on its root, anything under `.claude/worktrees/X` is X, and another
+repository is not followed. On a switch the server stops indexing the old checkout — releasing its indexer lease, so a
+standby session takes it — and indexes the worktree as its own `<dir>@<branch>` project, on that project's streams and
+lease. A `git switch` inside the worktree renames that project, and is followed the same way. Until the worktree's first
+index finishes, queries are answered from the main checkout's project. A worktree has no `atlas.local.toml` (it is
+gitignored), so it runs on this process's `[backend]` and `[embeddings]` unless it has one of its own. Installed hooks
+predating this need `atlas hooks install` again.
 
 Grep output is never replaced: grep is exhaustive over literal text and the graph is not, so a substitution would turn
 an index gap into a confident wrong answer. Strict blocks fire once per kind per agent — re-issuing the call is allowed
