@@ -3327,6 +3327,48 @@ class SqliteGraphClient:
             )
         await conn.commit()
 
+    async def read_embed_lines(
+        self,
+        uids: list[str],
+        *,
+        labels: list[str] | None = None,  # noqa: ARG002 — part of the GraphBackend contract, unused (unified table)
+    ) -> dict[str, list[str]]:
+        if not uids:
+            return {}
+        conn = await self._get_conn()
+        result: dict[str, list[str]] = {}
+        for chunk in _chunks(uids):
+            if not chunk:
+                continue
+            placeholders = ",".join("?" * len(chunk))
+            cur = await conn.execute(
+                f"SELECT uid, json_extract(props_json, '$.embed_lines') FROM nodes WHERE uid IN ({placeholders})", chunk
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for uid, lines in rows:
+                if lines is not None:
+                    result[uid] = json.loads(lines)
+        return result
+
+    async def write_embed_lines(
+        self,
+        items: list[tuple[str, list[str]]],
+        *,
+        labels: list[str] | None = None,  # noqa: ARG002 — part of the GraphBackend contract, unused (unified table)
+    ) -> None:
+        if not items:
+            return
+        conn = await self._get_conn()
+        for uid, lines in items:
+            # json_set, not json_patch: RFC 7386 merge-patch replaces an array whole too,
+            # but json_set says so without relying on it.
+            await conn.execute(
+                "UPDATE nodes SET props_json = json_set(props_json, '$.embed_lines', json(?)) WHERE uid = ?",
+                (json.dumps(lines), uid),
+            )
+        await conn.commit()
+
     async def write_embeddings_and_hashes(
         self,
         items: list[tuple[str, list[float], str]],

@@ -7,6 +7,7 @@ Uses litellm to route embedding requests to any OpenAI-compatible endpoint
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -542,6 +543,29 @@ def hash_text(text: str) -> str:
     because the graph is what stores it.
     """
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def embed_line_fingerprint(text: str) -> list[str]:
+    """One short hash per non-blank line of an embed text, the baseline a body edit is measured against.
+
+    Stripped, so re-indenting a block is not a change, and short (8 hex chars) because it is
+    stored on every embedded node and only ever compared line against line.
+    """
+    return [hashlib.blake2b(s.encode(), digest_size=4).hexdigest() for line in text.splitlines() if (s := line.strip())]
+
+
+def changed_line_ratio(baseline: list[str], current: list[str]) -> float:
+    """Share of lines that differ between two fingerprints: 0.0 identical, 1.0 nothing in common.
+
+    Counted against the longer of the two, so appending lines and deleting them weigh the same.
+    """
+    longest = max(len(baseline), len(current))
+    if longest == 0:
+        return 0.0
+    matched = sum(
+        block.size for block in difflib.SequenceMatcher(None, baseline, current, autojunk=False).get_matching_blocks()
+    )
+    return (longest - matched) / longest
 
 
 def build_embed_text(props: dict[str, Any]) -> str:

@@ -315,6 +315,14 @@ if TYPE_CHECKING:
             self, items: list[tuple[str, str]], *, labels: list[str] | None = None
         ) -> None: ...
 
+        async def read_embed_lines(
+            self, uids: list[str], *, labels: list[str] | None = None
+        ) -> dict[str, list[str]]: ...
+
+        async def write_embed_lines(
+            self, items: list[tuple[str, list[str]]], *, labels: list[str] | None = None
+        ) -> None: ...
+
         async def write_embeddings_and_hashes(
             self,
             items: list[tuple[str, list[float], str]],

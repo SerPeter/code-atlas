@@ -394,6 +394,16 @@ class EmbeddingSettings(StrictSection):
             "make sense of, which is a name and a value and never a semantic neighbour of anything."
         ),
     )
+    body_change_threshold: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Share of an entity's embed-text lines that must differ from the version last embedded "
+            "before a body-only change is re-embedded. Signature and docstring changes always are. "
+            "The graph node is updated either way; only the vector waits. 0 re-embeds every change."
+        ),
+    )
 
     provider: str = Field(default="tei", description="Embedding provider: 'tei', 'litellm', or 'ollama'.")
     model: str = Field(default="nomic-ai/nomic-embed-code", description="Embedding model name.")

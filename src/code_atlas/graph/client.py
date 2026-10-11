@@ -789,7 +789,9 @@ def _classify_file(
         elif (new_entity.docstring or "") != (old.docstring or ""):
             mod_significance[qn] = "MODERATE"
         else:
-            mod_significance[qn] = "HIGH"
+            # The body: the node is rewritten all the same, but whether its vector is
+            # bought again depends on how much of it moved (`body_change_threshold`).
+            mod_significance[qn] = "TRIVIAL"
 
     # Position shifts for unchanged entities
     shifted: list[ParsedEntity] = []
@@ -5141,6 +5143,43 @@ class GraphClient:
                 "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embed_hash = item.hash",
                 {"items": params},
             )
+
+    async def read_embed_lines(self, uids: list[str], *, labels: list[str] | None = None) -> dict[str, list[str]]:
+        """``{uid: embed_lines}`` -- the line fingerprint of the text last queued for embedding.
+
+        Absent for a node embedded before fingerprints existed; a caller treats that as
+        "no baseline", never as "nothing changed".
+        """
+        if not uids:
+            return {}
+        ret = "RETURN n.uid AS uid, n.embed_lines AS lines"
+        if labels is None or len(labels) != len(uids):
+            rows = await self.execute(f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}", {"uids": uids})
+        else:
+            by_label: dict[str, list[str]] = defaultdict(list)
+            for uid, lbl in zip(uids, labels, strict=True):
+                by_label[lbl].append(uid)
+            rows = []
+            for lbl, group in by_label.items():
+                _assert_valid_label(lbl)
+                rows += await self.execute(f"UNWIND $uids AS u MATCH (n:{lbl}) WHERE n.uid = u {ret}", {"uids": group})
+        return {r["uid"]: list(r["lines"]) for r in rows if r["lines"] is not None}
+
+    async def write_embed_lines(self, items: list[tuple[str, list[str]]], *, labels: list[str] | None = None) -> None:
+        """Record the line fingerprint of the text each node was just queued to embed."""
+        if not items:
+            return
+        query = "UNWIND $items AS item MATCH (n{label}) WHERE n.uid = item.uid SET n.embed_lines = item.lines"
+        if labels is not None and len(labels) == len(items):
+            by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for (uid, lines), lbl in zip(items, labels, strict=True):
+                by_label[lbl].append({"uid": uid, "lines": lines})
+            for lbl, group in by_label.items():
+                _assert_valid_label(lbl)
+                await self.execute_write(query.format(label=f":{lbl}"), {"items": group})
+        else:
+            params = [{"uid": uid, "lines": lines} for uid, lines in items]
+            await self.execute_write(query.format(label=""), {"items": params})
 
     async def write_embeddings_and_hashes(
         self,

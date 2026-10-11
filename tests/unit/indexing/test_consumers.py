@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from code_atlas.events import EmbedDirty, FileChanged, Topic, encode_event
+from code_atlas.events import EmbedDirty, EntityRef, FileChanged, Significance, Topic, encode_event
 from code_atlas.graph.client import UpsertResult
 from code_atlas.indexing.consumers import (
     _MAX_BATCH_FAILURES,
@@ -22,7 +22,7 @@ from code_atlas.indexing.consumers import (
     _retry_key,
 )
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship
-from code_atlas.schema import RelType
+from code_atlas.schema import NodeLabel, RelType
 from code_atlas.settings import AtlasSettings, EmbeddingSettings, IndexSettings
 
 if TYPE_CHECKING:
@@ -64,6 +64,9 @@ class StubGraph:
         self.rels_hash_writes: list[tuple[str, dict[str, str]]] = []
         self.gc_calls: int = 0
         self.embed_chunk_gc_calls: int = 0
+        #: uid -> (embed_hash, has_embedding) and uid -> embed_lines, for the embed gate.
+        self.embed_state: dict[str, tuple[str | None, bool]] = {}
+        self.embed_lines: dict[str, list[str]] = {}
 
     async def delete_file_entities(self, project_name: str, file_path: str) -> list[str]:
         self.deleted.append((project_name, file_path))
@@ -99,7 +102,13 @@ class StubGraph:
     async def read_embed_hashes(
         self, uids: list[str], *, labels: list[str] | None = None
     ) -> dict[str, tuple[str | None, bool]]:
-        return {}
+        return {u: self.embed_state[u] for u in uids if u in self.embed_state}
+
+    async def read_embed_lines(self, uids: list[str], *, labels: list[str] | None = None) -> dict[str, list[str]]:
+        return {u: self.embed_lines[u] for u in uids if u in self.embed_lines}
+
+    async def write_embed_lines(self, items: list[tuple[str, list[str]]], *, labels: list[str] | None = None) -> None:
+        self.embed_lines = {**self.embed_lines, **dict(items)}
 
     async def invalidate_stale_anchors(self, changed_uids: set[str]) -> int:
         return 0
@@ -1123,3 +1132,145 @@ async def test_code_is_untouched_by_the_default_policy(tmp_path: Path) -> None:
     queued = _embed_uids(await _index_one(tmp_path, "mod.py", body, settings))
 
     assert "proj:mod.handler" in queued
+
+
+# ---------------------------------------------------------------------------
+# Body-change gate: the node is rewritten, the vector waits
+# ---------------------------------------------------------------------------
+
+
+def _fn_text(body_lines: list[str]) -> str:
+    return "Module: m\ndef f(x):\n" + "\n".join(f"    {line}" for line in body_lines)
+
+
+async def _gate(
+    graph: StubGraph, text: str, sig: Significance, *, threshold: float = 0.25
+) -> tuple[list[str], ASTConsumer]:
+    from pathlib import Path
+
+    from code_atlas.search.embeddings import embed_line_fingerprint, hash_text
+
+    settings = AtlasSettings(project_root=Path(), embeddings=EmbeddingSettings(body_change_threshold=threshold))
+    bus = RecordingBus()
+    consumer = ASTConsumer(bus, graph, settings)  # ty: ignore[invalid-argument-type]
+    ref = EntityRef(qualified_name="proj:m.f", node_type="Callable", file_path="m.py")
+    await consumer._publish_embed_work({"proj:m.f": (ref, hash_text(text), sig, embed_line_fingerprint(text))})
+    return _embed_uids(bus), consumer
+
+
+def _embedded(graph: StubGraph, text: str) -> None:
+    """The graph holds a vector for *text*, with *text* as its baseline."""
+    from code_atlas.search.embeddings import embed_line_fingerprint, hash_text
+
+    graph.embed_state["proj:m.f"] = (hash_text(text), True)
+    graph.embed_lines["proj:m.f"] = embed_line_fingerprint(text)
+
+
+async def test_a_small_body_edit_keeps_the_vector() -> None:
+    body = [f"step_{i}()" for i in range(10)]
+    graph = StubGraph()
+    _embedded(graph, _fn_text(body))
+
+    queued, consumer = await _gate(graph, _fn_text([*body[:-1], "step_changed()"]), Significance.TRIVIAL)
+
+    assert queued == []
+    assert consumer.stats.embeds_held == 1
+
+
+async def test_a_large_body_edit_is_re_embedded_and_becomes_the_baseline() -> None:
+    from code_atlas.search.embeddings import embed_line_fingerprint
+
+    body = [f"step_{i}()" for i in range(10)]
+    graph = StubGraph()
+    _embedded(graph, _fn_text(body))
+    rewritten = _fn_text([f"other_{i}()" for i in range(5)] + body[5:])
+
+    queued, _ = await _gate(graph, rewritten, Significance.TRIVIAL)
+
+    assert queued == ["proj:m.f"]
+    assert graph.embed_lines["proj:m.f"] == embed_line_fingerprint(rewritten)
+
+
+async def test_small_edits_add_up_against_the_last_embedded_text() -> None:
+    """Measured against the previous version, ten one-line edits would each look trivial
+    and a half-rewritten function would never be re-embedded."""
+    body = [f"step_{i}()" for i in range(10)]
+    graph = StubGraph()
+    _embedded(graph, _fn_text(body))
+
+    held = 0
+    for i in range(10):
+        body[i] = f"edited_{i}()"
+        queued, _ = await _gate(graph, _fn_text(body), Significance.TRIVIAL)
+        if queued:
+            break
+        held += 1
+
+    assert 0 < held < 10, "held while small, re-embedded once enough of it moved"
+
+
+@pytest.mark.parametrize("sig", [Significance.HIGH, Significance.MODERATE])
+async def test_signature_and_docstring_changes_always_re_embed(sig: Significance) -> None:
+    body = [f"step_{i}()" for i in range(10)]
+    graph = StubGraph()
+    _embedded(graph, _fn_text(body))
+
+    queued, _ = await _gate(graph, _fn_text([*body[:-1], "tiny()"]), sig)
+
+    assert queued == ["proj:m.f"]
+
+
+async def test_no_baseline_or_no_vector_is_never_held() -> None:
+    """A node embedded before fingerprints existed, or one whose vector is missing."""
+    from code_atlas.search.embeddings import hash_text
+
+    old = _fn_text([f"step_{i}()" for i in range(10)])
+    new = _fn_text([f"step_{i}()" for i in range(9)] + ["x()"])
+    no_baseline = StubGraph()
+    no_baseline.embed_state["proj:m.f"] = (hash_text(old), True)
+    no_vector = StubGraph()
+    _embedded(no_vector, old)
+    no_vector.embed_state["proj:m.f"] = (hash_text(old), False)
+
+    assert (await _gate(no_baseline, new, Significance.TRIVIAL))[0] == ["proj:m.f"]
+    assert (await _gate(no_vector, new, Significance.TRIVIAL))[0] == ["proj:m.f"]
+
+
+async def test_threshold_zero_re_embeds_every_change() -> None:
+    body = [f"step_{i}()" for i in range(10)]
+    graph = StubGraph()
+    _embedded(graph, _fn_text(body))
+
+    queued, _ = await _gate(graph, _fn_text([*body[:-1], "tiny()"]), Significance.TRIVIAL, threshold=0.0)
+
+    assert queued == ["proj:m.f"]
+
+
+def test_a_body_only_change_is_rated_trivial() -> None:
+    from code_atlas.graph.client import EntityHashData, _classify_file
+
+    def entity(body: str, doc: str = "d", sig: str = "def f(x)") -> ParsedEntity:
+        return ParsedEntity(
+            name="f",
+            qualified_name="proj:m.f",
+            label=NodeLabel.CALLABLE,
+            kind="function",
+            line_start=1,
+            line_end=3,
+            file_path="m.py",
+            signature=sig,
+            docstring=doc,
+            source=body,
+            content_hash=body + doc + sig,
+        )
+
+    old = {"proj:m.f": EntityHashData("x", 1, 3, "def f(x)", "d", "Callable")}
+    strip = lambda uid: uid.split(":", 1)[1]  # noqa: E731
+
+    assert _classify_file(old, [entity("return 2")], strip).result.modified_significance == {"m.f": "TRIVIAL"}
+    assert _classify_file(old, [entity("return 2", doc="new")], strip).result.modified_significance == {
+        "m.f": "MODERATE"
+    }
+    assert _classify_file(old, [entity("return 2", sig="def f(y)")], strip).result.modified_significance == {
+        "m.f": "HIGH"
+    }
