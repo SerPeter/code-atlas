@@ -104,6 +104,7 @@ class _FakeDaemon:
     def __init__(self, status: dict, bus: object | None = None) -> None:
         self._status = {**self._DEFAULTS, **status}
         self.bus = bus
+        self.lease_owner: str | None = None
 
     def status(self) -> dict:
         return self._status
@@ -651,8 +652,8 @@ async def test_the_daemon_is_only_consulted_for_pipeline_liveness(tmp_path):
     since `daemon.bus` is None then -- exactly when someone is most likely to be asking
     what is wrong.
 
-    The caller passes the bus it holds; the daemon is consulted for one thing, which is
-    whether its pipeline tasks are alive.
+    The caller passes the bus it holds; the daemon is consulted for whether its pipeline
+    tasks are alive, and for whose the lease is -- never for a connection.
     """
     (tmp_path / ".git").mkdir()
     settings = AtlasSettings(project_root=tmp_path)
@@ -710,3 +711,22 @@ async def test_run_health_checks_closes_nothing_it_was_given(tmp_path):
     assert by_name["valkey"].status == CheckStatus.OK
     graph.close.assert_not_awaited()
     bus.close.assert_not_awaited()
+
+
+async def test_the_lease_this_session_holds_is_not_another_indexer():
+    """The MCP server's own daemon holds the lease while it indexes. Reporting that as
+    "another indexer is running" sent a reader looking for a second process that was the
+    one answering the health check."""
+    from code_atlas.server.health import check_indexer_lease
+
+    bus = AsyncMock()
+    bus.read_indexer_lease.return_value = "host:26851:ab12cd34"
+
+    own = await check_indexer_lease(bus, own_owner="host:26851:ab12cd34")
+    foreign = await check_indexer_lease(bus, own_owner="host:28933:ffffffff")
+
+    assert own is not None
+    assert own.status == CheckStatus.OK
+    assert "This session" in own.message
+    assert foreign is not None
+    assert foreign.status == CheckStatus.WARN
