@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -867,3 +868,85 @@ class TestDaemonCliWiring:
             await cli._run_daemon(no_embed=True)
 
         assert captured.get("include_watcher") is True
+
+
+# ---------------------------------------------------------------------------
+# Index checkpoint follows HEAD
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointFollowsHead:
+    """The holder re-runs its catch-up when HEAD moves past the stored git_hash.
+
+    Live events kept the content current but nothing but an index pass writes git_hash, so a
+    session that indexed for days reported every commit since startup as unindexed -- and a
+    startup catch-up that failed was never retried.
+    """
+
+    @pytest.fixture
+    async def holder(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        import os
+
+        monkeypatch.setattr(daemon_module, "_CHECKPOINT_POLL_S", 0.01)
+        monkeypatch.setattr(daemon_module, "ASTConsumer", lambda bus, graph, settings, **kw: FakeConsumer("ast-0"))
+        git = tmp_path / ".git"
+        git.mkdir()
+        state: dict[str, Any] = {"stored": "a" * 40, "catchups": [], "head": git / "HEAD"}
+
+        def set_head(sha: str) -> None:
+            state["head"].write_text(sha + "\n", encoding="utf-8")
+            later = time.time() + len(state["catchups"]) + 1  # a fresh mtime defeats the HEAD cache
+            os.utime(state["head"], (later, later))
+
+        set_head("a" * 40)
+        state["set_head"] = set_head
+
+        class Graph:
+            async def get_project_git_hash(self, _name: str) -> str | None:
+                return state["stored"]
+
+        manager = DaemonManager()
+        manager._settings, manager._graph = _make_settings(tmp_path), Graph()  # ty: ignore[invalid-assignment]
+        manager._bus, manager._limiter = FakeBus(object()), unpaced()  # ty: ignore[invalid-assignment]
+        manager._consumers = manager._build_consumers()
+        manager._start_consumers()
+        state["first"] = list(manager._consumers)
+
+        async def catchup(*_args: Any, **_kw: Any) -> None:
+            state["catchups"].append({"paused": all(c.stopped for c in state["first"])})
+            state["stored"] = state["head"].read_text(encoding="utf-8").strip()  # a drained pass stamps HEAD
+
+        manager._catchup = catchup  # ty: ignore[invalid-assignment]
+        state["manager"] = manager
+        return state
+
+    async def test_a_commit_is_caught_up_with_the_consumers_paused(self, holder: dict[str, Any]) -> None:
+        manager: DaemonManager = holder["manager"]
+        holder["set_head"]("b" * 40)
+        task = asyncio.create_task(manager._run_checkpointer())
+        try:
+            for _ in range(200):
+                if holder["catchups"]:
+                    break
+                await asyncio.sleep(0.01)
+            assert holder["catchups"] == [{"paused": True}], "the inline pipeline never shares consumer names"
+            assert holder["stored"] == "b" * 40
+            await asyncio.sleep(0.05)
+            assert len(holder["catchups"]) == 1, "an advanced checkpoint is not chased again"
+            assert manager._consumers
+            assert manager._consumers[0] is not holder["first"][0]
+            assert all(not t.done() for t in manager._consumer_tasks), "the consumers came back"
+            assert set(manager._consumer_tasks) <= set(manager._tasks)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await manager._stop_stack()
+
+    async def test_nothing_runs_while_head_is_at_the_checkpoint(self, holder: dict[str, Any]) -> None:
+        manager: DaemonManager = holder["manager"]
+        manager._checkpointer = asyncio.create_task(manager._run_checkpointer())
+        await asyncio.sleep(0.1)
+
+        assert holder["catchups"] == []
+        await manager._stop_stack()
+        assert manager._checkpointer is None, "stopping the stack stops the poll"
