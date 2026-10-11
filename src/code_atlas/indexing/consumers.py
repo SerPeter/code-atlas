@@ -202,10 +202,12 @@ _ABANDONED_MIN_IDLE_MS = 120_000
 _STAGE_BY_TOPIC = {Topic.FILE_CHANGED: "ast", Topic.EMBED_DIRTY: "embed"}
 
 # The AST consumer's default batch window. Also sets the blocking read: block_ms is
-# max(100, time_window_s * 1000 // 2), so 3.0s here means every XREADGROUP blocks 1.5s.
+# max(100, time_window_s * 1000 // 2), so 1.0s here means every XREADGROUP blocks 0.5s.
+# Short because it sits on the path from an edit to a findable node, behind the watcher's
+# own debounce (see WatcherSettings); 3.0s was a third of a single edit's latency.
 # Named so the integration suite can shrink it. Do NOT shrink it to 0 -- `is_reindex`
 # below tests `time_window_s == 0` and zero silently switches the resolution cadence.
-_AST_WINDOW_S = 3.0
+_AST_WINDOW_S = 1.0
 
 # How often a paused consumer re-checks whether the foreign lease has been released.
 _LEASE_POLL_S = 1.0
