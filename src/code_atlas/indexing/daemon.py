@@ -21,6 +21,7 @@ from code_atlas.events import INDEXER_LEASE_TTL_MS, EventBus, Topic, new_lease_o
 from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
     FileScope,
+    StalenessChecker,
     detect_sub_projects,
     gc_vanished_worktree_projects,
     index_monorepo,
@@ -64,6 +65,12 @@ _STANDBY_POLL_JITTER = 0.5
 # asked it to yield. Well inside the TTL, and short because whoever asked is waiting.
 _HOLDER_TICK_S = 5.0
 
+# How often the indexer compares HEAD with the stored ``git_hash`` checkpoint, and the
+# ceiling its retries back off to when a catch-up cannot advance it (graph down, drain
+# timed out). A poll is two file stats and one graph read.
+_CHECKPOINT_POLL_S = 30.0
+_CHECKPOINT_BACKOFF_MAX_S = 900.0
+
 
 @dataclass
 class DaemonManager:
@@ -96,6 +103,8 @@ class DaemonManager:
     _active: bool = field(default=False, repr=False)
     _elector: asyncio.Task[None] | None = field(default=None, repr=False)
     _activation: asyncio.Task[None] | None = field(default=None, repr=False)
+    _consumer_tasks: list[asyncio.Task[None]] = field(default_factory=list, repr=False)
+    _checkpointer: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
     def standby(self) -> bool:
@@ -238,33 +247,7 @@ class DaemonManager:
         except Exception:
             logger.exception("Worktree GC sweep failed — continuing startup")
 
-        embed: EmbedClient | None = None
-        if settings.embeddings.enabled:
-            embed = EmbedClient(settings.embeddings, limiter=limiter)
-            self._embed = embed
-
-        consumers: list[ASTConsumer | EmbedConsumer] = [
-            ASTConsumer(
-                bus,
-                graph,
-                settings,
-                cooldown_s=settings.watcher.cooldown_s,
-                defer_to_lease=True,
-                lease_owner=self._owner,
-            ),
-        ]
-        if embed is not None:
-            consumers.append(
-                EmbedConsumer(
-                    bus,
-                    graph,
-                    embed,
-                    defer_to_lease=True,
-                    lease_owner=self._owner,
-                    embedding_policy=EmbedPolicy.from_settings(settings.embeddings),
-                )
-            )
-        self._consumers = consumers
+        self._consumers = self._build_consumers()
 
         if self._include_watcher:
             scope = FileScope(settings.project_root, settings)
@@ -300,10 +283,12 @@ class DaemonManager:
         elif first_index_ready is not None:
             first_index_ready.set()
 
-        for consumer in self._consumers:
-            self._tasks.append(asyncio.get_running_loop().create_task(self._run_consumer(consumer)))
+        self._start_consumers()
 
         self._start_backlog_sampler()
+
+        if self._include_watcher:
+            self._checkpointer = asyncio.get_running_loop().create_task(self._run_checkpointer())
 
         # Extra vaults (global vault, harness memory dir) live outside project_root,
         # so each gets its own FileWatcher instance rather than riding the main
@@ -315,6 +300,113 @@ class DaemonManager:
                 await self._start_vault(vault, settings, graph, bus, catchup=self._catchup_enabled)
             except Exception:
                 logger.exception("Failed to start extra vault '{}' — continuing without it", vault.project_name)
+
+    def _build_consumers(self) -> list[ASTConsumer | EmbedConsumer]:
+        """The AST consumer, plus the embed consumer when embeddings are on, under this process's lease."""
+        settings, graph, bus, limiter = self._settings, self._graph, self._bus, self._limiter
+        assert settings is not None
+        assert graph is not None
+        assert bus is not None
+        assert limiter is not None
+        embed: EmbedClient | None = None
+        if settings.embeddings.enabled:
+            embed = EmbedClient(settings.embeddings, limiter=limiter)
+        self._embed = embed
+
+        consumers: list[ASTConsumer | EmbedConsumer] = [
+            ASTConsumer(
+                bus,
+                graph,
+                settings,
+                cooldown_s=settings.watcher.cooldown_s,
+                defer_to_lease=True,
+                lease_owner=self._owner,
+            ),
+        ]
+        if embed is not None:
+            consumers.append(
+                EmbedConsumer(
+                    bus,
+                    graph,
+                    embed,
+                    defer_to_lease=True,
+                    lease_owner=self._owner,
+                    embedding_policy=EmbedPolicy.from_settings(settings.embeddings),
+                )
+            )
+        return consumers
+
+    def _start_consumers(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._consumer_tasks = [loop.create_task(self._run_consumer(consumer)) for consumer in self._consumers]
+        self._tasks.extend(self._consumer_tasks)
+
+    async def _run_checkpointer(self) -> None:
+        """Re-run the catch-up whenever HEAD moves past the stored ``git_hash`` checkpoint.
+
+        Live events keep the graph's *content* current, but only an index pass writes
+        ``git_hash``. So a session that indexed for days left the checkpoint wherever its
+        startup catch-up put it: every staleness report counted every commit since, every
+        query answer carried the whole diff as ``changed_files``, and a startup catch-up
+        that failed (Memgraph away for a moment) was never retried at all.
+
+        The catch-up is the existing delta pass, so it keeps the existing guarantee: the
+        checkpoint advances only when the pipeline drained. The hash gate keeps it cheap --
+        the watcher has already handled nearly every file the diff names.
+        """
+        assert self._settings is not None
+        assert self._graph is not None
+        graph = self._graph
+        checker = StalenessChecker(self._settings.project_root)
+        wait = _CHECKPOINT_POLL_S
+        seen: str | None = None
+        while True:
+            await asyncio.sleep(wait)
+            try:
+                head = checker.current_head()
+                stored = await graph.get_project_git_hash(checker.project_name)
+                if head is None or head == stored:
+                    seen, wait = None, _CHECKPOINT_POLL_S
+                    continue
+                if head != seen:
+                    # Moved since the last look: one more poll lets a rebase or a merge finish first.
+                    seen = head
+                    continue
+                logger.info(
+                    "HEAD {} is past the index checkpoint ({}) — running a catch-up pass",
+                    head[:8],
+                    stored[:8] if stored else "none",
+                )
+                await self._refresh_checkpoint()
+                advanced = await graph.get_project_git_hash(checker.project_name) != stored
+                wait = _CHECKPOINT_POLL_S if advanced else min(wait * 2, _CHECKPOINT_BACKOFF_MAX_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Index checkpoint refresh failed — retrying")
+                wait = min(wait * 2, _CHECKPOINT_BACKOFF_MAX_S)
+
+    async def _refresh_checkpoint(self) -> None:
+        """Pause the consumers, run the catch-up, resume them: the order activation uses.
+
+        The catch-up's inline pipeline runs under this process's consumer names, so the two
+        must never coexist (see ``_activate``). The watcher keeps running; what it publishes
+        meanwhile is drained by the catch-up or waits in the stream for the new consumers.
+        """
+        settings, graph, bus, limiter = self._settings, self._graph, self._bus, self._limiter
+        assert settings is not None
+        assert graph is not None
+        assert bus is not None
+        assert limiter is not None
+        for consumer in self._consumers:
+            consumer.stop()
+        await asyncio.gather(*self._consumer_tasks, return_exceptions=True)
+        self._tasks = [t for t in self._tasks if t not in self._consumer_tasks]
+        try:
+            await self._catchup(settings, graph, bus, limiter)
+        finally:
+            self._consumers = self._build_consumers()
+            self._start_consumers()
 
     def _spawn_activation(self, first_index_ready: asyncio.Event | None) -> asyncio.Task[None]:
         """Start the stack as a task, so the elector can cancel it on a yield mid catch-up."""
@@ -566,6 +658,13 @@ class DaemonManager:
 
     async def _stop_stack(self) -> None:
         """Stop watcher, vault watchers and consumers, and forget them, so a takeover rebuilds."""
+        # First, and cancelled rather than flagged: it sleeps between polls, and a refresh it
+        # is running would restart the consumers this is about to stop.
+        checkpointer, self._checkpointer = self._checkpointer, None
+        if checkpointer is not None:
+            checkpointer.cancel()
+            await asyncio.gather(checkpointer, return_exceptions=True)
+
         if self._watcher is not None:
             self._watcher.stop()
 
@@ -584,6 +683,7 @@ class DaemonManager:
                 task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._consumer_tasks = []
         self._watcher = None
         self._vault_watchers = []
         self._consumers = []
