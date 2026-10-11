@@ -38,7 +38,14 @@ from code_atlas.graph.client import _CONFIG_REF_REL_TYPES, EmbedChunkWrite
 from code_atlas.parsing.ast import ParsedEntity, ParsedFile, ParsedRelationship, parse_file
 from code_atlas.parsing.detectors import DetectorResult, get_enabled_detectors, run_detectors
 from code_atlas.schema import NodeLabel, RelType
-from code_atlas.search.embeddings import _CODE_ENTITY_LABELS, EmbedPolicy, build_embed_text, hash_text
+from code_atlas.search.embeddings import (
+    _CODE_ENTITY_LABELS,
+    EmbedPolicy,
+    build_embed_text,
+    changed_line_ratio,
+    embed_line_fingerprint,
+    hash_text,
+)
 from code_atlas.settings import EmbeddingSettings, derive_project_name, extraction_key
 from code_atlas.telemetry import get_metrics, get_tracer, timed_phase
 
@@ -680,26 +687,23 @@ class TierConsumer(ABC):
 # AST stage: parse + graph write (medium cost)
 # ---------------------------------------------------------------------------
 
-# Significance levels for the AST → Embed gate
+# Significance levels for the AST → Embed gate, decided per entity
 #
-# | Condition                                  | Level    | Action       |
-# |--------------------------------------------|----------|--------------|
-# | Docstring-only changed                     | MODERATE | Gate through |
-# | Signature/body/name/tags/visibility change | HIGH     | Gate through |
-# | Entity added/deleted                       | HIGH     | Always gate  |
+# | Condition                  | Level    | Re-embedded when                                      |
+# |----------------------------|----------|-------------------------------------------------------|
+# | Entity added               | HIGH     | always                                                |
+# | Signature changed          | HIGH     | always                                                |
+# | Docstring changed          | MODERATE | always                                                |
+# | Anything else (the body)   | TRIVIAL  | >= body_change_threshold of its lines moved since the |
+# |                            |          | text last queued for embedding (embed_lines)          |
 #
-# Whitespace-only file changes never reach classification — the file hash
-# gate strips whitespace (_compute_file_hash). Every added|modified entity
-# becomes an embed candidate; the embed_hash gate (read_embed_hashes) is
-# what suppresses re-embedding when the embed text is unchanged.
-
-
-_SIG_ORDER: dict[Significance, int] = {
-    Significance.NONE: 0,
-    Significance.TRIVIAL: 1,
-    Significance.MODERATE: 2,
-    Significance.HIGH: 3,
-}
+# The node itself is rewritten in every case -- name, source, edges and keyword
+# search are current at once; only the vector waits. The baseline is the last
+# *embedded* text, not the previous version, so small edits add up: an agent
+# nudging one function every few seconds re-embeds it once enough of it has
+# moved, rather than on every save or never. An unchanged embed text is never
+# re-embedded (embed_hash), and whitespace-only file changes never reach
+# classification (the file hash gate strips whitespace).
 
 
 # Labels a citation can resolve to. A batch that adds or changes one of these
@@ -720,6 +724,8 @@ class ASTStats:
     entities_modified: int = 0
     entities_deleted: int = 0
     entities_unchanged: int = 0
+    #: Body-only changes whose vector was kept: below `body_change_threshold`.
+    embeds_held: int = 0
 
 
 @dataclass(frozen=True)
@@ -1349,6 +1355,54 @@ class ASTConsumer(TierConsumer):
             citations={e.qualified_name: list(e.citations) for e in parsed.entities if e.citations},
         )
 
+    async def _publish_embed_work(self, candidates: dict[str, tuple[EntityRef, str, Significance, list[str]]]) -> None:
+        """Queue the candidates whose vector is missing or worth buying again.
+
+        Skips an unchanged embed text, and holds a body-only change until enough of its lines
+        moved since the text last queued (`body_change_threshold`). What it queues, it records
+        as the new baseline -- at queue time, so a burst of edits is measured against the text
+        that will actually be embedded rather than against one still in flight.
+        """
+        uids = list(candidates)
+        labels = [candidates[uid][0].node_type for uid in uids]
+        stored = await self.graph.read_embed_hashes(uids, labels=labels)
+
+        threshold = self.settings.embeddings.body_change_threshold
+        body_only = [
+            uid
+            for uid in uids
+            if candidates[uid][2] == Significance.TRIVIAL
+            and (info := stored.get(uid)) is not None
+            and info[1]
+            and info[0] != candidates[uid][1]
+        ]
+        baselines = (
+            await self.graph.read_embed_lines(body_only, labels=[candidates[u][0].node_type for u in body_only])
+            if body_only and threshold > 0
+            else {}
+        )
+
+        queued: list[tuple[EntityRef, Significance, list[str]]] = []
+        for uid, (ref, text_hash, sig, lines) in candidates.items():
+            info = stored.get(uid)
+            if info is not None and info[1]:
+                if info[0] == text_hash:
+                    continue  # graph hit — embedding still valid
+                base = baselines.get(uid)
+                if base is not None and changed_line_ratio(base, lines) < threshold:
+                    self.stats.embeds_held += 1
+                    continue
+            queued.append((ref, sig, lines))
+
+        if queued:
+            await self.bus.publish_many(
+                Topic.EMBED_DIRTY, [EmbedDirty(entity=ref, significance=sig) for ref, sig, _ in queued]
+            )
+            await self.graph.write_embed_lines(
+                [(ref.qualified_name, lines) for ref, _, lines in queued],
+                labels=[ref.node_type for ref, _, _ in queued],
+            )
+
     async def process_batch(self, events: list[Event], batch_id: str) -> set[str]:  # noqa: PLR0912, PLR0915
         deferred_keys: set[str] = set()
         with _tracer.start_as_current_span("ast.process_batch", attributes={"batch_id": batch_id}) as span:
@@ -1390,11 +1444,11 @@ class ASTConsumer(TierConsumer):
             total_paths = sum(len(p) for p in groups.values())
             logger.debug("AST batch {}: {} unique path(s) in {} group(s)", batch_id, total_paths, len(groups))
 
-            embed_candidates: dict[str, tuple[EntityRef, str]] = {}  # uid → (ref, text_hash)
+            # uid → (ref, text_hash, significance, line fingerprint)
+            embed_candidates: dict[str, tuple[EntityRef, str, Significance, list[str]]] = {}
             changed_uids: set[str] = set()  # accumulated across every group in this batch
             skipped_before = self.stats.files_skipped
             total_changed = 0
-            batch_max_sig = Significance.NONE
 
             for (event_project_name, event_project_root), unique_paths in groups.items():
                 project_name = event_project_name or derive_project_name(Path(self.settings.project_root))
@@ -1493,8 +1547,6 @@ class ASTConsumer(TierConsumer):
                     deleted = await self.graph.delete_file_entities(project_name, fp)
                     self.stats.files_deleted += 1
                     self.stats.entities_deleted += len(deleted)
-                    if deleted:
-                        batch_max_sig = Significance.HIGH
 
                 # Relationship fingerprints of what step 3 (and step 4b) actually write,
                 # keyed by file. Persisted with the file hashes at step 6, on the same
@@ -1606,20 +1658,6 @@ class ASTConsumer(TierConsumer):
 
                         total_changed += len(changed_qns)
 
-                        # Compute file-level significance
-                        if result.added or result.deleted:
-                            file_sig = Significance.HIGH
-                        elif result.modified_significance:
-                            file_sig = max(
-                                (Significance(v) for v in result.modified_significance.values()),
-                                key=lambda s: _SIG_ORDER[s],
-                            )
-                        else:
-                            file_sig = Significance.NONE
-
-                        if _SIG_ORDER[file_sig] > _SIG_ORDER[batch_max_sig]:
-                            batch_max_sig = file_sig
-
                         entity_map = {
                             (e.qualified_name.split(":", 1)[1] if ":" in e.qualified_name else e.qualified_name): e
                             for e in pfd.entities
@@ -1662,8 +1700,17 @@ class ASTConsumer(TierConsumer):
                                 }
                                 text = build_embed_text(props)
                                 if text:
-                                    text_hash = hash_text(text)
-                                    embed_candidates[entity.qualified_name] = (ref, text_hash)
+                                    sig = (
+                                        Significance.HIGH
+                                        if qn in result.added
+                                        else Significance(result.modified_significance.get(qn, Significance.HIGH))
+                                    )
+                                    embed_candidates[entity.qualified_name] = (
+                                        ref,
+                                        hash_text(text),
+                                        sig,
+                                        embed_line_fingerprint(text),
+                                    )
 
                 # 6. Withhold EVERY processed file's hash until the deferred flush.
                 #    A hash written before _flush_deferred_resolution completes lets a
@@ -1775,30 +1822,8 @@ class ASTConsumer(TierConsumer):
                 total_changed,
             )
 
-            if (
-                self.settings.embeddings.enabled
-                and embed_candidates
-                and _SIG_ORDER[batch_max_sig] >= _SIG_ORDER[Significance.MODERATE]
-            ):
-                # Batch-read stored embed_hashes to filter graph hits
-                cand_uids = list(embed_candidates.keys())
-                cand_labels = [embed_candidates[uid][0].node_type for uid in cand_uids]
-                stored = await self.graph.read_embed_hashes(cand_uids, labels=cand_labels)
-
-                to_publish: list[EntityRef] = []
-                for uid, (ref, text_hash) in embed_candidates.items():
-                    stored_info = stored.get(uid)
-                    if stored_info is not None:
-                        stored_hash, has_embedding = stored_info
-                        if stored_hash == text_hash and has_embedding:
-                            continue  # graph hit — embedding still valid
-                    to_publish.append(ref)
-
-                if to_publish:
-                    await self.bus.publish_many(
-                        Topic.EMBED_DIRTY,
-                        [EmbedDirty(entity=ref, significance=batch_max_sig) for ref in to_publish],
-                    )
+            if self.settings.embeddings.enabled and embed_candidates:
+                await self._publish_embed_work(embed_candidates)
 
         return deferred_keys
 

@@ -436,3 +436,68 @@ class TestHealthCheck:
         result = await _invoke_tool(app_ctx, "health_check")
         memgraph_check = next(c for c in result["checks"] if c["name"] == "memgraph")
         assert "SQLite (embedded)" in memgraph_check["message"]
+
+
+# ---------------------------------------------------------------------------
+# Body-change gate, end to end: the node is current at once, the vector waits
+# ---------------------------------------------------------------------------
+
+
+class TestBodyChangeGate:
+    """Real index passes on the embedded graph, the provider stubbed at its one network call."""
+
+    @staticmethod
+    def _source(body: list[str]) -> str:
+        lines = "".join(f"    {b}\n" for b in body)
+        return 'def worker(x: int) -> int:\n    """Do the work."""\n' + lines + "    return x\n"
+
+    async def test_small_body_edits_update_the_node_and_wait_for_the_vector(self, tmp_path: Path) -> None:
+        from code_atlas.backends import use_backends
+        from code_atlas.bench import stub_provider
+        from code_atlas.indexing.orchestrator import index_project
+
+        root = tmp_path / "repo"
+        body = [f"x = step_{i}(x)" for i in range(10)]
+        _write(root, "work.py", self._source(body))
+        _git(root, "init")
+        settings = AtlasSettings(
+            project_root=root,
+            backend=BackendSettings(graph={"sqlite": {}}, queue={"sqlite": {}}),
+            embeddings=EmbeddingSettings(provider="openai", model="stub-model", dimension=8),
+        )
+
+        async def edit_and_index(new_body: list[str]) -> tuple[bool, str]:
+            """Commit the edit (delta mode reads what git reports), index, and say whether the
+            vector was bought again -- by its stored hash, since every run also makes one
+            dimension-probe call to the provider."""
+            _write(root, "work.py", self._source(new_body))
+            _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "edit")
+            rows = await b.graph.get_node_exact_matches("worker", "", 5)
+            uid = rows[0]["n"]["uid"]
+            before = (await b.graph.read_embed_hashes([uid]))[uid][0]
+            await index_project(settings, b.graph, b.bus, limiter=unpaced(), drain_timeout_s=60)  # ty: ignore[invalid-argument-type]
+            after = (await b.graph.read_embed_hashes([uid]))[uid][0]
+            rows = await b.graph.get_node_exact_matches("worker", "", 5)
+            return after != before, rows[0]["n"].get("source") or ""
+
+        with stub_provider(8):
+            async with use_backends(settings) as b:
+                await b.graph.ensure_schema()
+                await index_project(settings, b.graph, b.bus, limiter=unpaced(), drain_timeout_s=60)  # ty: ignore[invalid-argument-type]
+                _git(root, "add", "-A")
+                _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial")
+
+                body[3] = "x = tweak(x)"
+                re_embedded, source = await edit_and_index(body)
+                assert not re_embedded, "one changed line does not buy a new vector"
+                assert "tweak(x)" in source, "the node itself is current at once"
+
+                # The embed text is 16 lines (signature and docstring ride along with the source),
+                # so a quarter is 4: this edit's 3 plus the one held above.
+                body[4], body[5], body[6] = "x = more(x)", "x = again(x)", "x = still(x)"
+                re_embedded, _ = await edit_and_index(body)
+                assert re_embedded, "four lines changed since the last embed, counted together"
+
+                body[7] = "x = one_more(x)"
+                re_embedded, _ = await edit_and_index(body)
+                assert not re_embedded, "the re-embedded text is the new baseline"

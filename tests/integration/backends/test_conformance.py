@@ -80,6 +80,7 @@ _COMPARED: frozenset[str] = frozenset(
         "trace_path_between",
         "get_project_file_paths",
         "read_embed_hashes",
+        "read_embed_lines",
         "find_embeddings_by_hash",
         "find_embedded_entities",
         "clear_embeddings_for_uids",
@@ -113,6 +114,7 @@ _NOT_COMPARED: dict[str, str] = {
     "write_embeddings": "write path; read back by find_embeddings_by_hash",
     "write_embeddings_and_hashes": "write path; read back by read_embed_hashes",
     "write_embed_hashes": "write path; read back by read_embed_hashes",
+    "write_embed_lines": "write path; read back by read_embed_lines",
     # Partly compared: its *scope* is, by TestTheDefectsThatMotivatedThis
     # .test_a_scoped_embedding_clear_reaches_the_same_projects. The counts it returns are
     # not, so it stays here rather than moving to _COMPARED.
@@ -666,6 +668,16 @@ class TestSharedSurfaceAgrees:
         mg, lite = both
         uids = [f"{PROJECT}:mod.caller", f"{PROJECT}:mod.absent"]
         assert await mg.read_embed_hashes(uids) == await lite.read_embed_hashes(uids)
+
+    async def test_read_embed_lines(self, both):
+        """The body-change gate's baseline: written, read back, absent where never written."""
+        mg, lite = both
+        written, absent = f"{PROJECT}:mod.caller", f"{PROJECT}:mod.absent"
+        lines = ["d85d9bd4", "80974876"]
+        for backend in (mg, lite):
+            await backend.write_embed_lines([(written, lines)], labels=["Callable"])
+        assert await mg.read_embed_lines([written, absent]) == await lite.read_embed_lines([written, absent])
+        assert await lite.read_embed_lines([written, absent], labels=["Callable", "Callable"]) == {written: lines}
 
     async def test_find_embeddings_by_hash(self, both):
         mg, lite = both
