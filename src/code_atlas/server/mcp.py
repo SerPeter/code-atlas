@@ -203,6 +203,9 @@ _ROOTS_TIMEOUT = 2.0  # seconds — fast fail for broken/missing clients
 # through the real five seconds -- a third of that suite's runtime in two tests.
 _STALENESS_TIMEOUT_S = 5.0
 
+# How many of the files changed since the index checkpoint an answer lists.
+_CHANGED_FILES_SHOWN = 20
+
 
 def _file_uri_to_path(uri: str) -> Path:
     """Convert a ``file://`` URI to a local :class:`Path` (cross-platform)."""
@@ -778,7 +781,10 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
     if info.stale:
         result["stale_since"] = info.last_indexed_commit
         if info.changed_files:
-            result["changed_files"] = info.changed_files
+            # Capped: the diff since the checkpoint rode along on every answer, and a
+            # checkpoint days behind made each one ~165 kB -- truncated by the client.
+            result["changed_files"] = info.changed_files[:_CHANGED_FILES_SHOWN]
+            result["changed_files_total"] = len(info.changed_files)
 
     # Surface live catchup/watch backlog when non-trivial — lets a caller tell
     # "stale, but actively catching up" apart from "stale, nothing is happening".
