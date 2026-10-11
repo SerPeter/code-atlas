@@ -717,11 +717,20 @@ class ObservabilitySettings(StrictSection):
 
 
 class WatcherSettings(StrictSection):
-    """File watcher debounce settings."""
+    """File watcher debounce settings.
 
-    debounce_s: float = Field(default=5.0, description="Debounce timer in seconds (resets per change).")
-    max_wait_s: float = Field(default=30.0, description="Max-wait ceiling in seconds (per batch).")
-    cooldown_s: float = Field(default=10.0, description="Per-file cooldown after processing (seconds). 0 disables.")
+    Sized for an agent editing every few seconds, not for a human saving once a minute. At
+    5s / 30s / 10s each edit reset the debounce before it fired, so nothing was published
+    until the agent paused: a function written at the start of a burst of edits 3s apart
+    was not findable for 23s. At 1s / 5s / 2s every edit in that burst is findable in ~2.2s
+    (watcher + parse + graph write, embedded SQLite). Embedding cost does not move with
+    these: the embed stage keeps its own 10s window and coalesces repeated edits of one
+    entity there, and an unchanged text is never re-embedded.
+    """
+
+    debounce_s: float = Field(default=1.0, description="Debounce timer in seconds (resets per change).")
+    max_wait_s: float = Field(default=5.0, description="Max-wait ceiling in seconds (per batch).")
+    cooldown_s: float = Field(default=2.0, description="Per-file cooldown after processing (seconds). 0 disables.")
 
 
 class HealthSettings(StrictSection):
