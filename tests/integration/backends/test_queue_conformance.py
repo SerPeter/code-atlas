@@ -283,8 +283,10 @@ async def test_an_expired_lease_passes_on(make_bus) -> None:
 
 
 async def test_projects_are_isolated(make_bus) -> None:
+    # A checkout and one of its worktrees: `derive_project_name` gives the worktree
+    # `<base>@<branch>`, so the two names share a prefix -- the pair most likely to collide.
     suffix = uuid.uuid4().hex[:6]
-    alpha, beta = make_bus(f"test-alpha-{suffix}"), make_bus(f"test-beta-{suffix}")
+    alpha, beta = make_bus(f"test-alpha-{suffix}"), make_bus(f"test-alpha-{suffix}@lane")
     try:
         await alpha.ping()
     except Exception as exc:
