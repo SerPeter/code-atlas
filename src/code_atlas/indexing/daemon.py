@@ -112,6 +112,11 @@ class DaemonManager:
         return self._elector is not None and not self._active
 
     @property
+    def lease_owner(self) -> str | None:
+        """This process's identity on the indexer lease, once ``start()`` has run."""
+        return self._owner
+
+    @property
     def bus(self) -> EventBus | None:
         """The event bus this manager is actually running on (``None`` before ``start()``).
 

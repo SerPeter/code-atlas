@@ -272,7 +272,10 @@ async def check_index(graph: GraphClient, settings: AtlasSettings) -> CheckResul
 
 
 async def check_indexer_lease(
-    bus: EventBus | SqliteEventBus | PostgresEventBus | None, *, timeout_s: float = _DEFAULTS.connect_timeout_s
+    bus: EventBus | SqliteEventBus | PostgresEventBus | None,
+    *,
+    timeout_s: float = _DEFAULTS.connect_timeout_s,
+    own_owner: str | None = None,
 ) -> CheckResult | None:
     """Report a foreign indexer holding the lease.
 
@@ -282,6 +285,10 @@ async def check_indexer_lease(
 
     Returns ``None`` when the lease is free — a check that says nothing when there is
     nothing to say, rather than adding a permanent OK line to every report.
+
+    *own_owner* is this process's lease identity. The MCP server's own daemon holds the
+    lease while it indexes, and reporting that as "another indexer" sent a reader hunting
+    for a second process that was the one answering.
     """
     if bus is None:
         return None
@@ -291,6 +298,8 @@ async def check_indexer_lease(
         return None
     if not holder:
         return None
+    if holder == own_owner:
+        return CheckResult("indexer_lease", CheckStatus.OK, f"This session indexes this project ({holder})")
     return CheckResult(
         "indexer_lease",
         CheckStatus.WARN,
@@ -384,7 +393,11 @@ async def run_health_checks(
             timeout_s=settings.health.connect_timeout_s,
             chosen=settings.backend.queue_choice == "sqlite",
         ),
-        check_indexer_lease(bus, timeout_s=settings.health.connect_timeout_s),
+        check_indexer_lease(
+            bus,
+            timeout_s=settings.health.connect_timeout_s,
+            own_owner=daemon.lease_owner if daemon is not None else None,
+        ),
     )
 
     results = [mode_res, config_res, mg_res, embed_res, valkey_res]
