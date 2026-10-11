@@ -678,7 +678,7 @@ def test_an_upgrade_replaces_the_old_module_form() -> None:
     hooks.merge_settings(settings, hooks.hook_config(strict=True, launcher='"C:/bin/atlas-hook.exe"'))
 
     commands = [h["command"] for groups in settings["hooks"].values() for g in groups for h in g["hooks"]]
-    assert len(commands) == 4, commands
+    assert len(commands) == 5, commands
     assert all(c.startswith('"C:/bin/atlas-hook.exe" ') for c in commands), commands
 
 
@@ -706,7 +706,7 @@ def test_cli_install_and_uninstall(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert result.exit_code == 0, result.output
     data = json.loads(settings.read_text(encoding="utf-8"))
     assert data["env"] == {"A": "1"}
-    assert set(data["hooks"]) == {"SessionStart", "SubagentStart", "PostToolUse", "PreToolUse"}
+    assert set(data["hooks"]) == {"SessionStart", "SubagentStart", "PostToolUse", "PreToolUse", "CwdChanged"}
     commands = {h["command"] for groups in data["hooks"].values() for g in groups for h in g["hooks"]}
     assert all(c.startswith(f'"{script.as_posix()}" ') for c in commands), "hooks run as the tool's atlas-hook"
     assert (tmp_path / ".claude" / "settings.json.atlas-bak").exists()
@@ -715,7 +715,7 @@ def test_cli_install_and_uninstall(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert result.exit_code == 0, result.output
     data = json.loads(settings.read_text(encoding="utf-8"))
     commands = {h["command"] for groups in data["hooks"].values() for g in groups for h in g["hooks"]}
-    assert len(commands) == 3, "the atlas-hook entries were replaced, not kept alongside"
+    assert len(commands) == 4, "the atlas-hook entries were replaced, not kept alongside"
     assert all(c.startswith('"C:/elsewhere/python.exe" -m code_atlas.hooks ') for c in commands), "--python wins"
 
     result = runner.invoke(app, ["hooks", "uninstall"])
@@ -757,3 +757,43 @@ def test_install_refuses_a_settings_file_it_cannot_read(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not a JSON object"):
         hooks.write_settings(path, hooks.hook_config(strict=False))
     assert path.read_text(encoding="utf-8") == "[1, 2]"
+
+
+def test_the_session_cwd_is_recorded_per_claude_process(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keyed by CLAUDE_PID, so /clear -- a new session id inside the same process and the same
+    MCP server -- keeps finding it."""
+    monkeypatch.setenv("CLAUDE_PID", "4242")
+    hooks.record_session_cwd({"session_id": "before-clear", "cwd": str(tmp_path / "a")}, "post-tool")
+    hooks.record_session_cwd({"session_id": "after-clear", "new_cwd": str(tmp_path / "b")}, "cwd-changed")
+
+    assert hooks.read_session_cwd() == tmp_path / "b"
+
+
+def test_a_subagent_never_moves_the_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A subagent with worktree isolation runs in the same process; following it would drag the
+    session's index into a checkout the session is not working in."""
+    monkeypatch.setenv("CLAUDE_PID", "4242")
+    hooks.record_session_cwd({"cwd": str(tmp_path / "main")}, "session-start")
+    hooks.record_session_cwd({"agent_id": "a1", "cwd": str(tmp_path / "isolated")}, "post-tool")
+    hooks.record_session_cwd({"cwd": str(tmp_path / "isolated")}, "subagent-start")
+
+    assert hooks.read_session_cwd() == tmp_path / "main"
+
+
+def test_a_record_older_than_the_reader_is_ignored(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A recycled pid must not hand a new session the worktree a dead one was in."""
+    monkeypatch.setenv("CLAUDE_PID", "4242")
+    hooks.record_session_cwd({"cwd": str(tmp_path)}, "post-tool")
+
+    assert hooks.read_session_cwd(since=time.time() + 60) is None
+
+
+def test_main_records_the_cwd_on_every_event(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import io
+
+    monkeypatch.setenv("CLAUDE_PID", "4242")
+    payload = {"session_id": "s", "old_cwd": str(tmp_path), "new_cwd": str(tmp_path / "wt"), "cwd": str(tmp_path)}
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode())))
+
+    assert hooks.main(["cwd-changed"]) == 0
+    assert hooks.read_session_cwd() == tmp_path / "wt"

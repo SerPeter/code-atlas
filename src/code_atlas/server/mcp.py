@@ -12,7 +12,6 @@ import contextlib
 import functools
 import re
 import time
-import tomllib
 import urllib.parse
 import urllib.request
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -25,10 +24,11 @@ from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
-from code_atlas.backends import graph_backend_label, use_backends
+from code_atlas.backends import graph_backend_label, use_backends, use_queue
 from code_atlas.backends.sqlite_graph import SqliteGraphClient
 from code_atlas.dream import VaultRoot, build_dream_report, report_to_dict
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
+from code_atlas.hooks import main_checkout, read_session_cwd
 from code_atlas.indexing.daemon import DaemonManager
 from code_atlas.indexing.orchestrator import StalenessChecker, assert_embedding_dimension_matches
 from code_atlas.schema import (
@@ -170,6 +170,26 @@ class AppContext:
     vector_enabled: bool = field(default=True, repr=False)
     needs_first_index: bool = field(default=False, repr=False)
     first_index_ready: asyncio.Event = field(default_factory=_ready_event, repr=False)
+    #: What the process started on: its checkout's settings, and the bus bound to that
+    #: checkout's project. Following the session into a worktree rebinds `settings` and
+    #: `bus`; following it back restores these two.
+    launch_settings: AtlasSettings | None = field(default=None, repr=False)
+    launch_bus: EventBus | None = field(default=None, repr=False)
+    #: The project the bus and indexer are bound to. Tracked rather than re-derived: a
+    #: worktree's name carries its branch, so a `git switch` inside it renames the project
+    #: under an unchanged root, and only the remembered name can notice.
+    bound_project: str = field(default="", repr=False)
+    launch_project: str = field(default="", repr=False)
+    #: The queue scope opened for a worktree's bus, closed when the session leaves it.
+    root_queue: AsyncExitStack | None = field(default=None, repr=False)
+    #: The background start of the current daemon (a catch-up can take minutes).
+    indexing_task: asyncio.Task | None = field(default=None, repr=False)
+    catchup: bool = field(default=True, repr=False)
+    auto_index: bool = field(default=True, repr=False)
+    started_at: float = field(default_factory=time.time, repr=False)
+    switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    #: A root whose switch failed, not retried until the session moves somewhere else.
+    failed_root: Path | None = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -208,23 +228,57 @@ async def _try_list_roots(ctx: Context) -> Path | None:
     return None
 
 
+def _settings_for_root(launch: AtlasSettings, root: Path) -> AtlasSettings:
+    """Settings for *root*: its own committed config, on this process's infrastructure.
+
+    A worktree checks out ``atlas.toml`` but never ``atlas.local.toml``, which is gitignored.
+    Read on its own, a worktree would lose the ``[backend]`` and ``[embeddings]`` this process
+    runs on -- and index under a different embedding model than the graph it writes into. A
+    root with a local file of its own keeps it.
+    """
+    if (root / "atlas.local.toml").is_file():
+        return AtlasSettings(project_root=root)
+    return AtlasSettings(project_root=root, backend=launch.backend, embeddings=launch.embeddings)
+
+
 async def _switch_root(app: AppContext, new_root: Path) -> None:
-    """Stop daemon, re-create settings from *new_root*, restart daemon."""
+    """Serve and index *new_root* instead: settings, bus, indexer lease, watcher.
+
+    The bus is the part a switch used to keep. Streams, consumer groups and the indexer lease
+    are all keyed by project, and a bus is bound to one project when it is built -- so a
+    switch that kept the launch bus indexed the worktree through the launch checkout's
+    streams, under the launch checkout's lease, and stood down every other session's indexer
+    for a checkout this one no longer watched.
+    """
+    if app.indexing_task is not None:
+        app.indexing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await app.indexing_task
+        app.indexing_task = None
     await app.daemon.stop()
     app.daemon = DaemonManager()
 
-    # Re-read atlas.toml from new root and re-create settings.
-    # Init kwargs have highest Pydantic precedence (init > env > toml > default)
-    # so env vars still apply for fields not in the toml.
-    overrides: dict[str, Any] = {"project_root": new_root}
-    toml_path = new_root / "atlas.toml"
-    if toml_path.is_file():
-        with toml_path.open("rb") as fh:
-            overrides.update(tomllib.load(fh))
-        overrides["project_root"] = new_root  # ensure root wins over toml
-
-    app.settings = AtlasSettings(**overrides)
+    launch = app.launch_settings or app.settings
+    if app.root_queue is not None:
+        stack, app.root_queue = app.root_queue, None
+        await stack.aclose()
+    new_project = derive_project_name(new_root)
+    launch_project = app.launch_project or derive_project_name(launch.project_root)
+    if new_root == launch.project_root.resolve() and new_project == launch_project:
+        app.settings, app.bus = launch, app.launch_bus or app.bus
+    else:
+        app.settings = _settings_for_root(launch, new_root)
+        stack = AsyncExitStack()
+        try:
+            bus, _limiter = await stack.enter_async_context(
+                use_queue(app.settings, limiter=app.limiter, project_name=new_project)
+            )
+        except BaseException:
+            await stack.aclose()
+            raise
+        app.root_queue, app.bus = stack, bus  # ty: ignore[invalid-assignment]
     app.resolved_root = new_root
+    app.bound_project = new_project
     app.staleness = StalenessChecker(new_root)
 
     # Re-check embedding model match for new root. The backends -- and so the limiter --
@@ -248,11 +302,18 @@ async def _switch_root(app: AppContext, new_root: Path) -> None:
             )
             app.vector_enabled = False
 
-    started = await app.daemon.start(app.settings, app.graph, app.bus, limiter=app.limiter)
-    if started:
-        logger.info("Daemon restarted for new root: {}", new_root)
-    else:
-        logger.info("Query-only mode for new root: {} (no Valkey)", new_root)
+    # In the background, as at startup: a worktree's first index is a full one, and a
+    # tool call must not wait minutes for it.
+    app.indexing_task = _spawn_indexing(
+        app.daemon,
+        app.settings,
+        app.graph,
+        app.bus,
+        limiter=app.limiter,
+        catchup=app.catchup,
+        auto_index=app.auto_index,
+        first_index_ready=asyncio.Event(),
+    )
 
 
 def _is_project_root(path: Path) -> bool:
@@ -264,6 +325,86 @@ def _is_project_root(path: Path) -> bool:
     to advertise (which would orphan the configured/indexed project).
     """
     return (path / "atlas.toml").is_file() or find_git_root(path) == path
+
+
+# How often the server re-reads where the session works, so indexing follows it into a
+# worktree without waiting for a tool call. A poll is one small file read.
+_FOLLOW_POLL_S = 5.0
+# A cwd record from before this server started is only trusted this far back: older, and it
+# may belong to a dead Claude Code process whose pid this one inherited.
+_CWD_RECORD_GRACE_S = 300.0
+
+
+def _serves(app: AppContext, root: Path) -> bool:
+    """Whether this server already serves *root* -- the same checkout, still on the same branch."""
+    if root != app.settings.project_root.resolve():
+        return False
+    return derive_project_name(root) == (app.bound_project or derive_project_name(root))
+
+
+def _same_repository(a: Path, b: Path) -> bool:
+    return (main_checkout(a) or a) == (main_checkout(b) or b)
+
+
+async def _follow_session_cwd(app: AppContext) -> bool:
+    """Re-root onto the checkout the session is working in, as its hooks recorded it.
+
+    Claude Code never tells an MCP server about a worktree: roots/list keeps naming the
+    launch directory, and this process's cwd never moves. The hooks see every move, so they
+    write it down (``hooks.record_session_cwd``) and this reads it. The rule is the git root
+    of that cwd -- a ``cd`` inside the checkout stays on its root, anything under
+    ``.claude/worktrees/X`` is X -- and only within this repository: a server configured for
+    one repository does not wander into another because the session looked at it.
+
+    Returns whether there is a record at all; when there is, it outranks MCP roots.
+    """
+    cwd = read_session_cwd(since=app.started_at - _CWD_RECORD_GRACE_S)
+    if cwd is None:
+        return False
+    root = find_git_root(cwd)
+    if root is None:
+        return True
+    root = root.resolve()
+    launch = app.launch_settings or app.settings
+    if root == app.failed_root or _serves(app, root):
+        return True
+    if not _same_repository(root, launch.project_root.resolve()):
+        return True
+    async with app.switch_lock:
+        if _serves(app, root):
+            return True
+        logger.info("Session moved to {} — serving and indexing {}", root, derive_project_name(root))
+        try:
+            await _switch_root(app, root)
+        except Exception:
+            app.failed_root = root
+            logger.exception("Could not switch to {} — staying on {}", root, app.settings.project_root)
+            raise
+        app.failed_root = None
+    return True
+
+
+async def _follow_session_cwd_forever(app: AppContext) -> None:
+    while True:
+        await asyncio.sleep(_FOLLOW_POLL_S)
+        with contextlib.suppress(Exception):  # logged inside; the next move is retried
+            await _follow_session_cwd(app)
+
+
+async def _served_project(app: AppContext) -> str:
+    """The project a query defaults to.
+
+    This checkout's -- unless it is a worktree the session just moved into whose first index
+    has not finished, which is answered from the launch checkout until it has: a slightly
+    stale answer beats an empty one, the same trade the hooks make.
+    """
+    name = derive_project_name(app.settings.project_root)
+    launch = app.launch_settings
+    if launch is None or app.settings is launch:
+        return name
+    if await app.graph.get_project_git_hash(name) is not None:
+        return name
+    return derive_project_name(launch.project_root)
 
 
 async def _maybe_update_root(app: AppContext, ctx: Context) -> None:
@@ -327,7 +468,12 @@ async def _ensure_root(ctx: Context, *, require_index: bool = True) -> AppContex
     caller can still see why other tools are blocked.
     """
     app: AppContext = ctx.request_context.lifespan_context
-    await _maybe_update_root(app, ctx)
+    try:
+        followed = await _follow_session_cwd(app)
+    except Exception:
+        followed = True  # logged; answer from where this server already is
+    if not followed:
+        await _maybe_update_root(app, ctx)
     if require_index and app.needs_first_index and not app.first_index_ready.is_set():
         try:
             await asyncio.wait_for(app.first_index_ready.wait(), timeout=_INDEX_READY_TIMEOUT_S)
@@ -707,7 +853,7 @@ async def _default_scope_projects(app: AppContext) -> list[str]:
     always appended too, matching ``_resolve_hybrid_scope``'s explicit-scope
     branch.
     """
-    root_name = derive_project_name(app.settings.project_root)
+    root_name = await _served_project(app)
     extra_vault_names = [v.project_name for v in app.settings.knowledge.extra_vaults]
     try:
         project_rows = await app.graph.get_project_status()
@@ -859,6 +1005,12 @@ def create_mcp_server(  # noqa: PLR0915
             vector_enabled=vector_enabled,
             needs_first_index=needs_first_index,
             first_index_ready=first_index_ready,
+            launch_settings=settings,
+            launch_bus=bus,
+            bound_project=derive_project_name(settings.project_root),
+            launch_project=derive_project_name(settings.project_root),
+            catchup=catchup,
+            auto_index=auto_index,
         )
 
         # Register handler for roots/list_changed notification so we re-probe
@@ -882,7 +1034,7 @@ def create_mcp_server(  # noqa: PLR0915
         # clients' connect timeout. Run daemon startup in the background instead
         # so tools are reachable immediately; health_check reports pipeline state
         # and result staleness already surfaces an index that's still catching up.
-        daemon_start_task = _spawn_indexing(
+        app_ctx.indexing_task = _spawn_indexing(
             daemon,
             settings,
             graph,
@@ -893,14 +1045,24 @@ def create_mcp_server(  # noqa: PLR0915
             first_index_ready=first_index_ready,
         )
 
+        follower = asyncio.get_running_loop().create_task(_follow_session_cwd_forever(app_ctx))
+
         try:
             yield app_ctx
         finally:
-            if daemon_start_task is not None:
-                daemon_start_task.cancel()
+            # Indexing is cancelled first, before anything is awaited: a daemon start still
+            # in flight that gets one more turn of the loop can open a SQLite connection the
+            # teardown below never sees.
+            follower.cancel()
+            if app_ctx.indexing_task is not None:
+                app_ctx.indexing_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await daemon_start_task
+                    await app_ctx.indexing_task
             await app_ctx.daemon.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await follower
+            if app_ctx.root_queue is not None:
+                await app_ctx.root_queue.aclose()
             await stack.aclose()
             shutdown_telemetry()
             logger.info("MCP server shut down")
@@ -2164,7 +2326,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
-        project_name = project or derive_project_name(app.settings.project_root)
+        project_name = project or await _served_project(app)
         clamped = _clamp_limit(limit)
         test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
@@ -2208,7 +2370,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
-        project_name = project or derive_project_name(app.settings.project_root)
+        project_name = project or await _served_project(app)
         max_nodes = max(1, min(max_nodes, _MAX_LIMIT))
         test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
@@ -2250,7 +2412,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
-        project_name = project or derive_project_name(app.settings.project_root)
+        project_name = project or await _served_project(app)
         clamped = _clamp_limit(limit)
         test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
@@ -2283,7 +2445,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
-        project_name = project or derive_project_name(app.settings.project_root)
+        project_name = project or await _served_project(app)
         clamped = _clamp_limit(limit)
         test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
@@ -2330,7 +2492,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
-        project_name = project or derive_project_name(app.settings.project_root)
+        project_name = project or await _served_project(app)
         clamped = _clamp_limit(limit)
         test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
@@ -2366,7 +2528,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
-        project_name = project or derive_project_name(app.settings.project_root)
+        project_name = project or await _served_project(app)
         clamped = _clamp_limit(limit)
         test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:
@@ -2415,7 +2577,7 @@ def _register_analysis_tools(mcp: FastMCP) -> None:  # noqa: PLR0915
             app = await _ensure_root(ctx)
         except IndexNotReadyError as exc:
             return _error(str(exc), code="INDEX_REQUIRED")
-        project_name = project or derive_project_name(app.settings.project_root)
+        project_name = project or await _served_project(app)
         clamped = _clamp_limit(limit)
         test_patterns = _resolve_test_patterns(app.settings.search, exclude_tests)
         try:

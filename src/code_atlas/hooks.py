@@ -188,6 +188,76 @@ def _prune_state_dir() -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Session cwd -- how the MCP server learns the session moved into a worktree
+# ---------------------------------------------------------------------------
+#
+# Claude Code tells an MCP server nothing when a session enters a worktree: roots/list keeps
+# answering with the launch directory, and the server's own cwd and CLAUDE_PROJECT_DIR never
+# move. A hook payload's `cwd` does. So the hooks record it, and `atlas mcp` follows the record.
+#
+# Keyed by the Claude Code process (CLAUDE_PID, inherited by every hook and MCP server it
+# spawns) rather than by session id: /clear starts a new session inside the same process and
+# the same MCP server, which would then be reading a file nobody writes any more. The session
+# id is written too, for a client that sets only that.
+
+
+_CWD_REFRESH_S = 60.0
+
+
+def _session_keys(payload: dict[str, Any] | None = None) -> list[str]:
+    keys = [f"pid-{os.environ['CLAUDE_PID']}"] if os.environ.get("CLAUDE_PID") else []
+    session = (payload or {}).get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if session:
+        keys.append(f"session-{session}")
+    return keys
+
+
+def _cwd_path(key: str) -> Path:
+    return _state_dir() / f"cwd-{re.sub(r'[^A-Za-z0-9_.-]', '_', key)}.json"
+
+
+def record_session_cwd(payload: dict[str, Any], event: str) -> None:
+    """Write where the main conversation is working now, when that changed or the record ages.
+
+    Refreshed at most every ``_CWD_REFRESH_S`` while unchanged, so a long session's record
+    stays inside the freshness window ``read_session_cwd`` applies to a restarted server.
+
+    Only the main conversation's: a subagent runs in the same Claude Code process, and one
+    started with worktree isolation would otherwise drag the session's index along with it.
+    """
+    if payload.get("agent_id") or event == "subagent-start":
+        return
+    cwd = payload.get("new_cwd") if event == "cwd-changed" else None
+    cwd = cwd or payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        return
+    for key in _session_keys(payload):
+        path = _cwd_path(key)
+        with suppress(OSError, ValueError, TypeError):
+            known = json.loads(path.read_text(encoding="utf-8"))
+            if known.get("cwd") == cwd and time.time() - float(known.get("at", 0)) < _CWD_REFRESH_S:
+                continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"cwd": cwd, "at": time.time()}), encoding="utf-8")
+        tmp.replace(path)
+
+
+def read_session_cwd(*, since: float = 0.0) -> Path | None:
+    """The cwd the hooks last recorded for this process's Claude Code session, or None.
+
+    *since* drops a record older than that (epoch seconds): a recycled pid must not hand a
+    new session the worktree a dead one was working in.
+    """
+    for key in _session_keys():
+        with suppress(OSError, ValueError, TypeError):
+            record = json.loads(_cwd_path(key).read_text(encoding="utf-8"))
+            if float(record.get("at", 0)) >= since and record.get("cwd"):
+                return Path(record["cwd"])
+    return None
+
+
 def _agent(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     key = payload.get("agent_id") or "main"
     return state.setdefault("agents", {}).setdefault(key, {"oriented": False, "blocked": [], "hinted": []})
@@ -245,7 +315,7 @@ def resolve_context(cwd: str) -> dict[str, Any]:
     root = find_git_root(Path(cwd))
     if root is None:
         return {"available": False, "reason": "not-a-repo"}
-    main_root = _main_checkout(root)
+    main_root = main_checkout(root)
     reason = mcp_unavailable([Path(cwd), root, *([main_root] if main_root else [])])
     if reason is not None:
         return {"available": False, "reason": reason}
@@ -485,7 +555,7 @@ def _probe_graph(settings: AtlasSettings, candidates: dict[str, Path], *, memgra
     return {**ctx, "backend": None, "reason": "no-index"}
 
 
-def _main_checkout(root: Path) -> Path | None:
+def main_checkout(root: Path) -> Path | None:
     """The main working tree behind a linked worktree (via its ``commondir``), else None."""
     from code_atlas.settings import resolve_git_dir
 
@@ -868,7 +938,10 @@ def hook_config(*, strict: bool, launcher: str | None = None) -> dict[str, list[
     config = {
         "SessionStart": [entry("startup|resume|clear|compact", "session-start")],
         "SubagentStart": [entry("*", "subagent-start")],
-        "PostToolUse": [entry(f"Grep|Bash|{_MCP_PREFIX}.*", "post-tool")],
+        "PostToolUse": [entry(f"Grep|Bash|EnterWorktree|ExitWorktree|{_MCP_PREFIX}.*", "post-tool")],
+        # No matcher: it has none. WorktreeCreate is deliberately absent -- registering it
+        # replaces Claude Code's own `git worktree add`, it does not observe it.
+        "CwdChanged": [entry("", "cwd-changed")],
     }
     if strict:
         config["PreToolUse"] = [entry("Grep|Bash|Agent|Task|Workflow", "pre-tool --strict")]
@@ -926,7 +999,7 @@ def main(argv: list[str] | None = None) -> int:
     global _hook_output
     args = sys.argv[1:] if argv is None else argv
     if not args:
-        sys.stderr.write("usage: atlas-hook {session-start|subagent-start|pre-tool|post-tool} [--strict]\n")
+        sys.stderr.write("usage: atlas-hook {session-start|subagent-start|pre-tool|post-tool|cwd-changed} [--strict]\n")
         return 2
     try:
         warnings.simplefilter("ignore")  # stderr from a hook is noise in the transcript, never context
@@ -936,6 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8")  # ty: ignore[unresolved-attribute]
         _hook_output, sys.stdout = sys.stdout, sys.stderr
         event = args[0]
+        record_session_cwd(payload, event)
         if event == "session-start":
             on_start(payload, "SessionStart")
         elif event == "subagent-start":

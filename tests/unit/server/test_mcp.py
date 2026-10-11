@@ -2099,3 +2099,152 @@ class TestBackendStamp:
         import code_atlas.server.mcp as mcp_mod
 
         assert mcp_mod._backend_note(object()) == {}
+
+
+# ---------------------------------------------------------------------------
+# Following the session into a worktree (no DB needed)
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True, capture_output=True
+    )
+
+
+@pytest.fixture
+def repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """A repository with one linked worktree where Claude Code puts them."""
+    main = tmp_path / "repo"
+    main.mkdir()
+    _git(main, "init", "-q")
+    _git(main, "commit", "-q", "--allow-empty", "-m", "init")
+    _git(main, "worktree", "add", "-q", ".claude/worktrees/lane", "-b", "lane")
+    return main.resolve(), (main / ".claude" / "worktrees" / "lane").resolve()
+
+
+class TestFollowSessionCwd:
+    """`atlas mcp` re-roots onto the checkout the session works in, as its hooks record it."""
+
+    @pytest.fixture
+    def harness(self, repo_with_worktree, monkeypatch):
+        from contextlib import asynccontextmanager
+        from types import SimpleNamespace
+
+        from code_atlas import hooks
+        from code_atlas.server import mcp as mcp_module
+
+        main, worktree = repo_with_worktree
+        monkeypatch.setenv("CLAUDE_PID", "4242")
+        opened: list[SimpleNamespace] = []
+        spawned: list[tuple[Path, object]] = []
+
+        @asynccontextmanager
+        async def fake_use_queue(settings, *, limiter, project_name):
+            bus = SimpleNamespace(project=project_name, closed=False)
+            opened.append(bus)
+            yield bus, limiter
+            bus.closed = True
+
+        def fake_spawn(daemon, settings, graph, bus, **_kw):
+            spawned.append((settings.project_root, bus))
+
+        monkeypatch.setattr(mcp_module, "use_queue", fake_use_queue)
+        monkeypatch.setattr(mcp_module, "_spawn_indexing", fake_spawn)
+
+        launch = AtlasSettings(project_root=main)
+        launch.embeddings.enabled = False
+        launch_bus = AsyncMock()
+        app = AppContext(
+            bus=launch_bus,
+            graph=AsyncMock(),
+            settings=launch,
+            embed=None,
+            limiter=unpaced(),
+            launch_settings=launch,
+            launch_bus=launch_bus,
+            bound_project="repo",
+            launch_project="repo",
+        )
+
+        def move(cwd: Path) -> None:
+            hooks.record_session_cwd({"session_id": "s1", "new_cwd": str(cwd)}, "cwd-changed")
+
+        return SimpleNamespace(
+            app=app, main=main, worktree=worktree, opened=opened, spawned=spawned, move=move, launch_bus=launch_bus
+        )
+
+    async def test_a_worktree_gets_its_own_bus_and_indexer(self, harness):
+        """The bus is bound to one project, and streams, consumer groups and the indexer
+        lease are all keyed by it. Keeping the launch bus across a switch indexed the
+        worktree through the main checkout's streams under the main checkout's lease."""
+        from code_atlas.server.mcp import _follow_session_cwd
+
+        harness.move(harness.worktree / "src")
+
+        assert await _follow_session_cwd(harness.app) is True
+
+        assert harness.app.settings.project_root == harness.worktree
+        assert [b.project for b in harness.opened] == ["lane@lane"]
+        assert harness.app.bus is harness.opened[0]
+        assert harness.spawned == [(harness.worktree, harness.opened[0])], "indexes the worktree, on its bus"
+
+    async def test_back_in_the_main_checkout_restores_the_launch_bus(self, harness):
+        from code_atlas.server.mcp import _follow_session_cwd
+
+        harness.move(harness.worktree)
+        await _follow_session_cwd(harness.app)
+        harness.move(harness.main / "src" / "deep")  # a cd inside the checkout stays on its root
+        await _follow_session_cwd(harness.app)
+
+        assert harness.app.settings is harness.app.launch_settings
+        assert harness.app.bus is harness.launch_bus
+        assert harness.opened[0].closed, "the worktree's queue scope is closed when the session leaves it"
+        assert harness.spawned[-1] == (harness.main, harness.launch_bus)
+
+    async def test_another_repository_is_not_followed(self, harness, tmp_path):
+        from code_atlas.server.mcp import _follow_session_cwd
+
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        _git(other, "init", "-q")
+        harness.move(other)
+
+        assert await _follow_session_cwd(harness.app) is True
+        assert harness.app.settings.project_root == harness.main
+        assert harness.opened == []
+
+    async def test_no_record_leaves_mcp_roots_in_charge(self, harness, monkeypatch):
+        from code_atlas.server.mcp import _follow_session_cwd
+
+        monkeypatch.delenv("CLAUDE_PID")
+        assert await _follow_session_cwd(harness.app) is False
+
+    async def test_a_worktree_not_indexed_yet_is_answered_from_the_main_checkout(self, harness):
+        from code_atlas.server.mcp import _follow_session_cwd, _served_project
+
+        harness.move(harness.worktree)
+        await _follow_session_cwd(harness.app)
+
+        harness.app.graph.get_project_git_hash = AsyncMock(return_value=None)
+        assert await _served_project(harness.app) == "repo"
+        harness.app.graph.get_project_git_hash = AsyncMock(return_value="a" * 40)
+        assert await _served_project(harness.app) == "lane@lane"
+
+    async def test_a_branch_switch_inside_the_worktree_is_a_new_project(self, harness):
+        """A worktree is named `<dir>@<branch>`, so `git switch` renames its project under an
+        unchanged root. Comparing roots alone kept indexing under the old branch's name."""
+        from code_atlas.server.mcp import _follow_session_cwd
+
+        harness.move(harness.worktree)
+        await _follow_session_cwd(harness.app)
+        _git(harness.worktree, "switch", "-q", "-c", "other")
+
+        await _follow_session_cwd(harness.app)  # same cwd record: the poll alone notices
+
+        assert [b.project for b in harness.opened] == ["lane@lane", "lane@other"]
+        assert harness.app.bus is harness.opened[1]
+        assert harness.opened[0].closed
+        assert harness.app.bound_project == "lane@other"
