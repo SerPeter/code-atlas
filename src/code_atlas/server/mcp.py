@@ -30,7 +30,7 @@ from code_atlas.dream import VaultRoot, build_dream_report, report_to_dict
 from code_atlas.graph.client import GraphClient, QueryTimeoutError
 from code_atlas.hooks import main_checkout, read_session_cwd
 from code_atlas.indexing.daemon import DaemonManager
-from code_atlas.indexing.orchestrator import StalenessChecker, assert_embedding_dimension_matches
+from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo, assert_embedding_dimension_matches
 from code_atlas.schema import (
     _CODE_LABELS,
     _DOC_LABELS,
@@ -190,6 +190,8 @@ class AppContext:
     switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     #: A root whose switch failed, not retried until the session moves somewhere else.
     failed_root: Path | None = field(default=None, repr=False)
+    #: The (checkpoint, HEAD) whose stale details this session was already shown.
+    stale_reported: tuple[str, str | None] | None = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +205,8 @@ _ROOTS_TIMEOUT = 2.0  # seconds — fast fail for broken/missing clients
 # through the real five seconds -- a third of that suite's runtime in two tests.
 _STALENESS_TIMEOUT_S = 5.0
 
-# How many of the files changed since the index checkpoint an answer lists.
-_CHANGED_FILES_SHOWN = 20
+# How many of the files changed since the index checkpoint an answer lists, before "+ N more files".
+_CHANGED_FILES_SHOWN = 10
 
 
 def _file_uri_to_path(uri: str) -> Path:
@@ -730,12 +732,38 @@ def _unverified_staleness(result: dict[str, Any], stale_mode: str) -> dict[str, 
     return {**result, "stale": None, "stale_check": "timed_out"}
 
 
+def _describe_staleness(app: AppContext, result: dict[str, Any], info: StalenessInfo) -> None:
+    """Add the stale details to *result* once per checkpoint/HEAD pair, then a one-line note."""
+    if not info.stale:
+        app.stale_reported = None
+        return
+    pair = (info.last_indexed_commit, info.current_commit)
+    if info.last_indexed_commit is not None and app.stale_reported == pair:
+        # Already detailed once for this pair: repeating it on every answer is noise.
+        result["stale_note"] = (
+            f"index behind HEAD since {info.last_indexed_commit[:8]}, "
+            f"{len(info.changed_files)} files changed (listed in an earlier reply)"
+        )
+        return
+    result["stale_since"] = info.last_indexed_commit
+    if info.changed_files:
+        # Capped: the diff since the checkpoint rode along on every answer, and a
+        # checkpoint days behind made each one ~165 kB -- truncated by the client.
+        shown = info.changed_files[:_CHANGED_FILES_SHOWN]
+        hidden = len(info.changed_files) - len(shown)
+        result["changed_files"] = [*shown, f"+ {hidden} more files"] if hidden else shown
+    if info.last_indexed_commit is not None:
+        app.stale_reported = (info.last_indexed_commit, info.current_commit)
+
+
 async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str = "") -> dict[str, Any]:
     """Annotate a query result envelope with staleness info.
 
     - ``stale_mode == "ignore"``: return result unchanged.
     - ``stale_mode == "lock"`` and stale: return an error envelope.
-    - ``stale_mode == "warn"``: add ``stale``, ``stale_since``, ``changed_files`` keys.
+    - ``stale_mode == "warn"``: add ``stale``, ``stale_since``, ``changed_files`` keys
+      (the first 10 files, then ``"+ N more files"``). That detail is given once per
+      checkpoint/HEAD pair; later answers carry ``stale`` plus a one-line ``stale_note``.
 
     When staleness is indeterminate (project never indexed or index in progress),
     ``stale`` is set to ``None`` rather than ``True``.
@@ -778,13 +806,7 @@ async def _with_staleness(app: AppContext, result: dict[str, Any], *, scope: str
         result["stale"] = None  # indeterminate — never indexed or index in progress
     else:
         result["stale"] = info.stale
-    if info.stale:
-        result["stale_since"] = info.last_indexed_commit
-        if info.changed_files:
-            # Capped: the diff since the checkpoint rode along on every answer, and a
-            # checkpoint days behind made each one ~165 kB -- truncated by the client.
-            result["changed_files"] = info.changed_files[:_CHANGED_FILES_SHOWN]
-            result["changed_files_total"] = len(info.changed_files)
+    _describe_staleness(app, result, info)
 
     # Surface live catchup/watch backlog when non-trivial — lets a caller tell
     # "stale, but actively catching up" apart from "stale, nothing is happening".
