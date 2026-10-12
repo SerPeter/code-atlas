@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.15.3 (2026-10-12)
+
+### Bug Fixes
+
+- **mcp**: Detail a stale index once, then answer with one line
+  ([#26](https://github.com/SerPeter/code-atlas/pull/26),
+  [`6be3d5b`](https://github.com/SerPeter/code-atlas/commit/6be3d5b3f796037e96251de049c2717a3edb09d9))
+
+
 ## v0.15.2 (2026-10-12)
 
 ### Bug Fixes
