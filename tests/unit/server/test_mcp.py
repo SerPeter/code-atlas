@@ -913,6 +913,75 @@ class TestWithStaleness:
             annotated = await _with_staleness(app, result, scope="myproject")
             assert annotated["stale"] is None
 
+    async def test_changed_files_capped_at_ten(self, settings):
+        """A large diff must not swamp the reply: 10 files, then a '+ N more files' marker."""
+        from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
+
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(
+            bus=AsyncMock(), graph=AsyncMock(), settings=settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
+        files = [f"src/f{i}.py" for i in range(2500)]
+
+        with patch.object(
+            checker,
+            "check",
+            new_callable=AsyncMock,
+            return_value=StalenessInfo(
+                stale=True, last_indexed_commit="abc123", current_commit="def456", changed_files=files
+            ),
+        ):
+            annotated = await _with_staleness(app, {"results": []}, scope="myproject")
+            assert annotated["changed_files"] == [*files[:10], "+ 2490 more files"]
+
+        app.stale_reported = None
+        with patch.object(
+            checker,
+            "check",
+            new_callable=AsyncMock,
+            return_value=StalenessInfo(
+                stale=True, last_indexed_commit="abc123", current_commit="def456", changed_files=files[:10]
+            ),
+        ):
+            annotated = await _with_staleness(app, {"results": []}, scope="myproject")
+            assert annotated["changed_files"] == files[:10]
+
+    async def test_stale_details_shown_once_then_one_line(self, settings):
+        """Details once per checkpoint/HEAD pair; repeats get a one-line note; a new pair or freshness resets."""
+        from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
+
+        checker = StalenessChecker(settings.project_root, project_name="myproject")
+        embed = EmbedClient(settings.embeddings, limiter=unpaced())
+        app = AppContext(
+            bus=AsyncMock(), graph=AsyncMock(), settings=settings, embed=embed, staleness=checker, limiter=unpaced()
+        )
+        stale = StalenessInfo(
+            stale=True, last_indexed_commit="abc12345ff", current_commit="def456", changed_files=["a.py", "b.py"]
+        )
+        moved = StalenessInfo(
+            stale=True, last_indexed_commit="abc12345ff", current_commit="789aaa", changed_files=["a.py"]
+        )
+        fresh = StalenessInfo(stale=False, current_commit="789aaa")
+
+        async def annotate(info: StalenessInfo) -> dict:
+            with patch.object(checker, "check", new_callable=AsyncMock, return_value=info):
+                return await _with_staleness(app, {"results": []}, scope="myproject")
+
+        first = await annotate(stale)
+        assert first["changed_files"] == ["a.py", "b.py"]
+        assert "stale_note" not in first
+
+        second = await annotate(stale)
+        assert second["stale"] is True
+        assert "changed_files" not in second
+        assert "stale_since" not in second
+        assert second["stale_note"] == "index behind HEAD since abc12345, 2 files changed (listed in an earlier reply)"
+
+        assert (await annotate(moved))["changed_files"] == ["a.py"]  # HEAD moved: detail again
+        assert (await annotate(fresh))["stale"] is False
+        assert (await annotate(moved))["changed_files"] == ["a.py"]  # stale again after fresh: detail again
+
     async def test_lock_mode_stale_returns_error(self, settings):
         """Lock mode with stale index returns STALE_INDEX error."""
         from code_atlas.indexing.orchestrator import StalenessChecker, StalenessInfo
