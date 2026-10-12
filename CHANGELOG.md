@@ -2,6 +2,34 @@
 
 <!-- version list -->
 
+## v0.15.2 (2026-10-12)
+
+### Bug Fixes
+
+- **health**: Report the session's own indexer lease as its own
+  ([`564d77c`](https://github.com/SerPeter/code-atlas/commit/564d77c478fc02ce3afe90b4f6bc941c08d615e3))
+
+- **indexing**: Make an agent's edits findable within seconds
+  ([`e9125fd`](https://github.com/SerPeter/code-atlas/commit/e9125fde727b4d14ef5b082ded3d7ea9240c44b1))
+
+- **indexing**: Re-embed a body-only change once enough of it has moved
+  ([`fba3e28`](https://github.com/SerPeter/code-atlas/commit/fba3e28fd9035bc2eb995bb77fe90c121ab0c060))
+
+- **indexing**: Re-run the catch-up when HEAD moves past the index checkpoint
+  ([`78d7634`](https://github.com/SerPeter/code-atlas/commit/78d7634ae52bf0b54504e7bf0ea4cd40c11b6cfe))
+
+- **mcp**: Cap the changed_files list a stale answer carries
+  ([`5abb490`](https://github.com/SerPeter/code-atlas/commit/5abb490511c653c9c4ff100b7cc126620b1b5979))
+
+- **mcp**: Follow the session into a worktree, on the worktree's own bus and lease
+  ([`d9ca1bc`](https://github.com/SerPeter/code-atlas/commit/d9ca1bc4f61b67144e2e0346f0c6a1c7ce7c07db))
+
+### Testing
+
+- **backends**: Pin queue isolation between a checkout and its worktree
+  ([`a5c160b`](https://github.com/SerPeter/code-atlas/commit/a5c160b26a07543dd02c03e0b9a45167d2a6e0ef))
+
+
 ## v0.15.1 (2026-10-06)
 
 ### Performance Improvements
