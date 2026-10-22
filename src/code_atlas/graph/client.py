@@ -3343,7 +3343,8 @@ class GraphClient:
 
         if uid_form:
             records = await self.execute(
-                "UNWIND $uids AS uid MATCH (b {uid: uid}) RETURN b.uid AS uid, b.content_hash AS hash",
+                f"UNWIND $uids AS uid MATCH (b:{NodeLabel.ENTITY} {{uid: uid}}) "
+                "RETURN b.uid AS uid, b.content_hash AS hash",
                 {"uids": list({r.to_name for r in uid_form})},
             )
             hash_by_uid = {r["uid"]: r["hash"] or "" for r in records}
@@ -3359,7 +3360,7 @@ class GraphClient:
             await self.execute_write(
                 f"UNWIND $rels AS r "
                 f"MATCH (a:{NodeLabel.NOTE} {{uid: r.from_uid}}) "
-                f"MATCH (b {{uid: r.to_uid}}) "
+                f"MATCH (b:{NodeLabel.ENTITY} {{uid: r.to_uid}}) "
                 f"MERGE (a)-[e:{RelType.DOCUMENTS} {{link_type: 'anchor'}}]->(b) "
                 f"SET e.confidence = 1.0, e.anchor_hash = r.to_hash, e.stale = false",
                 {"rels": resolved},
@@ -4581,7 +4582,7 @@ class GraphClient:
             await self.execute_write(
                 f"MATCH (src:{NodeLabel.MODULE} {{project_name: $proj}})-[r:{RelType.IMPORTS}]->"
                 f"(ep:{NodeLabel.EXTERNAL_PACKAGE} {{uid: $ep_uid}}) "
-                f"MATCH (real {{uid: $real_uid}}) "
+                f"MATCH (real:{NodeLabel.ENTITY} {{uid: $real_uid}}) "
                 f"MERGE (src)-[:{RelType.IMPORTS}]->(real) "
                 "DELETE r",
                 {"ep_uid": ep_uid, "real_uid": real_uid, "proj": proj},
@@ -4681,7 +4682,7 @@ class GraphClient:
 
         if ambiguous:
             await self.execute_write(
-                f"UNWIND $rows AS row MATCH (t {{uid: row.table_uid}})-[r:{RelType.IMPORTS}]->"
+                f"UNWIND $rows AS row MATCH (t:{NodeLabel.ENTITY} {{uid: row.table_uid}})-[r:{RelType.IMPORTS}]->"
                 f"(es {{uid: row.stub_uid}}) SET r.confidence = 'ambiguous'",
                 {"rows": ambiguous},
             )
@@ -4929,12 +4930,12 @@ class GraphClient:
         )
 
         if labels is None or len(labels) != len(uids):
-            # Fallback: label-free scan (slow on large graphs), chunked
+            # Fallback: the :Entity marker's uid index, chunked
             results: list[dict[str, Any]] = []
             for i in range(0, len(uids), chunk_size):
                 chunk = uids[i : i + chunk_size]
                 rows = await self.execute(
-                    f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}",
+                    f"UNWIND $uids AS u MATCH (n:{NodeLabel.ENTITY}) WHERE n.uid = u {ret}",
                     {"uids": chunk},
                 )
                 results.extend(rows)
@@ -4976,7 +4977,7 @@ class GraphClient:
 
         if labels is None or len(labels) != len(uids):
             rows = await self.execute(
-                f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}",
+                f"UNWIND $uids AS u MATCH (n:{NodeLabel.ENTITY}) WHERE n.uid = u {ret}",
                 {"uids": uids},
             )
             return {r["uid"]: (r["embed_hash"], r["has_embedding"]) for r in rows}
@@ -5069,12 +5070,16 @@ class GraphClient:
 
         Chunks are deleted rather than stripped, for the same reason ``clear_embeddings``
         gives: a chunk's entire content is its vector.
+
+        Matched on the ``:Entity`` marker: unlabelled, Memgraph scans every node in the
+        graph *per uid* -- measured at 0.83 s each on a 131k-node graph, so reclaiming a
+        17k-entity ``.archive`` tree would have run for hours and timed out instead.
         """
         if not uids:
             return 0
         unique = list(dict.fromkeys(uids))
         rows = await self.execute(
-            "UNWIND $uids AS u MATCH (n) WHERE n.uid = u AND "
+            f"UNWIND $uids AS u MATCH (n:{NodeLabel.ENTITY}) WHERE n.uid = u AND "
             "(n.embedding IS NOT NULL OR n.embed_hash IS NOT NULL) "
             "REMOVE n.embedding, n.embed_hash, n.embed_model RETURN count(n) AS c",
             {"uids": unique},
@@ -5114,7 +5119,8 @@ class GraphClient:
                 chunk_items = items[i : i + chunk_size]
                 params = [{"uid": uid, "vector": vec} for uid, vec in chunk_items]
                 await self.execute_write(
-                    "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embedding = item.vector",
+                    f"UNWIND $items AS item MATCH (n:{NodeLabel.ENTITY}) WHERE n.uid = item.uid "
+                    "SET n.embedding = item.vector",
                     {"items": params},
                 )
 
@@ -5140,7 +5146,8 @@ class GraphClient:
         else:
             params = [{"uid": uid, "hash": h} for uid, h in items]
             await self.execute_write(
-                "UNWIND $items AS item MATCH (n) WHERE n.uid = item.uid SET n.embed_hash = item.hash",
+                f"UNWIND $items AS item MATCH (n:{NodeLabel.ENTITY}) WHERE n.uid = item.uid "
+                "SET n.embed_hash = item.hash",
                 {"items": params},
             )
 
@@ -5154,7 +5161,9 @@ class GraphClient:
             return {}
         ret = "RETURN n.uid AS uid, n.embed_lines AS lines"
         if labels is None or len(labels) != len(uids):
-            rows = await self.execute(f"UNWIND $uids AS u MATCH (n) WHERE n.uid = u {ret}", {"uids": uids})
+            rows = await self.execute(
+                f"UNWIND $uids AS u MATCH (n:{NodeLabel.ENTITY}) WHERE n.uid = u {ret}", {"uids": uids}
+            )
         else:
             by_label: dict[str, list[str]] = defaultdict(list)
             for uid, lbl in zip(uids, labels, strict=True):
@@ -5179,7 +5188,7 @@ class GraphClient:
                 await self.execute_write(query.format(label=f":{lbl}"), {"items": group})
         else:
             params = [{"uid": uid, "lines": lines} for uid, lines in items]
-            await self.execute_write(query.format(label=""), {"items": params})
+            await self.execute_write(query.format(label=f":{NodeLabel.ENTITY}"), {"items": params})
 
     async def write_embeddings_and_hashes(
         self,
@@ -5219,7 +5228,7 @@ class GraphClient:
             params = [{"uid": uid, "vector": vec, "hash": h} for uid, vec, h in items]
             await self.execute_write(
                 "UNWIND $items AS item "
-                "MATCH (n) WHERE n.uid = item.uid "
+                f"MATCH (n:{NodeLabel.ENTITY}) WHERE n.uid = item.uid "
                 f"SET n.embedding = item.vector, n.embed_hash = item.hash{stamp}",
                 {"items": params},
             )
@@ -5723,7 +5732,7 @@ class GraphClient:
                 return {}
             records = await self.execute(
                 "UNWIND $uids AS uid "
-                "MATCH (n {uid: uid}) "
+                f"MATCH (n:{NodeLabel.ENTITY} {{uid: uid}}) "
                 f"OPTIONAL MATCH (caller)-[:{RelType.CALLS}]->(n) "
                 "WITH uid, n, count(DISTINCT caller) AS cc, collect(DISTINCT caller.name)[0..$top_n] AS cn "
                 f"OPTIONAL MATCH (n)-[:{RelType.CALLS}]->(callee) "
@@ -5750,7 +5759,9 @@ class GraphClient:
 
     async def node_exists(self, uid: str) -> bool:
         """Single-node existence check, used by ``server.analysis.blast_radius``."""
-        exist_raw = await self.execute("OPTIONAL MATCH (n {uid: $uid}) RETURN n IS NOT NULL AS exists", {"uid": uid})
+        exist_raw = await self.execute(
+            f"OPTIONAL MATCH (n:{NodeLabel.ENTITY} {{uid: $uid}}) RETURN n IS NOT NULL AS exists", {"uid": uid}
+        )
         return bool(exist_raw and exist_raw[0]["exists"])
 
     async def trace_path_between(
@@ -5780,7 +5791,8 @@ class GraphClient:
         """
         params: dict[str, Any] = {"from_uid": from_uid, "to_uid": to_uid}
         exist_raw = await self.execute(
-            "OPTIONAL MATCH (a {uid: $from_uid}) OPTIONAL MATCH (b {uid: $to_uid}) "
+            f"OPTIONAL MATCH (a:{NodeLabel.ENTITY} {{uid: $from_uid}}) "
+            f"OPTIONAL MATCH (b:{NodeLabel.ENTITY} {{uid: $to_uid}}) "
             "RETURN a IS NOT NULL AS from_exists, b IS NOT NULL AS to_exists",
             params,
         )
@@ -5800,7 +5812,7 @@ class GraphClient:
         cost = _WEIGHT_COST_LAMBDA
         if from_uid != to_uid:
             query = (
-                f"MATCH (a {{uid: $from_uid}}), (b {{uid: $to_uid}}) "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: $from_uid}}), (b:{NodeLabel.ENTITY} {{uid: $to_uid}}) "
                 f"MATCH hop=(a)-[:{rel_pattern} *BFS ..{max_depth}]->(b) "
                 "WITH a, b, size(relationships(hop)) AS h "
                 f"MATCH p=(a)-[:{rel_pattern} *WSHORTEST h {cost} total]->(b) "
@@ -5820,7 +5832,7 @@ class GraphClient:
                 else "WITH a, first, x, CASE WHEN x = a THEN 0 END AS rest "
             )
             query = (
-                f"MATCH (a {{uid: $from_uid}})-[first:{rel_pattern}]->(x) "
+                f"MATCH (a:{NodeLabel.ENTITY} {{uid: $from_uid}})-[first:{rel_pattern}]->(x) "
                 f"{back}"
                 "WITH a, first, x, rest WHERE rest IS NOT NULL "
                 "WITH a, collect({first: first, x: x, rest: rest}) AS firsts, min(rest) AS shortest "
@@ -5919,7 +5931,7 @@ class GraphClient:
             else "WITH *, [] AS returns "
         )
         records = await self.execute(
-            "MATCH (start {uid: $uid}) "
+            f"MATCH (start:{NodeLabel.ENTITY} {{uid: $uid}}) "
             "CALL { WITH start "
             f"MATCH p=(start){expand(f'*BFS ..{max_depth}')}(a) WHERE a <> start "
             "RETURN collect({uid: a.uid, name: a.name, qn: a.qualified_name, "
@@ -6388,20 +6400,20 @@ class GraphClient:
             return None
         mod = modules[0]
         entities = await self.execute(
-            "MATCH (m {uid: $uid})-[:DEFINES]->(e) "
+            f"MATCH (m:{NodeLabel.ENTITY} {{uid: $uid}})-[:DEFINES]->(e) "
             f"RETURN e.name AS name, e.qualified_name AS qn, {primary_label_expr('e')} AS label, "
             f"e.kind AS kind, e.visibility AS vis, e.signature AS sig ORDER BY e.line_start LIMIT {max_nodes}",
             {"uid": mod["uid"]},
         )
         methods = await self.execute(
-            "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:DEFINES]->(method:Callable) "
+            f"MATCH (m:{NodeLabel.ENTITY} {{uid: $uid}})-[:DEFINES]->(td:TypeDef)-[:DEFINES]->(method:Callable) "
             "RETURN td.qualified_name AS class_qn, td.name AS class_name, "
             "method.name AS name, method.visibility AS vis, method.kind AS kind "
             f"ORDER BY td.name, method.line_start LIMIT {max_nodes}",
             {"uid": mod["uid"]},
         )
         inherits = await self.execute(
-            "MATCH (m {uid: $uid})-[:DEFINES]->(td:TypeDef)-[:INHERITS]->(parent) "
+            f"MATCH (m:{NodeLabel.ENTITY} {{uid: $uid}})-[:DEFINES]->(td:TypeDef)-[:INHERITS]->(parent) "
             "RETURN td.qualified_name AS child_qn, td.name AS child_name, "
             "parent.qualified_name AS parent_qn, parent.name AS parent_name "
             f"LIMIT {max_nodes}",
@@ -6492,21 +6504,21 @@ class GraphClient:
 
     async def get_entity_by_uid(self, uid: str, label: str = "") -> dict[str, Any] | None:
         """Single node fetch by uid (optionally label-scoped) — ``expand_context``'s target lookup."""
-        label_clause = f":{label}" if label else ""
+        label_clause = f":{label}" if label else f":{NodeLabel.ENTITY}"
         records = await self.execute(f"MATCH (n{label_clause} {{uid: $uid}}) RETURN n", {"uid": uid})
         return records[0].get("n") if records else None
 
     async def get_defining_parent(self, uid: str) -> dict[str, Any] | None:
         """The entity that DEFINES *uid* (its enclosing class/module) — ``expand_context``'s parent."""
         records = await self.execute(
-            f"MATCH (p)-[:{RelType.DEFINES}]->(n {{uid: $uid}}) RETURN p AS n LIMIT 1", {"uid": uid}
+            f"MATCH (p)-[:{RelType.DEFINES}]->(n:{NodeLabel.ENTITY} {{uid: $uid}}) RETURN p AS n LIMIT 1", {"uid": uid}
         )
         return records[0].get("n") if records else None
 
     async def get_sibling_entities(self, uid: str, limit: int) -> list[dict[str, Any]]:
         """Other entities DEFINEd by *uid*'s same parent — ``expand_context``'s siblings."""
         records = await self.execute(
-            f"MATCH (p)-[:{RelType.DEFINES}]->(n {{uid: $uid}}), (p)-[:{RelType.DEFINES}]->(s) "
+            f"MATCH (p)-[:{RelType.DEFINES}]->(n:{NodeLabel.ENTITY} {{uid: $uid}}), (p)-[:{RelType.DEFINES}]->(s) "
             f"WHERE s.uid <> $uid RETURN s AS n LIMIT {limit}",
             {"uid": uid},
         )
@@ -6515,7 +6527,7 @@ class GraphClient:
     async def get_package_docstring(self, uid: str) -> str | None:
         """Docstring of the nearest enclosing Module (1-3 DEFINES hops) — ``expand_context``'s package context."""
         records = await self.execute(
-            f"MATCH (pkg:{NodeLabel.MODULE})-[:{RelType.DEFINES}*1..3]->(target {{uid: $uid}}) "
+            f"MATCH (pkg:{NodeLabel.MODULE})-[:{RelType.DEFINES}*1..3]->(target:{NodeLabel.ENTITY} {{uid: $uid}}) "
             "RETURN pkg.docstring AS docstring LIMIT 1",
             {"uid": uid},
         )
@@ -6539,7 +6551,7 @@ class GraphClient:
         (into) *uid* landing on a node the expansion reached in fewer than *call_depth*
         hops, or on *uid* itself.
         """
-        label_clause = f":{label}" if label else ""
+        label_clause = f":{label}" if label else f":{NodeLabel.ENTITY}"
         if callers:
             expand, close = f"<-[:{RelType.CALLS} *BFS ..{call_depth}]-", f"-[:{RelType.CALLS}]->"
         else:
@@ -6574,7 +6586,7 @@ class GraphClient:
         DocFile far more often than a section. No other DOCUMENTS route can
         originate from one, so admitting the label adds nothing else.
         """
-        label_clause = f":{label}" if label else ""
+        label_clause = f":{label}" if label else f":{NodeLabel.ENTITY}"
         records = await self.execute(
             f"MATCH (doc)-[r:{RelType.DOCUMENTS}]->(n{label_clause} {{uid: $uid}}) "
             f"WHERE doc:{NodeLabel.DOC_SECTION} OR doc:{NodeLabel.NOTE} OR doc:{NodeLabel.DOC_FILE} "
@@ -6926,7 +6938,7 @@ class GraphClient:
                 continue
             if label:
                 _assert_valid_label(label)
-            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else "MATCH (n {uid: uid})"
+            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else f"MATCH (n:{NodeLabel.ENTITY} {{uid: uid}})"
             referenced = await self.execute(
                 f"UNWIND $uids AS uid {match_n} "
                 "MATCH (other)-[r]->(n) WHERE (other.file_path IS NULL OR other.file_path <> n.file_path) "
@@ -6944,7 +6956,7 @@ class GraphClient:
         for label, uids in remove_by_label.items():
             if not uids:
                 continue
-            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else "MATCH (n {uid: uid})"
+            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else f"MATCH (n:{NodeLabel.ENTITY} {{uid: uid}})"
             # Deletion marking is folded into the same statement as the DETACH
             # DELETE: a node about to be removed may be an explicit anchor
             # target, so any Note anchoring into it gets has_broken_anchors
@@ -6960,7 +6972,7 @@ class GraphClient:
         for label, uids in preserve_by_label.items():
             if not uids:
                 continue
-            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else "MATCH (n {uid: uid})"
+            match_n = f"MATCH (n:{label} {{uid: uid}})" if label else f"MATCH (n:{NodeLabel.ENTITY} {{uid: uid}})"
             await self.execute_write(
                 f"UNWIND $uids AS uid {match_n} OPTIONAL MATCH (n)-[out]->() DELETE out",
                 {"uids": uids},
