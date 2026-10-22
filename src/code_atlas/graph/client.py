@@ -5049,16 +5049,24 @@ class GraphClient:
         every node in the graph — and this runs at the end of *every* index, not on the rare
         destructive path ``clear_embeddings`` serves. Each primary label indexes
         ``project_name`` and ``kind``.
+
+        One statement per label, never ``(n:A|B|...)``. With ``n.kind IN $kinds`` the
+        multi-label form plans a union whose every branch scans under a chain of
+        ``Unwind`` steps over the list, so its cost explodes with the list's length:
+        measured on trading-bot (70k vectors), 1 kind 0.5 s, 3 kinds 12 s, 4 kinds past
+        30 s. One label at a time is a plain index scan, 0.06 s for all 13.
         """
-        labels = "|".join(sorted(lbl.value for lbl in _ENTITY_LABELS))
         kind_clause = "AND n.kind IN $kinds " if kinds else ""
-        rows = await self.execute(
-            f"MATCH (n:{labels}) WHERE n.project_name = $project AND n.embedding IS NOT NULL "
-            f"{kind_clause}"
-            "RETURN n.uid AS uid, n.kind AS kind, n.file_path AS file_path",
-            {"project": project_name, "kinds": list(kinds)},
-        )
-        return [(r["uid"], r["kind"] or "", r["file_path"] or "") for r in rows]
+        found: dict[str, tuple[str, str, str]] = {}
+        for label in sorted(lbl.value for lbl in _ENTITY_LABELS):
+            rows = await self.execute(
+                f"MATCH (n:{label}) WHERE n.project_name = $project AND n.embedding IS NOT NULL "
+                f"{kind_clause}"
+                "RETURN n.uid AS uid, n.kind AS kind, n.file_path AS file_path",
+                {"project": project_name, "kinds": list(kinds)},
+            )
+            found.update((r["uid"], (r["uid"], r["kind"] or "", r["file_path"] or "")) for r in rows)
+        return list(found.values())
 
     async def clear_embeddings_for_uids(self, uids: list[str]) -> int:
         """Strip the vector, hash and model stamp from *uids*, and delete their chunks.
