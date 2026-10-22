@@ -7887,3 +7887,39 @@ async def test_uid_only_lookups_never_scan_the_whole_graph(graph_client: GraphCl
             scans.append((query[:100], full))
     assert len(statements) > 25, "the recorder missed the calls it exists to inspect"
     assert scans == []
+
+
+async def test_find_embedded_entities_plans_stay_linear_in_the_kinds_list(
+    graph_client: GraphClient, settings: AtlasSettings, monkeypatch: pytest.MonkeyPatch
+):
+    """`kind IN $kinds` across many labels at once planned a union scanning under nested
+    `Unwind`s over the list: 3 kinds took 12 s and 4 never finished on a 70k-vector project,
+    which hung the embedding-policy reclaim at the end of every index."""
+    await graph_client.ensure_schema()
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'test:f', project_name: 'test', name: 'f', "
+        "kind: 'function', file_path: 'a.py', embedding: $vec}) "
+        f"CREATE (:{NodeLabel.DOC_SECTION}:{NodeLabel.ENTITY} {{uid: 'test:s', project_name: 'test', name: 's', "
+        "kind: 'section', file_path: 'a.md', embedding: $vec}) "
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'test:m', project_name: 'test', name: 'm', "
+        "kind: 'method', file_path: 'a.py'})",
+        {"vec": [0.1] * (settings.embeddings.dimension or 768)},
+    )
+    statements: list[tuple[str, dict]] = []
+    real_read = graph_client._execute_inner
+
+    async def record_read(query, params=None):
+        statements.append((query, params or {}))
+        return await real_read(query, params)
+
+    monkeypatch.setattr(graph_client, "_execute_inner", record_read)
+    kinds = ["function", "section", "method", "constant", "field"]
+    rows = await graph_client.find_embedded_entities("test", kinds=kinds)
+    monkeypatch.undo()
+
+    assert sorted(rows) == [("test:f", "function", "a.py"), ("test:s", "section", "a.md")]
+    assert statements, "the recorder saw no statement"
+    for query, params in statements:
+        plan = [r["QUERY PLAN"].strip() for r in await graph_client.execute(f"EXPLAIN {query}", params)]
+        assert not any("Union" in step for step in plan), f"one label per statement: {query[:80]}"
+        assert sum("Unwind" in step for step in plan) <= 1, f"nested Unwinds over $kinds: {plan}"
