@@ -2,6 +2,29 @@
 
 <!-- version list -->
 
+## v0.15.4 (2026-10-22)
+
+### Bug Fixes
+
+- **graph**: Match uid-only lookups on the :Entity marker index
+  ([#28](https://github.com/SerPeter/code-atlas/pull/28),
+  [`320f029`](https://github.com/SerPeter/code-atlas/commit/320f029bfa315321f365c57fb69aa9c2f0787896))
+
+- **indexing**: Bound worktree projects and reclaim the ones left behind
+  ([#29](https://github.com/SerPeter/code-atlas/pull/29),
+  [`e8d02c1`](https://github.com/SerPeter/code-atlas/commit/e8d02c142b43d340087436f38c0b270137e7d6de))
+
+### Build System
+
+- **deps**: Bump aiohttp, certifi, gitpython and mcp for new advisories
+  ([#30](https://github.com/SerPeter/code-atlas/pull/30),
+  [`74bf963`](https://github.com/SerPeter/code-atlas/commit/74bf96358963e600362cb2a271312f110bd99844))
+
+- **deps**: Bump multidict to 6.9.1 for CVE-2026-104874
+  ([#27](https://github.com/SerPeter/code-atlas/pull/27),
+  [`0aa6cf5`](https://github.com/SerPeter/code-atlas/commit/0aa6cf55f04ea4a9c9d9087b633bfca259bbe522))
+
+
 ## v0.15.3 (2026-10-12)
 
 ### Bug Fixes
