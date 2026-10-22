@@ -7877,6 +7877,14 @@ async def test_uid_only_lookups_never_scan_the_whole_graph(graph_client: GraphCl
     await graph_client.get_callees(a, "", 2, 10)
     await graph_client.get_linked_docs(a, "", 10)
     await graph_client._batch_delete_entities({"": [a]})
+    # No observed label for either endpoint: a batch's own citations always arrive this way.
+    await graph_client._write_labelled_edges(
+        [{"from_uid": a, "to_uid": b}],
+        {},
+        lambda x, y: (
+            f"UNWIND $rels AS r MATCH (a{x} {{uid: r.from_uid}}), (b{y} {{uid: r.to_uid}}) MERGE (a)-[:CALLS]->(b)"
+        ),
+    )
     monkeypatch.undo()
 
     scans = []
@@ -7887,6 +7895,35 @@ async def test_uid_only_lookups_never_scan_the_whole_graph(graph_client: GraphCl
             scans.append((query[:100], full))
     assert len(statements) > 25, "the recorder missed the calls it exists to inspect"
     assert scans == []
+
+
+async def test_get_node_finds_a_uid_through_the_marker_index(graph_client: GraphClient):
+    """Its uid branch was unlabelled whenever no label was given, so every `get_node` call
+    scanned the whole graph to find one node. (The name branch is ATL-198.)"""
+    await graph_client.ensure_schema()
+    plan = [
+        r["QUERY PLAN"].strip()
+        for r in await graph_client.execute(
+            "EXPLAIN MATCH (n:Entity {uid: $name}) RETURN n LIMIT 5", {"name": "test:x"}
+        )
+    ]
+    assert any("ScanAllByLabelProperties (n :Entity {uid})" in step for step in plan), plan
+
+    recorded: list[str] = []
+    real_read = graph_client._execute_inner
+
+    async def record_read(query, params=None):
+        recorded.append(query)
+        return await real_read(query, params)
+
+    graph_client._execute_inner = record_read  # ty: ignore[invalid-assignment]
+    try:
+        await graph_client.get_node_exact_matches("test:x", "", 5)
+    finally:
+        del graph_client._execute_inner
+    uid_branch = recorded[0].split("UNION ALL")[0]
+    plan = [r["QUERY PLAN"].strip() for r in await graph_client.execute(f"EXPLAIN {uid_branch}", {"name": "test:x"})]
+    assert any("ScanAllByLabelProperties (n :Entity {uid})" in step for step in plan), plan
 
 
 async def test_find_embedded_entities_plans_stay_linear_in_the_kinds_list(
