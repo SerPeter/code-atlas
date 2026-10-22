@@ -66,7 +66,6 @@ _WEIGHTS = (None, 1.0, 0.5, 1 / 3, 0.25, 1 / 6, 0.125, 1e-6)
 @dataclass
 class Node:
     label: str
-    marker: bool
     name: str
     qualified_name: str | None
     file_path: str
@@ -92,7 +91,8 @@ async def _write_graph(client: GraphClient, nodes: list[Node], edges: list[Edge]
     params: dict[str, Any] = {}
     parts: list[str] = []
     for i, nd in enumerate(nodes):
-        labels = f":{nd.label}" + (f":{NodeLabel.ENTITY}" if nd.marker else "")
+        # Always marked, as every writer marks them: uid lookups match on :Entity.
+        labels = f":{nd.label}:{NodeLabel.ENTITY}"
         props = {
             "uid": _uid(i),
             "project_name": _PROJECT,
@@ -428,7 +428,6 @@ def _graphs(draw: st.DrawFn) -> tuple[list[Node], list[Edge]]:
     nodes = [
         Node(
             label=draw(st.sampled_from((NodeLabel.CALLABLE.value, NodeLabel.TYPE_DEF.value))),
-            marker=draw(st.booleans()),
             name=f"n{i}",
             # Few distinct values and sometimes none, so the ORDER BY tie-break on uid matters.
             qualified_name=draw(st.one_of(st.none(), st.sampled_from(("m.a", "m.b", "m.c")))),
@@ -509,7 +508,7 @@ async def test_traversals_match_the_all_paths_reference(
 
 
 def _fn(i: int, qn: str | None = None) -> Node:
-    return Node(NodeLabel.CALLABLE.value, True, f"n{i}", qn or f"m.n{i}", "src/a.py", "function")
+    return Node(NodeLabel.CALLABLE.value, f"n{i}", qn or f"m.n{i}", "src/a.py", "function")
 
 
 def _calls(src: int, dst: int, weight: float | None = None, **props: Any) -> Edge:
@@ -709,7 +708,7 @@ async def test_callers_and_callees_cut_in_order(graph_client: GraphClient) -> No
     # A hub reached by many callers at different depths, shared qualified names, a TypeDef in
     # the middle (traversed, never returned), and a cycle.
     nodes = [_fn(i, qn="m.same" if i % 2 else None) for i in range(9)]
-    nodes[3] = Node(NodeLabel.TYPE_DEF.value, False, "n3", "m.a", "src/a.py", "class")
+    nodes[3] = Node(NodeLabel.TYPE_DEF.value, "n3", "m.a", "src/a.py", "class")
     edges = [
         _calls(1, 0),
         _calls(2, 0),

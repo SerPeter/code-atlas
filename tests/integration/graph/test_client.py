@@ -7807,3 +7807,83 @@ async def test_a_stub_two_tables_read_survives_a_partial_match(graph_client: Gra
 
     assert await _feeds_count(graph_client, model_uid, resolved) == 1
     assert await _warehouse_stubs(graph_client) == ["ext/warehouse/warehouse.no_such_model"]
+
+
+# ---------------------------------------------------------------------------
+# Uid lookups use an index
+# ---------------------------------------------------------------------------
+
+
+async def test_uid_only_lookups_never_scan_the_whole_graph(graph_client: GraphClient, monkeypatch: pytest.MonkeyPatch):
+    """A caller holding only a uid must match on the ``:Entity`` marker, never on ``(n)``.
+
+    Unlabelled, Memgraph can use no index and scans every node in the graph *per uid*:
+    measured at 0.83 s each on a 131k-node graph, which put a 17k-uid embedding reclaim
+    hours past its query timeout. The plan is the assertion rather than a clock — an
+    empty test graph scans fast, and a ``ScanAll`` in the plan is the defect itself.
+    """
+    await graph_client.ensure_schema()
+    await graph_client.execute_write(
+        f"CREATE (m:{NodeLabel.MODULE}:{NodeLabel.ENTITY} {{uid: 'test:mod', project_name: 'test', "
+        "name: 'mod', qualified_name: 'mod', file_path: 'pkg/mod.py'}) "
+        f"CREATE (a:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'test:mod.a', project_name: 'test', "
+        "name: 'a', qualified_name: 'mod.a', file_path: 'pkg/mod.py'}) "
+        f"CREATE (b:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'test:mod.b', project_name: 'test', "
+        "name: 'b', qualified_name: 'mod.b', file_path: 'pkg/mod.py'}) "
+        f"CREATE (m)-[:{RelType.DEFINES}]->(a), (m)-[:{RelType.DEFINES}]->(b), (a)-[:{RelType.CALLS}]->(b)"
+    )
+    # The planner is cost-based: on three nodes it rightly prefers scanning the one Module
+    # to an index lookup, which no real graph would. Filler gives it a real graph's shape.
+    await graph_client.execute_write(
+        f"UNWIND range(1, 500) AS i CREATE (:{NodeLabel.MODULE}:{NodeLabel.ENTITY} "
+        "{uid: 'test:filler' + toString(i), project_name: 'test', name: 'f', qualified_name: 'f'})"
+    )
+
+    # Reads run for real, so a lookup that gates a second query (trace_path's existence
+    # check) reaches it. Writes are only recorded: their plans are what is under test.
+    statements: list[tuple[str, dict]] = []
+    real_read = graph_client._execute_inner
+
+    async def record_read(query, params=None):
+        statements.append((query, params or {}))
+        return await real_read(query, params)
+
+    async def record_write(query, params=None):
+        statements.append((query, params or {}))
+
+    monkeypatch.setattr(graph_client, "_execute_inner", record_read)
+    monkeypatch.setattr(graph_client, "_execute_write_inner", record_write)
+
+    a, b = "test:mod.a", "test:mod.b"
+    await graph_client.clear_embeddings_for_uids([a])
+    await graph_client.read_entity_texts([a])
+    await graph_client.read_embed_hashes([a])
+    await graph_client.read_embed_lines([a])
+    await graph_client.write_embeddings([(a, [0.0])])
+    await graph_client.write_embed_hashes([(a, "h")])
+    await graph_client.write_embed_lines([(a, ["l"])])
+    await graph_client.write_embeddings_and_hashes([(a, [0.0], "h")])
+    await graph_client.batch_call_stats([a])
+    await graph_client.node_exists(a)
+    await graph_client.trace_path_between(a, b, 3, (RelType.CALLS.value,))
+    await graph_client.trace_path_between(a, a, 3, (RelType.CALLS.value,))
+    await graph_client.compute_blast_radius(a, "out", (RelType.CALLS.value,), 2)
+    await graph_client.get_diagram_module_detail("test", "pkg/mod.py", 10)
+    await graph_client.get_entity_by_uid(a)
+    await graph_client.get_defining_parent(a)
+    await graph_client.get_sibling_entities(a, 5)
+    await graph_client.get_package_docstring(a)
+    await graph_client.get_callers(a, "", 2, 10)
+    await graph_client.get_callees(a, "", 2, 10)
+    await graph_client.get_linked_docs(a, "", 10)
+    await graph_client._batch_delete_entities({"": [a]})
+    monkeypatch.undo()
+
+    scans = []
+    for query, params in statements:
+        plan = [r["QUERY PLAN"] for r in await graph_client.execute(f"EXPLAIN {query}", params)]
+        full = [step.strip() for step in plan if "ScanAll " in step and "ScanAllBy" not in step]
+        if full:
+            scans.append((query[:100], full))
+    assert len(statements) > 25, "the recorder missed the calls it exists to inspect"
+    assert scans == []
