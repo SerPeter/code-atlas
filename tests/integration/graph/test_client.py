@@ -7960,3 +7960,41 @@ async def test_find_embedded_entities_plans_stay_linear_in_the_kinds_list(
         plan = [r["QUERY PLAN"].strip() for r in await graph_client.execute(f"EXPLAIN {query}", params)]
         assert not any("Union" in step for step in plan), f"one label per statement: {query[:80]}"
         assert sum("Unwind" in step for step in plan) <= 1, f"nested Unwinds over $kinds: {plan}"
+
+
+async def test_dead_code_candidates_plan_one_project_scan_per_label(
+    graph_client: GraphClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Two plan bugs timed analyze_repo(dead_code) out at 10 s on production for a 12k-node
+    project. `(n:Callable OR n:TypeDef) AND n.kind IN $code_kinds` planned a union of lookups on
+    the database-wide kind index under nested Unwinds over 20 kinds; and the inbound-reference
+    EXISTS, written from `src`, scanned the whole database once per candidate."""
+    await graph_client.ensure_schema()
+    await graph_client.execute_write(
+        f"CREATE (:{NodeLabel.CALLABLE}:{NodeLabel.ENTITY} {{uid: 'test:dead', project_name: 'test', name: 'dead', "
+        "qualified_name: 'm.dead', kind: 'function', file_path: 'b.py', line_start: 3}) "
+        f"CREATE (:{NodeLabel.TYPE_DEF}:{NodeLabel.ENTITY} {{uid: 'test:Gone', project_name: 'test', name: 'Gone', "
+        "qualified_name: 'm.Gone', kind: 'class', file_path: 'a.py', line_start: 9})"
+    )
+    # The planner is cost-based: on two nodes a scan is genuinely cheapest. Filler gives it a real shape.
+    await graph_client.execute_write(
+        f"UNWIND range(1, 500) AS i CREATE (:{NodeLabel.MODULE}:{NodeLabel.ENTITY} "
+        "{uid: 'test:filler' + toString(i), project_name: 'test', name: 'f', qualified_name: 'f'})"
+    )
+    statements: list[tuple[str, dict]] = []
+    real_read = graph_client._execute_inner
+
+    async def record_read(query, params=None):
+        statements.append((query, params or {}))
+        return await real_read(query, params)
+
+    monkeypatch.setattr(graph_client, "_execute_inner", record_read)
+    rows = await graph_client.get_dead_code_candidates("test", "")
+    monkeypatch.undo()
+
+    assert [r["qn"] for r in rows] == ["m.Gone", "m.dead"], "ordered by file, then line, across both labels"
+    for query, params in statements:
+        plan = [r["QUERY PLAN"].strip() for r in await graph_client.execute(f"EXPLAIN {query}", params)]
+        assert not any(step.lstrip("* ").startswith("Union") for step in plan), plan
+        assert sum("Unwind" in step for step in plan) <= 1, plan
+        assert not any("ScanAll (" in step for step in plan), plan

@@ -6262,9 +6262,24 @@ class GraphClient:
             # call that eventually runs it is a framework's, not this codebase's.
             f"|{RelType.REFERENCES}"
         )
+        # One statement per label. `(n {project_name}) WHERE (n:Callable OR n:TypeDef) AND
+        # n.kind IN $code_kinds` planned a union of lookups on the database-wide kind index
+        # under nested Unwinds over the 20-kind list, and timed out at 10 s on a 131k-node
+        # graph for a 12k-node project. Labelled, each is one project_name index scan.
+        rows: list[dict[str, Any]] = []
+        for label in (NodeLabel.CALLABLE, NodeLabel.TYPE_DEF):
+            rows += await self._dead_code_candidates_for(label, refs, pa, params)
+        return sorted(
+            rows,
+            key=lambda r: (r["file_path"] is None, r["file_path"] or "", r["line_start"] is None, r["line_start"] or 0),
+        )
+
+    async def _dead_code_candidates_for(
+        self, label: NodeLabel, refs: str, pa: str, params: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         return await self.execute(
-            "MATCH (n {project_name: $project}) "
-            f"WHERE (n:Callable OR n:TypeDef) AND n.kind IN $code_kinds "
+            f"MATCH (n:{label} {{project_name: $project}}) "
+            f"WHERE n.kind IN $code_kinds "
             f"AND NOT n.name STARTS WITH '__'{pa} "
             # The inbound test names its source so grants can be excluded from it. A
             # permission set gives every Apex class it grants an inbound IMPORTS, which
@@ -6272,7 +6287,10 @@ class GraphClient:
             # were indexed: the analysis returned zero dead Apex in any org where most
             # classes are granted somewhere, which is every org. Being *visible to* a
             # profile is not being *used by* anything.
-            f"AND NOT EXISTS {{ MATCH (src)-[:{refs}]->(n) "
+            # Written from `n`, never from `src`: Memgraph plans an EXISTS subquery from its
+            # first node, and `(src)-[...]->(n)` became a scan of the whole database per
+            # candidate -- past 30 s for 7.7k candidates, against 0.02 s anchored on `n`.
+            f"AND NOT EXISTS {{ MATCH (n)<-[:{refs}]-(src) "
             "WHERE NOT coalesce(src.kind, '') IN $grant_kinds } "
             # Constructing a class produces an edge to its __init__, not to the class.
             f"AND NOT (n)-[:{RelType.DEFINES}]->()<-[:{RelType.CALLS}]-() "
