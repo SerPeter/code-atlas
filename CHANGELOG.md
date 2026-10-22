@@ -2,6 +2,25 @@
 
 <!-- version list -->
 
+## v0.15.5 (2026-10-22)
+
+### Bug Fixes
+
+- **graph**: Fall back to the :Entity marker, not to no label, for uid edges
+  ([`b87df6a`](https://github.com/SerPeter/code-atlas/commit/b87df6a088f61a5100823e83135e9414ef6cc310))
+
+- **graph**: Find embedded entities one label at a time
+  ([`9c2ff1c`](https://github.com/SerPeter/code-atlas/commit/9c2ff1c26241746fd0e983335a66858ecd31ad9b))
+
+- **graph**: Make dead-code analysis finish on a large graph
+  ([`715c279`](https://github.com/SerPeter/code-atlas/commit/715c279c27c4e0ffadba19325be07db878700d8d))
+
+### Testing
+
+- Add an on-demand query-plan audit against a real graph
+  ([`2f7eb88`](https://github.com/SerPeter/code-atlas/commit/2f7eb88e76235e358defafb521859d9546c944f8))
+
+
 ## v0.15.4 (2026-10-22)
 
 ### Bug Fixes
