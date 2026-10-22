@@ -804,7 +804,9 @@ async def _run_index(  # noqa: PLR0912, PLR0915
     from code_atlas.graph.client import EmbeddingsPresentError
     from code_atlas.indexing.orchestrator import (
         EmbeddingDimensionMismatchError,
+        WorktreeBudgetError,
         assert_embedding_dimension_matches,
+        check_worktree_budget,
         detect_sub_projects,
         select_sub_projects,
     )
@@ -998,6 +1000,12 @@ async def _run_index(  # noqa: PLR0912, PLR0915
             logger.error("{}", exc)
             raise typer.Exit(code=1) from exc
         logger.debug("Holding indexer lease ({})", owner)
+
+        try:
+            await check_worktree_budget(settings, graph)
+        except WorktreeBudgetError as exc:
+            logger.error("{}", exc)
+            raise typer.Exit(code=1) from exc
 
         # An undrained pipeline means the graph does not reflect the working tree. Printing
         # "Done" and exiting 0 for that made two incomplete indexes read as successes, to a
@@ -1520,6 +1528,16 @@ async def _run_status() -> None:
                 f"Project: {name} | indexed: {ts} | files: {files} | entities: {entities} | git: {git_hash}{deps_str}"
             )
 
+        from code_atlas.indexing.orchestrator import worktree_project_counts
+
+        cap = settings.worktrees.max_projects
+        for main_root, count in sorted(worktree_project_counts(projects).items()):
+            if count >= cap:
+                _echo(
+                    f"Warning: {main_root} holds {count} worktree project(s), at [worktrees] max_projects "
+                    f"({cap}) — a new worktree will not be indexed until some are removed (atlas project rm)."
+                )
+
 
 @project_app.command("rm")
 def project_rm(
@@ -1529,9 +1547,10 @@ def project_rm(
     """Delete a project's graph data (nodes, relationships, embeddings) and its queue data.
 
     Mainly for worktree-project cleanup: a linked worktree indexes as its own
-    'base@branch' project, and the daemon auto-GCs these once the checkout is
-    gone — this command covers the manual case (immediate cleanup, or a
-    non-worktree project you want to drop).
+    'dir@branch' project, and the daemon auto-GCs these once the checkout is
+    gone, switched to another branch, or idle past [worktrees] idle_days — this
+    command covers the manual case (immediate cleanup, or a non-worktree
+    project you want to drop).
     """
     asyncio.run(_run_project_rm(name, skip_confirm=yes))
 

@@ -24,6 +24,7 @@ import yaml
 from loguru import logger
 
 from code_atlas.events import EmbedDirty, EntityRef, Event, EventBus, FileChanged, Significance, Topic
+from code_atlas.hooks import main_checkout
 from code_atlas.indexing.consumers import ASTConsumer, BatchPolicy, EmbedConsumer
 from code_atlas.indexing.stubs import read_package_stubs
 from code_atlas.parsing.ast import get_language_for_file
@@ -35,7 +36,13 @@ from code_atlas.schema import (
     split_image_reference,
 )
 from code_atlas.search.embeddings import EmbedClient, EmbeddingError, EmbedPolicy
-from code_atlas.settings import EmbeddingSettings, derive_project_name, extraction_key, resolve_git_dir
+from code_atlas.settings import (
+    EmbeddingSettings,
+    derive_project_name,
+    extraction_key,
+    get_worktree_branch,
+    resolve_git_dir,
+)
 from code_atlas.telemetry import get_metrics, get_tracer
 
 if TYPE_CHECKING:
@@ -1858,7 +1865,12 @@ async def _create_package_hierarchy(
     """Create Project + Package nodes and CONTAINS edges. Returns package count."""
     # root_path enables absolute-path anchor resolution for the knowledge vault
     # (a note's anchors: entry can point at a file by absolute path).
-    await graph.merge_project_node(project_name, root_path=str(project_root.resolve()).replace("\\", "/"))
+    paths = {"root_path": str(project_root.resolve()).replace("\\", "/")}
+    # A worktree's name carries its own directory, not its repository's, so this is the
+    # only link the worktree GC and budget have back to the main checkout once it is gone.
+    if (main_root := main_checkout(project_root)) is not None:
+        paths["main_root"] = str(main_root).replace("\\", "/")
+    await graph.merge_project_node(project_name, **paths)
     packages = _detect_packages(project_root, exclude_dirs=exclude_dirs)
     batch = [(qn, qn.rsplit(".", 1)[-1], f"{rel_path}/__init__.py") for qn, rel_path in packages]
     await graph.merge_package_batch(project_name, batch)
@@ -3351,85 +3363,197 @@ async def _wait_for_drain(
 # ---------------------------------------------------------------------------
 
 
-async def gc_vanished_worktree_projects(graph: GraphClient) -> list[str]:
-    """Delete graph data for worktree projects whose checkout no longer exists on disk.
+class WorktreeBudgetError(RuntimeError):
+    """A new worktree's first index would take its repository past ``[worktrees] max_projects``."""
 
-    A linked git worktree indexes as its own ``base@branch`` Project
-    (``derive_project_name``); once the worktree is removed
-    (``git worktree remove`` or a manual ``rm``), its ``root_path`` — stored on
-    the Project node by ``_create_package_hierarchy`` — points at a directory
-    that's gone. This runs at the startup of *every* daemon for *any* project
-    sharing the Memgraph instance, so a directory that merely looks gone
-    (transient mount hiccup, unmounted drive) must not be trusted blind —
-    destructively wiping a project's graph data is irreversible. A vanished
-    root_path is therefore only a candidate; it must be corroborated against
-    the base project's own ``git worktree list`` (via ``_git_worktree_list``)
-    before deletion proceeds — a real ``git worktree remove`` drops the entry
-    from that list, while a merely-unavailable checkout still shows up there.
-    If the base project can't be found in the graph, its root_path also isn't
-    a live directory, or git is unavailable, the candidate is skipped this
-    run rather than guessed at — same "skip, don't guess" behavior as
-    ``_decide_empty_scan_deletion``. Meant to run once at daemon startup, not
-    on a timer — a removed worktree is a one-time event, not something that
-    needs continuous polling.
+
+@dataclass(frozen=True)
+class _WorktreeCheckout:
+    """One linked worktree's projects: its own, plus the monorepo sub-projects inside it."""
+
+    name: str
+    root_path: str
+    members: tuple[str, ...]
+    main_root: Path | None
+    last_used: float | None
+
+
+def _worktree_main_root(node: dict[str, Any], roots_by_name: dict[str, str]) -> Path | None:
+    """The main checkout behind a worktree project, or None when nothing ties it to one.
+
+    ``main_root`` is stamped by ``_create_package_hierarchy``; a checkout indexed before
+    that falls back to asking git while it still exists, then to Claude Code's own
+    ``<main>/.claude/worktrees/<name>`` layout, then to a main project the name's ``@``
+    prefix happens to match. The name alone is not enough: a worktree is named after
+    *its own* directory, so ``agent-1@agent-1`` names no project at all, which is how
+    every Claude Code worktree used to be skipped by this sweep forever.
     """
-    removed: list[str] = []
-    records = await graph.get_project_status()
+    stored = node.get("main_root")
+    if stored:
+        return Path(stored)
+    root = Path(node["root_path"])
+    if root.is_dir():
+        return main_checkout(root)
+    stored_root = PurePosixPath(node["root_path"])
+    if stored_root.parent.name == "worktrees" and stored_root.parent.parent.name == ".claude":
+        return Path(str(stored_root.parent.parent.parent))
+    base_root = roots_by_name.get(node["project_name"].rpartition("@")[0])
+    return Path(base_root) if base_root else None
 
-    roots_by_name: dict[str, str] = {}
-    for record in records:
-        node = record.get("n")
-        if node is None:
-            continue
-        name = node.get("project_name")
-        root_path = node.get("root_path")
-        if name and root_path:
-            roots_by_name[name] = root_path
 
-    for record in records:
-        node = record.get("n")
-        if node is None:
-            continue
-        name = node.get("project_name")
-        root_path = node.get("root_path")
-        if not name or "@" not in name or not root_path:
-            continue
-        if Path(root_path).is_dir():
-            continue
+def _worktree_checkouts(records: list[dict[str, Any]]) -> list[_WorktreeCheckout]:
+    """Group the graph's worktree projects by the checkout they were indexed from.
 
-        base = name.rpartition("@")[0]
-        base_root = roots_by_name.get(base)
-        if not base_root or not Path(base_root).is_dir():
-            logger.warning(
-                "GC: worktree project '{}' checkout vanished ({}) but base project '{}' has no live root_path "
-                "to corroborate against — skipping deletion this run",
-                name,
-                root_path,
-                base,
+    A monorepo worktree is several projects (``a@b`` and ``a@b/core``), and they live and
+    die together. Membership needs both the name prefix and a root inside the checkout's
+    root, because a branch name may contain ``/`` too.
+    """
+    nodes = [n for r in records if (n := r.get("n")) is not None and n.get("project_name") and n.get("root_path")]
+    roots_by_name = {n["project_name"]: n["root_path"] for n in nodes}
+    worktree = [n for n in nodes if "@" in n["project_name"]]
+
+    def inside(child: dict[str, Any], parent: dict[str, Any]) -> bool:
+        return child is not parent and (
+            child["project_name"].startswith(parent["project_name"] + "/")
+            and PurePosixPath(child["root_path"]).is_relative_to(PurePosixPath(parent["root_path"]))
+        )
+
+    checkouts = []
+    for top in worktree:
+        if any(inside(top, other) for other in worktree):
+            continue
+        members = [top, *(n for n in worktree if inside(n, top))]
+        stamps = [s for m in members for s in (m.get("last_indexed_at"), m.get("last_used_at")) if s is not None]
+        checkouts.append(
+            _WorktreeCheckout(
+                name=top["project_name"],
+                root_path=top["root_path"],
+                members=tuple(m["project_name"] for m in members),
+                main_root=_worktree_main_root(top, roots_by_name),
+                last_used=max(stamps, default=None),
             )
-            continue
+        )
+    return checkouts
 
-        worktrees = await asyncio.to_thread(_git_worktree_list, Path(base_root))
+
+def worktree_project_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    """How many worktree projects each main checkout holds, keyed by its path (``atlas status``)."""
+    counts: Counter[str] = Counter()
+    for checkout in _worktree_checkouts(records):
+        if checkout.main_root is not None:
+            counts[str(checkout.main_root).replace("\\", "/")] += 1
+    return dict(counts)
+
+
+async def _checkout_removal_reason(checkout: _WorktreeCheckout, idle_days: float, now: float) -> str:
+    """Why *checkout*'s projects can go, or ``""`` to keep them.
+
+    Removal is irreversible, and this sweeps every project sharing the database, so
+    each reason must be corroborated rather than inferred:
+
+    - **Gone** only when the main checkout's ``git worktree list`` agrees: a drive that is
+      merely unmounted still shows up there.
+    - **Switched** only when the checkout's HEAD names another branch: the project's name
+      carries its branch, so ``git switch`` inside a worktree starts a new project and
+      leaves the old one behind on a directory that still exists.
+    - **Idle** only from a stamp: a checkout with none is kept.
+
+    A checkout no main checkout can be found for is never touched.
+    """
+    if checkout.main_root is None:
+        logger.warning("GC: no main checkout found for worktree project '{}' — keeping it", checkout.name)
+        return ""
+    root = Path(checkout.root_path)
+    if not root.is_dir():
+        worktrees = (
+            await asyncio.to_thread(_git_worktree_list, checkout.main_root) if checkout.main_root.is_dir() else None
+        )
         if worktrees is None:
             logger.warning(
-                "GC: worktree project '{}' checkout vanished ({}) but 'git worktree list' is unavailable for "
-                "base '{}' — skipping deletion this run (not corroborated)",
-                name,
-                root_path,
-                base,
+                "GC: worktree project '{}' checkout is unreachable ({}) and its main checkout {} cannot "
+                "corroborate a removal — keeping it",
+                checkout.name,
+                checkout.root_path,
+                checkout.main_root,
             )
-            continue
+        elif root.resolve() not in worktrees:
+            return f"its checkout {checkout.root_path} was removed"
+    elif get_worktree_branch(root) is not None and (current := derive_project_name(root)) != checkout.name:
+        return f"its checkout {checkout.root_path} is now '{current}'"
+    if checkout.last_used is not None and now - checkout.last_used > idle_days * 86_400:
+        return f"nothing has used it for {(now - checkout.last_used) / 86_400:.0f} days"
+    return ""
 
-        if Path(root_path).resolve() in worktrees:
-            logger.warning(
-                "GC: worktree project '{}' checkout looks vanished ({}) but git still lists it as a live "
-                "worktree — skipping deletion this run (likely transient unavailability, not a real removal)",
-                name,
-                root_path,
-            )
-            continue
 
-        logger.info("GC: worktree project '{}' checkout vanished ({}) — removing graph data", name, root_path)
+async def _remove_checkout(graph: GraphBackend, checkout: _WorktreeCheckout, reason: str) -> list[str]:
+    logger.info("GC: removing worktree project '{}' — {}", checkout.name, reason)
+    for name in checkout.members:
         await graph.delete_project_data(name)
-        removed.append(name)
+    return list(checkout.members)
+
+
+async def gc_worktree_projects(graph: GraphBackend, *, idle_days: float, now: float | None = None) -> list[str]:
+    """Delete worktree projects whose checkout is gone, moved to another branch, or idle.
+
+    Runs at the start of every indexing daemon, for every project sharing the database,
+    and before a new worktree's first index (:func:`check_worktree_budget`). Returns the
+    project names removed.
+    """
+    now = time.time() if now is None else now
+    removed: list[str] = []
+    for checkout in _worktree_checkouts(await graph.get_project_status()):
+        reason = await _checkout_removal_reason(checkout, idle_days, now)
+        if reason:
+            removed += await _remove_checkout(graph, checkout, reason)
     return removed
+
+
+async def check_worktree_budget(settings: AtlasSettings, graph: GraphBackend, *, now: float | None = None) -> None:
+    """Make room for this worktree's first index under ``[worktrees] max_projects``, or refuse it.
+
+    Only a *new* worktree project is gated: one that already exists is never refused,
+    because refusing it would strand an index that is already paid for. Room comes from
+    :func:`gc_worktree_projects` first; ``on_limit`` decides what happens after that.
+
+    Must run before anything writes the project. The daemon checks before it starts its
+    watcher, not inside the catch-up, because a catch-up failure is logged and the live
+    pipeline starts anyway -- and would build the refused project one file at a time.
+
+    Raises :class:`WorktreeBudgetError` when ``on_limit = "error"`` and there is no room.
+    """
+    root = Path(settings.project_root).resolve()
+    main_root = main_checkout(root)
+    if main_root is None:
+        return
+    name = derive_project_name(root)
+    if await graph.get_project_status(name):
+        return
+    budget = settings.worktrees
+
+    def siblings(records: list[dict[str, Any]]) -> list[_WorktreeCheckout]:
+        return [
+            c
+            for c in _worktree_checkouts(records)
+            if c.name != name and c.main_root is not None and c.main_root.resolve() == main_root
+        ]
+
+    taken = siblings(await graph.get_project_status())
+    if len(taken) < budget.max_projects:
+        return
+    await gc_worktree_projects(graph, idle_days=budget.idle_days, now=now)
+    taken = siblings(await graph.get_project_status())
+    excess = len(taken) - budget.max_projects + 1
+    if excess <= 0:
+        return
+    oldest_first = sorted(taken, key=lambda c: c.last_used or 0.0)
+    if budget.on_limit == "evict":
+        for checkout in oldest_first[:excess]:
+            await _remove_checkout(graph, checkout, f"least recently used, making room for '{name}'")
+        return
+    listing = "\n".join(f"  atlas project rm {c.name}   # {c.root_path}" for c in oldest_first)
+    raise WorktreeBudgetError(
+        f"Not indexing '{name}': {main_root} already has {len(taken)} worktree project(s), and "
+        f"[worktrees] max_projects is {budget.max_projects}. Each one is a full copy of the graph. "
+        f"Remove some (least recently used first), then restart this session or run `atlas index`:\n{listing}\n"
+        'Or raise max_projects, or set on_limit = "evict" to remove the oldest automatically.'
+    )

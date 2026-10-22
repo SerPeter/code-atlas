@@ -705,6 +705,35 @@ class IndexSettings(StrictSection):
     )
 
 
+class WorktreeSettings(StrictSection):
+    """Limits on the projects linked git worktrees create.
+
+    Each worktree indexes as its own ``<dir>@<branch>`` project, a full copy of the graph
+    and its vectors. Thirty of them accumulated unnoticed and put Memgraph out of memory.
+    """
+
+    max_projects: int = Field(
+        default=8,
+        ge=1,
+        description="How many worktree projects one repository may hold. A new worktree's first index "
+        "first removes what is safe to remove (checkout gone, switched to another branch, idle past "
+        "idle_days), then applies on_limit if the repository is still at the cap.",
+    )
+    idle_days: float = Field(
+        default=14.0,
+        gt=0,
+        description="Remove a worktree project nothing has indexed or watched for this long. An indexing "
+        "session stamps its project hourly, so this only reaches checkouts nobody has open. Rebuilding "
+        "one costs a full index but no embedding calls: vectors are copied from the main checkout.",
+    )
+    on_limit: Literal["error", "evict"] = Field(
+        default="error",
+        description="At the cap: 'error' refuses to index the new worktree and names what to remove; "
+        "'evict' removes the least recently used worktree project instead, which that worktree pays "
+        "for with a full rebuild the next time it is opened.",
+    )
+
+
 class ObservabilitySettings(StrictSection):
     """OpenTelemetry observability settings (requires ``[otel]`` extra)."""
 
@@ -1097,6 +1126,7 @@ class AtlasSettings(BaseSettings):
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     backend: BackendSettings = Field(default_factory=BackendSettings)
     index: IndexSettings = Field(default_factory=IndexSettings)
+    worktrees: WorktreeSettings = Field(default_factory=WorktreeSettings)
     rationale: RationaleSettings = Field(default_factory=RationaleSettings)
     watcher: WatcherSettings = Field(default_factory=WatcherSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
