@@ -11,6 +11,7 @@ import typer
 
 from code_atlas.indexing import daemon as daemon_module
 from code_atlas.indexing.daemon import DaemonManager
+from code_atlas.indexing.orchestrator import WorktreeBudgetError
 from code_atlas.search.ratelimit import unpaced
 from code_atlas.settings import AtlasSettings, ExtraVaultSettings, GraphBackendSettings, MemgraphSettings
 
@@ -399,6 +400,33 @@ class TestStartupCatchup:
 
         # Consumers still started despite the catch-up failure
         assert "consumer-run" in patched_daemon["order"]
+
+        await manager.stop()
+
+    async def test_a_refused_worktree_starts_nothing(
+        self, tmp_path: Path, patched_daemon: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unlike a failed catch-up: live consumers would build the refused project file by file."""
+
+        async def refuse(settings: object, graph: object) -> None:
+            raise WorktreeBudgetError("Not indexing 'wt@b': at the cap\n  atlas project rm old@o")
+
+        monkeypatch.setattr(daemon_module, "check_worktree_budget", refuse)
+        manager = DaemonManager()
+        ready = asyncio.Event()
+        await manager.start(
+            _make_settings(tmp_path),
+            object(),  # ty: ignore[invalid-argument-type]
+            FakeBus(_make_settings(tmp_path)),  # ty: ignore[invalid-argument-type]
+            include_watcher=False,
+            limiter=unpaced(),
+            first_index_ready=ready,
+        )
+        await asyncio.wait_for(ready.wait(), 1)
+        await asyncio.sleep(0.05)
+
+        assert patched_daemon["order"] == [], "no catch-up and no consumers"
+        assert manager.disabled_reason == "Not indexing 'wt@b': at the cap"
 
         await manager.stop()
 
@@ -950,3 +978,24 @@ class TestCheckpointFollowsHead:
         assert holder["catchups"] == []
         await manager._stop_stack()
         assert manager._checkpointer is None, "stopping the stack stops the poll"
+
+    async def test_a_live_session_stamps_its_project_as_used(
+        self, holder: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Edits go through the consumers, never an index pass, so only this keeps a busy
+        worktree from looking idle to the worktree GC."""
+        monkeypatch.setattr(daemon_module, "_LAST_USED_STAMP_S", 0.0)
+        manager: DaemonManager = holder["manager"]
+        stamps: list[dict[str, Any]] = []
+
+        async def update_project_metadata(name: str, **metadata: Any) -> None:
+            stamps.append({"name": name, **metadata})
+
+        manager._graph.update_project_metadata = update_project_metadata  # ty: ignore[invalid-assignment]
+        manager._checkpointer = asyncio.create_task(manager._run_checkpointer())
+        await asyncio.sleep(0.1)
+        await manager._stop_stack()
+
+        assert stamps, "no last_used_at stamp while the session indexed"
+        assert {s["name"] for s in stamps} == {holder["manager"]._settings.project_root.resolve().name}
+        assert all(s["last_used_at"] > 0 for s in stamps)

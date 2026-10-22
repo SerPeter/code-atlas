@@ -22,8 +22,10 @@ from code_atlas.indexing.consumers import ASTConsumer, EmbedConsumer
 from code_atlas.indexing.orchestrator import (
     FileScope,
     StalenessChecker,
+    WorktreeBudgetError,
+    check_worktree_budget,
     detect_sub_projects,
-    gc_vanished_worktree_projects,
+    gc_worktree_projects,
     index_monorepo,
     index_project,
     publish_project_changes,
@@ -70,6 +72,11 @@ _HOLDER_TICK_S = 5.0
 # timed out). A poll is two file stats and one graph read.
 _CHECKPOINT_POLL_S = 30.0
 _CHECKPOINT_BACKOFF_MAX_S = 900.0
+
+# How often the indexer stamps ``last_used_at`` on its project. Live edits go through the
+# consumers, never an index pass, so ``last_indexed_at`` alone would make a session that
+# has been editing for weeks look idle to the worktree GC ([worktrees] idle_days).
+_LAST_USED_STAMP_S = 3600.0
 
 
 @dataclass
@@ -246,11 +253,24 @@ class DaemonManager:
         assert limiter is not None
 
         try:
-            removed = await gc_vanished_worktree_projects(graph)
+            removed = await gc_worktree_projects(graph, idle_days=settings.worktrees.idle_days)
             if removed:
-                logger.info("GC: removed {} vanished worktree project(s): {}", len(removed), ", ".join(removed))
+                logger.info("GC: removed {} worktree project(s): {}", len(removed), ", ".join(removed))
         except Exception:
             logger.exception("Worktree GC sweep failed — continuing startup")
+
+        # Before the watcher, not in the catch-up: a failed catch-up is logged and the live
+        # pipeline starts anyway, which would build a refused project one file at a time.
+        try:
+            await check_worktree_budget(settings, graph)
+        except WorktreeBudgetError as exc:
+            logger.error("{}", exc)
+            self.disabled_reason = str(exc).partition("\n")[0]
+            if first_index_ready is not None:
+                first_index_ready.set()
+            return
+        except Exception:
+            logger.exception("Worktree budget check failed — continuing startup")
 
         self._consumers = self._build_consumers()
 
@@ -365,9 +385,13 @@ class DaemonManager:
         checker = StalenessChecker(self._settings.project_root)
         wait = _CHECKPOINT_POLL_S
         seen: str | None = None
+        stamped = time.monotonic()  # the catch-up just stamped last_indexed_at
         while True:
             await asyncio.sleep(wait)
             try:
+                if time.monotonic() - stamped >= _LAST_USED_STAMP_S:
+                    await graph.update_project_metadata(checker.project_name, last_used_at=time.time())
+                    stamped = time.monotonic()
                 head = checker.current_head()
                 stored = await graph.get_project_git_hash(checker.project_name)
                 if head is None or head == stored:

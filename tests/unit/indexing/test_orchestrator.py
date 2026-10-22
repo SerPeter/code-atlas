@@ -18,6 +18,7 @@ from code_atlas.indexing.orchestrator import (
     EmbeddingDimensionMismatchError,
     FileScope,
     StalenessChecker,
+    WorktreeBudgetError,
     _check_model_lock,
     _detect_packages,
     _git_changed_files,
@@ -27,13 +28,15 @@ from code_atlas.indexing.orchestrator import (
     _stop_consumer_tasks,
     _wait_for_drain,
     assert_embedding_dimension_matches,
-    gc_vanished_worktree_projects,
+    check_worktree_budget,
+    gc_worktree_projects,
     register_manifest_parser,
     scan_files,
+    worktree_project_counts,
 )
 from code_atlas.parsing.ast import _EXTENSION_MAP, _FILENAME_MAP
 from code_atlas.parsing.languages import discover_plugins
-from code_atlas.settings import AtlasSettings, ScopeSettings, derive_project_name, resolve_git_dir
+from code_atlas.settings import AtlasSettings, ScopeSettings, WorktreeSettings, derive_project_name, resolve_git_dir
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1459,20 +1462,21 @@ class TestReconcileUntilEmbedded:
 
 
 class FakeGCGraph:
-    """Records delete_project_data calls made by gc_vanished_worktree_projects."""
+    """Project nodes in memory; records delete_project_data calls made by the worktree GC."""
 
     def __init__(self, projects: list[dict]) -> None:
         self._projects = projects
         self.deleted: list[str] = []
 
-    async def get_project_status(self):
-        return self._projects
+    async def get_project_status(self, project_name: str | None = None):
+        live = [r for r in self._projects if r["n"].get("project_name") not in self.deleted]
+        return [r for r in live if project_name is None or r["n"].get("project_name") == project_name]
 
     async def delete_project_data(self, project_name: str) -> None:
         self.deleted.append(project_name)
 
 
-class TestGcVanishedWorktreeProjects:
+class TestGcWorktreeProjects:
     async def test_removes_worktree_project_whose_root_path_vanished(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -1484,7 +1488,7 @@ class TestGcVanishedWorktreeProjects:
         )
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: [tmp_path.resolve()])
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == ["code-atlas@feature-x"]
         assert graph.deleted == ["code-atlas@feature-x"]
@@ -1492,7 +1496,7 @@ class TestGcVanishedWorktreeProjects:
     async def test_spares_worktree_project_whose_root_path_still_exists(self, tmp_path: Path):
         graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x", "root_path": str(tmp_path)}}])
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1502,7 +1506,7 @@ class TestGcVanishedWorktreeProjects:
         with a vanished root_path (e.g. moved checkout) is not auto-GC'd."""
         graph = FakeGCGraph([{"n": {"project_name": "code-atlas", "root_path": str(tmp_path / "gone")}}])
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1511,7 +1515,7 @@ class TestGcVanishedWorktreeProjects:
         """No root_path stored (pre-orchestrator-fix data) — nothing to check against, so skip rather than guess."""
         graph = FakeGCGraph([{"n": {"project_name": "code-atlas@feature-x"}}])
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1524,7 +1528,7 @@ class TestGcVanishedWorktreeProjects:
         calls: list[Path] = []
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", calls.append)
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1543,7 +1547,7 @@ class TestGcVanishedWorktreeProjects:
         calls: list[Path] = []
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", calls.append)
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1561,7 +1565,7 @@ class TestGcVanishedWorktreeProjects:
         )
         monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: None)
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1581,7 +1585,7 @@ class TestGcVanishedWorktreeProjects:
             orchestrator_module, "_git_worktree_list", lambda base_root: [tmp_path.resolve(), vanished.resolve()]
         )
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
         assert graph.deleted == []
@@ -1589,9 +1593,184 @@ class TestGcVanishedWorktreeProjects:
     async def test_empty_project_list_is_noop(self):
         graph = FakeGCGraph([])
 
-        removed = await gc_vanished_worktree_projects(graph)  # ty: ignore[invalid-argument-type]
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
 
         assert removed == []
+        assert graph.deleted == []
+
+
+_DAY = 86_400.0
+_NOW = 1_800_000_000.0
+
+
+def _fake_worktree(tmp_path: Path, main: str, directory: str, branch: str, *, under: str = "") -> tuple[Path, Path]:
+    """A main checkout and a linked worktree of it, as git lays them out: ``(main_root, worktree)``."""
+    main_root = tmp_path / main
+    git_dir = main_root / ".git" / "worktrees" / directory
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text(f"ref: refs/heads/{branch}\n", encoding="utf-8")
+    (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = (main_root / under if under else tmp_path) / directory
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    return main_root.resolve(), worktree.resolve()
+
+
+def _project(name: str, root: Path, **props) -> dict:
+    return {"n": {"project_name": name, "root_path": str(root).replace("\\", "/"), **props}}
+
+
+class TestGcWorktreeProjectsByCheckout:
+    async def test_removes_a_vanished_worktree_named_after_its_own_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A worktree is `<its dir>@<branch>`, so the name's `@` prefix names no project.
+
+        The sweep used to look the main checkout up by that prefix, find nothing, and keep
+        every such project forever -- every Claude Code worktree, and how 30 piled up.
+        """
+        main = tmp_path / "repo"
+        main.mkdir()
+        graph = FakeGCGraph(
+            [
+                _project("repo", main),
+                _project("agent-1@agent-1", tmp_path / "gone", main_root=str(main)),
+            ]
+        )
+        monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: [main.resolve()])
+
+        assert await gc_worktree_projects(graph, idle_days=14) == ["agent-1@agent-1"]  # ty: ignore[invalid-argument-type]
+
+    async def test_finds_the_main_checkout_of_an_unstamped_claude_code_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Indexed before main_root was stamped: Claude Code's own layout still says where it came from."""
+        main = tmp_path / "repo"
+        main.mkdir()
+        graph = FakeGCGraph([_project("agent-2@agent-2", main / ".claude" / "worktrees" / "agent-2")])
+        asked: list[Path] = []
+        monkeypatch.setattr(orchestrator_module, "_git_worktree_list", lambda base_root: asked.append(base_root) or [])
+
+        assert await gc_worktree_projects(graph, idle_days=14) == ["agent-2@agent-2"]  # ty: ignore[invalid-argument-type]
+        assert [p.resolve() for p in asked] == [main.resolve()]
+
+    async def test_removes_the_project_a_branch_switch_left_behind(self, tmp_path: Path):
+        """`git switch` inside a worktree renames its project; the old one keeps a live directory."""
+        main, wt = _fake_worktree(tmp_path, "repo", "wt", "new")
+        graph = FakeGCGraph(
+            [
+                _project("wt@old", wt, main_root=str(main)),
+                _project("wt@old/core", wt / "core", main_root=str(main)),
+                _project("wt@new", wt, main_root=str(main)),
+            ]
+        )
+
+        removed = await gc_worktree_projects(graph, idle_days=14)  # ty: ignore[invalid-argument-type]
+
+        assert removed == ["wt@old", "wt@old/core"], "the old branch and its sub-project go together"
+
+    async def test_removes_a_checkout_idle_past_idle_days(self, tmp_path: Path):
+        main, old = _fake_worktree(tmp_path, "repo", "old", "old")
+        _, busy = _fake_worktree(tmp_path, "repo", "busy", "busy")
+        _, watched = _fake_worktree(tmp_path, "repo", "watched", "watched")
+        graph = FakeGCGraph(
+            [
+                _project("old@old", old, main_root=str(main), last_indexed_at=_NOW - 30 * _DAY),
+                _project("busy@busy", busy, main_root=str(main), last_indexed_at=_NOW - _DAY),
+                # Edited through the watcher for weeks: no index pass, but the session stamps it.
+                _project(
+                    "watched@watched",
+                    watched,
+                    main_root=str(main),
+                    last_indexed_at=_NOW - 30 * _DAY,
+                    last_used_at=_NOW - 0.5 * _DAY,
+                ),
+            ]
+        )
+
+        removed = await gc_worktree_projects(graph, idle_days=14, now=_NOW)  # ty: ignore[invalid-argument-type]
+
+        assert removed == ["old@old"]
+
+    async def test_keeps_a_checkout_with_no_stamp(self, tmp_path: Path):
+        main, wt = _fake_worktree(tmp_path, "repo", "wt", "wt")
+        graph = FakeGCGraph([_project("wt@wt", wt, main_root=str(main))])
+
+        assert await gc_worktree_projects(graph, idle_days=14, now=_NOW) == []  # ty: ignore[invalid-argument-type]
+
+    def test_a_branch_containing_a_slash_is_not_a_sub_project(self, tmp_path: Path):
+        """`wt@feat` and `wt@feat/x` are two checkouts unless the second's root is inside the first."""
+        main, a = _fake_worktree(tmp_path, "repo", "a", "feat")
+        _, b = _fake_worktree(tmp_path, "repo", "b", "feat/x")
+        records = [_project("wt@feat", a, main_root=str(main)), _project("wt@feat/x", b, main_root=str(main))]
+
+        assert worktree_project_counts(records) == {str(main).replace("\\", "/"): 2}
+
+
+class TestWorktreeBudget:
+    @staticmethod
+    def _setup(tmp_path: Path, **budget) -> tuple[AtlasSettings, FakeGCGraph]:
+        """A new worktree `new@n` of `repo`, which already holds two live, recently used ones."""
+        main, new = _fake_worktree(tmp_path, "repo", "new", "n")
+        _, older = _fake_worktree(tmp_path, "repo", "older", "o")
+        _, newer = _fake_worktree(tmp_path, "repo", "newer", "w")
+        graph = FakeGCGraph(
+            [
+                _project("repo", main),
+                _project("older@o", older, main_root=str(main), last_indexed_at=_NOW - 2 * _DAY),
+                _project("newer@w", newer, main_root=str(main), last_indexed_at=_NOW - _DAY),
+            ]
+        )
+        settings = AtlasSettings(project_root=new, worktrees=WorktreeSettings(**budget))
+        return settings, graph
+
+    async def test_refuses_a_new_worktree_at_the_cap_and_names_what_to_remove(self, tmp_path: Path):
+        settings, graph = self._setup(tmp_path, max_projects=2)
+
+        with pytest.raises(WorktreeBudgetError) as exc:
+            await check_worktree_budget(settings, graph, now=_NOW)  # ty: ignore[invalid-argument-type]
+
+        message = str(exc.value)
+        assert "new@n" in message
+        assert message.index("atlas project rm older@o") < message.index("atlas project rm newer@w"), "oldest first"
+        assert graph.deleted == []
+
+    async def test_evict_removes_the_least_recently_used_instead(self, tmp_path: Path):
+        settings, graph = self._setup(tmp_path, max_projects=2, on_limit="evict")
+
+        await check_worktree_budget(settings, graph, now=_NOW)  # ty: ignore[invalid-argument-type]
+
+        assert graph.deleted == ["older@o"]
+
+    async def test_room_made_by_the_gc_admits_the_new_worktree(self, tmp_path: Path):
+        settings, graph = self._setup(tmp_path, max_projects=2, idle_days=1.5)
+
+        await check_worktree_budget(settings, graph, now=_NOW)  # ty: ignore[invalid-argument-type]
+
+        assert graph.deleted == ["older@o"], "idle past 1.5 days -- removed as stale, not refused"
+
+    async def test_under_the_cap_nothing_is_touched(self, tmp_path: Path):
+        settings, graph = self._setup(tmp_path, max_projects=3)
+
+        await check_worktree_budget(settings, graph, now=_NOW)  # ty: ignore[invalid-argument-type]
+
+        assert graph.deleted == []
+
+    async def test_an_existing_worktree_project_is_never_refused(self, tmp_path: Path):
+        """Refusing a project that already exists would strand an index that is already paid for."""
+        settings, graph = self._setup(tmp_path, max_projects=1)
+        graph._projects.append(_project("new@n", settings.project_root))
+
+        await check_worktree_budget(settings, graph, now=_NOW)  # ty: ignore[invalid-argument-type]
+
+        assert graph.deleted == []
+
+    async def test_the_main_checkout_is_never_gated(self, tmp_path: Path):
+        settings, graph = self._setup(tmp_path, max_projects=1)
+        main_settings = AtlasSettings(project_root=tmp_path / "repo", worktrees=settings.worktrees)
+
+        await check_worktree_budget(main_settings, graph, now=_NOW)  # ty: ignore[invalid-argument-type]
+
         assert graph.deleted == []
 
 
