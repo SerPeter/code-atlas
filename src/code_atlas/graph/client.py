@@ -3212,17 +3212,20 @@ class GraphClient:
         label it "obviously" has is exactly what once dropped every module-scope
         CALLS edge with no error at all. So the label comes from *observed* data —
         a scan this method's callers already perform — and **any uid absent from
-        ``uid_label`` falls back to the unlabelled form for its group alone**. A
-        missing entry costs speed, never an edge.
+        ``uid_label`` falls back to the ``:Entity`` marker for its group alone**.
+        Every uid-bearing node but an ``EmbedChunk`` carries the marker, so the
+        fallback narrows nothing, and its ``uid`` index keeps the lookup indexed. It
+        used to fall back to no label at all, and a batch's own citations always
+        arrive without one: 40 ms per row against 0.25 ms on a 131k-node graph.
         """
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for edge in edges:
-            a = uid_label.get(edge[from_key], "")
-            b = uid_label.get(edge[to_key], "")
+            a = uid_label.get(edge[from_key]) or NodeLabel.ENTITY.value
+            b = uid_label.get(edge[to_key]) or NodeLabel.ENTITY.value
             grouped[(a, b)].append(edge)
 
         for (a_label, b_label), group in grouped.items():
-            query = make_query(f":{a_label}" if a_label else "", f":{b_label}" if b_label else "")
+            query = make_query(f":{a_label}", f":{b_label}")
             for chunk in batched(group, _CALLS_WRITE_CHUNK, strict=False):
                 await self.execute_write(query, {"rels": list(chunk)})
 
@@ -6619,11 +6622,13 @@ class GraphClient:
 
         Only the second branch is ordered. The first matches on ``uid``, which carries a
         unique constraint, so at most one row exists and its LIMIT can never cut anything;
-        ordering it would be noise that reads as though it mattered.
+        ordering it would be noise that reads as though it mattered. With no label it
+        matches on the ``:Entity`` marker, whose ``uid`` index an unlabelled match cannot
+        use.
         """
         label_filter = f":{label}" if label else ""
         return await self.execute(
-            f"MATCH (n{label_filter} {{uid: $name}}) RETURN n LIMIT {limit} "
+            f"MATCH (n{label_filter or f':{NodeLabel.ENTITY}'} {{uid: $name}}) RETURN n LIMIT {limit} "
             f"UNION ALL "
             f"MATCH (n{label_filter}) WHERE n.name = $name "
             f"RETURN n {_LIMITED_QUERY_ORDER} LIMIT {limit}",
